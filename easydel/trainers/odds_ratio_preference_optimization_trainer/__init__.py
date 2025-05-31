@@ -14,4 +14,4 @@
 
 from .orpo_trainer import ORPOConfig, ORPOTrainer
 
-__all__ = ("ORPOTrainer", "ORPOConfig")
+__all__ = ("ORPOConfig", "ORPOTrainer")

@@ -20,181 +20,180 @@ from abc import ABC, abstractmethod
 from eformer.pytree import auto_pytree
 
 if tp.TYPE_CHECKING:
-	from jax.sharding import Mesh, PartitionSpec
+    from jax.sharding import Mesh, PartitionSpec
 
-	from easydel.layers.quantization.quantizers import EasyQuantizer
+    from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
-	EasyQuantizer = object
-	PartitionSpec = tp.Any
-	Mesh = tp.Any
+    EasyQuantizer = object
+    PartitionSpec = tp.Any
+    Mesh = tp.Any
 
 
 @auto_pytree
 class BaseCacheMetadata(ABC):
-	"""
-	Abstract base class defining the interface for cache metadata.
+    """
+    Abstract base class defining the interface for cache metadata.
 
-	Concrete implementations should provide:
-	- Required configuration parameters for cache initialization
-	- Validation logic in the create() method
-	- Any metadata needed during cache operations
-	"""
+    Concrete implementations should provide:
+    - Required configuration parameters for cache initialization
+    - Validation logic in the create() method
+    - Any metadata needed during cache operations
+    """
 
-	@classmethod
-	@abstractmethod
-	def create(cls, *args, **kwargs) -> BaseCacheMetadata:
-		"""
-		Factory method to create validated metadata instance.
+    @classmethod
+    @abstractmethod
+    def create(cls, *args, **kwargs) -> BaseCacheMetadata:
+        """
+        Factory method to create validated metadata instance.
 
-		Args:
-		    *args: Positional arguments for metadata creation
-		    **kwargs: Keyword arguments for metadata creation
+        Args:
+            *args: Positional arguments for metadata creation
+            **kwargs: Keyword arguments for metadata creation
 
-		Returns:
-		    Instance of concrete metadata implementation
+        Returns:
+            Instance of concrete metadata implementation
 
-		Raises:
-		    ValueError: If any validation checks fail
-		"""
-		pass
+        Raises:
+            ValueError: If any validation checks fail
+        """
+        pass
 
 
 @auto_pytree
 class BaseRunTimeMetadata:
-	"""
-	Abstract base class for optional runtime metadata used during attention computation.
+    """
+    Abstract base class for optional runtime metadata used during attention computation.
 
-	This can hold dynamic information needed during the forward pass that isn't
-	known at cache initialization time.
-	"""
+    This can hold dynamic information needed during the forward pass that isn't
+    known at cache initialization time.
+    """
 
 
 class BaseCacheView(ABC):
-	"""
-	Abstract base class for a single cache view (typically per layer).
+    """
+    Abstract base class for a single cache view (typically per layer).
 
-	Responsible for:
-	- Storing cached key/value states
-	- Tracking current cache position
-	- Updating cache with new states
-	"""
+    Responsible for:
+    - Storing cached key/value states
+    - Tracking current cache position
+    - Updating cache with new states
+    """
 
-	metadata: BaseCacheMetadata
-	layer_index: tp.Optional[int]
+    metadata: BaseCacheMetadata
+    layer_index: int | None
 
-	@classmethod
-	@abstractmethod
-	def init(cls, metadata: BaseCacheMetadata, *args, **kwargs) -> BaseCacheView:
-		"""
-		Initialize a new cache view instance.
+    @classmethod
+    @abstractmethod
+    def init(cls, metadata: BaseCacheMetadata, *args, **kwargs) -> BaseCacheView:
+        """
+        Initialize a new cache view instance.
 
-		Args:
-		    metadata: Configuration metadata for the cache
-		    *args: Additional positional arguments
-		    **kwargs: Additional keyword arguments
+        Args:
+            metadata: Configuration metadata for the cache
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments
 
-		Returns:
-		    Initialized cache view instance
-		"""
-		pass
+        Returns:
+            Initialized cache view instance
+        """
+        pass
 
-	@abstractmethod
-	def concatenate_to_cache(self, *args, **kwargs) -> tp.Any:
-		"""
-		Update cache with new states.
+    @abstractmethod
+    def concatenate_to_cache(self, *args, **kwargs) -> tp.Any:
+        """
+        Update cache with new states.
 
-		Args:
-		    *args: Typically includes new tensors
-		    **kwargs: Additional parameters for cache update
+        Args:
+            *args: Typically includes new tensors
+            **kwargs: Additional parameters for cache update
 
-		Returns:
-		    Tuple containing:
-					- anything
-		"""
-		pass
+        Returns:
+            Tuple containing:
+                                - anything
+        """
+        pass
 
 
 class BaseCache(ABC):
-	"""
-	Abstract base class for the main cache container.
+    """
+    Abstract base class for the main cache container.
 
-	Manages a sequence of cache views (typically one per layer) and provides
-	initialization methods.
-	"""
+    Manages a sequence of cache views (typically one per layer) and provides
+    initialization methods.
+    """
 
-	views: tp.Sequence[tp.Optional[BaseCacheView]]
+    views: tp.Sequence[BaseCacheView | None]
 
-	@classmethod
-	@abstractmethod
-	def init_cache(
-		cls,
-		metadata: BaseCacheMetadata,
-		*args,
-		**kwargs,
-	) -> BaseCache:
-		"""
-		Initialize a complete cache with views for all layers.
+    @classmethod
+    @abstractmethod
+    def init_cache(
+        cls,
+        metadata: BaseCacheMetadata,
+        *args,
+        **kwargs,
+    ) -> BaseCache:
+        """
+        Initialize a complete cache with views for all layers.
 
-		Args:
-		    metadata: Configuration metadata
-		    *args: Additional positional arguments
-		    **kwargs: Additional keyword arguments
+        Args:
+            metadata: Configuration metadata
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments
 
-		Returns:
-		    Fully initialized cache instance
-		"""
-		pass
+        Returns:
+            Fully initialized cache instance
+        """
+        pass
 
-	@classmethod
-	@abstractmethod
-	def init_empty(cls, *args, **kwargs) -> BaseCache:
-		"""
-		Initialize an empty cache container.
+    @classmethod
+    @abstractmethod
+    def init_empty(cls, *args, **kwargs) -> BaseCache:
+        """
+        Initialize an empty cache container.
 
-		Args:
-		    *args: Additional positional arguments
-		    **kwargs: Additional keyword arguments
+        Args:
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments
 
-		Returns:
-		    Cache instance with uninitialized views
-		"""
-		pass
+        Returns:
+            Cache instance with uninitialized views
+        """
+        pass
 
-	def __getitem__(self, index):
-		"""
-		Enable indexing to access cache views.
+    def __getitem__(self, index):
+        """
+        Enable indexing to access cache views.
 
-		Args:
-				index: Index of the cache view to retrieve
+        Args:
+                        index: Index of the cache view to retrieve
 
-		Returns:
-				The cache view at the specified index
-		"""
-		return self.views[index]
+        Returns:
+                        The cache view at the specified index
+        """
+        return self.views[index]
 
-	def __setitem__(self, index, value):
-		"""
-		Enable item assignment to update cache views.
+    def __setitem__(self, index, value):
+        """
+        Enable item assignment to update cache views.
 
-		Args:
-				index: Index of the cache view to update
-				value: New cache view to assign
-		"""
-		self.views[index] = value
+        Args:
+                        index: Index of the cache view to update
+                        value: New cache view to assign
+        """
+        self.views[index] = value
 
-	def __len__(self) -> int:
-		"""
-		Returns the number of cache views.
+    def __len__(self) -> int:
+        """
+        Returns the number of cache views.
 
-		Returns:
-				The number of items in the `views` sequence.
+        Returns:
+                        The number of items in the `views` sequence.
 
-		Raises:
-				AttributeError: If `self.views` has not been initialized by a subclass.
-		"""
-		if not hasattr(self, "views"):
-			raise AttributeError(
-				"The 'views' attribute has not been initialized. "
-				"Ensure a concrete subclass initializes it."
-			)
-		return len(self.views)
+        Raises:
+                        AttributeError: If `self.views` has not been initialized by a subclass.
+        """
+        if not hasattr(self, "views"):
+            raise AttributeError(
+                "The 'views' attribute has not been initialized. Ensure a concrete subclass initializes it."
+            )
+        return len(self.views)

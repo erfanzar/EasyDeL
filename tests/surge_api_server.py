@@ -25,56 +25,56 @@ import easydel as ed
 
 
 def main():
-	model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    model_id = "meta-llama/Llama-3.2-1B-Instruct"
 
-	max_decode_length = 2048
-	max_prefill_length = 2048
-	max_concurrent_decodes = 8
+    max_decode_length = 2048
+    max_prefill_length = 2048
+    max_concurrent_decodes = 8
 
-	max_length = max_prefill_length + max_decode_length
+    max_length = max_prefill_length + max_decode_length
 
-	processor = AutoTokenizer.from_pretrained(model_id)
-	processor.pad_token_id = processor.eos_token_id
-	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-		model_id,
-		dtype=jnp.bfloat16,
-		param_dtype=jnp.bfloat16,
-		precision=lax.Precision.HIGH,
-		auto_shard_model=True,
-		sharding_axis_dims=(1, 1, -1, 1),
-		config_kwargs=ed.EasyDeLBaseConfigDict(
-			freq_max_position_embeddings=max_length,
-			mask_max_position_embeddings=max_length,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			attn_dtype=jnp.bfloat16,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-		),
-		partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-	)
+    processor = AutoTokenizer.from_pretrained(model_id)
+    processor.pad_token_id = processor.eos_token_id
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=lax.Precision.HIGH,
+        auto_shard_model=True,
+        sharding_axis_dims=(1, 1, 1, -1, 1),
+        config_kwargs=ed.EasyDeLBaseConfigDict(
+            freq_max_position_embeddings=max_length,
+            mask_max_position_embeddings=max_length,
+            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+            attn_mechanism=ed.AttentionMechanisms.VANILLA,
+            attn_dtype=jnp.bfloat16,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        ),
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
+        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+    )
 
-	surge = ed.vSurge.create_vdriver(
-		model=model,
-		processor=processor,
-		prefill_lengths=[
-			max_prefill_length // 8,
-			max_prefill_length // 4,
-			max_prefill_length // 2,
-			max_prefill_length,
-		],
-		max_concurrent_decodes=max_concurrent_decodes,
-		max_prefill_length=max_prefill_length,
-		max_length=max_length,
-		vsurge_name="llama",
-		verbose=True,
-		seed=48,
-	)
+    surge = ed.vSurge.from_model(
+        model=model,
+        processor=processor,
+        prefill_lengths=[
+            max_prefill_length // 8,
+            max_prefill_length // 4,
+            max_prefill_length // 2,
+            max_prefill_length,
+        ],
+        max_concurrent_decodes=max_concurrent_decodes,
+        max_prefill_length=max_prefill_length,
+        max_length=max_length,
+        vsurge_name="llama",
+        verbose=True,
+        seed=48,
+    )
 
-	surge.compile()
-	surge.start()
-	ed.vSurgeApiServer(surge).fire()
+    surge.compile()
+    surge.start()
+    ed.vSurgeApiServer(surge).fire()
 
 
 if __name__ == "__main__":
-	main()
+    main()

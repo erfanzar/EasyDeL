@@ -13,15 +13,15 @@
 # limitations under the License.
 
 from .modeling_olmo2_flax import (
-	Olmo2ForCausalLM,
-	Olmo2Model,
-	Olmo2ForSequenceClassification,
+    Olmo2ForCausalLM,
+    Olmo2ForSequenceClassification,
+    Olmo2Model,
 )
 from .olmo2_configuration import Olmo2Config
 
 __all__ = (
-	"Olmo2ForCausalLM",
-	"OlmoForSequenceClassification",
-	"Olmo2Model",
-	"Olmo2Config",
+    "Olmo2Config",
+    "Olmo2ForCausalLM",
+    "Olmo2Model",
+    "OlmoForSequenceClassification",
 )

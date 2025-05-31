@@ -27,351 +27,346 @@ from .._utils import safe_autotune
 
 
 def _is_cuda():
-	return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
 def _get_cuda_autotune_config():
-	return [
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 256,
-				"BLOCK_SIZE_K": 64,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=3,
-			num_warps=8,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 64,
-				"BLOCK_SIZE_N": 256,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=4,
-			num_warps=4,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 128,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=4,
-			num_warps=4,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 64,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=4,
-			num_warps=4,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 64,
-				"BLOCK_SIZE_N": 128,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=4,
-			num_warps=4,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 32,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-			},
-			num_stages=4,
-			num_warps=4,
-		),
-	]
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+            },
+            num_stages=4,
+            num_warps=4,
+        ),
+    ]
 
 
 def _get_hip_autotune_config():
-	return [
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 256,
-				"BLOCK_SIZE_K": 16,
-				"GROUP_SIZE_M": 1,
-				"waves_per_eu": 2,
-			},
-			num_warps=4,
-			num_stages=0,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 256,
-				"BLOCK_SIZE_N": 256,
-				"BLOCK_SIZE_K": 16,
-				"GROUP_SIZE_M": 4,
-				"waves_per_eu": 2,
-			},
-			num_warps=8,
-			num_stages=0,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 128,
-				"BLOCK_SIZE_N": 128,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 1,
-				"waves_per_eu": 2,
-			},
-			num_warps=8,
-			num_stages=0,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 64,
-				"BLOCK_SIZE_N": 128,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 8,
-				"waves_per_eu": 3,
-			},
-			num_warps=4,
-			num_stages=0,
-		),
-		triton.Config(
-			{
-				"BLOCK_SIZE_M": 64,
-				"BLOCK_SIZE_N": 64,
-				"BLOCK_SIZE_K": 32,
-				"GROUP_SIZE_M": 1,
-				"waves_per_eu": 8,
-			},
-			num_warps=4,
-			num_stages=0,
-		),
-	]
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 16,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 2,
+            },
+            num_warps=4,
+            num_stages=0,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 16,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 2,
+            },
+            num_warps=8,
+            num_stages=0,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 2,
+            },
+            num_warps=8,
+            num_stages=0,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "waves_per_eu": 3,
+            },
+            num_warps=4,
+            num_stages=0,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 8,
+            },
+            num_warps=4,
+            num_stages=0,
+        ),
+    ]
 
 
 def _get_autotune_config():
-	try:
-		if _is_cuda():
-			return _get_cuda_autotune_config()
-		else:
-			return _get_hip_autotune_config()
-	except:  # noqa
-		return _get_cuda_autotune_config()
+    try:
+        if _is_cuda():
+            return _get_cuda_autotune_config()
+        else:
+            return _get_hip_autotune_config()
+    except:  # noqa
+        return _get_cuda_autotune_config()
 
 
 @safe_autotune(
-	configs=_get_autotune_config(),
-	key=["M", "N", "K"],
+    configs=_get_autotune_config(),
+    key=["M", "N", "K"],
 )
 @triton.jit
 def _triton_matmul(
-	a_ptr,
-	b_ptr,
-	c_ptr,
-	stride_am,
-	stride_ak,
-	stride_bk,
-	stride_bn,
-	stride_cm,
-	stride_cn,
-	M,
-	N,
-	K,
-	BLOCK_SIZE_M: tl.constexpr,
-	BLOCK_SIZE_N: tl.constexpr,
-	BLOCK_SIZE_K: tl.constexpr,
-	GROUP_SIZE_M: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-	pid = tl.program_id(0)
-	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-	num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-	num_pid_in_group = GROUP_SIZE_M * num_pid_n
-	group_id = pid // num_pid_in_group
-	first_pid_m = group_id * GROUP_SIZE_M
-	group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-	pid_m = first_pid_m + (pid % group_size_m)
-	pid_n = (pid % num_pid_in_group) // group_size_m
-	offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-	offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-	offs_k = tl.arange(0, BLOCK_SIZE_K)
-	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-	b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-	acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-	for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-		a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
-		b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
-		acc += tl.dot(a_data, b_data)
-		a_ptrs += BLOCK_SIZE_K * stride_ak
-		b_ptrs += BLOCK_SIZE_K * stride_bk
-	acc = acc.to(dtype=tl.float16)
-	offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-	offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-	c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-	c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-	tl.store(c_ptrs, acc, mask=c_mask)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
+        b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
+        acc += tl.dot(a_data, b_data)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    acc = acc.to(dtype=tl.float16)
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 @triton.jit
 def _matmul_activation_kernel(
-	a_ptr,
-	b_ptr,
-	c_ptr,
-	M,
-	N,
-	K,
-	stride_am,
-	stride_ak,
-	stride_bk,
-	stride_bn,
-	stride_cm,
-	stride_cn,
-	BLOCK_SIZE_M: tl.constexpr,
-	BLOCK_SIZE_N: tl.constexpr,
-	BLOCK_SIZE_K: tl.constexpr,
-	GROUP_SIZE_M: tl.constexpr,
-	activation: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    activation: tl.constexpr,
 ):
-	pid = tl.program_id(0)
-	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-	num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-	num_pid_in_group = GROUP_SIZE_M * num_pid_n
-	group_id = pid // num_pid_in_group
-	first_pid_m = group_id * GROUP_SIZE_M
-	group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-	pid_m = first_pid_m + (pid % group_size_m)
-	pid_n = (pid % num_pid_in_group) // group_size_m
-	offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-	offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-	offs_k = tl.arange(0, BLOCK_SIZE_K)
-	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-	b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-	acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-	for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-		a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
-		b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
-		acc += tl.dot(a_data, b_data)
-		a_ptrs += BLOCK_SIZE_K * stride_ak
-		b_ptrs += BLOCK_SIZE_K * stride_bk
-	acc = activation(acc.to(dtype=tl.float16))
-	offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-	offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-	c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-	c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-	tl.store(c_ptrs, acc, mask=c_mask)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
+        b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
+        acc += tl.dot(a_data, b_data)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    acc = activation(acc.to(dtype=tl.float16))
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 def _triton_call_matmul(A, B):
-	M, K, N = A.shape[0], A.shape[1], B.shape[1]
-	out_shape = jax.ShapeDtypeStruct(
-		(A.shape[0], B.shape[1]),
-		dtype=A.dtype,
-	)
+    M, K, N = A.shape[0], A.shape[1], B.shape[1]
+    out_shape = jax.ShapeDtypeStruct(
+        (A.shape[0], B.shape[1]),
+        dtype=A.dtype,
+    )
 
-	metaparams = dict(
-		stride_am=K,
-		stride_ak=1,
-		stride_bk=N,
-		stride_bn=1,
-		stride_cm=N,
-		stride_cn=1,
-		M=M,
-		N=N,
-		K=K,
-	)
-	return triton_call(
-		A,
-		B,
-		kernel=_triton_matmul,
-		grid=lambda META: (
-			triton.cdiv(META["M"], META["BLOCK_SIZE_M"])
-			* triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),
-		),
-		out_shape=out_shape,
-		**metaparams,
-	)
+    metaparams = dict(
+        stride_am=K,
+        stride_ak=1,
+        stride_bk=N,
+        stride_bn=1,
+        stride_cm=N,
+        stride_cn=1,
+        M=M,
+        N=N,
+        K=K,
+    )
+    return triton_call(
+        A,
+        B,
+        kernel=_triton_matmul,
+        grid=lambda META: (triton.cdiv(META["M"], META["BLOCK_SIZE_M"]) * triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),),
+        out_shape=out_shape,
+        **metaparams,
+    )
 
 
 triton_matmul_primitive = jax.extend.core.Primitive("triton_matmul_primitive")
 
 
 def impt_prim(A, B):
-	# operate in float16 or bfloat16 since they are both accurate on GPUs
-	if A.dtype == jnp.bfloat16 or B.dtype == jnp.bfloat16:
-		compute_dtype = jnp.bfloat16
-	elif A.dtype == jnp.float16 or B.dtype == jnp.float16:
-		compute_dtype = jnp.float16
-	else:
-		compute_dtype = jnp.float32
-	return _triton_call_matmul(
-		A.astype(compute_dtype),
-		B.astype(compute_dtype),
-	).astype(A.dtype)
+    # operate in float16 or bfloat16 since they are both accurate on GPUs
+    if A.dtype == jnp.bfloat16 or B.dtype == jnp.bfloat16:
+        compute_dtype = jnp.bfloat16
+    elif A.dtype == jnp.float16 or B.dtype == jnp.float16:
+        compute_dtype = jnp.float16
+    else:
+        compute_dtype = jnp.float32
+    return _triton_call_matmul(
+        A.astype(compute_dtype),
+        B.astype(compute_dtype),
+    ).astype(A.dtype)
 
 
 triton_matmul_primitive.def_impl(partial(xla.apply_primitive, triton_matmul_primitive))
 
 mlir.register_lowering(
-	triton_matmul_primitive,
-	mlir.lower_fun(fun=impt_prim, multiple_results=False),
-	platform="gpu",
+    triton_matmul_primitive,
+    mlir.lower_fun(fun=impt_prim, multiple_results=False),
+    platform="gpu",
 )
 
 
 @triton_matmul_primitive.def_abstract_eval
 def triton_matmul_abstract_eval(A, B):
-	if A.ndim != 2 or B.ndim != 2:
-		raise ValueError("Both inputs must be 2-dimensional")
-	if A.shape[1] != B.shape[0]:
-		raise ValueError(
-			f"Incompatible shapes for matrix multiplication: {A.shape} and {B.shape}"
-		)
-	return jax.core.ShapedArray((A.shape[0], B.shape[1]), A.dtype)
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("Both inputs must be 2-dimensional")
+    if A.shape[1] != B.shape[0]:
+        raise ValueError(f"Incompatible shapes for matrix multiplication: {A.shape} and {B.shape}")
+    return jax.core.ShapedArray((A.shape[0], B.shape[1]), A.dtype)
 
 
 def triton_matmul_vjp(A, B):
-	def vjp(y_bar):
-		return (
-			triton_matmul_primitive.bind(y_bar, B.T),
-			triton_matmul_primitive.bind(A.T, y_bar),
-		)
+    def vjp(y_bar):
+        return (
+            triton_matmul_primitive.bind(y_bar, B.T),
+            triton_matmul_primitive.bind(A.T, y_bar),
+        )
 
-	return triton_matmul_primitive.bind(A, B), vjp
+    return triton_matmul_primitive.bind(A, B), vjp
 
 
 def triton_matmul_batch(args, batch_axes):
-	A, B = args
-	A_axis, B_axis = batch_axes
+    A, B = args
+    A_axis, B_axis = batch_axes
 
-	if A_axis is None and B_axis is None:
-		return triton_matmul_primitive.bind(A, B), None
+    if A_axis is None and B_axis is None:
+        return triton_matmul_primitive.bind(A, B), None
 
-	# Helper function to prepare inputs
-	def prepare_input(X, axis):
-		if axis is not None:
-			return jnp.swapaxes(X, axis, 0) if axis != 0 else X
-		return jnp.expand_dims(X, 0)
+    # Helper function to prepare inputs
+    def prepare_input(X, axis):
+        if axis is not None:
+            return jnp.swapaxes(X, axis, 0) if axis != 0 else X
+        return jnp.expand_dims(X, 0)
 
-	A = prepare_input(A, A_axis)
-	B = prepare_input(B, B_axis)
+    A = prepare_input(A, A_axis)
+    B = prepare_input(B, B_axis)
 
-	# Ensure both A and B have the same batch dimension
-	batch_size = max(A.shape[0], B.shape[0])
-	A = jnp.broadcast_to(A, (batch_size,) + A.shape[1:])
-	B = jnp.broadcast_to(B, (batch_size,) + B.shape[1:])
+    # Ensure both A and B have the same batch dimension
+    batch_size = max(A.shape[0], B.shape[0])
+    A = jnp.broadcast_to(A, (batch_size,) + A.shape[1:])
+    B = jnp.broadcast_to(B, (batch_size,) + B.shape[1:])
 
-	# Perform batched matrix multiplication
-	def batched_matmul(A, B):
-		assert A.ndim == 3 and B.ndim == 3, "Inputs must be 3D after batching"
-		return jax.lax.map(lambda x: triton_matmul_primitive.bind(x[0], x[1]), (A, B))
+    # Perform batched matrix multiplication
+    def batched_matmul(A, B):
+        assert A.ndim == 3 and B.ndim == 3, "Inputs must be 3D after batching"
+        return jax.lax.map(lambda x: triton_matmul_primitive.bind(x[0], x[1]), (A, B))
 
-	result = batched_matmul(A, B)
-	return result, 0  # The result is always batched along the first dimension
+    result = batched_matmul(A, B)
+    return result, 0  # The result is always batched along the first dimension
 
 
 batching.primitive_batchers[triton_matmul_primitive] = triton_matmul_batch
@@ -379,18 +374,18 @@ batching.primitive_batchers[triton_matmul_primitive] = triton_matmul_batch
 
 @jax.custom_vjp
 def matmul(A, B):
-	return triton_matmul_primitive.bind(A, B)
+    return triton_matmul_primitive.bind(A, B)
 
 
 def _fwd_matmul(A, B):
-	return triton_matmul_primitive.bind(A, B), (A, B)
+    return triton_matmul_primitive.bind(A, B), (A, B)
 
 
 def _bwd_matmul(residual, gO):
-	return (
-		triton_matmul_primitive.bind(gO, residual[1].transpose(1, 0)),
-		triton_matmul_primitive.bind(residual[0].transpose(1, 0), gO),
-	)
+    return (
+        triton_matmul_primitive.bind(gO, residual[1].transpose(1, 0)),
+        triton_matmul_primitive.bind(residual[0].transpose(1, 0), gO),
+    )
 
 
 matmul.defvjp(_fwd_matmul, _bwd_matmul)
@@ -398,60 +393,56 @@ matmul = jax.jit(matmul)
 
 
 def test_run(argv):
-	M, K, N = 1027 * 10, 4096, 1021 * 8
-	dtype = jnp.float16
-	A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
-	B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
-	res = matmul(A, B)
-	g = jax.grad(lambda x, e: jnp.sum(x @ e))(A, B)
-	g_ = jax.grad(lambda x, e: jnp.sum(matmul(x, e)))(A, B)
-	print("Result Close : ", jnp.allclose(res, A @ B, atol=0.125, rtol=0))
-	print("Grad Close   : ", jnp.allclose(g, g_, atol=0.125, rtol=0))
+    M, K, N = 1027 * 10, 4096, 1021 * 8
+    dtype = jnp.float16
+    A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
+    B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
+    res = matmul(A, B)
+    g = jax.grad(lambda x, e: jnp.sum(x @ e))(A, B)
+    g_ = jax.grad(lambda x, e: jnp.sum(matmul(x, e)))(A, B)
+    print("Result Close : ", jnp.allclose(res, A @ B, atol=0.125, rtol=0))
+    print("Grad Close   : ", jnp.allclose(g, g_, atol=0.125, rtol=0))
 
 
 def test_vmap(argv):
-	A = jnp.array(
-		[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]
-	)  # Shape: (2, 2, 2)
-	B = jnp.array([[5.0, 6.0], [7.0, 8.0]])  # Shape: (2, 2)
+    A = jnp.array([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])  # Shape: (2, 2, 2)
+    B = jnp.array([[5.0, 6.0], [7.0, 8.0]])  # Shape: (2, 2)
 
-	result = jax.vmap(matmul, in_axes=(0, None))(A, B)
-	print("Batched Result:", result)
+    result = jax.vmap(matmul, in_axes=(0, None))(A, B)
+    print("Batched Result:", result)
 
-	# Test gradients with batching
-	grad_func = jax.grad(lambda A, B: jax.vmap(matmul, in_axes=(0, None))(A, B).sum())
-	grad_A, grad_B = grad_func(A, B)
-	print("Batched Gradient w.r.t. A:", grad_A)
-	print("Batched Gradient w.r.t. B:", grad_B)
+    # Test gradients with batching
+    grad_func = jax.grad(lambda A, B: jax.vmap(matmul, in_axes=(0, None))(A, B).sum())
+    grad_A, grad_B = grad_func(A, B)
+    print("Batched Gradient w.r.t. A:", grad_A)
+    print("Batched Gradient w.r.t. B:", grad_B)
 
 
 def bench(argv):
-	import timeit
+    import timeit
 
-	M, K, N = 1027 * 10, 4096, 1021 * 8
-	ntrials = 100
-	dtype = jnp.float16
-	A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
-	B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
-	_ = matmul(A, B)  # skip autotuning process
+    M, K, N = 1027 * 10, 4096, 1021 * 8
+    ntrials = 100
+    dtype = jnp.float16
+    A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
+    B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
+    _ = matmul(A, B)  # skip autotuning process
 
-	def _benchmark(f, ntrials: int = 100):
-		def run(*args, **kwargs):
-			jax.block_until_ready(f(*args, **kwargs))
-			result = timeit.timeit(
-				lambda: jax.block_until_ready(f(*args, **kwargs)), number=ntrials
-			)
-			time = result / ntrials
-			return time
+    def _benchmark(f, ntrials: int = 100):
+        def run(*args, **kwargs):
+            jax.block_until_ready(f(*args, **kwargs))
+            result = timeit.timeit(lambda: jax.block_until_ready(f(*args, **kwargs)), number=ntrials)
+            time = result / ntrials
+            return time
 
-		return run
+        return run
 
-	print("TRITON CALL : ", _benchmark(matmul, ntrials=ntrials)(A, B))
-	print("JAX.LAX CALL : ", _benchmark(jax.lax.batch_matmul, ntrials=ntrials)(A, B))
+    print("TRITON CALL : ", _benchmark(matmul, ntrials=ntrials)(A, B))
+    print("JAX.LAX CALL : ", _benchmark(jax.lax.batch_matmul, ntrials=ntrials)(A, B))
 
 
 __all__ = ["matmul"]
 if __name__ == "__main__":
-	from absl import app
+    from absl import app
 
-	app.run(bench)
+    app.run(bench)

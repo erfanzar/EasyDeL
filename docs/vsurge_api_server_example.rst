@@ -27,7 +27,7 @@ To initialize and run the API server, you can use the following pattern:
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path,
         auto_shard_model=True,
-        sharding_axis_dims=(1, 1, -1, 1),
+        sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
@@ -41,19 +41,13 @@ To initialize and run the API server, you can use the following pattern:
         partition_axis=partition_axis,
         precision=jax.lax.Precision.DEFAULT,
     )
-
-		page_size = 128
-    hbm_utilization = 0.875
+ 
     max_concurrent_decodes = 64
-    max_concurrent_prefill = 64 # Often set equal to max_concurrent_decodes
+    max_concurrent_prefill = 1
 
-    surge = ed.vSurge.create_odriver(
+    surge = ed.vSurge.from_model(
         model=model,
-        processor=processor,
-        max_prefill_length=prefill_length,
-        prefill_lengths=[prefill_length],
-        page_size=page_size,
-        hbm_utilization=hbm_utilization,
+        processor=processor, 
         max_concurrent_prefill=max_concurrent_prefill,
         max_concurrent_decodes=max_concurrent_decodes,
         seed=877,

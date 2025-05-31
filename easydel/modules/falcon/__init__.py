@@ -15,4 +15,4 @@
 from .falcon_configuration import FalconConfig
 from .modeling_falcon_flax import FalconForCausalLM, FalconModel
 
-__all__ = "FalconForCausalLM", "FalconModel", "FalconConfig"
+__all__ = "FalconConfig", "FalconForCausalLM", "FalconModel"

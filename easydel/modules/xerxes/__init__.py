@@ -15,4 +15,4 @@
 from .modeling_xerxes_flax import XerxesForCausalLM, XerxesModel
 from .xerxes_configuration import XerxesConfig
 
-__all__ = "XerxesForCausalLM", "XerxesModel", "XerxesConfig"
+__all__ = "XerxesConfig", "XerxesForCausalLM", "XerxesModel"

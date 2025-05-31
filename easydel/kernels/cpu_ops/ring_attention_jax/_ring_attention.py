@@ -34,7 +34,6 @@ settings.
 - also adding softmax scale option to support custom scales
 """
 
-import typing as tp
 from functools import partial
 
 import chex
@@ -48,140 +47,140 @@ from ._forward_jax import _ring_attention_fwd
 
 
 @partial(
-	jax.custom_vjp,
-	nondiff_argnums=[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    jax.custom_vjp,
+    nondiff_argnums=[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
 )
 def ring_attention(
-	query: chex.Array,
-	key: chex.Array,
-	value: chex.Array,
-	bias: tp.Optional[chex.Array] = None,
-	segment_ids: tp.Optional[chex.Array] = None,
-	axis_name: tp.Optional[str] = None,
-	float32_logits: bool = True,
-	softmax_scale: tp.Optional[float] = None,
-	blocksize_q: int = 512,
-	blocksize_k: int = 512,
-	blocksize_c: tp.Optional[int] = None,
-	deterministic: bool = True,
-	dropout_rng: tp.Optional[chex.PRNGKey] = None,
-	pdrop: float = 0.0,
-	dtype: jnp.dtype = jnp.float32,
-	policy=jax.checkpoint_policies.nothing_saveable,
-	precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-	prevent_cse: bool = True,
+    query: chex.Array,
+    key: chex.Array,
+    value: chex.Array,
+    bias: chex.Array | None = None,
+    segment_ids: chex.Array | None = None,
+    axis_name: str | None = None,
+    float32_logits: bool = True,
+    softmax_scale: float | None = None,
+    blocksize_q: int = 512,
+    blocksize_k: int = 512,
+    blocksize_c: int | None = None,
+    deterministic: bool = True,
+    dropout_rng: chex.PRNGKey = None,
+    pdrop: float = 0.0,
+    dtype: jnp.dtype = jnp.float32,
+    policy=jax.checkpoint_policies.nothing_saveable,
+    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
+    prevent_cse: bool = True,
 ):
-	"""
-	Computes ring attention with blockwise transformers.
+    """
+    Computes ring attention with blockwise transformers.
 
-	Args:
-		query: Query array of shape (batch, q_len, num_heads, dim_per_head).
-		key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-		value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
-		axis_name: Name of the axis to ppermute over.
-		float32_logits: Whether to compute logits in float32.
-		softmax_scale: scale for softmax or depth ** -0.5.
-		blocksize_q: Size of query chunks.
-		blocksize_k: Size of key chunks.
-		blocksize_c: Size of causal blocks.
-		deterministic: Whether to apply dropout.
-		dropout_rng: PRNG key for dropout.
-		pdrop: Dropout probability.
-		dtype: dtype of the computation.
-		policy: Checkpoint policy.
-		precision: Precision of the computation.
-		prevent_cse: Whether to prevent common subexpression elimination.
+    Args:
+            query: Query array of shape (batch, q_len, num_heads, dim_per_head).
+            key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
+            value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
+            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+            segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
+            axis_name: Name of the axis to ppermute over.
+            float32_logits: Whether to compute logits in float32.
+            softmax_scale: scale for softmax or depth ** -0.5.
+            blocksize_q: Size of query chunks.
+            blocksize_k: Size of key chunks.
+            blocksize_c: Size of causal blocks.
+            deterministic: Whether to apply dropout.
+            dropout_rng: PRNG key for dropout.
+            pdrop: Dropout probability.
+            dtype: dtype of the computation.
+            policy: Checkpoint policy.
+            precision: Precision of the computation.
+            prevent_cse: Whether to prevent common subexpression elimination.
 
-	Returns:
-		Output array of shape (batch, q_len, num_heads, dim_per_head).
-	"""
-	y, _ = _ring_attention_fwd(
-		query,
-		key,
-		value,
-		bias,
-		segment_ids,
-		axis_name,
-		float32_logits,
-		softmax_scale,
-		blocksize_q,
-		blocksize_k,
-		blocksize_c,
-		deterministic,
-		dropout_rng,
-		pdrop,
-		dtype,
-		policy,
-		precision,
-		prevent_cse,
-	)
-	return y
+    Returns:
+            Output array of shape (batch, q_len, num_heads, dim_per_head).
+    """
+    y, _ = _ring_attention_fwd(
+        query,
+        key,
+        value,
+        bias,
+        segment_ids,
+        axis_name,
+        float32_logits,
+        softmax_scale,
+        blocksize_q,
+        blocksize_k,
+        blocksize_c,
+        deterministic,
+        dropout_rng,
+        pdrop,
+        dtype,
+        policy,
+        precision,
+        prevent_cse,
+    )
+    return y
 
 
 ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
 ring_attention = jax.jit(
-	ring_attention,
-	static_argnums=(
-		5,
-		6,
-		7,
-		8,
-		9,
-		10,
-		11,
-		12,
-		13,
-		14,
-		15,
-		16,
-		17,
-	),
+    ring_attention,
+    static_argnums=(
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+    ),
 )
 
 
 if __name__ == "__main__":
-	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
-	blocksize_k = 256
-	blocksize_q = 256
-	query = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
-	key = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
-	value = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, H, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if False
-		else None
-	)
-	print("QKV Allocated")
-	try:
-		co = ring_attention(
-			query,
-			key,
-			value,
-			b,
-			None,
-			None,
-			blocksize_q=blocksize_q,
-			blocksize_k=blocksize_k,
-			float32_logits=False,
-		)
-		print(co[-1, -1, -1, :5])
-	except Exception as er:
-		print("Ring OOM", er)
-		co = None
-	try:
-		import flax
+    q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+    B, H, QS, KS, D = 1, 32, 2048, 2048, 128
+    blocksize_k = 256
+    blocksize_q = 256
+    query = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
+    key = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
+    value = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
+    b = (
+        jnp.where(
+            jrnd.randint(v_key, (B, H, QS, KS), 0, 4) > 2,
+            jnp.finfo(jnp.float16).min,
+            0,
+        )
+        if False
+        else None
+    )
+    print("QKV Allocated")
+    try:
+        co = ring_attention(
+            query,
+            key,
+            value,
+            b,
+            None,
+            None,
+            blocksize_q=blocksize_q,
+            blocksize_k=blocksize_k,
+            float32_logits=False,
+        )
+        print(co[-1, -1, -1, :5])
+    except Exception as er:
+        print("Ring OOM", er)
+        co = None
+    try:
+        import flax
 
-		fo = flax.nnx.dot_product_attention(query, key, value, b)
-		print(fo[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flax OOM", er)
-		fo = None
-	if fo is not None and co is not None:
-		print(jnp.allclose(co, fo, 0, 0.125))
+        fo = flax.nnx.dot_product_attention(query, key, value, b)
+        print(fo[-1, -1, -1, :5])
+    except Exception as er:
+        print("Flax OOM", er)
+        fo = None
+    if fo is not None and co is not None:
+        print(jnp.allclose(co, fo, 0, 0.125))

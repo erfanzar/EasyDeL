@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from .modeling_qwen2_vl_flax import (
-	Qwen2VLForConditionalGeneration,
-	Qwen2VLModel,
+    Qwen2VLForConditionalGeneration,
+    Qwen2VLModel,
 )
 from .qwen2_vl_configuration import Qwen2VLConfig
 
-__all__ = ("Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLConfig")
+__all__ = ("Qwen2VLConfig", "Qwen2VLForConditionalGeneration", "Qwen2VLModel")

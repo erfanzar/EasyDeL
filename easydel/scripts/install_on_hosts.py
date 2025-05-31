@@ -36,109 +36,92 @@ import argparse
 import sys
 
 import ray
-from eformer.executor.ray import execute, TpuAcceleratorConfig
+from eformer.executor.ray import TpuAcceleratorConfig, execute
 
 
 @ray.remote
 def install_easydel_on_pods_pypi():
-	"""Installs EasyDel[tf] from PyPI and other dependencies on Ray nodes."""
-	import os  # Import within the function
+    """Installs EasyDel[tf] from PyPI and other dependencies on Ray nodes."""
+    import os  # Import within the function
 
-	node_id = ray.get_runtime_context().get_node_id()
-	print(f"Node {node_id}: Installing EasyDel from PyPI...")
-	os.system("pip install --upgrade pip -q")
-	os.system("pip install easydel[tf] -qU")
-	os.system("pip install jax[tpu] -qU")
-	os.system(
-		"pip3 install torch torchvision torchaudio --index-url "
-		"https://download.pytorch.org/whl/cpu -qU"
-	)
-	print(f"Node {node_id}: Installation from PyPI complete.")
-	return True 
+    node_id = ray.get_runtime_context().get_node_id()
+    print(f"Node {node_id}: Installing EasyDel from PyPI...")
+    os.system("pip install --upgrade pip -q")
+    os.system("pip install easydel[tf] -qU")
+    os.system("pip install jax[tpu] -qU")
+    os.system("pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -qU")
+    print(f"Node {node_id}: Installation from PyPI complete.")
+    return True
 
 
 @ray.remote
 def install_easydel_on_pods_github():
-	"""Installs EasyDel[tf] from GitHub head and other dependencies on Ray nodes."""
-	import os 
+    """Installs EasyDel[tf] from GitHub head and other dependencies on Ray nodes."""
+    import os
 
-	node_id = ray.get_runtime_context().get_node_id()
-	print(f"Node {node_id}: Installing EasyDel from GitHub head...")
-	os.system("pip install --upgrade pip -q")
-	os.system("pip uninstall easydel -y -q")
-	os.system(
-		"pip install 'easydel[tf] @ git+https://github.com/erfanzar/easydel.git' -qU"
-	)
-	os.system("pip install jax[tpu] -qU")
-	os.system(
-		"pip3 install torch torchvision torchaudio --index-url "
-		"https://download.pytorch.org/whl/cpu -qU"
-	)
-	print(f"Node {node_id}: Installation from GitHub head complete.")
-	return True
+    node_id = ray.get_runtime_context().get_node_id()
+    print(f"Node {node_id}: Installing EasyDel from GitHub head...")
+    os.system("pip install --upgrade pip -q")
+    os.system("pip uninstall easydel -y -q")
+    os.system("pip install 'easydel[tf] @ git+https://github.com/erfanzar/easydel.git' -qU")
+    os.system("pip install jax[tpu] -qU")
+    os.system("pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -qU")
+    print(f"Node {node_id}: Installation from GitHub head complete.")
+    return True
 
 
 def main():
-	parser = argparse.ArgumentParser(
-		description="Install EasyDel and dependencies on Ray TPU pods. Requires Ray and eformer.escale.tpexec.",
-		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-	)
+    parser = argparse.ArgumentParser(
+        description="Install EasyDel and dependencies on Ray TPU pods. Requires Ray and eformer.escale.tpexec.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
-	parser.add_argument(
-		"--source",
-		choices=["pypi", "github"],
-		default="pypi",
-		help="Choose the source for EasyDel installation: PyPI package or GitHub head.",
-	)
+    parser.add_argument(
+        "--source",
+        choices=["pypi", "github"],
+        default="pypi",
+        help="Choose the source for EasyDel installation: PyPI package or GitHub head.",
+    )
 
-	parser.add_argument(
-		"--tpu-type", type=str, default="v4-16", help="The type of TPU pod slice to use."
-	)
+    parser.add_argument("--tpu-type", type=str, default="v4-16", help="The type of TPU pod slice to use.")
 
-	args = parser.parse_args()
+    args = parser.parse_args()
 
-	if args.source == "github":
-		install_func = install_easydel_on_pods_github
-		print("Selected installation source: GitHub head ")
-	else:
-		install_func = install_easydel_on_pods_pypi
-		print("Selected installation source: PyPI")
+    if args.source == "github":
+        install_func = install_easydel_on_pods_github
+        print("Selected installation source: GitHub head ")
+    else:
+        install_func = install_easydel_on_pods_pypi
+        print("Selected installation source: PyPI")
 
-	tpu_type = args.tpu_type
-	print(f"Selected TPU type: {tpu_type}")
+    tpu_type = args.tpu_type
+    print(f"Selected TPU type: {tpu_type}")
 
-	print(f"Determined number of hosts for {tpu_type}")
-	config = TpuAcceleratorConfig(tpu_version=tpu_type)
-	try:
-		print("Initializing Ray...")
-		ray.init("auto")
-		print(f"Ray initialized successfully. Cluster resources: {ray.cluster_resources()}")
+    print(f"Determined number of hosts for {tpu_type}")
+    config = TpuAcceleratorConfig(tpu_version=tpu_type)
+    try:
+        print("Initializing Ray...")
+        ray.init("auto")
+        print(f"Ray initialized successfully. Cluster resources: {ray.cluster_resources()}")
 
-		results = ray.get(execute(config)(install_func)())
-		print(
-			"\nExecution command sent. Waiting for remote tasks "
-			"(TPUExecutor might block or manage this)..."
-		)
-		if results:
-			print(
-				f"Received results from execution (structure depends on TPUExecutor): {results}"
-			)
+        results = ray.get(execute(config)(install_func)())
+        print("\nExecution command sent. Waiting for remote tasks (TPUExecutor might block or manage this)...")
+        if results:
+            print(f"Received results from execution (structure depends on TPUExecutor): {results}")
 
-		print(
-			"\nInstallation process initiated (or completed, depending on executor) on pods."
-		)
+        print("\nInstallation process initiated (or completed, depending on executor) on pods.")
 
-	except Exception as e:
-		print(f"\nAn error occurred during Ray initialization or execution: {e}")
-		import traceback
+    except Exception as e:
+        print(f"\nAn error occurred during Ray initialization or execution: {e}")
+        import traceback
 
-		traceback.print_exc()
-		if ray.is_initialized():
-			print("Attempting to shutdown Ray...")
-			ray.shutdown()
-			print("Ray shutdown.")
-		sys.exit(1)
+        traceback.print_exc()
+        if ray.is_initialized():
+            print("Attempting to shutdown Ray...")
+            ray.shutdown()
+            print("Ray shutdown.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-	main()
+    main()

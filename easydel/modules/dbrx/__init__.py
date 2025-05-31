@@ -14,16 +14,16 @@
 
 from .dbrx_configuration import DbrxAttentionConfig, DbrxConfig, DbrxFFNConfig
 from .modeling_dbrx_flax import (
-	DbrxForCausalLM,
-	DbrxModel,
-	DbrxForSequenceClassification,
+    DbrxForCausalLM,
+    DbrxForSequenceClassification,
+    DbrxModel,
 )
 
 __all__ = (
-	"DbrxForCausalLM",
-	"DbrxModel",
-	"DbrxAttentionConfig",
-	"DbrxForSequenceClassification",
-	"DbrxConfig",
-	"DbrxFFNConfig",
+    "DbrxAttentionConfig",
+    "DbrxConfig",
+    "DbrxFFNConfig",
+    "DbrxForCausalLM",
+    "DbrxForSequenceClassification",
+    "DbrxModel",
 )

@@ -15,4 +15,4 @@
 from .modeling_phimoe_flax import PhiMoeForCausalLM, PhiMoeModel
 from .phimoe_configuration import PhiMoeConfig
 
-__all__ = "PhiMoeForCausalLM", "PhiMoeModel", "PhiMoeConfig"
+__all__ = "PhiMoeConfig", "PhiMoeForCausalLM", "PhiMoeModel"

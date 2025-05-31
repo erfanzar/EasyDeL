@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .api_server import vSurgeApiServer
-from .engines import oDriver, oEngine, vDriver, vEngine
+from .core import vDriver, vEngine
+from .server import vSurgeApiServer
 from .vsurge import vSurge, vSurgeRequest
 
-__all__ = (
-	"oDriver",
-	"oEngine",
-	"vDriver",
-	"vEngine",
-	"vSurge",
-	"vSurgeApiServer",
-	"vSurgeRequest",
-)
+__all__ = ("vDriver", "vEngine", "vSurge", "vSurgeApiServer", "vSurgeRequest")

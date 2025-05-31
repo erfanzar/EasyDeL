@@ -14,14 +14,14 @@
 
 from .mistral_configuration import MistralConfig
 from .modeling_mistral_flax import (
-	MistralForCausalLM,
-	MistralModel,
-	MistralForSequenceClassification,
+    MistralForCausalLM,
+    MistralForSequenceClassification,
+    MistralModel,
 )
 
 __all__ = (
-	"MistralForCausalLM",
-	"MistralModel",
-	"MistralConfig",
-	"MistralForSequenceClassification",
+    "MistralConfig",
+    "MistralForCausalLM",
+    "MistralForSequenceClassification",
+    "MistralModel",
 )

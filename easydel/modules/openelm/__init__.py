@@ -15,4 +15,4 @@
 from .modeling_openelm_flax import OpenELMForCausalLM, OpenELMModel
 from .openelm_configuration import OpenELMConfig
 
-__all__ = "OpenELMForCausalLM", "OpenELMModel", "OpenELMConfig"
+__all__ = "OpenELMConfig", "OpenELMForCausalLM", "OpenELMModel"

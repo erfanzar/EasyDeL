@@ -13,15 +13,15 @@
 # limitations under the License.
 
 from .modeling_whisper_flax import (
-	WhisperForAudioClassification,
-	WhisperForConditionalGeneration,
-	WhisperTimeStampLogitsProcessor,
+    WhisperForAudioClassification,
+    WhisperForConditionalGeneration,
+    WhisperTimeStampLogitsProcessor,
 )
 from .whisper_configuration import WhisperConfig
 
 __all__ = (
-	"WhisperForAudioClassification",
-	"WhisperForConditionalGeneration",
-	"WhisperTimeStampLogitsProcessor",
-	"WhisperConfig",
+    "WhisperConfig",
+    "WhisperForAudioClassification",
+    "WhisperForConditionalGeneration",
+    "WhisperTimeStampLogitsProcessor",
 )

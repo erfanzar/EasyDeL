@@ -15,4 +15,4 @@
 from .gpt_j_configuration import GPTJConfig
 from .modeling_gpt_j_flax import GPTJForCausalLM, GPTJModel
 
-__all__ = "GPTJForCausalLM", "GPTJModel", "GPTJConfig"
+__all__ = "GPTJConfig", "GPTJForCausalLM", "GPTJModel"

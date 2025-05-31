@@ -14,4 +14,4 @@
 from .modeling_pixtral_flax import PixtralVisionModel
 from .pixtral_configuration import PixtralVisionConfig
 
-__all__ = "PixtralVisionModel", "PixtralVisionConfig"
+__all__ = "PixtralVisionConfig", "PixtralVisionModel"

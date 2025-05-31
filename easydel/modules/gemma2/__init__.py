@@ -14,14 +14,14 @@
 
 from .gemma2_configuration import Gemma2Config
 from .modeling_gemma2_flax import (
-	Gemma2ForCausalLM,
-	Gemma2Model,
-	Gemma2ForSequenceClassification,
+    Gemma2ForCausalLM,
+    Gemma2ForSequenceClassification,
+    Gemma2Model,
 )
 
 __all__ = (
-	"Gemma2ForCausalLM",
-	"Gemma2Model",
-	"Gemma2Config",
-	"Gemma2ForSequenceClassification",
+    "Gemma2Config",
+    "Gemma2ForCausalLM",
+    "Gemma2ForSequenceClassification",
+    "Gemma2Model",
 )

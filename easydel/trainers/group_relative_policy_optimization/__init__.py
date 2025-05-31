@@ -14,4 +14,4 @@
 from .grpo_config import GRPOConfig
 from .grpo_trainer import GRPOTrainer
 
-__all__ = "GRPOTrainer", "GRPOConfig"
+__all__ = "GRPOConfig", "GRPOTrainer"

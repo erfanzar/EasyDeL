@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
-import typing as tp
 
 import chex
 import jax
@@ -24,125 +23,125 @@ DEV_MODE = True
 
 
 def _jax_fwd_attention_call(
-	q: tp.Optional[chex.Array],
-	k: tp.Optional[chex.Array],
-	v: tp.Optional[chex.Array],
-	attention_mask: tp.Optional[chex.Array] = None,
-	bias: tp.Optional[chex.Array] = None,
-	softmax_scale: tp.Optional[float] = None,
-	dropout_prob: float = 0.0,
-	causal: bool = False,
-	dropout_seed: tp.Optional[int] = None,
-	varlen_mode: bool = True,
+    q: chex.Array | None,
+    k: chex.Array | None,
+    v: chex.Array | None,
+    attention_mask: chex.Array | None = None,
+    bias: chex.Array | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    varlen_mode: bool = True,
 ):
-	out, lse = _fwd_attention_kernel_call(
-		q=q,
-		k=k,
-		v=v,
-		attention_mask=attention_mask,
-		bias=bias,
-		softmax_scale=softmax_scale,
-		dropout_prob=dropout_prob,
-		causal=causal,
-		dropout_seed=dropout_seed,
-		varlen_mode=varlen_mode,
-	)
-	residual = (
-		q,
-		k,
-		v,
-		bias,
-		attention_mask,
-		out,
-		lse,
-		dropout_seed,
-	)
-	return out, residual
+    out, lse = _fwd_attention_kernel_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        varlen_mode=varlen_mode,
+    )
+    residual = (
+        q,
+        k,
+        v,
+        bias,
+        attention_mask,
+        out,
+        lse,
+        dropout_seed,
+    )
+    return out, residual
 
 
 def _jax_bwd_attention_call(
-	softmax_scale: tp.Optional[float],
-	dropout_prob: float,
-	causal: bool,
-	varlen_mode: bool,
-	residual: tp.Tuple[chex.Array],
-	dO: chex.Array,
+    softmax_scale: float | None,
+    dropout_prob: float,
+    causal: bool,
+    varlen_mode: bool,
+    residual: tuple[chex.Array],
+    dO: chex.Array,
 ):
-	q, k, v, bias, attention_mask, out, lse, dropout_seed = residual
-	dq, dk, dv = _bwd_attention_kernel_call(
-		dO=dO,
-		q=q,
-		k=k,
-		v=v,
-		bias=bias,
-		attention_mask=attention_mask,
-		o=out,
-		M=lse,
-		dropout_prob=dropout_prob,
-		causal=causal,
-		dropout_seed=dropout_seed,
-		softmax_scale=softmax_scale,
-		varlen_mode=varlen_mode,
-	)
-	return dq, dk, dv, None, None, None
+    q, k, v, bias, attention_mask, out, lse, dropout_seed = residual
+    dq, dk, dv = _bwd_attention_kernel_call(
+        dO=dO,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        attention_mask=attention_mask,
+        o=out,
+        M=lse,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        softmax_scale=softmax_scale,
+        varlen_mode=varlen_mode,
+    )
+    return dq, dk, dv, None, None, None
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 9))
 @functools.partial(jax.jit, static_argnums=(5, 6, 7, 9))
 def flash_attention_call(
-	q: tp.Optional[chex.Array],
-	k: tp.Optional[chex.Array],
-	v: tp.Optional[chex.Array],
-	attention_mask: tp.Optional[chex.Array] = None,
-	bias: tp.Optional[chex.Array] = None,
-	softmax_scale: tp.Optional[float] = None,
-	dropout_prob: float = 0.0,
-	causal: bool = False,
-	dropout_seed: tp.Optional[int] = None,
-	varlen_mode: bool = True,
+    q: chex.Array | None,
+    k: chex.Array | None,
+    v: chex.Array | None,
+    attention_mask: chex.Array | None = None,
+    bias: chex.Array | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    varlen_mode: bool = True,
 ) -> chex.Array:
-	return _fwd_attention_kernel_call(
-		q=q,
-		k=k,
-		v=v,
-		attention_mask=attention_mask,
-		bias=bias,
-		softmax_scale=softmax_scale,
-		dropout_prob=dropout_prob,
-		causal=causal,
-		dropout_seed=dropout_seed,
-		varlen_mode=varlen_mode,
-	)[0]
+    return _fwd_attention_kernel_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        varlen_mode=varlen_mode,
+    )[0]
 
 
 flash_attention_call.defvjp(
-	_jax_fwd_attention_call,
-	_jax_bwd_attention_call,
+    _jax_fwd_attention_call,
+    _jax_bwd_attention_call,
 )
 
 
 def flash_attention(
-	q: tp.Optional[chex.Array],
-	k: tp.Optional[chex.Array],
-	v: tp.Optional[chex.Array],
-	attention_mask: tp.Optional[chex.Array] = None,
-	bias: tp.Optional[chex.Array] = None,
-	softmax_scale: tp.Optional[float] = None,
-	dropout_prob: float = 0.0,
-	causal: bool = False,
-	dropout_seed: tp.Optional[int] = None,
-	varlen_mode: bool = True,
+    q: chex.Array | None,
+    k: chex.Array | None,
+    v: chex.Array | None,
+    attention_mask: chex.Array | None = None,
+    bias: chex.Array | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    varlen_mode: bool = True,
 ) -> chex.Array:
-	del varlen_mode  # TODO: Debug varlen mode
-	return flash_attention_call(
-		q=q,
-		k=k,
-		v=v,
-		attention_mask=attention_mask,
-		bias=bias,
-		softmax_scale=softmax_scale,
-		dropout_prob=dropout_prob,
-		causal=causal,
-		dropout_seed=dropout_seed,
-		varlen_mode=False,
-	)
+    del varlen_mode  # TODO: Debug varlen mode
+    return flash_attention_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        varlen_mode=False,
+    )

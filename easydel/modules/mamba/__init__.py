@@ -15,4 +15,4 @@
 from .mamba_configuration import MambaConfig
 from .modeling_mamba_flax import MambaForCausalLM, MambaModel
 
-__all__ = ("MambaForCausalLM", "MambaModel", "MambaConfig")
+__all__ = ("MambaConfig", "MambaForCausalLM", "MambaModel")

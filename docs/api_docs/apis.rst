@@ -1,9 +1,9 @@
 EasyDeL APIs 🔮
 ====
-    
+
 .. toctree::
    :maxdepth: 2
-   
+
    inference
    infra
    kernels

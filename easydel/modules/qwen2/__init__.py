@@ -13,15 +13,15 @@
 # limitations under the License.
 
 from .modeling_qwen_flax import (
-	Qwen2ForCausalLM,
-	Qwen2ForSequenceClassification,
-	Qwen2Model,
+    Qwen2ForCausalLM,
+    Qwen2ForSequenceClassification,
+    Qwen2Model,
 )
 from .qwen_configuration import Qwen2Config
 
 __all__ = (
-	"Qwen2ForCausalLM",
-	"Qwen2ForSequenceClassification",
-	"Qwen2Model",
-	"Qwen2Config",
+    "Qwen2Config",
+    "Qwen2ForCausalLM",
+    "Qwen2ForSequenceClassification",
+    "Qwen2Model",
 )

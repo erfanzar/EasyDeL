@@ -14,4 +14,4 @@
 from .llava_configuration import LlavaConfig
 from .modeling_llava_flax import LlavaForConditionalGeneration
 
-__all__ = "LlavaForConditionalGeneration", "LlavaConfig"
+__all__ = "LlavaConfig", "LlavaForConditionalGeneration"
