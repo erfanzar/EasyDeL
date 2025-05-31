@@ -78,7 +78,7 @@ class BaseAutoEasyModel:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,
+        device: jax.Device | None = None,  # type: ignore
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
@@ -205,7 +205,7 @@ class BaseAutoEasyModel:
     def _from_easydel_params(
         cls,
         pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,
+        device: jax.Device | None = None,  # type: ignore
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
@@ -301,7 +301,7 @@ class BaseAutoEasyModel:
     def _from_torch_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,
+        device: jax.Device | None = None,  # type: ignore
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
@@ -517,7 +517,7 @@ class BaseAutoEasyState:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,
+        device: jax.Device | None = None,  # type: ignore
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,

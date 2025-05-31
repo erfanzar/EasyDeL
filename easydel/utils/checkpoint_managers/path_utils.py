@@ -550,18 +550,24 @@ class PathManager:
         gcs_client: storage.Client | None = None,
         gcs_credentials_path: str | None = None,
     ):
-        try:
-            if gcs_client is None:
-                if gcs_credentials_path:
-                    from google.oauth2 import service_account
+        self._gcs_client = gcs_client
+        self._gcs_credentials_path = gcs_credentials_path
 
-                    credentials = service_account.Credentials.from_service_account_file(gcs_credentials_path)
-                    gcs_client = storage.Client(credentials=credentials)
-                else:
-                    gcs_client = storage.Client()
-        except Exception:
-            gcs_client = None
-        self.gcs_client = gcs_client
+    @property
+    def gcs_client(self):
+        if self._gcs_client is None:
+            try:
+                if self._gcs_client is None:
+                    if self._gcs_credentials_path:
+                        from google.oauth2 import service_account
+
+                        credentials = service_account.Credentials.from_service_account_file(self._gcs_credentials_path)
+                        self._gcs_client = storage.Client(credentials=credentials)
+                    else:
+                        self._gcs_client = storage.Client()
+            except Exception:
+                ...
+        return self._gcs_client
 
     def __call__(self, path: str | Path) -> UniversalPath:
         """Create appropriate path object based on path string"""
