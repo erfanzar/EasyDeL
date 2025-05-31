@@ -301,13 +301,9 @@ class Gemma3Attention(AttentionModule):
         if self.is_sliding:
             cache_pos = self.build_cache_pos(attention_mask, cache_view)
             if isinstance(cache_view, TransformerCacheView):
-                curr_index = cache_view.index
+                curr_index = cache_view.indexs
             else:
-                curr_index = jnp.repeat(
-                    jnp.array([0], "i4").reshape(-1),
-                    query_states.shape[0],
-                    0,
-                )
+                curr_index = jnp.repeat(jnp.array([0], "i4").reshape(-1), query_states.shape[0], 0)
             sliding_mask = self._create_sliding_mask(
                 cache_pos=cache_pos,
                 curr_index=curr_index,

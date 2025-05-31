@@ -23,12 +23,7 @@ from eformer.jaximus import implicit
 from jax import numpy as jnp
 
 from ..utilities import SamplingParams
-from .utilities import (
-    SampleState,
-    create_sampling_step,
-    vInferenceConfig,
-    vInferencePreCompileConfig,
-)
+from .utilities import SampleState, create_sampling_step, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -106,12 +101,7 @@ def prefill_fn(
             pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
         )
         runner = implicit(runner)
-        state = runner(
-            graphdef=graphdef,
-            graphstate=graphstate,
-            graphother=graphother,
-            state=state,
-        )
+        state = runner(graphdef=graphdef, graphstate=graphstate, graphother=graphother, state=state)
     return state
 
 
@@ -168,7 +158,7 @@ COMPILED_FUNCS = {}
 
 def get_compiled_funcs(
     standalone_config: vInferencePreCompileConfig,
-    id: str,
+    id: str,  # noqa
     safe: bool = True,
     false_instance: tp.Any = None,
 ):
@@ -191,11 +181,7 @@ def get_compiled_funcs(
     return outs
 
 
-def put_compiled_funcs(
-    funcs: tp.Any,
-    standalone_config: vInferencePreCompileConfig,
-    id: str,
-):
+def put_compiled_funcs(funcs: tp.Any, standalone_config: vInferencePreCompileConfig, id: str):  # noqa
     """
     Stores compiled generation functions in a cache.
 

@@ -160,9 +160,9 @@ class SplashAttn(AttentionImpl):
             q_mask, kv_mask = self._split_attention_mask(mask)
             q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
 
-        index, starts = [None] * 2
+        indexs, starts = [None] * 2
         if cache_view is not None:
-            index, starts = cache_view.index, cache_view.starts
+            indexs, starts = cache_view.indexs, cache_view.starts
 
         @functools.partial(
             shard_map,
@@ -173,7 +173,7 @@ class SplashAttn(AttentionImpl):
                 self.create_stable_sharding(v_sharding, dep=v, tensor=v, preserved_indices=[0, 2]),
                 self.create_stable_sharding(qkv_mask_sharding, dep=q_mask, tensor=q_mask),
                 self.create_stable_sharding(qkv_mask_sharding, dep=kv_mask, tensor=kv_mask),
-                self.create_stable_sharding(views_sharding, dep=index, tensor=index),
+                self.create_stable_sharding(views_sharding, dep=indexs, tensor=indexs),
                 self.create_stable_sharding(views_sharding, dep=starts, tensor=starts),
             ),
             out_specs=self.create_stable_sharding(a_sharding, tensor=q, preserved_indices=[0, 2]),
@@ -211,7 +211,7 @@ class SplashAttn(AttentionImpl):
             v.transpose(0, 2, 1, 3).astype(dtype),
             q_mask,
             kv_mask,
-            index,
+            indexs,
             starts,
         ).transpose(0, 2, 1, 3)
 

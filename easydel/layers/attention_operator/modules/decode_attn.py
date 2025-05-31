@@ -89,7 +89,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
             v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
             cache_view (TransformerCacheView): Contains metadata about the cache, specifically
-                `starts` (start index for valid keys/values) and `index` (current index or length).
+                `starts` (start indexs for valid keys/values) and `indexs` (current indexs or length).
             **ignores: Ignored keyword arguments.
 
         Returns:
@@ -122,7 +122,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             weight = jax.nn.softmax(weight, axis=-1)
             return jnp.einsum("bkhm,bmkd->bkhd", weight, v).reshape(qb, qhead, qdim)
 
-        attn_output = _compute(q, k, v, cache_view.starts.reshape(-1, 1), cache_view.index.reshape(-1, 1))
+        attn_output = _compute(q, k, v, cache_view.starts.reshape(-1, 1), cache_view.indexs.reshape(-1, 1))
         attn_output = jnp.expand_dims(attn_output, 1)
         return AttentionOutput(
             attention_weights=None,
@@ -149,7 +149,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         views_sharding = Ps(q_sharding[0])
 
         starts = cache_view.starts.reshape(-1, 1)
-        indexs = cache_view.index.reshape(-1, 1)
+        indexs = cache_view.indexs.reshape(-1, 1)
 
         @partial(
             shard_map,
@@ -214,7 +214,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         views_sharding = Ps(q_sharding[0])
 
         starts = cache_view.starts.reshape(-1, 1)
-        indexs = cache_view.index.reshape(-1, 1)
+        indexs = cache_view.indexs.reshape(-1, 1)
 
         @partial(
             shard_map,

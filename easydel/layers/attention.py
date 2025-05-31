@@ -406,12 +406,17 @@ class AttentionModule(nn.Module):
                 - The attention mask combined with the sliding window mask.
                 - A function (`init_attention_bias`) to create the corresponding attention bias.
         """
+        cache_pos = self.build_cache_pos(attention_mask, cache_view)
+        if isinstance(cache_view, TransformerCacheView):
+            curr_index = cache_view.indexs
+        else:
+            curr_index = jnp.repeat(jnp.array([0], "i4").reshape(-1), attention_mask.shape[0], 0)
         attention_mask = jnp.logical_and(
             self._create_sliding_mask(
-                cache_pos=self.build_cache_pos(attention_mask, cache_view),
-                curr_index=cache_view.index[0] if cache_view is not None else 0,
+                cache_pos=cache_pos,
+                curr_index=curr_index,
                 cache_length=attention_mask.shape[-1],
-                sliding_window=sliding_window,
+                sliding_window=self.sliding_window,
             ),
             attention_mask,
         )
@@ -442,7 +447,7 @@ class AttentionModule(nn.Module):
                        adjusted by the cache index if provided. Shape usually [batch, q_len].
         """
         if isinstance(cache_view, TransformerCacheView):
-            end_index = jnp.reshape(cache_view.index, (-1, 1))
+            end_index = jnp.reshape(cache_view.indexs, (-1, 1))
         else:
             end_index = 0
         inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)

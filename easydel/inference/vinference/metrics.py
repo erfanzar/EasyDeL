@@ -149,20 +149,7 @@ class vInferenceMetrics:
             f"{model_name}_model_generation_length",
             "Distribution of generation lengths",
             ["model_name"],
-            buckets=(
-                16,
-                32,
-                64,
-                128,
-                256,
-                512,
-                1024,
-                2048,
-                4096,
-                8192,
-                16384,
-                32768,
-            ),
+            buckets=(16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
         )
 
         # Compilation metrics
@@ -265,9 +252,10 @@ class vInferenceMetrics:
                 start_time = time.time()
                 result = func(*args, **kwargs)
                 compilation_time = time.time() - start_time
-                self.compilation_time.labels(model_name=self.model_name, function_name=function_name).observe(
-                    compilation_time
-                )
+                self.compilation_time.labels(
+                    model_name=self.model_name,
+                    function_name=function_name,
+                ).observe(compilation_time)
                 return result
 
             return wrapper

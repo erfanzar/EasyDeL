@@ -93,17 +93,11 @@ def continuous_insert(
 ) -> GenerationState:
     def update_idx1d(x, y):
         sharding = getattr(x, "sharding", PartitionSpec())
-        return with_sharding_constraint(
-            jax.lax.dynamic_update_slice(x, y, (slot,)),
-            sharding,
-        )
+        return with_sharding_constraint(jax.lax.dynamic_update_slice(x, y, (slot,)), sharding)
 
     def update_idx2d(x, y):
         sharding = getattr(x, "sharding", PartitionSpec())
-        return with_sharding_constraint(
-            jax.lax.dynamic_update_slice(x, y, (slot, 0)),
-            sharding,
-        )
+        return with_sharding_constraint(jax.lax.dynamic_update_slice(x, y, (slot, 0)), sharding)
 
     @implicit
     def _cache(cache: TransformerCache, other: TransformerCache):
@@ -122,21 +116,15 @@ def continuous_insert(
         valids=update_idx2d(decode_state.valids, prefix.valids),
         top_p=update_idx1d(decode_state.top_p, prefix.top_p),
         temperature=update_idx1d(decode_state.temperature, prefix.temperature),
-        next_position_ids=update_idx2d(
-            decode_state.next_position_ids,
-            prefix.next_position_ids,
-        ),
-        generated_tokens=update_idx2d(
-            decode_state.generated_tokens,
-            prefix.generated_tokens,
-        ),
+        next_position_ids=update_idx2d(decode_state.next_position_ids, prefix.next_position_ids),
+        generated_tokens=update_idx2d(decode_state.generated_tokens, prefix.generated_tokens),
     )
 
 
 def continuous_bulk_free_state_slots(slots: list[int], decode_state: GenerationState) -> GenerationState:
     for slot in slots:
         for i in range(len(decode_state.cache)):
-            decode_state.cache[i].index = decode_state.cache[i].index.at[slot].set(0)
+            decode_state.cache[i].indexs = decode_state.cache[i].indexs.at[slot].set(0)
             decode_state.cache[i].starts = decode_state.cache[i].starts.at[slot].set(0)
     return decode_state
 
