@@ -192,7 +192,7 @@ class LocalPath(UniversalPath):
             yield LocalPath(item)
 
     def __truediv__(self, other) -> "LocalPath":
-        return LocalPath(self.path / other)
+        return LocalPath(self.path / str(other))
 
     def __str__(self) -> str:
         return str(self.path)
@@ -375,6 +375,7 @@ class GCSPath(UniversalPath):
                 yield GCSPath(f"gs://{self.bucket_name}/{blob.name}", self.client)
 
     def __truediv__(self, other) -> "GCSPath":
+        other = str(other)
         if self.blob_name:
             new_path = f"{self.blob_name.rstrip('/')}/{other}"
         else:
