@@ -691,10 +691,10 @@ files = [
 absl-py = ">=0.6.1"
 attrs = ">=18.2.0"
 numpy = [
-    {version = ">=1.21.2", markers = "python_version >= \"3.10\""},
-    {version = ">=1.23.3", markers = "python_version >= \"3.11\""},
     {version = ">=2.1.0", markers = "python_version >= \"3.13\""},
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
+    {version = ">=1.23.3", markers = "python_version >= \"3.11\""},
+    {version = ">=1.21.2", markers = "python_version >= \"3.10\""},
 ]
 wrapt = ">=1.11.2"
 
@@ -727,14 +727,14 @@ files = [
 
 [[package]]
 name = "eformer"
-version = "0.0.38"
+version = "0.0.40"
 description = "(EasyDel Former) is a utility library designed to simplify and enhance the development in JAX"
 optional = false
 python-versions = "<3.14,>=3.10"
 groups = ["main"]
 files = [
-    {file = "eformer-0.0.38-py3-none-any.whl", hash = "sha256:f29f7209ac5edf3983cefd552909238fb43e93b348ed30bfd6e52a97fcf14939"},
-    {file = "eformer-0.0.38.tar.gz", hash = "sha256:650f0cf53ffb0b76254487ec14fb08790ff2d8aa3a611665c4635c916b804e1d"},
+    {file = "eformer-0.0.40-py3-none-any.whl", hash = "sha256:ca59713d58e76d023410f3081e7161e04dccc2f20765ec148998a34e7ec4d3ed"},
+    {file = "eformer-0.0.40.tar.gz", hash = "sha256:af8eb99895a8585305dd20b27f8aff782363cf581c82d930245ea3fd9b1fea2c"},
 ]
 
 [package.dependencies]
@@ -873,22 +873,22 @@ files = [
 
 [[package]]
 name = "flax"
-version = "0.10.4"
+version = "0.10.6"
 description = "Flax: A neural network library for JAX designed for flexibility"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "flax-0.10.4-py3-none-any.whl", hash = "sha256:8cc83d91654ff943909730e02e858b4cd4577531373f83abe6597c58c581032d"},
-    {file = "flax-0.10.4.tar.gz", hash = "sha256:57ae44d3f111fc85cff9049adb9684ce8ebd44e87bd8ca776ed52422c2d85021"},
+    {file = "flax-0.10.6-py3-none-any.whl", hash = "sha256:86a5f0ba0f1603c687714999b58a4e362e784a6d2dc5a510b18a8e7a6c729e18"},
+    {file = "flax-0.10.6.tar.gz", hash = "sha256:8f3d1eb7de9bbaa18e08d0423dce890aef88a8b9dc6daa23baa631e8dfb09618"},
 ]
 
 [package.dependencies]
-jax = ">=0.4.27"
+jax = ">=0.5.1"
 msgpack = "*"
 numpy = [
-    {version = ">=1.23.2", markers = "python_version >= \"3.11\""},
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
+    {version = ">=1.23.2", markers = "python_version == \"3.11\""},
 ]
 optax = "*"
 orbax-checkpoint = "*"
@@ -900,9 +900,9 @@ typing_extensions = ">=4.2"
 
 [package.extras]
 all = ["matplotlib"]
-dev = ["pre-commit (>=3.8.0)"]
+dev = ["nanobind (>=2.5.0)", "pre-commit (>=3.8.0)", "scikit-build-core[pyproject] (>=0.11.0)"]
 docs = ["Pygments (>=2.6.1)", "dm-haiku", "docutils (==0.16)", "einops", "ipykernel", "ipython_genutils", "ipywidgets (>=8.1.5)", "jupytext (==1.13.8)", "kagglehub (>=0.3.3)", "matplotlib", "ml_collections", "myst_nb", "nbstripout", "recommonmark", "scikit-learn", "sphinx (>=3.3.1)", "sphinx-book-theme", "sphinx-design"]
-testing = ["cloudpickle (>=3.0.0)", "clu", "clu (<=0.0.9) ; python_version < \"3.10\"", "einops", "gymnasium[accept-rom-license,atari]", "jaxlib", "jaxtyping", "jraph (>=0.0.6dev0)", "ml-collections", "mypy", "opencv-python", "pytest", "pytest-cov", "pytest-custom_exit_code", "pytest-xdist", "pytype", "sentencepiece", "tensorflow (>=2.12.0)", "tensorflow_datasets", "tensorflow_text (>=2.11.0) ; platform_system != \"Darwin\"", "torch", "treescope (>=0.1.1) ; python_version >= \"3.10\""]
+testing = ["ale-py (>=0.10.2)", "cloudpickle (>=3.0.0)", "clu", "clu (<=0.0.9) ; python_version < \"3.10\"", "einops", "gymnasium[accept-rom-license,atari]", "jaxlib", "jaxtyping", "jraph (>=0.0.6dev0)", "ml-collections", "mypy", "opencv-python", "pytest", "pytest-cov", "pytest-custom_exit_code", "pytest-xdist", "pytype", "sentencepiece", "tensorflow (>=2.12.0)", "tensorflow_datasets", "tensorflow_text (>=2.11.0) ; platform_system != \"Darwin\"", "torch", "treescope (>=0.1.1) ; python_version >= \"3.10\""]
 
 [[package]]
 name = "frozenlist"
@@ -1148,8 +1148,8 @@ files = [
 google-auth = ">=2.14.1,<3.0.0"
 googleapis-common-protos = ">=1.56.2,<2.0.0"
 proto-plus = [
-    {version = ">=1.22.3,<2.0.0"},
     {version = ">=1.25.0,<2.0.0", markers = "python_version >= \"3.13\""},
+    {version = ">=1.22.3,<2.0.0", markers = "python_version < \"3.13\""},
 ]
 protobuf = ">=3.19.5,<3.20.0 || >3.20.0,<3.20.1 || >3.20.1,<4.21.0 || >4.21.0,<4.21.1 || >4.21.1,<4.21.2 || >4.21.2,<4.21.3 || >4.21.3,<4.21.4 || >4.21.4,<4.21.5 || >4.21.5,<7.0.0"
 requests = ">=2.18.0,<3.0.0"
@@ -1602,8 +1602,8 @@ files = [
 jaxlib = "0.6.0"
 ml_dtypes = ">=0.5.0"
 numpy = [
-    {version = ">=1.25"},
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
+    {version = ">=1.25"},
 ]
 opt_einsum = "*"
 scipy = ">=1.11.1"
@@ -1937,10 +1937,10 @@ files = [
 
 [package.dependencies]
 numpy = [
-    {version = ">=1.21.2", markers = "python_version >= \"3.10\""},
-    {version = ">=1.23.3", markers = "python_version >= \"3.11\""},
     {version = ">=2.1.0", markers = "python_version >= \"3.13\""},
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
+    {version = ">=1.23.3", markers = "python_version >= \"3.11\""},
+    {version = ">=1.21.2", markers = "python_version >= \"3.10\""},
 ]
 
 [package.extras]
@@ -2573,9 +2573,9 @@ files = [
 
 [package.dependencies]
 numpy = [
-    {version = ">=1.22.4", markers = "python_version < \"3.11\""},
-    {version = ">=1.23.2", markers = "python_version == \"3.11\""},
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
+    {version = ">=1.23.2", markers = "python_version == \"3.11\""},
+    {version = ">=1.22.4", markers = "python_version < \"3.11\""},
 ]
 python-dateutil = ">=2.8.2"
 pytz = ">=2020.1"
@@ -3285,8 +3285,8 @@ packaging = "*"
 prometheus-client = {version = ">=0.7.1", optional = true, markers = "extra == \"default\""}
 protobuf = ">=3.15.3,<3.19.5 || >3.19.5"
 py-spy = [
-    {version = ">=0.2.0", optional = true, markers = "python_version < \"3.12\" and extra == \"default\""},
     {version = ">=0.4.0", optional = true, markers = "python_version >= \"3.12\" and extra == \"default\""},
+    {version = ">=0.2.0", optional = true, markers = "python_version < \"3.12\" and extra == \"default\""},
 ]
 pydantic = {version = "<2.0.dev0 || >=2.5.dev0,<3", optional = true, markers = "extra == \"default\""}
 pyyaml = "*"
@@ -4280,8 +4280,8 @@ absl-py = "*"
 array_record = {version = ">=0.5.0", markers = "platform_system == \"Linux\""}
 dm-tree = "*"
 etils = [
-    {version = ">=1.6.0", extras = ["edc", "enp", "epath", "epy", "etree"], markers = "python_version < \"3.11\""},
     {version = ">=1.9.1", extras = ["edc", "enp", "epath", "epy", "etree"], markers = "python_version >= \"3.11\""},
+    {version = ">=1.6.0", extras = ["edc", "enp", "epath", "epy", "etree"], markers = "python_version < \"3.11\""},
 ]
 immutabledict = "*"
 numpy = "*"
@@ -4387,8 +4387,8 @@ files = [
 absl-py = ">=0.9,<3.0.0"
 googleapis-common-protos = {version = ">=1.56.4,<2", markers = "python_version >= \"3.11\""}
 protobuf = [
-    {version = ">=4.21.6,<4.22", markers = "python_version < \"3.11\""},
     {version = ">=4.25.2,<6.0.0", markers = "python_version >= \"3.11\""},
+    {version = ">=4.21.6,<4.22", markers = "python_version < \"3.11\""},
 ]
 
 [[package]]
@@ -5394,4 +5394,4 @@ tf = ["tensorboard", "tensorflow", "tensorflow-datasets"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.14"
-content-hash = "8d9a8735328573a9d94d6dc2b8f0474509b72c8a4c6ce985fb34797baa19d9d5"
+content-hash = "520d5bd323de45c464934cb6e0d6bd5a35b70da26dfe0b63ad04ffe1b081abc6"
