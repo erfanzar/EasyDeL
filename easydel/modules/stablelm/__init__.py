@@ -15,4 +15,4 @@
 from .modeling_stablelm_flax import StableLmForCausalLM, StableLmModel
 from .stablelm_configuration import StableLmConfig
 
-__all__ = "StableLmForCausalLM", "StableLmModel", "StableLmConfig"
+__all__ = "StableLmConfig", "StableLmForCausalLM", "StableLmModel"

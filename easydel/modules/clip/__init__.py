@@ -13,25 +13,25 @@
 # limitations under the License.
 
 from .clip_configuration import (
-	CLIPConfig,
-	CLIPTextConfig,
-	CLIPVisionConfig,
+    CLIPConfig,
+    CLIPTextConfig,
+    CLIPVisionConfig,
 )
 from .modeling_clip_flax import (
-	CLIPForImageClassification,
-	CLIPModel,
-	CLIPTextModel,
-	CLIPTextModelWithProjection,
-	CLIPVisionModel,
+    CLIPForImageClassification,
+    CLIPModel,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPVisionModel,
 )
 
 __all__ = (
-	"CLIPConfig",
-	"CLIPTextConfig",
-	"CLIPVisionConfig",
-	"CLIPModel",
-	"CLIPTextModel",
-	"CLIPTextModelWithProjection",
-	"CLIPVisionModel",
-	"CLIPForImageClassification",
+    "CLIPConfig",
+    "CLIPForImageClassification",
+    "CLIPModel",
+    "CLIPTextConfig",
+    "CLIPTextModel",
+    "CLIPTextModelWithProjection",
+    "CLIPVisionConfig",
+    "CLIPVisionModel",
 )

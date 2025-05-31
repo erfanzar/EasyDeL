@@ -14,14 +14,14 @@
 
 from .cohere2_configuration import Cohere2Config
 from .modeling_cohere2_flax import (
-	Cohere2ForCausalLM,
-	Cohere2ForSequenceClassification,
-	Cohere2Model,
+    Cohere2ForCausalLM,
+    Cohere2ForSequenceClassification,
+    Cohere2Model,
 )
 
 __all__ = (
-	"Cohere2Config",
-	"Cohere2ForCausalLM",
-	"Cohere2ForSequenceClassification",
-	"Cohere2Model",
+    "Cohere2Config",
+    "Cohere2ForCausalLM",
+    "Cohere2ForSequenceClassification",
+    "Cohere2Model",
 )

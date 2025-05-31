@@ -28,7 +28,7 @@ processor.padding_side = "left"
 model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
     model_name,
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 1, -1, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         freq_max_position_embeddings=prefill_length + max_new_tokens,
         mask_max_position_embeddings=prefill_length + max_new_tokens,

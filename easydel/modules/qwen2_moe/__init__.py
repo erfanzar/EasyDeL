@@ -14,14 +14,14 @@
 
 from .configuration_qwen2_moe import Qwen2MoeConfig
 from .modeling_qwen2_moe_flax import (
-	Qwen2MoeForCausalLM,
-	Qwen2MoeForSequenceClassification,
-	Qwen2MoeModel,
+    Qwen2MoeForCausalLM,
+    Qwen2MoeForSequenceClassification,
+    Qwen2MoeModel,
 )
 
 __all__ = (
-	"Qwen2MoeForCausalLM",
-	"Qwen2MoeModel",
-	"Qwen2MoeConfig",
-	"Qwen2MoeForSequenceClassification",
+    "Qwen2MoeConfig",
+    "Qwen2MoeForCausalLM",
+    "Qwen2MoeForSequenceClassification",
+    "Qwen2MoeModel",
 )

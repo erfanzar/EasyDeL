@@ -16,4 +16,4 @@ from .bridge import EasyBridgeMixin
 from .generation import EasyGenerationMixin
 from .protocol import BaseModuleProtocol
 
-__all__ = "BaseModuleProtocol", "EasyGenerationMixin", "EasyBridgeMixin"
+__all__ = "BaseModuleProtocol", "EasyBridgeMixin", "EasyGenerationMixin"

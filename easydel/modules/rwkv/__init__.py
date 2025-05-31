@@ -15,4 +15,4 @@
 from .modeling_rwkv_flax import RwkvForCausalLM, RwkvModel
 from .rwkv_configuration import RwkvConfig
 
-__all__ = "RwkvForCausalLM", "RwkvModel", "RwkvConfig"
+__all__ = "RwkvConfig", "RwkvForCausalLM", "RwkvModel"

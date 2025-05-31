@@ -14,4 +14,4 @@
 from .aya_vision_configuration import AyaVisionConfig
 from .modeling_aya_vision_flax import AyaVisionForConditionalGeneration
 
-__all__ = "AyaVisionForConditionalGeneration", "AyaVisionConfig"
+__all__ = "AyaVisionConfig", "AyaVisionForConditionalGeneration"

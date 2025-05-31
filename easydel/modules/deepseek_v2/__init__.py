@@ -15,4 +15,4 @@
 from .deepseek_configuration import DeepseekV2Config
 from .modeling_deepseek_flax import DeepseekV2ForCausalLM, DeepseekV2Model
 
-__all__ = "DeepseekV2ForCausalLM", "DeepseekV2Model", "DeepseekV2Config"
+__all__ = "DeepseekV2Config", "DeepseekV2ForCausalLM", "DeepseekV2Model"

@@ -15,4 +15,4 @@
 from .modeling_mosaic_flax import MptForCausalLM, MptModel
 from .mosaic_configuration import MptAttentionConfig, MptConfig
 
-__all__ = ("MptForCausalLM", "MptModel", "MptAttentionConfig", "MptConfig")
+__all__ = ("MptAttentionConfig", "MptConfig", "MptForCausalLM", "MptModel")

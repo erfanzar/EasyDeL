@@ -15,4 +15,4 @@ from .linear_8bit import Linear8bit
 from .linear_nf4 import LinearNF4
 from .quantizers import EasyQuantizer
 
-__all__ = "EasyQuantizer", "LinearNF4", "Linear8bit"
+__all__ = "EasyQuantizer", "Linear8bit", "LinearNF4"

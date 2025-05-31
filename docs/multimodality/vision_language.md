@@ -45,7 +45,7 @@ processor.padding_side = "left"
 model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
     model_name,
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 1, -1, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         freq_max_position_embeddings=max_length,
         mask_max_position_embeddings=max_length,
@@ -190,7 +190,7 @@ processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
 model = ed.AutoEasyDeLModel.from_pretrained(
     "google/siglip-base-patch16-224",
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 1, -1, 1),
 )
 
 # Prepare inputs
@@ -229,7 +229,7 @@ processor.padding_side = "left"
 model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
     "CohereForAI/aya-vision-8b",
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 1, -1, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         attn_mechanism=ed.AttentionMechanisms.VANILLA,
     ),
@@ -300,7 +300,7 @@ processor.padding_side = "left"
 model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
     "google/gemma-3-4b-it",
     auto_shard_model=True,
-    sharding_axis_dims=(1, 1, -1, 1),
+    sharding_axis_dims=(1, 1, 1, -1, 1),
     config_kwargs=ed.EasyDeLBaseConfigDict(
         attn_mechanism=ed.AttentionMechanisms.VANILLA,
     ),
@@ -460,6 +460,7 @@ model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
 ```
 
 Supported quantization methods:
+
 - `NF4`: 4-bit quantization for efficient inference
 - `A8BIT`: 8-bit quantization
 - `NONE`: No quantization (default)
@@ -502,4 +503,4 @@ inference.precompile(
 3. **Precompile**: Always precompile with `inference.precompile()` for best performance
 4. **Image Size**: Use the smallest image dimensions that give good results
 5. **Batch Processing**: Process multiple images together when possible
-6. **System Memory**: VLMs use more memory than text-only models; adjust your batch size accordingly 
+6. **System Memory**: VLMs use more memory than text-only models; adjust your batch size accordingly

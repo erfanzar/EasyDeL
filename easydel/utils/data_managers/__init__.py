@@ -13,18 +13,18 @@
 # limitations under the License.
 from .manager import DataManager
 from .types import (
-	DatasetLoadError,
-	DatasetMixture,
-	DatasetType,
-	TextDatasetInform,
-	VisualDatasetInform,
+    DatasetLoadError,
+    DatasetMixture,
+    DatasetType,
+    TextDatasetInform,
+    VisualDatasetInform,
 )
 
 __all__ = (
-	"DatasetLoadError",
-	"DataManager",
-	"DatasetMixture",
-	"DatasetType",
-	"TextDatasetInform",
-	"VisualDatasetInform",
+    "DataManager",
+    "DatasetLoadError",
+    "DatasetMixture",
+    "DatasetType",
+    "TextDatasetInform",
+    "VisualDatasetInform",
 )

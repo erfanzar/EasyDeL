@@ -78,17 +78,17 @@ import jax.numpy as jnp
 
 # Complete configuration example
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
- "meta-llama/Llama-3.1-8B-instruct",
- platform=ed.EasyDeLPlatforms.TRITON,
- config_kwargs=ed.EasyDeLBaseConfigDict(
-  attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
-  attn_dtype=jnp.float16,
-  gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
- ),
- dtype=jnp.float16,
- param_dtype=jnp.float16,
- auto_shard_model=True,
- sharding_axis_dims=(1,1,-1,1) # Fully Tensor Parallel
+    "meta-llama/Llama-3.1-8B-instruct",
+    platform=ed.EasyDeLPlatforms.TRITON,
+    config_kwargs=ed.EasyDeLBaseConfigDict(
+        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+        attn_dtype=jnp.float16,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+    ),
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    auto_shard_model=True,
+    sharding_axis_dims=(1,1,-1,1) # Fully Tensor Parallel
 )
 ```
 
@@ -109,10 +109,10 @@ import jax.numpy as jnp
 
 # Initialize model
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
- "meta-llama/Llama-3.1-8B-instruct",
- dtype=jnp.float16,
- platform=ed.EasyDeLPlatforms.TRITON,
- auto_shard_model=True
+    "meta-llama/Llama-3.1-8B-instruct",
+    dtype=jnp.float16,
+    platform=ed.EasyDeLPlatforms.TRITON,
+    auto_shard_model=True
 )
 
 # Setup tokenizer
@@ -121,19 +121,19 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # Create inference engine
 sampling_params=ed.SamplingParams(
- max_tokens=1024,
- temperature=0.8,
- top_p=0.95,
- top_k=10,
+    max_tokens=1024,
+    temperature=0.8,
+    top_p=0.95,
+    top_k=10,
 )
 inference = ed.vInference(
- model=model,
- tokenizer=tokenizer,
- generation_config=ed.vInferenceConfig(
-   max_new_tokens=1024,
-   sampling_params=sampling_params,
-   streaming_chunks=32,
- )
+    model=model,
+    tokenizer=tokenizer,
+    generation_config=ed.vInferenceConfig(
+        max_new_tokens=1024,
+        sampling_params=sampling_params,
+        streaming_chunks=32,
+    )
 )
 
 # Create API server (OpenAI compatible)
@@ -152,15 +152,15 @@ from datasets import load_dataset
 
 
 ed.DPOTrainer(
- model=ed.AutoEasyDeLModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
- arguments=ed.DPOConfig(
-  max_completion_length=128,
-  max_prompt_length=128,
-  max_length=256,
-  save_steps=100,
- ),
- train_dataset=load_dataset("trl-lib/ultrafeedback_binarized", split="train"),
- processing_class=AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
+    model=ed.AutoEasyDeLModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
+    arguments=ed.DPOConfig(
+        max_completion_length=128,
+        max_prompt_length=128,
+        max_length=256,
+        save_steps=100,
+    ),
+    train_dataset=load_dataset("trl-lib/ultrafeedback_binarized", split="train"),
+    processing_class=AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
 ).train()
 
 ```
@@ -178,65 +178,65 @@ from flax import nnx as nn
 
 # Example Custom Module
 class MyCustomModule(ed.EasyDeLBaseModule):
- def __init__(
-  self,
-  config,
-  dtype: jnp.dtype = jnp.float32,
-  param_dtype: jnp.dtype = jnp.float32,
-  precision: jax.lax.PrecisionLike = None,
-  other_parameters=...,
-  other_parameters_1=...,
-  *,
-  rngs: nn.Rngs,
- ):
-  super().__init__(
-   config=config,
-   dtype=dtype,
-   param_dtype=param_dtype,
-   precision=precision,
-   rngs=rngs,
-  )
-  self.other_parameters = other_parameters
+    def __init__(
+        self,
+        config,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: jax.lax.PrecisionLike = None,
+        other_parameters=...,
+        other_parameters_1=...,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__(
+        config=config,
+        dtype=dtype,
+        param_dtype=param_dtype,
+        precision=precision,
+        rngs=rngs,
+        )
+        self.other_parameters = other_parameters
 
- def __call__(self, x):
-  # Custom implementation
-  return x
+    def __call__(self, x):
+        # Custom implementation
+        return x
 
 
 # Example Model using the Custom Module
 class MyModel(ed.EasyDeLBaseModule):
- config_class = ed.EasyDeLBaseConfig
- def __init__(
-  self,
-  config,
-  dtype: jnp.dtype = jnp.float32,
-  param_dtype: jnp.dtype = jnp.float32,
-  precision: jax.lax.PrecisionLike = None,
-  other_parameters=...,
-  other_parameters_1=...,
-  other_parameters_2=...,
-  *,
-  rngs: nn.Rngs,
- ):
-  super().__init__(
-   config=config,
-   dtype=dtype,
-   param_dtype=param_dtype,
-   precision=precision,
-   rngs=rngs,
-  )
-  self.custom_module = MyCustomModule(
-   config=config,
-   dtype=dtype,
-   param_dtype=param_dtype,
-   precision=precision,
-   other_parameters=other_parameters,
-   other_parameters_1=other_parameters_1,
-   rngs=rngs,
-  )
+    config_class = ed.EasyDeLBaseConfig
+    def __init__(
+        self,
+        config,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        precision: jax.lax.PrecisionLike = None,
+        other_parameters=...,
+        other_parameters_1=...,
+        other_parameters_2=...,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__(
+        config=config,
+        dtype=dtype,
+        param_dtype=param_dtype,
+        precision=precision,
+        rngs=rngs,
+        )
+        self.custom_module = MyCustomModule(
+        config=config,
+        dtype=dtype,
+        param_dtype=param_dtype,
+        precision=precision,
+        other_parameters=other_parameters,
+        other_parameters_1=other_parameters_1,
+        rngs=rngs,
+        )
 
- def __call__(self, x):
-  return self.custom_module(x)
+    def __call__(self, x):
+        return self.custom_module(x)
 ```
 
 ### Key Features at a Glance
@@ -279,28 +279,28 @@ import jax.numpy as jnp
 
 # Create model
 model = ed.LlamaForCausalLM(
- config=model_config,
- dtype=jnp.float32,
- param_dtype=jnp.float32
+    config=model_config,
+    dtype=jnp.float32,
+    param_dtype=jnp.float32
 )
 
 # Configure training
 training_args = ed.TrainingArguments(
- save_directory="checkpoints",
- model_name="my_model",
- num_train_epochs=3,
- total_batch_size=8,
- learning_rate=3e-4,
- optimizer=ed.EasyDeLOptimizers.ADAMW,
- scheduler=ed.EasyDeLSchedulers.COSINE
+    save_directory="checkpoints",
+    model_name="my_model",
+    num_train_epochs=3,
+    total_batch_size=8,
+    learning_rate=3e-4,
+    optimizer=ed.EasyDeLOptimizers.ADAMW,
+    scheduler=ed.EasyDeLSchedulers.COSINE
 )
 
 # Initialize trainer
 trainer = ed.Trainer(
- arguments=training_args,
- model=model,
- dataset_train=train_dataset,
- dataset_eval=eval_dataset
+    arguments=training_args,
+    model=model,
+    dataset_train=train_dataset,
+    dataset_eval=eval_dataset
 )
 
 # Start training

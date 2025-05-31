@@ -14,14 +14,14 @@
 
 from .mixtral_configuration import MixtralConfig
 from .modeling_mixtral_flax import (
-	MixtralForCausalLM,
-	MixtralModel,
-	MixtralForSequenceClassification,
+    MixtralForCausalLM,
+    MixtralForSequenceClassification,
+    MixtralModel,
 )
 
 __all__ = (
-	"MixtralForCausalLM",
-	"MixtralModel",
-	"MixtralConfig",
-	"MixtralForSequenceClassification",
+    "MixtralConfig",
+    "MixtralForCausalLM",
+    "MixtralForSequenceClassification",
+    "MixtralModel",
 )

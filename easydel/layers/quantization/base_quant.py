@@ -13,16 +13,14 @@
 # limitations under the License.
 from __future__ import annotations
 
-import typing as tp
-
 import jax
 import jax.numpy as jnp
 from flax.nnx import Param
 from flax.nnx.module import Module
 from flax.nnx.nn import initializers
 from flax.typing import (
-	Dtype,
-	PrecisionLike,
+    Dtype,
+    PrecisionLike,
 )
 
 Array = jax.Array
@@ -38,20 +36,20 @@ class QuantParam(Param): ...
 
 
 class QauntModule(Module):
-	def __init__(
-		self,
-		dtype: tp.Optional[Dtype] = None,
-		param_dtype: Dtype = jnp.float32,
-		precision: PrecisionLike = None,
-	):
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
+    def __init__(
+        self,
+        dtype: Dtype | None = None,
+        param_dtype: Dtype = jnp.float32,
+        precision: PrecisionLike = None,
+    ):
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
 
-	@staticmethod
-	def metadata():
-		raise NotImplementedError()
+    @staticmethod
+    def metadata():
+        raise NotImplementedError()
 
-	@staticmethod
-	def quantization_mapping():
-		raise NotImplementedError()
+    @staticmethod
+    def quantization_mapping():
+        raise NotImplementedError()

@@ -14,4 +14,4 @@
 
 from .dpo_trainer import DPOConfig, DPOTrainer
 
-__all__ = "DPOTrainer", "DPOConfig"
+__all__ = "DPOConfig", "DPOTrainer"

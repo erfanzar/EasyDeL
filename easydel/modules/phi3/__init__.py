@@ -15,4 +15,4 @@
 from .modeling_phi3_flax import Phi3ForCausalLM, Phi3Model
 from .phi3_configuration import Phi3Config
 
-__all__ = "Phi3ForCausalLM", "Phi3Model", "Phi3Config"
+__all__ = "Phi3Config", "Phi3ForCausalLM", "Phi3Model"

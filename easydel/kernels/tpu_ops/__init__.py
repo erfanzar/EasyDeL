@@ -15,20 +15,18 @@
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
+from .grouped_matmul_pallas import pallas_grouped_matmul
 from .matmul_pallas import pallas_matmul
-from .paged_attention_pallas import (
-	pallas_chunked_prefill_attention,
-	pallas_paged_attention,
-	pallas_prefill_attention,
-)
+from .paged_attention_pallas import pallas_chunked_prefill_attention, pallas_paged_attention, pallas_prefill_attention
 from .ragged_attention_pallas import pallas_ragged_decode
 from .ring_attention_pallas import pallas_ring_attention
 
 __all__ = (
-	"pallas_matmul",
-	"pallas_ring_attention",
-	"pallas_paged_attention",
-	"pallas_prefill_attention",
-	"pallas_chunked_prefill_attention",
-	"pallas_ragged_decode",
+    "pallas_chunked_prefill_attention",
+    "pallas_grouped_matmul",
+    "pallas_matmul",
+    "pallas_paged_attention",
+    "pallas_prefill_attention",
+    "pallas_ragged_decode",
+    "pallas_ring_attention",
 )

@@ -15,4 +15,4 @@
 from .mamba2_configuration import Mamba2Config
 from .modeling_mamba2_flax import Mamba2ForCausalLM, Mamba2Model
 
-__all__ = ("Mamba2ForCausalLM", "Mamba2Model", "Mamba2Config")
+__all__ = ("Mamba2Config", "Mamba2ForCausalLM", "Mamba2Model")

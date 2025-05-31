@@ -14,14 +14,14 @@
 
 from .arctic_configuration import ArcticConfig
 from .modeling_arctic_flax import (
-	ArcticForCausalLM,
-	ArcticModel,
-	ArcticForSequenceClassification,
+    ArcticForCausalLM,
+    ArcticForSequenceClassification,
+    ArcticModel,
 )
 
 __all__ = (
-	"ArcticModel",
-	"ArcticForCausalLM",
-	"ArcticConfig",
-	"ArcticForSequenceClassification",
+    "ArcticConfig",
+    "ArcticForCausalLM",
+    "ArcticForSequenceClassification",
+    "ArcticModel",
 )

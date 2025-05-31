@@ -13,11 +13,10 @@
 # limitations under the License.
 
 from .minimax_text_01_configuration import MiniMaxText01Config
-from .modeling_minimax_text_01_flax import MiniMaxText01Model, MiniMaxText01ForCausalLM
-
+from .modeling_minimax_text_01_flax import MiniMaxText01ForCausalLM, MiniMaxText01Model
 
 __all__ = (
-	"MiniMaxText01Model",
-	"MiniMaxText01ForCausalLM",
-	"MiniMaxText01Config",
+    "MiniMaxText01Config",
+    "MiniMaxText01ForCausalLM",
+    "MiniMaxText01Model",
 )

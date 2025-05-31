@@ -15,4 +15,4 @@
 from .modeling_opt_flax import OPTForCausalLM, OPTModel
 from .opt_configuration import OPTConfig
 
-__all__ = "OPTForCausalLM", "OPTModel", "OPTConfig"
+__all__ = "OPTConfig", "OPTForCausalLM", "OPTModel"

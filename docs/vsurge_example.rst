@@ -29,7 +29,7 @@ Load the pretrained model and tokenizer using EasyDeL's `AutoEasyDeLModelForCaus
 -   `processor`: The tokenizer loaded using `AutoTokenizer`. Padding side is set to "left" and pad token is set to EOS token for batched inference.
 -   `model`: The EasyDeL model loaded using `AutoEasyDeLModelForCausalLM`.
     -   `auto_shard_model`: Automatically shards the model parameters across available devices.
-    -   `sharding_axis_dims`: Defines the sharding dimensions for the model parameters. `(1, 1, -1, 1)` is a common configuration.
+    -   `sharding_axis_dims`: Defines the sharding dimensions for the model parameters. `(1, 1, 1, -1, 1)` is a common configuration.
     -   `config_kwargs`: Allows passing additional configuration parameters to the model's underlying configuration object using `EasyDeLBaseConfigDict`.
         -   `freq_max_position_embeddings` and `mask_max_position_embeddings`: Related to rotary embeddings and attention masks, set to `max_length`.
         -   `kv_cache_quantization_method`: Specifies the quantization method for the KV cache. `ed.EasyDeLQuantizationMethods.NONE` means no quantization.
@@ -54,7 +54,7 @@ Load the pretrained model and tokenizer using EasyDeL's `AutoEasyDeLModelForCaus
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path,
         auto_shard_model=True,
-        sharding_axis_dims=(1, 1, -1, 1),
+        sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
@@ -91,7 +91,7 @@ Instantiate the `vSurge` engine using the `create_odriver` class method. This me
     max_concurrent_decodes = 64
     max_concurrent_prefill = 64 # Often set equal to max_concurrent_decodes
 
-    surge = ed.vSurge.create_odriver(
+    surge = ed.vSurge.from_model(
         model=model,
         processor=processor,
         max_prefill_length=prefill_length,

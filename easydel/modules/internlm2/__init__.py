@@ -14,14 +14,14 @@
 
 from .internlm2_configuration import InternLM2Config
 from .modeling_internlm2_flax import (
-	InternLM2ForCausalLM,
-	InternLM2ForSequenceClassification,
-	InternLM2Model,
+    InternLM2ForCausalLM,
+    InternLM2ForSequenceClassification,
+    InternLM2Model,
 )
 
 __all__ = (
-	"InternLM2ForCausalLM",
-	"InternLM2ForSequenceClassification",
-	"InternLM2Model",
-	"InternLM2Config",
+    "InternLM2Config",
+    "InternLM2ForCausalLM",
+    "InternLM2ForSequenceClassification",
+    "InternLM2Model",
 )

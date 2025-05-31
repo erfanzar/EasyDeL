@@ -14,7 +14,7 @@
 
 
 import ray  # noqa
-from eformer.executor.ray import TpuAcceleratorConfig, execute  # noqa
+from eformer.executor.ray import TpuAcceleratorConfig, execute
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
@@ -24,58 +24,58 @@ import easydel as ed
 @execute(TpuAcceleratorConfig("v4-8"))
 @ray.remote
 def main():
-	model_id = "google/gemma-3-27b-it"
+    model_id = "google/gemma-3-27b-it"
 
-	max_decode_length = 4096
-	max_prefill_length = 8192
-	max_concurrent_decodes = 4  # or maybe 8
+    max_decode_length = 4096
+    max_prefill_length = 8192
+    max_concurrent_decodes = 4  # or maybe 8
 
-	max_length = max_prefill_length + max_decode_length
+    max_length = max_prefill_length + max_decode_length
 
-	processor = AutoTokenizer.from_pretrained(model_id)
+    processor = AutoTokenizer.from_pretrained(model_id)
 
-	model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
-		model_id,
-		dtype=jnp.bfloat16,
-		param_dtype=jnp.bfloat16,
-		precision=lax.Precision.DEFAULT,
-		auto_shard_model=True,
-		sharding_axis_dims=(1, 1, -1, 1),
-		config_kwargs=ed.EasyDeLBaseConfigDict(
-			freq_max_position_embeddings=max_length,
-			mask_max_position_embeddings=max_length,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.AUTO,
-			# decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-		),
-		partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		cache_dir="/dev/shm/gemma3",
-	)
+    model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=jnp.bfloat16,
+        param_dtype=jnp.bfloat16,
+        precision=lax.Precision.DEFAULT,
+        auto_shard_model=True,
+        sharding_axis_dims=(1, 1, 1, -1, 1),
+        config_kwargs=ed.EasyDeLBaseConfigDict(
+            freq_max_position_embeddings=max_length,
+            mask_max_position_embeddings=max_length,
+            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            # decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+        ),
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
+        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        cache_dir="/dev/shm/gemma3",
+    )
 
-	surge = ed.vSurge.create_vdriver(
-		model=model,
-		processor=processor,
-		prefill_lengths=[
-			max_prefill_length // 8,
-			max_prefill_length // 4,
-			max_prefill_length // 2,
-			max_prefill_length,
-		],
-		max_concurrent_decodes=max_concurrent_decodes,
-		max_prefill_length=max_prefill_length,
-		max_length=max_length,
-		vsurge_name="gemma3-27b",
-		verbose=True,
-		seed=48,
-	)
+    surge = ed.vSurge.from_model(
+        model=model,
+        processor=processor,
+        prefill_lengths=[
+            max_prefill_length // 8,
+            max_prefill_length // 4,
+            max_prefill_length // 2,
+            max_prefill_length,
+        ],
+        max_concurrent_decodes=max_concurrent_decodes,
+        max_prefill_length=max_prefill_length,
+        max_length=max_length,
+        vsurge_name="gemma3-27b",
+        verbose=True,
+        seed=48,
+    )
 
-	surge.compile()
-	surge.start()
+    surge.compile()
+    surge.start()
 
-	ed.vSurgeApiServer(surge).fire()
+    ed.vSurgeApiServer(surge).fire()
 
 
 if __name__ == "__main__":
-	main()
+    main()

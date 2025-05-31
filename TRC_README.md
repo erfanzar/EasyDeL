@@ -37,6 +37,7 @@ pip install eopod
 ```
 
 > **Troubleshooting**: If you encounter a "command not found" error, add your local bin to PATH:
+>
 > ```shell
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 > source ~/.bashrc
@@ -78,6 +79,7 @@ eopod run python -m wandb login YOUR_WANDB_TOKEN
 EasyDeL provides several state-of-the-art fine-tuning techniques. Below you'll find examples for each method with explanations of their use cases.
 
 > **Tip**: To explore all available parameters for any script, use the `--help` flag:
+>
 > ```shell
 > eopod run python -m easydel.scripts.finetune.dpo --help
 > ```

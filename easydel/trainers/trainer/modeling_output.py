@@ -17,19 +17,19 @@ import jax
 from eformer.pytree import auto_pytree
 
 if tp.TYPE_CHECKING:
-	from easydel.infra.base_state import EasyDeLState
+    from easydel.infra.base_state import EasyDeLState
 else:
-	EasyDeLState = tp.Any
+    EasyDeLState = tp.Any
 
-CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | tp.Dict[str, tp.Callable]
+CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | dict[str, tp.Callable]
 
 
 @auto_pytree
 class TrainerOutput:
-	state: EasyDeLState
-	mesh: tp.Optional[jax.sharding.Mesh]
-	checkpoint_manager: tp.Any
-	gather_fns: tp.Optional[CallFN] = None
-	shard_fns: tp.Optional[CallFN] = None
-	last_save_file_name: tp.Optional[str] = None
-	checkpoint_path: tp.Optional[str] = None
+    state: EasyDeLState
+    mesh: jax.sharding.Mesh | None
+    checkpoint_manager: tp.Any
+    gather_fns: CallFN | None = None
+    shard_fns: CallFN | None = None
+    last_save_file_name: str | None = None
+    checkpoint_path: str | None = None

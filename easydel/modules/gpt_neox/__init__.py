@@ -15,4 +15,4 @@
 from .gpt_neox_configuration import GPTNeoXConfig
 from .modeling_gpt_neox_flax import GPTNeoXForCausalLM, GPTNeoXModel
 
-__all__ = "GPTNeoXForCausalLM", "GPTNeoXModel", "GPTNeoXConfig"
+__all__ = "GPTNeoXConfig", "GPTNeoXForCausalLM", "GPTNeoXModel"
