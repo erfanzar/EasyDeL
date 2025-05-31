@@ -88,7 +88,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.float16,
     param_dtype=jnp.float16,
     auto_shard_model=True,
-    sharding_axis_dims=(1,1,-1,1) # Fully Tensor Parallel
+    sharding_axis_dims=(1, 1, 1, -1, 1) # Fully Tensor Parallel
 )
 ```
 
