@@ -293,38 +293,33 @@ class GRPOTrainer(Trainer):
         mesh = self.model.mesh
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
-        _generation_static_argnums = (3,)
 
-        @partial(cjit, static_argnums=_generation_static_argnums)
+        @cjit
         @partial(
             jax.jit,
-            static_argnums=_generation_static_argnums,
-            in_shardings=(
-                self.state_shardings,
-                empty_sharding,
-                empty_sharding,
-            ),
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=empty_sharding,
         )
-        def generate(state, input_ids, attention_mask, generation_config):
+        def generate(state, input_ids, attention_mask):
             module = state.model
             with module.mesh:
                 return module.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    generation_config=generation_config,
+                    generation_config=GenerationConfig(
+                        top_p=self.arguments.top_p,
+                        top_k=self.arguments.top_k,
+                        temperature=self.arguments.temperature,
+                        pad_token_id=self.pad_token_id,
+                        eos_token_id=self.eos_token_id,
+                        max_new_tokens=self.arguments.max_completion_length,
+                        num_return_sequences=self.num_generations,
+                        do_sample=True,
+                    ),
                 ).sequences
 
         self.generate_function = generate
-        self.hf_generation_config = GenerationConfig(
-            top_p=self.arguments.top_p,
-            top_k=self.arguments.top_k,
-            temperature=self.arguments.temperature,
-            pad_token_id=self.pad_token_id,
-            eos_token_id=self.eos_token_id,
-            max_new_tokens=self.arguments.max_completion_length,
-            num_return_sequences=self.num_generations,
-        )
+
         self._train_shared_fn_static_args = (
             self.eos_token_id,
             self.num_generations,
@@ -399,7 +394,7 @@ class GRPOTrainer(Trainer):
         )
 
     def _make_attn_mask(self, arr):
-        is_eos = arr == self.vinference.generation_config.eos_token_id
+        is_eos = jnp.isin(arr, jnp.asarray(self.eos_token_id).reshape(-1))
         return (
             (jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
             <= jnp.where(
@@ -419,7 +414,7 @@ class GRPOTrainer(Trainer):
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                sequences = self.generate_function(state, prompt_ids, prompt_mask, self.hf_generation_config)
+                sequences = self.generate_function(state, prompt_ids, prompt_mask)
             generation_time = generation_time_fn()
             prompt_completion_ids = sequences
             completion_ids = prompt_completion_ids[..., prompt_ids.shape[-1] :]
