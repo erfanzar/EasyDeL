@@ -23,6 +23,7 @@ import numpy as np
 from eformer.pytree import auto_pytree
 from jax import lax
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
@@ -48,6 +49,14 @@ from easydel.utils.helpers import get_logger
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
 
+if tp.TYPE_CHECKING:
+    from easydel.inference import vInference, vInferenceConfig, vInferencePreCompileConfig
+    from easydel.infra.utils import ProcessingClassType
+else:
+    vInference = tp.Any
+    vInferenceConfig = tp.Any
+    ProcessingClassType = tp.Any
+    vInferencePreCompileConfig = tp.Any
 logger = get_logger(__name__)
 
 
@@ -477,7 +486,7 @@ class EasyGenerationMixin:
         from keyword arguments. Intended to be overridden by subclasses if needed.
 
         Args:
-            model_kwargs (dict): Keyword arguments passed to the model.
+            model_kwargs (dict): Keyword arguments passed to the
 
         Returns:
             Optional[Mapping[str, Dict[str, Any]]]: Extracted properties or None.
@@ -830,7 +839,7 @@ class EasyGenerationMixin:
                 generation config an error is thrown. This feature is intended for advanced users.
             kwargs (`tp.Dict[str, Any]`, *optional*):
                 Ad hoc parametrization of `generate_config` and/or additional model-specific kwargs that will be
-                forwarded to the `forward` function of the model. If the model is an encoder-decoder model, encoder
+                forwarded to the `forward` function of the  If the model is an encoder-decoder model, encoder
                 specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with *decoder_*.
 
         Return:
@@ -1537,3 +1546,52 @@ class EasyGenerationMixin:
         scores = flatten_beam_dim(scores[:, :num_return_sequences])
 
         return BeamSearchOutput(sequences=sequences, scores=scores)
+
+    def create_vinference(
+        self,
+        processor: ProcessingClassType,
+        generation_config: vInferenceConfig,
+        compile_config: vInferencePreCompileConfig | None = None,
+        input_partition_spec: PartitionSpec | None = None,
+        seed: int | None = None,
+    ) -> vInference:
+        from easydel import SamplingParams, vInference, vInferenceConfig
+
+        if hasattr(self, "generation_config"):
+            if self.generation_config is not None:
+                sampling_params = generation_config.sampling_params
+                generation_config = vInferenceConfig(
+                    bos_token_id=generation_config.bos_token_id or self.generation_config.bos_token_id,
+                    eos_token_id=generation_config.eos_token_id or self.generation_config.eos_token_id,
+                    pad_token_id=generation_config.pad_token_id or self.generation_config.pad_token_id,
+                    max_new_tokens=generation_config.max_new_tokens or self.generation_config.max_new_tokens,
+                    streaming_chunks=generation_config.streaming_chunks or 64,
+                    sampling_params=SamplingParams(
+                        max_tokens=sampling_params.max_tokens or self.generation_config.max_new_tokens,
+                        temperature=sampling_params.temperature or self.generation_config.temperature,
+                        top_k=sampling_params.top_k or self.generation_config.top_k,
+                        top_p=sampling_params.top_p or self.generation_config.top_p,
+                    ),
+                )
+        num_params = sum(n.size for n in jax.tree_util.tree_flatten(self.graphstate)[0])
+        size_in_billions = num_params / 1e9
+        size_in_billions = f"{size_in_billions:.2f}b"
+        vinference = vInference(
+            model=None,
+            processor_class=processor,
+            generation_config=generation_config,
+            graphdef=self.graphdef,
+            mesh=self.mesh,
+            partition_axis=self.config.partition_axis,
+            inference_name=str(self._model_task) + str(self._model_type) + ":" + size_in_billions,
+            input_partition_spec=input_partition_spec,
+            seed=seed,
+            report_metrics=False,
+        )
+        if compile_config is not None:
+            vinference.precompile(
+                config=compile_config,
+                graphother=self.graphother,
+                graphstate=self.graphstate,
+            )
+        return vinference

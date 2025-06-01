@@ -27,6 +27,9 @@ from datetime import datetime
 from functools import cached_property
 from uuid import uuid4
 
+import eformer
+import eformer.common_types
+import eformer.escale
 import eformer.escale as es
 import jax
 import numpy as np
@@ -39,30 +42,21 @@ from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
-from easydel.utils.compiling_utils import (
-    load_compiled_fn,
-    save_compiled_fn,
-    smart_compile,
-)
+from easydel.utils.compiling_utils import load_compiled_fn, save_compiled_fn, smart_compile
 from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
+from easydel.utils.rngs_utils import GenerateRNG
 
 from ..utilities import SamplingParams
-from ._fn import (
-    decode_fn,
-    expand_inputs_for_generation,
-    get_compiled_funcs,
-    prefill_fn,
-    put_compiled_funcs,
-)
+from ._fn import decode_fn, expand_inputs_for_generation, get_compiled_funcs, prefill_fn, put_compiled_funcs
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
 else:
-    EasyDeLBaseModule = None
-    ProcessingClassType = None
+    EasyDeLBaseModule = tp.Any
+    ProcessingClassType = tp.Any
 
 logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
@@ -107,62 +101,149 @@ class vInference:
 
     def __init__(
         self,
-        model: EasyDeLBaseModule,
-        processor_class: ProcessingClassType,
+        model: EasyDeLBaseModule | None = None,
+        processor_class: ProcessingClassType | None = None,
+        graphdef: nn.GraphDef | None = None,
+        graphstate: nn.GraphState | None = None,
+        graphother: nn.GraphState | None = None,
+        mesh: eformer.common_types.Mesh | None = None,
         generation_config: vInferenceConfig | None = None,
         seed: int | None = None,
         input_partition_spec: PartitionSpec | None = None,
         max_new_tokens: int = 512,
         inference_name: str | None = None,
+        partition_axis: eformer.escale.PartitionAxis | None = None,
+        report_metrics: bool = True,
     ):
+        """Initialize vInference with model components and configuration.
+
+        Args:
+            model: Pre-trained language model. If provided, graphdef/graphstate/graphother
+                will be extracted automatically.
+            processor_class: Processor class for the model.
+            graphdef: Graph definition (required if model is None).
+            graphstate: Graph state (optional for lazy initialization).
+            graphother: Additional graph state (optional for lazy initialization).
+            mesh: JAX mesh for distributed computation.
+            generation_config: Generation configuration settings.
+            seed: Random seed for generation. If None, generates random seed.
+            input_partition_spec: Partitioning specification for input data.
+            max_new_tokens: Maximum number of new tokens to generate.
+            inference_name: Name for this inference instance.
+            partition_axis: Partitioning axis configuration.
+
+        Raises:
+            AssertionError: If required parameters are missing for lazy initialization.
+            ValueError: If model property is accessed during lazy initialization.
         """
-        Arguments:
-          model: The pre-trained language model.
-          processor_class: The processor_class for the model.
-          generation_config: The generation configuration.
-          seed: The random seed for generation.
-          input_partition_spec: The partitioning specification for input data.
-          max_new_tokens: The maximum number of new tokens to generate.
-        """
-        from easydel.utils import GenerateRNG
-
-        graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
-
-        self.graphdef = graphdef
-        self.graphstate = graphstate
-        self.graphother = graphother
-
+        self._init_model_components(model, graphdef, graphstate, graphother, mesh, inference_name, partition_axis)
         self.processor_class = processor_class
-        self.generation_config = self._init_generation_config(
-            generation_config,
-            max_new_tokens,
-        )
+        self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
+        self._setup_partitioning(partition_axis, input_partition_spec)
+        self._setup_rng(seed)
+        self._init_internal_state()
+        self._setup_metrics_reporting(report_metrics)
+
+    def _init_model_components(
+        self,
+        model: EasyDeLBaseModule | None,
+        graphdef: nn.GraphDef | None,
+        graphstate: nn.GraphState | None,
+        graphother: nn.GraphState | None,
+        mesh: eformer.common_types.Mesh | None,
+        inference_name: str | None,
+        partition_axis: eformer.escale.PartitionAxis | None,
+    ) -> None:
+        """Initialize model components from either a full model or individual components."""
+        if model is not None:
+            self.graphdef, self.graphstate, self.graphother = nn.split(model, nn.Param, ...)
+            self.mesh = model.config.mesh
+            self._inference_name = inference_name or self._generate_inference_name(model)
+            self._partition_axis = partition_axis or model.config.partition_axis
+        else:
+            self.graphdef = graphdef
+            self.graphstate = graphstate
+            self.graphother = graphother
+            self.mesh = mesh
+            self._inference_name = inference_name
+            self._partition_axis = partition_axis
+
+        if self.graphdef is None:
+            raise ValueError("graphdef is required. Either provide a complete model or specify graphdef explicitly.")
+        if self._inference_name is None:
+            raise ValueError("inference_name is required for lazy initialization.")
+        if self.mesh is None:
+            raise ValueError("mesh is required for distributed computation.")
+
+        if self._partition_axis is None:
+            self._partition_axis = eformer.escale.PartitionAxis()
+
+    def _setup_partitioning(
+        self,
+        partition_axis: eformer.escale.PartitionAxis | None = None,
+        input_partition_spec: PartitionSpec | None = None,
+    ) -> None:
+        """Configure partitioning specifications."""
         if self.generation_config.partition_axis is None:
-            self.generation_config.partition_axis = model.config.partition_axis
+            _partition_axis = partition_axis if partition_axis is not None else self._partition_axis
+            self.generation_config.partition_axis = _partition_axis
+        self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
+
+    def _setup_rng(self, seed: int | None) -> None:
+        """Initialize random number generator with given or random seed."""
         if seed is None:
             seed = random.randint(0, int(1e6))
-        self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
-        self.mesh = self.model.config.mesh
+
         self._rng_generator = GenerateRNG(seed)
+
+    def _init_internal_state(self) -> None:
+        """Initialize internal state variables."""
         self._precompile_lock = asyncio.Lock()
-        self._precompiled_configs: dict[int, vInferencePreCompileConfig] = dict()
-        self._in_compiling_process = set()
+        self._precompiled_configs: dict[int, vInferencePreCompileConfig] = {}
+        self._in_compiling_process: set = set()
+        self._uuid4 = uuid4().hex
         self._init_variables()
         self._validate_token_ids()
-        self._uuid4 = uuid4().hex
-        self._inference_name = inference_name or self._generate_inference_name(model)
-        erm = check_bool_flag("EASYDEL_RECORDS_METRICS")
-        self._report_metrics = erm and jax.process_count() == 1 and is_package_available("prometheus_client")
+
+    def _setup_metrics_reporting(self, report_metrics: bool) -> None:
+        """Configure metrics reporting based on environment and available packages."""
+        metrics_enabled = check_bool_flag("EASYDEL_RECORDS_METRICS")
+        is_main_process = jax.process_count() == 1
+        has_prometheus = is_package_available("prometheus_client")
+
+        self._report_metrics = metrics_enabled and is_main_process and has_prometheus and report_metrics
+
         if not self._report_metrics:
-            if is_package_available("prometheus_client"):
-                logger.info("vInference-metrics is disabled")
+            if has_prometheus:
+                logger.info("vInference metrics reporting is disabled")
             else:
-                # fmt:off
-                logger.info("`prometheus_client` not found!, vInference-metrics will be disabled.")
-                # fmt:on
+                logger.info("prometheus_client not found - vInference metrics will be disabled")
+
+    def get_model(self, graphstate: nn.GraphState | None = None, graphother: nn.GraphState | None = None):
+        if graphstate is None:
+            graphstate = self.graphstate
+        if graphother is None:
+            graphother = self.graphother
+
+        assert graphstate is not None
+        assert graphother is not None
+        return nn.merge(self.graphdef, graphstate, graphother)
 
     @property
-    def model(self):
+    def model(self) -> nn.Module:
+        """Get the complete model by merging graph components.
+
+        Returns:
+            Complete model instance.
+
+        Raises:
+            ValueError: If using lazy initialization without graphstate/graphother.
+        """
+        if self.graphstate is None or self.graphother is None:
+            raise ValueError(
+                "Model property cannot be accessed when using lazy initialization. "
+                "Provide graphstate and graphother or use a complete model."
+            )
         return nn.merge(self.graphdef, self.graphstate, self.graphother)
 
     @cached_property
@@ -304,8 +385,12 @@ class vInference:
         Returns:
             tp.Optional[int]: The maximum length if found, None otherwise
         """
+        try:
+            model = self.model
+        except ValueError:
+            return None
         for attr in attributes:
-            max_length = getattr(self.model.config, attr, None)
+            max_length = getattr(model.config, attr, None)
             if max_length is not None:
                 return max_length
         return None
@@ -314,7 +399,11 @@ class vInference:
         """
         Validates the token IDs for padding, end-of-sequence, and beginning-of-sequence.
         """
-        if hasattr(self.model, "generation_config"):
+        try:
+            model = self.model
+        except ValueError:
+            model = None
+        if hasattr(model, "generation_config"):
             if self.generation_config.pad_token_id is None:
                 self.generation_config.pad_token_id = self.model.generation_config.pad_token_id
             if self.generation_config.eos_token_id is None:
@@ -393,44 +482,42 @@ class vInference:
         """
         Initializes the shardings for input data.
         """
-        mesh = self.model.mesh
+        mesh = self.mesh
         fsdp = self.input_partition_spec[0]
 
-        self.input_sharding = NamedSharding(
-            spec=self.input_partition_spec,
-            mesh=mesh,
-        )
-        self.empty_sharding = NamedSharding(
-            spec=PartitionSpec(),
-            mesh=mesh,
-        )
-        self.generation_input_shape = NamedSharding(
-            spec=PartitionSpec(fsdp, None),
-            mesh=mesh,
-        )
+        self.input_sharding = NamedSharding(spec=self.input_partition_spec, mesh=mesh)
+        self.empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        self.generation_input_shape = NamedSharding(spec=PartitionSpec(fsdp, None), mesh=mesh)
 
     def _get_init_state(
         self,
+        graphstate: nn.GraphState,
+        graphother: nn.GraphState,
         vinference_compile_config: vInferencePreCompileConfig,
         model_kwargs: tp.Mapping[str | int, jax.Array],
     ) -> SampleState:
-        func = get_compiled_funcs(
-            standalone_config=vinference_compile_config,
-            id="_init_state",
-            safe=False,
-        )
+        func = get_compiled_funcs(standalone_config=vinference_compile_config, id="_init_state", safe=False)
+
         if func is None:
             logger.info(f"registering new signature({vinference_compile_config.get_default_hash()}) for `_init_state`")
-            eshape = jax.eval_shape(self._init_state_pure, **model_kwargs)
+            eshape = jax.eval_shape(
+                self._init_state_pure,
+                graphstate=graphstate,
+                graphother=graphother,
+                vinference_compile_config=vinference_compile_config,
+                **model_kwargs,
+            )
             prules = self.generation_config.get_partition_rules(vinference_compile_config)
             out_shardings = jax.tree_util.tree_map(
                 lambda spec: NamedSharding(mesh=self.mesh, spec=spec),
                 es.match_partition_rules(prules, eshape),
             )
-            lowered = jax.jit(
-                self._init_state_pure,
-                out_shardings=out_shardings,
-            ).lower(vinference_compile_config=vinference_compile_config, **model_kwargs)
+            lowered = jax.jit(self._init_state_pure, out_shardings=out_shardings).lower(
+                graphstate=graphstate,
+                graphother=graphother,
+                vinference_compile_config=vinference_compile_config,
+                **model_kwargs,
+            )
             func = smart_compile(lowered, tag="vinference-init-state")
             put_compiled_funcs(
                 funcs=func,
@@ -438,17 +525,22 @@ class vInference:
                 id="_init_state",
             )
         return func(
+            graphstate=graphstate,
+            graphother=graphother,
             vinference_compile_config=vinference_compile_config,
             **model_kwargs,
         )
 
     def _init_state_pure(
         self,
+        graphstate: nn.GraphState,
+        graphother: nn.GraphState,
         input_ids: jax.Array = None,
         rng: PRNGKey = None,
         vinference_compile_config: vInferencePreCompileConfig | None = None,
         **model_kwargs,
     ):
+        model = self.get_model(graphstate=graphstate, graphother=graphother)
         num_return_sequences = self.generation_config.num_return_sequences
         if num_return_sequences is None:
             num_return_sequences = 1
@@ -469,7 +561,7 @@ class vInference:
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
         is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
-        model_kwargs = self.model.prepare_inputs_for_generation(
+        model_kwargs = model.prepare_inputs_for_generation(
             input_ids=input_ids,
             max_length=max_length,
             pad_token_id=pad_token_id,
@@ -488,11 +580,7 @@ class vInference:
             _compile_config=vinference_compile_config,
         )
 
-    def _find_optimal_config(
-        self,
-        batch_size: int,
-        sequence_length: int,
-    ) -> tuple[int, int]:
+    def _find_optimal_config(self, batch_size: int, sequence_length: int) -> tuple[int, int]:
         """
         Finds the optimal precompiled configuration for given input dimensions.
 
@@ -555,6 +643,8 @@ class vInference:
 
     def _create_vinference_config_from_kwargs(
         self,
+        graphstate: nn.GraphState,
+        graphother: nn.GraphState,
         kwargs: dict,
         batch_size: int | None = None,
         prefill_length: int | None = None,
@@ -573,24 +663,16 @@ class vInference:
         if "pixel_values" in kwargs.keys():
             vision_included = True
             if kwargs["pixel_values"].ndim == 4:
-                (
-                    vision_batch_size,
-                    vision_channels,
-                    vision_height,
-                    vision_width,
-                ) = kwargs["pixel_values"].shape
+                vision_batch_size, vision_channels, vision_height, vision_width = kwargs["pixel_values"].shape
             elif kwargs["pixel_values"].ndim == 3:
                 vision_batch_size = 1
-                (
-                    vision_channels,
-                    vision_height,
-                    vision_width,
-                ) = kwargs["pixel_values"].shape
+                vision_channels, vision_height, vision_width = kwargs["pixel_values"].shape
             elif kwargs["pixel_values"].ndim == 2:
                 vision_batch_size = 1
                 vision_channels = 1
                 vision_height, vision_width = kwargs["pixel_values"].shape
-        required_props = self.model._create_required_props_from_kwargs(model_kwargs=kwargs)
+        model = self.get_model(graphstate=graphstate, graphother=graphother)
+        required_props = model._create_required_props_from_kwargs(model_kwargs=kwargs)
         vinf_config = vInferencePreCompileConfig(
             batch_size=batch_size,
             prefill_length=prefill_length,
@@ -691,39 +773,41 @@ class vInference:
 
     def adjust_kwargs(
         self,
+        graphstate: nn.GraphState,
+        graphother: nn.GraphState,
         input_ids: jax.Array,
         attention_mask: jax.Array | None = None,
         **model_kwargs,
     ):
-        # Input validation and preprocessing
         if not isinstance(input_ids, jax.Array):
             input_ids = jnp.array(input_ids, dtype=jnp.int32)
 
-        # Combine all inputs into model_kwargs
         model_kwargs["input_ids"] = input_ids
         if attention_mask is not None:
             model_kwargs["attention_mask"] = attention_mask
 
         batch_size, sequence_length = input_ids.shape
-
-        # Find optimal configuration
         target_batch, target_length = self._find_optimal_config(
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
-        # Adjust all inputs
         adjusted_kwargs = self._adjust_inputs_to_config(
             model_kwargs=model_kwargs,
             target_batch=target_batch,
             target_length=target_length,
         )
-
         vinference_compile_config = self._create_vinference_config_from_kwargs(
-            batch_size=batch_size,
-            prefill_length=target_length,
             kwargs=adjusted_kwargs,
+            batch_size=target_batch,
+            prefill_length=target_length,
+            graphstate=graphstate,
+            graphother=graphother,
         )
-        self.precompile(vinference_compile_config)
+        self.precompile(
+            config=vinference_compile_config,
+            graphstate=graphstate,
+            graphother=graphother,
+        )
 
         if target_batch <= 0 or target_length <= 0:
             raise ValueError(f"Invalid target dimensions: ({target_batch}, {target_length})")
@@ -758,6 +842,8 @@ class vInference:
             sampling_params.n = None
         try:
             adjusted_kwargs, vinference_compile_config = self.adjust_kwargs(
+                graphstate=graphstate,
+                graphother=graphother,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 **model_kwargs,
@@ -769,6 +855,8 @@ class vInference:
                 attention_mask = adjusted_kwargs.pop("attention_mask", None)
 
                 state = self._prepare_sample_state(
+                    graphstate=graphstate,
+                    graphother=graphother,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     model_kwargs=adjusted_kwargs,
@@ -776,15 +864,11 @@ class vInference:
                 )
                 state.padded_length = vinference_compile_config.prefill_length
 
-                (
-                    generate_func,
-                    interval_func,
-                ) = get_compiled_funcs(
+                generate_func, interval_func = get_compiled_funcs(
                     standalone_config=vinference_compile_config,
                     id=self._uuid4,
                 )
 
-            # Main generation loop
             with self._inference_latency_context_manager("inference"):
                 state = yield from self._inner_generate(
                     state,
@@ -808,6 +892,8 @@ class vInference:
 
     def _prepare_sample_state(
         self,
+        graphstate: nn.GraphState,
+        graphother: nn.GraphState,
         input_ids: jax.Array,
         attention_mask: jax.Array | None,
         model_kwargs: dict,
@@ -815,20 +901,22 @@ class vInference:
     ) -> SampleState:
         """Prepares the initial state for text generation."""
         if attention_mask is None:
-            warnings.warn(
-                "No attention mask provided. Using default mask.",
-                UserWarning,
-                stacklevel=2,
-            )
+            warnings.warn("No attention mask provided. Using default mask.", UserWarning, stacklevel=2)
             attention_mask = jnp.ones_like(input_ids, dtype="b1")
 
         attention_mask = jnp.asarray(attention_mask, dtype="b1", device=self.input_sharding)
         input_ids = jnp.asarray(input_ids, dtype="i4", device=self.input_sharding)
         model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
         if model_kwargs.get("rng") is None:
-            rng = self._rng_generator.rng
-            model_kwargs["rng"] = rng
+            model_kwargs["rng"] = self._rng_generator.rng
+        if graphstate is None:
+            graphstate = self.graphstate
+        if graphother is None:
+            graphother = self.graphother
+
         return self._get_init_state(
+            graphstate=graphstate,
+            graphother=graphother,
             vinference_compile_config=vinference_compile_config,
             model_kwargs=model_kwargs,
         )
@@ -894,6 +982,9 @@ class vInference:
             graphother = self.graphother
         if sampling_params is None:
             sampling_params = self.generation_config.sampling_params
+
+        assert graphstate is not None
+        assert graphother is not None
 
         if func is None:
             func = get_compiled_funcs(state._compile_config, self._uuid4)[0]
@@ -1006,23 +1097,33 @@ class vInference:
 
         raise RuntimeError(f"Generation failed: {error!s}") from error
 
-    def _compile_and_lower_funs(self, standalone_config: vInferencePreCompileConfig):
+    def _compile_and_lower_funs(
+        self,
+        standalone_config: vInferencePreCompileConfig,
+        graphstate: nn.GraphState | None = None,
+        graphother: nn.GraphState | None = None,
+    ):
         assert standalone_config._im_standalone()
-        funs = get_compiled_funcs(
-            standalone_config=standalone_config,
-            id=self._uuid4,
-            safe=False,
-        )
+        funs = get_compiled_funcs(standalone_config=standalone_config, id=self._uuid4, safe=False)
         do_compile = funs is None
         if do_compile:
+            graphstate = graphstate if graphstate is not None else self.graphstate
+            graphother = graphother if graphother is not None else self.graphother
             logger.info("initiating state for lowering and compiling func.")
-            wargs = self.model._get_compile_model_kwargs(
+            model = self.get_model(graphstate=graphstate, graphother=graphother)
+            wargs = model._get_compile_model_kwargs(
                 input_tokens_length=standalone_config.prefill_length,
                 input_sharding=self.input_sharding,
                 rngs=self._rng_generator.rng,
                 **standalone_config.extract(),
             )
-            state = self._get_init_state(standalone_config, wargs)
+            state = self._get_init_state(
+                graphstate=graphstate,
+                graphother=graphother,
+                vinference_compile_config=standalone_config,
+                model_kwargs=wargs,
+            )
+
             logger.info("smart compiling `prefill`")
             logger.info("lowering `prefill`")
             prefill_lowered = jax.jit(
@@ -1030,15 +1131,15 @@ class vInference:
                 donate_argnums=(3,),
                 static_argnums=(0, 4),
                 in_shardings=(
-                    es.extract_shardings(self.graphstate),
-                    es.extract_shardings(self.graphother),
+                    es.extract_shardings(graphstate),
+                    es.extract_shardings(graphother),
                     es.extract_shardings(state),
                     es.extract_shardings(self.generation_config.sampling_params),
                 ),
             ).lower(
                 self.graphdef,  # Static
-                self.graphstate,
-                self.graphother,
+                graphstate,
+                graphother,
                 state,
                 self.generation_config,  # Static
                 self.generation_config.sampling_params,
@@ -1048,29 +1149,28 @@ class vInference:
             logger.info("smart compiling `decode`")
             logger.info("lowering `decode`")
             sample_state = compiled_prefill_fn(
-                self.graphstate,
-                self.graphother,
+                graphstate,
+                graphother,
                 state,
                 self.generation_config.sampling_params,
             )
             sample_state_shardings = es.extract_shardings(sample_state)
-
             decode_lowered = jax.jit(
                 decode_fn,
                 donate_argnums=(3,),
                 static_argnums=(0, 4),
                 in_shardings=(
-                    es.extract_shardings(self.graphstate),
-                    es.extract_shardings(self.graphother),
+                    es.extract_shardings(graphstate),
+                    es.extract_shardings(graphother),
                     sample_state_shardings,
                     es.extract_shardings(self.generation_config.sampling_params),
                     None,
                 ),
                 out_shardings=sample_state_shardings,
             ).lower(
-                self.graphdef,  # STATIC
-                self.graphstate,
-                self.graphother,
+                self.graphdef,
+                graphstate,
+                graphother,
                 sample_state,
                 self.generation_config,  # STATIC
                 self.generation_config.sampling_params,
@@ -1087,7 +1187,12 @@ class vInference:
                 id=self._uuid4,
             )
 
-    def precompile(self, config: vInferencePreCompileConfig):
+    def precompile(
+        self,
+        config: vInferencePreCompileConfig,
+        graphstate: nn.GraphState | None = None,
+        graphother: nn.GraphState | None = None,
+    ):
         """
         Precompiles the generation functions for a given batch size and input length.
 
@@ -1112,13 +1217,21 @@ class vInference:
                     "already been requested adding 5 second timeout"
                 )
                 time.sleep(5)
-                return self.precompile(config=standalone_config)
+                return self.precompile(
+                    config=standalone_config,
+                    graphstate=graphstate,
+                    graphother=graphother,
+                )
             else:
                 with self._compilation_metrics_recorder():
                     logger.info(f"lowering and compiling with `config` {config_hash}")
                     self._in_compiling_process.add(config_hash)
                     with self.mesh:
-                        self._compile_and_lower_funs(standalone_config=standalone_config)
+                        self._compile_and_lower_funs(
+                            standalone_config=standalone_config,
+                            graphstate=graphstate,
+                            graphother=graphother,
+                        )
                     self._precompiled_configs.update({config_hash: standalone_config})
         return True
 
@@ -1135,20 +1248,9 @@ class vInference:
         )
         for config_key, config in self._precompiled_configs.items():
             metafile = f"{metadata.uuid4}-{config_key}"
-            (compiled_prefill_fn, compiled_decode_fn) = get_compiled_funcs(
-                standalone_config=config,
-                id=metadata.uuid4,
-            )
-            save_compiled_fn(
-                path=path,
-                fn=compiled_prefill_fn,
-                prefix=f"compiled-prefill-{metafile}",
-            )
-            save_compiled_fn(
-                path=path,
-                fn=compiled_decode_fn,
-                prefix=f"compiled-decode-{metafile}",
-            )
+            compiled_prefill_fn, compiled_decode_fn = get_compiled_funcs(standalone_config=config, id=metadata.uuid4)
+            save_compiled_fn(path=path, fn=compiled_prefill_fn, prefix=f"compiled-prefill-{metafile}")
+            save_compiled_fn(path=path, fn=compiled_decode_fn, prefix=f"compiled-decode-{metafile}")
 
         metadata = pickle.dump(metadata, open(path / "config", "wb"))
 
@@ -1164,14 +1266,8 @@ class vInference:
         metadata = pickle.load(open(path / "config", "rb"))
         for config_key, standalone_config in metadata.precompiled_configs.items():
             metafile = f"{metadata.uuid4}-{config_key}"
-            compiled_prefill_fn = load_compiled_fn(
-                path=path,
-                prefix=f"compiled-prefill-{metafile}",
-            )
-            compiled_decode_fn = load_compiled_fn(
-                path=path,
-                prefix=f"compiled-decode-{metafile}",
-            )
+            compiled_prefill_fn = load_compiled_fn(path=path, prefix=f"compiled-prefill-{metafile}")
+            compiled_decode_fn = load_compiled_fn(path=path, prefix=f"compiled-decode-{metafile}")
             put_compiled_funcs(
                 funcs=(compiled_prefill_fn, compiled_decode_fn),
                 standalone_config=standalone_config,

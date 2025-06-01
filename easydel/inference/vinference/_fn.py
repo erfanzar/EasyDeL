@@ -164,15 +164,9 @@ def get_compiled_funcs(
 ):
     """
     Retrieves compiled generation functions from a cache.
-
-    Args:
-            batch_size: The batch size.
-            input_tokens_length: The length of the input tokens.
-            vision_active: whenever the model using it vision features.
-            id: A unique identifier for the compilation.
-
     """
     search_key = f"{standalone_config.get_default_hash()}-UUID{id}"
+
     outs = COMPILED_FUNCS.get(search_key, false_instance)
     if outs is None and safe:
         raise RuntimeError(
