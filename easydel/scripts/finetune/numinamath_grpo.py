@@ -142,7 +142,7 @@ def main():
     def accuracy_reward(prompts, completions, batch, **kwargs):
         """Reward function that checks if the completion is the same as the ground truth."""
         # solutions = kwargs["solution"]
-        solutions = processor.batch_decode(batch["solution_ids"]) * runtime_config.num_return_sequences
+        solutions = processor.batch_decode(batch["solution_ids"]) * grpo_config.num_return_sequences
         completion_contents = [completion[0]["content"] for completion in completions]
         rewards = []
         for content, solution in zip(completion_contents, solutions, strict=False):

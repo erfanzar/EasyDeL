@@ -150,7 +150,7 @@ def main():
     def correctness_reward_func(prompts, completions, batch, **kwargs) -> list[float]:
         responses = [completion[0]["content"] for completion in completions]
         extracted_responses = [extract_xml_answer(r) for r in responses]
-        answer = processor.batch_decode(batch["answer_ids"]) * runtime_config.num_return_sequences
+        answer = processor.batch_decode(batch["answer_ids"]) * grpo_config.num_return_sequences
         return [
             runtime_config.correctness_reward if r == a else 0.0
             for r, a in zip(extracted_responses, answer, strict=False)
