@@ -492,7 +492,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
 
                 self.state_shardings = state_shardings
-                self.model_state = self.model_state.shard_witth_shape(state_shardings)
+                self.model_state = self.model_state.shard_with_shape(state_shardings)
 
         self.timer.log("configure sharded state")
 
