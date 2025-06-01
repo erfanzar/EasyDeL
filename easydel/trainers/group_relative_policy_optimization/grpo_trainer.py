@@ -321,10 +321,8 @@ class GRPOTrainer(Trainer):
         self.generate_function = generate
 
         self._train_shared_fn_static_args = (
-            self.eos_token_id,
             self.num_generations,
             self.arguments.beta,
-            self.arguments.max_prompt_length,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -332,7 +330,7 @@ class GRPOTrainer(Trainer):
             True,  # is_train
         )
 
-        static_argnames = (2, 3, 4, 5, 6, 7, 8, 9, 10)
+        static_argnames = (2, 3, 4, 5, 6, 7, 8)
 
         sharded_training_step_function = jax.jit(
             grpo_step,
@@ -343,10 +341,8 @@ class GRPOTrainer(Trainer):
         )
 
         self._eval_shared_fn_static_args = (
-            self.eos_token_id,
             self.num_generations,
             self.arguments.beta,
-            self.arguments.max_prompt_length,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,

@@ -73,10 +73,8 @@ def compute_per_token_logps(logits, input_ids, prompt_length):
 def grpo_step(
     state: EasyDeLState,
     batch: tp.Mapping[str, jax.Array],
-    eos_token_id: int,
     num_generations: int,
     beta: float,
-    prompt_length: int,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
@@ -90,8 +88,6 @@ def grpo_step(
         batch_partition_spec=partition_spec,
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
-
-    assert eos_token_id is not None, "`eos_token_id` can not be None"
 
     def loss_fn(tree, minibatch):
         module = flax.nnx.merge(state.graphdef, tree, state.graphother)
@@ -110,21 +106,10 @@ def grpo_step(
             minibatch["advantages"],
         )
 
-        input_ids = jnp.concatenate(
-            [prompt_ids.repeat(num_generations, 0), completion_ids],
-            axis=1,
-        )
-        attention_mask = jnp.concatenate(
-            [prompt_mask.repeat(num_generations, 0), completion_mask],
-            axis=1,
-        )
+        input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
+        attention_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
 
-        per_token_logps = get_per_token_logps(
-            module,
-            input_ids,
-            attention_mask,
-            prompt_ids.shape[-1],
-        )
+        per_token_logps = get_per_token_logps(module, input_ids, attention_mask, prompt_ids.shape[-1])
 
         ref_per_token_logps = minibatch["ref_per_token_logps"]
         per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
