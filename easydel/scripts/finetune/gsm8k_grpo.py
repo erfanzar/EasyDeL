@@ -43,47 +43,20 @@ class RunTimeConfig:
     xml_full_match_reject: float = field(default=0.0)
     correctness_reward: float = field(default=2.0)
     kv_cache_quantization: ed.EasyDeLQuantizationMethods = field(default=ed.EasyDeLQuantizationMethods.NONE)
-    num_return_sequences: int = field(
-        default=8,
-        metadata={"help": "number of sequences to generate from each sequence"},
-    )
 
-    top_p: float = field(
-        default=0.95,
-        metadata={"help": "top_p in vInference GenerationConfig"},
-    )
-    top_k: int = field(
-        default=50,
-        metadata={"help": "top_k in vInference GenerationConfig"},
-    )
-    temperature: float = field(
-        default=0.7,
-        metadata={"help": "temperature in vInference GenerationConfig"},
-    )
     sharding_axis: str = field(
         default="1, -1, 1, 1, 1",
         metadata={"help": "The sharding axis."},
     )
     attn_mechanism: ed.AttentionMechanisms = field(
-        default=ed.AttentionMechanisms.VANILLA,
-        metadata={"help": "The attention mechanism to use."},
+        default=ed.AttentionMechanisms.AUTO, metadata={"help": "The attention mechanism to use."}
     )
 
-    param_dtype: jnp.dtype = field(
-        default=jnp.bfloat16,
-        metadata={"help": "The data type for model parameters."},
-    )
-    dtype: jnp.dtype = field(
-        default=jnp.bfloat16,
-        metadata={"help": "The data type for general computation."},
-    )
-    attn_dtype: jnp.dtype = field(
-        default=jnp.bfloat16,
-        metadata={"help": "The data type for attention computation."},
-    )
+    param_dtype: jnp.dtype = field(default=jnp.bfloat16, metadata={"help": "The data type for model parameters."})
+    dtype: jnp.dtype = field(default=jnp.bfloat16, metadata={"help": "The data type for general computation."})
+    attn_dtype: jnp.dtype = field(default=jnp.bfloat16, metadata={"help": "The data type for attention computation."})
     attn_softmax_dtype: jnp.dtype = field(
-        default=jnp.float32,
-        metadata={"help": "The data type for attention softmax computation."},
+        default=jnp.float32, metadata={"help": "The data type for attention softmax computation."}
     )
 
     def __post_init__(self):
@@ -224,38 +197,8 @@ def main():
         contents = [completion[0]["content"] for completion in completions]
         return [count_xml(c) for c in contents]
 
-    max_prompt_length = grpo_config.max_prompt_length
-    max_completion_length = grpo_config.max_completion_length
-    total_batch_size = grpo_config.total_batch_size
-
     train_dataset = get_gsm8k_questions("train")
     test_dataset = get_gsm8k_questions("test")
-    vinference = ed.vInference(
-        model=model,
-        processor_class=processor,
-        generation_config=ed.vInferenceConfig(
-            bos_token_id=processor.bos_token_id,
-            eos_token_id=processor.eos_token_id,
-            pad_token_id=processor.pad_token_id,
-            max_new_tokens=max_completion_length,
-            streaming_chunks=64,
-            sampling_params=ed.SamplingParams(
-                max_tokens=max_completion_length,
-                top_k=runtime_config.top_k,
-                top_p=runtime_config.top_p,
-                temperature=runtime_config.temperature,
-            ),
-            num_return_sequences=runtime_config.num_return_sequences,
-        ),
-        seed=84,
-    )
-
-    vinference.precompile(
-        ed.vInferencePreCompileConfig(
-            batch_size=total_batch_size,
-            prefill_length=max_prompt_length,
-        )
-    )
 
     def data_tokenize_fn(batch, tokenizer, tools):
         ids = tokenizer(
@@ -293,7 +236,6 @@ def main():
         eval_dataset=test_dataset,
         train_dataset=train_dataset,
         arguments=grpo_config,
-        vinference=vinference,
         data_tokenize_fn=data_tokenize_fn,
     )
 
