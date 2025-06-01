@@ -404,6 +404,7 @@ class vInferenceConfig:
     streaming_chunks: int = 16
 
     num_return_sequences: int | dict[int, int] | None = 1
+
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None

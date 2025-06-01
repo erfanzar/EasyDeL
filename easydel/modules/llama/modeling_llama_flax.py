@@ -162,6 +162,7 @@ class LlamaAttention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=self.config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=self.config.attention_dropout,
@@ -246,7 +247,6 @@ class LlamaAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
         attn_output = self.resid_dropout(
             self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),

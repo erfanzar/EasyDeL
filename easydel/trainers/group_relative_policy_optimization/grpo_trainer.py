@@ -12,16 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE: Reason why vInference instead of vSurge?
-# - faster generation with FSDP, SP | since vSurge is fast but really depends on TP.
-# - being able to customize top-k, rep penalty and ...
-# - easier to tweak if u wana use EP shardings.
-# - support images.
-# - support almost everysingle model inside easydel echosystem.
-
 
 import typing as tp
-from functools import partial
+from functools import cached_property, partial
 
 import flax
 import flax.nnx
@@ -30,9 +23,8 @@ from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig, ProcessorMixin
 
-from easydel.inference import vInference
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
@@ -79,7 +71,6 @@ class GRPOTrainer(Trainer):
     def __init__(
         self,
         arguments: GRPOConfig,
-        vinference: vInference,
         model: EasyDeLBaseModule | EasyDeLState | None,
         reward_funcs: RewardFunc | list[RewardFunc],
         train_dataset: Dataset | None = None,
@@ -88,15 +79,12 @@ class GRPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
-        # fmt:off
-        # caused by OCD
         assert arguments is not None, (
-            "You Have to pass `arguments` that will be used for training, "
-            "but you have passed `arguments=None`"
+            "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
         )
         assert isinstance(arguments, GRPOConfig), f"arguments type must be `GRPOConfig` but got {type(arguments)}"
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
-        # fmt:on
+
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
@@ -159,15 +147,11 @@ class GRPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
                 reward_funcs[i] = reward_func
 
-        self.vinference = vinference
-        self.num_return_sequences = vinference.generation_config.num_return_sequences
-        self.eos_token_id = vinference.generation_config.eos_token_id
-        self.pad_token_id = vinference.generation_config.pad_token_id
+        self.num_generations = arguments.num_return_sequences
         self.reward_processing_classes = reward_processing_classes
         self.reward_funcs = reward_funcs
         self.arguments = arguments
         self.processing_class = processing_class
-        self.num_generations = vinference.generation_config.num_return_sequences
         self.train_is_conversational = False
         self.eval_is_conversational = False
         self.data_tokenize_fn = data_tokenize_fn
@@ -192,6 +176,34 @@ class GRPOTrainer(Trainer):
             dataset_eval=eval_dataset,
             data_collator=None,
         )
+
+    @cached_property
+    def pad_token_id(self):
+        if isinstance(self.processing_class, ProcessorMixin):
+            pad_token_id = self.processing_class.tokenizer.pad_token_id
+        else:
+            pad_token_id = self.processing_class.pad_token_id
+        if pad_token_id is not None:
+            return pad_token_id
+        else:
+            return self.eos_token_id[0]
+
+    @cached_property
+    def eos_token_id(self) -> list[int]:
+        eos_ids = []
+        if isinstance(self.processing_class, ProcessorMixin):
+            proc_eos_token_id = self.processing_class.tokenizer.eos_token_id
+        else:
+            proc_eos_token_id = self.processing_class.eos_token_id
+        if isinstance(proc_eos_token_id, int):
+            proc_eos_token_id = [proc_eos_token_id]
+        eos_ids = eos_ids + proc_eos_token_id
+        if hasattr(self.model, "generation_config"):
+            conf_eos = self.model.generation_config.eos_token_id
+            if isinstance(conf_eos, int):
+                conf_eos = [conf_eos]
+            eos_ids = eos_ids + conf_eos
+        return list(set(eos_ids))
 
     def _prepare_dataset(
         self,
@@ -220,10 +232,7 @@ class GRPOTrainer(Trainer):
         if not self.arguments.skip_apply_chat_template:
             dataset = dataset.map(
                 maybe_apply_chat_template,
-                fn_kwargs={
-                    "tokenizer": processing_class,
-                    "tools": arguments.tools,
-                },
+                fn_kwargs={"tokenizer": processing_class, "tools": arguments.tools},
                 **map_kwargs,
             )
 
@@ -284,10 +293,41 @@ class GRPOTrainer(Trainer):
         mesh = self.model.mesh
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        _generation_static_argnums = (3,)
 
+        @partial(cjit, static_argnums=_generation_static_argnums)
+        @partial(
+            jax.jit,
+            static_argnums=_generation_static_argnums,
+            in_shardings=(
+                self.state_shardings,
+                empty_sharding,
+                empty_sharding,
+            ),
+            out_shardings=empty_sharding,
+        )
+        def generate(state, input_ids, attention_mask, generation_config):
+            module = state.model
+            with module.mesh:
+                return module.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=generation_config,
+                ).sequences
+
+        self.generate_function = generate
+        self.hf_generation_config = GenerationConfig(
+            top_p=self.arguments.top_p,
+            top_k=self.arguments.top_k,
+            temperature=self.arguments.temperature,
+            pad_token_id=self.pad_token_id,
+            eos_token_id=self.eos_token_id,
+            max_new_tokens=self.arguments.max_completion_length,
+            num_return_sequences=self.num_generations,
+        )
         self._train_shared_fn_static_args = (
             self.eos_token_id,
-            self.num_return_sequences,
+            self.num_generations,
             self.arguments.beta,
             self.arguments.max_prompt_length,
             self.arguments.loss_config,
@@ -309,7 +349,7 @@ class GRPOTrainer(Trainer):
 
         self._eval_shared_fn_static_args = (
             self.eos_token_id,
-            self.num_return_sequences,
+            self.num_generations,
             self.arguments.beta,
             self.arguments.max_prompt_length,
             self.arguments.loss_config,
@@ -378,39 +418,24 @@ class GRPOTrainer(Trainer):
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
-            with capture_time() as vinference_time_fn:
-                for output in self.vinference.generate(  # noqa
-                    input_ids=prompt_ids,
-                    attention_mask=prompt_mask,
-                    graphother=state.graphother,
-                    graphstate=state.graphstate,
-                ):
-                    ...
-
-            vinference_time = vinference_time_fn()
-            prompt_completion_ids = jnp.copy(self._all_gather(output.sequences))
-            completion_ids = prompt_completion_ids[..., output.padded_length :]
+            with capture_time() as generation_time_fn:
+                sequences = self.generate_function(state, prompt_ids, prompt_mask, self.hf_generation_config)
+            generation_time = generation_time_fn()
+            prompt_completion_ids = sequences
+            completion_ids = prompt_completion_ids[..., prompt_ids.shape[-1] :]
             completion_mask = self._make_attn_mask(completion_ids)
             ridmask = prompt_mask.repeat(self.num_generations, 0)
-            output = delete_tree(output)  # free kv memory
-            del output
 
             with capture_time() as token_logps_time_fn:
                 ref_per_token_logps = self.compute_refmodel_logps(
                     self.ref_state.graphstate,
                     self.ref_state.graphother,
-                    self._all_gather(prompt_completion_ids),
-                    self._all_gather(jnp.concatenate([ridmask, completion_mask], -1)),
+                    prompt_completion_ids,
+                    jnp.concatenate([ridmask, completion_mask], -1),
                 )
             token_logps_time = token_logps_time_fn()
-            prompts = self.processing_class.batch_decode(
-                batch["input_ids"],
-                skip_special_tokens=True,
-            )
-            completions_text = self.processing_class.batch_decode(
-                completion_ids,
-                skip_special_tokens=True,
-            )
+            prompts = self.processing_class.batch_decode(batch["input_ids"], skip_special_tokens=True)
+            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
             if is_conversational:
@@ -424,11 +449,7 @@ class GRPOTrainer(Trainer):
             )
             with capture_time() as rewarding_time_fn:
                 for i, (reward_func, reward_processing_class) in enumerate(
-                    zip(
-                        self.reward_funcs,
-                        self.reward_processing_classes,
-                        strict=False,
-                    )
+                    zip(self.reward_funcs, self.reward_processing_classes, strict=False)
                 ):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conversational:
@@ -491,7 +512,7 @@ class GRPOTrainer(Trainer):
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
-            "vinference_time": vinference_time,
+            "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
         for i, reward_func in enumerate(self.reward_funcs):
@@ -499,8 +520,8 @@ class GRPOTrainer(Trainer):
                 rewards_per_func[:, i]
             )
 
-            # i don't care who you are and what you do.
-            # ill find you and ill gather u...
+        # i don't care who you are and what you do.
+        # ill find you and ill gather u...
         return (
             {
                 "prompt_ids": self._all_gather(prompt_ids),

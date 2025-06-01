@@ -237,6 +237,7 @@ class PhiMoEAttention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -350,7 +351,6 @@ class PhiMoEAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)

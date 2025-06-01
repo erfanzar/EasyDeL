@@ -195,6 +195,7 @@ class WhisperAttention(AttentionModule):
         self.out_proj = linear(use_bias=self.bias, rngs=rngs)
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -276,7 +277,6 @@ class WhisperAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=None,
             causal=self.causal,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))

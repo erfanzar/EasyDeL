@@ -75,6 +75,34 @@ class GRPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "whenever to skip extracting prompt from dataset."},
     )
+    num_return_sequences: int = field(
+        default=False,
+        metadata={
+            "help": "The number of sequences to return for each input prompt. Used during sampling to "
+            "generate multiple completions per prompt."
+        },
+    )
+
+    top_p: float = field(
+        default=0.95,
+        metadata={
+            "help": "Top-p (nucleus) sampling threshold. Tokens are sampled from the smallest possible set whose "
+            "cumulative probability exceeds this value."
+        },
+    )
+
+    top_k: int = field(
+        default=50,
+        metadata={"help": "Top-k sampling threshold. Limits sampling to the top-k most probable tokens at each step."},
+    )
+
+    temperature: float = field(
+        default=0.7,
+        metadata={
+            "help": "Sampling temperature. Higher values (e.g., >1.0) produce more random outputs, while "
+            "lower values (e.g., <1.0) make the output more deterministic."
+        },
+    )
 
     def __post_init__(self):
         """Post initialization to set dependent parameters."""

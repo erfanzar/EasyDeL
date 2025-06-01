@@ -22,7 +22,8 @@ class RunTimeConfig:
         processor_repo_id (str, optional): The repository ID for the processor. If None, defaults to repo_id.
         refrence_model_repo_id (str, optional): The repository ID for the reference model. If None, defaults to repo_id.
         sharding_axis (Tuple[int]): The sharding axis. Defaults to (1, -1, 1, 1, 1).
-        attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use. Defaults to ed.AttentionMechanisms.VANILLA.
+        attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use. Defaults to
+            ed.AttentionMechanisms.VANILLA.
         param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
         dtype (jnp.dtype): The data type for general computation. Defaults to jnp.bfloat16.
         attn_dtype (jnp.dtype): The data type for attention computation. Defaults to jnp.bfloat16.

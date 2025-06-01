@@ -383,6 +383,7 @@ class Llama4TextAttention(AttentionModule):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=self.config,
             softmax_scale=self.scaling,
             dropout_prob=0.0,
@@ -470,7 +471,6 @@ class Llama4TextAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=False,
-            dropout_rng=self.rngs.params(),
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attn_output)
@@ -1201,6 +1201,7 @@ class Llama4VisionAttention(AttentionModule):
         self.o_proj = linear_class(self.num_heads * self.head_dim, self.embed_dim)
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=self.config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,

@@ -18,12 +18,14 @@ from enum import Enum
 from functools import cached_property, partial
 
 import einops
+import flax
+import flax.errors
 import flax.nnx as nn
 import jax
 from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from jax import NamedSharding, lax, random
+from jax import NamedSharding, lax
 from jax import numpy as jnp
 from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
@@ -178,6 +180,8 @@ class FlexibleAttentionModule(nn.Module):
         base_config: EasyDeLBaseConfig,
         softmax_scale: float,
         dropout_prob: float = 0.0,
+        *,
+        rngs: nn.Rngs = nn.Rngs(42),
     ):
         """
         Initializes the AttentionModule.
@@ -206,10 +210,8 @@ class FlexibleAttentionModule(nn.Module):
         )
         self.config = base_config
         self.metadata = metadata
-        self.impl = AttentionRegistry.create(
-            impl_name=base_config.attn_mechanism,
-            metadata=metadata,
-        )
+        self.rngs = rngs
+        self.impl = AttentionRegistry.create(impl_name=base_config.attn_mechanism, metadata=metadata)
         self.deterministic = True
         self.impl_decode = None
         if base_config.decode_attn_mechanism is not None:
@@ -233,7 +235,6 @@ class FlexibleAttentionModule(nn.Module):
         attention_mask: Array | None = None,
         segment_ids: Array | None = None,
         causal: bool = True,
-        dropout_rng: random.PRNGKey = None,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -258,7 +259,11 @@ class FlexibleAttentionModule(nn.Module):
         """
         if isinstance(cache_view, PagedAttentionCacheView):
             assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
-
+        try:
+            rngs = self.rngs()
+        except flax.errors.TraceContextError:
+            warnings.warn("couldn't renew rng due to `flax.errors.TraceContextError` error.", stacklevel=1)
+            rngs = None
         with self.config.mesh:
             input_dict = dict(
                 q=query_states,
@@ -273,7 +278,7 @@ class FlexibleAttentionModule(nn.Module):
                 segment_ids=segment_ids,
                 causal=causal,
                 deterministic=self.deterministic,
-                dropout_rng=dropout_rng,
+                dropout_rng=rngs,
             )
             if mode == common_types.MODE_DECODE:
                 assert cache_view is not None

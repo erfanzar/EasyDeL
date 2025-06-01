@@ -211,6 +211,7 @@ class MptAttention(AttentionModule):
             self.softmax_scale = 1 / math.sqrt(self.hidden_size / self.n_heads)
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             dropout_prob=self.config.attn_config.attn_pdrop,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
@@ -477,11 +478,7 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
     return alibi
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=MptConfig,
-    model_type="mpt"
-)
+@register_module(TaskType.BASE_MODULE, config=MptConfig, model_type="mpt")
 class MptModel(EasyDeLBaseModule):
     """MPT model implementation.
 
@@ -638,11 +635,7 @@ class MptModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.CAUSAL_LM,
-    config=MptConfig,
-    model_type="mpt"
-)
+@register_module(TaskType.CAUSAL_LM, config=MptConfig, model_type="mpt")
 class MptForCausalLM(EasyDeLBaseModule):
     """MPT model with a language modeling head.
 

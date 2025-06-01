@@ -317,6 +317,7 @@ class MiniMaxText01Attention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             dropout_prob=config.attention_dropout,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
@@ -400,7 +401,6 @@ class MiniMaxText01Attention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
@@ -784,11 +784,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         return outputs
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=MiniMaxText01Config,
-    model_type="MiniMaxText01"
-)
+@register_module(TaskType.BASE_MODULE, config=MiniMaxText01Config, model_type="MiniMaxText01")
 class MiniMaxText01Model(EasyDeLBaseModule):
     def __init__(
         self,
@@ -941,11 +937,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.CAUSAL_LM,
-    config=MiniMaxText01Config,
-    model_type="MiniMaxText01"
-)
+@register_module(TaskType.CAUSAL_LM, config=MiniMaxText01Config, model_type="MiniMaxText01")
 class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
     def __init__(
         self,

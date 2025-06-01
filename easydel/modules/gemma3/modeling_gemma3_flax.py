@@ -191,6 +191,7 @@ class Gemma3Attention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.config.query_pre_attn_scalar**-0.5,
             dropout_prob=config.attention_dropout,
@@ -332,7 +333,6 @@ class Gemma3Attention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = self.o_proj(attn_output)

@@ -466,6 +466,7 @@ class VisionAttention(AttentionModule):
             rngs=rngs,
         )
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
@@ -709,6 +710,7 @@ class Qwen2VLAttention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -794,7 +796,6 @@ class Qwen2VLAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
@@ -910,11 +911,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         )
 
 
-@register_module(
-    TaskType.BASE_VISION,
-    config=Qwen2VLConfig,
-    model_type="qwen2_vl"
-)
+@register_module(TaskType.BASE_VISION, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
     config_class = Qwen2VLVisionConfig
 
@@ -1047,11 +1044,7 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
         return self.merger(hidden_states)
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=Qwen2VLConfig,
-    model_type="qwen2_vl"
-)
+@register_module(TaskType.BASE_MODULE, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VLModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -1186,11 +1179,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.IMAGE_TEXT_TO_TEXT,
-    config=Qwen2VLConfig,
-    model_type="qwen2_vl"
-)
+@register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
     loss_type = "ForCausalLM"
 

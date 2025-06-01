@@ -249,6 +249,7 @@ class SiglipAttention(AttentionModule):
 
         self.causal = False
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -309,7 +310,6 @@ class SiglipAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=None,
             causal=self.causal,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -584,11 +584,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=SiglipTextConfig,
-    model_type="siglip_text_model"
-)
+@register_module(TaskType.BASE_MODULE, config=SiglipTextConfig, model_type="siglip_text_model")
 class SiglipTextModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -839,11 +835,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         return hidden_state[:, 0]
 
 
-@register_module(
-    TaskType.BASE_VISION,
-    config=SiglipVisionConfig,
-    model_type="siglip_vision_model"
-)
+@register_module(TaskType.BASE_VISION, config=SiglipVisionConfig, model_type="siglip_vision_model")
 class SiglipVisionModel(nn.Module):
     def __init__(
         self,
@@ -877,11 +869,7 @@ class SiglipVisionModel(nn.Module):
         )
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=SiglipConfig,
-    model_type="siglip"
-)
+@register_module(TaskType.BASE_MODULE, config=SiglipConfig, model_type="siglip")
 class SiglipModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -1057,11 +1045,7 @@ class SiglipModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.IMAGE_CLASSIFICATION,
-    config=SiglipConfig,
-    model_type="siglip"
-)
+@register_module(TaskType.IMAGE_CLASSIFICATION, config=SiglipConfig, model_type="siglip")
 class SiglipForImageClassification(EasyDeLBaseModule):
     def __init__(
         self,

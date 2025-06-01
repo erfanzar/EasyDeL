@@ -495,6 +495,7 @@ class DeepseekV2Attention(AttentionModule):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 softmax_scale = self.softmax_scale * mscale * mscale
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=softmax_scale,
             dropout_prob=config.attention_dropout,
@@ -608,7 +609,6 @@ class DeepseekV2Attention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
