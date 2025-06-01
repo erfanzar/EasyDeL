@@ -329,39 +329,21 @@ def create_sampling_step(
 
         logits = model_outputs.logits[:, -1]
 
-        logits = sampling_params.logits_warper(
-            state.sequences,
-            logits,
-            state.current_length,
-        )
-        logits = sampling_params.logits_warper(
-            state.sequences,
-            logits,
-            state.current_length,
-        )
+        logits = sampling_params.logits_warper(state.sequences, logits, state.current_length)
+        logits = sampling_params.logits_warper(state.sequences, logits, state.current_length)
 
         next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
-
-        # Ensure finished sequences continue generating pad tokens
         next_token = next_token * ~state.is_sequence_finished + pad_token_id * state.is_sequence_finished
-        # Determine if the sequence is finished (EOS encountered or already finished)
 
         next_sequence_finished = jnp.logical_or(
             state.generated_tokens >= (sampling_params.max_tokens * state.sequences.shape[0]),
             state.is_sequence_finished | jnp.isin(next_token, eos_token_id),
         )
 
-        next_token = next_token[:, None]  # Add dimension for dynamic update
-        # Update sequences with the new token
-        next_sequences = jax.lax.dynamic_update_slice(
-            state.sequences,
-            next_token,
-            (0, state.current_length),
-        )
-        # Update model-specific arguments (like past KVs)
+        next_token = next_token[:, None]
+        next_sequences = jax.lax.dynamic_update_slice(state.sequences, next_token, (0, state.current_length))
         next_model_kwargs = model.update_inputs_for_generation(model_outputs, state.model_kwargs)
 
-        # Return the updated state
         return state.replace(
             current_length=state.current_length + 1,
             sequences=next_sequences,
@@ -508,10 +490,8 @@ class vInferenceConfig:
            `max_tokens` attribute to the value of `self.max_new_tokens`.
         """
         if isinstance(self.max_new_tokens, int):
-            # Calculate the number of streaming loops needed
             self._loop_rows = (self.max_new_tokens + self.streaming_chunks - 1) // self.streaming_chunks
         if self.sampling_params is None:
-            # Initialize default sampling parameters if none provided
             self.sampling_params = SamplingParams(max_tokens=self.max_new_tokens)
         self.sampling_params.n = None
         self.sampling_params.stop = None
