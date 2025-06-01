@@ -75,7 +75,7 @@ def expand_inputs_for_generation(
     return input_ids, model_kwargs
 
 
-def prefill_fn(
+def prefill_func(
     graphdef: EasyDeLBaseModule,
     graphstate: dict,
     graphother,
@@ -105,7 +105,7 @@ def prefill_fn(
     return state
 
 
-def decode_fn(
+def interval_func(
     graphdef: EasyDeLBaseModule,
     graphstate: dict,
     graphother,

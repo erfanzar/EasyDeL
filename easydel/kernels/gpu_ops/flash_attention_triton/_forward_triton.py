@@ -496,7 +496,7 @@ def _fwd_attention_kernel_call(
 
     assert nheads_q % nheads_kv == 0, f"{nheads_q = } is not divisible by {nheads_kv =}"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
-    assert q.dtype in [jnp.float16, jnp.bfloat16], "Only support fp16 and bf16"
+    assert q.dtype in [jnp.float16, jnp.bfloat16], f"Only support fp16 and bf16 got {q.dtype}"
 
     softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
     BOOL_BIAS = False

@@ -358,7 +358,7 @@ class EasyGenerationMixin:
     @staticmethod
     def compute_prefill_length(array, padding_id) -> chex.Array:
         """
-        Calculates the number of non-padding tokens at the beginning of each sequence.
+        Calculates the number of padding tokens at the beginning of each sequence.
 
         This is useful for determining the actual starting position in a KV cache when
         dealing with left-padded inputs.
@@ -371,7 +371,21 @@ class EasyGenerationMixin:
             chex.Array: An array of shape (batch_size,) containing the number of leading
                 padding tokens for each sequence in the batch.
         """
-        return jnp.sum(jnp.cumsum(array != padding_id, axis=-1) == 0, axis=-1)
+        return jnp.sum(jnp.cumsum(array == padding_id, axis=-1) == 0, axis=-1)
+
+    @staticmethod
+    def compute_prefill_length_from_mask(mask) -> chex.Array:
+        """
+        Calculates the number of padding tokens at the beginning of each sequence.
+
+        This is useful for determining the actual starting position in a KV cache when
+        dealing with left-padded inputs.
+
+        Returns:
+            chex.Array: An array of shape (batch_size,) containing the number of leading
+                padding tokens for each sequence in the batch.
+        """
+        return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
 
     def prepare_inputs_for_generation(
         self,
@@ -412,8 +426,10 @@ class EasyGenerationMixin:
         """
         batch_size, seq_length = input_ids.shape
         if starts is None:
-            starts = self.compute_prefill_length(input_ids, pad_token_id)
-
+            if attention_mask is not None:
+                starts = self.compute_prefill_length_from_mask(attention_mask)
+            else:
+                starts = self.compute_prefill_length(input_ids, pad_token_id)
         past_key_values = self.init_cache(
             batch_size,
             max_length,
@@ -1583,7 +1599,11 @@ class EasyGenerationMixin:
             graphdef=self.graphdef,
             mesh=self.mesh,
             partition_axis=self.config.partition_axis,
-            inference_name=str(self._model_task) + str(self._model_type) + ":" + size_in_billions,
+            inference_name=str(getattr(self._model_task, "value", self._model_task))
+            + "-"
+            + str(self._model_type)
+            + ":"
+            + size_in_billions,
             input_partition_spec=input_partition_spec,
             seed=seed,
             report_metrics=False,

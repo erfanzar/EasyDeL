@@ -166,6 +166,7 @@ class FalconAttention(AttentionModule):
                 dtype=self.dtype,
             )
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -313,7 +314,6 @@ class FalconAttention(AttentionModule):
                 attention_mask=None,
                 segment_ids=segment_ids,
                 causal=True,
-                dropout_rng=self.rngs.params(),
             )
             attention_outputs = attention.attention_outputs
             attention_outputs = attention_outputs.reshape(batch_size, query_length, self.num_heads * self.head_dim)

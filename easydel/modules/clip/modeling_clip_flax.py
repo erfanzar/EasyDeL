@@ -269,6 +269,7 @@ class CLIPAttention(AttentionModule):
 
         self.causal = isinstance(config, CLIPTextConfig)
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,

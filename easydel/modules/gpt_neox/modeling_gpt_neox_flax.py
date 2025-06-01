@@ -100,6 +100,7 @@ class GPTNeoXAttention(AttentionModule):
             rngs=rngs,
         )
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
@@ -191,7 +192,6 @@ class GPTNeoXAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

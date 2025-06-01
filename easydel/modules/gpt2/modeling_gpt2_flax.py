@@ -217,6 +217,7 @@ class GPT2Attention(AttentionModule):
 
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             dropout_prob=config.attn_pdrop,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
@@ -310,7 +311,6 @@ class GPT2Attention(AttentionModule):
             cache_view=cache_view,
             attention_mask=attention_mask,
             causal=self.causal,
-            dropout_rng=self.rngs.params(),
             segment_ids=None,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))

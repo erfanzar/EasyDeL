@@ -132,6 +132,7 @@ class InternLM2Attention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
@@ -228,7 +229,6 @@ class InternLM2Attention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.wo(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))

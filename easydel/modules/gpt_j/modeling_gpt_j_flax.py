@@ -123,6 +123,7 @@ class GPTJAttention(AttentionModule):
         )
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             dropout_prob=config.attn_pdrop,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
@@ -211,7 +212,6 @@ class GPTJAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = self.out_proj(attn_output)

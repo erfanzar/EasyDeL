@@ -153,6 +153,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
         self.head_dim = head_dim
 
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
@@ -301,7 +302,6 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))

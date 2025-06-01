@@ -48,7 +48,7 @@ from easydel.utils.lazy_import import is_package_available
 from easydel.utils.rngs_utils import GenerateRNG
 
 from ..utilities import SamplingParams
-from ._fn import decode_fn, expand_inputs_for_generation, get_compiled_funcs, prefill_fn, put_compiled_funcs
+from ._fn import expand_inputs_for_generation, get_compiled_funcs, interval_func, prefill_func, put_compiled_funcs
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
@@ -114,6 +114,7 @@ class vInference:
         inference_name: str | None = None,
         partition_axis: eformer.escale.PartitionAxis | None = None,
         report_metrics: bool = True,
+        verbose: bool = True,
     ):
         """Initialize vInference with model components and configuration.
 
@@ -136,6 +137,7 @@ class vInference:
             AssertionError: If required parameters are missing for lazy initialization.
             ValueError: If model property is accessed during lazy initialization.
         """
+        self.log = logger.info if verbose else logger.debug
         self._init_model_components(model, graphdef, graphstate, graphother, mesh, inference_name, partition_axis)
         self.processor_class = processor_class
         self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
@@ -215,9 +217,9 @@ class vInference:
 
         if not self._report_metrics:
             if has_prometheus:
-                logger.info("vInference metrics reporting is disabled")
+                self.log("vInference metrics reporting is disabled")
             else:
-                logger.info("prometheus_client not found - vInference metrics will be disabled")
+                self.log("prometheus_client not found - vInference metrics will be disabled")
 
     def get_model(self, graphstate: nn.GraphState | None = None, graphother: nn.GraphState | None = None):
         if graphstate is None:
@@ -255,7 +257,7 @@ class vInference:
                 return vInferenceMetrics(self._inference_name)
             else:
                 self._report_metrics = False
-                logger.info("`prometheus_client` not found!, metrics logging in vinference will be disabled")
+                self.log("`prometheus_client` not found!, metrics logging in vinference will be disabled")
         return None
 
     def _metrics_increase_queue(self):
@@ -499,7 +501,7 @@ class vInference:
         func = get_compiled_funcs(standalone_config=vinference_compile_config, id="_init_state", safe=False)
 
         if func is None:
-            logger.info(f"registering new signature({vinference_compile_config.get_default_hash()}) for `_init_state`")
+            self.log(f"registering new signature({vinference_compile_config.get_default_hash()}) for `_init_state`")
             eshape = jax.eval_shape(
                 self._init_state_pure,
                 graphstate=graphstate,
@@ -592,7 +594,7 @@ class vInference:
             tuple[int, int]: The optimal (batch_size, sequence_length) configuration
         """
         if not self._precompiled_configs:
-            warnings.warn(
+            logger.warn(
                 f"vInference [{self.inference_name}] doesn't contain any precompiled "
                 "config please precompile instance for best performance",
                 stacklevel=1,
@@ -924,8 +926,8 @@ class vInference:
     def _inner_generate(
         self,
         state: SampleState,
-        prefill_fn: tp.Callable[[tp.Any], SampleState] | None,
-        decode_fn: tp.Callable[[tp.Any], SampleState] | None,
+        prefill_func: tp.Callable[[tp.Any], SampleState] | None,
+        interval_func: tp.Callable[[tp.Any], SampleState] | None,
         *,
         graphstate: nn.GraphState | None = None,
         graphother: nn.GraphState | None = None,
@@ -945,7 +947,7 @@ class vInference:
             graphother=graphother,
             compile_config=compile_config,
             sampling_params=sampling_params,
-            func=prefill_fn,
+            func=prefill_func,
         )
 
         if not state.is_sequence_finished.all():
@@ -957,7 +959,7 @@ class vInference:
                     graphother=graphother,
                     compile_config=compile_config,
                     sampling_params=sampling_params,
-                    func=decode_fn,
+                    func=interval_func,
                 )
                 yield state
                 if state.is_sequence_finished.all():
@@ -1109,7 +1111,7 @@ class vInference:
         if do_compile:
             graphstate = graphstate if graphstate is not None else self.graphstate
             graphother = graphother if graphother is not None else self.graphother
-            logger.info("initiating state for lowering and compiling func.")
+            self.log("initiating state for lowering and compiling func.")
             model = self.get_model(graphstate=graphstate, graphother=graphother)
             wargs = model._get_compile_model_kwargs(
                 input_tokens_length=standalone_config.prefill_length,
@@ -1124,10 +1126,10 @@ class vInference:
                 model_kwargs=wargs,
             )
 
-            logger.info("smart compiling `prefill`")
-            logger.info("lowering `prefill`")
+            self.log("smart compiling `prefill`")
+            self.log("lowering `prefill`")
             prefill_lowered = jax.jit(
-                prefill_fn,
+                prefill_func,
                 donate_argnums=(3,),
                 static_argnums=(0, 4),
                 in_shardings=(
@@ -1144,11 +1146,11 @@ class vInference:
                 self.generation_config,  # Static
                 self.generation_config.sampling_params,
             )
-            logger.info("`prefill` lowered successfully.")
-            compiled_prefill_fn = smart_compile(prefill_lowered, tag="vinference.prefill_fn")
-            logger.info("smart compiling `decode`")
-            logger.info("lowering `decode`")
-            sample_state = compiled_prefill_fn(
+            self.log("`prefill` lowered successfully.")
+            compiled_prefill_func = smart_compile(prefill_lowered, tag="vinference.prefill_func")
+            self.log("smart compiling `decode`")
+            self.log("lowering `decode`")
+            sample_state = compiled_prefill_func(
                 graphstate,
                 graphother,
                 state,
@@ -1156,7 +1158,7 @@ class vInference:
             )
             sample_state_shardings = es.extract_shardings(sample_state)
             decode_lowered = jax.jit(
-                decode_fn,
+                interval_func,
                 donate_argnums=(3,),
                 static_argnums=(0, 4),
                 in_shardings=(
@@ -1176,13 +1178,13 @@ class vInference:
                 self.generation_config.sampling_params,
                 self.generation_config.streaming_chunks,
             )
-            logger.info("`decode` lowered successfully.")
-            compiled_decode_fn = smart_compile(decode_lowered, tag="vinference.decode_fn")
+            self.log("`decode` lowered successfully.")
+            compiled_interval_func = smart_compile(decode_lowered, tag="vinference.interval_func")
 
             del state
-            logger.info("saving compiled functions...")
+            self.log("saving compiled functions...")
             put_compiled_funcs(
-                funcs=(compiled_prefill_fn, compiled_decode_fn),
+                funcs=(compiled_prefill_func, compiled_interval_func),
                 standalone_config=standalone_config,
                 id=self._uuid4,
             )
@@ -1205,14 +1207,14 @@ class vInference:
         """
         if config.prefill_length is None:
             config.prefill_length = self.model_prefill_length
-            logger.info("`input_tokens_length` is None using `vInference.model_prefill_length`")
+            self.log("`input_tokens_length` is None using `vInference.model_prefill_length`")
         for standalone_config in config.get_standalones():
             config_hash = standalone_config.get_default_hash()
 
             if config_hash in self._precompiled_configs.keys():
                 return True
             if config_hash in self._in_compiling_process:
-                logger.info(
+                self.log(
                     f"lowering and compiling with `config` {config_hash} have "
                     "already been requested adding 5 second timeout"
                 )
@@ -1224,7 +1226,7 @@ class vInference:
                 )
             else:
                 with self._compilation_metrics_recorder():
-                    logger.info(f"lowering and compiling with `config` {config_hash}")
+                    self.log(f"lowering and compiling with `config` {config_hash}")
                     self._in_compiling_process.add(config_hash)
                     with self.mesh:
                         self._compile_and_lower_funs(
@@ -1248,9 +1250,11 @@ class vInference:
         )
         for config_key, config in self._precompiled_configs.items():
             metafile = f"{metadata.uuid4}-{config_key}"
-            compiled_prefill_fn, compiled_decode_fn = get_compiled_funcs(standalone_config=config, id=metadata.uuid4)
-            save_compiled_fn(path=path, fn=compiled_prefill_fn, prefix=f"compiled-prefill-{metafile}")
-            save_compiled_fn(path=path, fn=compiled_decode_fn, prefix=f"compiled-decode-{metafile}")
+            compiled_prefill_func, compiled_interval_func = get_compiled_funcs(
+                standalone_config=config, id=metadata.uuid4
+            )
+            save_compiled_fn(path=path, fn=compiled_prefill_func, prefix=f"compiled-prefill-{metafile}")
+            save_compiled_fn(path=path, fn=compiled_interval_func, prefix=f"compiled-decode-{metafile}")
 
         metadata = pickle.dump(metadata, open(path / "config", "wb"))
 
@@ -1266,10 +1270,10 @@ class vInference:
         metadata = pickle.load(open(path / "config", "rb"))
         for config_key, standalone_config in metadata.precompiled_configs.items():
             metafile = f"{metadata.uuid4}-{config_key}"
-            compiled_prefill_fn = load_compiled_fn(path=path, prefix=f"compiled-prefill-{metafile}")
-            compiled_decode_fn = load_compiled_fn(path=path, prefix=f"compiled-decode-{metafile}")
+            compiled_prefill_func = load_compiled_fn(path=path, prefix=f"compiled-prefill-{metafile}")
+            compiled_interval_func = load_compiled_fn(path=path, prefix=f"compiled-decode-{metafile}")
             put_compiled_funcs(
-                funcs=(compiled_prefill_fn, compiled_decode_fn),
+                funcs=(compiled_prefill_func, compiled_interval_func),
                 standalone_config=standalone_config,
                 id=metadata.uuid4,
             )
@@ -1502,7 +1506,7 @@ class vInference:
         effective_concurrency = max(1, max_concurrent_requests) if max_concurrent_requests > 0 else 1
 
         if not stream:
-            logger.info(
+            self.log(
                 f"Processing {num_prompts} prompts concurrently (non-streaming, max_workers={effective_concurrency})"
             )
             results = [None] * num_prompts

@@ -144,6 +144,7 @@ class RobertaSelfAttention(AttentionModule):
                 "                   : {self.config.num_attention_heads}"
             )
         self.attention_performer = FlexibleAttentionModule(
+            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
@@ -787,11 +788,7 @@ class RobertaClassificationHead(nn.Module):
         return hidden_states
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=RobertaConfig,
-    model_type="roberta"
-)
+@register_module(TaskType.BASE_MODULE, config=RobertaConfig, model_type="roberta")
 class RobertaModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -896,11 +893,7 @@ class RobertaModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.SEQUENCE_CLASSIFICATION,
-    config=RobertaConfig,
-    model_type="roberta"
-)
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
 class RobertaForSequenceClassification(EasyDeLBaseModule):
     def __init__(
         self,
@@ -1203,11 +1196,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.CAUSAL_LM,
-    config=RobertaConfig,
-    model_type="roberta"
-)
+@register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
 class RobertaForCausalLM(EasyDeLBaseModule):
     def __init__(
         self,
