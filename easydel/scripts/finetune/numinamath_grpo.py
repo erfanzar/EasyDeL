@@ -40,27 +40,12 @@ class RunTimeConfig:
         metadata={"help": "The repository ID for the processor. If None, defaults to repo_id."},
     )
     kv_cache_quantization: ed.EasyDeLQuantizationMethods = field(default=ed.EasyDeLQuantizationMethods.NONE)
-    num_return_sequences: int = field(
-        default=8,
-        metadata={"help": "number of sequences to generate from each sequence"},
-    )
 
     dataset_use_rate: int = field(
         default=100,
         metadata={"help": "split in train or test dataset"},
     )
-    top_p: float = field(
-        default=0.95,
-        metadata={"help": "top_p in vInference GenerationConfig"},
-    )
-    top_k: int = field(
-        default=50,
-        metadata={"help": "top_k in vInference GenerationConfig"},
-    )
-    temperature: float = field(
-        default=0.7,
-        metadata={"help": "temperature in vInference GenerationConfig"},
-    )
+
     sharding_axis: str = field(
         default="1, -1, 1, 1, 1",
         metadata={"help": "The sharding axis."},
@@ -144,34 +129,6 @@ def main():
         dtype=runtime_config.dtype,
         precision=jax.lax.Precision.DEFAULT,
         partition_axis=ed.PartitionAxis(),
-    )
-
-    total_batch_size = grpo_config.total_batch_size
-
-    vinference = ed.vInference(
-        model=model,
-        processor_class=processor,
-        generation_config=ed.vInferenceConfig(
-            bos_token_id=processor.bos_token_id,
-            eos_token_id=processor.eos_token_id,
-            pad_token_id=processor.pad_token_id,
-            max_new_tokens=max_completion_length,
-            streaming_chunks=64,
-            sampling_params=ed.SamplingParams(
-                max_tokens=max_completion_length,
-                top_k=runtime_config.top_k,
-                top_p=runtime_config.top_p,
-                temperature=runtime_config.temperature,
-            ),
-            num_return_sequences=runtime_config.num_return_sequences,
-        ),
-    )
-
-    vinference.precompile(
-        ed.vInferencePreCompileConfig(
-            batch_size=total_batch_size,
-            prefill_length=max_prompt_length,
-        )
     )
 
     def format_reward(completions, **kwargs):
@@ -265,7 +222,6 @@ def main():
         eval_dataset=test_dataset,
         train_dataset=train_dataset,
         arguments=grpo_config,
-        vinference=vinference,
         data_tokenize_fn=data_tokenize_fn,
     )
 
