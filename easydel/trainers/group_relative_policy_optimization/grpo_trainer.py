@@ -176,7 +176,7 @@ class GRPOTrainer(Trainer):
             )
         table = None
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            table = wandb.Table(columns=["generations", "took", "length", "index", "step"])
+            table = wandb.Table(columns=["generations", "took", "length", "rewards", "step"])
         self.table = table
         super().__init__(
             model_state=model,
@@ -524,8 +524,7 @@ class GRPOTrainer(Trainer):
         if self.table is not None:
             cur_step = jax.device_get(state.step)
             decoded_text = self.processing_class.batch_decode(jax.device_get(completion_ids))
-            for idx, text in enumerate(decoded_text):
-                self.table.add_data(text, generation_time, completion_length, idx, cur_step)
+            self.table.add_data(decoded_text, generation_time, completion_length, metrics_dict, cur_step)
             wandb.log({"generations": self.table}, step=cur_step)
 
         # i don't care who you are and what you do.
