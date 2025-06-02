@@ -174,10 +174,10 @@ class GRPOTrainer(Trainer):
                 arguments=arguments,
                 dataset_name="eval",
             )
-        table = None
+        log_table = None
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            table = wandb.Table(columns=["generations", "took", "length", "rewards", "step"])
-        self.table = table
+            log_table = wandb.Table(columns=["generations", "took", "length", "step"])
+        self.log_table = log_table
         super().__init__(
             model_state=model,
             arguments=arguments,
@@ -518,14 +518,14 @@ class GRPOTrainer(Trainer):
             "preprocessing_time": preprocessing_time,
         }
         for i, reward_func in enumerate(self.reward_funcs):
-            metrics_dict[getattr(reward_func, "__name__", None) or reward_func.__class__.__name__] = jnp.mean(
-                rewards_per_func[:, i]
-            )
-        if self.table is not None:
+            _name = getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
+            metrics_dict[_name] = jnp.mean(rewards_per_func[:, i])
+        if self.log_table is not None:
             cur_step = jax.device_get(state.step)
             decoded_text = self.processing_class.batch_decode(jax.device_get(completion_ids))
-            self.table.add_data(decoded_text, generation_time, completion_length, metrics_dict, cur_step)
-            wandb.log({"generations": self.table}, step=cur_step)
+            for text in decoded_text:
+                self.log_table.add_data(text, generation_time, completion_length, cur_step)
+            wandb.log({"generations": self.log_table}, step=cur_step)
 
         # i don't care who you are and what you do.
         # ill find you and ill gather u...
