@@ -39,6 +39,11 @@ from ..training_configurations import MetricsType
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
+try:
+    import wandb  # type:ignore
+except ImportError:
+    wandb = None
+
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
     from tensorflow import data
@@ -169,6 +174,10 @@ class GRPOTrainer(Trainer):
                 arguments=arguments,
                 dataset_name="eval",
             )
+        table = None
+        if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
+            table = wandb.Table(columns=["generations", "took", "length", "index", "step"])
+        self.table = table
         super().__init__(
             model_state=model,
             arguments=arguments,
@@ -294,7 +303,7 @@ class GRPOTrainer(Trainer):
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
-        @cjit
+        @partial(cjit, verbose=False)
         @partial(
             jax.jit,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
@@ -313,6 +322,7 @@ class GRPOTrainer(Trainer):
                         pad_token_id=self.pad_token_id,
                         eos_token_id=self.eos_token_id,
                         max_new_tokens=self.arguments.max_completion_length,
+                        max_length=self.arguments.max_completion_length + self.arguments.max_prompt_length,
                         num_return_sequences=self.num_generations,
                         do_sample=True,
                     ),
@@ -410,7 +420,7 @@ class GRPOTrainer(Trainer):
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                sequences = self.generate_function(state, prompt_ids, prompt_mask)
+                sequences = jax.block_until_ready(self.generate_function(state, prompt_ids, prompt_mask))
             generation_time = generation_time_fn()
             prompt_completion_ids = sequences
             completion_ids = prompt_completion_ids[..., prompt_ids.shape[-1] :]
@@ -497,9 +507,10 @@ class GRPOTrainer(Trainer):
                 )
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()
+        completion_length = jnp.sum(completion_mask.sum(-1), -1)
         metrics_dict = {
             "rewards": jnp.mean(rewards, -1),
-            "completion_length": jnp.sum(completion_mask.sum(-1), -1),
+            "completion_length": completion_length,
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
@@ -510,6 +521,12 @@ class GRPOTrainer(Trainer):
             metrics_dict[getattr(reward_func, "__name__", None) or reward_func.__class__.__name__] = jnp.mean(
                 rewards_per_func[:, i]
             )
+        if self.table is not None:
+            cur_step = jax.device_get(state.step)
+            decoded_text = self.processing_class.batch_decode(jax.device_get(completion_ids))
+            for idx, text in enumerate(decoded_text):
+                self.table.add_data(text, generation_time, completion_length, idx, cur_step)
+            wandb.log({"generations": self.table}, step=cur_step)
 
         # i don't care who you are and what you do.
         # ill find you and ill gather u...
