@@ -54,9 +54,14 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_reduce_scatter_combine_threshold_bytes=33554432 "
         "--xla_gpu_all_reduce_combine_threshold_bytes=33554432 "
         "--xla_gpu_multi_streamed_windowed_einsum=true  "
-        "--xla_gpu_threshold_for_windowed_einsum_mib=0  "
         "--xla_gpu_enable_latency_hiding_scheduler=true  "
         "--xla_gpu_enable_command_buffer=  "
+        "--xla_gpu_enable_cublaslt=true "
+        "--xla_gpu_enable_cudnn_fmha=true "
+        "--xla_gpu_force_compilation_parallelism=4 "
+        "--xla_gpu_enable_shared_constants=true "
+        "--xla_gpu_enable_triton_gemm=true "
+        "--xla_gpu_graph_level=2 "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
         _os.getenv("LIBTPU_INIT_ARGS", "") + " "
