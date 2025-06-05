@@ -51,9 +51,9 @@ class SFTConfig(TrainingArguments):
             for more details. Defaults to 3.6.
     """
 
-    model_name: str = field(
-        default="SFTTrainer",
-        metadata={"help": "The name of the model."},
+    trainer_prefix: str | None = field(
+        default="sfttrainer",
+        metadata={"help": "default prefix name for trainer."},
     )
     dataset_text_field: str | None = field(
         default=None,

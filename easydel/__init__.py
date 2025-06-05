@@ -65,18 +65,18 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
         _os.getenv("LIBTPU_INIT_ARGS", "") + " "
-        "--xla_tpu_enable_latency_hiding_scheduler=true "  # Concept supported
-        "--xla_enable_async_collective_permute=true "  # Aligns with async strategy
-        "--xla_tpu_enable_ag_backward_pipelining=true "  # Aligns with async/overlap strategy
-        "--xla_tpu_enable_data_parallel_all_reduce_opt=true "  #  Good for DP overlap
-        "--xla_tpu_data_parallel_opt_different_sized_ops=true "  # : Enables pipelining, BUT watch memory!
-        "--xla_tpu_enable_async_collective_fusion=true "  #  Key fusion flag
-        "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "  #  More fusion flexibility
-        "--xla_tpu_overlap_compute_collective_tc=true "  #  Fine-grained overlap
-        "--xla_enable_async_all_gather=true "  # Needed for async AG fusion
-        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "  #  Controls AG fusion
+        "--xla_tpu_enable_latency_hiding_scheduler=true "
+        "--xla_enable_async_collective_permute=true "
+        "--xla_tpu_enable_ag_backward_pipelining=true "
+        "--xla_tpu_enable_data_parallel_all_reduce_opt=true "
+        "--xla_tpu_data_parallel_opt_different_sized_ops=true "
+        "--xla_tpu_enable_async_collective_fusion=true "
+        "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+        "--xla_tpu_overlap_compute_collective_tc=true "
+        "--xla_enable_async_all_gather=true "
+        "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
         "--xla_tpu_megacore_fusion_allow_ags=true "
-        "TPU_MEGACORE=MEGACORE_DENSE "  # Or MEGACORE_XL
+        "TPU_MEGACORE=MEGACORE_DENSE "
     )
     _os.environ.update(
         {
@@ -85,7 +85,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
             "NCCL_PROTO": "SIMPLE,LL,LL128",
         }
     )
-    _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     if _os.getenv("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
         _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
     if _os.getenv("JAX_TRACEBACK_FILTERING", None) is None:

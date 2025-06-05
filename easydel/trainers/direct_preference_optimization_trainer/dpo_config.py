@@ -95,9 +95,9 @@ class DPOConfig(TrainingArguments):
         ... )
     """
 
-    model_name: str = field(
-        default="DPOTrainer",
-        metadata={"help": "The name of the model."},
+    trainer_prefix: str | None = field(
+        default="dpotrainer",
+        metadata={"help": "default prefix name for trainer."},
     )
     beta: float = field(
         default=0.1,

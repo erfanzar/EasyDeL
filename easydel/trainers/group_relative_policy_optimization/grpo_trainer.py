@@ -96,7 +96,9 @@ class GRPOTrainer(Trainer):
 
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
+
         self.ref_state = deepcopy_model(model=model)
+
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(
                 model.model.config._name_or_path,
@@ -178,6 +180,7 @@ class GRPOTrainer(Trainer):
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
             log_table = wandb.Table(columns=["generations", "took", "length", "step"])
         self.log_table = log_table
+
         super().__init__(
             model_state=model,
             arguments=arguments,

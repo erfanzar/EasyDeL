@@ -140,7 +140,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 self.generation_config.save_pretrained(str(save_directory))
 
         output_model_file = save_directory / FLAX_WEIGHTS_NAME
-        state = nn.split(self, nn.Param, ...)[1]
+        state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
         output_model_file = CheckpointManager.save_checkpoint(
@@ -634,7 +634,7 @@ class EasyBridgeMixin(PushToHubMixin):
     def _from_torch_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device: jax.Device | None = None,
+        device: jax.Device | None = None,  # type:ignore
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,

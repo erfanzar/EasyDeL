@@ -119,8 +119,12 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             parameters[key] = value.value
         return parameters
 
+    @property
+    def graphstate_type(self):
+        return nn.LoRAParam if self.lora_is_enabled else nn.Param
+
     def split_module(self):
-        return nn.split(self, nn.Param, ...)
+        return nn.split(self, self.graphstate_type, ...)
 
     @staticmethod
     def merge_module(graphdef: nn.GraphDef, graphstate: nn.GraphState, graphother: nn.GraphState):
@@ -136,7 +140,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphDef: The graph definition of the module.
         """
-        return nn.split(self, nn.Param, ...)[0]
+        return nn.split(self, self.graphstate_type, ...)[0]
 
     @property
     def graphstate(self) -> nn.GraphState:
@@ -148,7 +152,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphState: The graph state containing the module's parameters.
         """
-        return nn.split(self, nn.Param, ...)[1]
+        return nn.split(self, self.graphstate_type, ...)[1]
 
     @property
     def graphother(self) -> nn.GraphState:
@@ -160,7 +164,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphState: The graph state containing non-parameter variables.
         """
-        return nn.split(self, nn.Param, ...)[-1]
+        return nn.split(self, self.graphstate_type, ...)[-1]
 
     @property
     def graphtree_params_shape(self) -> dict:
@@ -173,7 +177,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             tp.Dict: A nested dictionary mirroring the parameter structure, containing their shapes.
         """
-        graphtree = nn.eval_shape(lambda: nn.split(self, nn.Param, ...)[1])
+        graphtree = nn.eval_shape(lambda: nn.split(self, self.graphstate_type, ...)[1])
 
         flattened_tree = flatten_dict(graphtree)
 
@@ -333,7 +337,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             jnp.dtype: The data type of the module's parameters.
         """
-        params_state = nn.split(self, nn.Param, ...)[1].flat_state()
+        params_state = nn.split(self, self.graphstate_type, ...)[1].flat_state()
         return jax.tree_util.tree_leaves(params_state)[0].dtype
 
     def compute_complex_rotary(self, position_ids: jax.Array) -> jnp.ndarray:
@@ -359,7 +363,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         from easydel.utils.graph_utils import iter_module_search
 
-        gdef, state, others = nn.split(self, nn.Param, ...)
+        gdef, state, others = nn.split(self, self.graphstate_type, ...)
 
         def _map(path, val: nn.VariableState):
             if val.value is not None:
@@ -442,7 +446,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         from easydel.utils.graph_utils import iter_module_search
 
-        gdef, gtree, others = nn.split(self, nn.Param, ...)
+        gdef, gtree, others = nn.split(self, self.graphstate_type, ...)
 
         def _map(array):
             if array.dtype in [
@@ -456,6 +460,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             return array
 
         gtree = jax.tree_util.tree_map(_map, gtree)
+        others = jax.tree_util.tree_map(_map, others)
         self = nn.merge(gdef, gtree, others)
 
         for _path, module in iter_module_search(self):
@@ -588,7 +593,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             Self: The module instance with sharding/gathering functions applied to its parameters.
         """
-        gdef, state, others = nn.split(self, nn.Param, ...)
+        gdef, state, others = nn.split(self, self.graphstate_type, ...)
         sharding_fns = flatten_dict(sharding_fns)
         _shard_keys = list(sharding_fns.keys())
 
@@ -602,6 +607,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             return val
 
         state.update(state.map(_map))
+        others.update(others.map(_map))
         self = nn.merge(gdef, state, others)
         return self
 
@@ -1078,7 +1084,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             precision=self.precision,
             rngs=self.rngs,
         )
-        gdef, _, _ = nn.split(dummy, nn.Param, ...)
+        gdef, _, _ = nn.split(dummy, self.graphstate_type, ...)
         return gdef
 
     @property
@@ -1104,7 +1110,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             precision=self.precision,
             rngs=self.rngs,
         )
-        _, _, gother = nn.split(dummy, nn.Param, ...)
+        _, _, gother = nn.split(dummy, self.graphstate_type, ...)
         gother = traversals.recreate_meta_values(gother)
         return gother
 
@@ -1136,7 +1142,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             EasyDeLBaseModule: The module instance with the new parameters merged in.
         """
-        gdef, _, gother = nn.split(self, nn.Param, ...)
+        gdef, _, gother = nn.split(self, self.graphstate_type, ...)
         self = nn.merge(gdef, tree, gother)
         return self
 
@@ -1149,7 +1155,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphState: The parameter state of the module.
         """
-        return nn.split(self, nn.Param, ...)[1]
+        return nn.split(self, self.graphstate_type, ...)[1]
 
     def split_params_dict(
         self,
