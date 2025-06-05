@@ -966,6 +966,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         pytree = split_lora_params(self)
         return pytree
 
+    @property
+    def lora_is_enabled(self):
+        for _, tensor in nn.iter_graph(self):
+            if isinstance(tensor, nn.LoRAParam):
+                return True
+        return False
+
     def apply_lora_to_layers(
         self: Self,
         lora_rank: int,

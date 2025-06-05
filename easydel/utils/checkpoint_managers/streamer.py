@@ -378,7 +378,7 @@ class CheckpointManager:
         if cls._is_gcs_path(path):
             return cls._save_to_gcs(state, path, metadata, verbose)
         else:
-            safe_flax.save_file(tensors=state, filename=path, metadata=metadata)
+            safe_flax.save_file(tensors=state, filename=str(path), metadata=metadata)
             return path
 
     @classmethod

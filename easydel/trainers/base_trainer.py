@@ -128,7 +128,7 @@ class BaseTrainer(BaseTrainerProtocol):
         dataset_train: Dataset | None = None,
         dataset_eval: Dataset | None = None,
         data_collator: tp.Callable | None = None,
-        device: jax.Device | None = "cpu",
+        device: jax.Device | None = "cpu",  # type:ignore
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
