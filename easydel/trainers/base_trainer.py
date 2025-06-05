@@ -383,8 +383,11 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_wandb()
         self._initialize_timer()
         self._configure_dataloaders()
+
         self._configure_model()
+
         self._configure_state()
+
         self._configure_functions()
 
     def _initialize_wandb(self):

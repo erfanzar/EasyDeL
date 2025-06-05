@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import typing as tp
 from abc import ABCMeta, abstractmethod
+from mimetypes import common_types
 
 import chex
 from flax import nnx as nn
@@ -30,10 +31,7 @@ from easydel.layers.linear import ParallelLinear
 
 from ..base_config import EasyDeLBaseConfig
 from ..etils import EasyDeLQuantizationMethods
-from ..loss_utils import (
-    LossConfig,
-    LossMetrics,
-)
+from ..loss_utils import LossConfig, LossMetrics
 from ..modeling_outputs import (
     CausalLMOutput,
     CLIPOutput,
@@ -44,7 +42,7 @@ from ..modeling_outputs import (
     SequenceClassifierOutput,
 )
 
-PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]
+PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]  # noqa
 _CP = type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")

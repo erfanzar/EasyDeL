@@ -492,7 +492,7 @@ class EasyDeLState(struct.PyTreeNode):
     def load_state(
         cls,
         load_directory: str | os.PathLike,
-        device: jax.Device | None = "cpu",
+        device: jax.Device | None = "cpu",  # type:ignore
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,

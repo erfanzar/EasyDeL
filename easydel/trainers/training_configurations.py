@@ -327,6 +327,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to train on the input data."},
     )
+    trainer_prefix: str | None = field(
+        default=None,
+        metadata={"help": "default prefix name for trainer."},
+    )
     truncation_mode: tp.Literal["keep_end", "keep_start"] = field(
         default="keep_end",
         metadata={"help": "The truncation mode to use."},
@@ -629,13 +633,17 @@ class TrainingArguments:
                 )
                 return None
             wandb_name = self.wandb_name
-
+            prefix = self.trainer_prefix
+            if prefix is None:
+                prefix = ""
+            else:
+                prefix = "-" + prefix
             if wandb_name is None:
                 _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
                 wandb_name = f"{self.model_name.lower()}-{_time}"
 
             return wandb.init(
-                project=f"EasyDeL-{self.model_name}",
+                project=f"EasyDeL{prefix}-{self.model_name}",
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,

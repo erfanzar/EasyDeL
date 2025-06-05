@@ -27,9 +27,9 @@ class GRPOConfig(TrainingArguments):
     Configuration class for the GRPOTrainer.
     """
 
-    model_name: str = field(
-        default="GRPOTrainer",
-        metadata={"help": "The name of the model."},
+    trainer_prefix: str | None = field(
+        default="grpotrainer",
+        metadata={"help": "default prefix name for trainer."},
     )
     remove_unused_columns: bool | None = field(
         default=False,

@@ -37,9 +37,9 @@ class RewardConfig(TrainingArguments):
             forward pass. Can be `True` only if the dataset is pretokenized. Defaults to False.
     """
 
-    model_name: str = field(
-        default="RewardTrainer",
-        metadata={"help": "The name of the model."},
+    trainer_prefix: str | None = field(
+        default="rewardtrainer",
+        metadata={"help": "default prefix name for trainer."},
     )
     max_sequence_length: int | None = field(
         default=1024,

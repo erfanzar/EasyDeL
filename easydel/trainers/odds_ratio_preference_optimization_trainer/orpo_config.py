@@ -60,9 +60,9 @@ class ORPOConfig(TrainingArguments):
                                    used for training. It is set in the __post_init__ method.
     """
 
-    model_name: str = field(
-        default="ORPOTrainer",
-        metadata={"help": "The name of the model."},
+    trainer_prefix: str | None = field(
+        default="orpotrainer",
+        metadata={"help": "default prefix name for trainer."},
     )
     learning_rate: float = field(
         default=1e-6,

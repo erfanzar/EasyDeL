@@ -146,10 +146,9 @@ def minibatch_call(
         batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
 
         (_, metrics_shape), grads_shape = jax.eval_shape(
-            lambda: grad_fn(
-                state.graphstate,
-                jax.tree_util.tree_map(lambda x: x[0], batch),
-            )
+            grad_fn,
+            state.graphstate,
+            jax.tree_util.tree_map(lambda x: x[0], batch),
         )
 
         init_acc = {

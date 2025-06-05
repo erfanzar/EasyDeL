@@ -674,3 +674,37 @@ def deepcopy_model(model):
     leaves = deepcopy(jax.tree_util.tree_leaves(model))
     struct = jax.tree_util.tree_structure(model)
     return jax.tree_util.tree_unflatten(struct, leaves)
+
+
+def recursive_merge(full_tree, updates):
+    """
+    Recursively merge two PyTrees where updates may have fewer parameters.
+
+    Args:
+        full_tree: The complete parameter tree
+        updates: Tree with updated values (subset of full_tree)
+
+    Returns:
+        Merged tree with updated values where available
+    """
+    if updates is None:
+        return full_tree
+
+    if isinstance(full_tree, dict) and isinstance(updates, dict):
+        result = {}
+        for key in full_tree:
+            if key in updates:
+                result[key] = recursive_merge(full_tree[key], updates[key])
+            else:
+                result[key] = full_tree[key]
+        return result
+    elif isinstance(full_tree, list | tuple) and isinstance(updates, list | tuple):
+        result = []
+        for i, item in enumerate(full_tree):
+            if i < len(updates):
+                result.append(recursive_merge(item, updates[i]))
+            else:
+                result.append(item)
+        return type(full_tree)(result)
+    else:
+        return updates
