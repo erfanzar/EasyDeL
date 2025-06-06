@@ -20,11 +20,9 @@ import os
 import typing as tp
 from http import HTTPStatus
 
-import openai
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from openai import AsyncOpenAI
 
 from .openai_api_modules import (
     ChatCompletionRequest,
@@ -67,12 +65,16 @@ class EasyDeLApiHub:
         organization: str | None = None,
         **kwargs,
     ) -> None:
+        import openai
+        from openai import AsyncOpenAI
+
         self.client = AsyncOpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
             base_url=base_url,
             organization=organization,
             **kwargs,
         )
+        self.openai_module = openai
 
         self._register_endpoints()
 
@@ -154,7 +156,7 @@ class EasyDeLApiHub:
                     media_type="text/event-stream",
                 )
 
-        except openai.APIError as e:
+        except self.openai_module.APIError as e:
             raise HTTPException(status_code=e.status_code, detail=str(e)) from e
         except Exception as e:
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
@@ -248,7 +250,7 @@ class EasyDeLApiHub:
                     media_type="text/event-stream",
                 )
 
-        except openai.APIError as e:
+        except self.openai_module.APIError as e:
             raise HTTPException(status_code=e.status_code, detail=str(e)) from e
         except Exception as e:
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))

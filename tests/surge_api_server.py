@@ -15,8 +15,6 @@
 import os
 import sys
 
-from easydel.inference.openai_api_modules import FunctionCallFormat
-
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from jax import lax
@@ -24,14 +22,15 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 import easydel as ed
+from easydel.inference.openai_api_modules import FunctionCallFormat
 
 
 def main():
     model_id = "Qwen/Qwen3-8B"
 
     max_decode_length = 2048
-    max_prefill_length = 2048
-    max_concurrent_decodes = 2
+    max_prefill_length = 6144
+    max_concurrent_decodes = 1
 
     max_length = max_prefill_length + max_decode_length
 
@@ -41,7 +40,7 @@ def main():
         model_id,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
-        precision=lax.Precision.HIGH,
+        precision=lax.Precision.DEFAULT,
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
@@ -50,6 +49,7 @@ def main():
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             attn_mechanism=ed.AttentionMechanisms.SDPA,
             attn_dtype=jnp.bfloat16,
+            kvdtype=jnp.float8_e5m2,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
@@ -68,7 +68,7 @@ def main():
         max_concurrent_decodes=max_concurrent_decodes,
         max_prefill_length=max_prefill_length,
         max_length=max_length,
-        vsurge_name="llama",
+        vsurge_name="surge",
         verbose=True,
         seed=48,
     )
