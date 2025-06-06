@@ -24,29 +24,16 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .openai_api_modules import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionResponseChoice,
-    ChatCompletionStreamResponse,
-    ChatCompletionStreamResponseChoice,
-    ChatMessage,
-    CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    CompletionStreamResponse,
-    CompletionStreamResponseChoice,
-    DeltaMessage,
-    UsageInfo,
-)
+from .openai_api_modules import ChatCompletionRequest, CompletionRequest
 
 if tp.TYPE_CHECKING:
     from pydantic import BaseModel
 else:
     BaseModel = tp.Any
+
 TIMEOUT_KEEP_ALIVE = 5.0
 
-APP = FastAPI(title="EasyDeL API Hub")
+APP = FastAPI(title="EasyDeL Inference API Hub")
 
 
 def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse:
@@ -54,7 +41,7 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
     return JSONResponse({"error": {"message": message}}, status_code=status_code.value)
 
 
-class EasyDeLApiHub:
+class InferenceApiRouter:
     """
     FastAPI server that acts as a hub for OpenAI API requests.
 
@@ -151,31 +138,7 @@ class EasyDeLApiHub:
             )
 
             if not request.stream:
-                response = await self.client.chat.completions.create(**openai_params)
-                return ChatCompletionResponse(
-                    id=response.id,
-                    model=response.model,
-                    created=response.created,
-                    choices=[
-                        ChatCompletionResponseChoice(
-                            index=choice.index,
-                            message=ChatMessage(
-                                role=choice.message.role,
-                                content=choice.message.content,
-                                function_call=choice.message.function_call,
-                            ),
-                            finish_reason=choice.finish_reason,
-                        )
-                        for choice in response.choices
-                    ],
-                    usage=UsageInfo(
-                        prompt_tokens=response.usage.prompt_tokens,
-                        completion_tokens=response.usage.completion_tokens,
-                        total_tokens=response.usage.total_tokens,
-                    )
-                    if response.usage
-                    else None,
-                )
+                return await self.client.chat.completions.create(**openai_params)
             else:
                 return StreamingResponse(
                     self._stream_chat_completion(openai_params, metadata),
@@ -194,28 +157,7 @@ class EasyDeLApiHub:
             if metadata is not None:
                 yield f"metadata: {metadata.model_dump_json(exclude_unset=True)}\n\n".encode()
             async for chunk in stream:
-                # Convert OpenAI chunk to your format
-                stream_response = ChatCompletionStreamResponse(
-                    id=chunk.id,
-                    model=chunk.model,
-                    created=chunk.created,
-                    choices=[
-                        ChatCompletionStreamResponseChoice(
-                            index=choice.index,
-                            delta=DeltaMessage(
-                                role=choice.delta.role,
-                                content=choice.delta.content,
-                                function_call=choice.delta.function_call,
-                            )
-                            if choice.delta
-                            else DeltaMessage(),
-                            finish_reason=choice.finish_reason,
-                        )
-                        for choice in chunk.choices
-                    ],
-                )
-
-                yield f"data: {stream_response.model_dump_json(exclude_unset=True)}\n\n".encode()
+                yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n".encode()
 
             yield b"data: [DONE]\n\n"
 
@@ -238,28 +180,7 @@ class EasyDeLApiHub:
             )
 
             if not request.stream:
-                response = await self.client.completions.create(**openai_params)
-
-                return CompletionResponse(
-                    id=response.id,
-                    model=response.model,
-                    created=response.created,
-                    choices=[
-                        CompletionResponseChoice(
-                            text=choice.text,
-                            index=choice.index,
-                            finish_reason=choice.finish_reason,
-                        )
-                        for choice in response.choices
-                    ],
-                    usage=UsageInfo(
-                        prompt_tokens=response.usage.prompt_tokens,
-                        completion_tokens=response.usage.completion_tokens,
-                        total_tokens=response.usage.total_tokens,
-                    )
-                    if response.usage
-                    else None,
-                )
+                return await self.client.completions.create(**openai_params)
             else:
                 return StreamingResponse(
                     self._stream_completion(openai_params, metadata),
@@ -278,21 +199,7 @@ class EasyDeLApiHub:
             if metadata is not None:
                 yield f"metadata: {metadata.model_dump_json(exclude_unset=True)}\n\n".encode()
             async for chunk in stream:
-                stream_response = CompletionStreamResponse(
-                    id=chunk.id,
-                    model=chunk.model,
-                    created=chunk.created,
-                    choices=[
-                        CompletionStreamResponseChoice(
-                            text=choice.text,
-                            index=choice.index,
-                            finish_reason=choice.finish_reason,
-                        )
-                        for choice in chunk.choices
-                    ],
-                )
-
-                yield f"data: {stream_response.model_dump_json(exclude_unset=True)}\n\n".encode()
+                yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n".encode()
 
             yield b"data: [DONE]\n\n"
 

@@ -26,11 +26,11 @@ from easydel.inference.openai_api_modules import FunctionCallFormat
 
 
 def main():
-    model_id = "Qwen/Qwen3-8B"
-
+    # model_id = "Qwen/Qwen3-8B"
+    model_id = "meta-llama/Llama-3.2-1B-Instruct"
     max_decode_length = 2048
     max_prefill_length = 6144
-    max_concurrent_decodes = 1
+    max_concurrent_decodes = 4
 
     max_length = max_prefill_length + max_decode_length
 

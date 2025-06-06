@@ -104,7 +104,7 @@ _import_structure = {
         "VisualDatasetInform",
     ],
     "inference": [
-        "EasyDeLApiHub",
+        "InferenceApiRouter",
         "SamplingParams",
         "vInference",
         "vInferenceApiServer",
@@ -471,6 +471,7 @@ _import_structure = {
 if _tp.TYPE_CHECKING:
     from . import utils
     from .inference import (
+        InferenceApiRouter,
         SamplingParams,
         vDriver,
         vEngine,
