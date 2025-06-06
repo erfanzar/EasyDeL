@@ -91,9 +91,46 @@ class EasyDeLApiHub:
         for path, handler, methods in endpoints:
             APP.add_api_route(path=path, endpoint=handler, methods=methods)
 
+    def build_oai_params_from_request(
+        self,
+        request: CompletionRequest,
+    ) -> dict[str, float | int | str | bool | list]:
+        return {
+            "model": request.model,
+            "prompt": request.prompt,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "frequency_penalty": request.frequency_penalty,
+            "presence_penalty": request.presence_penalty,
+            "stop": request.stop,
+            "stream": request.stream,
+            "n": request.n,
+        }
+
+    def build_oai_params_from_chat_request(
+        self,
+        request: CompletionRequest,
+    ) -> dict[str, float | int | str | bool | list]:
+        return {
+            "model": request.model,
+            "messages": [msg.model_dump() for msg in request.messages],
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "frequency_penalty": request.frequency_penalty,
+            "presence_penalty": request.presence_penalty,
+            "stop": request.stop,
+            "stream": request.stream,
+            "n": request.n,
+        }
+
     def process_request_params(
         self,
         request_params: dict[str, tp.Any],
+        request: ChatCompletionRequest | CompletionRequest,
     ) -> tuple[dict[str, tp.Any], dict[str, tp.Any] | None]:
         return request_params, None
 
@@ -104,22 +141,10 @@ class EasyDeLApiHub:
         Forwards the request to OpenAI API and returns the response.
         """
         try:
-            openai_params = {
-                "model": request.model,
-                "messages": [msg.model_dump() for msg in request.messages],
-                "temperature": request.temperature,
-                "max_tokens": request.max_tokens,
-                "top_p": request.top_p,
-                "top_k": request.top_k,
-                "frequency_penalty": request.frequency_penalty,
-                "presence_penalty": request.presence_penalty,
-                "stop": request.stop,
-                "stream": request.stream,
-                "n": request.n,
-            }
+            openai_params = self.build_oai_params_from_chat_request(request)
 
             openai_params = {k: v for k, v in openai_params.items() if v is not None}
-            openai_params, metadata = self.process_request_params(openai_params)
+            openai_params, metadata = self.process_request_params(openai_params, request)
 
             if not request.stream:
                 # Non-streaming response
@@ -204,22 +229,10 @@ class EasyDeLApiHub:
         Forwards the request to OpenAI API and returns the response.
         """
         try:
-            openai_params = {
-                "model": request.model,
-                "prompt": request.prompt,
-                "temperature": request.temperature,
-                "max_tokens": request.max_tokens,
-                "top_p": request.top_p,
-                "top_k": request.top_k,
-                "frequency_penalty": request.frequency_penalty,
-                "presence_penalty": request.presence_penalty,
-                "stop": request.stop,
-                "stream": request.stream,
-                "n": request.n,
-            }
+            openai_params = self.build_oai_params_from_request(request)
 
             openai_params = {k: v for k, v in openai_params.items() if v is not None}
-            openai_params, metadata = self.process_request_params(openai_params)
+            openai_params, metadata = self.process_request_params(openai_params, request)
 
             if not request.stream:
                 response = await self.client.completions.create(**openai_params)
