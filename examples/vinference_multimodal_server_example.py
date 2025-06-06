@@ -48,13 +48,6 @@ def main():
 
     parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
 
-    parser.add_argument(
-        "--metrics_port",
-        type=int,
-        default=None,
-        help="Port for metrics server (default: port+1)",
-    )
-
     parser.add_argument("--prefill_length", type=int, default=2048, help="Prefill sequence length")
 
     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum new tokens to generate")
@@ -185,8 +178,7 @@ def main():
 
     # Start the server
     ed.vInferenceApiServer(inference, max_workers=1).fire(
-        port=args.port,
-        metrics_port=args.metrics_port,
+        port=args.port
     )
 
 

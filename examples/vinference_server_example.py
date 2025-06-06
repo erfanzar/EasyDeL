@@ -48,13 +48,6 @@ def main():
 
     parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
 
-    parser.add_argument(
-        "--metrics_port",
-        type=int,
-        default=None,
-        help="Port for metrics server (default: port+1)",
-    )
-
     parser.add_argument("--max_length", type=int, default=4096, help="Maximum sequence length")
 
     parser.add_argument(
@@ -154,8 +147,7 @@ def main():
 
     # Start the API server
     ed.vInferenceApiServer(inference).fire(
-        port=args.port,
-        metrics_port=args.metrics_port,
+        port=args.port
     )
 
 

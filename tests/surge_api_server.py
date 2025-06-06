@@ -15,6 +15,8 @@
 import os
 import sys
 
+from easydel.inference.openai_api_modules import FunctionCallFormat
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from jax import lax
@@ -25,11 +27,11 @@ import easydel as ed
 
 
 def main():
-    model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    model_id = "Qwen/Qwen3-8B"
 
     max_decode_length = 2048
     max_prefill_length = 2048
-    max_concurrent_decodes = 8
+    max_concurrent_decodes = 2
 
     max_length = max_prefill_length + max_decode_length
 
@@ -46,7 +48,7 @@ def main():
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-            attn_mechanism=ed.AttentionMechanisms.VANILLA,
+            attn_mechanism=ed.AttentionMechanisms.SDPA,
             attn_dtype=jnp.bfloat16,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         ),
@@ -73,7 +75,11 @@ def main():
 
     surge.compile()
     surge.start()
-    ed.vSurgeApiServer(surge).fire()
+    ed.vSurgeApiServer(
+        surge,
+        enable_function_calling=True,
+        default_function_format=FunctionCallFormat.OPENAI,
+    ).fire()
 
 
 if __name__ == "__main__":
