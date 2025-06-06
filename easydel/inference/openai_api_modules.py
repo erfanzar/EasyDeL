@@ -155,7 +155,7 @@ class CompletionRequest(BaseModel):
 
     model: str
     prompt: str | list[str]
-    max_tokens: int = 16
+    max_tokens: int = 128
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -186,7 +186,7 @@ class CompletionResponseChoice(BaseModel):
     text: str
     index: int
     logprobs: CompletionLogprobs | None = None
-    finish_reason: tp.Literal["stop", "length"] | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call"] | None = None
 
 
 class CompletionResponse(BaseModel):
@@ -206,8 +206,8 @@ class CompletionStreamResponseChoice(BaseModel):
 
     index: int
     text: str  # The delta text content
-    logprobs: CompletionLogprobs | None = None  # Logprobs are usually None in streaming chunks
-    finish_reason: tp.Literal["stop", "length"] | None = None
+    logprobs: CompletionLogprobs | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call"] | None = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -345,11 +345,17 @@ class FunctionCallParser:
                 data = json.loads(json_match.group())
                 if isinstance(data, dict) and "function" in data:
                     func_data = data["function"]
-                    return [FunctionCall(name=func_data["name"], arguments=json.dumps(func_data.get("arguments", {})))]
+                    return [
+                        FunctionCall(
+                            name=func_data["name"],
+                            arguments=json.dumps(func_data.get("arguments", {})),
+                        )
+                    ]
                 elif "name" in data:
                     return [
                         FunctionCall(
-                            name=data["name"], arguments=json.dumps(data.get("arguments", data.get("parameters", {})))
+                            name=data["name"],
+                            arguments=json.dumps(data.get("arguments", data.get("parameters", {}))),
                         )
                     ]
         except json.JSONDecodeError:
@@ -368,7 +374,12 @@ class FunctionCallParser:
         for match in matches:
             try:
                 data = json.loads(match)
-                function_calls.append(FunctionCall(name=data["name"], arguments=json.dumps(data.get("arguments", {}))))
+                function_calls.append(
+                    FunctionCall(
+                        name=data["name"],
+                        arguments=json.dumps(data.get("arguments", {})),
+                    )
+                )
             except json.JSONDecodeError:
                 if self.strict:
                     raise
@@ -457,7 +468,11 @@ class FunctionCallFormatter:
 
         for tool in tools:
             func = tool.function
-            tool_def = {"name": func.name, "description": func.description, "parameters": func.parameters}
+            tool_def = {
+                "name": func.name,
+                "description": func.description,
+                "parameters": func.parameters,
+            }
             formatted += f"<tool>{json.dumps(tool_def, indent=2)}</tool>\n\n"
 
         formatted += (
@@ -532,7 +547,9 @@ class ChatMessageWithTools(ChatMessage):
 
     @classmethod
     def from_function_calls(
-        cls, function_calls: list[FunctionCall], content: str | None = None
+        cls,
+        function_calls: list[FunctionCall],
+        content: str | None = None,
     ) -> "ChatMessageWithTools":
         """Create message from function calls."""
         tool_calls = [
