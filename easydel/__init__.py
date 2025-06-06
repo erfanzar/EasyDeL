@@ -104,6 +104,7 @@ _import_structure = {
         "VisualDatasetInform",
     ],
     "inference": [
+        "EasyDeLApiHub",
         "SamplingParams",
         "vInference",
         "vInferenceApiServer",

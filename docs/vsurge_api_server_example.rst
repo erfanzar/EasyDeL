@@ -70,7 +70,6 @@ The ``.fire()`` method is used to start the Uvicorn server, which hosts the API.
 
 *   ``host`` (default: "0.0.0.0"): The host address to bind the server to.
 *   ``port`` (default: 11556): The port number to listen on for API requests.
-*   ``metrics_port`` (optional): A separate port for exposing metrics.
 *   ``log_level`` (default: "info"): The logging level for the server.
 *   ``ssl_keyfile`` (optional): Path to the SSL key file for HTTPS.
 *   ``ssl_certfile`` (optional): Path to the SSL certificate file for HTTPS.

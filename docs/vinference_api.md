@@ -207,8 +207,7 @@ inference.precompile(
 
 # Start the API server
 ed.vInferenceApiServer(inference).fire(
-    port=8000,
-    metrics_port=8001,
+    port=8000
 )
 ```
 
@@ -256,8 +255,7 @@ inference.precompile(
 
 # Start the API server
 ed.vInferenceApiServer(inference).fire(
-    port=8000,
-    metrics_port=8001,
+    port=8000
 )
 ```
 

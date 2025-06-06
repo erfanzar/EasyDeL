@@ -64,10 +64,7 @@ def main():
         )
     )
     print(inference.inference_name)
-    ed.vInferenceApiServer(inference).fire(
-        port=11557,
-        metrics_port=11550,
-    )
+    ed.vInferenceApiServer(inference).fire(port=11557)
 
 
 if __name__ == "__main__":

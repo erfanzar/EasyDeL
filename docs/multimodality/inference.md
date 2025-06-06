@@ -215,7 +215,6 @@ To enable monitoring with Prometheus metrics:
 ```python
 ed.vInferenceApiServer(inference).fire(
     port=8000,
-    metrics_port=8001,      # Port for Prometheus metrics
     log_level="info"        # Logging level (debug, info, warning, error)
 )
 ```

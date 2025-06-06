@@ -391,7 +391,7 @@ class vDriver:
             )
             fn_call = time.time()
             sampled_tokens.copy_to_host_async()
-            if (generate_timestep % self._slot_clear_steps) == 0:
+            if ((generate_timestep + 1) % self._slot_clear_steps) == 0:
                 decode_state = engine.free_state_resources(
                     [i for i, v in self._live_requests.items() if v is None],
                     decode_state,
