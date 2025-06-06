@@ -40,6 +40,10 @@ from .openai_api_modules import (
     UsageInfo,
 )
 
+if tp.TYPE_CHECKING:
+    from pydantic import BaseModel
+else:
+    BaseModel = tp.Any
 TIMEOUT_KEEP_ALIVE = 5.0
 
 APP = FastAPI(title="EasyDeL API Hub")
@@ -101,7 +105,6 @@ class EasyDeLApiHub:
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "top_p": request.top_p,
-            "top_k": request.top_k,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
             "stop": request.stop,
@@ -119,7 +122,6 @@ class EasyDeLApiHub:
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
             "top_p": request.top_p,
-            "top_k": request.top_k,
             "frequency_penalty": request.frequency_penalty,
             "presence_penalty": request.presence_penalty,
             "stop": request.stop,
@@ -129,10 +131,10 @@ class EasyDeLApiHub:
 
     def process_request_params(
         self,
-        request_params: dict[str, tp.Any],
+        openai_params: dict,
         request: ChatCompletionRequest | CompletionRequest,
-    ) -> tuple[dict[str, tp.Any], dict[str, tp.Any] | None]:
-        return request_params, None
+    ) -> tuple[dict, BaseModel | None]:
+        return openai_params, None
 
     async def chat_completions(self, request: ChatCompletionRequest):
         """
@@ -142,15 +144,14 @@ class EasyDeLApiHub:
         """
         try:
             openai_params = self.build_oai_params_from_chat_request(request)
-
             openai_params = {k: v for k, v in openai_params.items() if v is not None}
-            openai_params, metadata = self.process_request_params(openai_params, request)
+            openai_params, metadata = self.process_request_params(
+                openai_params=openai_params,
+                request=request,
+            )
 
             if not request.stream:
-                # Non-streaming response
                 response = await self.client.chat.completions.create(**openai_params)
-
-                # Convert OpenAI response to your format
                 return ChatCompletionResponse(
                     id=response.id,
                     model=response.model,
@@ -230,9 +231,11 @@ class EasyDeLApiHub:
         """
         try:
             openai_params = self.build_oai_params_from_request(request)
-
             openai_params = {k: v for k, v in openai_params.items() if v is not None}
-            openai_params, metadata = self.process_request_params(openai_params, request)
+            openai_params, metadata = self.process_request_params(
+                openai_params=openai_params,
+                request=request,
+            )
 
             if not request.stream:
                 response = await self.client.completions.create(**openai_params)
@@ -360,12 +363,3 @@ class EasyDeLApiHub:
         uvicorn.run(APP, **uvicorn_config)
 
     fire = run
-
-
-# Example usage
-if __name__ == "__main__":
-    # Create the hub with your OpenAI API key
-    hub = EasyDeLApiHub(api_key="sosk", base_url="http://192.168.1.212:11544")
-
-    # Start the server
-    hub.fire(host="0.0.0.0", port=8000)
