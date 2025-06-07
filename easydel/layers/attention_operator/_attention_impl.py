@@ -135,7 +135,8 @@ class AttentionMetadata:
         self.set_attrs_carefully("scan_ring_attention", True)
         self.set_attrs_carefully("partition_axis", PartitionAxis())
         self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
-        self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)  # DON'T READ FROM CONFIG
+        # DON'T READ FROM CONFIG
+        self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
         self.set_attrs_carefully("platform", NOT_GIVEN, "platform")
         self.set_attrs_carefully("mesh", NOT_GIVEN, "mesh")
@@ -543,27 +544,28 @@ class AttentionImpl(BaseOperation):
             A new PartitionSpec with only specified axes partitioned, or None based on `dep`.
             Returns `state_ps` directly if `preserved_indices` is None.
         """
-        if dep is None:
-            return None
+        with self.metadata.mesh:
+            if dep is None:
+                return None
 
-        if state_ps is None:
-            return None
+            if state_ps is None:
+                return None
 
-        if preserved_indices is None:
+            if preserved_indices is None:
+                if tensor is None:
+                    return state_ps
+                return es.get_corrected_named_sharding(tensor.shape, state_ps).spec
+
+            new_spec = [None] * len(state_ps)
+            for idx in preserved_indices:
+                new_spec[idx] = state_ps[idx] if clone_ps is None else clone_ps[idx]
+
+            sharding = Ps(*new_spec)
+
             if tensor is None:
-                return state_ps
-            return es.get_corrected_named_sharding(tensor.shape, state_ps).spec
-
-        new_spec = [None] * len(state_ps)
-        for idx in preserved_indices:
-            new_spec[idx] = state_ps[idx] if clone_ps is None else clone_ps[idx]
-
-        sharding = Ps(*new_spec)
-
-        if tensor is None:
-            return sharding
-        else:
-            return es.get_corrected_named_sharding(tensor.shape, sharding).spec
+                return sharding
+            else:
+                return es.get_corrected_named_sharding(tensor.shape, sharding).spec
 
     def __call__(self, *args, **kwargs) -> AttentionOutput:
         """
@@ -609,7 +611,7 @@ class AttentionRegistry:
     instantiating them by name.
     """
 
-    _registry: dict[str, type[AttentionImpl]] = {}
+    _registry: dict[str, type[AttentionImpl]] | tp.ClassVar = {}  # noqa
 
     @classmethod
     def register(cls, impl_cls: type[_I]) -> type[_I]:
@@ -664,7 +666,8 @@ class AttentionRegistry:
         """
         if impl_name not in cls._registry:
             raise ValueError(
-                f"Attention implementation '{impl_name}' not found. Available implementations: {list(cls._registry.keys())}"
+                f"Attention implementation '{impl_name}' not found. Available "
+                f"implementations: {list(cls._registry.keys())}"
             )
         return cls._registry[impl_name]
 
