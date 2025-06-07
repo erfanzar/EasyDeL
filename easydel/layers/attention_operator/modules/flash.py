@@ -79,7 +79,7 @@ class FlashAttn(AttentionImpl):
         """
         raise NotImplementedError("Flash Attention v2 does not have a native CPU implementation.")
 
-    def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+    def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
         """
         GPU forward pass. Delegates to the CUDA-specific implementation.
 
@@ -90,7 +90,7 @@ class FlashAttn(AttentionImpl):
         Returns:
             An `AttentionOutput` object containing the attention results.
         """
-        return self.forward_cuda(*args, **kwargs)
+        return self.forward_gpu(*args, **kwargs)
 
     @jax.named_scope("easydel-flash-attnimpl-tpu")
     def forward_tpu(
@@ -212,8 +212,8 @@ class FlashAttn(AttentionImpl):
         """
         return self.forward_native(*args, **kwargs)
 
-    @jax.named_scope("easydel-flash-attnimpl-gpu-cuda")
-    def forward_cuda(
+    @jax.named_scope("easydel-flash-attnimpl-gpu-cuda-rocm")
+    def forward_gpu(
         self,
         q: Array,
         k: Array,
@@ -262,34 +262,37 @@ class FlashAttn(AttentionImpl):
             m_sharding,
             a_sharding,
         ) = self.metadata.get_shardings(model_mode, BTHD=True)
-        if mask is None and bias is None and init_bias is not None:
+
+        if bias is None and init_bias is not None:
             bias = init_bias()
+            mask = None
 
         func = functools.partial(
             triton_flash_attention,
             dropout_prob=self.metadata.dropout_prob,
             dropout_seed=None,
-            softmax_scale=self.metadata.softmax_scale,
+            softmax_scale=sm_scale,
+            varlen_mode=False,
             causal=causal,
         )
         attn = shard_map(
             func,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(q_sharding, dep=q, tensor=q),
-                self.create_stable_sharding(k_sharding, dep=k, tensor=k),
-                self.create_stable_sharding(v_sharding, dep=v, tensor=v),
-                self.create_stable_sharding(m_sharding, dep=mask, tensor=mask),
-                self.create_stable_sharding(b_sharding, dep=bias, tensor=bias),
+                self.create_stable_sharding(q_sharding, tensor=q, preserved_indices=[0, 2]),
+                self.create_stable_sharding(k_sharding, tensor=k, preserved_indices=[0, 2]),
+                self.create_stable_sharding(v_sharding, tensor=v, preserved_indices=[0, 2]),
+                self.create_stable_sharding(m_sharding, dep=mask, tensor=mask, preserved_indices=[0, 1]),
+                self.create_stable_sharding(b_sharding, dep=bias, tensor=bias, preserved_indices=[0, 1]),
             ),
-            out_specs=self.create_stable_sharding(a_sharding, tensor=q),
+            out_specs=self.create_stable_sharding(a_sharding, tensor=q, preserved_indices=[0, 2]),
             check_rep=False,
         )(
             q.astype(dtype),
             k.astype(dtype),
             v.astype(dtype),
-            mask.astype(dtype) if mask is not None else bias,
-            bias.astype("b1") if bias is not None else bias,
+            mask,
+            bias.astype(dtype) if bias is not None else bias,
         )
         return AttentionOutput(
             attention_weights=None,
@@ -298,13 +301,10 @@ class FlashAttn(AttentionImpl):
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
         """
-        ROCm GPU forward pass. Not implemented, falls back to native (error).
-
-        Raises:
-            NotImplementedError: Via `forward_native`. ROCm support requires a specific kernel.
+        ROCm GPU forward pass.
         """
         # ROCm would require a specific hipFlashAttention kernel or similar
-        return self.forward_native(*args, **kwargs)
+        return self.forward_gpu(*args, **kwargs)
 
     def __call__(
         self,
