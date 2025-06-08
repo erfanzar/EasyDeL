@@ -64,7 +64,7 @@ class Trainer(BaseTrainer):
                     data_sample = jnp.array(data_sample)
                 except TypeError:
                     continue
-                if self.model.__class__.__name__ == "ForCausalLMLoss":
+                if self.model.lossfn_type == "ForCausalLM":
                     if truncation_mode == "keep_end":
                         corrected_sequence = [jnp.array(f[key])[..., -max_sequence_length:] for f in batch]
                     else:
