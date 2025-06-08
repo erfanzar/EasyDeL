@@ -444,6 +444,8 @@ _import_structure = {
     ],
     "trainers": [
         "BaseTrainer",
+        "DistillationConfig",
+        "DistillationTrainer",
         "DPOConfig",
         "DPOTrainer",
         "GRPOConfig",
@@ -809,6 +811,8 @@ if _tp.TYPE_CHECKING:
     )
     from .trainers import (
         BaseTrainer,
+        DistillationConfig,
+        DistillationTrainer,
         DPOConfig,
         DPOTrainer,
         GRPOConfig,

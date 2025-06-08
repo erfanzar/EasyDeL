@@ -294,17 +294,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         return self.get_static_arguments()
 
     @cached_property
-    def loss_function(self):
-        """
-        Determines and returns the appropriate loss function based on the configuration or model type.
-
-        It prioritizes `config.loss_type`, then `self.loss_type`, and finally tries to infer
-        the loss type from the class name. If no suitable loss function is found, it defaults
-        to `ForCausalLMLoss` and issues a warning.
-
-        Returns:
-            tp.Callable: The selected loss function (e.g., `ForCausalLMLoss`, `ForSequenceClassificationLoss`).
-        """
+    def lossfn_type(self):
         if getattr(self.config, "loss_type", None) is not None:
             loss_type = self.config.loss_type
         elif getattr(self, "loss_type", None) is not None:
@@ -325,7 +315,22 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
                 stacklevel=1,
             )
             loss_type = "ForCausalLM"
-        return LOSS_MAPPING[loss_type]
+        return loss_type
+
+    @cached_property
+    def loss_function(self):
+        """
+        Determines and returns the appropriate loss function based on the configuration or model type.
+
+        It prioritizes `config.loss_type`, then `self.loss_type`, and finally tries to infer
+        the loss type from the class name. If no suitable loss function is found, it defaults
+        to `ForCausalLMLoss` and issues a warning.
+
+        Returns:
+            tp.Callable: The selected loss function (e.g., `ForCausalLMLoss`, `ForSequenceClassificationLoss`).
+        """
+
+        return LOSS_MAPPING[self.lossfn_type]
 
     @property
     def module_dtype(self) -> jnp.dtype:
