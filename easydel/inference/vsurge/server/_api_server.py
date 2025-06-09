@@ -354,7 +354,10 @@ class vSurgeApiServer:
         vsurge = self.vsurge_map.get(model_name)
         if vsurge is None:
             available = list(self.vsurge_map.keys())
-            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available models: {available}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{model_name}' not found. Available models: {available}",
+            )
         return vsurge
 
     def _prepare_vsurge_input(
@@ -493,12 +496,16 @@ class vSurgeApiServer:
                     else:
                         message = ChatMessage(role="assistant", content=response_text)
                         finish_reason = self._determine_finish_reason(
-                            result.num_generated_tokens[idx], sampling_params.max_tokens, response_text
+                            result.num_generated_tokens[idx],
+                            sampling_params.max_tokens,
+                            response_text,
                         )
                 else:
                     message = ChatMessage(role="assistant", content=response_text)
                     finish_reason = self._determine_finish_reason(
-                        result.num_generated_tokens[idx], sampling_params.max_tokens, response_text
+                        result.num_generated_tokens[idx],
+                        sampling_params.max_tokens,
+                        response_text,
                     )
 
                 choices.append(
@@ -652,7 +659,9 @@ class vSurgeApiServer:
 
                         final_choices.append(
                             ChatCompletionStreamResponseChoice(
-                                index=idx, delta=DeltaMessage(), finish_reason=finish_reason
+                                index=idx,
+                                delta=DeltaMessage(),
+                                finish_reason=finish_reason,
                             )
                         )
 
@@ -706,8 +715,14 @@ class vSurgeApiServer:
                             "parameters": {
                                 "type": "object",
                                 "properties": {
-                                    "param1": {"type": "string", "description": "First parameter"},
-                                    "param2": {"type": "number", "description": "Second parameter"},
+                                    "param1": {
+                                        "type": "string",
+                                        "description": "First parameter",
+                                    },
+                                    "param2": {
+                                        "type": "number",
+                                        "description": "Second parameter",
+                                    },
                                 },
                                 "required": ["param1"],
                             },
@@ -1025,7 +1040,9 @@ class vSurgeApiServer:
         choices = []
         for idx in range(len(result.text)):
             finish_reason = self._determine_finish_reason(
-                result.num_generated_tokens[idx], request.max_tokens or float("inf"), result.accumulated_text[idx]
+                result.num_generated_tokens[idx],
+                request.max_tokens or float("inf"),
+                result.accumulated_text[idx],
             )
 
             choices.append(
@@ -1119,18 +1136,53 @@ class vSurgeApiServer:
 
     async def health_check(self) -> JSONResponse:
         """Comprehensive health check."""
+        model_health_info = {}
+        for name, vsurge_instance in self.vsurge_map.items():
+            # Assuming vsurge_instance.driver is the vDriver instance
+            driver_metrics = {}
+            device_memory_stats = None
+            if hasattr(vsurge_instance, "driver") and hasattr(vsurge_instance.driver, "get_device_memory_stats"):
+                try:
+                    # Call get_device_memory_stats if it's not a coroutine
+                    if asyncio.iscoroutinefunction(vsurge_instance.driver.get_device_memory_stats):
+                        device_memory_stats = await vsurge_instance.driver.get_device_memory_stats()
+                    else:
+                        device_memory_stats = vsurge_instance.driver.get_device_memory_stats()
+                except Exception as e:
+                    logger.warning(f"Could not get device memory stats for model {name}: {e}")
+
+            if hasattr(vsurge_instance, "driver") and hasattr(vsurge_instance.driver, "get_metrics"):
+                try:
+                    # Call get_metrics if it's not a coroutine
+                    if asyncio.iscoroutinefunction(vsurge_instance.driver.get_metrics):
+                        raw_driver_metrics = await vsurge_instance.driver.get_metrics(aggregated=True)
+                    else:
+                        raw_driver_metrics = vsurge_instance.driver.get_metrics(aggregated=True)
+
+                    # Select a few key driver metrics to include
+                    driver_metrics = {
+                        "queue_sizes": raw_driver_metrics.get("queue_sizes"),
+                        "active_driver_requests": raw_driver_metrics.get("active_requests_count"),
+                        "ttft_ms_avg": raw_driver_metrics.get("ttft_ms_avg"),
+                        "prefill_op_ms_avg": raw_driver_metrics.get("prefill_op_ms_avg"),
+                        "decode_op_ms_avg": raw_driver_metrics.get("decode_op_ms_avg"),
+                    }
+                except Exception as e:
+                    logger.warning(f"Could not get driver metrics for model {name}: {e}")
+
+            model_health_info[name] = {
+                "loaded": True,
+                "type": type(vsurge_instance).__name__,
+                "driver_metrics": driver_metrics or "N/A",
+                "device_memory_stats": device_memory_stats or "N/A",
+            }
+
         health_status = {
             "status": self.status.value,
             "timestamp": time.time(),
             "uptime_seconds": self.metrics.uptime_seconds,
-            "models": {
-                name: {
-                    "loaded": True,
-                    "type": type(vsurge).__name__,
-                }
-                for name, vsurge in self.vsurge_map.items()
-            },
-            "active_requests": len(self._active_requests),
+            "models": model_health_info,
+            "active_api_requests": len(self._active_requests),
             "thread_pool": {
                 "max_workers": self.thread_pool._max_workers,
                 "active_threads": len(self.thread_pool._threads),
@@ -1139,6 +1191,54 @@ class vSurgeApiServer:
 
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
+
+    async def get_metrics(self) -> JSONResponse:
+        """Get server performance metrics, including vDriver metrics if available."""
+
+        all_driver_metrics = {}
+        all_device_memory_stats = {}
+
+        for model_name, vsurge_instance in self.vsurge_map.items():
+            if hasattr(vsurge_instance, "driver"):
+                driver = vsurge_instance.driver
+                if hasattr(driver, "get_metrics"):
+                    try:
+                        if asyncio.iscoroutinefunction(driver.get_metrics):
+                            all_driver_metrics[model_name] = await driver.get_metrics(aggregated=True)
+                        else:
+                            all_driver_metrics[model_name] = driver.get_metrics(aggregated=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to get driver metrics for {model_name}: {e}")
+                        all_driver_metrics[model_name] = {"error": str(e)}
+
+                if hasattr(driver, "get_device_memory_stats"):
+                    try:
+                        if asyncio.iscoroutinefunction(driver.get_device_memory_stats):
+                            all_device_memory_stats[model_name] = await driver.get_device_memory_stats()
+                        else:
+                            all_device_memory_stats[model_name] = driver.get_device_memory_stats()
+                    except Exception as e:
+                        logger.warning(f"Failed to get device memory stats for {model_name}: {e}")
+                        all_device_memory_stats[model_name] = {"error": str(e)}
+            else:
+                all_driver_metrics[model_name] = "Driver not found or metrics unavailable"
+                all_device_memory_stats[model_name] = "Driver not found or memory stats unavailable"
+
+        return JSONResponse(
+            {
+                "api_server_uptime_seconds": self.metrics.uptime_seconds,
+                "total_api_requests": self.metrics.total_requests,
+                "successful_api_requests": self.metrics.successful_requests,
+                "failed_api_requests": self.metrics.failed_requests,
+                "total_tokens_generated_via_api": self.metrics.total_tokens_generated,
+                "average_tokens_per_second_via_api": round(self.metrics.average_tokens_per_second, 2),
+                "active_api_requests": len(self._active_requests),
+                "models_loaded_count": len(self.vsurge_map),
+                "api_server_status": self.status.value,
+                "vsurge_driver_metrics": all_driver_metrics,
+                "device_memory_stats_per_model": all_device_memory_stats,
+            }
+        )
 
     async def list_models(self) -> JSONResponse:
         """List available models with function calling information."""
@@ -1194,22 +1294,6 @@ class vSurgeApiServer:
                     "architecture": type(vsurge).__name__,
                     "supports_chat": hasattr(vsurge.processor, "apply_chat_template"),
                 },
-            }
-        )
-
-    async def get_metrics(self) -> JSONResponse:
-        """Get server performance metrics."""
-        return JSONResponse(
-            {
-                "uptime_seconds": self.metrics.uptime_seconds,
-                "total_requests": self.metrics.total_requests,
-                "successful_requests": self.metrics.successful_requests,
-                "failed_requests": self.metrics.failed_requests,
-                "total_tokens_generated": self.metrics.total_tokens_generated,
-                "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
-                "active_requests": len(self._active_requests),
-                "models_loaded": len(self.vsurge_map),
-                "status": self.status.value,
             }
         )
 

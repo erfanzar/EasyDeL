@@ -329,6 +329,18 @@ class vSurge:
         """
         return self.driver.replace_graphstate(state=state)
 
+    def get_device_memory_stats(self) -> dict | None:
+        """Delegates to vDriver to get device memory stats."""
+        if hasattr(self, "vdriver") and hasattr(self.vdriver, "get_device_memory_stats"):
+            return self.vdriver.get_device_memory_stats()
+        return None
+
+    def get_vdriver_metrics(self, aggregated: bool = True, window_size: int = 100) -> dict | None:
+        """Delegates to vDriver to get its operational metrics."""
+        if hasattr(self, "vdriver") and hasattr(self.vdriver, "get_metrics"):
+            return self.vdriver.get_metrics(aggregated=aggregated, window_size=window_size)
+        return None
+
     @classmethod
     def from_model(
         cls,
