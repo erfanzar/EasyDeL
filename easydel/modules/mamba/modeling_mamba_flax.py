@@ -427,11 +427,7 @@ class MambaBlock(nn.Module):
         return hidden_states, cache
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=MambaConfig,
-    model_type="mamba"
-)
+@register_module(TaskType.BASE_MODULE, config=MambaConfig, model_type="mamba")
 class MambaModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -562,11 +558,7 @@ class MambaModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.CAUSAL_LM,
-    config=MambaConfig,
-    model_type="mamba"
-)
+@register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
 class MambaForCausalLM(EasyDeLBaseModule):
     def __init__(
         self,

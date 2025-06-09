@@ -367,11 +367,7 @@ class SingleStandRwkvBlock(nn.Module):
 RwkvBlock = nn.vmap(SingleStandRwkvBlock, in_axes=0, out_axes=0)
 
 
-@register_module(
-    TaskType.BASE_MODULE,
-    config=RwkvConfig,
-    model_type="rwkv"
-)
+@register_module(TaskType.BASE_MODULE, config=RwkvConfig, model_type="rwkv")
 class RwkvModel(EasyDeLBaseModule):
     def __init__(
         self,
@@ -486,11 +482,7 @@ class RwkvModel(EasyDeLBaseModule):
         )
 
 
-@register_module(
-    TaskType.CAUSAL_LM,
-    config=RwkvConfig,
-    model_type="rwkv"
-)
+@register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
 class RwkvForCausalLM(EasyDeLBaseModule):
     def __init__(
         self,
