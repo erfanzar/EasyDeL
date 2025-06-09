@@ -7,6 +7,7 @@ Trainers
    trainers___init__
    trainers_base_trainer
    trainers_direct_preference_optimization_trainer
+   trainers_distillation_trainer
    trainers_group_relative_policy_optimization
    trainers_metrics
    trainers_odds_ratio_preference_optimization_trainer

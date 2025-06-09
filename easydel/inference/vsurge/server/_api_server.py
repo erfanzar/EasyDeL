@@ -382,7 +382,7 @@ class vSurgeApiServer:
                 **request.chat_template_kwargs,
             )
         except Exception as e:
-            self.logger.exception(f"Error applying chat template for model {vsurge.vsurge_name}: {e}")
+            logger.exception(f"Error applying chat template for model {vsurge.vsurge_name}: {e}")
             raise RuntimeError(f"Error tokenizing input: {e}") from e
 
     async def _prepare_vsurge_input_async(self, request, vsurge) -> dict:
