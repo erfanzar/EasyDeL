@@ -382,14 +382,10 @@ def main():
 if __name__ == "__main__":
     # This calls the main function, which is decorated to run on Ray TPUs.
     # Ray will handle distributing this call to the configured TPU resources.
-    main.main() # Ray requires calling .main() on the remote function object
-                # or using ray.get(main.remote())
-
     # Correction: The `eformer.executor.ray.execute` decorator handles launching.
     # So, a direct call to `main()` is what's intended IF the script itself
     # is what `ray job submit` or similar would target.
-    # However, `main.main()` is typical for `@ray.remote` if you want to explicitly invoke it.
-    # Given the `@execute` decorator, it's likely just `main()` is sufficient.
+    
     # Let's stick to the original `main()` as it seems to be the pattern for `eformer.executor`.
     main()
 ```
