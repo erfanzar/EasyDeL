@@ -243,7 +243,7 @@ def main():
     logger.info("Initializing GRPOTrainer.")
     trainer = ed.GRPOTrainer(
         model=model,
-        reward_funcs=[format_reward, accuracy_reward], 
+        reward_funcs=[format_reward, accuracy_reward],
         processing_class=tokenizer,  # Pass the instance
         eval_dataset=test_dataset,
         train_dataset=train_dataset,
