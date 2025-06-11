@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import pprint
 import re
 from typing import Any
 
@@ -49,10 +50,11 @@ SYSTEM_PROMPT = (
 
 # --- TPU Accelerator Configuration ---
 tpu_config = TpuAcceleratorConfig(
-    accelerator="v4-64",
+    "v4-64",
     execution_env={"env_vars": TPU_EXECUTION_ENV_VARS, "pip": TPU_PIP_PACKAGES},
 )
 
+pprint.pprint(TPU_EXECUTION_ENV_VARS)
 
 @execute(tpu_config)
 @ray.remote
