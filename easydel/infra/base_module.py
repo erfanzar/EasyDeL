@@ -55,7 +55,7 @@ PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | 
 
 logger = get_logger(__name__)
 
-BaseConf = tp.TypeVar("BConf", bound=EasyDeLBaseConfig)
+BaseConf = EasyDeLBaseConfig
 Self = tp.TypeVar("Self")
 
 
@@ -69,6 +69,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
     base_model_prefix: str
     _model_task: str | None = None
     _model_type: str | None = None
+    config: BaseConf | None = None
 
     def __init__(
         self,
