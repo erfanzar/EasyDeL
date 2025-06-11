@@ -19,6 +19,7 @@ from functools import cached_property, partial
 import flax
 import flax.nnx
 import jax
+from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
@@ -310,28 +311,38 @@ class GRPOTrainer(Trainer):
         @partial(
             jax.jit,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
-            out_shardings=empty_sharding,
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
         )
-        def generate(state, input_ids, attention_mask):
+        def generate(state: EasyDeLState, input_ids, attention_mask):
             module = state.model
+
             with module.mesh:
-                return jnp.asarray(
-                    module.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        generation_config=GenerationConfig(
-                            top_p=self.arguments.top_p,
-                            top_k=self.arguments.top_k,
-                            temperature=self.arguments.temperature,
-                            pad_token_id=self.pad_token_id,
-                            eos_token_id=self.eos_token_id,
-                            max_new_tokens=self.arguments.max_completion_length,
-                            max_length=self.arguments.max_completion_length + self.arguments.max_prompt_length,
-                            num_return_sequences=self.num_generations,
-                            do_sample=True,
-                        ),
-                    ).sequences
+                input_ids = module.config.partition_manager.shard(
+                    input_ids,
+                    axes=[common_types.BATCH, common_types.SEQUENCE_PARALLEL],
+                    mode=common_types.MODE_PREFILL,
                 )
+                attention_mask = module.config.partition_manager.shard(
+                    attention_mask,
+                    axes=[common_types.BATCH, common_types.SEQUENCE_PARALLEL],
+                    mode=common_types.MODE_PREFILL,
+                )
+                sequences = module.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=GenerationConfig(
+                        top_p=self.arguments.top_p,
+                        top_k=self.arguments.top_k,
+                        temperature=self.arguments.temperature,
+                        pad_token_id=self.pad_token_id,
+                        eos_token_id=self.eos_token_id,
+                        max_new_tokens=self.arguments.max_completion_length,
+                        max_length=self.arguments.max_completion_length + self.arguments.max_prompt_length,
+                        num_return_sequences=self.num_generations,
+                        do_sample=True,
+                    ),
+                ).sequences
+                return sequences, input_ids, attention_mask
 
         self.generate_function = generate
 
@@ -425,7 +436,9 @@ class GRPOTrainer(Trainer):
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                sequences = jax.block_until_ready(self.generate_function(state, prompt_ids, prompt_mask))
+                sequences, prompt_ids, prompt_mask = jax.block_until_ready(
+                    self.generate_function(state, prompt_ids, prompt_mask)
+                )
             generation_time = generation_time_fn()
             prompt_completion_ids = sequences
             completion_ids = prompt_completion_ids[..., prompt_ids.shape[-1] :]
@@ -536,10 +549,10 @@ class GRPOTrainer(Trainer):
         # ill find you and ill gather u...
         return (
             {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": self._all_gather(jnp.asarray(completion_ids)),
-                "completion_mask": self._all_gather(jnp.asarray(completion_mask)),
+                "prompt_ids": self._all_gather(prompt_ids),
+                "prompt_mask": self._all_gather(prompt_mask),
+                "completion_ids": self._all_gather(completion_ids),
+                "completion_mask": self._all_gather(completion_mask),
                 "ref_per_token_logps": self._all_gather(ref_per_token_logps),
                 "advantages": self._all_gather(advantages),
             },
