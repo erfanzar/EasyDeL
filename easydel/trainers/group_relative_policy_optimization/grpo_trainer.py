@@ -551,7 +551,7 @@ class GRPOTrainer(Trainer):
                 "completion_ids": self._all_gather(completion_ids),
                 "completion_mask": self._all_gather(completion_mask),
                 "ref_per_token_logps": self._all_gather(ref_per_token_logps),
-                "advantages": self._one_to_all(advantages),
+                "advantages": advantages,
             },
             metrics_dict,
         )
