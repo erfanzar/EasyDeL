@@ -288,9 +288,6 @@ class GRPOTrainer(Trainer):
             spec=self.arguments.step_partition_spec,
         )
 
-    def _all_gather(self, arr: jax.Array) -> jax.Array:
-        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
-
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
         Configures and JIT-compiles the training and evaluation step functions.
@@ -554,7 +551,7 @@ class GRPOTrainer(Trainer):
                 "completion_ids": self._all_gather(completion_ids),
                 "completion_mask": self._all_gather(completion_mask),
                 "ref_per_token_logps": self._all_gather(ref_per_token_logps),
-                "advantages": self._all_gather(advantages),
+                "advantages": self._one_to_all(advantages),
             },
             metrics_dict,
         )
