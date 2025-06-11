@@ -143,7 +143,7 @@ log_info "Uninstalling existing easydel..."
 
 install_package "git+https://github.com/erfanzar/easydel" || exit 1
 install_package "jax[tpu]" "-U" || exit 1
-install_package "ray[default]==2.34.0" "-U" || exit 1
+install_package "ray[default]==2.46.0" "-U" || exit 1
 
 log_info "Configuring Ray..."
 if ! "$EOPOD_PATH" auto-config-ray --self-job; then
