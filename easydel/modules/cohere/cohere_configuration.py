@@ -155,6 +155,7 @@ class CohereConfig(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.head_dim = hidden_size // num_attention_heads
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

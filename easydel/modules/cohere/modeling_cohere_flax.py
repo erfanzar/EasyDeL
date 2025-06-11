@@ -125,7 +125,7 @@ class CohereAttention(AttentionModule):
         self.rngs = rngs
         self.hidden_size = config.hidden_size
         self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+        self.head_dim = self.config.head_dim
         self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
 
         if self.num_key_value_groups == 1:
