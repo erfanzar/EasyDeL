@@ -108,7 +108,7 @@ SYSTEM_PROMPT = (
 # --- TPU Accelerator Configuration ---
 # This configures the Ray execution environment for TPUs.
 tpu_config = TpuAcceleratorConfig(
-    accelerator="v4-64", # Specifies the TPU type and size (e.g., v4 pod with 64 chips)
+    "v4-64", # Specifies the TPU type and size (e.g., v4 pod with 64 chips)
     execution_env={ # Defines the environment for each Ray worker
         "env_vars": TPU_EXECUTION_ENV_VARS, # Passes our defined environment variables
         "pip": TPU_PIP_PACKAGES # Installs specified pip packages
