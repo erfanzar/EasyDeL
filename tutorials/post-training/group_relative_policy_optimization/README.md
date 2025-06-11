@@ -1,6 +1,6 @@
 # Tutorial: Fine-Tuning with GRPO on TPUs using EasyDeL & Ray
 
-This tutorial will guide you through fine-tuning a language model (Cohere Aya-8B) on a math problem-solving dataset (NuminaMath) using the Generative Response Policy Optimization (GRPO) algorithm. We'll leverage the EasyDeL library for efficient JAX-based training and Ray for distributed execution on TPUs.
+This tutorial will guide you through fine-tuning a language model (Cohere Aya-8B) on a math problem-solving dataset (NuminaMath) using the Group Relative Policy Optimization (GRPO) algorithm. We'll leverage the EasyDeL library for efficient JAX-based training and Ray for distributed execution on TPUs.
 
 **What is GRPO?**
 GRPO is an algorithm similar to Reinforcement Learning from Human Feedback (RLHF) methods like PPO, but often simpler to implement and tune for generative tasks. It aims to steer the model towards generating responses that maximize a given reward signal, often by comparing multiple generated responses.
@@ -410,7 +410,7 @@ if __name__ == "__main__":
     * The `main()` function will then run on these Ray actors.
     * You'll see logs related to dataset loading, model sharding, and then the training progress (loss, rewards, etc.).
     * If WandB is enabled, metrics will be logged there.
-    * Checkpoints will be saved according to `save_steps` and `save_directory` (if specified, defaults to `./easydel_ckpt_manager/`).
+    * Checkpoints will be saved according to `save_steps` and `save_directory` (if specified, defaults to `./EasyDeL-Checkpoints/`).
 
 ---
 
