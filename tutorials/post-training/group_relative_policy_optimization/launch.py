@@ -12,39 +12,84 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
+from typing import Any
 
-import ray
-from eformer.executor.ray import TpuAcceleratorConfig, execute
+import ray  # type: ignore
+from eformer.executor.ray import TpuAcceleratorConfig, execute  # type: ignore
 
 ray.init()
+# --- Configuration Constants ---
+MODEL_ID = "cohereLabs/aya-expanse-8b"
+DATASET_ID = "AI-MO/NuminaMath-TIR"
+WANDB_ENTITY = None
+
+# For TPU execution environment - consider fetching sensitive tokens from environment variables
+# For example: HF_TOKEN = os.environ.get("HF_TOKEN")
+# Make sure these are set in the environment where the script/Ray workers run.
+TPU_EXECUTION_ENV_VARS = {
+    "EASYDEL_AUTO": "1",
+    "HF_TOKEN": os.environ.get("HF_TOKEN_FOR_EASYDEL", ""),
+    "HF_DATASETS_CACHE": "/dev/shm/huggingface-dataset",
+    "HF_HOME": "/dev/shm/huggingface",
+    "HF_DATASETS_OFFLINE": "0",
+    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY_FOR_EASYDEL", ""),
+}
+
+TPU_PIP_PACKAGES = ["math_verify"]
+
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    "The assistant first thinks about the think process in the mind and then provides the user with the answer. "
+    "The think process and answer are enclosed within <think> </think> and answer needs no tag tags, respectively, i.e.,"
+    " <think> think process here </think> answer here"
+)
 
 
-@execute(TpuAcceleratorConfig("v4-64"))
+# --- TPU Accelerator Configuration ---
+tpu_config = TpuAcceleratorConfig(
+    accelerator="v4-64",
+    execution_env={"env_vars": TPU_EXECUTION_ENV_VARS, "pip": TPU_PIP_PACKAGES},
+)
+
+
+@execute(tpu_config)
 @ray.remote
 def main():
-    import easydel as ed  # noqa
-
-    import jax
-    from datasets import load_dataset
-    from jax import numpy as jnp
-    from math_verify import LatexExtractionConfig, parse, verify
+    # Imports inside main to ensure they are available in the Ray remote environment
+    import jax  # type: ignore
+    from datasets import load_dataset  # type: ignore
+    from jax import numpy as jnp  # type: ignore
+    from math_verify import LatexExtractionConfig, parse, verify  # type: ignore
     from transformers import AutoTokenizer
 
-    model_id = "CohereLabs/aya-expanse-8b"
-    processor = AutoTokenizer.from_pretrained(model_id)
-    processor.padding_side = "left"
+    import easydel as ed
 
+    logger = ed.utils.get_logger("GRPO-EasyDeL")
+    logger.info(f"Starting main execution on Ray worker with JAX backend: {jax.default_backend()}")
+
+    # --- Tokenizer Setup ---
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        logger.info(f"Set pad_token_id to eos_token_id: {tokenizer.pad_token_id}")
+
+    # --- GRPO Configuration ---
+    # Hyperparameters (consider making these more configurable if varied often)
     total_batch_size = 8
     num_return_sequences = 4
     top_k = 50
     top_p = 0.95
     temperature = 0.7
+    max_prompt_length = 2048
+    max_completion_length = 2048
 
     grpo_config = ed.GRPOConfig(
         total_batch_size=total_batch_size,
-        max_prompt_length=2048,
-        max_completion_length=2048,
+        max_prompt_length=max_prompt_length,
+        max_completion_length=max_completion_length,
         learning_rate=1e-6,
         learning_rate_end=6e-7,
         log_steps=5,
@@ -54,13 +99,12 @@ def main():
         optimizer=ed.EasyDeLOptimizers.ADAMW,
         scheduler=ed.EasyDeLSchedulers.LINEAR,
         do_last_save=True,
-        track_memory=False,
+        track_memory=False,  # Set to True if memory tracking is needed
         save_steps=1000,
-        save_total_limit=0,  # 0 means remove everything and then save
+        save_total_limit=0,
         save_optimizer_state=False,
-        per_epoch_training_steps=None,
-        per_epoch_evaluation_steps=None,
         use_wandb=True,
+        wandb_entity=WANDB_ENTITY,
         clip_grad=1.0,
         weight_distribution_log_steps=100,
         warmup_steps=0,
@@ -69,48 +113,54 @@ def main():
         top_p=top_p,
         top_k=top_k,
         temperature=temperature,
+        # save_directory="gs://somewhere" maybe
     )
 
-    if processor.pad_token_id is None:
-        processor.pad_token_id = processor.eos_token_id
+    max_sequence_length = grpo_config.max_completion_length + grpo_config.max_prompt_length
 
-    max_prompt_length = grpo_config.max_prompt_length
-    max_completion_length = grpo_config.max_completion_length
-    max_sequence_length = max_completion_length + max_prompt_length
-
+    # --- Model Loading ---
+    logger.info(f"Loading model: {MODEL_ID}")
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-        model_id,
+        MODEL_ID,
         auto_shard_model=True,
-        sharding_axis_dims=(1, -1, 1, 1, 1),
+        sharding_axis_dims=(1, -1, 1, 1, 1),  # Specific to model architecture and TPU topology
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=max_sequence_length,
             mask_max_position_embeddings=max_sequence_length,
             attn_dtype=jnp.bfloat16,
             attn_softmax_dtype=jnp.bfloat16,
             kvdtype=jnp.bfloat16,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+            # kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        # quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
         param_dtype=jnp.bfloat16,
         dtype=jnp.bfloat16,
         precision=jax.lax.Precision.DEFAULT,
-        partition_axis=ed.PartitionAxis(),
+        # partition_axis=ed.PartitionAxis(), # Default
     )
+    logger.info("Model loaded successfully.")
 
-    def format_reward(completions, **kwargs):
-        """Reward function that checks if the completion has a specific format."""
-        pattern = r"^<think>.*?</think>.*?"
-        completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.match(pattern, content) for content in completion_contents]
-        rewards_list = [1.0 if match else 0.0 for match in matches]
-        return rewards_list
+    # --- Reward Functions ---
+    def format_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[float]:
+        """
+        Reward function that checks if the completion starts with a <think>...</think> block.
+        """
+        pattern = r"^<think>.*?</think>"  # Simplified: only checks start, not full structure
+        rewards = []
+        for completion_group in completions:
+            if completion_group and "content" in completion_group[0]:
+                content = completion_group[0]["content"]
+                rewards.append(1.0 if re.match(pattern, content, re.DOTALL) else 0.0)
+            else:
+                rewards.append(0.0)
+        return rewards
 
     def accuracy_reward(prompts, completions, batch, **kwargs):
         """Reward function that checks if the completion is the same as the ground truth."""
         # solutions = kwargs["solution"]
-        solutions = processor.batch_decode(batch["solution_ids"]) * num_return_sequences
+        solutions = tokenizer.batch_decode(batch["solution_ids"]) * num_return_sequences
         completion_contents = [completion[0]["content"] for completion in completions]
         rewards = []
         for content, solution in zip(completion_contents, solutions, strict=False):
@@ -133,64 +183,75 @@ def main():
                 rewards.append(1.0)
         return rewards
 
-    SYSTEM_PROMPT = (
-        "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant"
-        " first thinks about the think process in the mind and then provides the user with the answer. The think "
-        "process and answer are enclosed within <think> </think> and answer needs not tag tags, respectively, i.e., "
-        "<think> think process here </think> answer here"
-    )
-
-    dataset_id = "AI-MO/NuminaMath-TIR"
+    # --- Dataset Preparation ---
+    logger.info(f"Loading dataset: {DATASET_ID}")
+    # Consider using streaming for very large datasets if memory is an issue
     train_dataset, test_dataset = load_dataset(
-        dataset_id,
+        DATASET_ID,
         split=["train[:100%]", "test[:100%]"],
     )
+    logger.info(f"Train dataset size: {len(train_dataset)}, Test dataset size: {len(test_dataset)}")
 
-    def make_conversation(example):
+    def map_conversation_format(example: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+        """Converts dataset examples to the required conversational format."""
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": example["problem"]},
             ],
+            "solution": example["solution"],
         }
 
-    train_dataset = train_dataset.map(make_conversation, remove_columns=["messages"])
-    test_dataset = test_dataset.map(make_conversation, remove_columns=["messages"])
+    train_dataset = train_dataset.map(map_conversation_format, remove_columns=["messages"])
+    test_dataset = test_dataset.map(map_conversation_format, remove_columns=["messages"])
 
-    def data_tokenize_fn(batch, tokenizer, tools):
-        ids = tokenizer(
+    def data_tokenize_fn(
+        batch: dict[str, Any],
+        tokenizer_instance: AutoTokenizer,
+        config: ed.GRPOConfig,
+    ) -> dict[str, Any]:
+        """Tokenizes prompts and solutions for GRPO training."""
+        # Tokenize prompts
+        prompt_ids = tokenizer_instance(
             batch["prompt"],
             return_tensors="np",
             padding="max_length",
-            padding_side="left",
-            max_length=grpo_config.max_prompt_length,
+            padding_side="left",  # Important for causal LM
+            max_length=config.max_prompt_length,
             truncation=True,
-            add_special_tokens=False,
+            add_special_tokens=False,  # Usually False for pre-formatted conversations
         )
-        ans = tokenizer(
+
+        # Tokenize solutions (targets)
+        solution_ids_tokenized = tokenizer_instance(
             batch["solution"],
             return_tensors="np",
-            padding="max_length",
-            padding_side="left",
-            max_length=grpo_config.max_prompt_length,
+            padding="max_length",  # Or "longest" if dynamic padding is handled later
+            padding_side="left",  # Typically 'right' for labels, but check GRPO requirements
+            max_length=config.max_completion_length,  # Use completion length for solutions
             truncation=True,
             add_special_tokens=False,
-            return_attention_mask=False,
+            return_attention_mask=False,  # Usually not needed for labels
         )
-        ids.update({"solution_ids": ans["input_ids"]})
-        return ids
+        # The key for solution IDs should match what `accuracy_reward` expects
+        prompt_ids["solution_ids"] = solution_ids_tokenized["input_ids"]
+        return prompt_ids
 
+    # --- Trainer Setup and Execution ---
+    logger.info("Initializing GRPOTrainer.")
     trainer = ed.GRPOTrainer(
         model=model,
-        reward_funcs=[format_reward, accuracy_reward],
-        processing_class=processor,
+        reward_models_or_functions=[format_reward, accuracy_reward],  # Renamed for clarity
+        processor_class_or_instance=tokenizer,  # Pass the instance
         eval_dataset=test_dataset,
         train_dataset=train_dataset,
         arguments=grpo_config,
-        data_tokenize_fn=data_tokenize_fn,
+        data_collator_or_fn=lambda batch: data_tokenize_fn(batch, tokenizer, grpo_config),  # Pass tokenizer and config
     )
 
+    logger.info("Starting training...")
     trainer.train()
+    logger.info("Training finished.")
 
 
 if __name__ == "__main__":
