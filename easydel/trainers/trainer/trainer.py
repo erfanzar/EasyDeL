@@ -16,8 +16,9 @@ import typing as tp
 import jax
 import jax.experimental
 import jax.lib
+from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
@@ -134,6 +135,14 @@ class Trainer(BaseTrainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    def _all_gather(self, arr: jax.Array) -> jax.Array:
+        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
+
+    def _one_to_all(self, arr: jax.Array) -> jax.Array:
+        with self.mesh:
+            arr = with_sharding_constraint(arr, PartitionSpec(None))
+        return arr
 
     def _run_training_loop(
         self,
