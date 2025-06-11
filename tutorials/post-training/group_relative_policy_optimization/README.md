@@ -319,22 +319,22 @@ def main():
 
     def data_tokenize_fn(
         batch: dict[str, Any], # A batch of examples from the mapped dataset
-        tokenizer_instance: AutoTokenizer, # The tokenizer
-        config: ed.GRPOConfig, # The GRPO config (for max_lengths)
+        tokenizer: AutoTokenizer, # The tokenizer
+        tools,
     ) -> dict[str, Any]:
         """Tokenizes prompts and solutions for GRPO training."""
         # Tokenize prompts (system + user message)
-        # `tokenizer_instance(batch["prompt"])` works because HuggingFace tokenizers can
+        # `tokenizer(batch["prompt"])` works because HuggingFace tokenizers can
         # automatically format conversational inputs if `add_special_tokens` is appropriate
         # or if the model's chat template is used. Here, `add_special_tokens=False` suggests
         # manual control or that the model doesn't need special chat tokens prepended/appended
         # beyond what's in the roles.
-        prompt_ids = tokenizer_instance(
+        prompt_ids = tokenizer(
             batch["prompt"], # List of conversation turns
             return_tensors="np", # Return NumPy arrays
             padding="max_length", # Pad to max_prompt_length
             padding_side="left", # Pad on the left for decoder-only models
-            max_length=config.max_prompt_length,
+            max_length=grpo_config.max_prompt_length,
             truncation=True,
             add_special_tokens=False, # Usually False for pre-formatted conversational data,
                                       # assuming EOS/BOS handled by model/training if needed elsewhere.
@@ -342,14 +342,14 @@ def main():
         )
 
         # Tokenize solutions (ground truth answers)
-        solution_ids_tokenized = tokenizer_instance(
+        solution_ids_tokenized = tokenizer(
             batch["solution"], # Text of the solutions
             return_tensors="np",
             padding="max_length",
             padding_side="left", # Important: For GRPO, reference answer tokens are also often left-padded.
                                  # This might be specific to EasyDeL's GRPO implementation.
                                  # Typically, labels are right-padded. Double-check EasyDeL docs if issues arise.
-            max_length=config.max_completion_length, # Use completion length for solutions
+            max_length=grpo_config.max_completion_length, # Use completion length for solutions
             truncation=True,
             add_special_tokens=False,
             return_attention_mask=False, # Attention mask not needed for solution_ids here
@@ -363,14 +363,17 @@ def main():
     trainer = ed.GRPOTrainer(
         model=model, # The EasyDeL model instance
         # List of reward functions. Their outputs will be combined (usually summed or weighted).
-        reward_models_or_functions=[format_reward, accuracy_reward],
-        processor_class_or_instance=tokenizer, # The tokenizer instance
+        reward_funcs=[format_reward, accuracy_reward],
+        processing_class=tokenizer, # The tokenizer instance
         eval_dataset=test_dataset, # Evaluation dataset
         train_dataset=train_dataset, # Training dataset
         arguments=grpo_config, # The GRPOConfig object
         # `data_collator_or_fn` is used to process batches from the dataset.
         # Here, it's a lambda calling our tokenization function.
-        data_collator_or_fn=lambda batch: data_tokenize_fn(batch, tokenizer, grpo_config),
+        eval_dataset=test_dataset,
+        train_dataset=train_dataset,
+        arguments=grpo_config,
+        data_tokenize_fn=data_tokenize_fn,  # Pass tokenizer and config
     )
 
     logger.info("Starting training...")

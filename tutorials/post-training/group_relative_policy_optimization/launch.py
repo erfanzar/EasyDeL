@@ -190,7 +190,7 @@ def main():
     # Consider using streaming for very large datasets if memory is an issue
     train_dataset, test_dataset = load_dataset(
         DATASET_ID,
-        split=["train[:100%]", "test[:100%]"],
+        split=["train[:100%]", "test[:100%]"]
     )
     logger.info(f"Train dataset size: {len(train_dataset)}, Test dataset size: {len(test_dataset)}")
 
@@ -209,28 +209,28 @@ def main():
 
     def data_tokenize_fn(
         batch: dict[str, Any],
-        tokenizer_instance: AutoTokenizer,
-        config: ed.GRPOConfig,
+        tokenizer: AutoTokenizer,
+        tools,
     ) -> dict[str, Any]:
         """Tokenizes prompts and solutions for GRPO training."""
         # Tokenize prompts
-        prompt_ids = tokenizer_instance(
+        prompt_ids = tokenizer(
             batch["prompt"],
             return_tensors="np",
             padding="max_length",
             padding_side="left",  # Important for causal LM
-            max_length=config.max_prompt_length,
+            max_length=grpo_config.max_prompt_length,
             truncation=True,
             add_special_tokens=False,  # Usually False for pre-formatted conversations
         )
 
         # Tokenize solutions (targets)
-        solution_ids_tokenized = tokenizer_instance(
+        solution_ids_tokenized = tokenizer(
             batch["solution"],
             return_tensors="np",
             padding="max_length",  # Or "longest" if dynamic padding is handled later
             padding_side="left",  # Typically 'right' for labels, but check GRPO requirements
-            max_length=config.max_completion_length,  # Use completion length for solutions
+            max_length=grpo_config.max_completion_length,  # Use completion length for solutions
             truncation=True,
             add_special_tokens=False,
             return_attention_mask=False,  # Usually not needed for labels
@@ -243,12 +243,12 @@ def main():
     logger.info("Initializing GRPOTrainer.")
     trainer = ed.GRPOTrainer(
         model=model,
-        reward_models_or_functions=[format_reward, accuracy_reward],  # Renamed for clarity
-        processor_class_or_instance=tokenizer,  # Pass the instance
+        reward_funcs=[format_reward, accuracy_reward], 
+        processing_class=tokenizer,  # Pass the instance
         eval_dataset=test_dataset,
         train_dataset=train_dataset,
         arguments=grpo_config,
-        data_collator_or_fn=lambda batch: data_tokenize_fn(batch, tokenizer, grpo_config),  # Pass tokenizer and config
+        data_tokenize_fn=data_tokenize_fn,  # Pass tokenizer and config
     )
 
     logger.info("Starting training...")
