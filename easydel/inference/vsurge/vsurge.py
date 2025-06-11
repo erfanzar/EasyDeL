@@ -12,59 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This module defines the vSurge system, a high-throughput inference engine
-for EasyDeL models, designed for high-throughput and low-latency text generation.
-
-vSurge orchestrates text generation requests, managing the underlying driver
-(vDriver for standard attention or oDriver for paged attention) and processing
-responses. It provides a high-level interface for submitting text generation
-requests and handles the complexities of request queuing, tokenization,
-detokenization, and asynchronous processing.
-
-Key features of vSurge include:
-
-- **High-throughput:** vSurge is designed to handle a large number of concurrent
-  text generation requests.
-- **Low-latency:** vSurge minimizes latency by using asynchronous processing
-  and optimized inference engines.
-- **Memory-efficient:** vSurge supports paged attention via the oDriver, which
-  allows for efficient memory management when generating long sequences.
-- **Flexibility:** vSurge supports both standard attention (vDriver) and paged
-  attention (oDriver), allowing users to choose the best option for their
-  specific needs.
-- **Easy integration:** vSurge integrates seamlessly with other modules in the
-  EasyDeL library.
-
-The following diagram illustrates the architecture of the vSurge system:
-
-```mermaid
-graph LR
-    A[vSurge] --> B(vDriver or oDriver);
-    B --> C(vEngine or oEngine);
-    C --> D(EasyDeLBaseModule);
-    C --> E(Processor);
-    B --> F(ActiveRequest Queue);
-    F --> B;
-    A --> G(ReturnSample Queue);
-    G --> A;
-```
-
-In this diagram:
-
-- `vSurge` is the main class that orchestrates the text generation process.
-- `vDriver` and `oDriver` are the underlying inference drivers that handle the
-  actual text generation. `vDriver` uses standard attention, while `oDriver`
-  uses paged attention for memory-efficient inference.
-- `vEngine` and `oEngine` are the inference engines that perform the forward
-  pass of the model.
-- `EasyDeLBaseModule` is the EasyDeL model instance.
-- `Processor` is the processor/tokenizer instance.
-- `ActiveRequest Queue` is the queue that holds the incoming text generation
-  requests.
-- `ReturnSample Queue` is the queue that holds the generated text samples.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -74,6 +21,7 @@ import time
 import typing as tp
 
 import jax
+from eformer.common_types import NOT_GIVEN, _Empty
 
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
@@ -100,67 +48,47 @@ logger = get_logger("vSurge")
 
 
 class vSurgeMetadata:
-    """
-    Tracks timing information for requests processed by the vSurge.
-
-    This class is used to store metadata related to a request's processing,
-    such as the start time. It helps in measuring the latency and performance
-    of the vSurge system.
+    """Tracks timing information for requests processed by vSurge.
 
     Attributes:
-        start_time (float): The Unix timestamp (seconds) when the request processing started.
+        start_time (float): The Unix timestamp (seconds) when request processing began.
     """
 
     def __init__(self):
-        """
-        Initializes the metadata, capturing the current time as the start time.
-        """
+        """Initializes the metadata, capturing the current time as the start time."""
         self.start_time = time.time()
 
 
 @dataclasses.dataclass
 class vSurgeRequest:
-    """
-    Represents a request specifically for text completion within the vSurge system.
-
-    This dataclass encapsulates all parameters necessary for a text generation
-    request, providing a structured way to configure the generation process.
+    """Represents a request for text completion within the vSurge system.
 
     Attributes:
-        prompt (str): The input prompt for text completion. This is the text that the model will use as a starting point
-            for generating new text.
-        max_tokens (int): The maximum number of tokens to generate. This limits the length of the generated text.
-        top_p (float): The nucleus sampling probability. Only tokens comprising the top_p cumulative probability are
-            considered. Defaults to 1.0.
-        top_k (int): The number of highest probability vocabulary tokens to keep for top-k-filtering. Defaults to 0
-            (no top-k filtering).
-        min_p (float): The minimum probability for a token to be considered. Defaults to 0.0.
-        n (int): The number of independent samples to generate for each prompt. Defaults to 1.
-        stop (tp.Optional[tp.Union[str, tp.List[str]]]): A string or list of strings that, if generated, will cause the
-            generation to stop. Defaults to None.
-        temperature (float): The sampling temperature. Higher values make the output more random, lower values make it
-            more deterministic. Defaults to 0.7.
-        presence_penalty (float): Penalty applied to tokens based on their presence in the generated text so far.
-            Discourages repetition. Defaults to 0.0.
-        frequency_penalty (float): Penalty applied to tokens based on their frequency in the generated text so far.
-            Discourages frequent tokens. Defaults to 0.0.
-        repetition_penalty (float): Penalty applied to repeated tokens. A value > 1.0 discourages repetition.
-            Defaults to 1.0.
-        metadata (vSurgeMetadata | None): Metadata associated with the request, such as start time.
-            Automatically initialized if None.
-        is_client_side_tokenization (bool): If True, indicates that the prompt is already tokenized and the
-            client expects token IDs as output. Defaults to False.
+        prompt (str): The input prompt for text completion.
+        max_tokens (int): The maximum number of tokens to generate.
+        top_p (float): Nucleus sampling probability. Defaults to 0.95.
+        top_k (int): Number of highest probability tokens for top-k filtering. Defaults to 0.
+        min_p (float): Minimum probability for a token to be considered. Defaults to 0.0.
+        n (int): Number of independent samples to generate. Defaults to 1.
+        stop (tp.Optional[tp.Union[str, tp.List[str]]]): String or list of strings to
+            stop generation if encountered. Defaults to None.
+        temperature (float): Sampling temperature. Defaults to 0.7.
+        presence_penalty (float): Penalty for token presence. Defaults to 0.0.
+        frequency_penalty (float): Penalty for token frequency. Defaults to 0.0.
+        repetition_penalty (float): Penalty for repeated tokens. Defaults to 1.0.
+        metadata (tp.Optional[vSurgeMetadata]): Metadata associated with the request.
+            Auto-initialized if None.
+        is_client_side_tokenization (bool): If True, prompt is tokenized and client expects
+            token IDs. Defaults to False.
     """
 
     prompt: str
     max_tokens: int
-
     top_p: float = 0.95
     top_k: int = 0
     min_p: float = 0.0
     n: int = 1
     stop: str | list[str] | None = None
-
     temperature: float = 0.7
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -169,17 +97,15 @@ class vSurgeRequest:
     is_client_side_tokenization: bool = False
 
     @classmethod
-    def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams):
-        """
-        Creates a vSurgeRequest instance from a prompt and SamplingParams.
+    def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams) -> vSurgeRequest:
+        """Creates a vSurgeRequest from a prompt and SamplingParams.
 
         Args:
             prompt (str): The input prompt string.
             sampling_params (SamplingParams): An object containing sampling parameters.
 
         Returns:
-            vSurgeRequest: A new vSurgeRequest instance initialized with the
-                provided prompt and sampling parameters.
+            vSurgeRequest: A new vSurgeRequest instance.
         """
         return vSurgeRequest(
             prompt=prompt,
@@ -196,149 +122,152 @@ class vSurgeRequest:
         )
 
     def __post_init__(self):
-        """
-        Ensures metadata is initialized and validates the prompt type.
-        `is_client_side_tokenization` is also explicitly set to False by default here.
-        """
+        """Ensures metadata is initialized and validates prompt type."""
         if self.metadata is None:
             self.metadata = vSurgeMetadata()
-        self.is_client_side_tokenization = False
         assert isinstance(self.prompt, str), "prompt should be a single string"
 
 
-class vSurge:
-    """
-    Orchestrates high-throughput text generation by interacting with a vDriver or oDriver.
-
-    The vSurge class acts as the main interface for submitting text generation
-    requests to the underlying inference engine. It manages the driver
-    (either a vDriver for standard attention or an oDriver for paged attention),
-    handles request queuing, and processes responses, including tokenization
-    and detokenization if needed.
+@dataclasses.dataclass
+class ProcessState:
+    """Internal state for tracking a single generation within a vSurgeRequest's 'n' sequences.
 
     Attributes:
-        _driver (vDriver): The underlying inference driver instance
-            (either vDriver for standard attention or oDriver for paged attention).
-        _vsurge_name (str): The name of this vSurge instance, defaulting to the
-            driver's name.
+        id (int): Identifier for this generation sequence (0 to n-1).
+        active_request (ActiveRequest): The ActiveRequest object submitted to the driver.
+        channel_iter (tp.AsyncIterator[list[ReturnSample]]): Asynchronous iterator for
+            receiving results from the driver.
+        driver_buffer (list[list[ReturnSample]]): Buffer for driver responses in
+            server-side tokenization.
+        finished_streaming (bool): True if this generation sequence has finished.
+        current_step_text (tp.Union[str, list]): Text or token IDs generated in the current step.
+            Type is `str` for server-side/bytecode, `List[int]` for client-side token IDs.
+        all_token_ids (list[int]): Accumulated list of all token IDs generated so far.
+        full_accumulated_text (tp.Union[str, list]): Full generated text or list of
+            per-token decoded strings. Type is `str` for server-side/bytecode, `List[str]`
+            (per-token decode) if client-side without bytecode.
+        time_spent (float): Cumulative time spent computing for this sequence.
+        tps (float): Tokens per second for this sequence.
+        num_tokens (int): Total number of tokens generated for this sequence.
+        decoded_text_upto_previous_step (tp.Optional[str]): Text decoded up to the
+            previous step, used for diffing with `bytecode_decode`.
+    """
+
+    id: int
+    active_request: ActiveRequest
+    channel_iter: tp.AsyncIterator[list[ReturnSample]]
+    driver_buffer: list[list[ReturnSample]] = dataclasses.field(default_factory=list)
+    finished_streaming: bool = False
+    current_step_text: str | list = ""
+    all_token_ids: list[int] = dataclasses.field(default_factory=list)
+    full_accumulated_text: str | list = ""
+    time_spent: float = 0.0
+    tps: float = 0.0
+    num_tokens: int = 0
+    decoded_text_upto_previous_step: str | None = None
+
+
+class vSurge:
+    """Orchestrates high-throughput text generation using an underlying vDriver.
+
+    vSurge manages request queuing, interaction with the driver, and processing
+    of generation results, including tokenization and detokenization. It supports
+    batch and streaming generation, client-side and server-side tokenization,
+    and special handling for bytecode tokenizers.
     """
 
     def __init__(
         self,
         driver: vDriver,
         vsurge_name: str | None = None,
+        bytecode_decode: bool = False,
     ):
-        """
-        Initializes the vSurge instance.
+        """Initializes the vSurge instance.
 
         Args:
-            driver (vDriver): The underlying driver instance
-                (vDriver or oDriver) that will handle the actual inference.
-            vsurge_name (str | None): An optional name for this vSurge instance.
-                If None, it defaults to the name of the provided driver.
+            driver (vDriver): The underlying vDriver instance for inference.
+            vsurge_name (tp.Optional[str]): Optional name for this vSurge instance.
+                Defaults to the driver's name.
+            bytecode_decode (bool): Default bytecode decoding behavior for this vSurge
+                instance. If True, attempts to decode tokens by accumulating all tokens
+                and decoding them together, which can be beneficial for tokenizers
+                with byte fallbacks. This setting can be overridden per-request in
+                `generate` and `complete` methods. Defaults to False.
         """
         self._driver = driver
         self._vsurge_name = vsurge_name or driver.driver_name
+        self._bytecode_decode = bytecode_decode
 
     def compile(self):
-        """
-        Compiles the underlying driver.
-
-        This typically involves JIT compilation of the model's forward pass for
-        optimized execution.
-        """
+        """Compiles the underlying driver for optimized execution."""
         self.driver.compile()
 
     @property
     def vsurge_name(self) -> str:
-        """
-        Returns the name of the vSurge instance.
-
-        Returns:
-            str: The name of this vSurge instance.
-        """
+        """str: The name of this vSurge instance."""
         return self._vsurge_name
 
     @property
-    def driver(self) -> vDriver:
-        """
-        Provides access to the underlying driver instance.
+    def bytecode_decode(self) -> bool:
+        """bool: The default bytecode decoding setting for this instance."""
+        return self._bytecode_decode
 
-        Returns:
-            vDriver: The vDriver or oDriver instance used by
-                this vSurge.
-        """
+    @property
+    def driver(self) -> vDriver:
+        """vDriver: Provides access to the underlying vDriver instance."""
         return self._driver
 
     @property
     def processor(self) -> ProcessingClassType:
-        """
-        Returns the processor/tokenizer associated with the underlying driver.
-
-        The processor is used for tokenizing prompts and detokenizing generated
-        token IDs.
-
-        Returns:
-            ProcessingClassType: The processor (e.g., a Hugging Face tokenizer)
-                instance.
-        """
+        """ProcessingClassType: The processor/tokenizer from the underlying driver."""
         return self.driver.processor
 
     def start(self):
-        """
-        Starts the underlying driver.
-
-        This initializes the driver's processing loops and makes it ready to
-        accept inference requests.
-        """
+        """Starts the underlying driver, making it ready for requests."""
         return self.driver.start()
 
     def stop(self):
-        """
-        Stops the underlying driver.
-
-        This gracefully shuts down the driver's processing loops.
-        """
+        """Stops the underlying driver gracefully."""
         return self.driver.stop()
 
     def pause(self):
-        """
-        Pauses the underlying driver.
-
-        This temporarily halts the processing of new requests by the driver.
-        """
+        """Pauses the underlying driver, halting new request processing."""
         return self.driver.pause()
 
     def resume(self):
-        """
-        Resumes the underlying driver after it has been paused.
-
-        This allows the driver to continue processing requests.
-        """
+        """Resumes the underlying driver after a pause."""
         return self.driver.resume()
 
     def replace_graphstate(self, state):
-        """
-        Replaces the graph state of the underlying driver.
-
-        This is an advanced feature, typically used for dynamic model updates or
-        state management in complex scenarios.
+        """Replaces the graph state of the underlying driver.
 
         Args:
-            state: The new graph state to be applied to the driver.
+            state: The new graph state to apply.
         """
         return self.driver.replace_graphstate(state=state)
 
     def get_device_memory_stats(self) -> dict | None:
-        """Delegates to vDriver to get device memory stats."""
-        if hasattr(self, "vdriver") and hasattr(self.vdriver, "get_device_memory_stats"):
-            return self.vdriver.get_device_memory_stats()
+        """Gets device memory statistics from the driver, if available.
+
+        Returns:
+            tp.Optional[dict]: A dictionary of memory stats or None.
+        """
+        if hasattr(self._driver, "get_device_memory_stats"):
+            return self._driver.get_device_memory_stats()
         return None
 
     def get_vdriver_metrics(self, aggregated: bool = True, window_size: int = 100) -> dict | None:
-        """Delegates to vDriver to get its operational metrics."""
-        if hasattr(self, "vdriver") and hasattr(self.vdriver, "get_metrics"):
-            return self.vdriver.get_metrics(aggregated=aggregated, window_size=window_size)
+        """Gets operational metrics from the driver, if available.
+
+        Args:
+            aggregated (bool): If True, returns aggregated metrics. Defaults to True.
+            window_size (int): Window size for non-aggregated metrics. Defaults to 100.
+
+        Returns:
+            tp.Optional[dict]: A dictionary of metrics or None.
+        """
+        if hasattr(self._driver, "get_metrics"):
+            return self._driver.get_metrics(aggregated=aggregated, window_size=window_size)
         return None
 
     @classmethod
@@ -348,7 +277,7 @@ class vSurge:
         processor: ProcessingClassType,
         max_concurrent_decodes: int | None = None,
         max_concurrent_prefill: int | None = None,
-        prefill_lengths: int | None = None,
+        prefill_lengths: int | list[int] | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
         num_pages: int | None = None,
@@ -358,93 +287,86 @@ class vSurge:
         slot_clear_steps: int = 512,
         vsurge_name: str | None = None,
         verbose: bool = True,
+        bytecode_decode: bool = False,
         seed: int = 894,
     ) -> vSurge:
-        """
-        Instantiates a `vSurge` object from a given model and processor, configuring
-        decoding and prefill concurrency, memory management, and generation parameters.
+        """Instantiates vSurge from a model and processor.
 
-        This method constructs a `vSurge` engine and driver stack, handling default
-        fallbacks and validations for parameters not explicitly provided.
+        This class method configures and creates a `vSurge` instance, setting up
+        the necessary driver and engine stack with appropriate parameters for
+        decoding, prefill concurrency, memory management, and other generation settings.
 
         Args:
-            model (EasyDeLBaseModule):
-                The EasyDeL model instance used for inference.
-
-            processor (ProcessingClassType):
-                The tokenizer or processor compatible with the model.
-
-            max_concurrent_decodes (int, optional):
-                Maximum number of decode calls allowed in parallel. Defaults to the
-                number of available JAX devices.
-
-            max_concurrent_prefill (int, optional):
-                Maximum number of concurrent prefill steps. Defaults to 1.
-
-            prefill_lengths (int, optional):
-                Custom prefill lengths for each decode group. If not provided, they are
-                computed automatically.
-
-            max_prefill_length (int, optional):
-                The maximum number of tokens allowed during the prefill phase. Defaults
-                to half of `max_length`.
-
-            max_length (int, optional):
-                The maximum sequence length for decoding. Defaults to the model's
-                `granted_mask_max_position_embedding`.
-
-            num_pages (int, optional):
-                Number of paging groups for memory partitioning and prefill scheduling.
-
-            tokens_per_page (int, optional):
-                Number of tokens allocated per page in the decoding workspace.
-
-            interleaved_mode (bool, optional):
-                If True, enables interleaved decoding and prefill scheduling.
-                Defaults to False.
-
-            detokenizing_blocks (int, optional):
-                Number of detokenization blocks used during output post-processing.
-                Defaults to 8.
-
-            slot_clear_steps (int, optional):
-                Number of steps after which stale memory slots are cleared.
-                Defaults to 512.
-
-            vsurge_name (str, optional):
-                Optional name identifier for the created `vSurge` instance.
-
-            verbose (bool, optional):
-                Enables logging and verbose driver output. Defaults to True.
-
-            seed (int, optional):
-                Random seed for consistent decoding behavior. Defaults to 894.
+            model (EasyDeLBaseModule): The EasyDeL model instance to be used for inference.
+            processor (ProcessingClassType): The tokenizer or processor compatible with the model.
+            max_concurrent_decodes (tp.Optional[int]): Maximum number of decode calls
+                allowed in parallel. Defaults to the number of available JAX devices.
+            max_concurrent_prefill (tp.Optional[int]): Maximum number of concurrent
+                prefill steps. Defaults to 1.
+            prefill_lengths (tp.Optional[tp.Union[int, list[int]]]): Custom prefill lengths.
+                If an integer is provided, it's treated as `max_prefill_length`, and
+                a list of prefill lengths is computed. If a list of integers is provided,
+                it's used directly, and its maximum value must match `max_prefill_length`.
+                If None, prefill lengths are computed automatically based on
+                `max_prefill_length` and `num_pages`.
+            max_prefill_length (tp.Optional[int]): The maximum number of tokens allowed
+                during the prefill phase. Defaults to half of `max_length`.
+            max_length (tp.Optional[int]): The maximum sequence length for decoding.
+                Defaults to the model's `granted_mask_max_position_embedding`.
+            num_pages (tp.Optional[int]): Number of paging groups for memory partitioning.
+                Used for computing `prefill_lengths` if not explicitly provided.
+                Defaults to 128 in that case.
+            tokens_per_page (tp.Optional[int]): Number of tokens allocated per page in
+                the decoding workspace.
+            interleaved_mode (bool): If True, enables interleaved decoding and prefill
+                scheduling. Defaults to False.
+            detokenizing_blocks (int): Number of detokenization blocks used during
+                output post-processing. Defaults to 8.
+            slot_clear_steps (int): Number of steps after which stale memory slots
+                are cleared. Defaults to 512.
+            vsurge_name (tp.Optional[str]): Optional name identifier for the created
+                `vSurge` instance.
+            verbose (bool): Enables logging and verbose driver output. Defaults to True.
+            bytecode_decode (bool): Default bytecode decoding behavior for the new
+                `vSurge` instance. Defaults to False.
+            seed (int): Random seed for consistent decoding behavior. Defaults to 894.
 
         Returns:
-            vSurge:
-                A fully configured `vSurge` instance ready for inference.
+            vSurge: A fully configured `vSurge` instance ready for inference.
 
         Raises:
-            ValueError:
-                If `prefill_lengths` is provided but its maximum value does not match
-                `max_prefill_length`.
+            ValueError: If `prefill_lengths` is provided as a list and its maximum
+                value does not match `max_prefill_length`.
+            TypeError: If `prefill_lengths` is of an unsupported type.
         """
         max_length = max_length or model.config.granted_mask_max_position_embedding
-
         max_prefill_length = max_prefill_length or max_length // 2
-
         max_concurrent_prefill = max_concurrent_prefill or 1
         max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 
-        if prefill_lengths is not None:
-            if max(prefill_lengths) != max_prefill_length:
-                raise ValueError("The maximum value in `prefill_lengths` must match `max_prefill_length`.")
-        else:
-            prefill_lengths = calculate_pefill_lengths(
+        actual_prefill_lengths: list[int]
+        if isinstance(prefill_lengths, int):
+            max_prefill_length = prefill_lengths
+            actual_prefill_lengths = calculate_pefill_lengths(
                 max_prefill_length=max_prefill_length,
-                num_pages=128,
+                num_pages=num_pages or 128,
             )
-            logger.info(f"Computed prefill lengths are {prefill_lengths}")
+            logger.info(f"Computed prefill lengths are {actual_prefill_lengths}")
+        elif isinstance(prefill_lengths, list):
+            if not all(isinstance(i, int) for i in prefill_lengths):
+                raise ValueError("`prefill_lengths` must be a list of integers if provided as a list.")
+            if max(prefill_lengths) != max_prefill_length:
+                raise ValueError("The maximum value in `prefill_lengths` list must match `max_prefill_length`.")
+            actual_prefill_lengths = prefill_lengths
+        elif prefill_lengths is None:
+            actual_prefill_lengths = calculate_pefill_lengths(
+                max_prefill_length=max_prefill_length,
+                num_pages=num_pages or 128,
+            )
+            logger.info(f"Computed prefill lengths are {actual_prefill_lengths}")
+        else:
+            raise TypeError("`prefill_lengths` must be an int, list of ints, or None.")
+
         return vSurge(
             driver=vDriver(
                 engine=vEngine(
@@ -452,7 +374,7 @@ class vSurge:
                     processor=processor,
                     max_concurrent_prefill=max_concurrent_prefill,
                     max_concurrent_decodes=max_concurrent_decodes,
-                    prefill_lengths=prefill_lengths,
+                    prefill_lengths=actual_prefill_lengths,
                     max_prefill_length=max_prefill_length,
                     num_pages=num_pages,
                     tokens_per_page=tokens_per_page,
@@ -465,19 +387,18 @@ class vSurge:
                 verbose=verbose,
             ),
             vsurge_name=vsurge_name,
+            bytecode_decode=bytecode_decode,
         )
 
     def count_tokens(self, text_or_conversation: str | list) -> int:
-        """
-        Counts the number of tokens in a given string or conversation list.
+        """Counts tokens in a string or conversation list.
 
-        Uses the underlying driver's processor to tokenize the input. If the input
-        is a list (assumed to be a conversation in OpenAI chat format), it attempts
-        to apply the chat template if available, otherwise concatenates content fields.
+        Uses the underlying driver's processor. If the input is a list (assumed
+        to be a conversation), it attempts to apply the chat template if available.
 
         Args:
-            text_or_conversation (tp.Union[str, list]): Either a single string or a
-                list of message dictionaries (e.g., `[{"role": "user", "content": "Hello"}]`).
+            text_or_conversation (tp.Union[str, list]): A single string or a list of
+                message dictionaries (e.g., `[{"role": "user", "content": "Hello"}]`).
 
         Returns:
             int: The total number of tokens in the input.
@@ -495,7 +416,7 @@ class vSurge:
                         tokenize=True,
                         add_generation_prompt=False,
                     )
-                    return len(tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized)
+                    return len(tokenized if isinstance(tokenized, list) else tokenized.get("input_ids", []))
                 else:
                     full_text = " ".join(
                         [msg.get("content", "") for msg in text_or_conversation if isinstance(msg.get("content"), str)]
@@ -507,17 +428,337 @@ class vSurge:
             logger.error(f"Error during token counting: {e}")
             raise ValueError(f"Failed to count tokens: {e}") from e
 
-    def should_buffer_response(self, response: list[ReturnSample]) -> bool:
-        """
-        Determines if a response from the driver needs buffering for server-side detokenization.
+    async def _generate_batch(
+        self,
+        requests: list[vSurgeRequest],
+        bytecode_decode: bool | _Empty = NOT_GIVEN,
+    ) -> list[ReturnSample]:
+        """Generates text completions for a batch of requests without streaming.
 
-        This is typically true if the response contains special tokens (e.g., byte fallbacks)
-        that indicate incomplete detokenization.
+        Internal method to handle batch generation logic.
+
+        Args:
+            requests (list[vSurgeRequest]): A list of `vSurgeRequest` objects.
+            bytecode_decode (tp.Union[bool, _Empty]): If provided (not `NOT_GIVEN`),
+                overrides the instance's default `bytecode_decode` setting for this call.
+                If `NOT_GIVEN`, the instance's default is used.
+
+        Returns:
+            list[ReturnSample]: A list of `ReturnSample` objects, one per input request.
+            The `ReturnSample.accumulated_text` field holds the final generated text(s)
+            for each of the 'n' generations within that request.
+        """
+        bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
+
+        async def _collect_last_yielded_item(
+            request_obj: vSurgeRequest,
+        ) -> ReturnSample | None:
+            last_item: ReturnSample | None = None
+            async for result_list in self.complete(request_obj, bytecode_decode=bytecode_decode):
+                if result_list:
+                    last_item = result_list[0]
+            return last_item
+
+        tasks = [asyncio.create_task(_collect_last_yielded_item(req)) for req in requests]
+        try:
+            final_samples_per_request: list[ReturnSample | None] = await asyncio.gather(*tasks)
+        except Exception as e:
+            for task_to_cancel in tasks:
+                if not task_to_cancel.done():
+                    task_to_cancel.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise e
+
+        processed_final_results: list[ReturnSample] = []
+        for i, last_step_sample in enumerate(final_samples_per_request):
+            original_req = requests[i]
+            if last_step_sample is not None:
+                processed_final_results.append(
+                    ReturnSample(
+                        text=last_step_sample.accumulated_text,
+                        token_ids=last_step_sample.token_ids,
+                        accumulated_text=last_step_sample.accumulated_text,
+                        time_spent_computing=last_step_sample.time_spent_computing,
+                        tokens_per_second=last_step_sample.tokens_per_second,
+                        num_generated_tokens=last_step_sample.num_generated_tokens,
+                    )
+                )
+            else:
+                empty_text_val_single: str | list
+                if original_req.is_client_side_tokenization and not bytecode_decode:
+                    empty_text_val_single = []
+                else:
+                    empty_text_val_single = ""
+                num_n = original_req.n if original_req.n > 0 else 0
+                processed_final_results.append(
+                    ReturnSample(
+                        text=[empty_text_val_single] * num_n,
+                        token_ids=[[]] * num_n,
+                        accumulated_text=[empty_text_val_single] * num_n,
+                        time_spent_computing=[0.0] * num_n,
+                        tokens_per_second=[0.0] * num_n,
+                        num_generated_tokens=[0] * num_n,
+                    )
+                )
+        return processed_final_results
+
+    def _create_default_return_sample_for_request(self, request: vSurgeRequest, bytecode_decode: bool) -> ReturnSample:
+        """Creates a default ReturnSample for a request.
+
+        This helper is used by `_generate_stream` to provide a consistent object
+        structure when a stream ends or if it never produces data, ensuring that
+        the yielded list always contains `ReturnSample` objects.
+
+        Args:
+            request (vSurgeRequest): The original `vSurgeRequest` for which to create
+                a default `ReturnSample`.
+            bytecode_decode (bool): The effective bytecode decoding setting, used to
+                determine the structure of empty text/token fields.
+
+        Returns:
+            ReturnSample: A `ReturnSample` instance with default (empty/zeroed) values,
+            structured according to `request.n` and the effective `bytecode_decode`
+            and `request.is_client_side_tokenization` settings.
+        """
+        num_n = request.n if request.n > 0 else 0
+        empty_text_val_single: str | list
+        if request.is_client_side_tokenization and not bytecode_decode:
+            empty_text_val_single = []
+        else:
+            empty_text_val_single = ""
+
+        return ReturnSample(
+            text=[empty_text_val_single] * num_n,
+            token_ids=[[]] * num_n,
+            accumulated_text=[empty_text_val_single] * num_n,
+            time_spent_computing=[0.0] * num_n,
+            tokens_per_second=[0.0] * num_n,
+            num_generated_tokens=[0] * num_n,
+        )
+
+    async def _generate_stream(
+        self,
+        requests: list[vSurgeRequest],
+        bytecode_decode: bool | _Empty = NOT_GIVEN,
+    ) -> tp.AsyncGenerator[list[ReturnSample], None]:
+        """Generates text completions for a batch of requests with streaming.
+
+        Internal method to handle streaming logic. Each yield provides the latest
+        state for all input requests. If a stream for a particular request finishes,
+        its slot in the yielded list will contain its *last actual `ReturnSample`*
+        repeatedly. If it never produced data or errored early, a default
+        `ReturnSample` (structured according to the request's 'n' value) is used.
+
+        Args:
+            requests (list[vSurgeRequest]): A list of `vSurgeRequest` objects.
+            bytecode_decode (tp.Union[bool, _Empty]): If provided (not `NOT_GIVEN`),
+                overrides the instance's default `bytecode_decode` setting for this call.
+                If `NOT_GIVEN`, the instance's default is used.
+
+        Yields:
+            tp.AsyncGenerator[list[ReturnSample], None]: An asynchronous generator.
+            Each yield is a list of `ReturnSample` objects. Each `ReturnSample` in
+            the list corresponds to an input request. Its fields (e.g., `text`,
+            `token_ids`) are lists themselves, where each element corresponds to one
+            of the `n` generations for that specific request. `ReturnSample.text`
+            contains the current chunk of text/tokens for each of the 'n' generations.
+        """
+        bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
+        num_original_requests = len(requests)
+        if num_original_requests == 0:
+            return
+
+        stream_iterators = [self.complete(req, bytecode_decode=bytecode_decode).__aiter__() for req in requests]
+
+        latest_data_from_streams: list[ReturnSample] = [
+            self._create_default_return_sample_for_request(req, bytecode_decode) for req in requests
+        ]
+        active_stream_indices = list(range(num_original_requests))
+        has_yielded_at_least_once = False
+
+        async def fetch_next_for_sync(iterator, idx_tag):
+            try:
+                item_list = await iterator.__anext__()
+                return idx_tag, item_list[0] if item_list else None, None
+            except StopAsyncIteration:
+                return idx_tag, None, StopAsyncIteration()
+            except Exception as exc:
+                return idx_tag, None, exc
+
+        while active_stream_indices:
+            tasks_for_this_sync_step = [
+                asyncio.create_task(fetch_next_for_sync(stream_iterators[original_idx], original_idx))
+                for original_idx in active_stream_indices
+            ]
+
+            if not tasks_for_this_sync_step:
+                break
+
+            done_tasks, _ = await asyncio.wait(
+                tasks_for_this_sync_step,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+
+            newly_finished_indices_this_poll = []
+            critical_error_occurred: Exception | None = None
+            any_new_data_arrived_in_this_step = False
+
+            for task in done_tasks:
+                original_idx, fetched_sample, task_error_status = task.result()
+
+                if task_error_status:
+                    if original_idx not in newly_finished_indices_this_poll:
+                        newly_finished_indices_this_poll.append(original_idx)
+                    if not isinstance(task_error_status, StopAsyncIteration):
+                        critical_error_occurred = task_error_status
+                        logger.error(
+                            f"Error in stream {original_idx} for prompt "
+                            f"'{requests[original_idx].prompt[:30]}...': {task_error_status}"
+                        )
+                else:
+                    if fetched_sample is not None:
+                        latest_data_from_streams[original_idx] = fetched_sample
+                        any_new_data_arrived_in_this_step = True
+
+            if critical_error_occurred:
+                logger.error(f"Critical error occurred during stream processing: {critical_error_occurred}")
+                active_stream_indices.clear()
+                yield list(latest_data_from_streams)
+                has_yielded_at_least_once = True
+                raise critical_error_occurred
+
+            if newly_finished_indices_this_poll:
+                for finished_idx in newly_finished_indices_this_poll:
+                    if finished_idx in active_stream_indices:
+                        active_stream_indices.remove(finished_idx)
+
+            should_yield_this_step = (
+                not has_yielded_at_least_once
+                or any_new_data_arrived_in_this_step
+                or bool(newly_finished_indices_this_poll)
+                or not active_stream_indices
+            )
+
+            if should_yield_this_step:
+                yield list(latest_data_from_streams)
+                has_yielded_at_least_once = True
+
+            if not active_stream_indices:
+                break
+
+        if not has_yielded_at_least_once and num_original_requests > 0:
+            yield list(latest_data_from_streams)
+
+    async def generate(
+        self,
+        prompts: str | tp.Sequence[str],
+        sampling_params: SamplingParams | tp.Sequence[SamplingParams] | None = None,
+        stream: bool = False,
+        bytecode_decode: bool | _Empty = NOT_GIVEN,
+    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
+        """Generates text completions for given prompts.
+
+        This is the main public method for text generation. It handles single or
+        multiple prompts and can operate in batch or streaming mode.
+
+        Args:
+            prompts (tp.Union[str, tp.Sequence[str]]): A single prompt string or a
+                sequence of prompt strings.
+            sampling_params (tp.Optional[tp.Union[SamplingParams, tp.Sequence[SamplingParams]]]):
+                Sampling parameters.
+                - If `prompts` is a single string, this can be a single `SamplingParams`
+                  object or None (to use default `SamplingParams`).
+                - If `prompts` is a sequence, this can be:
+                    - A single `SamplingParams` object (applied to all prompts).
+                    - A sequence of `SamplingParams` objects (one per prompt).
+                    - None (default `SamplingParams` used for all prompts).
+                Must match the structure of `prompts` if provided as a sequence.
+            stream (bool): If True, returns an async generator that yields results
+                incrementally. If False, returns a list with all results after
+                completion. Defaults to False.
+            bytecode_decode (tp.Union[bool, _Empty]): Overrides the instance's default
+                `bytecode_decode` setting for this specific generation call. If `NOT_GIVEN`
+                (the default), the instance's default `self.bytecode_decode` is used.
+                If True, enables special handling for bytecode tokenizers.
+
+        Returns:
+            tp.Union[list[ReturnSample], tp.AsyncGenerator[list[ReturnSample], None]]:
+            - If `stream` is False (batch mode): `list[ReturnSample]`.
+              Each `ReturnSample` corresponds to an input prompt. Its `accumulated_text`
+              field contains the final generated text(s). The structure of
+              `ReturnSample.accumulated_text` (and `.text`, `.token_ids`) is a list
+              representing the `n` generations (e.g., `List[str]` or `List[List[int]]`).
+            - If `stream` is True (streaming mode): `tp.AsyncGenerator[list[ReturnSample], None]`.
+              Each yield is `list[ReturnSample]`, one entry per input prompt.
+              A `ReturnSample` contains the latest generated chunk (in its `.text` field) and
+              cumulative data. If a specific prompt's stream has finished, its slot in the
+              yielded list will contain the *last actual `ReturnSample` it produced* repeatedly
+              until all streams are finished. If a stream never produces data, it will yield
+              a default `ReturnSample`.
+
+        Raises:
+            ValueError: If `prompts` and `sampling_params` have mismatched lengths
+                or unsupported types.
+            RuntimeError: If issues occur during the generation process (e.g., queue full).
+        """
+        if isinstance(prompts, str):
+            prompts = [prompts]
+            if sampling_params is not None and not isinstance(sampling_params, SamplingParams):
+                raise ValueError("If prompts is str, sampling_params must be SamplingParams or None.")
+            sampling_params = [sampling_params if sampling_params else SamplingParams()]
+        elif isinstance(prompts, tp.Sequence):
+            if not prompts:
+                if stream:
+
+                    async def empty_gen_for_empty_prompts():
+                        if False:
+                            yield []
+
+                    return empty_gen_for_empty_prompts()
+                return []
+            if sampling_params is None:
+                sampling_params = [SamplingParams()] * len(prompts)
+            elif isinstance(sampling_params, SamplingParams):
+                sampling_params = [sampling_params] * len(prompts)
+            elif isinstance(sampling_params, tp.Sequence):
+                if len(prompts) != len(sampling_params):
+                    raise ValueError("Lengths of prompts and sampling_params lists must match.")
+            else:
+                raise ValueError("sampling_params must be SamplingParams, list of SamplingParams, or None.")
+        else:
+            raise ValueError("prompts must be a string or a sequence of strings.")
+
+        if not prompts:
+            if stream:
+
+                async def empty_gen_final():
+                    if False:
+                        yield []
+
+                return empty_gen_final()
+            return []
+
+        requests_list = [
+            vSurgeRequest.from_sampling_params(p, sp) for p, sp in zip(prompts, sampling_params, strict=False)
+        ]
+
+        effective_bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
+
+        if stream:
+            return self._generate_stream(requests_list, bytecode_decode=effective_bytecode_decode)
+        else:
+            return await self._generate_batch(requests_list, bytecode_decode=effective_bytecode_decode)
+
+    def should_buffer_response(self, response: list[ReturnSample]) -> bool:
+        """Determines if a driver response needs buffering for server-side detokenization.
+
+        Buffering is typically needed if the response contains special tokens
+        (e.g., byte fallbacks) indicating incomplete detokenization.
 
         Args:
             response (list[ReturnSample]): A list of `ReturnSample` objects from the
-                driver for a single generation stream's current step. Each `ReturnSample`'s
-                `text` attribute is a list of strings/byte-strings from the driver.
+                driver for a single generation stream's current step. `ReturnSample.text`
+                is expected to be a list of strings/byte-strings from the driver.
 
         Returns:
             bool: True if buffering is needed, False otherwise.
@@ -526,6 +767,8 @@ class vSurge:
             if (
                 item.text
                 and isinstance(item.text, list)
+                and item.text
+                and isinstance(item.text[-1], str)
                 and item.text[-1].startswith("<0x")
                 and item.text[-1].endswith(">")
             ):
@@ -537,28 +780,28 @@ class vSurge:
         response: list[ReturnSample],
         generation_idx_tag: int,
     ) -> list[ReturnSample]:
-        """
-        Processes driver responses when tokenization is handled client-side.
+        """Processes driver responses for client-side tokenization.
 
         This method primarily tags the `ReturnSample` objects with the correct
-        `generation_idx`, which identifies which of the 'n' parallel generations
-        this sample belongs to.
+        `generation_idx`. For client-side tokenization, the `ReturnSample.text`
+        field from the driver is expected to contain the new token IDs for the current step.
+        These are moved to the `token_ids` field of the output `ReturnSample`.
 
         Args:
-            response (list[ReturnSample]): List of `ReturnSample` objects from the
-                driver for the current step of a single generation stream (one of 'n').
-                The `text` field in these samples is expected to be token IDs.
+            response (list[ReturnSample]): List of `ReturnSample` objects from the driver.
+                `ReturnSample.text` is expected to be `List[int]` (new token IDs).
             generation_idx_tag (int): The index of this generation stream (0 to n-1).
 
         Returns:
-            list[ReturnSample]: A list of `ReturnSample` objects, each updated with
-                the `generation_idx_tag`.
+            list[ReturnSample]: A list of `ReturnSample` objects, updated with
+            `generation_idx_tag` and with new token IDs in the `token_ids` field.
         """
         samples = []
         for sample_from_driver in response:
             new_sample = dataclasses.replace(
                 sample_from_driver,
                 generation_idx=generation_idx_tag,
+                token_ids=list(sample_from_driver.text) if isinstance(sample_from_driver.text, list) else [],
             )
             samples.append(new_sample)
         return samples
@@ -569,64 +812,60 @@ class vSurge:
         buffer_for_this_gen: list[list[ReturnSample]],
         generation_idx_tag: int,
     ) -> list[ReturnSample]:
-        """
-        Processes driver responses when tokenization/detokenization is server-side.
+        """Processes driver responses for server-side tokenization/detokenization.
 
-        This method handles detokenization of text segments, including potentially
-        combining buffered segments from previous steps with current segments,
-        especially to correctly decode byte fallbacks or other special tokens.
+        Handles detokenization of text segments, potentially combining buffered
+        segments with current ones, especially for byte fallbacks.
+        The `ReturnSample.text` from the driver (in `current_driver_response`)
+        contains text/byte segments for the current step. The `ReturnSample.token_ids`
+        from the driver contains the token IDs corresponding to these text segments
+        for the current step. Cumulative metrics are passed through.
 
         Args:
-            current_driver_response (list[ReturnSample]): List of `ReturnSample`
-                objects from the driver for the current step of a single generation stream.
-            buffer_for_this_gen (list[list[ReturnSample]]): A buffer containing lists
-                of `ReturnSample` objects from previous steps of the same generation stream,
-                kept when `should_buffer_response` was True.
+            current_driver_response (list[ReturnSample]): List of `ReturnSample` from
+                the driver for the current step.
+            buffer_for_this_gen (list[list[ReturnSample]]): Buffer of `ReturnSample`
+                lists from previous steps of the same generation sequence.
             generation_idx_tag (int): The index of this generation stream (0 to n-1).
 
         Returns:
-            list[ReturnSample]: A list of processed `ReturnSample` objects, typically
-                containing one `ReturnSample` with the detokenized text for the current
-                chunk, tagged with `generation_idx_tag`.
+            list[ReturnSample]: List of processed `ReturnSample` objects, typically
+            containing one `ReturnSample`. This output `ReturnSample` includes:
+            - `text`: The detokenized text for the current chunk (from current step + buffer).
+            - `token_ids`: The token IDs from the driver for the *current step only*.
+            - `accumulated_text`: Cumulative text as reported by the driver.
+            - Cumulative metrics (time_spent_computing, tokens_per_second, num_generated_tokens).
+            - `generation_idx_tag`.
         """
         items_to_process_tuples = (
             list(zip(*buffer_for_this_gen, current_driver_response, strict=False))
             if buffer_for_this_gen
             else [(r,) for r in current_driver_response]
         )
-
         processed_samples_for_yield = []
-
         for single_sequence_all_steps_tuple in items_to_process_tuples:
             text_segments_for_detok_this_chunk = []
 
-            latest_raw_sample_in_sequence = single_sequence_all_steps_tuple[-1]
-            tps = latest_raw_sample_in_sequence.tokens_per_second
-            num_gen_tokens_total_for_seq = latest_raw_sample_in_sequence.num_generated_tokens
-            time_spent = latest_raw_sample_in_sequence.time_spent_computing
+            latest_driver_sample_this_step = single_sequence_all_steps_tuple[-1]
+            tps = latest_driver_sample_this_step.tokens_per_second
+            num_gen_tokens_total_for_seq = latest_driver_sample_this_step.num_generated_tokens
+            time_spent = latest_driver_sample_this_step.time_spent_computing
+            driver_cumulative_text = latest_driver_sample_this_step.accumulated_text
+            token_ids_this_step = list(latest_driver_sample_this_step.token_ids or [])
 
-            full_accumulated_text_from_driver = latest_raw_sample_in_sequence.accumulated_text
-            if isinstance(full_accumulated_text_from_driver, list) and full_accumulated_text_from_driver:
-                full_accumulated_text_from_driver = "".join(
-                    s for s in full_accumulated_text_from_driver if isinstance(s, str)
-                )
-            elif not isinstance(full_accumulated_text_from_driver, str):
-                full_accumulated_text_from_driver = ""
-            all_token_ids_for_this_gen_sequence_total = latest_raw_sample_in_sequence.token_ids
-            if not isinstance(all_token_ids_for_this_gen_sequence_total, list):
-                all_token_ids_for_this_gen_sequence_total = []
-
-            for raw_step_sample in single_sequence_all_steps_tuple:
-                if isinstance(raw_step_sample.text, list):
-                    text_segments_for_detok_this_chunk.extend(raw_step_sample.text)
+            for raw_step_sample_from_buffer_or_current in single_sequence_all_steps_tuple:
+                if isinstance(raw_step_sample_from_buffer_or_current.text, list):
+                    text_segments_for_detok_this_chunk.extend(raw_step_sample_from_buffer_or_current.text)
+                elif isinstance(raw_step_sample_from_buffer_or_current.text, str | bytes):
+                    text_segments_for_detok_this_chunk.append(raw_step_sample_from_buffer_or_current.text)
 
             text_for_this_yield_step_chunk = text_tokens_to_string(text_segments_for_detok_this_chunk)
 
             processed_samples_for_yield.append(
                 ReturnSample(
                     text=text_for_this_yield_step_chunk,
-                    token_ids=all_token_ids_for_this_gen_sequence_total,
-                    accumulated_text=full_accumulated_text_from_driver,
+                    token_ids=token_ids_this_step,
+                    accumulated_text=driver_cumulative_text,
                     time_spent_computing=time_spent,
                     tokens_per_second=tps,
                     num_generated_tokens=num_gen_tokens_total_for_seq,
@@ -638,37 +877,51 @@ class vSurge:
     async def complete(
         self,
         request: vSurgeRequest,
+        bytecode_decode: bool | _Empty = NOT_GIVEN,
     ) -> tp.AsyncGenerator[list[ReturnSample], None]:
-        """
-        Performs text generation for a single `vSurgeRequest`, handling `n` parallel generations.
+        """Performs text generation for a single `vSurgeRequest`.
 
-        This asynchronous generator streams results. Each yield is a list containing
-        a single `ReturnSample` object. This `ReturnSample` aggregates the current
-        state of all `n` generations requested by the input `vSurgeRequest`.
-        For example, `ReturnSample.text` will be a list where each element is the
-        latest text chunk (or list of token IDs if client-side tokenization)
-        for one of the `n` generations.
+        This asynchronous generator streams results for `request.n` parallel
+        generations. Each yield is a list containing a single `ReturnSample` object.
+        This `ReturnSample` aggregates the current state of all `n` generations.
 
         Args:
             request (vSurgeRequest): The text generation request.
+            bytecode_decode (tp.Union[bool, _Empty]): If provided (not `NOT_GIVEN`),
+                overrides the instance's default `bytecode_decode` setting for this call.
+                If `NOT_GIVEN`, the instance's default `self.bytecode_decode` is used.
+                If True, enables special handling for bytecode tokenizers where text is
+                always decoded from the full accumulated list of token IDs.
 
         Yields:
-            tp.List[ReturnSample]: A list containing one `ReturnSample` object.
-                This object's fields (e.g., `text`, `token_ids`) are lists,
-                with each element corresponding to one of the `n` requested generations.
-                - `text`: `List[Union[str, List[int]]]` - current text/token_ids chunk for each 'n'.
-                - `token_ids`: `List[List[int]]` - all token IDs so far for each 'n'.
-                - `accumulated_text`: `List[Union[str, List[str]]]` - full text/token strings for each 'n'.
-
-        Raises:
-            RuntimeError: If the prefill queue is full or if an error occurs during generation.
+            tp.AsyncGenerator[list[ReturnSample], None]: A generator yielding lists,
+            each containing one `ReturnSample`. This `ReturnSample`'s fields
+            (e.g., `text`, `token_ids`, `accumulated_text`) are lists,
+            with each element corresponding to one of the `n` requested generations.
+            - `ReturnSample.text`: `List[Union[str, List[int]]]`. Current text/token_ids chunk.
+                - If `bytecode_decode` is True OR `request.is_client_side_tokenization` is False:
+                  `str` chunk.
+                - Else (`bytecode_decode` is False AND `request.is_client_side_tokenization` is True):
+                  `List[int]` of new token IDs for the current step.
+            - `ReturnSample.token_ids`: `List[List[int]]`. All token IDs generated so far for each 'n'.
+            - `ReturnSample.accumulated_text`: `List[Union[str, List[str]]]`. Full text or
+              list of per-token decoded strings for each 'n'.
+                - If `bytecode_decode` is True OR `request.is_client_side_tokenization` is False:
+                  `str` of full decoded text.
+                - Else (`bytecode_decode` is False AND `request.is_client_side_tokenization` is True):
+                  `List[str]` (each string being a per-token decode of all tokens so far).
         """
         if request.n == 0:
-            if False:
-                yield []
             return
 
-        gen_states = []
+        bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
+
+        logger.debug(
+            f"complete called for request (prompt: '...{request.prompt[-50:]}') with n={request.n}, "
+            f"bytecode_decode={bytecode_decode}, client_side_tok={request.is_client_side_tokenization}"
+        )
+
+        gen_states: list[ProcessState] = []
         for i in range(request.n):
             return_channel = AsyncMultifuture()
             active_req = ActiveRequest(
@@ -692,95 +945,114 @@ class vSurge:
             try:
                 self._driver.place_request_on_prefill_queue(active_req)
             except queue.Full as e:
+                for state_idx in range(i):
+                    if hasattr(gen_states[state_idx].active_request.return_channel, "cancel"):
+                        gen_states[state_idx].active_request.return_channel.cancel()
                 raise RuntimeError(f"Prefill queue full for generation {i + 1}/{request.n}") from e
 
+            initial_current_step_text: str | list
+            initial_full_accumulated_text: str | list
+            if request.is_client_side_tokenization and not bytecode_decode:
+                initial_current_step_text = []
+                initial_full_accumulated_text = []
+            else:
+                initial_current_step_text = ""
+                initial_full_accumulated_text = ""
+
             gen_states.append(
-                {
-                    "id": i,
-                    "active_request": active_req,
-                    "channel_iter": active_req.return_channel.__aiter__(),
-                    "driver_buffer": [],
-                    "finished_streaming": False,
-                    "current_step_text": [] if request.is_client_side_tokenization else "",
-                    "all_token_ids": [],
-                    "full_accumulated_text": [] if request.is_client_side_tokenization else "",
-                    "time_spent": 0.0,
-                    "tps": 0.0,
-                    "num_tokens": 0,
-                }
+                ProcessState(
+                    id=i,
+                    active_request=active_req,
+                    channel_iter=active_req.return_channel.__aiter__(),
+                    current_step_text=initial_current_step_text,
+                    full_accumulated_text=initial_full_accumulated_text,
+                    decoded_text_upto_previous_step="" if bytecode_decode else None,
+                )
             )
 
         num_gens_fully_finished = 0
         active_gen_indices_to_poll = list(range(request.n))
 
+        async def _fetch_next_from_channel(iterator, original_idx_tag):
+            try:
+                return original_idx_tag, await iterator.__anext__(), None
+            except StopAsyncIteration:
+                return original_idx_tag, None, StopAsyncIteration()
+            except Exception as exc:
+                return original_idx_tag, None, exc
+
         while num_gens_fully_finished < request.n:
-            tasks_to_poll = []
-            indices_polled_this_round = []
-            for gen_idx_val in active_gen_indices_to_poll:
-                state = gen_states[gen_idx_val]
-
-                async def fetch_next(iterator, original_idx_tag):
-                    try:
-                        return original_idx_tag, await iterator.__anext__(), None
-                    except StopAsyncIteration:
-                        return original_idx_tag, None, StopAsyncIteration
-                    except Exception as exc:
-                        return original_idx_tag, None, exc
-
-                tasks_to_poll.append(asyncio.create_task(fetch_next(state["channel_iter"], gen_idx_val)))
-                indices_polled_this_round.append(gen_idx_val)
-
+            tasks_to_poll = [
+                asyncio.create_task(_fetch_next_from_channel(gen_states[idx].channel_iter, idx))
+                for idx in active_gen_indices_to_poll
+            ]
             if not tasks_to_poll:
                 break
 
-            done_tasks, pending_tasks = await asyncio.wait(
-                tasks_to_poll,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending_tasks:
-                task.cancel()
-            if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            done_tasks, pending_tasks = await asyncio.wait(tasks_to_poll, return_when=asyncio.FIRST_COMPLETED)
             newly_set_current_step_text_flags = [False] * request.n
+
             for task in done_tasks:
                 original_idx, item_from_driver, error_status = task.result()
                 state = gen_states[original_idx]
 
-                if error_status is StopAsyncIteration:
-                    state["finished_streaming"] = True
+                if isinstance(error_status, StopAsyncIteration):
+                    state.finished_streaming = True
                     num_gens_fully_finished += 1
                     if original_idx in active_gen_indices_to_poll:
                         active_gen_indices_to_poll.remove(original_idx)
-
-                    if not request.is_client_side_tokenization and state["driver_buffer"]:
-                        dummy_driver_resp = [
+                    if not request.is_client_side_tokenization and state.driver_buffer:
+                        last_buffered_sample = (
+                            state.driver_buffer[-1][0]
+                            if state.driver_buffer and state.driver_buffer[-1]
+                            else ReturnSample(text=[], token_ids=[])
+                        )
+                        dummy_driver_resp_for_flush = [
                             ReturnSample(
                                 text=[],
                                 token_ids=[],
-                                accumulated_text=state["driver_buffer"][-1][0].accumulated_text,
-                                time_spent_computing=state["driver_buffer"][-1][0].time_spent_computing,
-                                tokens_per_second=state["driver_buffer"][-1][0].tokens_per_second,
-                                num_generated_tokens=state["driver_buffer"][-1][0].num_generated_tokens,
+                                accumulated_text=last_buffered_sample.accumulated_text,
+                                time_spent_computing=last_buffered_sample.time_spent_computing,
+                                tokens_per_second=last_buffered_sample.tokens_per_second,
+                                num_generated_tokens=last_buffered_sample.num_generated_tokens,
                             )
                         ]
                         processed_outputs = self.process_server_side_tokenization_response(
-                            dummy_driver_resp, state["driver_buffer"], original_idx
+                            dummy_driver_resp_for_flush, state.driver_buffer, original_idx
                         )
+                        state.driver_buffer = []
                         if processed_outputs:
-                            final_chunk = processed_outputs[0]
-                            state["current_step_text"] = final_chunk.text
-                            newly_set_current_step_text_flags[original_idx] = True
-                            state["all_token_ids"] = final_chunk.token_ids
-                            state["full_accumulated_text"] = final_chunk.accumulated_text
-                            state["time_spent"], state["tps"], state["num_tokens"] = (
-                                final_chunk.time_spent_computing,
-                                final_chunk.tokens_per_second,
-                                final_chunk.num_generated_tokens,
-                            )
-                        state["driver_buffer"] = []
+                            final_chunk_from_buffer = processed_outputs[0]
+                            state.time_spent = final_chunk_from_buffer.time_spent_computing
+                            state.tps = final_chunk_from_buffer.tokens_per_second
+                            state.num_tokens = final_chunk_from_buffer.num_generated_tokens
+                            if bytecode_decode and state.all_token_ids:
+                                full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                prev_decoded_text = state.decoded_text_upto_previous_step or ""
+                                current_text_chunk = (
+                                    full_decoded_text_now[len(prev_decoded_text) :]
+                                    if full_decoded_text_now.startswith(prev_decoded_text)
+                                    else full_decoded_text_now
+                                )
+                                state.current_step_text = current_text_chunk
+                                state.full_accumulated_text = full_decoded_text_now
+                            else:
+                                state.current_step_text = final_chunk_from_buffer.text
+                                state.full_accumulated_text = final_chunk_from_buffer.accumulated_text
+                            if state.current_step_text:
+                                newly_set_current_step_text_flags[original_idx] = True
                     continue
-
                 if error_status is not None:
+                    logger.error(f"Error in stream {original_idx} for request: {error_status}")
+                    for p_task in pending_tasks:
+                        p_task.cancel()
+                    if pending_tasks:
+                        await asyncio.gather(*pending_tasks, return_exceptions=True)
+                    for i_gen in range(request.n):
+                        if i_gen != original_idx and not gen_states[i_gen].finished_streaming:
+                            if hasattr(gen_states[i_gen].active_request.return_channel, "set_exception"):
+                                gen_states[i_gen].active_request.return_channel.set_exception(error_status)
+                            gen_states[i_gen].finished_streaming = True
                     raise error_status
 
                 driver_step_output_list = tp.cast(list[ReturnSample], item_from_driver)
@@ -791,362 +1063,118 @@ class vSurge:
                     )
                     if processed_outputs:
                         chunk = processed_outputs[0]
-                        state["current_step_text"] = chunk.text
-                        newly_set_current_step_text_flags[original_idx] = True
-                        state["all_token_ids"].extend(chunk.token_ids)
-                        state["full_accumulated_text"] = [
-                            self.processor.decode([tok_id]) for tok_id in state["all_token_ids"]
-                        ]
-                        state["time_spent"], state["tps"], state["num_tokens"] = (
-                            chunk.time_spent_computing,
-                            chunk.tokens_per_second,
-                            chunk.num_generated_tokens,
-                        )
-                else:
+                        new_token_ids_this_step = list(chunk.token_ids)
+                        state.time_spent = chunk.time_spent_computing
+                        state.tps = chunk.tokens_per_second
+                        state.num_tokens = chunk.num_generated_tokens
+                        if new_token_ids_this_step:
+                            state.all_token_ids.extend(new_token_ids_this_step)
+                            newly_set_current_step_text_flags[original_idx] = True
+                            if bytecode_decode:
+                                full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                prev_decoded_text = state.decoded_text_upto_previous_step or ""
+                                current_text_chunk = (
+                                    full_decoded_text_now[len(prev_decoded_text) :]
+                                    if full_decoded_text_now.startswith(prev_decoded_text)
+                                    else full_decoded_text_now
+                                )
+                                state.current_step_text = current_text_chunk
+                                state.full_accumulated_text = full_decoded_text_now
+                                state.decoded_text_upto_previous_step = full_decoded_text_now
+                            else:
+                                state.current_step_text = new_token_ids_this_step
+                                state.full_accumulated_text = [
+                                    self.processor.decode([tok_id]) for tok_id in state.all_token_ids
+                                ]
+                else:  # Server-side tokenization
                     if self.should_buffer_response(driver_step_output_list):
-                        state["driver_buffer"].append(driver_step_output_list)
-
+                        state.driver_buffer.append(driver_step_output_list)
                     else:
                         processed_outputs = self.process_server_side_tokenization_response(
-                            driver_step_output_list, state["driver_buffer"], original_idx
+                            driver_step_output_list, state.driver_buffer, original_idx
                         )
-                        state["driver_buffer"] = []
+                        state.driver_buffer = []
                         if processed_outputs:
                             chunk = processed_outputs[0]
-                            state["current_step_text"] = chunk.text
-                            newly_set_current_step_text_flags[original_idx] = True
-                            state["all_token_ids"] = chunk.token_ids
-                            state["full_accumulated_text"] = chunk.accumulated_text
-                            state["time_spent"], state["tps"], state["num_tokens"] = (
-                                chunk.time_spent_computing,
-                                chunk.tokens_per_second,
-                                chunk.num_generated_tokens,
-                            )
+                            new_token_ids_this_step = list(chunk.token_ids)
+                            if new_token_ids_this_step:
+                                state.all_token_ids.extend(new_token_ids_this_step)
+                            state.time_spent = chunk.time_spent_computing
+                            state.tps = chunk.tokens_per_second
+                            state.num_tokens = chunk.num_generated_tokens
+                            if chunk.text or not state.all_token_ids:
+                                newly_set_current_step_text_flags[original_idx] = True
+                                if bytecode_decode and state.all_token_ids:
+                                    full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                    prev_decoded_text = state.decoded_text_upto_previous_step or ""
+                                    current_text_chunk = (
+                                        full_decoded_text_now[len(prev_decoded_text) :]
+                                        if full_decoded_text_now.startswith(prev_decoded_text)
+                                        else full_decoded_text_now
+                                    )
+                                    state.current_step_text = current_text_chunk
+                                    state.full_accumulated_text = full_decoded_text_now
+                                    state.decoded_text_upto_previous_step = full_decoded_text_now
+                                else:
+                                    state.current_step_text = chunk.text
+                                    state.full_accumulated_text = chunk.accumulated_text
+                                    if bytecode_decode:
+                                        state.decoded_text_upto_previous_step = chunk.accumulated_text
+
+            for task_to_cancel in pending_tasks:
+                task_to_cancel.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
 
             any_stream_produced_new_text_this_cycle = any(newly_set_current_step_text_flags)
             all_streams_definitively_done = num_gens_fully_finished == request.n and not active_gen_indices_to_poll
 
             if any_stream_produced_new_text_this_cycle or all_streams_definitively_done:
-                texts_for_yield = []
+                texts_for_yield, all_tokens_for_yield, full_texts_for_yield = [], [], []
+                times_spent_for_yield, tps_for_yield, num_tokens_for_yield = [], [], []
+
                 for idx in range(request.n):
+                    s = gen_states[idx]
                     if newly_set_current_step_text_flags[idx]:
-                        texts_for_yield.append(gen_states[idx]["current_step_text"])
-                    elif request.is_client_side_tokenization:
+                        texts_for_yield.append(s.current_step_text)
+                    elif request.is_client_side_tokenization and not bytecode_decode:
                         texts_for_yield.append([])
                     else:
                         texts_for_yield.append("")
-                all_tokens_for_yield = [list(gs["all_token_ids"]) for gs in gen_states]
-                full_texts_for_yield = [gs["full_accumulated_text"] for gs in gen_states]
-                times_spent_for_yield = [gs["time_spent"] for gs in gen_states]
-                tps_for_yield = [gs["tps"] for gs in gen_states]
-                num_tokens_for_yield = [gs["num_tokens"] for gs in gen_states]
+                    all_tokens_for_yield.append(list(s.all_token_ids))
+                    full_texts_for_yield.append(s.full_accumulated_text)
+                    times_spent_for_yield.append(s.time_spent)
+                    tps_for_yield.append(s.tps)
+                    num_tokens_for_yield.append(s.num_tokens)
 
-                if request.n == 1:
-                    aggregated_sample = ReturnSample(
-                        text=texts_for_yield,
-                        token_ids=all_tokens_for_yield,
-                        accumulated_text=full_texts_for_yield,
-                        time_spent_computing=times_spent_for_yield,
-                        tokens_per_second=tps_for_yield,
-                        num_generated_tokens=num_tokens_for_yield,
-                    )
-                else:
-                    aggregated_sample = ReturnSample(
-                        text=texts_for_yield,
-                        token_ids=all_tokens_for_yield,
-                        accumulated_text=full_texts_for_yield,
-                        time_spent_computing=times_spent_for_yield,
-                        tokens_per_second=tps_for_yield,
-                        num_generated_tokens=num_tokens_for_yield,
-                    )
+                aggregated_sample = ReturnSample(
+                    text=texts_for_yield,
+                    token_ids=all_tokens_for_yield,
+                    accumulated_text=full_texts_for_yield,
+                    time_spent_computing=times_spent_for_yield,
+                    tokens_per_second=tps_for_yield,
+                    num_generated_tokens=num_tokens_for_yield,
+                )
                 yield [aggregated_sample]
 
                 for idx_reset in range(request.n):
                     if newly_set_current_step_text_flags[idx_reset]:
-                        rsp = [] if request.is_client_side_tokenization else ""
-                        gen_states[idx_reset]["current_step_text"] = rsp
-
-    async def _generate_batch(
-        self,
-        requests: list[vSurgeRequest],
-    ) -> list[ReturnSample]:
-        """
-        Generates text completions for a batch of requests without streaming.
-
-        This method processes multiple `vSurgeRequest` objects concurrently and
-        returns a list of `ReturnSample` objects, each containing the final,
-        fully generated text for the corresponding input request.
-
-        Args:
-            requests (tp.List[vSurgeRequest]): A list of `vSurgeRequest` objects.
-
-        Returns:
-            tp.List[ReturnSample]: A list of `ReturnSample` objects. Each object
-                corresponds to an input request.
-                - If a request completes successfully, its `ReturnSample` contains:
-                    - `text`: The final accumulated text(s). Type `List[Union[str, List[str]]]`.
-                              (e.g., `["final text"]` or `[["tok1", "tok2"]]` for n=1;
-                              `["text1", "text2"]` or `[["t1"], ["t2"]]` for n>1).
-                    - `token_ids`: Final token IDs. Type `List[List[int]]`.
-                - If a request `req` with `req.n=1` results in an empty generation:
-                    - `text`: `""` (if server-side tokenization) or `[]` (if client-side).
-                    - `token_ids`: `[]`.
-                - If a request `req` with `req.n > 0` (but not 1) results in empty generation:
-                    - `text`: List of `n` empty strings/lists (e.g., `["", ""]` or `[[], []]`).
-                    - `token_ids`: List of `n` empty lists (e.g., `[[], []]`).
-
-        Raises:
-            Exception: Propagates exceptions from the underlying `complete` calls.
-        """
-
-        async def _collect_last_yielded_item(
-            request_obj: vSurgeRequest,
-        ) -> ReturnSample | None:
-            last_item: ReturnSample | None = None
-            async for result_list in self.complete(request_obj):
-                if result_list:
-                    last_item = result_list[0]
-            return last_item
-
-        tasks = [asyncio.create_task(_collect_last_yielded_item(req)) for req in requests]
-        try:
-            final_samples_per_request: list[ReturnSample | None] = await asyncio.gather(*tasks)
-        except Exception as e:
-            for task_to_cancel in tasks:
-                if not task_to_cancel.done():
-                    task_to_cancel.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise e
-
-        processed_final_results: list[ReturnSample] = []
-        for i, last_step_sample in enumerate(final_samples_per_request):
-            original_req = requests[i]
-            if last_step_sample is not None:
-                final_text_to_use = last_step_sample.accumulated_text
-                final_time = last_step_sample.time_spent_computing
-                final_tps = last_step_sample.tokens_per_second
-                final_num_tokens = last_step_sample.num_generated_tokens
-
-                processed_final_results.append(
-                    ReturnSample(
-                        text=final_text_to_use,
-                        token_ids=last_step_sample.token_ids,
-                        accumulated_text=last_step_sample.accumulated_text,
-                        time_spent_computing=final_time,
-                        tokens_per_second=final_tps,
-                        num_generated_tokens=final_num_tokens,
-                    )
-                )
-            else:
-                empty_text_val_single = [] if original_req.is_client_side_tokenization else ""
-                if original_req.n == 1:
-                    processed_final_results.append(
-                        ReturnSample(
-                            text=empty_text_val_single,
-                            token_ids=[],
-                            accumulated_text=empty_text_val_single,
-                            time_spent_computing=0.0,
-                            tokens_per_second=0.0,
-                            num_generated_tokens=0,
-                        )
-                    )
-                else:
-                    num_n = original_req.n if original_req.n > 0 else 0
-                    processed_final_results.append(
-                        ReturnSample(
-                            text=[empty_text_val_single] * num_n,
-                            token_ids=[[]] * num_n,
-                            accumulated_text=[empty_text_val_single] * num_n,
-                            time_spent_computing=[0.0] * num_n,
-                            tokens_per_second=[0.0] * num_n,
-                            num_generated_tokens=[0] * num_n,
-                        )
-                    )
-        return processed_final_results
-
-    async def _generate_stream(
-        self, requests: list[vSurgeRequest]
-    ) -> tp.AsyncGenerator[list[ReturnSample | None], None]:
-        """
-        Generates text completions for a batch of requests with streaming.
-
-        This asynchronous generator processes multiple `vSurgeRequest` objects
-        concurrently. It yields lists of `ReturnSample` objects (or None if a
-        particular stream has finished). Each `ReturnSample` in the yielded list
-        corresponds to one of the input requests and contains the latest chunk
-        of generated text for that request (aggregating its 'n' internal generations).
-
-        Args:
-            requests (tp.List[vSurgeRequest]): A list of `vSurgeRequest` objects.
-
-        Yields:
-            tp.AsyncGenerator[tp.List[tp.Optional[ReturnSample]], None]:
-                An asynchronous generator. Each yield is a list where each element
-                is either a `ReturnSample` (containing the current chunk for one
-                of the input requests) or `None` (if that request's stream has ended).
-                Each `ReturnSample` object will have its fields (e.g., `text`, `token_ids`)
-                as lists, corresponding to the `n` generations of its original `vSurgeRequest`.
-                - `ReturnSample.text`: `List[Union[str, List[int]]]` - current chunk for each 'n'.
-        """
-        num_original_requests = len(requests)
-        if num_original_requests == 0:
-            if False:
-                yield []
-            return
-
-        stream_iterators = [self.complete(req).__aiter__() for req in requests]
-
-        latest_data_from_streams: list[ReturnSample | None] = [None] * num_original_requests
-
-        active_stream_indices = list(range(num_original_requests))
-
-        while active_stream_indices:
-            tasks_for_this_sync_step = []
-
-            for original_idx in active_stream_indices:
-
-                async def fetch_next_for_sync(iterator, idx_tag):
-                    try:
-                        item_list = await iterator.__anext__()
-                        return idx_tag, item_list[0] if item_list else None, None
-                    except StopAsyncIteration:
-                        return idx_tag, None, StopAsyncIteration()
-                    except Exception as exc:
-                        return idx_tag, None, exc
-
-                tasks_for_this_sync_step.append(
-                    asyncio.create_task(fetch_next_for_sync(stream_iterators[original_idx], original_idx))
-                )
-
-            if not tasks_for_this_sync_step:
-                break
-            done_tasks, _ = await asyncio.wait(
-                tasks_for_this_sync_step,
-                return_when=asyncio.ALL_COMPLETED,
-            )
-
-            newly_finished_indices_this_step = []
-            error_occurred = None
-
-            for task in done_tasks:
-                original_idx, fetched_sample, error = task.result()
-
-                if error:
-                    if isinstance(error, StopAsyncIteration):
-                        newly_finished_indices_this_step.append(original_idx)
-                    else:
-                        error_occurred = error
-                        break
-                else:
-                    if fetched_sample is not None:
-                        latest_data_from_streams[original_idx] = fetched_sample
-
-            if error_occurred:
-                logger.error(f"Error during _generate_stream sync step: {error_occurred}")
-                raise error_occurred
-
-            for idx_to_remove in newly_finished_indices_this_step:
-                if idx_to_remove in active_stream_indices:
-                    active_stream_indices.remove(idx_to_remove)
-
-            yield list(latest_data_from_streams)
-            if not active_stream_indices:
+                        if request.is_client_side_tokenization and not bytecode_decode:
+                            gen_states[idx_reset].current_step_text = []
+                        else:
+                            gen_states[idx_reset].current_step_text = ""
+            if all_streams_definitively_done:
                 break
 
-    async def generate(
-        self,
-        prompts: str | tp.Sequence[str],
-        sampling_params: SamplingParams | tp.Sequence[SamplingParams] | None = None,
-        stream: bool = False,
-    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
-        """
-        Generates text completions for given prompts.
-
-        This is the main public method for text generation. It can handle single
-        or multiple prompts, with corresponding sampling parameters. Output can be
-        streamed or returned as a batch.
-
-        Args:
-            prompts (tp.Union[str, tp.Sequence[str]]):
-                A single prompt string or a sequence of prompt strings.
-            sampling_params (tp.Optional[SamplingParams | tp.Sequence[SamplingParams]]):
-                Sampling parameters.
-                - If `prompts` is a single string, this can be a single `SamplingParams`
-                  object or None (to use default `SamplingParams`).
-                - If `prompts` is a sequence, this can be:
-                    - A single `SamplingParams` object (applied to all prompts).
-                    - A sequence of `SamplingParams` objects (one per prompt).
-                    - None (default `SamplingParams` used for all prompts).
-                Must match the structure of `prompts` if provided as a sequence.
-            stream (bool): If True, returns an async generator that yields results
-                incrementally. If False, returns a list with all results after
-                completion. Defaults to False.
-
-        Returns:
-            tp.Union[tp.List[ReturnSample], tp.AsyncGenerator[tp.List[ReturnSample], None]]:
-                - If `stream` is False (batch mode):
-                    Returns `tp.List[ReturnSample]`. Each `ReturnSample` in this list
-                    corresponds to one input prompt. The `text` field of this `ReturnSample`
-                    (and `token_ids`, `accumulated_text`) will be structured based on the `n`
-                    value in its `SamplingParams` and whether generation was empty:
-                    - For `n=1` and successful generation: `text` is `List[Union[str, List[str]]]`
-                      (e.g., `["final text"]` or `[["tok1", "tok2"]]`).
-                    - For `n>1` and successful generation: `text` is `List[Union[str, List[str]]]`
-                      (e.g., `["text1", "text2"]` or `[["t1"], ["t2"]]`).
-                    - For `n=1` and empty generation: `text` is `str` (e.g., `""`) or `List[int]` (e.g., `[]`).
-                    - For `n>1` (or `n=0`) and empty generation: `text` is `List[str]` or `List[List[int]]`
-                      (e.g., `["", ""]` or `[[], []]`).
-                - If `stream` is True (streaming mode):
-                    Returns `tp.AsyncGenerator[tp.List[tp.Optional[ReturnSample]], None]`.
-                    Each yield from the generator is `tp.List[tp.Optional[ReturnSample]]`.
-                    This list has one entry per input prompt. Each entry is either:
-                    - A `ReturnSample` object containing the latest generated chunk for that prompt.
-                      The `text` field (and similar fields like `token_ids`, `accumulated_text`)
-                      of this `ReturnSample` is always `tp.List[tp.Union[str, tp.List[int]]]`,
-                      where each element in this inner list corresponds to one of the `n`
-                      generations for that prompt (e.g., `["chunk for n0"]` or `[[ids_n0], [ids_n1]]`).
-                    - `None`, if the stream for that specific prompt has finished.
-
-        Raises:
-            ValueError: If `prompts` and `sampling_params` have mismatched lengths
-                or unsupported types.
-            RuntimeError: If issues occur during the generation process (e.g., queue full).
-        """
-        if isinstance(prompts, str):
-            prompts = [prompts]
-            if sampling_params is not None and not isinstance(sampling_params, SamplingParams):
-                raise ValueError("If prompts is str, sampling_params must be SamplingParams or None.")
-            sampling_params = [sampling_params if sampling_params else SamplingParams()]
-        elif isinstance(prompts, tp.Sequence):
-            if sampling_params is None:
-                sampling_params = [SamplingParams()] * len(prompts)
-            elif isinstance(sampling_params, SamplingParams):
-                sampling_params = [sampling_params] * len(prompts)
-            elif isinstance(sampling_params, tp.Sequence):
-                if len(prompts) != len(sampling_params):
-                    raise ValueError("Lengths of prompts and sampling_params lists must match.")
-            else:
-                raise ValueError("sampling_params must be SamplingParams, list of SamplingParams, or None.")
-        else:
-            raise ValueError("prompts must be a string or a sequence of strings.")
-
-        if not prompts:
-            if stream:
-
-                async def empty_gen():
-                    if False:
-                        yield []
-
-                return empty_gen()
-            return []
-
-        requests = [vSurgeRequest.from_sampling_params(p, sp) for p, sp in zip(prompts, sampling_params, strict=False)]
-        if stream:
-            return self._generate_stream(requests)
-        else:
-            return await self._generate_batch(requests)
+        for state_to_finalize in gen_states:
+            if not state_to_finalize.finished_streaming:
+                if hasattr(state_to_finalize.active_request.return_channel, "close"):
+                    state_to_finalize.active_request.return_channel.close()
+                state_to_finalize.finished_streaming = True
 
     def __repr__(self):
-        return f"vSurge(name={self.vsurge_name}, live={self.driver.live})"
+        """Returns a string representation of the vSurge instance."""
+        is_live = self.driver.live if hasattr(self.driver, "live") else "N/A"
+        return f"vSurge(name={self.vsurge_name}, live={is_live})"
 
     __str__ = __repr__
