@@ -40,6 +40,8 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["GLOG_minloglevel"] = "3"
     _os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
+    _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
+    _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=True  "
