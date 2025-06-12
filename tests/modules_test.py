@@ -192,7 +192,7 @@ class EasyModelsTest(unittest.TestCase):
             ed_model = ed_model.shard_model()
             try:
 
-                @partial(ed.utils.cjit, static_argnums=(1,))
+                @ed.utils.cjit
                 @partial(jax.jit, static_argnums=(1,))
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(
@@ -205,7 +205,7 @@ class EasyModelsTest(unittest.TestCase):
                 ed_output = jited(jax_input_ids, *ed_model.split_module())
             except Exception:
 
-                @partial(ed.utils.cjit, static_argnums=(1,))
+                @ed.utils.cjit
                 @partial(jax.jit, static_argnums=(1,))
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(

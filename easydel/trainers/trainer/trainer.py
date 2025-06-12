@@ -101,29 +101,24 @@ class Trainer(BaseTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        sharded_training_static_argnums = (2, 3, 4, 5)
         sharded_training_step_function = jax.jit(
             training_step,
-            static_argnums=sharded_training_static_argnums,
+            static_argnums=(2, 3, 4, 5),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
         )
 
         self._eval_shared_fn_static_args = (
-            self.arguments.step_partition_spec,
             self.arguments.loss_config,
+            self.arguments.step_partition_spec,
         )
-        sharded_evaluation_static_argnums = (2, 3)
         sharded_evaluation_step_function = jax.jit(
             evaluation_step,
-            static_argnums=sharded_evaluation_static_argnums,
+            static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(empty_sharding),
         )
-
-        sharded_training_step_function.static_argnums_ = sharded_training_static_argnums
-        sharded_evaluation_step_function.static_argnums_ = sharded_evaluation_static_argnums
 
         mesh = self.model.mesh
         self.arguments.ensure_checkpoint_path()

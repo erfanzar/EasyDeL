@@ -452,27 +452,9 @@ class BaseTrainer(BaseTrainerProtocol):
             sharded_training_step_function = functions.sharded_training_step_function
             sharded_evaluation_step_function = functions.sharded_evaluation_step_function
             if self.arguments.use_cjit:
-                if hasattr(sharded_training_step_function, "static_argnums_"):
-                    sharded_training_step_function = cjit(
-                        fn=sharded_training_step_function,
-                        static_argnums=sharded_training_step_function.static_argnums_,
-                        verbose=False,
-                    )
-                else:
-                    logger.warning(
-                        "sharded_training function doesn't contain `static_argnums_`, using cjit will be skiped."
-                    )
+                sharded_training_step_function = cjit(fn=sharded_training_step_function, verbose=False)
+                sharded_evaluation_step_function = cjit(fn=sharded_evaluation_step_function, verbose=False)
 
-                if hasattr(sharded_evaluation_step_function, "static_argnums_"):
-                    sharded_evaluation_step_function = cjit(
-                        fn=sharded_evaluation_step_function,
-                        static_argnums=sharded_evaluation_step_function.static_argnums_,
-                        verbose=False,
-                    )
-                else:
-                    logger.warning(
-                        "sharded_evaluation function doesn't contain `static_argnums_`, using cjit will be skiped."
-                    )
             self.sharded_training_step_function = sharded_training_step_function
             self.sharded_evaluation_step_function = sharded_evaluation_step_function
             self.mesh = functions.mesh

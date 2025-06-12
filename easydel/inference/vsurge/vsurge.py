@@ -453,10 +453,7 @@ class vSurge:
             request_obj: vSurgeRequest,
         ) -> ReturnSample | None:
             last_item: ReturnSample | None = None
-            async for result_list in self.complete(
-                request_obj,
-                bytecode_decode=bytecode_decode,
-            ):
+            async for result_list in self.complete(request_obj, bytecode_decode=bytecode_decode):
                 if result_list:
                     last_item = result_list[0]
             return last_item
@@ -578,14 +575,14 @@ class vSurge:
         active_stream_indices = list(range(num_original_requests))
         has_yielded_at_least_once = False
 
-        async def fetch_next_for_sync(iterator, original_idx_tag):
+        async def fetch_next_for_sync(iterator, idx_tag):
             try:
                 item_list = await iterator.__anext__()
-                return original_idx_tag, item_list[0] if item_list else None, None
+                return idx_tag, item_list[0] if item_list else None, None
             except StopAsyncIteration:
-                return original_idx_tag, None, StopAsyncIteration()
+                return idx_tag, None, StopAsyncIteration()
             except Exception as exc:
-                return original_idx_tag, None, exc
+                return idx_tag, None, exc
 
         while active_stream_indices:
             tasks_for_this_sync_step = [
@@ -617,20 +614,14 @@ class vSurge:
                             f"Error in stream {original_idx} for prompt "
                             f"'{requests[original_idx].prompt[:30]}...': {task_error_status}"
                         )
-
                 else:
                     if fetched_sample is not None:
                         latest_data_from_streams[original_idx] = fetched_sample
                         any_new_data_arrived_in_this_step = True
 
             if critical_error_occurred:
-                logger.error(
-                    f"Critical error occurred during stream processing: {critical_error_occurred}. "
-                    "Yielding last known states and terminating stream."
-                )
-
+                logger.error(f"Critical error occurred during stream processing: {critical_error_occurred}")
                 active_stream_indices.clear()
-
                 yield list(latest_data_from_streams)
                 has_yielded_at_least_once = True
                 raise critical_error_occurred
@@ -653,6 +644,7 @@ class vSurge:
 
             if not active_stream_indices:
                 break
+
         if not has_yielded_at_least_once and num_original_requests > 0:
             yield list(latest_data_from_streams)
 
@@ -692,9 +684,9 @@ class vSurge:
             tp.Union[list[ReturnSample], tp.AsyncGenerator[list[ReturnSample], None]]:
             - If `stream` is False (batch mode): `list[ReturnSample]`.
               Each `ReturnSample` corresponds to an input prompt. Its `accumulated_text`
-              (and `text`) field contains the final generated text(s). The structure of
-              these fields is a list representing the `n` generations
-              (e.g., `List[str]` or `List[List[int]]`).
+              field contains the final generated text(s). The structure of
+              `ReturnSample.accumulated_text` (and `.text`, `.token_ids`) is a list
+              representing the `n` generations (e.g., `List[str]` or `List[List[int]]`).
             - If `stream` is True (streaming mode): `tp.AsyncGenerator[list[ReturnSample], None]`.
               Each yield is `list[ReturnSample]`, one entry per input prompt.
               A `ReturnSample` contains the latest generated chunk (in its `.text` field) and
@@ -708,36 +700,21 @@ class vSurge:
                 or unsupported types.
             RuntimeError: If issues occur during the generation process (e.g., queue full).
         """
-
-        single_prompt_mode = False
         if isinstance(prompts, str):
             prompts = [prompts]
-            single_prompt_mode = True
-
-        if not prompts:
-            if stream:
-
-                async def empty_gen_for_empty_prompts():
-                    if False:
-                        yield []  # type: ignore
-
-                return empty_gen_for_empty_prompts()
-            return []
-
-        if single_prompt_mode:
-            if sampling_params is None or isinstance(sampling_params, SamplingParams):
-                sampling_params = [sampling_params or SamplingParams()]
-            elif isinstance(sampling_params, tp.Sequence):
-                if len(sampling_params) != 1:
-                    raise ValueError(
-                        "If prompts is a single string, sampling_params (if a sequence) must have length 1."
-                    )
-            else:
-                raise ValueError(
-                    "If prompts is str, sampling_params must be SamplingParams,"
-                    " a sequence of one SamplingParams, or None."
-                )
+            if sampling_params is not None and not isinstance(sampling_params, SamplingParams):
+                raise ValueError("If prompts is str, sampling_params must be SamplingParams or None.")
+            sampling_params = [sampling_params if sampling_params else SamplingParams()]
         elif isinstance(prompts, tp.Sequence):
+            if not prompts:
+                if stream:
+
+                    async def empty_gen_for_empty_prompts():
+                        if False:
+                            yield []
+
+                    return empty_gen_for_empty_prompts()
+                return []
             if sampling_params is None:
                 sampling_params = [SamplingParams()] * len(prompts)
             elif isinstance(sampling_params, SamplingParams):
@@ -746,24 +723,30 @@ class vSurge:
                 if len(prompts) != len(sampling_params):
                     raise ValueError("Lengths of prompts and sampling_params lists must match.")
             else:
-                raise ValueError(
-                    "For sequence of prompts, sampling_params must be "
-                    "SamplingParams, sequence of SamplingParams, or None."
-                )
+                raise ValueError("sampling_params must be SamplingParams, list of SamplingParams, or None.")
         else:
             raise ValueError("prompts must be a string or a sequence of strings.")
 
-        requests_list = []
-        zip_args = (prompts, sampling_params)
-        for p, sp in zip(*zip_args, strict=True):
-            requests_list.append(vSurgeRequest.from_sampling_params(p, sp))
+        if not prompts:
+            if stream:
 
-        bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
+                async def empty_gen_final():
+                    if False:
+                        yield []
+
+                return empty_gen_final()
+            return []
+
+        requests_list = [
+            vSurgeRequest.from_sampling_params(p, sp) for p, sp in zip(prompts, sampling_params, strict=False)
+        ]
+
+        effective_bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
 
         if stream:
-            return self._generate_stream(requests_list, bytecode_decode=bytecode_decode)
+            return self._generate_stream(requests_list, bytecode_decode=effective_bytecode_decode)
         else:
-            return await self._generate_batch(requests_list, bytecode_decode=bytecode_decode)
+            return await self._generate_batch(requests_list, bytecode_decode=effective_bytecode_decode)
 
     def should_buffer_response(self, response: list[ReturnSample]) -> bool:
         """Determines if a driver response needs buffering for server-side detokenization.
@@ -814,12 +797,10 @@ class vSurge:
         """
         samples = []
         for sample_from_driver in response:
-            new_token_ids_this_step = list(sample_from_driver.text) if isinstance(sample_from_driver.text, list) else []
             new_sample = dataclasses.replace(
                 sample_from_driver,
                 generation_idx=generation_idx_tag,
-                token_ids=new_token_ids_this_step,
-                text=[],
+                token_ids=list(sample_from_driver.text) if isinstance(sample_from_driver.text, list) else [],
             )
             samples.append(new_sample)
         return samples
@@ -855,21 +836,16 @@ class vSurge:
             - Cumulative metrics (time_spent_computing, tokens_per_second, num_generated_tokens).
             - `generation_idx_tag`.
         """
-
-        items_to_process_tuples = []
-        if buffer_for_this_gen:
-            all_steps_for_sequence_0 = [buf_list[0] for buf_list in buffer_for_this_gen if buf_list]
-            all_steps_for_sequence_0.append(current_driver_response[0])
-            items_to_process_tuples.append(tuple(all_steps_for_sequence_0))
-        else:
-            items_to_process_tuples.append(tuple(current_driver_response))
-
+        items_to_process_tuples = (
+            list(zip(*buffer_for_this_gen, current_driver_response, strict=False))
+            if buffer_for_this_gen
+            else [(r,) for r in current_driver_response]
+        )
         processed_samples_for_yield = []
         for single_sequence_all_steps_tuple in items_to_process_tuples:
             text_segments_for_detok_this_chunk = []
 
             latest_driver_sample_this_step = single_sequence_all_steps_tuple[-1]
-
             tps = latest_driver_sample_this_step.tokens_per_second
             num_gen_tokens_total_for_seq = latest_driver_sample_this_step.num_generated_tokens
             time_spent = latest_driver_sample_this_step.time_spent_computing
@@ -935,8 +911,6 @@ class vSurge:
                   `List[str]` (each string being a per-token decode of all tokens so far).
         """
         if request.n == 0:
-            if False:
-                yield  # type: ignore
             return
 
         bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
@@ -948,7 +922,7 @@ class vSurge:
 
         gen_states: list[ProcessState] = []
         for i in range(request.n):
-            return_channel = AsyncMultifuture()  # type: ignore
+            return_channel = AsyncMultifuture()
             active_req = ActiveRequest(
                 max_tokens=request.max_tokens,
                 prefill_content=request.prompt,
@@ -970,12 +944,9 @@ class vSurge:
             try:
                 self._driver.place_request_on_prefill_queue(active_req)
             except queue.Full as e:
-                for state_idx_to_cancel in range(i):
-                    if hasattr(
-                        gen_states[state_idx_to_cancel].active_request.return_channel,
-                        "cancel",
-                    ):
-                        gen_states[state_idx_to_cancel].active_request.return_channel.cancel()  # type: ignore
+                for state_idx in range(i):
+                    if hasattr(gen_states[state_idx].active_request.return_channel, "cancel"):
+                        gen_states[state_idx].active_request.return_channel.cancel()
                 raise RuntimeError(f"Prefill queue full for generation {i + 1}/{request.n}") from e
 
             initial_current_step_text: str | list
@@ -1001,8 +972,6 @@ class vSurge:
         num_gens_fully_finished = 0
         active_gen_indices_to_poll = list(range(request.n))
 
-        newly_set_current_step_text_flags = [False] * request.n
-
         async def _fetch_next_from_channel(iterator, original_idx_tag):
             try:
                 return original_idx_tag, await iterator.__anext__(), None
@@ -1012,9 +981,6 @@ class vSurge:
                 return original_idx_tag, None, exc
 
         while num_gens_fully_finished < request.n:
-            for i_flag in range(request.n):
-                newly_set_current_step_text_flags[i_flag] = False
-
             tasks_to_poll = [
                 asyncio.create_task(_fetch_next_from_channel(gen_states[idx].channel_iter, idx))
                 for idx in active_gen_indices_to_poll
@@ -1023,6 +989,7 @@ class vSurge:
                 break
 
             done_tasks, pending_tasks = await asyncio.wait(tasks_to_poll, return_when=asyncio.FIRST_COMPLETED)
+            newly_set_current_step_text_flags = [False] * request.n
 
             for task in done_tasks:
                 original_idx, item_from_driver, error_status = task.result()
@@ -1033,9 +1000,8 @@ class vSurge:
                     num_gens_fully_finished += 1
                     if original_idx in active_gen_indices_to_poll:
                         active_gen_indices_to_poll.remove(original_idx)
-
                     if not request.is_client_side_tokenization and state.driver_buffer:
-                        last_buffered_sample_metrics = (
+                        last_buffered_sample = (
                             state.driver_buffer[-1][0]
                             if state.driver_buffer and state.driver_buffer[-1]
                             else ReturnSample(text=[], token_ids=[])
@@ -1044,10 +1010,10 @@ class vSurge:
                             ReturnSample(
                                 text=[],
                                 token_ids=[],
-                                accumulated_text=last_buffered_sample_metrics.accumulated_text,
-                                time_spent_computing=last_buffered_sample_metrics.time_spent_computing,
-                                tokens_per_second=last_buffered_sample_metrics.tokens_per_second,
-                                num_generated_tokens=last_buffered_sample_metrics.num_generated_tokens,
+                                accumulated_text=last_buffered_sample.accumulated_text,
+                                time_spent_computing=last_buffered_sample.time_spent_computing,
+                                tokens_per_second=last_buffered_sample.tokens_per_second,
+                                num_generated_tokens=last_buffered_sample.num_generated_tokens,
                             )
                         ]
                         processed_outputs = self.process_server_side_tokenization_response(
@@ -1061,41 +1027,38 @@ class vSurge:
                             state.time_spent = final_chunk_from_buffer.time_spent_computing
                             state.tps = final_chunk_from_buffer.tokens_per_second
                             state.num_tokens = final_chunk_from_buffer.num_generated_tokens
-
                             if bytecode_decode and state.all_token_ids:
                                 full_decoded_text_now = self.processor.decode(state.all_token_ids)
                                 prev_decoded_text = state.decoded_text_upto_previous_step or ""
-
-                                current_text_chunk = full_decoded_text_now[len(prev_decoded_text) :]
+                                current_text_chunk = (
+                                    full_decoded_text_now[len(prev_decoded_text) :]
+                                    if full_decoded_text_now.startswith(prev_decoded_text)
+                                    else full_decoded_text_now
+                                )
                                 state.current_step_text = current_text_chunk
                                 state.full_accumulated_text = full_decoded_text_now
-
                             else:
                                 state.current_step_text = final_chunk_from_buffer.text
                                 state.full_accumulated_text = final_chunk_from_buffer.accumulated_text
-
                             if state.current_step_text:
                                 newly_set_current_step_text_flags[original_idx] = True
                     continue
-
                 if error_status is not None:
-                    logger.error(
-                        f"Error in stream {original_idx} for request '{request.prompt[:30]}...': {error_status}"
-                    )
+                    logger.error(f"Error in stream {original_idx} for request: {error_status}")
                     for p_task in pending_tasks:
                         p_task.cancel()
                     if pending_tasks:
                         await asyncio.gather(*pending_tasks, return_exceptions=True)
-
-                    for i_gen_state_idx, gen_s_to_err in enumerate(gen_states):
-                        if i_gen_state_idx != original_idx and not gen_s_to_err.finished_streaming:
+                    for i_gen in range(request.n):
+                        if i_gen != original_idx and not gen_states[i_gen].finished_streaming:
                             if hasattr(
-                                gen_s_to_err.active_request.return_channel,
+                                gen_states[i_gen].active_request.return_channel,
                                 "set_exception",
                             ):
-                                gen_s_to_err.active_request.return_channel.set_exception(error_status)  # type: ignore
-                            gen_s_to_err.finished_streaming = True
+                                gen_states[i_gen].active_request.return_channel.set_exception(error_status)
+                            gen_states[i_gen].finished_streaming = True
                     raise error_status
+
                 driver_step_output_list = tp.cast(list[ReturnSample], item_from_driver)
 
                 if request.is_client_side_tokenization:
@@ -1105,30 +1068,29 @@ class vSurge:
                     if processed_outputs:
                         chunk = processed_outputs[0]
                         new_token_ids_this_step = list(chunk.token_ids)
-
                         state.time_spent = chunk.time_spent_computing
                         state.tps = chunk.tokens_per_second
                         state.num_tokens = chunk.num_generated_tokens
-
                         if new_token_ids_this_step:
                             state.all_token_ids.extend(new_token_ids_this_step)
                             newly_set_current_step_text_flags[original_idx] = True
-
                             if bytecode_decode:
                                 full_decoded_text_now = self.processor.decode(state.all_token_ids)
                                 prev_decoded_text = state.decoded_text_upto_previous_step or ""
-
-                                current_text_chunk = full_decoded_text_now[len(prev_decoded_text) :]
+                                current_text_chunk = (
+                                    full_decoded_text_now[len(prev_decoded_text) :]
+                                    if full_decoded_text_now.startswith(prev_decoded_text)
+                                    else full_decoded_text_now
+                                )
                                 state.current_step_text = current_text_chunk
                                 state.full_accumulated_text = full_decoded_text_now
                                 state.decoded_text_upto_previous_step = full_decoded_text_now
                             else:
                                 state.current_step_text = new_token_ids_this_step
-
                                 state.full_accumulated_text = [
                                     self.processor.decode([tok_id]) for tok_id in state.all_token_ids
                                 ]
-                else:
+                else:  # Server-side tokenization
                     if self.should_buffer_response(driver_step_output_list):
                         state.driver_buffer.append(driver_step_output_list)
                     else:
@@ -1143,7 +1105,6 @@ class vSurge:
                             new_token_ids_this_step = list(chunk.token_ids)
                             if new_token_ids_this_step:
                                 state.all_token_ids.extend(new_token_ids_this_step)
-
                             state.time_spent = chunk.time_spent_computing
                             state.tps = chunk.tokens_per_second
                             state.num_tokens = chunk.num_generated_tokens
@@ -1152,7 +1113,11 @@ class vSurge:
                                 if bytecode_decode and state.all_token_ids:
                                     full_decoded_text_now = self.processor.decode(state.all_token_ids)
                                     prev_decoded_text = state.decoded_text_upto_previous_step or ""
-                                    current_text_chunk = full_decoded_text_now[len(prev_decoded_text) :]
+                                    current_text_chunk = (
+                                        full_decoded_text_now[len(prev_decoded_text) :]
+                                        if full_decoded_text_now.startswith(prev_decoded_text)
+                                        else full_decoded_text_now
+                                    )
                                     state.current_step_text = current_text_chunk
                                     state.full_accumulated_text = full_decoded_text_now
                                     state.decoded_text_upto_previous_step = full_decoded_text_now
@@ -1160,7 +1125,7 @@ class vSurge:
                                     state.current_step_text = chunk.text
                                     state.full_accumulated_text = chunk.accumulated_text
                                     if bytecode_decode:
-                                        state.decoded_text_upto_previous_step = chunk.accumulated_text  # type: ignore
+                                        state.decoded_text_upto_previous_step = chunk.accumulated_text
 
             for task_to_cancel in pending_tasks:
                 task_to_cancel.cancel()
@@ -1174,15 +1139,14 @@ class vSurge:
                 texts_for_yield, all_tokens_for_yield, full_texts_for_yield = [], [], []
                 times_spent_for_yield, tps_for_yield, num_tokens_for_yield = [], [], []
 
-                for idx_gs in range(request.n):
-                    s = gen_states[idx_gs]
-                    if newly_set_current_step_text_flags[idx_gs]:
+                for idx in range(request.n):
+                    s = gen_states[idx]
+                    if newly_set_current_step_text_flags[idx]:
                         texts_for_yield.append(s.current_step_text)
                     elif request.is_client_side_tokenization and not bytecode_decode:
                         texts_for_yield.append([])
                     else:
                         texts_for_yield.append("")
-
                     all_tokens_for_yield.append(list(s.all_token_ids))
                     full_texts_for_yield.append(s.full_accumulated_text)
                     times_spent_for_yield.append(s.time_spent)
@@ -1199,20 +1163,19 @@ class vSurge:
                 )
                 yield [aggregated_sample]
 
-                for idx_reset_text in range(request.n):
-                    if newly_set_current_step_text_flags[idx_reset_text]:
+                for idx_reset in range(request.n):
+                    if newly_set_current_step_text_flags[idx_reset]:
                         if request.is_client_side_tokenization and not bytecode_decode:
-                            gen_states[idx_reset_text].current_step_text = []
+                            gen_states[idx_reset].current_step_text = []
                         else:
-                            gen_states[idx_reset_text].current_step_text = ""
-
+                            gen_states[idx_reset].current_step_text = ""
             if all_streams_definitively_done:
                 break
 
         for state_to_finalize in gen_states:
             if not state_to_finalize.finished_streaming:
                 if hasattr(state_to_finalize.active_request.return_channel, "close"):
-                    state_to_finalize.active_request.return_channel.close()  # type: ignore
+                    state_to_finalize.active_request.return_channel.close()
                 state_to_finalize.finished_streaming = True
 
     def __repr__(self):
