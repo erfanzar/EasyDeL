@@ -19,6 +19,7 @@ import functools
 import hashlib
 import os
 import pickle
+import re
 import typing as tp
 import warnings
 
@@ -71,6 +72,23 @@ def is_jit_wrapped(fn: tp.Any) -> bool:
     )
 
 
+def remove_memory_addresses(input_string: str) -> str:
+    """
+    Removes hexadecimal memory address patterns (e.g., 0x736a142445e0) from a string.
+
+    Args:
+        input_string: The string to process.
+
+    Returns:
+        The string with memory address patterns removed.
+    """
+    # Regex to find hexadecimal memory addresses:
+    # 0x     : matches the literal "0x"
+    # [0-9a-fA-F]+ : matches one or more hexadecimal characters (0-9, a-f, A-F)
+
+    return re.sub(r"0x[0-9a-fA-F]+", "", input_string)
+
+
 def cjit(fn: tp.Callable[P, R], verbose: bool = True):
     """
     A decorator that adds caching to a JAX JIT-compiled function.
@@ -86,15 +104,17 @@ def cjit(fn: tp.Callable[P, R], verbose: bool = True):
     if len(static_argnums) == 0:
         static_argnums = None
 
-    state_signature = str(
-        (
-            fn.__signature__._hash_basis(),
-            fn.__annotations__,
-            fn._fun.__annotations__,
-            fn._fun.__kwdefaults__,
-            fn._fun.__name__,
-            static_argnums,
-            static_argnames,
+    state_signature = remove_memory_addresses(
+        str(
+            (
+                fn.__signature__._hash_basis(),
+                fn.__annotations__,
+                fn._fun.__annotations__,
+                fn._fun.__kwdefaults__,
+                fn._fun.__name__,
+                static_argnums,
+                static_argnames,
+            )
         )
     )
 

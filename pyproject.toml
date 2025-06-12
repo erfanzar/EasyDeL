@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "easydel"
-version = "0.1.5.dev14"
+version = "0.1.5.dev15"
 
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
