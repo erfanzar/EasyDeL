@@ -520,7 +520,7 @@ class vInference:
                 vinference_compile_config=vinference_compile_config,
                 **model_kwargs,
             )
-            func = smart_compile(lowered, tag="vinference-init-state")
+            func, _ = smart_compile(lowered, tag="vinference-init-state")
             put_compiled_funcs(
                 funcs=func,
                 standalone_config=vinference_compile_config,
@@ -1147,7 +1147,7 @@ class vInference:
                 self.generation_config.sampling_params,
             )
             self.log("`prefill` lowered successfully.")
-            compiled_prefill_func = smart_compile(prefill_lowered, tag="vinference.prefill_func")
+            compiled_prefill_func, _ = smart_compile(prefill_lowered, tag="vinference.prefill_func")
             self.log("smart compiling `decode`")
             self.log("lowering `decode`")
             sample_state = compiled_prefill_func(
@@ -1179,7 +1179,7 @@ class vInference:
                 self.generation_config.streaming_chunks,
             )
             self.log("`decode` lowered successfully.")
-            compiled_interval_func = smart_compile(decode_lowered, tag="vinference.interval_func")
+            compiled_interval_func, _ = smart_compile(decode_lowered, tag="vinference.interval_func")
 
             del state
             self.log("saving compiled functions...")
