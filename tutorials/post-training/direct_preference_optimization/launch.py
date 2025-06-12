@@ -73,12 +73,12 @@ def main():
     # Imports are placed inside the `main` function. This ensures that these libraries
     # are imported within the Ray remote worker's process, which is important for
     # dependency management in distributed contexts.
+    import easydel as ed  # The EasyDeL library. #noqa
+
     import jax  # JAX: numerical computation library, backbone of EasyDeL.
     from datasets import load_dataset  # Hugging Face Datasets library.
     from jax import numpy as jnp  # JAX's NumPy-like API.
     from transformers import AutoTokenizer  # Hugging Face Transformers for tokenizer.
-
-    import easydel as ed  # The EasyDeL library.
 
     # Initialize EasyDeL's logger for informative output during training.
     logger = ed.utils.get_logger("DPO-EasyDeL")
@@ -89,9 +89,10 @@ def main():
     sequence_length = 2048
     # `max_length` is the maximum total sequence length for both prompt and completion.
     # For DPO, it's often set to twice the prompt length to allow for full conversations.
-    max_length = sequence_length * 2
+    max_completion_length = 2048
+    max_length = sequence_length + max_completion_length
     # `total_batch_size` is the effective batch size across all TPU devices.
-    total_batch_size = 32
+    total_batch_size = 16
 
     # --- Tokenizer Setup ---
     # Load the tokenizer (referred to as 'processor' for Qwen models).
@@ -114,7 +115,8 @@ def main():
         # Sharding axis dimensions:
         #  (data_parallel, fully_sharded_data_parallel, expert_parallel, tensor_parallel, sequence_parallel)
         # `(1, -1, 1, 1, 1)` is a common setting for FSDP-like sharding across batch and model.
-        sharding_axis_dims=(1, -1, 1, 1, 1),
+        # but let try sequence_parallel
+        sharding_axis_dims=(1, 1, 1, 1, -1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length,  # For RoPE-based models, sets max position for frequency encoding.
@@ -135,8 +137,8 @@ def main():
     logger.info(f"Loading dataset: {DATASET_ID}")
     # The 'mlabonne/orpo-dpo-mix-40k' dataset already provides 'chosen' and 'rejected' conversation
     # lists, which is the required format for DPOTrainer. We load both train and test splits.
-    train_dataset, test_dataset = load_dataset(DATASET_ID, split=["train", "test"])
-    logger.info(f"Train dataset size: {len(train_dataset)}, Test dataset size: {len(test_dataset)}")
+    train_dataset = load_dataset(DATASET_ID, split="train")
+    logger.info(f"Train dataset size: {len(train_dataset)}")
 
     # --- DPO Configuration (Hyperparameters for DPO training) ---
     arguments = ed.DPOConfig(
@@ -144,12 +146,12 @@ def main():
         total_batch_size=total_batch_size,  # Total batch size used across all TPU devices.
         gradient_accumulation_steps=1,  # Number of gradient accumulation steps (often 1 for TPUs).
         do_eval=True,  # Enable evaluation on the test set during training.
-        use_wandb=(WANDB_ENTITY is not None),  # Automatically enable WandB logging if entity is provided.
+        use_wandb=True,  # Automatically enable WandB logging if entity is provided.
         wandb_entity=WANDB_ENTITY,
         do_last_save=True,  # Save the final model checkpoint after training.
         max_prompt_length=sequence_length,  # Max length for the prompt part of the input.
         max_length=max_length,  # Max total sequence length (prompt + completion) for tokenization.
-        max_completion_length=max_length - sequence_length,  # Max length for the generated completion.
+        max_completion_length=max_completion_length,  # Max length for the completion.
         max_training_steps=None,  # Maximum number of training steps (None means train until epochs are done).
         max_evaluation_steps=None,  # Maximum number of evaluation steps (None means evaluate full test set).
         max_sequence_length=max_length,  # Redundant with max_length, but good for clarity.
@@ -184,7 +186,7 @@ def main():
         model=model,  # The EasyDeL model instance to be trained.
         processing_class=processor,  # The tokenizer/processor instance for internal data handling.
         train_dataset=train_dataset,  # The dataset used for training.
-        eval_dataset=test_dataset,  # The dataset used for evaluation.
+        eval_dataset=None,  # The dataset used for evaluation.
     )
 
     logger.info("Starting training...")

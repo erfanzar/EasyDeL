@@ -168,7 +168,8 @@ def main():
         auto_shard_model=True, # EasyDeL automatically shards the model across TPU devices.
         # sharding_axis_dims: Defines how the model is sharded.
         # (1, -1, 1, 1, 1) typically corresponds to Fully Sharded Data Parallel (FSDP)-like sharding.
-        sharding_axis_dims=(1, -1, 1, 1, 1),
+        # but let try sequence_parallel
+        sharding_axis_dims=(1, 1, 1, 1, -1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length, # For RoPE-based models, sets max position for frequency encoding.
