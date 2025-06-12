@@ -220,8 +220,7 @@ class vEngine:
                         None,
                     ),
                     out_shardings=(self._prefill_state_sharding, None),
-                ),
-                static_argnums=(0, 9),
+                )
             )
             self.continuous_decode = cjit(
                 jax.jit(
@@ -236,8 +235,7 @@ class vEngine:
                         None,
                     ),
                     out_shardings=(self._decodes_state_sharding, None),
-                ),
-                static_argnums=(0,),
+                )
             )
             self.continuous_insert = cjit(
                 jax.jit(
@@ -250,8 +248,7 @@ class vEngine:
                         None,
                     ),
                     out_shardings=self._decodes_state_sharding,
-                ),
-                static_argnums=(3, 4),
+                )
             )
 
     @cached_property
