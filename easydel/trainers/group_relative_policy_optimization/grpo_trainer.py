@@ -126,7 +126,7 @@ class GRPOTrainer(Trainer):
                     reward_func = reward_func.to_state()
                     sharding = reward_func.shardings
 
-                    @partial(cjit, static_argnums=(0,))
+                    @cjit
                     @partial(
                         jax.jit,
                         static_argnums=(0,),

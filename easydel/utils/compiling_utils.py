@@ -26,6 +26,7 @@ import jax
 import numpy as np
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
+from .checkpoint_managers.path_utils import EasyPath
 from .helpers import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
@@ -54,6 +55,7 @@ CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 COMPILED_FILE_NAME = "compiled.func"
+SIGNATURE_FILE_NAME = "compiled.signature"
 
 COMPILED_CACHE: dict[tuple, tp.Any] = {}
 
@@ -69,38 +71,56 @@ def is_jit_wrapped(fn: tp.Any) -> bool:
     )
 
 
-def cjit(
-    fn: tp.Callable[P, R],
-    static_argnums: tuple[int, ...] | None = None,
-    static_argnames: tuple[str, ...] | None = None,
-    verbose: bool = True,
-):
+def cjit(fn: tp.Callable[P, R], verbose: bool = True):
     """
     A decorator that adds caching to a JAX JIT-compiled function.
     The input `fn` must already be a JIT-transformed function (e.g., from @jax.jit).
     """
     assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
 
+    static_argnums = fn._jit_info.static_argnums
+    static_argnames = fn._jit_info.static_argnames
+
+    if len(static_argnames) == 0:
+        static_argnames = None
+    if len(static_argnums) == 0:
+        static_argnums = None
+
+    state_signature = str(
+        (
+            fn.__signature__._hash_basis(),
+            fn.__annotations__,
+            fn._fun.__annotations__,
+            fn._fun.__kwdefaults__,
+            fn._fun.__name__,
+            static_argnums,
+            static_argnames,
+        )
+    )
+
+    static_arg_indices = set(static_argnums) if static_argnums is not None else set()
+
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        static_arg_indices = set(static_argnums) if static_argnums is not None else set()
         dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_arg_indices)
         dynamic_kwargs = kwargs.copy()
         if static_argnames is not None:
             for key in static_argnames:
                 dynamic_kwargs.pop(key, None)
         signature = get_signature_tree_util(dynamic_args, dynamic_kwargs)
-        cache_key = (fn, signature)
+        cache_key = (state_signature, signature)
         if cache_key in COMPILED_CACHE:
             compiled_func = COMPILED_CACHE[cache_key]
             return compiled_func(*dynamic_args, **dynamic_kwargs)
         lowered_func: Lowered = fn.lower(*args, **kwargs)
-        compiled_func = smart_compile(
+        compiled_func, signature = smart_compile(
             lowered_func=lowered_func,
             tag="cached-jit",
             verbose=verbose,
+            cache_key=cache_key,
         )
-        COMPILED_CACHE[cache_key] = compiled_func
+
+        COMPILED_CACHE[signature] = compiled_func
 
         return compiled_func(*dynamic_args, **dynamic_kwargs)
 
@@ -222,7 +242,8 @@ def smart_compile(
     lowered_func: Lowered,
     tag: str | None = None,
     verbose: bool = True,
-) -> Compiled:
+    cache_key: tuple[str, tuple] | None = None,
+) -> tuple[Compiled, tuple[str, tuple] | None]:
     """Compile a lowered JAX function with caching.
 
     Args:
@@ -237,16 +258,19 @@ def smart_compile(
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
     func_dir = COMPILE_FUNC_DIR / foldername
     filepath = func_dir / COMPILED_FILE_NAME
+    signature_filepath = func_dir / SIGNATURE_FILE_NAME
     post_fix = f" (TAG : {tag})" if tag else ""
+    signature = cache_key
     if filepath.exists() and not RECOMPILE_FORCE:
         try:
             (serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
+            signature = pickle.load(open(signature_filepath, "rb"))
             compiled_func = deserialize_and_load(
                 serialized=serialized,
                 in_tree=in_tree,
                 out_tree=out_tree,
             )
-            return compiled_func
+            return compiled_func, signature
         except Exception as e:
             if verbose:
                 warnings.warn(
@@ -259,13 +283,14 @@ def smart_compile(
                 func_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
+                    pickle.dump(cache_key, open(signature_filepath, "wb"))
                 except Exception as e:
                     if verbose:
                         warnings.warn(
                             f"couldn't save compiled function due to {e}" + post_fix,
                             stacklevel=4,
                         )
-            return compiled_func
+            return compiled_func, signature
     else:
         compiled_func: Compiled = lowered_func.compile()
         if ECACHE_COMPILES:
@@ -273,13 +298,14 @@ def smart_compile(
                 serialized, in_tree, out_tree = serialize(compiled_func)
                 func_dir.mkdir(parents=True, exist_ok=True)
                 pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
+                pickle.dump(cache_key, open(signature_filepath, "wb"))
             except Exception as e:
                 if verbose:
                     warnings.warn(
                         f"couldn't save and serialize compiled function due to {e}" + post_fix,
                         stacklevel=4,
                     )
-        return compiled_func
+        return compiled_func, signature
 
 
 def save_compiled_fn(
@@ -307,10 +333,7 @@ def save_compiled_fn(
         warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
 
 
-def load_compiled_fn(
-    path: str | os.PathLike,
-    prefix: str | None = None,
-):
+def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
     """Load a compiled function from disk.
 
     Args:
@@ -490,8 +513,20 @@ def compile_function(
     ).compile()
 
 
+def load_cached_functions() -> None:
+    files = [o for o in os.listdir(COMPILE_FUNC_DIR) if os.path.exists(os.path.join(COMPILE_FUNC_DIR, o))]
+    for file in files:
+        target_compiled_function = EasyPath(COMPILE_FUNC_DIR) / file / COMPILED_FILE_NAME
+        target_signature = EasyPath(COMPILE_FUNC_DIR) / file / SIGNATURE_FILE_NAME
+        (serialized, in_tree, out_tree) = pickle.loads(target_compiled_function.read_bytes())
+        signature = pickle.loads(target_signature.read_bytes())
+        compiled_function = deserialize_and_load(serialized=serialized, in_tree=in_tree, out_tree=out_tree)
+        COMPILED_CACHE[signature] = compiled_function
+
+
 if __name__ == "__main__":
     jnp = jax.numpy
+    load_cached_functions()
 
     @cjit
     @jax.jit

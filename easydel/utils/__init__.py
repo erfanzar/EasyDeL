@@ -14,7 +14,14 @@
 from . import analyze_memory, compiling_utils, graph_utils, traversals
 from .checkpoint_managers import CheckpointManager, EasyPath, EasyPathLike
 from .cli_helpers import DataClassArgumentParser
-from .compiling_utils import cache_compiles, cjit, compile_function, load_compiled_fn, save_compiled_fn
+from .compiling_utils import (
+    cache_compiles,
+    cjit,
+    compile_function,
+    load_cached_functions,
+    load_compiled_fn,
+    save_compiled_fn,
+)
 from .data_managers import (
     DataManager,
     DatasetLoadError,
@@ -54,6 +61,7 @@ __all__ = (
     "get_logger",
     "graph_utils",
     "is_package_available",
+    "load_cached_functions",
     "load_compiled_fn",
     "save_compiled_fn",
     "traversals",
