@@ -31,7 +31,7 @@ MODEL_ID = "Qwen/Qwen3-14B"
 DATASET_ID = "mlabonne/orpo-dpo-mix-40k"
 # WANDB_ENTITY: Your Weights & Biases entity (username or organization).
 # Set to None if you don't want to use WandB for logging.
-WANDB_ENTITY = None
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
 
 # Environment variables that will be passed to each Ray worker process on the TPUs.
 # These are crucial for HuggingFace and EasyDeL to function correctly in a distributed setup.
@@ -115,8 +115,7 @@ def main():
         # Sharding axis dimensions:
         #  (data_parallel, fully_sharded_data_parallel, expert_parallel, tensor_parallel, sequence_parallel)
         # `(1, -1, 1, 1, 1)` is a common setting for FSDP-like sharding across batch and model.
-        # but let try sequence_parallel
-        sharding_axis_dims=(1, 1, 1, 1, -1),
+        sharding_axis_dims=(1, jax.process_count(), 1, -1, 1),  # combine FSDP and TP
         config_kwargs=ed.EasyDeLBaseConfigDict(
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length,  # For RoPE-based models, sets max position for frequency encoding.
