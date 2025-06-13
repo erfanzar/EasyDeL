@@ -31,7 +31,7 @@ MODEL_ID = "Qwen/Qwen3-14B"
 DATASET_ID = "mlabonne/orpo-dpo-mix-40k"
 # WANDB_ENTITY: Your Weights & Biases entity (username or organization).
 # Set to None if you don't want to use WandB for logging.
-WANDB_ENTITY = None
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
 
 # Environment variables that will be passed to each Ray worker process on the TPUs.
 # These are crucial for HuggingFace and EasyDeL to function correctly in a distributed setup.
@@ -135,7 +135,7 @@ def main():
     # --- Dataset Preparation ---
     logger.info(f"Loading dataset: {DATASET_ID}")
     # The 'mlabonne/orpo-dpo-mix-40k' dataset already provides 'chosen' and 'rejected' conversation
-    # lists, which is the required format for DPOTrainer. We load both train and test splits.
+    # lists, which is the required format for ORPOTrainer. We load both train and test splits.
     train_dataset = load_dataset(DATASET_ID, split="train")
     logger.info(f"Train dataset size: {len(train_dataset)}")
 
@@ -179,7 +179,7 @@ def main():
     )
 
     # --- Trainer Setup and Execution ---
-    logger.info("Initializing DPOTrainer.")
+    logger.info("Initializing ORPOTrainer.")
     trainer = ed.ORPOTrainer(
         arguments=arguments,  # Pass the configured ORPO hyperparameters.
         model=model,  # The EasyDeL model instance to be trained.

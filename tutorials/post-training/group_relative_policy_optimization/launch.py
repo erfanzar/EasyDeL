@@ -24,7 +24,7 @@ ray.init()
 # --- Configuration Constants ---
 MODEL_ID = "cohereLabs/aya-expanse-8b"
 DATASET_ID = "AI-MO/NuminaMath-TIR"
-WANDB_ENTITY = None
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
 
 # For TPU execution environment - consider fetching sensitive tokens from environment variables
 # For example: HF_TOKEN = os.environ.get("HF_TOKEN")
