@@ -135,7 +135,7 @@ def main():
     arguments = ed.SFTConfig(
         num_train_epochs=1,  # Number of full passes over the training dataset.
         total_batch_size=total_batch_size,  # Total batch size used across all TPU devices.
-        gradient_accumulation_steps=1,  # Number of gradient accumulation steps (often 1 for TPUs).
+        gradient_accumulation_steps=1,  # Number of gradient accumulation steps .
         do_eval=True,  # Enable evaluation on the test set during training.
         use_wandb=True,  # Automatically enable WandB logging if entity is provided.
         wandb_entity=WANDB_ENTITY,

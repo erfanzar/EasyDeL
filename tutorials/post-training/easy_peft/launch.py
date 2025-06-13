@@ -16,19 +16,21 @@ import os
 import pprint
 
 import ray  # For distributed computing
-from eformer.executor.ray import TpuAcceleratorConfig, execute  # EasyDeL's Ray utilities
+from eformer.executor.ray import TpuAcceleratorConfig, execute
 
 # Initialize Ray. This ensures Ray is ready to manage distributed tasks.
 ray.init()
 
+LORA_RANK = 64
+LORA_PATTERN = ".*(q_proj|k_proj|q_proj|k_proj).*"
 # --- Configuration Constants ---
 # MODEL_ID: Specifies the base model to be fine-tuned.
 # We are using Qwen/Qwen3-14B, a powerful large language model.
 MODEL_ID = "Qwen/Qwen3-14B"
-# DATASET_ID: The dataset for ORPO training.
-# 'mlabonne/orpo-dpo-mix-40k' is a common dataset formatted for ORPO,
+# DATASET_ID: The dataset for SFT training.
+# 'LDJnr/Pure-Dove' is a common dataset formatted for SFT,
 # containing 'chosen' and 'rejected' response pairs.
-DATASET_ID = "mlabonne/orpo-dpo-mix-40k"
+DATASET_ID = "LDJnr/Pure-Dove"
 # WANDB_ENTITY: Your Weights & Biases entity (username or organization).
 # Set to None if you don't want to use WandB for logging.
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
@@ -45,7 +47,7 @@ TPU_EXECUTION_ENV_VARS = {
 }
 
 # Additional pip packages to be installed on each Ray worker.
-# For ORPO, we don't require external reward verification libraries like 'math_verify'.
+# For SFT, we don't require external reward verification libraries like 'math_verify'.
 TPU_PIP_PACKAGES = []
 
 # Pretty print the environment variables to confirm they are loaded.
@@ -81,17 +83,10 @@ def main():
     from transformers import AutoTokenizer  # Hugging Face Transformers for tokenizer.
 
     # Initialize EasyDeL's logger for informative output during training.
-    logger = ed.utils.get_logger("ORPO-EasyDeL")
+    logger = ed.utils.get_logger("SFT-EasyDeL")
     logger.info(f"Starting main execution on Ray worker with JAX backend: {jax.default_backend()}")
 
-    # --- ORPO Specific Configuration Variables ---
-    # `sequence_length` is the maximum length for the prompt part of the input.
-    sequence_length = 2048
-    # `max_length` is the maximum total sequence length for both prompt and completion.
-    # For ORPO, it's often set to twice the prompt length to allow for full conversations.
-    max_completion_length = 2048
-    max_length = sequence_length + max_completion_length
-    # `total_batch_size` is the effective batch size across all TPU devices.
+    max_length = 4096
     total_batch_size = 32
 
     # --- Tokenizer Setup ---
@@ -99,6 +94,7 @@ def main():
     processor = AutoTokenizer.from_pretrained(MODEL_ID)
     # Ensure a `pad_token_id` is set, typically to the `eos_token_id`,
     # which is crucial for consistent padding during training.
+    processor.padding_side = "left"
     if processor.pad_token_id is None:
         processor.pad_token_id = processor.eos_token_id
         logger.info(f"Set pad_token_id to eos_token_id: {processor.pad_token_id}")
@@ -134,13 +130,11 @@ def main():
 
     # --- Dataset Preparation ---
     logger.info(f"Loading dataset: {DATASET_ID}")
-    # The 'mlabonne/orpo-dpo-mix-40k' dataset already provides 'chosen' and 'rejected' conversation
-    # lists, which is the required format for ORPOTrainer. We load both train and test splits.
     train_dataset = load_dataset(DATASET_ID, split="train")
     logger.info(f"Train dataset size: {len(train_dataset)}")
-
-    # --- ORPO Configuration (Hyperparameters for ORPO training) ---
-    arguments = ed.ORPOConfig(
+    model = model.apply_lora_to_layers(LORA_RANK, LORA_PATTERN)  # here's how lora get applied to module
+    # --- SFT Configuration (Hyperparameters for SFT training) ---
+    arguments = ed.SFTConfig(
         num_train_epochs=1,  # Number of full passes over the training dataset.
         total_batch_size=total_batch_size,  # Total batch size used across all TPU devices.
         gradient_accumulation_steps=1,  # Number of gradient accumulation steps .
@@ -148,24 +142,18 @@ def main():
         use_wandb=True,  # Automatically enable WandB logging if entity is provided.
         wandb_entity=WANDB_ENTITY,
         do_last_save=True,  # Save the final model checkpoint after training.
-        max_prompt_length=sequence_length,  # Max length for the prompt part of the input.
-        max_length=max_length,  # Max total sequence length (prompt + completion) for tokenization.
-        max_completion_length=max_completion_length,  # Max length for the completion.
         max_training_steps=None,  # Maximum number of training steps (None means train until epochs are done).
         max_evaluation_steps=None,  # Maximum number of evaluation steps (None means evaluate full test set).
-        max_sequence_length=max_length,  # Redundant with max_length, but good for clarity.
-        loss_config=ed.LossConfig(z_loss=0.0),  # Z-loss regularization term in ORPO loss (0.0 means off).
+        max_sequence_length=max_length,  # max_length
+        loss_config=ed.LossConfig(z_loss=0.0),  # Z-loss regularization term in SFT loss (0.0 means off).
         track_memory=False,  # Set to True to enable memory tracking (can add minor overhead).
         save_steps=1_000,  # Save a model checkpoint every 1000 training steps.
         save_total_limit=0,  # Maximum number of checkpoints to keep (0 means keep all).
         save_optimizer_state=False,  # Whether to save optimizer state with checkpoints (turn True to resume training).
         per_epoch_training_steps=None,  # Number of training steps per epoch (None for automatic calculation).
         per_epoch_evaluation_steps=None,  # Number of evaluation steps per epoch (None for automatic calculation).
-        learning_rate=8e-6,  # Initial learning rate for the optimizer.
-        learning_rate_end=1e-6,  # End learning rate for linear scheduler (not active with COSINE scheduler).
-        beta=0.1,  # The ORPO beta parameter. Controls how much the policy
-        # can deviate from the reference model's behavior.
-        # Higher beta means stronger regularization (less divergence).
+        learning_rate=1e-5,  # Initial learning rate for the optimizer.
+        learning_rate_end=7e-6,  # End learning rate for linear scheduler (not active with COSINE scheduler).
         optimizer=ed.EasyDeLOptimizers.ADAMW,  # Optimizer to use (AdamW is common).
         scheduler=ed.EasyDeLSchedulers.COSINE,  # Learning rate scheduler (Cosine annealing).
         clip_grad=1.0,  # Gradients will be clipped to this maximum L2 norm.
@@ -174,22 +162,24 @@ def main():
         report_steps=10,  # Log metrics to WandB (if enabled) every 10 steps.
         log_steps=5,  # Log metrics to console/logger every 5 steps.
         progress_bar_type="json",  # Type of progress bar display.
-        # save_directory="gs://your-bucket/orpo-qwen-mix"
+        packing=False,  # you can also try packing.
+        # save_directory="gs://your-bucket/sft-checkpoints"
         # # Optional: specify a Google Cloud Storage bucket path for saving.
     )
 
     # --- Trainer Setup and Execution ---
-    logger.info("Initializing ORPOTrainer.")
-    trainer = ed.ORPOTrainer(
-        arguments=arguments,  # Pass the configured ORPO hyperparameters.
+    logger.info("Initializing PEFT-SFTTrainer.")
+    trainer = ed.SFTTrainer(
+        arguments=arguments,  # Pass the configured SFT hyperparameters.
         model=model,  # The EasyDeL model instance to be trained.
         processing_class=processor,  # The tokenizer/processor instance for internal data handling.
         train_dataset=train_dataset,  # The dataset used for training.
         eval_dataset=None,  # The dataset used for evaluation.
+        formatting_func=lambda batch: processor.apply_chat_template(batch["conversation"], tokenize=False),
     )
 
     logger.info("Starting training...")
-    trainer.train()  # Initiate the ORPO training process.
+    trainer.train()  # Initiate the SFT training process.
     logger.info("Training finished.")
 
 
