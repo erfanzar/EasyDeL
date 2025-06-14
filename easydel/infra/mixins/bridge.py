@@ -125,19 +125,20 @@ class EasyBridgeMixin(PushToHubMixin):
           mismatch_allowed (bool, optional): If True allows mismatch in parameters. Defaults to True.
           enable (bool): if True, allows file to be saved (used for multi-host saving models).
         """
+        if enable is None:
+            enable = jax.process_index() == 0
+        if enable:
+            save_directory.mkdir(parents=True, exist_ok=True)
 
-        save_directory.mkdir(parents=True, exist_ok=True)
+            config_to_save = deepcopy(self.config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [self.__class__.__name__]
+            config_to_save.save_pretrained(str(save_directory))
 
-        config_to_save = deepcopy(self.config)
-        config_to_save.__dict__.pop("attn_dtype", None)
-        config_to_save.__dict__.pop("attn_softmax_dtype", None)
-        # Make sure dtypes are not included
-        config_to_save.architectures = [self.__class__.__name__]
-        config_to_save.save_pretrained(str(save_directory))
-
-        if self.can_generate() and hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                self.generation_config.save_pretrained(str(save_directory))
+            if self.can_generate() and hasattr(self, "generation_config"):
+                if self.generation_config is not None:
+                    self.generation_config.save_pretrained(str(save_directory))
 
         output_model_file = save_directory / FLAX_WEIGHTS_NAME
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
