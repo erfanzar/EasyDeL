@@ -81,7 +81,7 @@ def main():
 
     # --- Basic Training Parameters ---
     max_length = 4096
-    total_batch_size = 64
+    total_batch_size = 128
 
     # --- Tokenizer Setup ---
     # The tokenizer MUST be loaded from the teacher model to ensure that both the
@@ -166,8 +166,8 @@ def main():
             sliding_window=4096,
             sharding_axis_dims=(1, jax.process_count(), 1, -1, 1),
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-            # freq_max_position_embeddings=max_length,
-            # mask_max_position_embeddings=max_length,
+            freq_max_position_embeddings=max_length,
+            mask_max_position_embeddings=max_length,
             attn_mechanism=ed.AttentionMechanisms.AUTO,
         ),
         dtype=jnp.bfloat16,
@@ -208,7 +208,7 @@ def main():
         clip_grad=1.0,
         report_steps=10,
         log_steps=5,
-        progress_bar_type="json"
+        progress_bar_type="json",
     )
 
     # --- Data Processing Functions ---
