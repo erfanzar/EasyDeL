@@ -125,8 +125,10 @@ class DistillationTrainer(Trainer):
             static_argnums=static_argnames,
         )
 
-        sharded_training_step_function.static_argnums_ = static_argnames
-        sharded_evaluation_step_function.static_argnums_ = static_argnames
+        flops_per_tkn = self.teacher_state.model.flops_per_token(include_loss=True, include_backward=True)
+
+        self._extra_forward_flops_per_token = flops_per_tkn
+        self._extra_backward_flops_per_token = flops_per_tkn
 
         self.arguments.ensure_checkpoint_path()
         return TrainerConfigureFunctionOutput(

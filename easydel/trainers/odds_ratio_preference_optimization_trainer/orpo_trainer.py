@@ -436,8 +436,8 @@ class ORPOTrainer(Trainer):
             static_argnums=static_argnums,
         )
 
-        sharded_training_step_function.static_argnums_ = static_argnums
-        sharded_evaluation_step_function.static_argnums_ = static_argnums
+        self._extra_forward_flops_per_token = 0
+        self._extra_backward_flops_per_token = 0
 
         self.arguments.ensure_checkpoint_path()
         self.concatenated_forward = jited_concatenated_forward
