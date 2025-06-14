@@ -424,6 +424,11 @@ class DPOTrainer(Trainer):
         self.concatenated_forward = jited_concatenated_forward
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
 
+        flops_per_tkn = self.reference_state.model.flops_per_token(include_loss=True, include_backward=True)
+
+        self._extra_forward_flops_per_token = flops_per_tkn
+        self._extra_backward_flops_per_token = flops_per_tkn
+
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
             sharded_evaluation_step_function=sharded_evaluation_step_function,

@@ -125,8 +125,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     pruning_module: tp.Any
     memory_monitor: tp.Any
 
-    _forward_flops_per_token: int
-    _backward_flops_per_token: int
+    _forward_flops_per_token: int | float
+    _backward_flops_per_token: int | float
+
+    _extra_forward_flops_per_token: int | float
+    _extra_backward_flops_per_token: int | float
 
     _train_shared_fn_static_args_: tuple[tp.Any]
     _train_shared_fn_extra_args_: tuple[tp.Any]

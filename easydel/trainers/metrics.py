@@ -74,6 +74,7 @@ class StepMetrics:
         current_step: int,
         epoch: int,
         flops_per_token: float,
+        extra_flops_per_token: float,
         batch_size: int,
         seq_length: int,
         learning_rate: float,
@@ -87,6 +88,10 @@ class StepMetrics:
         execution_time = metrics.execution_time
         flops = flops_per_token * seq_length
         total_flops = flops * batch_size
+
+        extra_flops = extra_flops_per_token * seq_length
+        total_flops += extra_flops * batch_size
+
         tflops = (total_flops / execution_time) / 1e12
         total_tokens = batch_size * seq_length
         visited_tokens = total_tokens * current_step
@@ -96,6 +101,8 @@ class StepMetrics:
             f"{perf_key}/execution_time": float(execution_time),
             f"{perf_key}/flops": float(flops),
             f"{perf_key}/flops_per_token": float(flops_per_token),
+            f"{perf_key}/extra_flops": float(extra_flops),
+            f"{perf_key}/extra_flops_per_token": float(extra_flops_per_token),
             f"{perf_key}/step_time": float(step_time),
             f"{perf_key}/tflops": float(tflops),
             f"{perf_key}/throughput": throughput,
@@ -123,7 +130,6 @@ class StepMetrics:
 
         if metrics.accuracy is not None:
             basic_metrics["accuracy"] = float(metrics.accuracy)
-
         if metrics.chosen_rewards is not None:
             basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
         if metrics.rejected_rewards is not None:
