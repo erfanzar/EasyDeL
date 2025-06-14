@@ -281,6 +281,8 @@ class BaseTrainer(BaseTrainerProtocol):
             "_backward_flops_per_token",
             self.model_state.model.flops_per_token(include_loss=True, include_backward=True),
         )
+        self._extra_forward_flops_per_token = getattr(self, "_extra_forward_flops_per_token", 0)
+        self._extra_backward_flops_per_token = getattr(self, "_extra_backward_flops_per_token", 0)
 
         self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
         self.pruning_module = getattr(self.arguments, "pruning_module", None)
