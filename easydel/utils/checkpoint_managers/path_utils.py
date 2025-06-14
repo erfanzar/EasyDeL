@@ -174,7 +174,8 @@ class LocalPath(UniversalPath):
         self.path.write_bytes(data)
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
-        self.path.mkdir(parents=parents, exist_ok=exist_ok)
+        if not str(self.path).startswith("/dev/null"):
+            self.path.mkdir(parents=parents, exist_ok=exist_ok)
 
     def is_dir(self) -> bool:
         return self.path.is_dir()
