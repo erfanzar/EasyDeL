@@ -216,6 +216,13 @@ class BaseTrainer(BaseTrainerProtocol):
     def is_process_zero(self):
         return self.arguments.is_process_zero
 
+    @cached_property
+    def is_enable(self):
+        enable = True
+        if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
+            enable = False
+        return enable
+
     @property
     def evaluation_batch_size(self):
         return self.arguments.eval_batch_size
@@ -721,24 +728,20 @@ class BaseTrainer(BaseTrainerProtocol):
         directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
 
         logger.info(f"saving state {directory_name}.")
-        enable = True
 
-        if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
-            enable = False
-
-        if enable:
+        if self.is_enable:
             directory_name.mkdir(exist_ok=True)
             self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
+            self._save_readme(directory_name)
 
         state.save_state(
             save_directory=directory_name,
             float_dtype=self.model.param_dtype,
             verbose=self.arguments.verbose,
             save_optimizer=self.arguments.save_optimizer_state,
-            enable=enable,
+            enable=self.is_enable,
         )
 
-        self._save_readme(directory_name)
         return str(directory_name)
 
     def _get_current_step(self, state):
