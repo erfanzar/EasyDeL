@@ -900,7 +900,10 @@ class TrainingArguments:
 
     def _get_save_directory_milestone(self, step, create: bool = True) -> EasyPathLike:
         directory_name = f"run-{step}"
-        save_directory = self._get_save_directory(create=create) / directory_name
+        savedir = self._get_save_directory(create=create)
+        if savedir is None:
+            return EasyPath("/dev/null")
+        save_directory = savedir / directory_name
         if create:
             save_directory.mkdir(exist_ok=True, parents=True)
         return save_directory
