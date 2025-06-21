@@ -857,7 +857,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.40"]
+    _targeted_versions = ["0.0.41"]
 
     from eformer import __version__ as _eform_version
 
