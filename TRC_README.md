@@ -30,6 +30,12 @@ EasyDeL is designed for maximum performance and flexibility on TPU hardware:
 
 ### 1. Install and Configure `eopod`
 
+#### You can also setup and install easydel with running command belowe
+
+```shell
+bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+```
+
 First, install `eopod`, the command-line tool for managing TPU pods:
 
 ```shell
