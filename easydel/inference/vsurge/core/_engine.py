@@ -25,7 +25,6 @@ from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
 from easydel.layers.attention import AttentionMechanisms
-from easydel.utils.compiling_utils import cjit
 
 from ..memory import PageManager
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
@@ -195,60 +194,52 @@ class vEngine:
                     min_size=0,
                 ),
             )
-            self._free_state_slots = cjit(
-                jax.jit(
-                    continuous_bulk_free_state_slots,
-                    donate_argnums=(1,),
-                    in_shardings=(None, self._decodes_state_sharding),
-                    out_shardings=self._decodes_state_sharding,
-                )
+            self._free_state_slots = jax.jit(
+                continuous_bulk_free_state_slots,
+                donate_argnums=(1,),
+                in_shardings=(None, self._decodes_state_sharding),
+                out_shardings=self._decodes_state_sharding,
             )
-            self.continuous_prefill = cjit(
-                jax.jit(
-                    continuous_prefill,
-                    static_argnums=(0, 9),
-                    in_shardings=(
-                        es.extract_shardings(self.graphstate),
-                        es.extract_shardings(self.graphothers),
-                        self._empty_sharding,
-                        self._empty_sharding,
-                        None,
-                        None,
-                        self._empty_sharding,
-                        self._empty_sharding,
-                        None,
-                        None,
-                    ),
-                    out_shardings=(self._prefill_state_sharding, None),
-                )
+            self.continuous_prefill = jax.jit(
+                continuous_prefill,
+                static_argnums=(0, 9),
+                in_shardings=(
+                    es.extract_shardings(self.graphstate),
+                    es.extract_shardings(self.graphothers),
+                    self._empty_sharding,
+                    self._empty_sharding,
+                    None,
+                    None,
+                    self._empty_sharding,
+                    self._empty_sharding,
+                    None,
+                    None,
+                ),
+                out_shardings=(self._prefill_state_sharding, None),
             )
-            self.continuous_decode = cjit(
-                jax.jit(
-                    continuous_decode,
-                    static_argnums=(0,),
-                    donate_argnums=(3,),
-                    in_shardings=(
-                        es.extract_shardings(self.graphstate),
-                        es.extract_shardings(self.graphothers),
-                        self._decodes_state_sharding,
-                        None,
-                        None,
-                    ),
-                    out_shardings=(self._decodes_state_sharding, None),
-                )
+            self.continuous_decode = jax.jit(
+                continuous_decode,
+                static_argnums=(0,),
+                donate_argnums=(3,),
+                in_shardings=(
+                    es.extract_shardings(self.graphstate),
+                    es.extract_shardings(self.graphothers),
+                    self._decodes_state_sharding,
+                    None,
+                    None,
+                ),
+                out_shardings=(self._decodes_state_sharding, None),
             )
-            self.continuous_insert = cjit(
-                jax.jit(
-                    continuous_insert,
-                    donate_argnums=(0, 1),
-                    static_argnums=(3, 4),
-                    in_shardings=(
-                        self._prefill_state_sharding,
-                        self._decodes_state_sharding,
-                        None,
-                    ),
-                    out_shardings=self._decodes_state_sharding,
-                )
+            self.continuous_insert = jax.jit(
+                continuous_insert,
+                donate_argnums=(0, 1),
+                static_argnums=(3, 4),
+                in_shardings=(
+                    self._prefill_state_sharding,
+                    self._decodes_state_sharding,
+                    None,
+                ),
+                out_shardings=self._decodes_state_sharding,
             )
 
     @cached_property

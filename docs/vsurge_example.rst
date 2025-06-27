@@ -60,7 +60,9 @@ Load the pretrained model and tokenizer using EasyDeL's `AutoEasyDeLModelForCaus
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-            attn_mechanism=ed.AttentionMechanisms.PAGED_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
+            kvdtype=jnp.bfloat16,
         ),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         param_dtype=param_dtype,
@@ -76,28 +78,19 @@ Instantiate the `vSurge` engine using the `create_odriver` class method. This me
 
 -   `model`: The loaded EasyDeL model.
 -   `processor`: The loaded tokenizer.
--   `max_prefill_length`: The maximum length for the prefill stage.
--   `prefill_lengths`: A list of possible prefill lengths the engine should be prepared to handle efficiently.
--   `page_size`: The size of KV cache pages. This is a key parameter for Paged Attention.
--   `hbm_utilization`: The target utilization of High Bandwidth Memory (HBM) for the KV cache.
 -   `max_concurrent_prefill`: The maximum number of prefill requests that can be processed concurrently.
 -   `max_concurrent_decodes`: The maximum number of decode requests (token generation) that can be processed concurrently.
 -   `seed`: A random seed for reproducibility.
 
 .. code-block:: python
-
-    page_size = 128
-    hbm_utilization = 0.875
+ 
     max_concurrent_decodes = 64
-    max_concurrent_prefill = 64 # Often set equal to max_concurrent_decodes
+    max_concurrent_prefill = 1
 
     surge = ed.vSurge.from_model(
         model=model,
         processor=processor,
         max_prefill_length=prefill_length,
-        prefill_lengths=[prefill_length],
-        page_size=page_size,
-        hbm_utilization=hbm_utilization,
         max_concurrent_prefill=max_concurrent_prefill,
         max_concurrent_decodes=max_concurrent_decodes,
         seed=877,
@@ -110,8 +103,8 @@ Before performing inference, the `vSurge` engine needs to be started and compile
 
 .. code-block:: python
 
-    surge.start()
     surge.compile()
+    surge.start()
 
 Non-Streaming Generation
 ------------------------
