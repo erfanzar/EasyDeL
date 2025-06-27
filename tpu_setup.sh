@@ -25,8 +25,17 @@ log_error() {
 python -c "
 import os
 bashrc_line = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
-with open(os.path.expanduser('~/.bashrc'), 'a') as f:
-    f.write(f'\n{bashrc_line}\n')
+# Check if the line already exists to avoid duplicates
+bashrc_path = os.path.expanduser('~/.bashrc')
+if os.path.exists(bashrc_path):
+    with open(bashrc_path, 'r') as f:
+        content = f.read()
+    if bashrc_line not in content:
+        with open(bashrc_path, 'a') as f:
+            f.write(f'\n{bashrc_line}\n')
+else:
+    with open(bashrc_path, 'a') as f:
+        f.write(f'\n{bashrc_line}\n')
 os.environ['PATH'] = os.path.expanduser('~/.local/bin') + ':' + os.environ.get('PATH', '')
 "
 
@@ -59,7 +68,8 @@ case ${#READY_TPUS[@]} in
     }
 
     echo ""
-    read -p "Enter your TPU name: " TPU_NAME
+    # FIX: Read from the terminal directly
+    read -p "Enter your TPU name: " TPU_NAME < /dev/tty
 
     if [ -z "$TPU_NAME" ]; then
         log_error "TPU name cannot be empty"
@@ -83,7 +93,8 @@ case ${#READY_TPUS[@]} in
     echo ""
 
     while true; do
-        read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input
+        # FIX: Read from the terminal directly
+        read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input < /dev/tty
 
         if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#READY_TPUS[@]} ]; then
             TPU_NAME="${READY_TPUS[$((input - 1))]}"
@@ -119,7 +130,9 @@ fi
 log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
-echo "Press Enter to continue with package installations..."
+
+# FIX: Make the "Press Enter" explicit and read from the terminal
+read -p "Press Enter to continue with package installations..." < /dev/tty
 
 install_package() {
     local package="$1"
