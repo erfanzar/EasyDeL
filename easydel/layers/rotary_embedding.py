@@ -228,7 +228,7 @@ AVAILABLE_ROPE_TYPES = {}
 """A dictionary to store registered RoPE (Rotary Position Embedding) types and their configurations."""
 
 
-def rope_wraper(type):
+def rope_wraper(type):  # noqa
     """
     A decorator factory that registers a RotaryEmbedding class under a specific type name.
 
@@ -1456,15 +1456,7 @@ def get_rope(
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
-                if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
+                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim")
             }
             rotary_emb = DeepseekScalingRotaryEmbedding(
                 head_size=head_size,
@@ -1500,14 +1492,7 @@ def get_rope(
 
 @partial(
     jax.jit,
-    static_argnames=[
-        "head_size",
-        "rotary_dim",
-        "max_position",
-        "base",
-        "rope_scaling",
-        "partial_rotary_factor",
-    ],
+    static_argnames=["head_size", "rotary_dim", "max_position", "base", "rope_scaling", "partial_rotary_factor"],
 )
 def get_frequencies(
     head_size: int,
@@ -1603,12 +1588,12 @@ def get_frequencies(
             frequencies = compute_yarn_frequencies(
                 base=base,
                 rotary_dim=rotary_dim,
-                beta_fast=extra_kwargs["beta_fast"],
-                beta_slow=extra_kwargs["beta_slow"],
+                beta_fast=extra_kwargs.get("beta_fast", 32),
+                beta_slow=extra_kwargs.get("beta_slow", 1),
                 max_position_embeddings=original_max_position,
                 scaling_factor=scaling_factor,
                 extrapolation_factor=extra_kwargs["extrapolation_factor"],
-                attn_factor=extra_kwargs["attn_factor"],
+                attn_factor=extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
             )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
@@ -1616,15 +1601,7 @@ def get_frequencies(
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
-                if k
-                in (
-                    "extrapolation_factor",
-                    "attn_factor",
-                    "beta_fast",
-                    "beta_slow",
-                    "mscale",
-                    "mscale_all_dim",
-                )
+                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim")
             }
             frequencies = compute_deepseek_frequencies(
                 base,
@@ -1661,14 +1638,7 @@ def get_frequencies(
 
 @partial(
     jax.jit,
-    static_argnames=[
-        "head_size",
-        "rotary_dim",
-        "max_position",
-        "base",
-        "rope_scaling",
-        "partial_rotary_factor",
-    ],
+    static_argnames=["head_size", "rotary_dim", "max_position", "base", "rope_scaling", "partial_rotary_factor"],
 )
 def get_inv_frequencies(
     head_size: int,
@@ -1705,10 +1675,7 @@ def get_inv_frequencies(
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
     if rope_scaling is None:
-        inv_frequencies = compute_basic_inv_frequencies(
-            base=base,
-            rotary_dim=rotary_dim,
-        )
+        inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
     else:
         scaling_type = rope_scaling["rope_type"]
 
@@ -1727,27 +1694,15 @@ def get_inv_frequencies(
             )
 
         elif scaling_type == "default":
-            inv_frequencies = compute_basic_inv_frequencies(
-                base=base,
-                rotary_dim=rotary_dim,
-            )
+            inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
         elif scaling_type == "linear":
-            # For linear scaling, we adjust the position indices, not the frequencies directly
-            # So we return the standard inverse frequencies
-            inv_frequencies = compute_basic_inv_frequencies(
-                base=base,
-                rotary_dim=rotary_dim,
-            )
+            inv_frequencies = compute_basic_inv_frequencies(base=base, rotary_dim=rotary_dim)
         elif scaling_type == "dynamic":
-            # Dynamic NTK scaling adjusts the base value
             scaling_factor = rope_scaling["factor"]
             adjusted_base = base * ((scaling_factor * max_position / max_position) - (scaling_factor - 1)) ** (
                 rotary_dim / (rotary_dim - 2)
             )
-            inv_frequencies = compute_basic_inv_frequencies(
-                base=adjusted_base,
-                rotary_dim=rotary_dim,
-            )
+            inv_frequencies = compute_basic_inv_frequencies(base=adjusted_base, rotary_dim=rotary_dim)
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
@@ -1757,7 +1712,6 @@ def get_inv_frequencies(
             extrapolation_factor = extra_kwargs.get("extrapolation_factor", 1.0)
             beta_fast = extra_kwargs.get("beta_fast", 32)
             beta_slow = extra_kwargs.get("beta_slow", 1)
-
             inv_frequencies = compute_yarn_inv_frequencies(
                 base=base,
                 rotary_dim=rotary_dim,
@@ -1768,7 +1722,6 @@ def get_inv_frequencies(
                 extrapolation_factor=extrapolation_factor,
             )
         elif scaling_type == "deepseek_yarn":
-            # Deepseek uses similar inverse frequencies to YaRN
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
             extra_kwargs = {
@@ -1777,30 +1730,18 @@ def get_inv_frequencies(
             extrapolation_factor = extra_kwargs.get("extrapolation_factor", 1.0)
             beta_fast = extra_kwargs.get("beta_fast", 32)
             beta_slow = extra_kwargs.get("beta_slow", 1)
-
-            # Similar to YaRN's inverse frequency calculation
             pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
             inv_freq_extrapolation = 1.0 / pos_freqs
             inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-            low, high = _yarn_find_correction_range(
-                beta_fast,
-                beta_slow,
-                rotary_dim,
-                base,
-                original_max_position,
-            )
+            low, high = _yarn_find_correction_range(beta_fast, beta_slow, rotary_dim, base, original_max_position)
             inv_freq_mask = (
                 1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)
             ) * extrapolation_factor
             inv_frequencies = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
         elif scaling_type == "longrope":
-            # For Phi-3 LongRoPE, the calculation is quite specific
-            # Simplified approximation based on the computation
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
-
-            # Choose factor based on whether target length exceeds original length
             if max_position > original_max_position:
                 ext_factors = jnp.array(long_factor, dtype=jnp.float32)
             else:
@@ -1833,22 +1774,8 @@ if __name__ == "__main__":
         "beta_slow": 1,
     }
 
-    rope = get_rope(
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        rope_scaling,
-        dtype,
-    )
-    freq = get_frequencies(
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        rope_scaling,
-    )
+    rope = get_rope(head_size, rotary_dim, max_position, base, is_neox_style, rope_scaling, dtype)
+    freq = get_frequencies(head_size, rotary_dim, max_position, base, rope_scaling)
 
 
 @chex.dataclass
@@ -1866,7 +1793,8 @@ class RopeConfig:
         low_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
         high_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
         original_max_position_embeddings (tp.Optional[int]): Original context window size,
-                                                            required by some scaling methods (yarn, llama3, phi3, deepseek).
+                                                            required by some scaling methods
+                                                            (yarn, llama3, phi3, deepseek).
         long_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths > original).
         short_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths <= original).
         long_mscale (tp.Optional[float]): Potentially used by variants like Phi3. (Not used in current `get_rope`).
