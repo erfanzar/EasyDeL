@@ -24,9 +24,6 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
-from easydel.layers.attention import AttentionMechanisms
-
-from ..memory import PageManager
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
 from ._functions import (
     continuous_bulk_free_state_slots,
@@ -128,24 +125,6 @@ class vEngine:
 
         self.manager = None
         self.attn_metadata = None
-
-        if model.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION:
-            msg = "num_pages must be specified for paged attention models."
-            assert num_pages is not None, msg
-            msg = "tokens_per_page must be specified for paged attention models."
-            assert tokens_per_page is not None, msg
-
-            self.manager = PageManager(
-                model.create_paged_metadata(
-                    num_pages=num_pages,
-                    tokens_per_page=tokens_per_page,
-                    batch_size=self._max_concurrent_decodes,
-                    max_prefill_length=self._max_prefill_length,
-                    max_decodes_length=self._max_decodes_length,
-                )
-            )
-
-            self.attn_metadata = self.manager.get_initial_page_state()
 
         self._prng_key = jax.random.PRNGKey(seed)
         self._empty_sharding = Ns(model.mesh, Ps())
