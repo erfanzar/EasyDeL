@@ -181,7 +181,7 @@ class FlexibleAttentionModule(nn.Module):
         softmax_scale: float,
         dropout_prob: float = 0.0,
         *,
-        rngs: nn.Rngs = nn.Rngs(42),
+        rngs: nn.Rngs | None = None,
     ):
         """
         Initializes the AttentionModule.
@@ -193,6 +193,8 @@ class FlexibleAttentionModule(nn.Module):
             dropout_prob (float, optional): The dropout probability for attention weights.
                                              Defaults to 0.0.
         """
+        if rngs is None:
+            rngs = nn.Rngs(42)
         if isinstance(base_config.attn_dtype, str):
             base_config.attn_dtype = _get_jax_dtype_from_string(base_config.attn_dtype)
         if isinstance(base_config.attn_softmax_dtype, str):

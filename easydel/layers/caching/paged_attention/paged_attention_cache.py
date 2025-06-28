@@ -22,21 +22,66 @@ import jax.experimental
 import jax.numpy as jnp
 from eformer import common_types
 from eformer import escale as es
+from eformer.escale import PartitionManager
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
-from .._abstracts import (
-    BaseCache,
-    BaseCacheMetadata,
-    BaseCacheView,
-)
+from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+
+
+def _store_kvcache(
+    key: jax.Array,
+    value: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    slot_mapping: jax.Array,
+):
+    """
+    Stores key-value pairs in cache with block structure, supporting padding in slot mapping.
+
+    Args:
+        key: [N, num_kv_heads, kv_head_dim_size] tensor of keys
+        value: [N, num_kv_heads, kv_head_dim_size] tensor of values
+        k_cache: [num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size] key cache
+        v_cache: [num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size] value cache
+        slot_mapping: [N] tensor of flat slot indices (-1 indicates padding)
+
+    Returns:
+        Updated (k_cache, v_cache)
+    """
+    N, num_kv_heads, kv_head_dim_size = key.shape
+    num_kvcache_blocks, kvcache_block_size, cache_num_heads, cache_head_dim = k_cache.shape
+    assert value.shape == (N, num_kv_heads, kv_head_dim_size)
+    assert v_cache.shape == (num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size)
+    assert cache_num_heads == num_kv_heads
+    assert cache_head_dim == kv_head_dim_size
+    assert slot_mapping.shape == (N,)
+    total_slots = num_kvcache_blocks * kvcache_block_size
+    block_indices = slot_mapping // kvcache_block_size
+    block_offsets = slot_mapping % kvcache_block_size
+
+    valid_mask = (slot_mapping >= 0) & (slot_mapping < total_slots)
+
+    safe_block_indices = jnp.where(valid_mask, block_indices, 0)
+    safe_block_offsets = jnp.where(valid_mask, block_offsets, 0)
+    update_mask = valid_mask.astype(jnp.int32)[:, None, None]
+
+    k_cache = k_cache.at[safe_block_indices, safe_block_offsets].add(
+        (key * update_mask) - k_cache[safe_block_indices, safe_block_offsets] * update_mask
+    )
+
+    v_cache = v_cache.at[safe_block_indices, safe_block_offsets].add(
+        (value * update_mask) - v_cache[safe_block_indices, safe_block_offsets] * update_mask
+    )
+
+    return k_cache, v_cache
 
 
 @auto_pytree
@@ -49,58 +94,70 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
     It inherits from `BaseCacheMetadata`.
     """
 
-    batch_size: int
-    tokens_per_page: int
-
-    max_prefill_length: int
-    max_decodes_length: int
-    max_pages_per_group: int
-
     num_hidden_layers: int
-    num_pages: int
     num_kv_heads: int
-
     kv_head_dim_size: int
+    max_num_batched_tokens: int = 32768
+    max_num_seqs: int = 512
+    max_model_len: int = 4096
+    hbm_utilization: float = 0.9
+    kvcache_block_size: int = 256
+    num_kvcache_blocks: int = -1
+
+    @staticmethod
+    def _compute_free_hbm(
+        mesh: Mesh,
+        partition_manager: PartitionManager,
+        hbm_utilization: float,
+    ):
+        partition_axis = partition_manager.paxis
+        size = mesh.shape[partition_axis.kv_head_axis]
+        try:
+            per_device_memory_stats = jax.local_devices()[0].memory_stats()
+            limit = per_device_memory_stats.get("bytes_limit", per_device_memory_stats.get("bytes_reservable_limit"))
+            used = per_device_memory_stats["bytes_in_use"]
+            usable = int(limit * hbm_utilization) - used
+            return usable * size
+        except Exception as e:
+            print(e)
+            return 22 * (1024**3)
 
     @classmethod
     def create(
         cls,
-        batch_size: int,
-        tokens_per_page: int,
-        max_prefill_length: int,
-        max_decodes_length: int,
+        mesh: Mesh,
+        partition_manager: PartitionManager,
+        kvdtype: jnp.dtype,
         num_hidden_layers: int,
-        num_pages: int,
         num_kv_heads: int,
         kv_head_dim_size: int,
+        max_num_batched_tokens: int = 32768,
+        max_num_seqs: int = 512,
+        max_model_len: int = 4096,
+        hbm_utilization: float = 0.9,
+        kvcache_block_size: int = 256,
     ) -> PagedAttentionCacheMetaData:
-        if batch_size <= 0:
-            raise ValueError("`batch_size` must be positive")
         if num_hidden_layers <= 0:
             raise ValueError("`num_hidden_layers` must be positive")
-        if tokens_per_page <= 0:
-            raise ValueError("`tokens_per_page` must be positive")
-        if max_prefill_length <= 0:
-            raise ValueError("`max_prefill_length` must be positive")
-        if max_decodes_length <= 0:
-            raise ValueError("`max_decodes_length` must be positive")
-        if num_pages <= 0:
-            raise ValueError("`num_pages` must be positive")
         if num_kv_heads <= 0:
             raise ValueError("`num_kv_heads` must be positive")
         if kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
-
+        free = cls._compute_free_hbm(mesh=mesh, partition_manager=partition_manager, hbm_utilization=hbm_utilization)
+        block_bytes = (
+            2 * num_hidden_layers * kvcache_block_size * num_kv_heads * kv_head_dim_size * (jnp.finfo(kvdtype).bits // 8)
+        )
+        num_kvcache_blocks = int(free) // block_bytes
         return cls(
-            batch_size=batch_size,
-            tokens_per_page=tokens_per_page,
-            max_prefill_length=max_prefill_length,
-            max_decodes_length=max_decodes_length,
-            max_pages_per_group=(max_decodes_length + tokens_per_page - 1) // tokens_per_page,
             num_hidden_layers=num_hidden_layers,
-            num_pages=num_pages,
             num_kv_heads=num_kv_heads,
             kv_head_dim_size=kv_head_dim_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            hbm_utilization=hbm_utilization,
+            kvcache_block_size=kvcache_block_size,
+            num_kvcache_blocks=num_kvcache_blocks,
         )
 
 
@@ -165,17 +222,17 @@ class PagedAttentionCacheView(BaseCacheView):
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
 
         kv_pages_shape = (
+            metadata.num_kvcache_blocks,
+            metadata.kvcache_block_size,
             metadata.num_kv_heads,
-            metadata.num_pages,
-            metadata.tokens_per_page,
             metadata.kv_head_dim_size,
         )
 
         kv_pages_sharding = partition_manager.resolve(
             [
+                common_types.EMPTY,
+                common_types.EMPTY,
                 common_types.HEAD,
-                common_types.EMPTY,
-                common_types.EMPTY,
                 common_types.EMPTY,
             ],
             mode=common_types.MODE_PREFILL,
@@ -185,83 +242,29 @@ class PagedAttentionCacheView(BaseCacheView):
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
 
         with jax.named_scope("easydel-paged-attention-cache-init"):
-            key_pages = jnp.zeros(
-                shape=kv_pages_shape,
-                dtype=dtype,
-                device=kv_pages_sharding,
-            )
-            value_pages = jnp.zeros(
-                shape=kv_pages_shape,
-                dtype=dtype,
-                device=kv_pages_sharding,
-            )
-
+            key_pages = jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding)
+            value_pages = jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding)
             key_pages = quantizer(key_pages)
             value_pages = quantizer(value_pages)
+            return cls(metadata=metadata, layer_index=layer_index, key_pages=key_pages, value_pages=value_pages)
 
-            return cls(
-                metadata=metadata,
-                layer_index=layer_index,
-                key_pages=key_pages,
-                value_pages=value_pages,
-            )
-
-    def concatenate_to_cache(self, *args, **kwargs):
+    def concatenate_to_cache(
+        self,
+        key: cx.Array,
+        value: cx.Array,
+        cache_metadata: PagedAttentionMetadata,
+    ):
         """
         Concatenation is not applicable for Paged Attention.
-        Raises NotImplementedError.
         """
-        raise NotImplementedError()
-
-    def write_prefill_to_cache(
-        self,
-        key: cx.Array,
-        value: cx.Array,
-        metadata: PagedAttentionMetadata,
-    ):
-        batch_size, seq_len, n_kv_head, head_dim = key.shape
-        tokens_per_page = self.key_pages.shape[2]
-
-        if batch_size == 1:
-            key = jnp.squeeze(key)
-            value = jnp.squeeze(value)
-        else:
-            key = key[0]
-            value = value[0]
-
-        key = jnp.transpose(key, axes=(1, 0, 2))
-        value = jnp.transpose(value, axes=(1, 0, 2))
-
-        shape = (n_kv_head, max(1, seq_len // tokens_per_page), tokens_per_page, head_dim)
-
-        self.key_pages = jnp.reshape(key, shape=shape)
-        self.value_pages = jnp.reshape(value, shape=shape)
-        return self
-
-    def write_decodes_to_cache(
-        self,
-        key: cx.Array,
-        value: cx.Array,
-        metadata: PagedAttentionMetadata,
-    ):
-        batch_size, _, kv_heads, head_dim = key.shape
-        kv_heads, _, _, head_dim = self.key_pages.shape
-
-        new_key = key.reshape(batch_size, kv_heads, head_dim)[:, :, :]
-        new_key = jnp.transpose(new_key, (1, 0, 2))
-        new_value = value.reshape(batch_size, kv_heads, head_dim)[:, :, :]
-        new_value = jnp.transpose(new_value, (1, 0, 2))
-        broadcast_pages = jnp.tile(metadata.active_page, (kv_heads, 1))
-        broadcast_pos = jnp.tile(metadata.active_page_position, (kv_heads, 1))
-        kv_indices = jnp.arange(kv_heads)[:, None]
-        kv_indices = jnp.tile(kv_indices, (1, batch_size))
-        key_pages_updated = self.key_pages.at[kv_indices, broadcast_pages, broadcast_pos].set(new_key)
-        value_pages_updated = self.value_pages.at[kv_indices, broadcast_pages, broadcast_pos].set(new_value)
-
-        self.key_pages_var = key_pages_updated
-        self.value_pages_var = value_pages_updated
-
-        return self
+        self.key_pages, self.value_pages = _store_kvcache(
+            key,
+            value,
+            self.key_pages,
+            self.value_pages,
+            cache_metadata.slot_mapping,
+        )
+        return self.key_pages, self.value_pages
 
     def __repr__(self):
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, kv_shape={self.key_pages.shape})"
@@ -348,27 +351,11 @@ class PagedAttentionCache(BaseCache):
 
 @auto_pytree
 class PagedAttentionMetadata:
-    page_status: jax.Array
-    page_map: jax.Array
-    num_pages_used: jax.Array
-    sequence_lengths: jax.Array
-    active_page: jax.Array
-    has_active_page: jax.Array
-    active_page_position: jax.Array
-
-    @classmethod
-    def create(
-        cls,
-        num_pages: int,
-        max_page_groups: int,
-        max_pages_per_group: int,
-    ) -> PagedAttentionMetadata:
-        return cls(
-            page_map=jnp.zeros((max_page_groups, max_pages_per_group), dtype="i4"),
-            active_page=jnp.zeros((max_page_groups,), dtype="i4"),
-            page_status=jnp.zeros((num_pages,), dtype="i4").at[0].set(1),
-            num_pages_used=jnp.zeros((max_page_groups,), dtype="i4"),
-            has_active_page=jnp.zeros((max_page_groups,), dtype="b1"),
-            sequence_lengths=jnp.zeros((max_page_groups,), dtype="i4"),
-            active_page_position=jnp.zeros((max_page_groups,), dtype="i4"),
-        )
+    is_prefill: bool
+    slot_mapping: jax.Array
+    block_tables: jax.Array | None = None
+    context_lens: jax.Array | None = None
+    cu_seqlens_q: jax.Array | None = None
+    cu_seqlens_k: jax.Array | None = None
+    max_seqlen_q: jax.Array | int | None = None
+    max_seqlen_k: jax.Array | int | None = None
