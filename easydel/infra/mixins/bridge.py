@@ -265,8 +265,7 @@ class EasyBridgeMixin(PushToHubMixin):
             use_temp_dir = not working_dir.is_dir()
 
         with working_or_temp_dir(working_dir=str(working_dir), use_temp_dir=use_temp_dir) as work_dir:
-            work_dir_path = EasyPath(work_dir)
-            files_timestamps = self._get_files_timestamps(work_dir_path)
+            files_timestamps = self._get_files_timestamps(work_dir)
             self.save_pretrained(
                 save_directory=work_dir,
                 push_to_hub=False,
@@ -279,7 +278,7 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
             return self._upload_modified_files(
-                str(work_dir_path),
+                str(work_dir),
                 repo_id,
                 files_timestamps,
                 commit_message=commit_message,
