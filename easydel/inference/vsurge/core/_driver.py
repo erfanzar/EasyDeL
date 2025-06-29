@@ -27,14 +27,7 @@ from jax import numpy as jnp
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
-from ..utils import (
-    ActiveRequest,
-    ResultTokens,
-    ReturnSample,
-    SafeThread,
-    pad_tokens,
-    process_result_tokens,
-)
+from ..utils import ActiveRequest, ResultTokens, ReturnSample, SafeThread, pad_tokens, process_result_tokens
 from ._engine import vEngine
 
 if tp.TYPE_CHECKING:
@@ -332,7 +325,7 @@ class vDriver:
         self._detokenizing_blocks = detokenizing_blocks
         self._slot_clear_steps = slot_clear_steps
         self._use_operation_lock = use_operation_lock
-
+        # self.scheduler = PriorityScheduler(SchedulerConfig())
         self.prefill_backlog_maxsize = prefill_backlog_maxsize
         self.transfer_backlog_maxsize = transfer_backlog_maxsize
         self.decode_backlog_maxsize = decode_backlog_maxsize
@@ -666,12 +659,8 @@ class vDriver:
         engine = self._engine
         generate_timestep = 0
         decode_state = engine.init_decode_state()
-        last_inserted_slot_in_cycle = -1
 
         while self.live:
-            inserted_new_request_this_cycle = False
-            last_inserted_slot_in_cycle = -1
-
             try:
                 self._acquire_operation_lock_if_needed()
                 while not self._decode_slots.empty() and not self._decode_backlog.empty():
@@ -704,48 +693,42 @@ class vDriver:
                     new_request.generate_timestep_added = generate_timestep
                     new_request.complete = np.zeros((engine.samples_per_slot,), "b1")
                     self._detokenize_backlog.put((slot_for_insert, new_request), block=True)
-                    inserted_new_request_this_cycle = True
-                    last_inserted_slot_in_cycle = slot_for_insert
             finally:
                 self._release_operation_lock_if_needed()
 
-            if not self.live and (
-                self._decode_backlog.empty() or not any(v is not None for v in self._live_requests.values())
-            ):
+            if not self.live and self._decode_backlog.empty():
                 break
 
-            decode_performed_this_iteration = False
             if any(v is not None for v in self._live_requests.values()):
                 time_before_decode_call = time.perf_counter()
                 try:
                     self._acquire_operation_lock_if_needed()
-                    slot_for_decode_op = last_inserted_slot_in_cycle if last_inserted_slot_in_cycle != -1 else 0
 
-                    temp_decode_state, sampled_tokens = engine.decode(
+                    decode_state, sampled_tokens = engine.decode(
                         graphstate=engine.graphstate,
                         graphothers=engine.graphothers,
                         state=decode_state,
                         rngs=engine.prng_key,
-                        slot=slot_for_decode_op,
+                        slot=0,
                     )
                     decode_op_duration_ms = (time.perf_counter() - time_before_decode_call) * 1000
                     self.metrics_recorder.record_decode_op_time(decode_op_duration_ms)
 
                     sampled_tokens.copy_to_host_async()
-                    decode_state = temp_decode_state
                     self._detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
-                    decode_performed_this_iteration = True
+                    generate_timestep += 1
                 finally:
                     self._release_operation_lock_if_needed()
 
                 total_decode_cycle_ms = (time.perf_counter() - time_before_decode_call) * 1000
                 self.log(
-                    f"Decode engine step {generate_timestep} - UsedSlotForDecode: {slot_for_decode_op}, "
-                    f"DecodeOpTook: {decode_op_duration_ms:.2f}ms, TotalCycleTook: {total_decode_cycle_ms:.2f}ms"
+                    f"Decode engine step {generate_timestep} - "
+                    f"UsedSlotForDecode: {sum([1 for v in self._live_requests.values() if v is not None])}, "
+                    f"DecodeOpTook: {decode_op_duration_ms:.2f}ms, "
+                    f"TotalCycleTook: {total_decode_cycle_ms:.2f}ms"
                 )
 
-            if decode_performed_this_iteration and self._slot_clear_steps:
-                generate_timestep += 1
+            if self._slot_clear_steps:
                 if (generate_timestep % self._slot_clear_steps) == 0:
                     self.log(f"Decode step {generate_timestep}: Clearing unused slot resources.")
                     try:
@@ -756,8 +739,6 @@ class vDriver:
                         )
                     finally:
                         self._release_operation_lock_if_needed()
-            elif not inserted_new_request_this_cycle:
-                time.sleep(0.00005)
 
     def _prefill_action_thread(self):
         """
@@ -785,14 +766,7 @@ class vDriver:
 
             request.metadata.prefill_dequeue_time = time.perf_counter()
 
-            (
-                (
-                    padded_tokens,
-                    padded_valids,
-                    true_length,
-                ),
-                sampling_params,
-            ) = self._process_prefill_content(
+            (padded_tokens, padded_valids, true_length), sampling_params = self._process_prefill_content(
                 request,
                 processor,
                 engine.max_prefill_length,
@@ -819,13 +793,9 @@ class vDriver:
                 self._release_operation_lock_if_needed()
             prefill_duration_ms = (time.perf_counter() - prefill_start_time) * 1000
             self.metrics_recorder.record_prefill_op_time(prefill_duration_ms)
-
             request.prefill_result = prefill_result
             request.complete = np.zeros((engine.samples_per_slot,), "b1")
-            self._detokenize_backlog.put(
-                (first_token, request, request.metadata.prefill_dequeue_time),
-                block=True,
-            )
+            self._detokenize_backlog.put((first_token, request, request.metadata.prefill_dequeue_time), block=True)
             try:
                 self._transfer_backlog.put(request, block=True)
                 self.log(f"Placed a request on transfer queue ({self._transfer_backlog.qsize()} items).")
@@ -1224,7 +1194,7 @@ class vDriver:
         else:
             return self.metrics_recorder.get_all_metrics()
 
-    def get_device_memory_stats(self) -> dict | None:
+    def get_device_memory_stats(self) -> list[dict] | None:
         """
         Attempts to retrieve memory statistics for the primary local JAX device.
 
@@ -1232,7 +1202,7 @@ class vDriver:
         which may not be available on all platforms or JAX versions.
 
         Returns:
-            tp.Optional[dict]: A dictionary with memory statistics (e.g.,
+            tp.Optional[list[dict]]: A list of dictionary with memory statistics (e.g.,
                 'bytes_used', 'bytes_limit') if available, otherwise None.
         """
         try:
@@ -1240,24 +1210,25 @@ class vDriver:
             if not local_devs:
                 self.log("No local JAX devices found.")
                 return None
-
-            device = local_devs[0]
-            if hasattr(device, "memory_stats"):
-                stats = device.memory_stats()
-                return {
-                    "device_id": device.id,
-                    "platform": device.platform,
-                    "device_kind": device.device_kind,
-                    "bytes_limit": stats.get("bytes_limit"),
-                    "bytes_used": stats.get("bytes_used"),
-                    "peak_bytes_in_use": stats.get("peak_bytes_in_use"),
-                    "bytes_available": stats.get(
-                        "bytes_available",
-                        stats.get("bytes_limit", 0) - stats.get("bytes_used", 0),
-                    ),
-                }
-            else:
-                self.log(f"Device {device.id} ({device.device_kind}) object does not have memory_stats method.")
+            infos = []
+            for device in local_devs:
+                if hasattr(device, "memory_stats"):
+                    stats = device.memory_stats()
+                    bytes_available = stats.get("bytes_limit", 0) - stats.get("bytes_used", 0)
+                    infos.append(
+                        {
+                            "device_id": device.id,
+                            "platform": device.platform,
+                            "device_kind": device.device_kind,
+                            "bytes_limit": stats.get("bytes_limit"),
+                            "bytes_used": stats.get("bytes_used"),
+                            "peak_bytes_in_use": stats.get("peak_bytes_in_use"),
+                            "bytes_available": stats.get("bytes_available", bytes_available),
+                        }
+                    )
+                else:
+                    self.log(f"Device {device.id} ({device.device_kind}) object does not have memory_stats method.")
+            if len(infos) == 0:
                 return None
         except Exception as e:
             self.log(f"Could not retrieve JAX device memory stats: {e}")
