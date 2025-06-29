@@ -283,7 +283,7 @@ class vSurge:
         tokens_per_page: int | None = None,
         interleaved_mode: bool = False,
         detokenizing_blocks: int = 8,
-        slot_clear_steps: int = 512,
+        slot_clear_steps: int = 0,
         vsurge_name: str | None = None,
         verbose: bool = True,
         bytecode_decode: bool = False,
@@ -322,7 +322,7 @@ class vSurge:
             detokenizing_blocks (int): Number of detokenization blocks used during
                 output post-processing. Defaults to 8.
             slot_clear_steps (int): Number of steps after which stale memory slots
-                are cleared. Defaults to 512.
+                are cleared. Defaults to 0.
             vsurge_name (tp.Optional[str]): Optional name identifier for the created
                 `vSurge` instance.
             verbose (bool): Enables logging and verbose driver output. Defaults to True.

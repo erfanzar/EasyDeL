@@ -744,7 +744,7 @@ class vDriver:
                     f"DecodeOpTook: {decode_op_duration_ms:.2f}ms, TotalCycleTook: {total_decode_cycle_ms:.2f}ms"
                 )
 
-            if decode_performed_this_iteration:
+            if decode_performed_this_iteration and self._slot_clear_steps:
                 generate_timestep += 1
                 if (generate_timestep % self._slot_clear_steps) == 0:
                     self.log(f"Decode step {generate_timestep}: Clearing unused slot resources.")
@@ -757,7 +757,7 @@ class vDriver:
                     finally:
                         self._release_operation_lock_if_needed()
             elif not inserted_new_request_this_cycle:
-                time.sleep(0.005)
+                time.sleep(0.00005)
 
     def _prefill_action_thread(self):
         """
@@ -920,11 +920,25 @@ class vDriver:
         for i in range(engine.max_concurrent_decodes):
             self._decode_slots.put(i)
 
-        self._prefill_thread = SafeThread(target=self._prefill_action_thread, name="prefill-thread", daemon=True)
-        self._transfer_thread = SafeThread(target=self._transfer_action_thread, name="transfer-thread", daemon=True)
-        self._decode_thread = SafeThread(target=self._decode_action_thread, name="decode-thread", daemon=True)
+        self._prefill_thread = SafeThread(
+            target=self._prefill_action_thread,
+            name="prefill-thread",
+            daemon=True,
+        )
+        self._transfer_thread = SafeThread(
+            target=self._transfer_action_thread,
+            name="transfer-thread",
+            daemon=True,
+        )
+        self._decode_thread = SafeThread(
+            target=self._decode_action_thread,
+            name="decode-thread",
+            daemon=True,
+        )
         self._detokenize_thread = SafeThread(
-            target=self._detokenize_action_thread, name="detokenize-thread", daemon=True
+            target=self._detokenize_action_thread,
+            name="detokenize-thread",
+            daemon=True,
         )
 
     def _metrics_monitor_thread_action(self):
