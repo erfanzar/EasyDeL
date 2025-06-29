@@ -24,6 +24,8 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
+from easydel.utils import check_bool_flag, cjit
+
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
 from ._functions import (
     continuous_bulk_free_state_slots,
@@ -220,6 +222,11 @@ class vEngine:
                 ),
                 out_shardings=self._decodes_state_sharding,
             )
+            if check_bool_flag("EASYDEL_CJIT_COMPILE", False):
+                self._free_state_slots = cjit(self._free_state_slots)
+                self.continuous_prefill = cjit(self.continuous_prefill)
+                self.continuous_decode = cjit(self.continuous_decode)
+                self.continuous_insert = cjit(self.continuous_insert)
 
     @cached_property
     def pad_token_id(self):
