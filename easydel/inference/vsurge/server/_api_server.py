@@ -483,7 +483,7 @@ class vSurgeApiServer:
 
             choices = []
             for idx in range(len(result.text)):
-                response_text = result.accumulated_text[idx]
+                response_text = result.accumulated_text[idx][0]
 
                 if is_function_request:
                     format_type = getattr(request, "function_call_format", self.default_function_format)
@@ -797,11 +797,19 @@ class vSurgeApiServer:
 
             if request.stream:
                 return await self._handle_streaming_with_tools_async(
-                    request, vsurge, content, request_id, is_function_request
+                    request,
+                    vsurge,
+                    content,
+                    request_id,
+                    is_function_request,
                 )
             else:
                 return await self._handle_completion_with_tools_async(
-                    request, vsurge, content, request_id, is_function_request
+                    request,
+                    vsurge,
+                    content,
+                    request_id,
+                    is_function_request,
                 )
 
         except HTTPException:
@@ -1005,7 +1013,10 @@ class vSurgeApiServer:
         return await loop.run_in_executor(self.thread_pool, vsurge.count_tokens, content)
 
     def _format_chat_response(
-        self, request: ChatCompletionRequest, result: ReturnSample, usage: UsageInfo
+        self,
+        request: ChatCompletionRequest,
+        result: ReturnSample,
+        usage: UsageInfo,
     ) -> ChatCompletionResponse:
         """Format chat completion response."""
         choices = []
@@ -1013,9 +1024,8 @@ class vSurgeApiServer:
             finish_reason = self._determine_finish_reason(
                 result.num_generated_tokens[idx],
                 request.max_tokens or float("inf"),
-                result.accumulated_text[idx],
+                result.accumulated_text[idx][0],
             )
-
             choices.append(
                 ChatCompletionResponseChoice(
                     index=idx,
@@ -1034,7 +1044,10 @@ class vSurgeApiServer:
         )
 
     def _format_completion_response(
-        self, request: CompletionRequest, result: ReturnSample, usage: UsageInfo
+        self,
+        request: CompletionRequest,
+        result: ReturnSample,
+        usage: UsageInfo,
     ) -> CompletionResponse:
         """Format completion response."""
         choices = []
@@ -1048,19 +1061,17 @@ class vSurgeApiServer:
             choices.append(
                 CompletionResponseChoice(
                     index=idx,
-                    text=result.accumulated_text[idx],
+                    text=result.accumulated_text[idx][0],
                     finish_reason=finish_reason,
                 )
             )
 
-        return CompletionResponse(
-            model=request.model,
-            choices=choices,
-            usage=usage,
-        )
+        return CompletionResponse(model=request.model, choices=choices, usage=usage)
 
     def _format_chat_stream_chunk(
-        self, request: ChatCompletionRequest, result: ReturnSample
+        self,
+        request: ChatCompletionRequest,
+        result: ReturnSample,
     ) -> ChatCompletionStreamResponse:
         """Format chat streaming chunk."""
         choices = []
