@@ -69,7 +69,7 @@ class vSurgeRequest:
         top_k (int): Number of highest probability tokens for top-k filtering. Defaults to 0.
         min_p (float): Minimum probability for a token to be considered. Defaults to 0.0.
         n (int): Number of independent samples to generate. Defaults to 1.
-        stop (tp.Optional[tp.Union[str, tp.List[str]]]): String or list of strings to
+        stop (tp.Optional[tp.Union[str, tp.list[str]]]): String or list of strings to
             stop generation if encountered. Defaults to None.
         temperature (float): Sampling temperature. Defaults to 0.7.
         presence_penalty (float): Penalty for token presence. Defaults to 0.0.
@@ -127,6 +127,92 @@ class vSurgeRequest:
         assert isinstance(self.prompt, str), "prompt should be a single string"
 
 
+class SmartBytecodeDecoder:
+    """A smart decoder that handles partial token sequences and recovers from malformed characters."""
+
+    def __init__(self, processor, fallback_char: str = ""):
+        self.processor = processor
+        self.fallback_char = fallback_char
+        self.malformed_indicators = {"�", "\\ufffd", "\ufffd"}  # noqa
+
+    def contains_malformed_chars(self, text: str) -> bool:
+        """Check if text contains malformed Unicode characters."""
+        return any(indicator in text for indicator in self.malformed_indicators)
+
+    def decode_with_recovery(
+        self,
+        all_tokens: list[int],
+        previous_good_text: str = "",
+        buffer_tokens: list[int] | None = None,
+    ) -> tuple[str, list[int], bool]:
+        """Decode tokens with smart error recovery."""
+        if not all_tokens:
+            return "", [], False
+        if buffer_tokens:
+            tokens_to_decode = buffer_tokens + all_tokens
+        else:
+            tokens_to_decode = all_tokens
+        try:
+            full_decoded = self.processor.decode(tokens_to_decode)
+            if self.contains_malformed_chars(full_decoded):
+                logger.debug("Malformed characters detected in full decode")
+                return self._handle_malformed_decode(tokens_to_decode, previous_good_text)
+            else:
+                if previous_good_text and full_decoded.startswith(previous_good_text):
+                    new_text = full_decoded[len(previous_good_text) :]
+                else:
+                    new_text = full_decoded
+                return new_text, [], False
+
+        except Exception as e:
+            logger.debug(f"Decode error: {e}, attempting recovery")
+            return self._handle_decode_error(tokens_to_decode, previous_good_text)
+
+    def _handle_malformed_decode(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
+        """Handle cases where decoding produces malformed characters."""
+        if len(tokens) <= 1:
+            return self.fallback_char, [], True
+        for i in range(len(tokens) - 1, 0, -1):
+            try:
+                partial_decoded = self.processor.decode(tokens[:i])
+                if not self.contains_malformed_chars(partial_decoded):
+                    if previous_good_text and partial_decoded.startswith(previous_good_text):
+                        good_new_text = partial_decoded[len(previous_good_text) :]
+                    else:
+                        good_new_text = partial_decoded
+                    remaining_tokens = tokens[i:]
+                    logger.debug(f"Buffering {len(remaining_tokens)} tokens due to malformed chars")
+                    return good_new_text, remaining_tokens, True
+
+            except Exception:
+                continue
+
+        logger.warning("Could not find any good partial decode, using fallback")
+        return self.fallback_char, [], True
+
+    def _handle_decode_error(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
+        """Handle decode exceptions by trying progressive decoding."""
+        if len(tokens) <= 1:
+            return self.fallback_char, [], True
+
+        for i in range(len(tokens) - 1, 0, -1):
+            try:
+                partial_decoded = self.processor.decode(tokens[:i])
+                if previous_good_text and partial_decoded.startswith(previous_good_text):
+                    good_new_text = partial_decoded[len(previous_good_text) :]
+                else:
+                    good_new_text = partial_decoded
+                remaining_tokens = tokens[i:]
+                logger.debug(f"Decode error recovery: buffering {len(remaining_tokens)} tokens")
+                return good_new_text, remaining_tokens, True
+
+            except Exception:
+                continue
+
+        logger.warning("Complete decode failure, using fallback")
+        return self.fallback_char, [], True
+
+
 @dataclasses.dataclass
 class ProcessState:
     """Internal state for tracking a single generation within a vSurgeRequest's 'n' sequences.
@@ -140,10 +226,10 @@ class ProcessState:
             server-side tokenization.
         finished_streaming (bool): True if this generation sequence has finished.
         current_step_text (tp.Union[str, list]): Text or token IDs generated in the current step.
-            Type is `str` for server-side/bytecode, `List[int]` for client-side token IDs.
+            Type is `str` for server-side/bytecode, `list[int]` for client-side token IDs.
         all_token_ids (list[int]): Accumulated list of all token IDs generated so far.
         full_accumulated_text (tp.Union[str, list]): Full generated text or list of
-            per-token decoded strings. Type is `str` for server-side/bytecode, `List[str]`
+            per-token decoded strings. Type is `str` for server-side/bytecode, `list[str]`
             (per-token decode) if client-side without bytecode.
         time_spent (float): Cumulative time spent computing for this sequence.
         tps (float): Tokens per second for this sequence.
@@ -164,6 +250,7 @@ class ProcessState:
     tps: float = 0.0
     num_tokens: int = 0
     decoded_text_upto_previous_step: str | None = None
+    buffered_tokens: list[int] = dataclasses.field(default_factory=list)
 
 
 class vSurge:
@@ -196,6 +283,7 @@ class vSurge:
         self._driver = driver
         self._vsurge_name = vsurge_name or driver.driver_name
         self._bytecode_decode = bytecode_decode
+        self._smart_decoder = SmartBytecodeDecoder(self.processor)
 
     def compile(self):
         """Compiles the underlying driver for optimized execution."""
@@ -215,6 +303,11 @@ class vSurge:
     def driver(self) -> vDriver:
         """vDriver: Provides access to the underlying vDriver instance."""
         return self._driver
+
+    @property
+    def smart_decoder(self) -> SmartBytecodeDecoder:
+        """SmartBytecodeDecoder: The smart decoder for handling malformed characters."""
+        return self._smart_decoder
 
     @property
     def processor(self) -> ProcessingClassType:
@@ -686,7 +779,7 @@ class vSurge:
               Each `ReturnSample` corresponds to an input prompt. Its `accumulated_text`
               field contains the final generated text(s). The structure of
               `ReturnSample.accumulated_text` (and `.text`, `.token_ids`) is a list
-              representing the `n` generations (e.g., `List[str]` or `List[List[int]]`).
+              representing the `n` generations (e.g., `list[str]` or `list[list[int]]`).
             - If `stream` is True (streaming mode): `tp.AsyncGenerator[list[ReturnSample], None]`.
               Each yield is `list[ReturnSample]`, one entry per input prompt.
               A `ReturnSample` contains the latest generated chunk (in its `.text` field) and
@@ -787,8 +880,8 @@ class vSurge:
         These are moved to the `token_ids` field of the output `ReturnSample`.
 
         Args:
-            response (list[ReturnSample]): List of `ReturnSample` objects from the driver.
-                `ReturnSample.text` is expected to be `List[int]` (new token IDs).
+            response (list[ReturnSample]): list of `ReturnSample` objects from the driver.
+                `ReturnSample.text` is expected to be `list[int]` (new token IDs).
             generation_idx_tag (int): The index of this generation stream (0 to n-1).
 
         Returns:
@@ -810,55 +903,54 @@ class vSurge:
         current_driver_response: list[ReturnSample],
         buffer_for_this_gen: list[list[ReturnSample]],
         generation_idx_tag: int,
+        state: ProcessState = None,
     ) -> list[ReturnSample]:
-        """Processes driver responses for server-side tokenization/detokenization.
+        """Enhanced version with smart bytecode decoding."""
 
-        Handles detokenization of text segments, potentially combining buffered
-        segments with current ones, especially for byte fallbacks.
-        The `ReturnSample.text` from the driver (in `current_driver_response`)
-        contains text/byte segments for the current step. The `ReturnSample.token_ids`
-        from the driver contains the token IDs corresponding to these text segments
-        for the current step. Cumulative metrics are passed through.
-
-        Args:
-            current_driver_response (list[ReturnSample]): List of `ReturnSample` from
-                the driver for the current step.
-            buffer_for_this_gen (list[list[ReturnSample]]): Buffer of `ReturnSample`
-                lists from previous steps of the same generation sequence.
-            generation_idx_tag (int): The index of this generation stream (0 to n-1).
-
-        Returns:
-            list[ReturnSample]: List of processed `ReturnSample` objects, typically
-            containing one `ReturnSample`. This output `ReturnSample` includes:
-            - `text`: The detokenized text for the current chunk (from current step + buffer).
-            - `token_ids`: The token IDs from the driver for the *current step only*.
-            - `accumulated_text`: Cumulative text as reported by the driver.
-            - Cumulative metrics (time_spent_computing, tokens_per_second, num_generated_tokens).
-            - `generation_idx_tag`.
-        """
         items_to_process_tuples = (
             list(zip(*buffer_for_this_gen, current_driver_response, strict=False))
             if buffer_for_this_gen
             else [(r,) for r in current_driver_response]
         )
         processed_samples_for_yield = []
+
         for single_sequence_all_steps_tuple in items_to_process_tuples:
             text_segments_for_detok_this_chunk = []
-
             latest_driver_sample_this_step = single_sequence_all_steps_tuple[-1]
             tps = latest_driver_sample_this_step.tokens_per_second
             num_gen_tokens_total_for_seq = latest_driver_sample_this_step.num_generated_tokens
             time_spent = latest_driver_sample_this_step.time_spent_computing
             driver_cumulative_text = latest_driver_sample_this_step.accumulated_text
             token_ids_this_step = list(latest_driver_sample_this_step.token_ids or [])
+            if self.bytecode_decode and state is not None:
+                buffered_tokens = getattr(state, "buffered_tokens", [])
+                previous_decoded_text = getattr(state, "decoded_text_upto_previous_step", "")
 
-            for raw_step_sample_from_buffer_or_current in single_sequence_all_steps_tuple:
-                if isinstance(raw_step_sample_from_buffer_or_current.text, list):
-                    text_segments_for_detok_this_chunk.extend(raw_step_sample_from_buffer_or_current.text)
-                elif isinstance(raw_step_sample_from_buffer_or_current.text, str | bytes):
-                    text_segments_for_detok_this_chunk.append(raw_step_sample_from_buffer_or_current.text)
+                if token_ids_this_step:
+                    current_text_chunk, new_buffered_tokens, had_malformed = self.smart_decoder.decode_with_recovery(
+                        token_ids_this_step, previous_decoded_text, buffered_tokens
+                    )
+                    state.buffered_tokens = new_buffered_tokens
+                    if had_malformed and new_buffered_tokens:
+                        text_for_this_yield_step_chunk = current_text_chunk
+                    else:
+                        try:
+                            full_decoded = self.processor.decode(state.all_token_ids)
+                            if not self.smart_decoder.contains_malformed_chars(full_decoded):
+                                driver_cumulative_text = full_decoded
+                        except Exception:
+                            pass
+                        text_for_this_yield_step_chunk = current_text_chunk
+                else:
+                    text_for_this_yield_step_chunk = ""
+            else:
+                for raw_step_sample_from_buffer_or_current in single_sequence_all_steps_tuple:
+                    if isinstance(raw_step_sample_from_buffer_or_current.text, list):
+                        text_segments_for_detok_this_chunk.extend(raw_step_sample_from_buffer_or_current.text)
+                    elif isinstance(raw_step_sample_from_buffer_or_current.text, str | bytes):
+                        text_segments_for_detok_this_chunk.append(raw_step_sample_from_buffer_or_current.text)
 
-            text_for_this_yield_step_chunk = text_tokens_to_string(text_segments_for_detok_this_chunk)
+                text_for_this_yield_step_chunk = text_tokens_to_string(text_segments_for_detok_this_chunk)
 
             processed_samples_for_yield.append(
                 ReturnSample(
@@ -871,6 +963,7 @@ class vSurge:
                     generation_idx=generation_idx_tag,
                 )
             )
+
         return processed_samples_for_yield
 
     async def complete(
@@ -897,18 +990,18 @@ class vSurge:
             each containing one `ReturnSample`. This `ReturnSample`'s fields
             (e.g., `text`, `token_ids`, `accumulated_text`) are lists,
             with each element corresponding to one of the `n` requested generations.
-            - `ReturnSample.text`: `List[Union[str, List[int]]]`. Current text/token_ids chunk.
+            - `ReturnSample.text`: `list[Union[str, list[int]]]`. Current text/token_ids chunk.
                 - If `bytecode_decode` is True OR `request.is_client_side_tokenization` is False:
                   `str` chunk.
                 - Else (`bytecode_decode` is False AND `request.is_client_side_tokenization` is True):
-                  `List[int]` of new token IDs for the current step.
-            - `ReturnSample.token_ids`: `List[List[int]]`. All token IDs generated so far for each 'n'.
-            - `ReturnSample.accumulated_text`: `List[Union[str, List[str]]]`. Full text or
+                  `list[int]` of new token IDs for the current step.
+            - `ReturnSample.token_ids`: `list[list[int]]`. All token IDs generated so far for each 'n'.
+            - `ReturnSample.accumulated_text`: `list[Union[str, list[str]]]`. Full text or
               list of per-token decoded strings for each 'n'.
                 - If `bytecode_decode` is True OR `request.is_client_side_tokenization` is False:
                   `str` of full decoded text.
                 - Else (`bytecode_decode` is False AND `request.is_client_side_tokenization` is True):
-                  `List[str]` (each string being a per-token decode of all tokens so far).
+                  `list[str]` (each string being a per-token decode of all tokens so far).
         """
         if request.n == 0:
             return
@@ -1020,6 +1113,7 @@ class vSurge:
                             dummy_driver_resp_for_flush,
                             state.driver_buffer,
                             original_idx,
+                            state,
                         )
                         state.driver_buffer = []
                         if processed_outputs:
@@ -1075,16 +1169,32 @@ class vSurge:
                             state.all_token_ids.extend(new_token_ids_this_step)
                             newly_set_current_step_text_flags[original_idx] = True
                             if bytecode_decode:
-                                full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                buffered_tokens = getattr(state, "buffered_tokens", [])
                                 prev_decoded_text = state.decoded_text_upto_previous_step or ""
-                                current_text_chunk = (
-                                    full_decoded_text_now[len(prev_decoded_text) :]
-                                    if full_decoded_text_now.startswith(prev_decoded_text)
-                                    else full_decoded_text_now
+                                current_text_chunk, new_buffered_tokens, had_malformed = (
+                                    self.smart_decoder.decode_with_recovery(
+                                        new_token_ids_this_step,
+                                        prev_decoded_text,
+                                        buffered_tokens,
+                                    )
                                 )
+                                state.buffered_tokens = new_buffered_tokens
                                 state.current_step_text = current_text_chunk
-                                state.full_accumulated_text = full_decoded_text_now
-                                state.decoded_text_upto_previous_step = full_decoded_text_now
+                                if not had_malformed or not new_buffered_tokens:
+                                    try:
+                                        full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                        if not self.smart_decoder.contains_malformed_chars(full_decoded_text_now):
+                                            state.full_accumulated_text = full_decoded_text_now
+                                            state.decoded_text_upto_previous_step = full_decoded_text_now
+                                        else:
+                                            state.full_accumulated_text = prev_decoded_text + current_text_chunk
+                                            state.decoded_text_upto_previous_step = state.full_accumulated_text
+                                    except Exception:
+                                        state.full_accumulated_text = prev_decoded_text + current_text_chunk
+                                        state.decoded_text_upto_previous_step = state.full_accumulated_text
+                                else:
+                                    state.full_accumulated_text = prev_decoded_text + current_text_chunk
+                                    state.decoded_text_upto_previous_step = state.full_accumulated_text
                             else:
                                 state.current_step_text = new_token_ids_this_step
                                 state.full_accumulated_text = [
@@ -1098,6 +1208,7 @@ class vSurge:
                             driver_step_output_list,
                             state.driver_buffer,
                             original_idx,
+                            state,
                         )
                         state.driver_buffer = []
                         if processed_outputs:
