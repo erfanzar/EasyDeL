@@ -480,7 +480,6 @@ class vSurgeApiServer:
                 self.metrics.average_tokens_per_second = (
                     self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
                 )
-
             choices = []
             for idx in range(len(result.text)):
                 response_text = result.accumulated_text[idx]
@@ -892,7 +891,6 @@ class vSurgeApiServer:
                 raise RuntimeError("Generation failed to produce output")
 
             result: ReturnSample = response[0]
-
             completion_tokens = sum(result.num_generated_tokens)
             self.metrics.total_tokens_generated += completion_tokens
             generation_time = time.time() - start_time
@@ -946,7 +944,7 @@ class vSurgeApiServer:
                     if not response_state:
                         continue
 
-                    result: ReturnSample = response_state[0]
+                    response_state: ReturnSample = response_state[0]
 
                     chunk_usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
@@ -955,18 +953,18 @@ class vSurgeApiServer:
                         tokens_per_second=max(response_state.tokens_per_second),
                         processing_time=max(response_state.time_spent_computing),
                     )
-                    if first_token_time is None and result.num_generated_tokens[0] > 0:
+                    if first_token_time is None and response_state.num_generated_tokens[0] > 0:
                         first_token_time = time.time() - start_time
 
-                    current_tokens = sum(result.num_generated_tokens)
+                    current_tokens = sum(response_state.num_generated_tokens)
                     if current_tokens > total_tokens:
                         self.metrics.total_tokens_generated += current_tokens - total_tokens
                         total_tokens = current_tokens
 
                     if isinstance(request, ChatCompletionRequest):
-                        chunk = self._format_chat_stream_chunk(request, result)
+                        chunk = self._format_chat_stream_chunk(request, response_state)
                     else:
-                        chunk = self._format_completion_stream_chunk(request, result, chunk_usage)
+                        chunk = self._format_completion_stream_chunk(request, response_state, chunk_usage)
 
                     yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
@@ -1057,14 +1055,10 @@ class vSurgeApiServer:
                 request.max_tokens or float("inf"),
                 result.accumulated_text[idx],
             )
-
-            choices.append(
-                CompletionResponseChoice(
-                    index=idx,
-                    text=result.accumulated_text[idx][0],
-                    finish_reason=finish_reason,
-                )
-            )
+            text = result.accumulated_text[idx]
+            if isinstance(text, list):
+                text = text[0]
+            choices.append(CompletionResponseChoice(index=idx, text=text, finish_reason=finish_reason))
 
         return CompletionResponse(model=request.model, choices=choices, usage=usage)
 
