@@ -87,7 +87,7 @@ class Mistral3Tokenizer:
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, str]],
+        conversation: list[dict[str, str]],
         tokenize: bool = True,
         add_special_tokens: bool = True,
         padding: bool = False,
@@ -100,7 +100,7 @@ class Mistral3Tokenizer:
         Applies a chat template to a conversation history.
 
         Args:
-            messages: A list of message dictionaries, each with 'role' and 'content'.
+            conversation: A list of message dictionaries, each with 'role' and 'content'.
             tokenize: If False, returns the formatted string. If True, tokenizes it.
             add_special_tokens: Whether to add special tokens.
             padding: Whether to pad the sequences.
@@ -111,7 +111,7 @@ class Mistral3Tokenizer:
         Returns:
             The processed output, which can be a string, list of IDs, or a dict.
         """
-        tokenized = self.mistral_tokenizer.encode_chat_completion(ChatCompletionRequest(messages=messages))
+        tokenized = self.mistral_tokenizer.encode_chat_completion(ChatCompletionRequest(messages=conversation))
         formatted_text = tokenized.text
 
         if not tokenize:
