@@ -483,8 +483,9 @@ class vSurgeApiServer:
 
             choices = []
             for idx in range(len(result.text)):
-                response_text = result.accumulated_text[idx][0]
-
+                response_text = result.accumulated_text[idx]
+                if isinstance(response_text, list):
+                    response_text = response_text[0]
                 if is_function_request:
                     format_type = getattr(request, "function_call_format", self.default_function_format)
                     parser = FunctionCallParser(format=format_type, strict=False)
@@ -910,7 +911,6 @@ class vSurgeApiServer:
                 tokens_per_second=tokens_per_second,
                 processing_time=generation_time,
             )
-
             if isinstance(request, ChatCompletionRequest):
                 return self._format_chat_response(request, result, usage)
             else:
