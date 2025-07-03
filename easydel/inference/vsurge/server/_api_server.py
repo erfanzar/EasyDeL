@@ -1143,12 +1143,10 @@ class vSurgeApiServer:
         """Comprehensive health check."""
         model_health_info = {}
         for name, vsurge_instance in self.vsurge_map.items():
-            # Assuming vsurge_instance.driver is the vDriver instance
             driver_metrics = {}
             device_memory_stats = None
             if hasattr(vsurge_instance, "driver") and hasattr(vsurge_instance.driver, "get_device_memory_stats"):
                 try:
-                    # Call get_device_memory_stats if it's not a coroutine
                     if asyncio.iscoroutinefunction(vsurge_instance.driver.get_device_memory_stats):
                         device_memory_stats = await vsurge_instance.driver.get_device_memory_stats()
                     else:
