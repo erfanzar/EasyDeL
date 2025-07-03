@@ -292,10 +292,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
             (r"mlp/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (
-                r".*(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),

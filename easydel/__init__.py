@@ -325,6 +325,11 @@ _import_structure = {
         "MistralForSequenceClassification",
         "MistralModel",
     ],
+    "modules.mistral3": [
+        "Mistral3Config",
+        "Mistral3ForConditionalGeneration",
+        "Mistral3Model",
+    ],
     "modules.mixtral": [
         "MixtralConfig",
         "MixtralForCausalLM",
@@ -691,6 +696,11 @@ if _tp.TYPE_CHECKING:
         MistralForCausalLM,
         MistralForSequenceClassification,
         MistralModel,
+    )
+    from .modules.mistral3 import (
+        Mistral3Config,
+        Mistral3ForConditionalGeneration,
+        Mistral3Model,
     )
     from .modules.mixtral import (
         MixtralConfig,
