@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
 from easydel.utils.helpers import get_logger
@@ -25,9 +27,9 @@ logger = get_logger(__name__)
 @register_config("llava")
 class LlavaConfig(EasyDeLBaseConfig):
     r"""
-    This is the configuration class to store the configuration of a [`LlavaForConditionalGeneration`]. It is used to instantiate an
-    Llava model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of the Llava-9B.
+    This is the configuration class to store the configuration of a [`LlavaForConditionalGeneration`].
+    It is used to instantiate an Llava model according to the specified arguments, defining the model architecture.
+    Instantiating a configuration with the defaults will yield a similar configuration to that of the Llava-9B.
 
     e.g. [llava-hf/llava-9b](https://huggingface.co/llava-hf/llava-9b)
 
@@ -57,7 +59,7 @@ class LlavaConfig(EasyDeLBaseConfig):
     """
 
     model_type = "llava"
-    sub_configs = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
+    sub_configs: typing.ClassVar = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
 
     def __init__(
         self,

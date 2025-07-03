@@ -179,10 +179,7 @@ class GemmaConfig(EasyDeLBaseConfig):
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r"score/kernel", pmag.resolve(RowWise)),
             (r".*bias", pmag.resolve(Replicated)),
