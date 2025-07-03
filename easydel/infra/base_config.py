@@ -32,14 +32,7 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
-from transformers.utils import (
-    CONFIG_NAME,
-    add_model_info_to_auto_map,
-    add_model_info_to_custom_pipelines,
-    cached_file,
-    download_url,
-    is_remote_url,
-)
+from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
 from transformers.utils.generic import is_timm_config_dict
 
 from easydel.utils.checkpoint_managers.path_utils import EasyPath, EasyPathLike
@@ -1001,14 +994,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         else:
             logger.debug(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
 
-        if "auto_map" in config_dict and not is_local:
-            config_dict["auto_map"] = add_model_info_to_auto_map(config_dict["auto_map"], pretrained_model_name_or_path)
-        if "custom_pipelines" in config_dict and not is_local:
-            config_dict["custom_pipelines"] = add_model_info_to_custom_pipelines(
-                config_dict["custom_pipelines"],
-                pretrained_model_name_or_path,
-            )
-
         if "model_type" not in config_dict and is_timm_config_dict(config_dict):
             config_dict["model_type"] = "timm_wrapper"
 
@@ -1016,19 +1001,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def granted_freq_max_position_embedding(self) -> int:
-        return getattr(
-            self,
-            "freq_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
-        return getattr(
-            self,
-            "mask_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
 
     def _get_rope_config(self) -> RopeConfig:
         """Get RoPE configuration from the instance attributes."""
