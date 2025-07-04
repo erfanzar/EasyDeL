@@ -7,8 +7,7 @@ execute_command.sh
 .idea
 *.so
 *.slurm
-env.ipynb
-easydel/kernels/gpu_ops/paged_attention_triton/*
+env.ipynb 
 env.py
 exp.py
 vxp.py
