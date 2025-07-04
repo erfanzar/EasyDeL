@@ -19,5 +19,6 @@
 from .flash_attention_triton import triton_flash_attention
 from .matmul_triton import triton_matmul
 from .ragged_decode_pallas import ragged_decode_gpu as pallas_ragged_decode
+from .ragged_paged_attention_pallas import ragged_paged_attention as pallas_ragged_paged_attention
 
-__all__ = ("pallas_ragged_decode", "triton_flash_attention", "triton_matmul")
+__all__ = ("pallas_ragged_decode", "pallas_ragged_paged_attention", "triton_flash_attention", "triton_matmul")

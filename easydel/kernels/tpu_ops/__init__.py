@@ -19,6 +19,7 @@ from .grouped_matmul_pallas import pallas_grouped_matmul
 from .matmul_pallas import pallas_matmul
 from .paged_attention_pallas import pallas_chunked_prefill_attention, pallas_paged_attention, pallas_prefill_attention
 from .ragged_attention_pallas import pallas_ragged_decode
+from .ragged_paged_attention_pallas import pallas_ragged_paged_attention
 from .ring_attention_pallas import pallas_ring_attention
 
 __all__ = (
@@ -28,5 +29,6 @@ __all__ = (
     "pallas_paged_attention",
     "pallas_prefill_attention",
     "pallas_ragged_decode",
+    "pallas_ragged_paged_attention",
     "pallas_ring_attention",
 )

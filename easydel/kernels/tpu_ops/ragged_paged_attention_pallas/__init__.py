@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .flash_attention_jax import jax_flash_attention
-from .ragged_paged_attention_jax import jax_ragged_paged_attention
-from .ring_attention_jax import jax_ring_attention
+from ._ragged_paged_attention import ragged_paged_attention as pallas_ragged_paged_attention
 
-__all__ = "jax_flash_attention", "jax_ragged_paged_attention", "jax_ring_attention"
+__all__ = ("pallas_ragged_paged_attention",)
