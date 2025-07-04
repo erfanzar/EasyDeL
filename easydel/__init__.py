@@ -329,6 +329,7 @@ _import_structure = {
         "Mistral3Config",
         "Mistral3ForConditionalGeneration",
         "Mistral3Model",
+        "Mistral3Tokenizer",
     ],
     "modules.mixtral": [
         "MixtralConfig",
@@ -701,6 +702,7 @@ if _tp.TYPE_CHECKING:
         Mistral3Config,
         Mistral3ForConditionalGeneration,
         Mistral3Model,
+        Mistral3Tokenizer,
     )
     from .modules.mixtral import (
         MixtralConfig,

@@ -1592,7 +1592,7 @@ def get_frequencies(
                 beta_slow=extra_kwargs.get("beta_slow", 1),
                 max_position_embeddings=original_max_position,
                 scaling_factor=scaling_factor,
-                extrapolation_factor=extra_kwargs["extrapolation_factor"],
+                extrapolation_factor=extra_kwargs.get("extrapolation_factor", 1.0),
                 attn_factor=extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
             )
         elif scaling_type == "deepseek_yarn":
@@ -1607,13 +1607,13 @@ def get_frequencies(
                 base,
                 rotary_dim,
                 scaling_factor,
-                extra_kwargs["extrapolation_factor"],
-                extra_kwargs["beta_fast"],
-                extra_kwargs["beta_slow"],
+                extra_kwargs.get("extrapolation_factor", 1.0),
+                extra_kwargs.get("beta_fast", 32),
+                extra_kwargs.get("beta_slow", 1),
                 original_max_position,
                 extra_kwargs["mscale"],
                 extra_kwargs["mscale_all_dim"],
-                extra_kwargs["attn_factor"],
+                extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
             )
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
