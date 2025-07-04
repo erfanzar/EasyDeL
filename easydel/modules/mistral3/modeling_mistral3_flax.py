@@ -43,6 +43,11 @@ logger = get_logger(__name__)
 
 
 @auto_pytree
+class Mistral3ModelOutput(BaseModelOutput):
+    image_hidden_states: chex.Array | None = None
+
+
+@auto_pytree
 class Mistral3CausalLMOutputWithPast(ModelOutput):
     """
     Base class for Mistral3 causal language model (or autoregressive) outputs.
@@ -284,7 +289,7 @@ class Mistral3Model(EasyDeLBaseModule):
             llm_input_ids = input_ids
 
         if inputs_embeds is None:
-            inputs_embeds = self.language_model.model.embed_tokens(llm_input_ids)
+            inputs_embeds = self.language_model.embed_tokens(llm_input_ids)
 
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, image_sizes)
@@ -311,7 +316,7 @@ class Mistral3Model(EasyDeLBaseModule):
             **lm_kwargs,
         )
 
-        return BaseModelOutput(
+        return Mistral3ModelOutput(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -530,7 +535,6 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
             image_sizes=image_sizes,
             cache_metadata=cache_metadata,
             mode=mode,
