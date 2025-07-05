@@ -42,8 +42,8 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -198,8 +198,8 @@ class RobertaSelfAttention(AttentionModule):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         key_value_states: chex.Array | None = None,
         causal_mask: chex.Array | None = None,
@@ -350,8 +350,8 @@ class RobertaAttention(nn.Module):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
         key_value_states=None,
         output_attentions: bool = False,
@@ -500,8 +500,8 @@ class RobertaLayer(nn.Module):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         encoder_hidden_states: chex.Array | None = None,
         encoder_attention_mask: chex.Array | None = None,
         causal_mask: chex.Array | None = None,

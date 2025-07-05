@@ -40,9 +40,9 @@ from easydel.inference.logits_process import (
     TopPLogitsWarper,
 )
 from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
-from easydel.layers.caching.paged_attention.paged_attention_cache import (
-    PagedAttentionCache,
-    PagedAttentionCacheMetaData,
+from easydel.layers.caching.page.paged_attention_cache import (
+    PagesCache,
+    PagesCacheMetaData,
 )
 from easydel.utils.helpers import get_logger
 
@@ -147,17 +147,17 @@ class EasyGenerationMixin:
         max_prefill_length: int,
         max_decodes_length: int,
         num_pages: int,
-    ) -> PagedAttentionCacheMetaData:
+    ) -> PagesCacheMetaData:
         """
         Creates the static configuration metadata required for initializing a Paged KV Cache.
 
         This method gathers necessary parameters from the model's configuration
         (like number of layers, heads, dimensions) and combines them with the provided
-        arguments to instantiate and return a `PagedAttentionCacheMetaData` object.
+        arguments to instantiate and return a `PagesCacheMetaData` object.
         This metadata object defines the structure and allocation parameters for the paged cache.
 
         Returns:
-            PagedAttentionCacheMetaData: An initialized metadata object containing the
+            PagesCacheMetaData: An initialized metadata object containing the
                 static configuration for the paged cache.
         """
         num_hidden_layers = _safepick(self.config, "num_hidden_layers")
@@ -174,7 +174,7 @@ class EasyGenerationMixin:
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
 
-        return PagedAttentionCacheMetaData.create(
+        return PagesCacheMetaData.create(
             batch_size=batch_size,
             tokens_per_page=tokens_per_page,
             max_prefill_length=max_prefill_length,
@@ -231,28 +231,28 @@ class EasyGenerationMixin:
 
     def init_pages(
         self,
-        metadata: PagedAttentionCacheMetaData | None = None,
+        metadata: PagesCacheMetaData | None = None,
         page_size: int | None = None,
         batch_size: int | None = None,
         max_sequences: int | None = None,
         dtype: jnp.dtype | None = jnp.bfloat16,
         hbm_utilization: float | None = None,
-    ) -> PagedAttentionCache:
+    ) -> PagesCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
-        This method orchestrates the creation of the `PagedAttentionCache`. It either uses
-        a pre-existing `PagedAttentionCacheMetaData` object passed via the `metadata`
+        This method orchestrates the creation of the `PagesCache`. It either uses
+        a pre-existing `PagesCacheMetaData` object passed via the `metadata`
         argument, or if `metadata` is None, it first creates the metadata by calling
         `self.create_paged_metadata` using the other provided arguments (page_size,
         batch_size, etc.).
 
-        Finally, it calls `PagedAttentionCache.init_cache` to allocate the necessary
+        Finally, it calls `PagesCache.init_cache` to allocate the necessary
         paged tensors (`key_pages`, `value_pages` for each layer) based on the
         metadata, model's mesh, dtype, partition manager, and quantization settings.
 
         Args:
-            metadata (tp.Optional[PagedAttentionCacheMetaData]): An optional pre-configured
+            metadata (tp.Optional[PagesCacheMetaData]): An optional pre-configured
                 metadata object. If provided, other arguments like page_size, batch_size etc.,
                 are ignored for metadata creation.
             page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
@@ -263,7 +263,7 @@ class EasyGenerationMixin:
             hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
 
         Returns:
-            PagedAttentionCache: An initialized PagedAttentionCache object containing the allocated
+            PagesCache: An initialized PagesCache object containing the allocated
                 cache tensors (views) for all layers.
 
         Raises:
@@ -284,7 +284,7 @@ class EasyGenerationMixin:
                 dtype=dtype,
                 hbm_utilization=hbm_utilization,
             )
-        return PagedAttentionCache.init_cache(
+        return PagesCache.init_cache(
             mesh=self.config.mesh,
             dtype=self.dtype,
             metadata=metadata,

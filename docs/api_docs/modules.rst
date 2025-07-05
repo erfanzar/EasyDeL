@@ -31,6 +31,7 @@ Modules
    modules_mamba2
    modules_minimax_text_v1
    modules_mistral
+   modules_mistral3
    modules_mixtral
    modules_mosaic_mpt
    modules_olmo

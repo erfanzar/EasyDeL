@@ -39,9 +39,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -248,8 +248,8 @@ class Qwen2MoeAttention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -580,8 +580,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -596,9 +596,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             position_ids (chex.Array): Position IDs (batch, seq_len).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for
+            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for
                 key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for
                 paged attention (optional).
             output_attentions (bool): Whether to output attention weights (default: False).
             output_router_logits (bool): Whether to output router logits (default: False).
@@ -729,8 +729,8 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass of the Qwen2 MoE model.
 
@@ -746,9 +746,9 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
                 (default defined by config).
             output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states
+            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states
                 for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for
                 paged attention (optional).
 
         Returns:
@@ -921,8 +921,8 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeCausalLMOutput:
         """Forward pass of the Qwen2 MoE model for Causal Language Modeling.
 
@@ -938,9 +938,9 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
                 (default defined by config).
             output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states
+            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states
                 for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged
                 attention (optional).
 
         Returns:
@@ -1068,8 +1068,8 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -1083,9 +1083,9 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
             attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
             position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for
+            past_key_values (tp.Optional[TransformerCache | PagesCache]): Precomputed key/value states for
                 caching (ignored in classification).
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention
                 (ignored in classification).
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers

@@ -38,9 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -184,8 +184,8 @@ class CohereAttention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -373,8 +373,8 @@ class CohereBlock(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -496,8 +496,8 @@ class CohereModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> BaseModelOutput:
         """Forward pass through the core Cohere model.
 
@@ -509,8 +509,8 @@ class CohereModel(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs.
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
+            past_key_values (Optional[TransformerCache | PagesCache]): KV cache.
+            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Cache metadata.
 
 
         Returns:
@@ -640,8 +640,8 @@ class CohereForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere model for Causal Language Modeling.
@@ -654,8 +654,8 @@ class CohereForCausalLM(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
-            past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache for faster generation.
-            cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            past_key_values (Optional[TransformerCache | PagesCache]): KV cache for faster generation.
+            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
         Returns:
             Union[CausalLMOutput, Tuple]: Model output, including logits.
@@ -774,8 +774,8 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """
         Forward pass for sequence classification.
@@ -788,8 +788,8 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs.
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
+            past_key_values (Optional[TransformerCache | PagesCache]): KV cache.
+            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Cache metadata.
 
 
         Returns:

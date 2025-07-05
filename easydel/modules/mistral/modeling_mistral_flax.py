@@ -38,9 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -181,8 +181,8 @@ class MistralAttention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -326,8 +326,8 @@ class MistralDecoderLayer(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -429,8 +429,8 @@ class MistralModel(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -442,9 +442,9 @@ class MistralModel(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagedAttentionCache, optional):
+            past_key_values (TransformerCache | PagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -593,8 +593,8 @@ class MistralForCausalLM(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
@@ -606,9 +606,9 @@ class MistralForCausalLM(EasyDeLBaseModule):
                 attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
                 position_ids (chex.Array, optional): Indices of positions of each input sequence token.
                 segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-                past_key_values (TransformerCache | PagedAttentionCache, optional):
+                past_key_values (TransformerCache | PagesCache, optional):
                     Cache containing precomputed key/value states.
-                cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+                cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
                 output_attentions (bool, optional): Whether to return attention weights.
                 output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -714,8 +714,8 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -730,9 +730,9 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagedAttentionCache, optional):
+            past_key_values (TransformerCache | PagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 

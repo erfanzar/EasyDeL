@@ -35,9 +35,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -151,8 +151,8 @@ class MixtralAttention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -166,8 +166,8 @@ class MixtralAttention(AttentionModule):
                 Shape: (batch_size, 1, query_length, key_length).
             position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
             fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
@@ -532,8 +532,8 @@ class MixtralDecoderLayer(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -549,8 +549,8 @@ class MixtralDecoderLayer(nn.Module):
             position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Default is False.
             output_router_logits (bool): Whether to return router logits from the MoE layer. Default is False.
             fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
@@ -682,8 +682,8 @@ class MixtralModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass of the MixtralModel.
 
@@ -702,9 +702,9 @@ class MixtralModel(EasyDeLBaseModule):
                 Defaults to `config.output_hidden_states`.
             output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
                 Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
 
         Returns:
@@ -887,8 +887,8 @@ class MixtralForCausalLM(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeCausalLMOutput | tuple:
         """Forward pass of the MixtralForCausalLM model.
 
@@ -907,9 +907,9 @@ class MixtralForCausalLM(EasyDeLBaseModule):
                 Defaults to `config.output_hidden_states`.
             output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
                 Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
         Returns:
             MoeCausalLMOutput: The model's output.
@@ -1036,8 +1036,8 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """Forward pass of the MixtralForSequenceClassification model.
 
@@ -1056,9 +1056,9 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
                 Defaults to `config.output_hidden_states`.
             output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
                 Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
 
         Returns:

@@ -27,8 +27,8 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesMetadata,
     TransformerCache,
     TransformerMetadata,
 )
@@ -298,8 +298,8 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -313,8 +313,8 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             attention_mask (Optional[chex.Array]): Mask for text attention.
             position_ids (Optional[chex.Array]): Position IDs for text.
             segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            past_key_values (Optional[TransformerCache | PagesCache]): Cached keys/values for language model.
+            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.

@@ -109,6 +109,7 @@ class AttentionMetadata:
     base_config: EasyDeLBaseConfig | None = None
     scan_ring_attention: bool = NOT_GIVEN
     softmax_scale: float = NOT_GIVEN
+    soft_cap: float | None = NOT_GIVEN
     dropout_prob: float = NOT_GIVEN
     blocksize_q: int = NOT_GIVEN
     blocksize_k: int = NOT_GIVEN
@@ -132,6 +133,7 @@ class AttentionMetadata:
         self.set_attrs_carefully("runtime_dtype",  jnp.float32, "attn_dtype")
         self.set_attrs_carefully("runtime_softmax_dtype", jnp.float32, "attn_softmax_dtype")
         self.set_attrs_carefully("softmax_scale", None, "softmax_scale")
+        self.set_attrs_carefully("soft_cap", None, "soft_cap")
         self.set_attrs_carefully("scan_ring_attention", True)
         self.set_attrs_carefully("partition_axis", PartitionAxis())
         self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
@@ -169,6 +171,7 @@ class AttentionMetadata:
         config: EasyDeLBaseConfig,
         softmax_scale: float,
         dropout_prob: float = 0.0,
+        soft_cap: int | None = None,
     ) -> AttentionMetadata:
         """
         Factory method to create AttentionMetadata from an EasyDeLBaseConfig.
@@ -193,6 +196,7 @@ class AttentionMetadata:
             base_config=config,
             scan_ring_attention=config.scan_attention_layers,
             softmax_scale=softmax_scale,
+            soft_cap=soft_cap,
             dropout_prob=dropout_prob,
             blocksize_q=config.blocksize_q,
             blocksize_k=config.blocksize_k,
