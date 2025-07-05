@@ -38,8 +38,6 @@ from ._forward_pallas import (
         "vmem_limit_bytes",
         "sliding_window",
         "soft_cap",
-        "k_scale",
-        "v_scale",
     ],
 )
 def _ragged_paged_attention(
