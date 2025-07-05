@@ -38,9 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -237,8 +237,8 @@ class FalconAttention(AttentionModule):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | bool | None = None,
         segment_ids: chex.Array | None = None,
         alibi: chex.Array | None = None,
@@ -483,8 +483,8 @@ class FalconBlock(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | bool | None = None,
         segment_ids: chex.Array | None = None,
         alibi: chex.Array | None = None,
@@ -611,8 +611,8 @@ class FalconModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> BaseModelOutput:
         """
         Forward pass through the Falcon module.
@@ -764,8 +764,8 @@ class FalconForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass through the Falcon module.

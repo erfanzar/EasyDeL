@@ -31,8 +31,8 @@ import numpy as np
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
-from easydel.layers.caching.paged_attention.paged_attention_cache import (
-    PagedAttentionCache,
+from easydel.layers.caching.page.paged_attention_cache import (
+    PagesCache,
 )
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 
@@ -182,7 +182,7 @@ class GenerationState:
                           each sequence in the batch. Shape: (batch_size, 1).
     """
 
-    cache: TransformerCache | PagedAttentionCache
+    cache: TransformerCache | PagesCache
     index: jax.Array
     logits: jax.Array
     tokens: jax.Array

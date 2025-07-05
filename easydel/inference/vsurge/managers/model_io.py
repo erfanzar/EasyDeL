@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ....layers.caching.paged_attention import PagedAttentionMetadata
+from ....layers.caching.page import PagesMetadata
 from .scheduler import BatchInfo
 from .sequence import SequenceState
 
@@ -28,7 +28,7 @@ class ModelInput:
 
     input_ids: jax.Array
     position_ids: jax.Array
-    attention_metadata: PagedAttentionMetadata
+    attention_metadata: PagesMetadata
 
 
 class ModelIOProcessor:
@@ -75,7 +75,7 @@ class ModelIOProcessor:
             max_seqlen = max(max_seqlen, seq_len)
             offset += seq_len
 
-        metadata = PagedAttentionMetadata(
+        metadata = PagesMetadata(
             is_prefill=True,
             slot_mapping=jnp.array(slots),
             cu_seqlens_q=jnp.array(cu_seqlens),
@@ -106,7 +106,7 @@ class ModelIOProcessor:
             slots[i] = seq.block_table[last_block_idx] * self.block_size + last_block_offset
             block_tables[i, : len(seq.block_table)] = seq.block_table
 
-        metadata = PagedAttentionMetadata(
+        metadata = PagesMetadata(
             is_prefill=False,
             slot_mapping=jnp.array(slots),
             block_tables=jnp.array(block_tables),

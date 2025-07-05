@@ -22,8 +22,8 @@ from flax import nnx as nn
 from jax.sharding import Mesh
 
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesMetadata,
     TransformerCache,
     TransformerMetadata,
 )
@@ -206,8 +206,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
@@ -271,8 +271,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeModelOutput:
         """
         Forward pass for Mixture-of-Experts (MoE) Models.
@@ -307,8 +307,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> MoeCausalLMOutput:
         """
         Forward pass for Mixture-of-Experts (MoE) Causal Language Models.
@@ -421,8 +421,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         loss_config: LossConfig | None = None,
@@ -493,8 +493,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeModelOutput, LossMetrics]:
@@ -531,8 +531,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeCausalLMOutput, LossMetrics]:

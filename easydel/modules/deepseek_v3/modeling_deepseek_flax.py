@@ -40,9 +40,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -499,8 +499,8 @@ class DeepseekV3Attention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -693,8 +693,8 @@ class DeepseekV3DecoderLayer(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -848,8 +848,8 @@ class DeepseekV3Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> BaseModelOutput:
         """
         Forward pass through the Deepseekv3 module.
@@ -1012,8 +1012,8 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass of the causal language model.
@@ -1026,9 +1026,9 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
             output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
             output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
-            past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values.
+            past_key_values (Optional[TransformerCache | PagesCache], optional): Cached key/values.
                 Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata.
+            cache_metadata (Optional[TransformerMetadata | PagesMetadata], optional): Cache metadata.
                 Defaults to None.
 
 

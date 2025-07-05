@@ -50,9 +50,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -179,8 +179,8 @@ class OPTAttention(AttentionModule):
         self,
         hidden_states: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
         key_value_states: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
@@ -195,8 +195,8 @@ class OPTAttention(AttentionModule):
                 these are used as keys and values. Shape: (batch_size, key_sequence_length, embed_dim).
             attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to certain positions.
                 Shape: (batch_size, 1, query_length, key_length).
-            cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
         Returns:
             tp.Tuple[chex.Array]: A tuple containing the attention output (shape: batch_size, sequence_length, embed_dim)
@@ -362,8 +362,8 @@ class OPTDecoderLayer(nn.Module):
         self,
         hidden_states: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
     ) -> tuple[chex.Array]:
@@ -375,8 +375,8 @@ class OPTDecoderLayer(nn.Module):
                 Shape: (1, 1, query_len, key_len) or inferred.
             attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to certain positions.
                 Shape: (batch_size, 1, query_length, key_length).
-            cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
 
         Returns:
             tp.Tuple[chex.Array]: A tuple containing the output hidden states
@@ -609,8 +609,8 @@ class OPTDecoder(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -622,9 +622,9 @@ class OPTDecoder(EasyDeLBaseModule):
                 Shape: (batch_size, sequence_length).
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Defaults to False.
             output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
 
@@ -755,8 +755,8 @@ class OPTModel(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -768,9 +768,9 @@ class OPTModel(EasyDeLBaseModule):
                 Shape: (batch_size, sequence_length).
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Defaults to False.
             output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
 
@@ -863,8 +863,8 @@ class OPTForCausalLM(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -876,9 +876,9 @@ class OPTForCausalLM(EasyDeLBaseModule):
                 Shape: (batch_size, sequence_length).
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]):
+            past_key_values (tp.Optional[TransformerCache | PagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Defaults to False.
             output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
              Defaults to True.

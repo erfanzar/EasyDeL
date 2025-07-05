@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .paged_attention_cache import (
-    PagedAttentionCache,
-    PagedAttentionCacheMetaData,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
-)
+from .paged_attention_cache import PagesCache, PagesCacheMetaData, PagesCacheView, PagesMetadata
 
-__all__ = (
-    "PagedAttentionCache",
-    "PagedAttentionCacheMetaData",
-    "PagedAttentionCacheView",
-    "PagedAttentionMetadata",
-)
+__all__ = ("PagesCache", "PagesCacheMetaData", "PagesCacheView", "PagesMetadata")

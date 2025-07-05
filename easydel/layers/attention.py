@@ -34,7 +34,7 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.utils.helpers import get_logger
 
 from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
-from .caching import PagedAttentionCacheView, PagedAttentionMetadata, TransformerCacheView, TransformerMetadata
+from .caching import PagesCacheView, PagesMetadata, TransformerCacheView, TransformerMetadata
 from .quantization.quantizers import EasyQuantizer
 
 logger = get_logger(__name__)
@@ -231,8 +231,8 @@ class FlexibleAttentionModule(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
         bias: Array | None = None,
         sliding_window: int | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
         init_bias: tp.Callable[[], Array] | None = None,
         attention_mask: Array | None = None,
         segment_ids: Array | None = None,
@@ -259,7 +259,7 @@ class FlexibleAttentionModule(nn.Module):
             AttentionOutput: An object containing the attention output tensor and potentially
                              attention weights (depending on the backend).
         """
-        if isinstance(cache_view, PagedAttentionCacheView):
+        if isinstance(cache_view, PagesCacheView):
             assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
         try:
             rngs = self.rngs()
@@ -577,8 +577,8 @@ class AttentionModule(nn.Module):
         value: Array,
         attention_mask: Array,
         # mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: Array | None = None,
         token_type_ids: Array | None = None,
         fcm_mask: Array | None = None,
@@ -623,7 +623,7 @@ class AttentionModule(nn.Module):
             elif isinstance(cache_view, TransformerCacheView):
                 target_length = cache_view.key.shape[1]
                 causal_mask = self.config._create_causal_mask(target_length)
-            elif isinstance(cache_view, PagedAttentionCacheView):
+            elif isinstance(cache_view, PagesCacheView):
                 causal_mask = None  # PagedAttention dont need mask
         if cache_view is None:
             query_length = query.shape[1]
@@ -679,7 +679,7 @@ class AttentionModule(nn.Module):
                     token_type_ids=token_type_ids,
                     partition_manager=self.config.partition_manager,
                 )
-            elif isinstance(cache_view, PagedAttentionCacheView):
+            elif isinstance(cache_view, PagesCacheView):
                 pop_axis = 1 if cache_metadata.is_decode_mode() else 0
 
                 if cache_metadata.is_decode_mode():

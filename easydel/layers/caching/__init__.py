@@ -30,11 +30,11 @@ from .mamba2 import (
     Mamba2CacheView,
     Mamba2Metadata,
 )
-from .paged_attention import (
-    PagedAttentionCache,
-    PagedAttentionCacheMetaData,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+from .page import (
+    PagesCache,
+    PagesCacheMetaData,
+    PagesCacheView,
+    PagesMetadata,
 )
 from .transformer import (
     TransformerCache,
@@ -56,10 +56,10 @@ __all__ = (
     "MambaCacheMetaData",
     "MambaCacheView",
     "MambaMetadata",
-    "PagedAttentionCache",
-    "PagedAttentionCacheMetaData",
-    "PagedAttentionCacheView",
-    "PagedAttentionMetadata",
+    "PagesCache",
+    "PagesCacheMetaData",
+    "PagesCacheView",
+    "PagesMetadata",
     "TransformerCache",
     "TransformerCacheMetaData",
     "TransformerCacheView",

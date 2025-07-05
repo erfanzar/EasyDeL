@@ -36,56 +36,8 @@ else:
     EasyQuantizer = object
 
 
-def _store_kvcache(
-    key: jax.Array,
-    value: jax.Array,
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    slot_mapping: jax.Array,
-):
-    """
-    Stores key-value pairs in cache with block structure, supporting padding in slot mapping.
-
-    Args:
-        key: [N, num_kv_heads, kv_head_dim_size] tensor of keys
-        value: [N, num_kv_heads, kv_head_dim_size] tensor of values
-        k_cache: [num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size] key cache
-        v_cache: [num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size] value cache
-        slot_mapping: [N] tensor of flat slot indices (-1 indicates padding)
-
-    Returns:
-        Updated (k_cache, v_cache)
-    """
-    N, num_kv_heads, kv_head_dim_size = key.shape
-    num_kvcache_blocks, kvcache_block_size, cache_num_heads, cache_head_dim = k_cache.shape
-    assert value.shape == (N, num_kv_heads, kv_head_dim_size)
-    assert v_cache.shape == (num_kvcache_blocks, kvcache_block_size, num_kv_heads, kv_head_dim_size)
-    assert cache_num_heads == num_kv_heads
-    assert cache_head_dim == kv_head_dim_size
-    assert slot_mapping.shape == (N,)
-    total_slots = num_kvcache_blocks * kvcache_block_size
-    block_indices = slot_mapping // kvcache_block_size
-    block_offsets = slot_mapping % kvcache_block_size
-
-    valid_mask = (slot_mapping >= 0) & (slot_mapping < total_slots)
-
-    safe_block_indices = jnp.where(valid_mask, block_indices, 0)
-    safe_block_offsets = jnp.where(valid_mask, block_offsets, 0)
-    update_mask = valid_mask.astype(jnp.int32)[:, None, None]
-
-    k_cache = k_cache.at[safe_block_indices, safe_block_offsets].add(
-        (key * update_mask) - k_cache[safe_block_indices, safe_block_offsets] * update_mask
-    )
-
-    v_cache = v_cache.at[safe_block_indices, safe_block_offsets].add(
-        (value * update_mask) - v_cache[safe_block_indices, safe_block_offsets] * update_mask
-    )
-
-    return k_cache, v_cache
-
-
 @auto_pytree
-class PagedAttentionCacheMetaData(BaseCacheMetadata):
+class PagesCacheMetaData(BaseCacheMetadata):
     """
     Metadata holding configuration parameters for the Paged Attention KV cache.
 
@@ -96,13 +48,12 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 
     num_hidden_layers: int
     num_kv_heads: int
-    kv_head_dim_size: int
-    max_num_batched_tokens: int = 32768
-    max_num_seqs: int = 512
-    max_model_len: int = 4096
+    k_headdim: int
+    v_headdim: int
+    max_sequence_length: int
     hbm_utilization: float = 0.9
-    kvcache_block_size: int = 256
-    num_kvcache_blocks: int = -1
+    page_size: int = 128
+    num_pages: int = -1
 
     @staticmethod
     def _compute_free_hbm(
@@ -120,7 +71,7 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
             return usable * size
         except Exception as e:
             print(e)
-            return 22 * (1024**3)
+            return 4 * (1024**3)
 
     @classmethod
     def create(
@@ -130,13 +81,19 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
         num_kv_heads: int,
-        kv_head_dim_size: int,
-        max_num_batched_tokens: int = 32768,
-        max_num_seqs: int = 512,
-        max_model_len: int = 4096,
+        kv_head_dim_size: int | None = None,
+        k_headdim: int | None = None,
+        v_headdim: int | None = None,
+        max_sequence_length: int = 4096,
         hbm_utilization: float = 0.9,
-        kvcache_block_size: int = 256,
-    ) -> PagedAttentionCacheMetaData:
+        page_size: int = 128,
+    ) -> PagesCacheMetaData:
+        if k_headdim is None:
+            assert kv_head_dim_size is not None, "Either `k_headdim` or `kv_head_dim_size` must be provided"
+            k_headdim = kv_head_dim_size
+        if v_headdim is None:
+            assert kv_head_dim_size is not None, "Either `v_headdim` or `kv_head_dim_size` must be provided"
+            v_headdim = kv_head_dim_size
         if num_hidden_layers <= 0:
             raise ValueError("`num_hidden_layers` must be positive")
         if num_kv_heads <= 0:
@@ -144,25 +101,23 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
         if kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
         free = cls._compute_free_hbm(mesh=mesh, partition_manager=partition_manager, hbm_utilization=hbm_utilization)
-        block_bytes = (
-            2 * num_hidden_layers * kvcache_block_size * num_kv_heads * kv_head_dim_size * (jnp.finfo(kvdtype).bits // 8)
-        )
-        num_kvcache_blocks = int(free) // block_bytes
+        bytes_av = jnp.finfo(kvdtype).bits // 8
+        block_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
+        num_pages = int(free) // block_bytes
         return cls(
             num_hidden_layers=num_hidden_layers,
             num_kv_heads=num_kv_heads,
-            kv_head_dim_size=kv_head_dim_size,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_num_seqs=max_num_seqs,
-            max_model_len=max_model_len,
+            k_headdim=k_headdim,
+            v_headdim=v_headdim,
+            max_sequence_length=max_sequence_length,
             hbm_utilization=hbm_utilization,
-            kvcache_block_size=kvcache_block_size,
-            num_kvcache_blocks=num_kvcache_blocks,
+            page_size=page_size,
+            num_pages=num_pages,
         )
 
 
 @auto_pytree
-class PagedAttentionCacheView(BaseCacheView):
+class PagesCacheView(BaseCacheView):
     """
     Represents the view of the Paged Attention KV cache for a single transformer layer.
 
@@ -171,7 +126,7 @@ class PagedAttentionCacheView(BaseCacheView):
     into the correct pages based on runtime metadata. It inherits from `BaseCacheView`.
 
     Attributes:
-        metadata (PagedAttentionCacheMetaData): The static configuration metadata for the
+        metadata (PagesCacheMetaData): The static configuration metadata for the
             entire paged cache.
         layer_index (int): The index of the transformer layer this view corresponds to.
         key_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all key pages for this layer.
@@ -182,7 +137,7 @@ class PagedAttentionCacheView(BaseCacheView):
             Can be a JAX array or an ImplicitArray if quantization is used.
     """
 
-    metadata: PagedAttentionCacheMetaData
+    metadata: PagesCacheMetaData
     layer_index: int
 
     key_pages: cx.Array | ImplicitArray
@@ -193,13 +148,13 @@ class PagedAttentionCacheView(BaseCacheView):
         cls,
         mesh: Mesh,
         dtype: jnp.dtype,
-        metadata: PagedAttentionCacheMetaData,
+        metadata: PagesCacheMetaData,
         layer_index: int,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
     ):
         """
-        Initializes the PagedAttentionCacheView for a specific layer.
+        Initializes the PagesCacheView for a specific layer.
 
         Allocates the `key_pages` and `value_pages` tensors with the appropriate
         shape, dtype, and sharding based on the provided metadata and partition manager.
@@ -208,62 +163,50 @@ class PagedAttentionCacheView(BaseCacheView):
         Args:
             mesh (Mesh): The JAX device mesh.
             dtype (jnp.dtype): The data type for the cache pages (e.g., jnp.bfloat16).
-            metadata (PagedAttentionCacheMetaData): Static configuration for the cache.
+            metadata (PagesCacheMetaData): Static configuration for the cache.
             layer_index (int): The index of the layer this view is for.
             partition_manager (es.PartitionManager): Manages tensor sharding across the mesh.
             quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply to the pages.
 
         Returns:
-            PagedAttentionCacheView: An initialized cache view for the specified layer.
+            PagesCacheView: An initialized cache view for the specified layer.
         """
         from easydel.infra.etils import EasyDeLQuantizationMethods
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
 
-        kv_pages_shape = (
-            metadata.num_kvcache_blocks,
-            metadata.kvcache_block_size,
-            metadata.num_kv_heads,
-            metadata.kv_head_dim_size,
-        )
-
-        kv_pages_sharding = partition_manager.resolve(
-            [
-                common_types.EMPTY,
-                common_types.EMPTY,
-                common_types.HEAD,
-                common_types.EMPTY,
-            ],
+        k_pages_shape = (metadata.num_kv_heads, metadata.num_pages, metadata.page_size, metadata.k_headdim)
+        k_pages_sharding = partition_manager.resolve(
+            [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
             mode=common_types.MODE_PREFILL,
-            shape=kv_pages_shape,
+            shape=k_pages_shape,
+        )
+        v_pages_shape = (metadata.num_kv_heads, metadata.num_pages, metadata.page_size, metadata.v_headdim)
+        v_pages_sharding = partition_manager.resolve(
+            [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
+            mode=common_types.MODE_PREFILL,
+            shape=v_pages_shape,
         )
 
-        kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
+        k_pages_sharding = Ns(mesh=mesh, spec=k_pages_sharding)
+        v_pages_sharding = Ns(mesh=mesh, spec=v_pages_sharding)
 
         with jax.named_scope("easydel-paged-attention-cache-init"):
-            key_pages = jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding)
-            value_pages = jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding)
-            key_pages = quantizer(key_pages)
-            value_pages = quantizer(value_pages)
+            key_pages = quantizer(jnp.zeros(shape=k_pages_shape, dtype=dtype, device=k_pages_sharding))
+            value_pages = quantizer(jnp.zeros(shape=v_pages_shape, dtype=dtype, device=v_pages_sharding))
             return cls(metadata=metadata, layer_index=layer_index, key_pages=key_pages, value_pages=value_pages)
 
-    def concatenate_to_cache(
-        self,
-        key: cx.Array,
-        value: cx.Array,
-        cache_metadata: PagedAttentionMetadata,
-    ):
+    def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
         """
         Concatenation is not applicable for Paged Attention.
         """
-        self.key_pages, self.value_pages = _store_kvcache(
-            key,
-            value,
-            self.key_pages,
-            self.value_pages,
-            cache_metadata.slot_mapping,
-        )
+        dist = cache_metadata.destination_pages
+        is_valid_token = dist >= 0
+        dest_pages = jnp.where(is_valid_token, dist // self.metadata.page_size, self.metadata.num_pages)
+        dest_slots = jnp.where(is_valid_token, dist % self.metadata.page_size, 0)
+        self.key_pages = self.key_pages.at[:, dest_pages, dest_slots, :].set(jnp.swapaxes(key, 0, 1))
+        self.value_pages = self.value_pages.at[:, dest_pages, dest_slots, :].set(jnp.swapaxes(value, 0, 1))
         return self.key_pages, self.value_pages
 
     def __repr__(self):
@@ -273,47 +216,47 @@ class PagedAttentionCacheView(BaseCacheView):
 
 
 @auto_pytree
-class PagedAttentionCache(BaseCache):
+class PagesCache(BaseCache):
     """
     Represents the complete Paged Attention KV cache for all layers of a model.
 
-    It holds a list of `PagedAttentionCacheView` objects, one for each layer.
+    It holds a list of `PagesCacheView` objects, one for each layer.
     It inherits from `BaseCache`.
 
     Attributes:
-        views (tp.List[PagedAttentionCacheView]): A list containing the cache view
+        views (tp.List[PagesCacheView]): A list containing the cache view
             for each layer in the model.
     """
 
-    views: list[PagedAttentionCacheView]
+    views: list[PagesCacheView]
 
     @classmethod
     def init_cache(
         cls,
         mesh: Mesh,
         dtype: jnp.dtype,
-        metadata: PagedAttentionCacheMetaData,
+        metadata: PagesCacheMetaData,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
     ):
         """
-        Initializes the entire PagedAttentionCache for all layers.
+        Initializes the entire PagesCache for all layers.
 
-        Creates a list of `PagedAttentionCacheView` instances, one for each layer
-        specified in the `metadata`, by calling `PagedAttentionCacheView.init` for each layer.
+        Creates a list of `PagesCacheView` instances, one for each layer
+        specified in the `metadata`, by calling `PagesCacheView.init` for each layer.
 
         Args:
             mesh (Mesh): The JAX device mesh.
             dtype (jnp.dtype): The data type for the cache pages.
-            metadata (PagedAttentionCacheMetaData): Static configuration for the cache.
+            metadata (PagesCacheMetaData): Static configuration for the cache.
             partition_manager (es.PartitionManager): Manages tensor sharding.
             quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply.
 
         Returns:
-            PagedAttentionCache: An initialized cache object containing views for all layers.
+            PagesCache: An initialized cache object containing views for all layers.
         """
         views = [
-            PagedAttentionCacheView.init(
+            PagesCacheView.init(
                 mesh=mesh,
                 dtype=dtype,
                 metadata=metadata,
@@ -326,7 +269,7 @@ class PagedAttentionCache(BaseCache):
         return cls(views=views)
 
     def init_empty(self, *args, **kwargs):
-        """Not typically used for PagedAttentionCache; returns None."""
+        """Not typically used for PagesCache; returns None."""
         return None
 
     def __repr__(self):
@@ -350,12 +293,11 @@ class PagedAttentionCache(BaseCache):
 
 
 @auto_pytree
-class PagedAttentionMetadata:
-    is_prefill: bool
-    slot_mapping: jax.Array
-    block_tables: jax.Array | None = None
-    context_lens: jax.Array | None = None
-    cu_seqlens_q: jax.Array | None = None
-    cu_seqlens_k: jax.Array | None = None
-    max_seqlen_q: jax.Array | int | None = None
-    max_seqlen_k: jax.Array | int | None = None
+class PagesMetadata:
+    is_prefill: bool | None
+    page_indices: jax.Array  # [sequence, page] i32
+    destination_pages: jax.Array  # [max_new_tokens] i32
+    sequence_lengths: jax.Array  # [sequence] i32
+    cumulative_sequence_lengths: jax.Array  # [sequence + 1] i32
+    num_sequence: jax.Array  # scalar i32
+    page_size: int = 128

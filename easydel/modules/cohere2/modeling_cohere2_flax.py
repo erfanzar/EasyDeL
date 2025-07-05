@@ -38,9 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -189,8 +189,8 @@ class Cohere2Attention(AttentionModule):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -203,8 +203,8 @@ class Cohere2Attention(AttentionModule):
           attention_mask (chex.Array): Attention mask.
           position_ids (chex.Array): Position IDs for RoPE.
           causal_mask (Optional[chex.Array | bool]): Causal mask.
-          cache_view (Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for kv-caching.
-          cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+          cache_view (Optional[TransformerCacheView | PagesCacheView]): Cache view for kv-caching.
+          cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
           segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
           output_attentions (bool): Whether to output attention weights.
           fcm_mask (Optional[chex.Array]): FCM mask (if applicable).
@@ -399,8 +399,8 @@ class Cohere2Block(nn.Module):
         position_ids: chex.Array,
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagedAttentionCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -523,8 +523,8 @@ class Cohere2Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> BaseModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -650,8 +650,8 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere module.
@@ -761,8 +761,8 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagedAttentionCache | None = None,
-        cache_metadata: TransformerMetadata | PagedAttentionMetadata | None = None,
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> SequenceClassifierOutput:
         transformer_outputs = self.model(
             input_ids=input_ids,
