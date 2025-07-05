@@ -17,7 +17,6 @@ from functools import partial
 
 import jax
 from jax import Array
-from jax import numpy as jnp
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
@@ -133,7 +132,7 @@ class PagedAttn(AttentionImpl):
             soft_cap=self.metadata.soft_cap,
         )(
             q,
-            jnp.concatenate([cache_view.key_pages, cache_view.value_pages], axis=2),
+            cache_view.interleave_by_reshaping(),
             cache_metadata.sequence_lengths,
             cache_metadata.page_indices,
             cache_metadata.cumulative_sequence_lengths,

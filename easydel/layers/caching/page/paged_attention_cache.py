@@ -209,6 +209,15 @@ class PagesCacheView(BaseCacheView):
         self.value_pages = self.value_pages.at[:, dest_pages, dest_slots, :].set(jnp.swapaxes(value, 0, 1))
         return self.key_pages, self.value_pages
 
+    def interleave_by_reshaping(self):
+        """
+        Recombines cache by stacking and reshaping.
+        """
+        stacked = jnp.stack([self.key_pages, self.value_pages], axis=3)
+        b, h, s_half, _, d = stacked.shape
+        final_shape = (b, h, s_half * 2, d)
+        return stacked.reshape(final_shape)
+
     def __repr__(self):
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, kv_shape={self.key_pages.shape})"
 
