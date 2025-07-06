@@ -21,7 +21,7 @@ from jax import Array
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
 from easydel.layers.caching import PagesCacheView
-from easydel.layers.caching.page.paged_attention_cache import PagesMetadata
+from easydel.layers.caching.page.paged_cache import PagesMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 

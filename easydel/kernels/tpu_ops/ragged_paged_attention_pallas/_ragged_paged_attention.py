@@ -17,7 +17,11 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.experimental.pallas.ops.tpu.ragged_paged_attention.tuned_block_sizes import get_tuned_block_sizes
+
+try:
+    from jax.experimental.pallas.ops.tpu.ragged_paged_attention.tuned_block_sizes import get_tuned_block_sizes
+except Exception:
+    from ._tuned_block_sizes import get_tuned_block_sizes
 
 from ._forward_pallas import (
     DEFAULT_MASK_VALUE,
@@ -177,7 +181,7 @@ def ragged_paged_attention(
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    sm_scale: float | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
@@ -209,6 +213,8 @@ def ragged_paged_attention(
     Returns:
       The output of the attention.
     """
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** -0.5
     return _ragged_paged_attention(
         q,
         kv_pages=kv_pages,

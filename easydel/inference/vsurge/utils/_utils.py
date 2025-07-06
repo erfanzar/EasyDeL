@@ -31,7 +31,7 @@ import numpy as np
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
-from easydel.layers.caching.page.paged_attention_cache import (
+from easydel.layers.caching.page.paged_cache import (
     PagesCache,
 )
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache

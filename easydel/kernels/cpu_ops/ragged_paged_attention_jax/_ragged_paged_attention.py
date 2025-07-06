@@ -1,3 +1,17 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import jax.numpy as jnp
 
 from ._forward_jax import _ragged_paged_attention
@@ -11,7 +25,7 @@ def ragged_paged_attention(
     sequence_page_indices: jnp.ndarray,
     cumulative_query_lengths: jnp.ndarray,
     num_sequences: jnp.ndarray,
-    softmax_scale: float,
+    softmax_scale: float | None = None,
     soft_cap: float | None = None,
 ) -> jnp.ndarray:
     """Performs paged attention for batched, ragged sequences.
@@ -41,7 +55,7 @@ def ragged_paged_attention(
         cumulative_query_lengths: The cumulative sum of query lengths for each
             sequence, used to index into the `queries` tensor.
             Shape: `[num_sequences + 1]`.
-        num_sequences: The total number of sequences in the batch which should be a scalar int32.
+        num_sequences: The total number of sequences in the batch which should be a shape[1] int32.
         softmax_scale: The scaling factor to apply to the attention scores
             before the softmax operation (typically `1 / sqrt(head_size)`).
         soft_cap: An optional value to cap the attention scores with `tanh`.
@@ -50,6 +64,7 @@ def ragged_paged_attention(
         The attention output tensor, with the same shape and dtype as `queries`.
         Shape: `[total_query_tokens, num_q_heads, head_size]`.
     """
+    softmax_scale = queries.shape[-1] ** -0.5
     return _ragged_paged_attention(
         queries=queries,
         key_pages=key_pages,
