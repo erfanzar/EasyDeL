@@ -632,7 +632,7 @@ class AttentionModule(nn.Module):
                 causal_mask = causal_mask[:, :, :query_length, :key_length]
                 causal_mask = jnp.broadcast_to(
                     causal_mask,
-                    (query.shape[0],) + causal_mask.shape[1:],
+                    (query.shape[0], *causal_mask.shape[1:]),
                 )
                 if token_type_ids is not None and query_length != 1:
                     token_type_mask = jnp.equal(
@@ -748,7 +748,7 @@ class AttentionModule(nn.Module):
         Returns:
             jax.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
+        return hidden_states.reshape((*hidden_states.shape[:2], -1))
 
     @staticmethod
     def repeat_key_value(key, value, num_reps: int):

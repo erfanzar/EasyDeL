@@ -126,13 +126,15 @@ class PagedAttn(AttentionImpl):
             NotImplementedError: Paged Attention currently relies on Pallas for TPUs
                 and does not have a specific implementation.
         """
+        kvcache = cache_view.interleave_by_reshaping()
+
         return partial(
             pallas_ragged_paged_attention,
             sm_scale=self.metadata.softmax_scale,
             soft_cap=self.metadata.soft_cap,
         )(
             q,
-            cache_view.interleave_by_reshaping(),
+            kvcache,
             cache_metadata.sequence_lengths,
             cache_metadata.page_indices,
             cache_metadata.cumulative_sequence_lengths,
@@ -218,12 +220,14 @@ class PagedAttn(AttentionImpl):
             AttentionOutput: The result of the attention computation with the sequence
                 dimension restored.
         """
+        batch, sequence, head, dim = q.shape
         output = super().__call__(
-            q=q,
+            q=q.reshape(-1, head, dim),
             k=k,
             v=v,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             **ignore,
         )
+        output.attention_outputs = output.attention_outputs.reshape(batch, sequence, head, dim)
         return output

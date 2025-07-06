@@ -140,14 +140,7 @@ class EasyGenerationMixin:
     _model_task: str | None = None
     _model_type: str | None = None
 
-    def create_paged_metadata(
-        self,
-        batch_size: int,
-        tokens_per_page: int,
-        max_prefill_length: int,
-        max_decodes_length: int,
-        num_pages: int,
-    ) -> PagesCacheMetaData:
+    def create_paged_metadata(self, hbm_utilization: float, page_size: int, dtype: jnp.dtype) -> PagesCacheMetaData:
         """
         Creates the static configuration metadata required for initializing a Paged KV Cache.
 
@@ -175,14 +168,16 @@ class EasyGenerationMixin:
             head_dim = hidden_size // num_attention_heads
 
         return PagesCacheMetaData.create(
-            batch_size=batch_size,
-            tokens_per_page=tokens_per_page,
-            max_prefill_length=max_prefill_length,
-            max_decodes_length=max_decodes_length,
+            mesh=self.mesh,
+            partition_manager=self.config.partition_manager,
+            kvdtype=dtype,
             num_hidden_layers=num_hidden_layers,
-            num_pages=num_pages,
             num_kv_heads=num_key_value_heads,
             kv_head_dim_size=head_dim,
+            k_headdim=None,
+            v_headdim=None,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
         )
 
     def create_cache_metadata(
@@ -233,8 +228,6 @@ class EasyGenerationMixin:
         self,
         metadata: PagesCacheMetaData | None = None,
         page_size: int | None = None,
-        batch_size: int | None = None,
-        max_sequences: int | None = None,
         dtype: jnp.dtype | None = jnp.bfloat16,
         hbm_utilization: float | None = None,
     ) -> PagesCache:
@@ -256,8 +249,6 @@ class EasyGenerationMixin:
                 metadata object. If provided, other arguments like page_size, batch_size etc.,
                 are ignored for metadata creation.
             page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
-            batch_size (tp.Optional[int]): Max concurrent sequences for decode. Required if `metadata` is None.
-            max_sequences (tp.Optional[int]): Max supported sequence length. Required if `metadata` is None.
             dtype (tp.Optional[jnp.dtype]): Data type for memory calculation. Required if `metadata` is None.
                 Defaults to jnp.bfloat16.
             hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
@@ -272,18 +263,10 @@ class EasyGenerationMixin:
         """
         if metadata is None:
             assert page_size is not None, "if your not passing orginal metadata you should pass `page_size`"
-            assert batch_size is not None, "if your not passing orginal metadata you should pass `batch_size`"
-            assert max_sequences is not None, "if your not passing orginal metadata you should pass `max_sequences`"
             assert dtype is not None, "if your not passing orginal metadata you should pass `dtype`"
             assert hbm_utilization is not None, "if your not passing orginal metadata you should pass `hbm_utilization`"
 
-            metadata = self.create_paged_metadata(
-                page_size=page_size,
-                batch_size=batch_size,
-                max_sequences=max_sequences,
-                dtype=dtype,
-                hbm_utilization=hbm_utilization,
-            )
+            metadata = self.create_paged_metadata(hbm_utilization=hbm_utilization, page_size=page_size, dtype=dtype)
         return PagesCache.init_cache(
             mesh=self.config.mesh,
             dtype=self.dtype,

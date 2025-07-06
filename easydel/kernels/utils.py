@@ -14,7 +14,7 @@
 import jax
 import jax.numpy as jnp
 
-from easydel.layers.caching.page import PagesCacheMetaData, PagesCacheView, PagesMetadata
+from easydel.layers.caching.page import PagesMetadata
 
 MAX_GPU_FUSED_SIZE = 65536
 
@@ -43,13 +43,12 @@ def generate_ragged_paged_attention_data(
     num_heads: tuple[int, int],  # (num_q_heads, num_kv_heads)
     head_dim: int,
     page_size: int,
-    max_num_pages: int,
     max_num_seq: int,
     max_num_batched_tokens: int,
     q_dtype: jnp.dtype = jnp.float32,
     kv_dtype: jnp.dtype = jnp.float32,
     seed: int = 42,
-) -> tuple[jax.Array, PagesCacheView, PagesMetadata, int]:
+) -> tuple[jax.Array, PagesMetadata, int]:
     """
     Generates realistic test data for a ragged paged attention kernel.
 
@@ -103,10 +102,6 @@ def generate_ragged_paged_attention_data(
         all_page_indices.append(indices)
         page_offset += num_pages_for_seq
     invalid_index_pad_value = -1
-    if all_kv_pages:
-        kv_pages = jnp.concatenate(all_kv_pages, axis=0)
-    else:
-        kv_pages = jnp.empty((0, page_size, num_kv_heads * 2, head_dim), dtype=kv_dtype)
     padded_page_indices = [
         _pad_to_shape(pi, (max_pages_per_seq,), pad_value=invalid_index_pad_value) for pi in all_page_indices
     ]
@@ -115,7 +110,6 @@ def generate_ragged_paged_attention_data(
     else:
         page_indices = jnp.empty((0, max_pages_per_seq), dtype=jnp.int32)
     q_padded = _pad_to_shape(q, (max_num_batched_tokens, num_q_heads, head_dim), pad_value=0.0)
-    kv_pages_padded = _pad_to_shape(kv_pages, (max_num_pages, page_size, num_kv_heads * 2, head_dim), pad_value=0)
     page_indices_padded = _pad_to_shape(
         page_indices,
         (max_num_seq, max_pages_per_seq),
@@ -133,19 +127,5 @@ def generate_ragged_paged_attention_data(
         num_sequence=jnp.array([batch_size], dtype=jnp.int32),
         page_size=page_size,
     )
-    view = PagesCacheView(
-        PagesCacheMetaData(
-            4,
-            num_kv_heads,
-            head_dim,
-            head_dim,
-            max(kv_lens_padded),
-            0.9,
-            page_size,
-            max_num_pages,
-        ),
-        3,
-        kv_pages_padded[:, :, 0::2, :],
-        kv_pages_padded[:, :, 1::2, :],
-    )
-    return q_padded, view, metadata, max_pages_per_seq
+
+    return q_padded, metadata, max_pages_per_seq
