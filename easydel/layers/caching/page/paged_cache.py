@@ -50,17 +50,12 @@ class PagesCacheMetaData(BaseCacheMetadata):
     num_kv_heads: int
     k_headdim: int
     v_headdim: int
-    max_sequence_length: int
     hbm_utilization: float = 0.9
     page_size: int = 128
     num_pages: int = -1
 
     @staticmethod
-    def _compute_free_hbm(
-        mesh: Mesh,
-        partition_manager: PartitionManager,
-        hbm_utilization: float,
-    ):
+    def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
         partition_axis = partition_manager.paxis
         size = mesh.shape[partition_axis.kv_head_axis]
         try:
@@ -84,7 +79,6 @@ class PagesCacheMetaData(BaseCacheMetadata):
         kv_head_dim_size: int | None = None,
         k_headdim: int | None = None,
         v_headdim: int | None = None,
-        max_sequence_length: int = 4096,
         hbm_utilization: float = 0.9,
         page_size: int = 128,
     ) -> PagesCacheMetaData:
@@ -109,7 +103,6 @@ class PagesCacheMetaData(BaseCacheMetadata):
             num_kv_heads=num_kv_heads,
             k_headdim=k_headdim,
             v_headdim=v_headdim,
-            max_sequence_length=max_sequence_length,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             num_pages=num_pages,
@@ -176,13 +169,13 @@ class PagesCacheView(BaseCacheView):
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
 
-        k_pages_shape = (metadata.num_kv_heads, metadata.num_pages, metadata.page_size, metadata.k_headdim)
+        k_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads, metadata.k_headdim)
         k_pages_sharding = partition_manager.resolve(
             [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
             mode=common_types.MODE_PREFILL,
             shape=k_pages_shape,
         )
-        v_pages_shape = (metadata.num_kv_heads, metadata.num_pages, metadata.page_size, metadata.v_headdim)
+        v_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads, metadata.v_headdim)
         v_pages_sharding = partition_manager.resolve(
             [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
             mode=common_types.MODE_PREFILL,
@@ -238,6 +231,12 @@ class PagesCache(BaseCache):
     """
 
     views: list[PagesCacheView]
+
+    @property
+    def metadata(self) -> PagesCacheMetaData | None:
+        if self.views[-1] is None:
+            return None
+        return self.views[-1].metadata
 
     @classmethod
     def init_cache(

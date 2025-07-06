@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._attention_impl import (
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionOutput,
-    AttentionRegistry,
-)
+from ._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 from .modules import (
     AutoRegressiveDecodeAttn,
     FlashAttn,
