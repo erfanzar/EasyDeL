@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -127,7 +129,8 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         sliding_window (`int`, *optional*, defaults to 4096):
             Sliding window attention (SWA) window size. If not specified, will default to `4096`.
         max_window_layers (`int`, *optional*, defaults to 80):
-            The number of layers that use SWA (Sliding Window Attention). The bottom layers use SWA while the top use full attention.
+            The number of layers that use SWA (Sliding Window Attention). The bottom layers use SWA while the top
+            use full attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         vision_config (`tp.Dict`, *optional*):
@@ -184,8 +187,8 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
     ```"""
 
     model_type = "qwen2_vl"
-    sub_configs = {"vision_config": Qwen2VLVisionConfig}
-    keys_to_ignore_at_inference = ["past_key_values"]
+    sub_configs: typing.ClassVar = {"vision_config": Qwen2VLVisionConfig}
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
         self,

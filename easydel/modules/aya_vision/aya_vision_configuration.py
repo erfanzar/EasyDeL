@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
 from easydel.utils.helpers import get_logger
@@ -25,9 +27,9 @@ logger = get_logger(__name__)
 @register_config("aya_vision")
 class AyaVisionConfig(EasyDeLBaseConfig):
     r"""
-    This is the configuration class to store the configuration of a [`AyaVisionForConditionalGeneration`]. It is used to instantiate an
-    AyaVision model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of AyaVision.
+    This is the configuration class to store the configuration of a [`AyaVisionForConditionalGeneration`]. It is used
+    to instantiate an AyaVision model according to the specified arguments, defining the model architecture.
+    Instantiating a configuration with the defaults will yield a similar configuration to that of AyaVision.
     e.g. [CohereForAI/aya-vision-8b](https://huggingface.co/CohereForAI/aya-vision-8b)
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
@@ -53,7 +55,7 @@ class AyaVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type = "aya_vision"
-    sub_configs = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
+    sub_configs: typing.ClassVar = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
 
     def __init__(
         self,

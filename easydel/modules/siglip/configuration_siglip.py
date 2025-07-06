@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -122,7 +124,8 @@ class SiglipTextConfig(EasyDeLBaseConfig):
     >>> # Initializing a SiglipTextConfig with google/siglip-base-patch16-224 style configuration
     >>> configuration = SiglipTextConfig()
 
-    >>> # Initializing a SiglipTextModel (with random weights) from the google/siglip-base-patch16-224 style configuration
+    >>> # Initializing a SiglipTextModel (with random weights)
+    >>> # from the google/siglip-base-patch16-224 style configuration
     >>> model = SiglipTextModel(configuration)
 
     >>> # Accessing the model configuration
@@ -260,7 +263,7 @@ class SiglipConfig(EasyDeLBaseConfig):
 	This is set to "siglip" to identify this as the main configuration for the SigLIP model.
 	"""
 
-    sub_configs = {"text_config": SiglipTextConfig, "vision_config": SiglipVisionConfig}
+    sub_configs: typing.ClassVar = {"text_config": SiglipTextConfig, "vision_config": SiglipVisionConfig}
     """
 	A dictionary that maps configuration keys to their respective configuration classes.
 	This enables the SiglipConfig to manage both text and vision components through

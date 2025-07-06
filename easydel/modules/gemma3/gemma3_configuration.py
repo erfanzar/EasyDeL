@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -29,8 +31,8 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
     the documentation from [`EasyDeLBaseConfig`] for more information.
     Args:
         vocab_size (`int`, *optional*, defaults to 262208):
-            Vocabulary size of the Gemma3Text model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`Gemma3TextModel`]
+            Vocabulary size of the Gemma3Text model. Defines the number of different tokens that can be represented
+            by the `inputs_ids` passed when calling [`Gemma3TextModel`]
         hidden_size (`int`, *optional*, defaults to 2304):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 9216):
@@ -77,17 +79,15 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
             The dropout ratio for the attention probabilities.
         query_pre_attn_scalar (`float`, *optional*, defaults to 256):
             Scaling factor used on the attention scores
-        sliding_window (`int`, *optional*, defaults to 4096): in Gemma3Text, every other layer uses sliding window attention. This is the
-            size of the sliding window.
+        sliding_window (`int`, *optional*, defaults to 4096): in Gemma3Text, every other layer uses sliding window
+            attention. This is the size of the sliding window.
         final_logit_softcapping (`float`, *optional*):
             Scaling factor when applying tanh softcapping on the logits.
         attn_logit_softcapping (`float`, *optional*):
             Scaling factor when applying tanh softcapping on the attention scores.
         cache_implementation (`str`, *optional*, defaults to `"hybrid"`): the cache type to be used with `generate`.
         rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings used in gloabl attention. NOTE: if you apply new rope type
-            and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
-            accordingly.
+            Dictionary containing the scaling configuration for the RoPE embeddings used in gloabl attention.
             Expected contents:
                 `rope_type` (`str`):
                     The sub-variant of RoPE to use. Can be one of ['default', 'linear', 'dynamic', 'yarn', 'longrope',
@@ -287,10 +287,7 @@ class Gemma3Config(EasyDeLBaseConfig):
     ```"""
 
     model_type = "gemma3"
-    sub_configs = {
-        "text_config": Gemma3TextConfig,
-        "vision_config": SiglipVisionConfig,
-    }
+    sub_configs: typing.ClassVar = {"text_config": Gemma3TextConfig, "vision_config": SiglipVisionConfig}
 
     def __init__(
         self,

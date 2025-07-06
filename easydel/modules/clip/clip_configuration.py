@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -87,8 +89,8 @@ class CLIPTextConfig(EasyDeLBaseConfig):
 
     Args:
             vocab_size (`int`, *optional*, defaults to 49408):
-                    Vocabulary size of the CLIP text model. Defines the number of different tokens that can be represented by
-                    the `inputs_ids` passed when calling [`CLIPModel`].
+                    Vocabulary size of the CLIP text model. Defines the number of different tokens that can be
+                    represented by the `inputs_ids` passed when calling [`CLIPModel`].
             hidden_size (`int`, *optional*, defaults to 512):
                     Dimensionality of the encoder layers and the pooler layer.
             intermediate_size (`int`, *optional*, defaults to 2048):
@@ -100,11 +102,11 @@ class CLIPTextConfig(EasyDeLBaseConfig):
             num_attention_heads (`int`, *optional*, defaults to 8):
                     Number of attention heads for each attention layer in the Transformer encoder.
             max_position_embeddings (`int`, *optional*, defaults to 77):
-                    The maximum sequence length that this model might ever be used with. Typically set this to something large
-                    just in case (e.g., 512 or 1024 or 2048).
+                    The maximum sequence length that this model might ever be used with. Typically set this to something
+                large just in case (e.g., 512 or 1024 or 2048).
             hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
-                    The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
-                    `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+                    The non-linear activation function (function or string) in the encoder and pooler. If string,
+                    `"gelu"`,`"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
             layer_norm_eps (`float`, *optional*, defaults to 1e-05):
                     The epsilon used by the layer normalization layers.
             attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -112,8 +114,8 @@ class CLIPTextConfig(EasyDeLBaseConfig):
             initializer_range (`float`, *optional*, defaults to 0.02):
                     The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
             initializer_factor (`float`, *optional*, defaults to 1.0):
-                    A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
-                    testing).
+                    A factor for initializing all weight matrices
+                    (should be kept to 1, used internally for initialization testing).
             pad_token_id (`int`, *optional*, defaults to 1):
                     Padding token id.
             bos_token_id (`int`, *optional*, defaults to 49406):
@@ -210,8 +212,8 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
             patch_size (`int`, *optional*, defaults to 32):
                     The size (resolution) of each patch.
             hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
-                    The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
-                    `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+                    The non-linear activation function (function or string) in the encoder and pooler.
+                    If string, `"gelu"`, `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
             layer_norm_eps (`float`, *optional*, defaults to 1e-05):
                     The epsilon used by the layer normalization layers.
             attention_dropout (`float`, *optional*, defaults to 0.0):
@@ -219,8 +221,8 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
             initializer_range (`float`, *optional*, defaults to 0.02):
                     The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
             initializer_factor (`float`, *optional*, defaults to 1.0):
-                    A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
-                    testing).
+                    A factor for initializing all weight matrices (should be kept to 1, used internally
+                    for initialization testing).
 
     Example:
 
@@ -295,7 +297,8 @@ class CLIPConfig(EasyDeLBaseConfig):
             projection_dim (`int`, *optional*, defaults to 512):
                     Dimensionality of text and vision projection layers.
             logit_scale_init_value (`float`, *optional*, defaults to 2.6592):
-                    The initial value of the *logit_scale* parameter. Default is used as per the original CLIP implementation.
+                    The initial value of the *logit_scale* parameter. Default is used as per the
+                    original CLIP implementation.
             kwargs (*optional*):
                     Dictionary of keyword arguments.
 
@@ -324,7 +327,7 @@ class CLIPConfig(EasyDeLBaseConfig):
     ```"""
 
     model_type = "clip"
-    sub_configs = {"text_config": CLIPTextConfig, "vision_config": CLIPVisionConfig}
+    sub_configs: typing.ClassVar = {"text_config": CLIPTextConfig, "vision_config": CLIPVisionConfig}
 
     def __init__(
         self,
@@ -334,34 +337,23 @@ class CLIPConfig(EasyDeLBaseConfig):
         logit_scale_init_value=2.6592,
         **kwargs,
     ):
-        # If `_config_dict` exist, we use them for the backward compatibility.
-        # We pop out these 2 attributes before calling `super().__init__` to avoid them being saved (which causes a lot
-        # of confusion!).
         text_config_dict = kwargs.pop("text_config_dict", None)
         vision_config_dict = kwargs.pop("vision_config_dict", None)
 
         super().__init__(**kwargs)
 
-        # Instead of simply assigning `[text|vision]_config_dict` to `[text|vision]_config`, we use the values in
-        # `[text|vision]_config_dict` to update the values in `[text|vision]_config`. The values should be same in most
-        # cases, but we don't want to break anything regarding `_config_dict` that existed before commit `8827e1b2`.
         if text_config_dict is not None:
             if text_config is None:
                 text_config = {}
 
-            # This is the complete result when using `text_config_dict`.
             _text_config_dict = CLIPTextConfig(**text_config_dict).to_dict()
-
-            # Give a warning if the values exist in both `_text_config_dict` and `text_config` but being different.
             for key, value in _text_config_dict.items():
                 if key in text_config and value != text_config[key] and key not in ["transformers_version"]:
-                    # If specified in `text_config_dict`
                     if key in text_config_dict:
                         message = (
                             f"`{key}` is found in both `text_config_dict` and `text_config` but with different values. "
                             f'The value `text_config_dict["{key}"]` will be used instead.'
                         )
-                    # If inferred from default argument values (just to be super careful)
                     else:
                         message = (
                             f"`text_config_dict` is provided which will be used to initialize `CLIPTextConfig`. The "
