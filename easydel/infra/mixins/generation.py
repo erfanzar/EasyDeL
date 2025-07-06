@@ -40,7 +40,7 @@ from easydel.inference.logits_process import (
     TopPLogitsWarper,
 )
 from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
-from easydel.layers.caching.page.paged_attention_cache import (
+from easydel.layers.caching.page.paged_cache import (
     PagesCache,
     PagesCacheMetaData,
 )
@@ -766,7 +766,7 @@ class EasyGenerationMixin:
         Returns:
             chex.Array: The tensor expanded for beam search.
         """
-        return jnp.broadcast_to(tensor[:, None], (tensor.shape[0], num_beams) + tensor.shape[1:])
+        return jnp.broadcast_to(tensor[:, None], (tensor.shape[0], num_beams, *tensor.shape[1:]))
 
     def _adapt_logits_for_beam_search(self, logits):
         """
@@ -1352,14 +1352,14 @@ class EasyGenerationMixin:
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
-            return tensor.reshape((tensor.shape[0] * tensor.shape[1],) + tensor.shape[2:])
+            return tensor.reshape((tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]))
 
         def unflatten_beam_dim(tensor, batch_size, num_beams):
             """Unflattens the first, flat batch*beam dimension of a non-scalar array."""
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
-            return tensor.reshape((batch_size, num_beams) + tensor.shape[1:])
+            return tensor.reshape((batch_size, num_beams, *tensor.shape[1:]))
 
         def gather_beams(nested, beam_indices, batch_size, new_num_beams):
             """

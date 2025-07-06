@@ -304,9 +304,13 @@ class PagesCache(BaseCache):
 @auto_pytree
 class PagesMetadata:
     is_prefill: bool | None
+
     page_indices: jax.Array  # [sequence, page] i32
     destination_pages: jax.Array  # [max_new_tokens] i32
     sequence_lengths: jax.Array  # [sequence] i32
     cumulative_sequence_lengths: jax.Array  # [sequence + 1] i32
-    num_sequence: jax.Array  # scalar i32
+    num_sequence: jax.Array  # [1] i32
+
     page_size: int = 128
+    prefill_chunk_size: int = 512
+    blocksize: int = 256
