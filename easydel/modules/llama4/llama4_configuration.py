@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -229,7 +231,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 @register_config("llama4")
 class Llama4Config(EasyDeLBaseConfig):
     model_type = "llama4"
-    sub_configs = {"text_config": Llama4TextConfig, "vision_config": Llama4VisionConfig}
+    sub_configs: typing.ClassVar = {"text_config": Llama4TextConfig, "vision_config": Llama4VisionConfig}
 
     def __init__(
         self,
