@@ -24,6 +24,7 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
+from easydel.layers.attention import AttentionMechanisms
 from easydel.utils import check_bool_flag, cjit
 
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
@@ -113,7 +114,8 @@ class vEngine:
         )
 
         self._partition_manager = model.config.partition_manager
-
+        self._hbm_utilization = hbm_utilization
+        self._page_size = page_size
         self._max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
         self._max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 
@@ -287,9 +289,25 @@ class vEngine:
         return new_key
 
     @property
+    def is_paged_runtime(self) -> bool:
+        attn_mechanism = self.model.config.attn_mechanism
+        value_to_compare = getattr(attn_mechanism, "value", attn_mechanism)
+        return value_to_compare == AttentionMechanisms.PAGED_ATTENTION.value
+
+    @property
     def prefill_lengths(self) -> list[int]:
         """Returns the configured list of max prefill length buckets for the engine."""
         return self._max_prefill_lengths
+
+    @property
+    def page_size(self) -> int | None:
+        """Returns the configured page_size for the engine, if specified."""
+        return self._page_size
+
+    @property
+    def hbm_utilization(self) -> int | None:
+        """Returns the configured hbm_utilization for the engine, if specified."""
+        return self._hbm_utilization
 
     @property
     def batch_size(self) -> int | None:
@@ -356,10 +374,14 @@ class vEngine:
             vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
         assert vocab_size is not None, "couldn't find `vocab_size` in model config"
         dt = self.model.dtype
+        if self.is_paged_runtime:
+            cache = self.model.init_pages(metadata=self.page_metadata)
+        else:
+            cache = self.model.init_cache(concurrent_decode, self.max_length)
         with self.model.mesh:
             return GenerationState(
                 logits=jnp.zeros((concurrent_decode, vocab_size), dt, device=sharding),
-                cache=self.model.init_cache(concurrent_decode, self.max_length),
+                cache=cache,
                 index=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
                 tokens=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
                 valids=jnp.zeros((concurrent_decode, self.max_length), "b1", device=sharding),
