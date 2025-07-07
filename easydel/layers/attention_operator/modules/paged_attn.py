@@ -16,7 +16,9 @@
 from functools import partial
 
 import jax
+from eformer import common_types as ct
 from jax import Array
+from jax.experimental.shard_map import shard_map
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
@@ -73,23 +75,20 @@ class PagedAttn(AttentionImpl):
         **ignore,
     ) -> AttentionOutput:
         """
-        Native (CPU) forward pass.
-
-        Raises:
-            NotImplementedError: Paged Attention requires specialized kernels and
-                does not have a native CPU implementation.
+        Native (XLA) forward pass.
         """
-        return jax_ragged_paged_attention(
+        output = jax_ragged_paged_attention(
             queries=q,
             key_pages=cache_view.key_pages,
             value_pages=cache_view.value_pages,
-            cumulative_query_lengths=cache_metadata.cumulative_sequence_lengths,
-            sequence_lengths=cache_metadata.sequence_lengths,
-            sequence_page_indices=cache_metadata.page_indices,
-            num_sequences=cache_metadata.num_sequence,
+            query_start_loc=cache_metadata.query_start_loc,
+            sequence_lengths=cache_metadata.context_lens,
+            block_tables=cache_metadata.block_tables,
+            num_seqs=cache_metadata.num_seqs,
             softmax_scale=self.metadata.softmax_scale,
             soft_cap=self.metadata.soft_cap,
         )
+        return AttentionOutput(attention_weights=None, attention_outputs=output)
 
     def forward_gpu(
         self,
@@ -126,20 +125,39 @@ class PagedAttn(AttentionImpl):
             NotImplementedError: Paged Attention currently relies on Pallas for TPUs
                 and does not have a specific implementation.
         """
-        kvcache = cache_view.interleave_by_reshaping()
-
-        return partial(
-            pallas_ragged_paged_attention,
-            sm_scale=self.metadata.softmax_scale,
-            soft_cap=self.metadata.soft_cap,
+        kv_pages = cache_view.kv_pages
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
+        output = shard_map(
+            f=partial(
+                pallas_ragged_paged_attention,
+                sm_scale=self.metadata.softmax_scale,
+                soft_cap=self.metadata.soft_cap,
+                num_kv_pages_per_block=8,
+                num_queries_per_block=64,
+                vmem_limit_bytes=None,
+            ),
+            in_specs=(
+                qaxes,
+                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.block_tables.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
+            ),
+            out_specs=qaxes,
+            mesh=self.metadata.mesh,
+            check_rep=False,
         )(
             q,
-            kvcache,
-            cache_metadata.sequence_lengths,
-            cache_metadata.page_indices,
-            cache_metadata.cumulative_sequence_lengths,
-            cache_metadata.num_sequence,
+            kv_pages,
+            cache_metadata.context_lens,
+            cache_metadata.block_tables,
+            cache_metadata.query_start_loc,
+            cache_metadata.num_seqs,
         )
+        return AttentionOutput(attention_weights=None, attention_outputs=output)
 
     def forward_cpu(
         self,

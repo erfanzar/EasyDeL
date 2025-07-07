@@ -106,12 +106,12 @@ def generate_ragged_paged_attention_data(
         _pad_to_shape(pi, (max_pages_per_seq,), pad_value=invalid_index_pad_value) for pi in all_page_indices
     ]
     if padded_page_indices:
-        page_indices = jnp.stack(padded_page_indices, axis=0)
+        block_tables = jnp.stack(padded_page_indices, axis=0)
     else:
-        page_indices = jnp.empty((0, max_pages_per_seq), dtype=jnp.int32)
+        block_tables = jnp.empty((0, max_pages_per_seq), dtype=jnp.int32)
     q_padded = _pad_to_shape(q, (max_num_batched_tokens, num_q_heads, head_dim), pad_value=0.0)
     page_indices_padded = _pad_to_shape(
-        page_indices,
+        block_tables,
         (max_num_seq, max_pages_per_seq),
         pad_value=invalid_index_pad_value,
     )
@@ -119,12 +119,11 @@ def generate_ragged_paged_attention_data(
     kv_lens_padded = _pad_to_shape(jnp.array(kv_lens_list, dtype=jnp.int32), (max_num_seq,), pad_value=0)
 
     metadata = PagesMetadata(
-        is_prefill=None,
-        page_indices=page_indices_padded,
-        destination_pages=None,
-        sequence_lengths=kv_lens_padded,
-        cumulative_sequence_lengths=cu_q_lens_padded,
-        num_sequence=jnp.array([batch_size], dtype=jnp.int32),
+        slot_mapping=jnp.zeros([max_num_batched_tokens], "i4"),
+        block_tables=page_indices_padded,
+        context_lens=kv_lens_padded,
+        query_start_loc=cu_q_lens_padded,
+        num_seqs=jnp.array([batch_size], dtype=jnp.int32),
         page_size=page_size,
     )
 

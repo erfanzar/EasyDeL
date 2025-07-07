@@ -122,10 +122,7 @@ class PagesCacheView(BaseCacheView):
         metadata (PagesCacheMetaData): The static configuration metadata for the
             entire paged cache.
         layer_index (int): The index of the transformer layer this view corresponds to.
-        key_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all key pages for this layer.
-            Shape: (num_kv_heads, num_pages_per_layer, page_size, kv_head_dim_size).
-            Can be a JAX array or an ImplicitArray if quantization is used.
-        value_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all value pages for this layer.
+        kv_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all key value pages for this layer.
             Shape: (num_kv_heads, num_pages_per_layer, page_size, kv_head_dim_size).
             Can be a JAX array or an ImplicitArray if quantization is used.
     """
@@ -133,8 +130,7 @@ class PagesCacheView(BaseCacheView):
     metadata: PagesCacheMetaData
     layer_index: int
 
-    key_pages: cx.Array | ImplicitArray
-    value_pages: cx.Array | ImplicitArray
+    kv_pages: cx.Array | ImplicitArray
 
     @classmethod
     def init(
@@ -149,7 +145,7 @@ class PagesCacheView(BaseCacheView):
         """
         Initializes the PagesCacheView for a specific layer.
 
-        Allocates the `key_pages` and `value_pages` tensors with the appropriate
+        Allocates the `kv_pages` tensors with the appropriate
         shape, dtype, and sharding based on the provided metadata and partition manager.
         Optionally applies quantization if a quantizer is provided.
 
@@ -168,48 +164,33 @@ class PagesCacheView(BaseCacheView):
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-
-        k_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads, metadata.k_headdim)
-        k_pages_sharding = partition_manager.resolve(
-            [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
-            mode=common_types.MODE_PREFILL,
-            shape=k_pages_shape,
-        )
-        v_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads, metadata.v_headdim)
-        v_pages_sharding = partition_manager.resolve(
-            [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY],
-            mode=common_types.MODE_PREFILL,
-            shape=v_pages_shape,
-        )
-
-        k_pages_sharding = Ns(mesh=mesh, spec=k_pages_sharding)
-        v_pages_sharding = Ns(mesh=mesh, spec=v_pages_sharding)
-
+        kv_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads * 2, metadata.k_headdim)
+        axes = [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY]
+        kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
+        kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
-            key_pages = quantizer(jnp.zeros(shape=k_pages_shape, dtype=dtype, device=k_pages_sharding))
-            value_pages = quantizer(jnp.zeros(shape=v_pages_shape, dtype=dtype, device=v_pages_sharding))
-            return cls(metadata=metadata, layer_index=layer_index, key_pages=key_pages, value_pages=value_pages)
+            kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding))
+
+        return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages)
 
     def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
-        """
-        Concatenation is not applicable for Paged Attention.
-        """
-        dist = cache_metadata.destination_pages
-        is_valid_token = dist >= 0
-        dest_pages = jnp.where(is_valid_token, dist // self.metadata.page_size, self.metadata.num_pages)
-        dest_slots = jnp.where(is_valid_token, dist % self.metadata.page_size, 0)
-        self.key_pages = self.key_pages.at[:, dest_pages, dest_slots, :].set(jnp.swapaxes(key, 0, 1))
-        self.value_pages = self.value_pages.at[:, dest_pages, dest_slots, :].set(jnp.swapaxes(value, 0, 1))
-        return self.key_pages, self.value_pages
+        num_blocks, block_size, num_combined_kv_heads, head_size = self.kv_pages.shape
+        num_kv_heads = num_combined_kv_heads // 2
+        key = key.reshape(-1, num_kv_heads, head_size)
+        value = value.reshape(-1, num_kv_heads, head_size)
+        kv = jnp.concatenate([key, value], axis=-1).reshape(-1, num_combined_kv_heads, head_size)
+        kv_cache_flat = self.kv_pages.reshape(-1, num_combined_kv_heads, head_size)
+        updated_kv_cache_flat = kv_cache_flat.at[cache_metadata.slot_mapping].set(kv)
+        self.kv_pages = updated_kv_cache_flat.reshape(num_blocks, block_size, num_combined_kv_heads, head_size)
+        return self
 
-    def interleave_by_reshaping(self):
-        """
-        Recombines cache by stacking and reshaping.
-        """
-        stacked = jnp.stack([self.key_pages, self.value_pages], axis=3)
-        b, h, s_half, _, d = stacked.shape
-        final_shape = (b, h, s_half * 2, d)
-        return stacked.reshape(final_shape)
+    @property
+    def key_pages(self) -> jax.Array:
+        return self.kv_pages[:, :, 0::2, :]
+
+    @property
+    def value_pages(self) -> jax.Array:
+        return self.kv_pages[:, :, 1::2, :]
 
     def __repr__(self):
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, kv_shape={self.key_pages.shape})"
@@ -284,31 +265,21 @@ class PagesCache(BaseCache):
         """Provides a string representation of the entire paged cache."""
         idx = self.views[-1]
         try:
-            k_shape = idx.key_pages.shape
-            v_shape = idx.value_pages.shape
+            kv_shape = idx.kv_pages.shape
         except AttributeError:
-            k_shape = "Uninitialized"
-            v_shape = "Uninitialized"
-        return (
-            f"{self.__class__.__name__}(\n"
-            f"  key_pages={k_shape},\n"
-            f"  value_pages={v_shape},\n"
-            f"  num_layers={len(self.views)},\n"
-            ")"
-        )
+            kv_shape = "Uninitialized"
+        return f"{self.__class__.__name__}(\n  kv_pages={kv_shape},\n  num_layers={len(self.views)},\n)"
 
     __str__ = __repr__
 
 
 @auto_pytree
 class PagesMetadata:
-    is_prefill: bool | None
-
-    page_indices: jax.Array  # [sequence, page] i32
-    destination_pages: jax.Array  # [max_new_tokens] i32
-    sequence_lengths: jax.Array  # [sequence] i32
-    cumulative_sequence_lengths: jax.Array  # [sequence + 1] i32
-    num_sequence: jax.Array  # [1] i32
+    slot_mapping: jax.Array  # [num_tokens] i32
+    block_tables: jax.Array  # [sequence, page] i32
+    context_lens: jax.Array  # [sequence] i32
+    query_start_loc: jax.Array  # [sequence + 1] i32
+    num_seqs: jax.Array  # [1] i32
 
     page_size: int = 128
     prefill_chunk_size: int = 512

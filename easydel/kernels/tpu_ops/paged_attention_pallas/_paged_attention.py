@@ -31,19 +31,16 @@ MAX_SMEM_USAGE = 512 * 1024
 
 
 @jax.jit
-def _build_contiguous_kv_vectorized(
-    pages,
-    page_indices,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    batch_size = page_indices.shape[0]
+def _build_contiguous_kv_vectorized(pages, block_tables) -> tuple[jnp.ndarray, jnp.ndarray]:
+    batch_size = block_tables.shape[0]
     num_heads, _, page_size, head_dim = pages.shape
 
     def gather_for_head(head_pages, indices_per_batch):
         return jax.vmap(lambda idx: head_pages[idx, :, :])(indices_per_batch)
 
-    gathered_per_head = jax.vmap(gather_for_head, in_axes=(0, None))(pages, page_indices)
+    gathered_per_head = jax.vmap(gather_for_head, in_axes=(0, None))(pages, block_tables)
     gathered_swapped = gathered_per_head.transpose(1, 0, 2, 3, 4)
-    max_seq_len = page_indices.shape[1] * page_size
+    max_seq_len = block_tables.shape[1] * page_size
     return gathered_swapped.reshape(batch_size, num_heads, max_seq_len, head_dim)
 
 
@@ -60,7 +57,7 @@ def _build_contiguous_kv_vectorized(
 def _build_paged_kv(
     contiguous_k: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
     contiguous_v: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
-    seq_lengths: jnp.ndarray,  # Shape: (batch,). True length of each sequence.
+    seq_context_lens: jnp.ndarray,  # Shape: (batch,). True context_lens of each sequence.
     block_size: int,
     num_total_blocks: int,  # Desired size of the physical cache.
     max_blocks_per_seq: int,  # Desired size of the block table per sequence.
@@ -72,14 +69,14 @@ def _build_paged_kv(
     """
     batch_size, _, _, _ = contiguous_k.shape  # Use different name
     assert contiguous_v.shape == contiguous_k.shape
-    assert seq_lengths.shape == (batch_size,)
+    assert seq_context_lens.shape == (batch_size,)
 
     assert contiguous_k.shape[-2] == num_kv_heads
     assert contiguous_k.shape[-1] == head_dim
 
     # --- 1. Calculate block requirements and allocate physical indices ---
     # (create_table_body using static iota and masking should be correct now)
-    num_blocks_per_seq = jnp.ceil(seq_lengths / block_size).astype(jnp.int32)
+    num_blocks_per_seq = jnp.ceil(seq_context_lens / block_size).astype(jnp.int32)
     cum_blocks = jnp.cumsum(num_blocks_per_seq)
     start_indices = jnp.concatenate([jnp.zeros(1, dtype=cum_blocks.dtype), cum_blocks[:-1]])
     block_tables = jnp.zeros((batch_size, max_blocks_per_seq), dtype=jnp.int32)
@@ -101,7 +98,7 @@ def _build_paged_kv(
 
     def scatter_body_outer(i, caches):
         phys_k, phys_v = caches
-        seq_len = seq_lengths[i]  # Traced sequence length for this item
+        seq_len = seq_context_lens[i]  # Traced sequence context_lens for this item
         num_blocks = num_blocks_per_seq[i]  # Traced number of blocks for this item
 
         def scatter_body_inner(j, inner_caches):
@@ -162,7 +159,7 @@ class PagedAttention:
         self,
         contiguous_k: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
         contiguous_v: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
-        seq_lengths: jnp.ndarray,  # Shape: (batch,). True length of each sequence.
+        seq_context_lens: jnp.ndarray,  # Shape: (batch,). True context_lens of each sequence.
         block_size: int,
         num_total_blocks: int,  # Desired size of the physical cache.
         max_blocks_per_seq: int,  # Desired size of the block table per sequence.
@@ -172,7 +169,7 @@ class PagedAttention:
         return _build_paged_kv(
             contiguous_k,
             contiguous_v,
-            seq_lengths,
+            seq_context_lens,
             block_size,
             num_total_blocks,
             max_blocks_per_seq,
@@ -180,26 +177,26 @@ class PagedAttention:
             head_dim,
         )
 
-    def build_contiguous_kv_vectorized(self, pages, page_indices) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def build_contiguous_kv_vectorized(self, pages, block_tables) -> tuple[jnp.ndarray, jnp.ndarray]:
         """
         Builds contiguous KV caches from paged KV caches using vectorized operations.
 
-        The output sequence length dimension will be max_blocks_per_seq * block_size.
-        The caller needs external knowledge (e.g., original sequence lengths) to
+        The output sequence context_lens dimension will be max_blocks_per_seq * block_size.
+        The caller needs external knowledge (e.g., original sequence context_lens) to
         correctly interpret or mask the padding positions in the returned tensors.
 
         Returns:
             A tuple containing (contiguous_k, contiguous_v).
         """
-        return _build_contiguous_kv_vectorized(pages, page_indices)
+        return _build_contiguous_kv_vectorized(pages, block_tables)
 
 
 def prefill_attention(
     q: jax.Array,
     k_pages: jax.Array,
     v_pages: jax.Array,
-    length: jax.Array,
-    page_indices: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
     sm_scale: float | None = None,
 ):
     """Computes paged attention for the prefill phase.
@@ -212,8 +209,8 @@ def prefill_attention(
       q: Query tensor for a chunk of the sequence.
       k_pages: Key cache stored in paged layout in HBM.
       v_pages: Value cache stored in paged layout in HBM.
-      length: The total sequence length for the item being processed.
-      page_indices: Array mapping sequence positions to page indices in k_pages/v_pages.
+      context_lens: The total sequence context_lens for the item being processed.
+      block_tables: Array mapping sequence positions to page indices in k_pages/v_pages.
       sm_scale: normal softmax scale. By default it is None or auto.
 
     Returns:
@@ -262,8 +259,8 @@ def prefill_attention(
             lm_shape,
         ],
     )(
-        jnp.reshape(length, (1,)),
-        page_indices,
+        jnp.reshape(context_lens, (1,)),
+        block_tables,
         jnp.asarray([0], jnp.int32),
         q,
         k_pages,
@@ -278,11 +275,11 @@ def chunked_prefill_attention(
     q: jax.Array,
     k_pages: jax.Array,
     v_pages: jax.Array,
-    length: jax.Array,
-    page_indices: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
     sm_scale: float | None = None,
 ):
-    return prefill_attention(q, k_pages, v_pages, length, page_indices, sm_scale)
+    return prefill_attention(q, k_pages, v_pages, context_lens, block_tables, sm_scale)
 
 
 @functools.partial(
@@ -299,8 +296,8 @@ def paged_attention(
     q: jax.Array,
     k_pages: jax.Array,
     v_pages: jax.Array,
-    lengths: jax.Array,
-    page_indices: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
     *,
     sm_scale: float = 1,
     mask_value: float = DEFAULT_MASK_VALUE,
@@ -315,8 +312,8 @@ def paged_attention(
       q: A [batch_size, num_heads, head_dim] jax.Array.
       k_pages: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
       v_pages: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
-      lengths: A i32[batch_size] jax.Array the length of each example.
-      page_indices: A i32[batch_size, pages_per_sequence] jax.Array. Each entry
+      context_lens: A i32[batch_size] jax.Array the context_lens of each example.
+      block_tables: A i32[batch_size, pages_per_sequence] jax.Array. Each entry
         should be in the range of [0, total_num_pages), indicating where to locate
         the page in `k_pages` or `v_pages`.
       sm_scale: normal softmax scale. By default it is 1.0.
@@ -343,7 +340,7 @@ def paged_attention(
 
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads, _, page_size, head_dim_k = k_pages.shape
-    batch_size_paged_indices, pages_per_sequence = page_indices.shape
+    batch_size_paged_indices, pages_per_sequence = block_tables.shape
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -364,12 +361,12 @@ def paged_attention(
             "pages_per_compute_block must be divisible by pages per sequence. Got"
             f" {pages_per_compute_block} and {pages_per_sequence}."
         )
-    if lengths.shape != (batch_size,):
-        raise ValueError("`lengths` and `q` must have the same batch size")
+    if context_lens.shape != (batch_size,):
+        raise ValueError("`context_lens` and `q` must have the same batch size")
     if batch_size_paged_indices != batch_size:
-        raise ValueError("`page_indices` and `q` must have the same batch size")
-    if lengths.dtype != jnp.int32:
-        raise ValueError("The dtype of `lengths` must be int32. Got {lengths.dtype}")
+        raise ValueError("`block_tables` and `q` must have the same batch size")
+    if context_lens.dtype != jnp.int32:
+        raise ValueError("The dtype of `context_lens` must be int32. Got {context_lens.dtype}")
 
     if megacore_mode == "kv_head":
         if num_kv_heads % 2 != 0:
@@ -477,8 +474,8 @@ def paged_attention(
             jax.ShapeDtypeStruct((*q.shape[:-1], 1), jnp.float32),
         ],
     )(
-        lengths,
-        page_indices.reshape(-1),
+        context_lens,
+        block_tables.reshape(-1),
         jnp.zeros((1,), jnp.int32),
         jnp.zeros((1,), jnp.int32),
         q.astype(q_dtype_for_kernel_launch) * sm_scale,

@@ -64,7 +64,7 @@ class MultiPageAsyncCopyDescriptor:
         pages_hbm_ref,
         vmem_buffer,
         sem,
-        page_indices,
+        block_tables,
         page_indices_start_offset,
         num_pages_to_load,
         head_index,
@@ -75,9 +75,9 @@ class MultiPageAsyncCopyDescriptor:
           pages_hbm_ref: Pallas Ref to the source K/V pages in HBM.
           vmem_buffer: Pallas Ref to the destination buffer in VMEM.
           sem: Pallas Ref for the semaphore to use for synchronization.
-          page_indices: Pallas Ref to the array holding the indices of the pages
+          block_tables: Pallas Ref to the array holding the indices of the pages
             to be loaded from HBM.
-          page_indices_start_offset: Starting offset in `page_indices` array.
+          page_indices_start_offset: Starting offset in `block_tables` array.
           num_pages_to_load: The number of pages to copy.
           head_index: The specific head index to load pages for, if the
             `pages_hbm_ref` has a head dimension. If None, assumes no head dim.
@@ -89,7 +89,7 @@ class MultiPageAsyncCopyDescriptor:
         else:
             self._pages_hbm_ref = pages_hbm_ref
         self._sem = sem
-        self._page_indices = page_indices
+        self._page_indices = block_tables
         self._page_indices_start_offset = page_indices_start_offset
         self._async_copies = [self._make_async_copy(i) for i in range(self._num_pages_to_load)]
 

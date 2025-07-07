@@ -47,8 +47,8 @@ from ._forward_pallas import (
 def _ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
+    context_lens: jax.Array,  # i32[max_num_seqs]
+    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
     *,
@@ -65,11 +65,11 @@ def _ragged_paged_attention(
     Args:
       q: concatenated all sequences' queries.
       kv_pages: paged KV cache. Normally in HBM.
-      kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: the first index indicates which page to use in the kv cache
+      context_lens: padded kv lengths. Only the first num_seqs values are valid.
+      block_tables: the first index indicates which page to use in the kv cache
         for each sequence. Only the first num_seqs values are valid.
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
+        context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
@@ -87,8 +87,8 @@ def _ragged_paged_attention(
     static_validate_inputs(
         q,
         kv_pages,
-        kv_lens,
-        page_indices,
+        context_lens,
+        block_tables,
         cu_q_lens,
         num_seqs,
         sm_scale=sm_scale,
@@ -105,7 +105,7 @@ def _ragged_paged_attention(
     _, page_size, num_combined_kv_heads, _ = kv_pages.shape
     assert num_combined_kv_heads % 2 == 0
     num_kv_heads = num_combined_kv_heads // 2
-    _, pages_per_seq = page_indices.shape
+    _, pages_per_seq = block_tables.shape
     num_q_heads_per_blk, num_combined_kv_heads_per_blk = get_min_heads_per_blk(
         num_q_heads,
         num_combined_kv_heads,
@@ -146,7 +146,7 @@ def _ragged_paged_attention(
         kv_pages.dtype,
     )
     scratch_shapes = [double_buf_scratch, pltpu.SemaphoreType.DMA((2,)), lm_scratch, lm_scratch, acc_scratch]
-    scalar_prefetches = (kv_lens, page_indices, cu_q_lens, jnp.array((0, 0), jnp.int32), num_seqs)
+    scalar_prefetches = (context_lens, block_tables, cu_q_lens, jnp.array((0, 0), jnp.int32), num_seqs)
     kernel = pl.pallas_call(
         functools.partial(
             ragged_paged_attention_kernel,
@@ -176,8 +176,8 @@ def _ragged_paged_attention(
 def ragged_paged_attention(
     q: jax.Array,
     kv_pages: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
     *,
@@ -194,11 +194,11 @@ def ragged_paged_attention(
     Args:
       q: concatenated all sequences' queries.
       kv_pages: paged KV cache. Normally in HBM.
-      kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: the first index indicates which page to use in the kv cache
+      context_lens: padded kv lengths. Only the first num_seqs values are valid.
+      block_tables: the first index indicates which page to use in the kv cache
         for each sequence. Only the first num_seqs values are valid.
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-        kv_lens, only the first num_seqs+1 values are valid.
+        context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
@@ -218,8 +218,8 @@ def ragged_paged_attention(
     return _ragged_paged_attention(
         q,
         kv_pages=kv_pages,
-        kv_lens=kv_lens,
-        page_indices=page_indices,
+        context_lens=context_lens,
+        block_tables=block_tables,
         cu_q_lens=cu_q_lens,
         num_seqs=num_seqs,
         sm_scale=sm_scale,

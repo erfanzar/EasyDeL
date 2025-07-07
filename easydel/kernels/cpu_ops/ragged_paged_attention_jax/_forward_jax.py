@@ -23,16 +23,16 @@ def _ragged_paged_attention(
     queries: jnp.ndarray,
     key_pages: jnp.ndarray,
     value_pages: jnp.ndarray,
-    sequence_lengths: jnp.ndarray,
-    sequence_page_indices: jnp.ndarray,
-    cumulative_query_lengths: jnp.ndarray,
-    num_sequences: jnp.ndarray,
+    context_lens: jnp.ndarray,
+    block_tables: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    num_seqs: jnp.ndarray,
     softmax_scale: float,
     soft_cap: float | None,
 ) -> jnp.ndarray:
     total_query_tokens, num_q_heads, head_size = queries.shape
     page_size, num_kv_heads = value_pages.shape[1], value_pages.shape[2]
-    max_pages_per_sequence = sequence_page_indices.shape[-1]
+    max_pages_per_sequence = block_tables.shape[-1]
     out_shape = (total_query_tokens, num_q_heads, head_size)
     q_heads_per_group = num_q_heads // num_kv_heads
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
@@ -49,20 +49,20 @@ def _ragged_paged_attention(
     attention_output = jnp.zeros_like(padded_queries)
 
     def _compute_attention_for_sequence(seq_idx, output_accumulator):
-        num_queries_for_seq = cumulative_query_lengths[seq_idx + 1] - cumulative_query_lengths[seq_idx]
+        num_queries_for_seq = query_start_loc[seq_idx + 1] - query_start_loc[seq_idx]
 
         def _process_sequence_with_queries():
             num_query_blocks = (num_queries_for_seq + qblocks - 1) // qblocks
 
             def _process_query_block(query_block_idx, block_output_accumulator):
                 query_block_offset = query_block_idx * qblocks
-                query_block_global_start = cumulative_query_lengths[seq_idx] + query_block_offset
+                query_block_global_start = query_start_loc[seq_idx] + query_block_offset
                 query_block = jax.lax.dynamic_slice(
                     padded_queries,
                     (query_block_global_start, 0, 0, 0),
                     (qblocks, num_kv_heads, q_heads_per_group, head_size),
                 )
-                kv_cache_len_for_seq = sequence_lengths[seq_idx]
+                kv_cache_len_for_seq = context_lens[seq_idx]
                 query_block_start_token_idx = kv_cache_len_for_seq - num_queries_for_seq + query_block_offset
                 query_token_indices = jnp.arange(qblocks, dtype=jnp.int32) + query_block_start_token_idx
                 kv_tokens_per_block = page_size * kvblocks
@@ -72,7 +72,7 @@ def _ragged_paged_attention(
                     output_block, sum_exponentials_block, max_score_block = online_softmax_carry
                     page_map_start_index = kv_block_idx * kvblocks
                     page_indices_for_block = jax.lax.dynamic_slice(
-                        sequence_page_indices,
+                        block_tables,
                         (seq_idx, page_map_start_index),
                         (1, kvblocks),
                     )
@@ -144,7 +144,7 @@ def _ragged_paged_attention(
         )
 
     return jax.lax.slice(
-        jax.lax.fori_loop(0, num_sequences[0], _compute_attention_for_sequence, attention_output),
+        jax.lax.fori_loop(0, num_seqs[0], _compute_attention_for_sequence, attention_output),
         (0, 0, 0, 0),
         (total_query_tokens, num_kv_heads, q_heads_per_group, head_size),
     ).reshape(out_shape)
