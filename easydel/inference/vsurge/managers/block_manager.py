@@ -57,12 +57,17 @@ class BlockAllocator:
     def num_free(self) -> int:
         return len(self.free_blocks)
 
+    def __repr__(self) -> str:
+        """Provides a summary of the allocator's state."""
+        return f"BlockAllocator(total={self.num_blocks}, free={self.num_free}, allocated={len(self.allocated)})"
+
 
 class BlockManager:
     """Thread-safe block manager with copy-on-write semantics."""
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
+        self.num_blocks = num_blocks
         self.allocator = BlockAllocator(num_blocks)
         self.blocks: dict[int, Block] = {i: Block(i) for i in range(num_blocks)}
         self.hash_to_block: dict[int, int] = {}
@@ -80,7 +85,6 @@ class BlockManager:
                 block_ids.append(block_id)
             return block_ids
         except Exception:
-            # Rollback on failure
             for bid in block_ids:
                 self.allocator.deallocate(bid)
             raise
@@ -108,8 +112,17 @@ class BlockManager:
         if block.ref_count == 1:
             return block_id, False
 
-        # Need to copy
         new_block_id = self.allocator.allocate()
         self.blocks[new_block_id] = Block(new_block_id, ref_count=1)
         self.decrement_ref(block_id)
         return new_block_id, True
+
+    def __repr__(self) -> str:
+        """Provides a summary of the block manager's state."""
+        return (
+            f"BlockManager("
+            f"block_size={self.block_size}, "
+            f"allocator={self.allocator!r}, "
+            f"hashed_blocks={len(self.hash_to_block)}"
+            f")"
+        )

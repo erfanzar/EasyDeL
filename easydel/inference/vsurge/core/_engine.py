@@ -81,8 +81,8 @@ class vEngine:
         prefill_lengths: int | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
-        num_pages: int | None = None,
-        tokens_per_page: int | None = None,
+        page_size: int = 128,
+        hbm_utilization: float = 0.8,
         seed: int = 894,
     ):
         """Initializes the vEngine.
@@ -122,7 +122,13 @@ class vEngine:
         self._max_decodes_length = self._max_length - self._max_prefill_length
         self._max_prefill_lengths = prefill_lengths or calculate_pefill_lengths(
             max_prefill_length=self._max_prefill_length,
-            page_size=128,
+            page_size=page_size,
+        )
+
+        self.page_metadata = model.create_paged_metadata(
+            dtype=model.config.kvdtype or model.dtype,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
         )
 
         self.manager = None

@@ -13,7 +13,7 @@
 # limitations under the License.
 from .block_manager import Block, BlockAllocator, BlockManager
 from .model_io import ModelInput, ModelIOProcessor
-from .scheduler import BatchInfo, PriorityScheduler, SchedulerConfig
+from .scheduler import BatchInfo, Scheduler, SchedulerConfig
 from .sequence import SequenceMetadata, SequenceState, SequenceStatus
 
 __all__ = (
@@ -23,7 +23,7 @@ __all__ = (
     "BlockManager",
     "ModelIOProcessor",
     "ModelInput",
-    "PriorityScheduler",
+    "Scheduler",
     "SchedulerConfig",
     "SequenceMetadata",
     "SequenceState",

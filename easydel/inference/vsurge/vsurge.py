@@ -372,8 +372,8 @@ class vSurge:
         prefill_lengths: int | list[int] | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
-        num_pages: int | None = None,
-        tokens_per_page: int | None = None,
+        page_size: int = 128,
+        hbm_utilization: float = 0.8,
         interleaved_mode: bool = False,
         detokenizing_blocks: int = 8,
         slot_clear_steps: int = 0,
@@ -439,10 +439,7 @@ class vSurge:
         actual_prefill_lengths: list[int]
         if isinstance(prefill_lengths, int):
             max_prefill_length = prefill_lengths
-            actual_prefill_lengths = calculate_pefill_lengths(
-                max_prefill_length=max_prefill_length,
-                num_pages=num_pages or 128,
-            )
+            actual_prefill_lengths = calculate_pefill_lengths(max_prefill_length=max_prefill_length)
             logger.info(f"Computed prefill lengths are {actual_prefill_lengths}")
         elif isinstance(prefill_lengths, list):
             if not all(isinstance(i, int) for i in prefill_lengths):
@@ -451,10 +448,7 @@ class vSurge:
                 raise ValueError("The maximum value in `prefill_lengths` list must match `max_prefill_length`.")
             actual_prefill_lengths = prefill_lengths
         elif prefill_lengths is None:
-            actual_prefill_lengths = calculate_pefill_lengths(
-                max_prefill_length=max_prefill_length,
-                num_pages=num_pages or 128,
-            )
+            actual_prefill_lengths = calculate_pefill_lengths(max_prefill_length=max_prefill_length)
             logger.info(f"Computed prefill lengths are {actual_prefill_lengths}")
         else:
             raise TypeError("`prefill_lengths` must be an int, list of ints, or None.")
@@ -468,9 +462,9 @@ class vSurge:
                     max_concurrent_decodes=max_concurrent_decodes,
                     prefill_lengths=actual_prefill_lengths,
                     max_prefill_length=max_prefill_length,
-                    num_pages=num_pages,
-                    tokens_per_page=tokens_per_page,
+                    hbm_utilization=hbm_utilization,
                     max_length=max_length,
+                    page_size=page_size,
                     seed=seed,
                 ),
                 interleaved_mode=interleaved_mode,

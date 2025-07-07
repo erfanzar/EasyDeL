@@ -25,8 +25,10 @@ import numpy as np
 from jax import numpy as jnp
 
 from easydel.inference.utilities import SamplingParams
+from easydel.layers.caching.page.paged_cache import PagesMetadata
 from easydel.utils.helpers import get_logger
 
+from ..managers import BatchInfo, BlockManager, Scheduler, SchedulerConfig
 from ..utils import ActiveRequest, ResultTokens, ReturnSample, SafeThread, pad_tokens, process_result_tokens
 from ._engine import vEngine
 
@@ -325,7 +327,23 @@ class vDriver:
         self._detokenizing_blocks = detokenizing_blocks
         self._slot_clear_steps = slot_clear_steps
         self._use_operation_lock = use_operation_lock
-        # self.scheduler = PriorityScheduler(SchedulerConfig())
+
+        self.scheduler_config = SchedulerConfig(
+            max_batch_size=engine.max_concurrent_decodes,
+            max_sequence_length=engine.max_length,
+            block_size=engine.page_metadata.page_size,
+            num_blocks=engine.page_metadata.num_pages,
+            eos_token_ids=list(engine.eos_token_ids),
+        )
+        self.block_manager = BlockManager(
+            num_blocks=self.scheduler_config.num_blocks,
+            block_size=self.scheduler_config.block_size,
+        )
+        self.scheduler = Scheduler(
+            config=self.scheduler_config,
+            block_manager=self.block_manager,
+        )
+
         self.prefill_backlog_maxsize = prefill_backlog_maxsize
         self.transfer_backlog_maxsize = transfer_backlog_maxsize
         self.decode_backlog_maxsize = decode_backlog_maxsize
@@ -488,6 +506,67 @@ class vDriver:
             int: Maximum concurrent decodes supported by the engine.
         """
         return self._engine.total_max_concurrent_decodes
+
+    def prepare_pages_metadata(self, batch_info: BatchInfo) -> PagesMetadata:
+        """
+        Converts a BatchInfo object from the scheduler into a PagesMetadata object
+        for the JAX engine, correctly handling padding for static shapes.
+        """
+        sequences = batch_info.sequences
+        num_seqs = len(sequences)
+
+        if num_seqs == 0:
+            max_blocks_in_batch = 1
+            return PagesMetadata(
+                slot_mapping=jnp.zeros([0], dtype=jnp.int32),
+                block_tables=jnp.full((0, max_blocks_in_batch), -1, dtype=jnp.int32),
+                context_lens=jnp.zeros([0], dtype=jnp.int32),
+                block_table_lens=jnp.zeros([0], dtype=jnp.int32),
+                query_start_loc=jnp.zeros([1], dtype=jnp.int32),
+                num_seqs=jnp.array([0], dtype=jnp.int32),
+                page_size=self.scheduler_config.block_size,
+            )
+
+        slot_mapping_list = []
+        context_lens_list = []
+        block_tables_list = []
+        block_table_lens_list = []
+        query_start_loc_list = [0]
+        current_token_count = 0
+        max_blocks_in_batch = max(seq.num_blocks for seq in sequences)
+
+        for seq in sequences:
+            context_lens_list.append(seq.num_tokens)
+            block_table_lens_list.append(seq.num_blocks)
+            padding_size = max_blocks_in_batch - seq.num_blocks
+            padded_table = seq.block_table + [-1] * padding_size
+            block_tables_list.append(padded_table)
+            if batch_info.is_prefill:
+                tokens_to_process = seq.num_tokens
+                start_idx = 0
+            else:
+                tokens_to_process = 1
+                start_idx = seq.num_tokens - 1
+            for i in range(tokens_to_process):
+                token_pos = start_idx + i
+                block_idx = token_pos // self.scheduler_config.block_size
+                block_offset = token_pos % self.scheduler_config.block_size
+                block_number = seq.block_table[block_idx]
+                physical_slot = block_number * self.scheduler_config.block_size + block_offset
+                slot_mapping_list.append(physical_slot)
+
+            current_token_count += tokens_to_process
+            query_start_loc_list.append(current_token_count)
+
+        return PagesMetadata(
+            slot_mapping=jnp.array(slot_mapping_list, dtype=jnp.int32),
+            block_tables=jnp.array(block_tables_list, dtype=jnp.int32),
+            context_lens=jnp.array(context_lens_list, dtype=jnp.int32),
+            block_table_lens=jnp.array(block_table_lens_list, dtype=jnp.int32),
+            query_start_loc=jnp.array(query_start_loc_list, dtype=jnp.int32),
+            num_seqs=jnp.array([num_seqs], dtype=jnp.int32),
+            page_size=self.scheduler_config.block_size,
+        )
 
     def _jax_transfer_prefill_result(self, new_request: ActiveRequest):
         """

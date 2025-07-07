@@ -99,3 +99,14 @@ class SequenceState:
             block_table=self.block_table.copy(),
             status=self.status,
         )
+
+    def __repr__(self) -> str:
+        """Provides a concise summary of the sequence's state."""
+        return (
+            f"SequenceState("
+            f"id={self.metadata.seq_id}, "
+            f"status={self.status.name}, "
+            f"tokens={self.num_tokens} (prompt={len(self.prompt_tokens)}, output={len(self.output_tokens)}), "
+            f"blocks={len(self.block_table)}"
+            f")"
+        )
