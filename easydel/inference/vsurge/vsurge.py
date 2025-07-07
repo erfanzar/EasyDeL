@@ -153,7 +153,7 @@ class SmartBytecodeDecoder:
         else:
             tokens_to_decode = all_tokens
         try:
-            full_decoded = self.processor.decode(tokens_to_decode)
+            full_decoded = self.processor.decode(tokens_to_decode, skip_special_tokens=True)
             if self.contains_malformed_chars(full_decoded):
                 logger.debug("Malformed characters detected in full decode")
                 return self._handle_malformed_decode(tokens_to_decode, previous_good_text)
@@ -174,7 +174,7 @@ class SmartBytecodeDecoder:
             return self.fallback_char, [], True
         for i in range(len(tokens) - 1, 0, -1):
             try:
-                partial_decoded = self.processor.decode(tokens[:i])
+                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
                 if not self.contains_malformed_chars(partial_decoded):
                     if previous_good_text and partial_decoded.startswith(previous_good_text):
                         good_new_text = partial_decoded[len(previous_good_text) :]
@@ -197,7 +197,7 @@ class SmartBytecodeDecoder:
 
         for i in range(len(tokens) - 1, 0, -1):
             try:
-                partial_decoded = self.processor.decode(tokens[:i])
+                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
                 if previous_good_text and partial_decoded.startswith(previous_good_text):
                     good_new_text = partial_decoded[len(previous_good_text) :]
                 else:
@@ -935,7 +935,7 @@ class vSurge:
                         text_for_this_yield_step_chunk = current_text_chunk
                     else:
                         try:
-                            full_decoded = self.processor.decode(state.all_token_ids)
+                            full_decoded = self.processor.decode(state.all_token_ids, skip_special_tokens=True)
                             if not self.smart_decoder.contains_malformed_chars(full_decoded):
                                 driver_cumulative_text = full_decoded
                         except Exception:
@@ -1122,7 +1122,10 @@ class vSurge:
                             state.tps = final_chunk_from_buffer.tokens_per_second
                             state.num_tokens = final_chunk_from_buffer.num_generated_tokens
                             if bytecode_decode and state.all_token_ids:
-                                full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                full_decoded_text_now = self.processor.decode(
+                                    state.all_token_ids,
+                                    skip_special_tokens=True,
+                                )
                                 prev_decoded_text = state.decoded_text_upto_previous_step or ""
                                 current_text_chunk = (
                                     full_decoded_text_now[len(prev_decoded_text) :]
@@ -1182,7 +1185,10 @@ class vSurge:
                                 state.current_step_text = current_text_chunk
                                 if not had_malformed or not new_buffered_tokens:
                                     try:
-                                        full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                        full_decoded_text_now = self.processor.decode(
+                                            state.all_token_ids,
+                                            skip_special_tokens=True,
+                                        )
                                         if not self.smart_decoder.contains_malformed_chars(full_decoded_text_now):
                                             state.full_accumulated_text = full_decoded_text_now
                                             state.decoded_text_upto_previous_step = full_decoded_text_now
@@ -1198,7 +1204,8 @@ class vSurge:
                             else:
                                 state.current_step_text = new_token_ids_this_step
                                 state.full_accumulated_text = [
-                                    self.processor.decode([tok_id]) for tok_id in state.all_token_ids
+                                    self.processor.decode([tok_id], skip_special_tokens=True)
+                                    for tok_id in state.all_token_ids
                                 ]
                 else:  # Server-side tokenization
                     if self.should_buffer_response(driver_step_output_list):
@@ -1222,7 +1229,10 @@ class vSurge:
                             if chunk.text or not state.all_token_ids:
                                 newly_set_current_step_text_flags[original_idx] = True
                                 if bytecode_decode and state.all_token_ids:
-                                    full_decoded_text_now = self.processor.decode(state.all_token_ids)
+                                    full_decoded_text_now = self.processor.decode(
+                                        state.all_token_ids,
+                                        skip_special_tokens=True,
+                                    )
                                     prev_decoded_text = state.decoded_text_upto_previous_step or ""
                                     current_text_chunk = (
                                         full_decoded_text_now[len(prev_decoded_text) :]
