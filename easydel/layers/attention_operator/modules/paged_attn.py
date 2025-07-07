@@ -82,7 +82,7 @@ class PagedAttn(AttentionImpl):
             key_pages=cache_view.key_pages,
             value_pages=cache_view.value_pages,
             query_start_loc=cache_metadata.query_start_loc,
-            sequence_lengths=cache_metadata.context_lens,
+            context_lens=cache_metadata.context_lens,
             block_tables=cache_metadata.block_tables,
             num_seqs=cache_metadata.num_seqs,
             softmax_scale=self.metadata.softmax_scale,

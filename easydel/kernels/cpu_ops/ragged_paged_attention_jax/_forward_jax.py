@@ -107,8 +107,15 @@ def _ragged_paged_attention(
                     (qblocks, num_kv_heads, q_heads_per_group, head_size),
                     dtype=padded_queries.dtype,
                 )
-                initial_sum_exponentials = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=jnp.float32)
-                initial_max_score = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=jnp.float32)
+                initial_sum_exponentials = jnp.zeros(
+                    (qblocks, num_kv_heads, q_heads_per_group),
+                    dtype=padded_queries.dtype,
+                )
+                initial_max_score = jnp.full(
+                    (qblocks, num_kv_heads, q_heads_per_group),
+                    -jnp.inf,
+                    dtype=padded_queries.dtype,
+                )
 
                 output_block, sum_exponentials_block, _ = jax.lax.fori_loop(
                     0,
