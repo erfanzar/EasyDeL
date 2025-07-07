@@ -267,9 +267,10 @@ class EasyGenerationMixin:
             assert hbm_utilization is not None, "if your not passing orginal metadata you should pass `hbm_utilization`"
 
             metadata = self.create_paged_metadata(hbm_utilization=hbm_utilization, page_size=page_size, dtype=dtype)
+        assert dtype is not None, "`Dtype` should be provided."
         return PagesCache.init_cache(
             mesh=self.config.mesh,
-            dtype=self.dtype,
+            dtype=dtype,
             metadata=metadata,
             partition_manager=self.config.partition_manager,
             quantizer=self._quant_class(

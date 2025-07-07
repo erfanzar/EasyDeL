@@ -35,8 +35,6 @@ class MultiPageAsyncCopyDescriptor:
         self._vmem_buf = vmem_buf
         seq_id, start_page_idx, end_page_idx = metadata
         self._async_copies = []
-        # TODO(jevinjiang): Only fetch dynamic shape in need! This will insert
-        # a bunch of if-ops. Check the performance when we have benchmarking setup.
         for i in range(vmem_buf.shape[0]):
             page_idx = start_page_idx + i
             page_idx = jax.lax.select(page_idx < end_page_idx, page_idx, 0)
@@ -62,8 +60,8 @@ class MultiPageAsyncCopyDescriptor:
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
+    context_lens: jax.Array,  # i32[max_num_seqs]
+    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1],
     *,
@@ -75,8 +73,8 @@ def ref_ragged_paged_attention(
     static_validate_inputs(
         queries,
         kv_pages,
-        kv_lens,
-        page_indices,
+        context_lens,
+        block_tables,
         cu_q_lens,
         num_seqs,
         sm_scale=sm_scale,
@@ -97,8 +95,8 @@ def ref_ragged_paged_attention(
         q_start = cu_q_lens[i]
         q_end = cu_q_lens[i + 1]
         q_len = q_end - q_start
-        kv_len = kv_lens[i]
-        indices = page_indices[i]
+        kv_len = context_lens[i]
+        indices = block_tables[i]
         q = queries[q_start:q_end]
         k = kv_pages[indices, :, 0::2, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
         v = kv_pages[indices, :, 1::2, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
@@ -125,8 +123,8 @@ def ref_ragged_paged_attention(
 def dynamic_validate_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
+    context_lens: jax.Array,  # i32[max_num_seqs]
+    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
     *,
@@ -142,8 +140,8 @@ def dynamic_validate_inputs(
     static_validate_inputs(
         q,
         kv_pages,
-        kv_lens,
-        page_indices,
+        context_lens,
+        block_tables,
         cu_q_lens,
         num_seqs,
         sm_scale=sm_scale,
@@ -156,10 +154,10 @@ def dynamic_validate_inputs(
     )
     max_num_batched_tokens = q.shape[0]
     page_size = kv_pages.shape[1]
-    max_num_seqs, pages_per_seq = page_indices.shape
+    max_num_seqs, pages_per_seq = block_tables.shape
     if num_seqs[0] > max_num_seqs:
         raise ValueError(f"{num_seqs[0]=} must be less or equal to {max_num_seqs=}")
-    max_kv_len = jnp.max(kv_lens)
+    max_kv_len = jnp.max(context_lens)
     min_pages_per_seq = cdiv(max_kv_len, page_size)
     if pages_per_seq < min_pages_per_seq:
         raise ValueError(
@@ -169,7 +167,7 @@ def dynamic_validate_inputs(
         raise ValueError(f"Total q tokens {cu_q_lens[num_seqs[0]]} must be less or equal to {max_num_batched_tokens=}.")
     for i in range(num_seqs[0]):
         q_len = cu_q_lens[i + 1] - cu_q_lens[i]
-        kv_len = kv_lens[i]
+        kv_len = context_lens[i]
         if q_len > kv_len:
             raise ValueError(f"{q_len=} must be less or equal to {kv_len=} at sequence {i}.")
 
@@ -178,8 +176,8 @@ def dynamic_validate_inputs(
 def static_validate_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
+    context_lens: jax.Array,  # i32[max_num_seqs]
+    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
     *,
@@ -196,23 +194,23 @@ def static_validate_inputs(
     _, _, num_combined_kv_heads, head_dim_k = kv_pages.shape
     assert num_combined_kv_heads % 2 == 0
     num_kv_heads = num_combined_kv_heads // 2
-    max_num_seqs, pages_per_seq = page_indices.shape
+    max_num_seqs, pages_per_seq = block_tables.shape
     if num_seqs.shape != (1,):
         raise ValueError(f"{num_seqs.shape=} must be (1,)")
     if head_dim_k != head_dim:
         raise ValueError(f"Q head_dim {head_dim} must be the same as that of K/V {head_dim_k}.")
-    if kv_lens.shape != (max_num_seqs,):
+    if context_lens.shape != (max_num_seqs,):
         raise ValueError(
-            f"Expected {kv_lens.shape=} to be ({max_num_seqs},) where `max_num_seqs` is `page_indices.shape[0]`."
+            f"Expected {context_lens.shape=} to be ({max_num_seqs},) where `max_num_seqs` is `block_tables.shape[0]`."
         )
     if cu_q_lens.shape != (max_num_seqs + 1,):
         raise ValueError(
-            f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},)  where `max_num_seqs` is `page_indices.shape[0]`."
+            f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},)  where `max_num_seqs` is `block_tables.shape[0]`."
         )
-    if kv_lens.dtype != jnp.int32 or page_indices.dtype != jnp.int32 or cu_q_lens.dtype != jnp.int32:
+    if context_lens.dtype != jnp.int32 or block_tables.dtype != jnp.int32 or cu_q_lens.dtype != jnp.int32:
         raise ValueError(
-            "The dtype of `kv_lens`, `page_indices`, and `cu_q_lens` must be"
-            f" int32. Got {kv_lens.dtype=}, {page_indices.dtype=},"
+            "The dtype of `context_lens`, `block_tables`, and `cu_q_lens` must be"
+            f" int32. Got {context_lens.dtype=}, {block_tables.dtype=},"
             f" {cu_q_lens.dtype=}."
         )
     if num_q_heads % num_kv_heads != 0:
@@ -233,7 +231,7 @@ def static_validate_inputs(
 
 def ragged_paged_attention_kernel(
     # Prefetch
-    kv_lens_ref,  # [max_num_seqs]
+    context_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs, pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     seq_buf_idx_ref,
@@ -277,7 +275,7 @@ def ragged_paged_attention_kernel(
 
     def create_kv_async_copy_descriptors(heads_blk_idx, seq_idx, kv_blk_idx, buf_idx):
         start_kv_page_idx = kv_blk_idx * num_kv_pages_per_blk
-        end_kv_page_idx = jnp.minimum(pages_per_seq, cdiv(kv_lens_ref[seq_idx], page_size))
+        end_kv_page_idx = jnp.minimum(pages_per_seq, cdiv(context_lens_ref[seq_idx], page_size))
         metadata = (seq_idx, start_kv_page_idx, end_kv_page_idx)
         heads_start = heads_blk_idx * num_combined_kv_heads_per_blk
         async_copy_kv = MultiPageAsyncCopyDescriptor(
@@ -350,7 +348,7 @@ def ragged_paged_attention_kernel(
         q_start = cu_q_lens_ref[cur_seq_idx]
         q_end = cu_q_lens_ref[cur_seq_idx + 1]
         q_len = q_end - q_start
-        kv_len = kv_lens_ref[cur_seq_idx]
+        kv_len = context_lens_ref[cur_seq_idx]
 
         def get_next_prefetch_ids(heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx):
             next_kv_blk_idx = kv_blk_idx + 1

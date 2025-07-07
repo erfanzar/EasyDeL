@@ -21,10 +21,10 @@ def ragged_paged_attention(
     queries: jnp.ndarray,
     key_pages: jnp.ndarray,
     value_pages: jnp.ndarray,
-    sequence_lengths: jnp.ndarray,
-    sequence_page_indices: jnp.ndarray,
-    cumulative_query_lengths: jnp.ndarray,
-    num_sequences: jnp.ndarray,
+    context_lens: jnp.ndarray,
+    block_tables: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    num_seqs: jnp.ndarray,
     softmax_scale: float | None = None,
     soft_cap: float | None = None,
 ) -> jnp.ndarray:
@@ -47,15 +47,15 @@ def ragged_paged_attention(
             Shape: `[num_pages, page_size, num_kv_heads, head_size]`.
         value_pages: The paged Value cache.
             Shape: `[num_pages, page_size, num_kv_heads, head_size]`.
-        sequence_lengths: The total length of each sequence in the KV cache.
-            Shape: `[num_sequences]`.
-        sequence_page_indices: A map from each sequence to its list of
+        context_lens: The total length of each sequence in the KV cache.
+            Shape: `[num_seqs]`.
+        block_tables: A map from each sequence to its list of
             physical page indices in the KV cache.
-            Shape: `[num_sequences, max_pages_per_sequence]`.
-        cumulative_query_lengths: The cumulative sum of query lengths for each
+            Shape: `[num_seqs, max_pages_per_sequence]`.
+        query_start_loc: The cumulative sum of query lengths for each
             sequence, used to index into the `queries` tensor.
-            Shape: `[num_sequences + 1]`.
-        num_sequences: The total number of sequences in the batch which should be a shape[1] int32.
+            Shape: `[num_seqs + 1]`.
+        num_seqs: The total number of sequences in the batch which should be a shape[1] int32.
         softmax_scale: The scaling factor to apply to the attention scores
             before the softmax operation (typically `1 / sqrt(head_size)`).
         soft_cap: An optional value to cap the attention scores with `tanh`.
@@ -69,10 +69,10 @@ def ragged_paged_attention(
         queries=queries,
         key_pages=key_pages,
         value_pages=value_pages,
-        sequence_lengths=sequence_lengths,
-        sequence_page_indices=sequence_page_indices,
-        cumulative_query_lengths=cumulative_query_lengths,
-        num_sequences=num_sequences,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        query_start_loc=query_start_loc,
+        num_seqs=num_seqs,
         softmax_scale=softmax_scale,
         soft_cap=soft_cap,
     )
