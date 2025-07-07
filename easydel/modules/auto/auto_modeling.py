@@ -145,8 +145,12 @@ class BaseAutoEasyModel:
         if partition_axis is None:
             partition_axis = PartitionAxis()
         if from_torch is None:
-            from_torch = not cls._is_easydel(pretrained_model_name_or_path)
-
+            try:
+                from_torch = not cls._is_easydel(pretrained_model_name_or_path)
+            except OSError as e:
+                from_torch = False
+                if "Error no file named easydel-model.parameters" in str(e):
+                    from_torch = True
         if from_torch:
             return cls._from_torch_pretrained(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,

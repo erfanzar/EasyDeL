@@ -284,3 +284,16 @@ class PagesMetadata:
     page_size: int = 128
     prefill_chunk_size: int = 512
     blocksize: int = 256
+
+    @classmethod
+    def create_empty(cls, num_tokens: int, max_num_reqs: int, max_blocks: int, page_size: int = 128) -> PagesMetadata:
+        """Create empty metadata with proper shapes."""
+        return cls(
+            slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32),
+            block_tables=jnp.zeros((max_num_reqs, max_blocks), dtype=jnp.int32),
+            context_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
+            query_start_loc=jnp.zeros([max_num_reqs + 1], dtype=jnp.int32),
+            num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
+            block_table_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
+            page_size=page_size,
+        )
