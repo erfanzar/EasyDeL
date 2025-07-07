@@ -30,7 +30,7 @@ from .sequence import SequenceState, SequenceStatus
 class SchedulerConfig:
     """Immutable scheduler configuration."""
 
-    max_batch_size: int
+    max_concurrent_tokens: int
     max_sequence_length: int
     block_size: int
     num_blocks: int
@@ -44,6 +44,7 @@ class BatchInfo:
 
     sequences: list[SequenceState]
     is_prefill: bool
+    is_decode: bool
     total_tokens: int
     block_copies: dict[int, int] = field(default_factory=dict)
 
@@ -121,10 +122,9 @@ class Scheduler:
 
         temp_waiting = []
 
-        while self.waiting_queue and len(batch_sequences) < self.config.max_batch_size:
+        while self.waiting_queue and len(batch_sequences) < self.config.max_concurrent_tokens:
             priority, seq_id, seq = heapq.heappop(self.waiting_queue)
-
-            if total_tokens + seq.num_tokens > self.config.max_batch_size:
+            if total_tokens + seq.num_tokens > self.config.max_concurrent_tokens:
                 temp_waiting.append((priority, seq_id, seq))
                 continue
 
@@ -161,7 +161,7 @@ class Scheduler:
         sorted_running = sorted(self.running_sequences.values(), key=lambda s: s.metadata.seq_id)
 
         for seq in sorted_running:
-            if len(batch_sequences) >= self.config.max_batch_size:
+            if len(batch_sequences) >= self.config.max_concurrent_tokens:
                 break
 
             if seq.num_tokens % self.config.block_size == 0:
@@ -185,13 +185,21 @@ class Scheduler:
 
     def schedule(self) -> BatchInfo | None:
         """Schedule next batch of sequences."""
-        if self.waiting_queue:
-            batch = self._schedule_prefill_batch()
-            if batch.sequences:
-                return batch
-
-        if self.running_sequences:
-            return self._schedule_decode_batch()
+        prefill_batch = self._schedule_prefill_batch()
+        if prefill_batch:
+            return BatchInfo(
+                sequences=prefill_batch,
+                is_prefill=True,
+                is_decode=False,
+            )
+        decode_batch, block_copies = self._schedule_decode_batch()
+        if decode_batch:
+            return BatchInfo(
+                sequences=decode_batch,
+                is_prefill=False,
+                is_decode=True,
+                block_copies=block_copies,
+            )
 
         return None
 

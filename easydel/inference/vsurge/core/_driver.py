@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import typing as tp
+from functools import cached_property
 
 import jax
 import numpy as np
@@ -28,7 +29,7 @@ from easydel.inference.utilities import SamplingParams
 from easydel.layers.caching.page.paged_cache import PagesMetadata
 from easydel.utils.helpers import get_logger
 
-from ..managers import BatchInfo, BlockManager, Scheduler, SchedulerConfig
+from ..managers import BatchInfo, BlockManager, Scheduler, SchedulerConfig, SequenceMetadata, SequenceState
 from ..utils import ActiveRequest, ResultTokens, ReturnSample, SafeThread, pad_tokens, process_result_tokens
 from ._engine import vEngine
 
@@ -329,7 +330,7 @@ class vDriver:
         self._use_operation_lock = use_operation_lock
 
         self.scheduler_config = SchedulerConfig(
-            max_batch_size=engine.max_concurrent_decodes,
+            max_concurrent_tokens=engine.max_concurrent_decodes + engine.max_prefill_length,
             max_sequence_length=engine.max_length,
             block_size=engine.page_metadata.page_size,
             num_blocks=engine.page_metadata.num_pages,
@@ -349,7 +350,7 @@ class vDriver:
         self.decode_backlog_maxsize = decode_backlog_maxsize
 
         self.metrics_recorder = MetricsRecorder(metrics_log_interval_sec)
-
+        self._request_counter = 0
         if self._use_operation_lock:
             self._operation_lock = threading.Lock()
         else:
@@ -359,6 +360,10 @@ class vDriver:
         self.log = logger.info if verbose else logger.debug
         self.live = False
         self._metrics_thread = None
+
+    @cached_property
+    def is_paged_runtime(self) -> bool:
+        return self._engine.is_paged_runtime
 
     def _acquire_operation_lock_if_needed(self):
         """Acquires the operation lock if it's enabled and records wait time."""
@@ -375,6 +380,10 @@ class vDriver:
             self._operation_lock.release()
 
     @property
+    def engine(self) -> vEngine:
+        return self._engine
+
+    @property
     def driver_name(self) -> str:
         """
         Returns a standardized name for the driver and its model.
@@ -386,6 +395,27 @@ class vDriver:
         """
         return self._get_model_name(self._engine.model)
 
+    def create_sequence_from_request(self, request: ActiveRequest) -> SequenceState:
+        (prompt_tokens, *_), sampling_params = self._process_prefill_content(
+            request,
+            self.engine.processor,
+            self.engine.max_prefill_length,
+            self.engine.prefill_lengths,
+            self.engine.pad_token_id,
+            do_pad=False,
+        )
+        return SequenceState(
+            metadata=SequenceMetadata(
+                seq_id=self._request_counter,
+                block_size=self._engine.page_metadata.page_size,
+                max_tokens=sampling_params.max_tokens,
+                temperature=sampling_params.temperature,
+                top_k=sampling_params.top_k,
+                top_p=sampling_params.top_p,
+            ),
+            prompt_tokens=prompt_tokens[0],
+        )
+
     def place_request_on_prefill_queue(self, request: ActiveRequest):
         """
         Places a new active request onto the prefill backlog queue.
@@ -396,11 +426,18 @@ class vDriver:
         Args:
             request (ActiveRequest): The request to be prefilled.
         """
-        try:
-            self._prefill_backlog.put(request, block=False)
-        except queue.Full:
-            self.log(f"Prefill backlog is full (max_size={self.prefill_backlog_maxsize}). Blocking to place request.")
-            self._prefill_backlog.put(request, block=True)
+        if self.is_paged_runtime:
+            sequence = self.create_sequence_from_request(request)
+            self.scheduler.add_sequence(sequence)
+            self._request_counter += 1
+        else:
+            try:
+                self._prefill_backlog.put(request, block=False)
+            except queue.Full:
+                self.log(
+                    f"Prefill backlog is full (max_size={self.prefill_backlog_maxsize}). Blocking to place request."
+                )
+                self._prefill_backlog.put(request, block=True)
 
     @property
     def processor(self) -> ProcessingClassType:
@@ -507,66 +544,7 @@ class vDriver:
         """
         return self._engine.total_max_concurrent_decodes
 
-    def prepare_pages_metadata(self, batch_info: BatchInfo) -> PagesMetadata:
-        """
-        Converts a BatchInfo object from the scheduler into a PagesMetadata object
-        for the JAX engine, correctly handling padding for static shapes.
-        """
-        sequences = batch_info.sequences
-        num_seqs = len(sequences)
-
-        if num_seqs == 0:
-            max_blocks_in_batch = 1
-            return PagesMetadata(
-                slot_mapping=jnp.zeros([0], dtype=jnp.int32),
-                block_tables=jnp.full((0, max_blocks_in_batch), -1, dtype=jnp.int32),
-                context_lens=jnp.zeros([0], dtype=jnp.int32),
-                block_table_lens=jnp.zeros([0], dtype=jnp.int32),
-                query_start_loc=jnp.zeros([1], dtype=jnp.int32),
-                num_seqs=jnp.array([0], dtype=jnp.int32),
-                page_size=self.scheduler_config.block_size,
-            )
-
-        slot_mapping_list = []
-        context_lens_list = []
-        block_tables_list = []
-        block_table_lens_list = []
-        query_start_loc_list = [0]
-        current_token_count = 0
-        max_blocks_in_batch = max(seq.num_blocks for seq in sequences)
-
-        for seq in sequences:
-            context_lens_list.append(seq.num_tokens)
-            block_table_lens_list.append(seq.num_blocks)
-            padding_size = max_blocks_in_batch - seq.num_blocks
-            padded_table = seq.block_table + [-1] * padding_size
-            block_tables_list.append(padded_table)
-            if batch_info.is_prefill:
-                tokens_to_process = seq.num_tokens
-                start_idx = 0
-            else:
-                tokens_to_process = 1
-                start_idx = seq.num_tokens - 1
-            for i in range(tokens_to_process):
-                token_pos = start_idx + i
-                block_idx = token_pos // self.scheduler_config.block_size
-                block_offset = token_pos % self.scheduler_config.block_size
-                block_number = seq.block_table[block_idx]
-                physical_slot = block_number * self.scheduler_config.block_size + block_offset
-                slot_mapping_list.append(physical_slot)
-
-            current_token_count += tokens_to_process
-            query_start_loc_list.append(current_token_count)
-
-        return PagesMetadata(
-            slot_mapping=jnp.array(slot_mapping_list, dtype=jnp.int32),
-            block_tables=jnp.array(block_tables_list, dtype=jnp.int32),
-            context_lens=jnp.array(context_lens_list, dtype=jnp.int32),
-            block_table_lens=jnp.array(block_table_lens_list, dtype=jnp.int32),
-            query_start_loc=jnp.array(query_start_loc_list, dtype=jnp.int32),
-            num_seqs=jnp.array([num_seqs], dtype=jnp.int32),
-            page_size=self.scheduler_config.block_size,
-        )
+    def prepare_pages_metadata(self, batch_info: BatchInfo) -> PagesMetadata: ...
 
     def _jax_transfer_prefill_result(self, new_request: ActiveRequest):
         """
@@ -890,6 +868,8 @@ class vDriver:
         max_prefill_length: int,
         prefill_lengths: list[int],
         pad_token_id: int,
+        do_pad: bool = True,
+        right_padding: bool = False,
     ) -> tuple[tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
         """
         Processes the content of a prefill request for the engine.
@@ -917,26 +897,26 @@ class vDriver:
             valids = jnp.array(content["attention_mask"])
         else:
             tokens, valids = content
-
-        return (
-            pad_tokens(
+        sampling_params = SamplingParams(
+            max_tokens=0,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            repetition_penalty=request.repetition_penalty,
+            min_p=request.min_p,
+            top_p=request.top_p,
+            temperature=request.temperature,
+        )
+        true_length = len(tokens)
+        if do_pad:
+            tokens, valids, true_length = pad_tokens(
                 tokens=tokens,
                 valids=valids,
                 pad_token_id=pad_token_id,
                 max_prefill_length=max_prefill_length,
                 prefill_lengths=prefill_lengths,
-                right_padding=False,
-            ),
-            SamplingParams(
-                max_tokens=0,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                repetition_penalty=request.repetition_penalty,
-                min_p=request.min_p,
-                top_p=request.top_p,
-                temperature=request.temperature,
-            ),
-        )
+                right_padding=right_padding,
+            )
+        return (tokens, valids, true_length), sampling_params
 
     def _setup_scheduler(self):
         """
