@@ -573,7 +573,7 @@ def pad_tokens(
     if prefill_lengths is None:
         prefill_lengths = DEFAULT_PREFILL_BUCKETS
     if max_prefill_length is not None:
-        prefill_lengths = prefill_lengths[: prefill_lengths.index(max_prefill_length)] + [max_prefill_length]
+        prefill_lengths = [*prefill_lengths[: prefill_lengths.index(max_prefill_length)], max_prefill_length]
     tokens = tokens.ravel()  # 1d Only
     valids = valids.ravel()
     true_length = tokens.shape[-1]
