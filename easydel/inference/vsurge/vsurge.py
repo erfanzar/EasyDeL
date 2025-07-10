@@ -362,6 +362,7 @@ class vSurge:
         processor: ProcessingClassType,
         max_concurrent_decodes: int | None = None,
         max_concurrent_prefill: int | None = None,
+        extra_eos_token_ids: int | list[int] | None = None,
         prefill_lengths: int | list[int] | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
@@ -451,6 +452,7 @@ class vSurge:
                 engine=vEngine(
                     model=model,
                     processor=processor,
+                    extra_eos_token_ids=extra_eos_token_ids,
                     max_concurrent_prefill=max_concurrent_prefill,
                     max_concurrent_decodes=max_concurrent_decodes,
                     prefill_lengths=actual_prefill_lengths,

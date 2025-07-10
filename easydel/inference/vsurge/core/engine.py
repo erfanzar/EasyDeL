@@ -79,6 +79,7 @@ class vEngine:
         self,
         model: EasyDeLBaseModule,
         processor: ProcessingClassType,
+        extra_eos_token_ids: int | list[int] | None = None,
         max_concurrent_decodes: int | None = None,
         max_concurrent_prefill: int | None = None,
         prefill_lengths: int | None = None,
@@ -134,7 +135,12 @@ class vEngine:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
         )
-
+        if extra_eos_token_ids is not None:
+            if isinstance(extra_eos_token_ids, int):
+                extra_eos_token_ids = [extra_eos_token_ids]
+        else:
+            extra_eos_token_ids = []
+        self._extra_eos_token_ids = extra_eos_token_ids
         self.manager = None
         self.attn_metadata = None
 
@@ -264,7 +270,7 @@ class vEngine:
             if isinstance(conf_eos, int):
                 conf_eos = [conf_eos]
             eos_ids = eos_ids + conf_eos
-        return list(set(eos_ids))
+        return list(set(eos_ids + self._extra_eos_token_ids))
 
     @property
     def samples_per_slot(self) -> int:
