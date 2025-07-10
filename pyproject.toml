@@ -53,6 +53,7 @@ grain = "~0.2.11"
 datasets = ">=3.6.0"
 gcsfs = "*"
 zstandard = ">=0.23.0"
+msgspec = "~0.19.0"
 tensorboard = { version = ">=2.19.0", optional = true }
 torch = { version = ">=2.7.0", source = "torch-cpu", optional = true }
 
