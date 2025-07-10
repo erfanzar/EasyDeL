@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@ logger = get_logger("vSurgeLMEvalAdapter")
 
 try:
     from lm_eval.api.model import LM  # type:ignore
-except Exception:
+except Exception as e:
     LM = object
-    logger.warn(
-        "consider installing lm_eval if you want to use `vSurgeLMEvalAdapter`.",
+    logger.warning(
+        f"consider installing lm_eval if you want to use `vSurgeLMEvalAdapter` (err : {e}).",
         stacklevel=1,
     )
 

@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -96,6 +96,7 @@ class XerxesConfig(EasyDeLBaseConfig):
         num_local_experts: int = 4,
         xe_moe: bool = True,
         xe_kvnorm: bool = False,
+        xe_mlpnorm: bool = False,
         num_experts_per_tok: int = 2,
         tie_word_embeddings=False,
         rope_theta=10000.0,
@@ -124,6 +125,7 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.swish_run = swish_run
         self.xe_moe = xe_moe
         self.xe_kvnorm = xe_kvnorm
+        self.xe_mlpnorm = xe_mlpnorm
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

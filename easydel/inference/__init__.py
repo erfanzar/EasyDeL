@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 from .oai_proxies import InferenceApiRouter
 from .openai_api_modules import FunctionCallFormat, FunctionCallFormatter
-from .utilities import SamplingParams
+from .sampling_params import JitableSamplingParams, SamplingParams
 from .vinference import vInference, vInferenceApiServer, vInferenceConfig, vInferencePreCompileConfig
 from .vsurge import vDriver, vEngine, vSurge, vSurgeApiServer, vSurgeRequest
 from .vwhisper import vWhisperInference, vWhisperInferenceConfig
@@ -22,6 +22,7 @@ __all__ = (
     "FunctionCallFormat",
     "FunctionCallFormatter",
     "InferenceApiRouter",
+    "JitableSamplingParams",
     "SamplingParams",
     "vDriver",
     "vEngine",

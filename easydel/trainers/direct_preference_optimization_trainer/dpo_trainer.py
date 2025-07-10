@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -465,32 +465,15 @@ class DPOTrainer(Trainer):
         them as columns to the dataset.
 
         Returns:
-            tensorflow.data.Dataset: The training dataloader.
+            Iterator: The training dataloader using Grain.
         """
 
-        try:
-            import tensorflow_datasets
-        except ImportError as e:
-            raise ImportError(
-                "tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-            ) from e
         if self.train_dataset is not None:
             if self.arguments.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
-                data_loader = tensorflow_datasets.as_numpy(
-                    self.train_dataset.to_tf_dataset(
-                        batch_size=self.training_batch_size,
-                        collate_fn=self.input_data_collator,
-                        num_workers=self.arguments.dataloader_num_workers,
-                        shuffle=False,
-                        drop_remainder=True,
-                    )
-                )
                 reference_chosen_log_probs = []
                 ref_rejected_logps = []
-                for padded_batch in tqdm(
-                    iterable=data_loader,
-                    desc="Train dataset reference log probs",
-                ):
+
+                for padded_batch in tqdm(iterable=self.train_dataset, desc="Train dataset reference log probs"):
                     reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
                         self.model_state,
                         padded_batch,
@@ -500,6 +483,7 @@ class DPOTrainer(Trainer):
 
                 all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
                 all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+
                 self.train_dataset = self.train_dataset.add_column(
                     name="reference_chosen_log_probs",
                     column=all_reference_chosen_log_probs,
@@ -510,23 +494,13 @@ class DPOTrainer(Trainer):
                 )
 
                 self._precomputed_train_ref_log_probs = True
+
         if self.eval_dataset is not None:
             if self.arguments.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
-                data_loader = tensorflow_datasets.as_numpy(
-                    self.eval_dataset.to_tf_dataset(
-                        batch_size=self.evaluation_batch_size,
-                        collate_fn=self.input_data_collator,
-                        num_workers=self.arguments.dataloader_num_workers,
-                        shuffle=False,
-                        drop_remainder=True,
-                    )
-                )
                 reference_chosen_log_probs = []
                 ref_rejected_logps = []
-                for padded_batch in tqdm(
-                    iterable=data_loader,
-                    desc="Eval dataset reference log probs",
-                ):
+
+                for padded_batch in tqdm(iterable=self.eval_dataset, desc="Eval dataset reference log probs"):
                     reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
                         self.model_state,
                         padded_batch,
@@ -536,6 +510,7 @@ class DPOTrainer(Trainer):
 
                 all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
                 all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+
                 self.eval_dataset = self.eval_dataset.add_column(
                     name="reference_chosen_log_probs",
                     column=all_reference_chosen_log_probs,
@@ -545,7 +520,7 @@ class DPOTrainer(Trainer):
                     column=all_ref_rejected_logps,
                 )
 
-                self._precomputed_train_ref_log_probs = True
+                self._precomputed_eval_ref_log_probs = True
         return super().configure_dataloaders()
 
     def compute_reference_log_probs(

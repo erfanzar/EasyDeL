@@ -58,7 +58,7 @@ The setup process is identical to previous tutorials.
 Save the provided Python script as `evaluate_model.py`. This script is not for training; its sole purpose is to load a model and run it against benchmark tasks. Let's break down its components.
 
 ```python
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import json

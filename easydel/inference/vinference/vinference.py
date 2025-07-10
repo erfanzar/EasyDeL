@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,8 +47,8 @@ from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.rngs_utils import GenerateRNG
 
-from ..utilities import SamplingParams
-from ._fn import expand_inputs_for_generation, get_compiled_funcs, interval_func, prefill_func, put_compiled_funcs
+from ..sampling_params import SamplingParams
+from .functions import expand_inputs_for_generation, get_compiled_funcs, interval_func, prefill_func, put_compiled_funcs
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
@@ -463,7 +463,7 @@ class vInference:
             temperature = self.model.generation_config.temperature
             max_new_tokens = self.model.generation_config.max_new_tokens or max_new_tokens
             if self.model.generation_config is not None:
-                return vInferenceConfig(
+                generation_config = vInferenceConfig(
                     bos_token_id=self.model.generation_config.bos_token_id,
                     eos_token_id=self.model.generation_config.eos_token_id,
                     pad_token_id=self.model.generation_config.pad_token_id,
@@ -473,11 +473,10 @@ class vInference:
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
-                        stop=None,
-                        n=None,
-                    ),
+                    ).make_jitable(),
                 )
-            return vInferenceConfig(max_new_tokens=max_new_tokens)
+            else:
+                generation_config = vInferenceConfig(max_new_tokens=max_new_tokens)
         return generation_config
 
     def _init_variables(self):
@@ -594,7 +593,7 @@ class vInference:
             tuple[int, int]: The optimal (batch_size, sequence_length) configuration
         """
         if not self._precompiled_configs:
-            logger.warn(
+            logger.warning(
                 f"vInference [{self.inference_name}] doesn't contain any precompiled "
                 "config please precompile instance for best performance",
                 stacklevel=1,
@@ -839,9 +838,6 @@ class vInference:
             Generator yielding SampleState objects containing generation results and metrics
         """
         self._metrics_increase_queue()
-        if sampling_params is not None:
-            sampling_params.stop = None
-            sampling_params.n = None
         try:
             adjusted_kwargs, vinference_compile_config = self.adjust_kwargs(
                 graphstate=graphstate,
@@ -938,8 +934,7 @@ class vInference:
         if sampling_params is not None:
             if sampling_params.max_tokens > self.generation_config.max_new_tokens:
                 sampling_params.max_tokens = self.generation_config.max_new_tokens
-            sampling_params.stop = None
-            sampling_params.n = None
+            sampling_params = sampling_params.make_jitable()
         # Initial generation step
         state = self.execute_prefill(
             state,
@@ -983,7 +978,7 @@ class vInference:
         if graphother is None:
             graphother = self.graphother
         if sampling_params is None:
-            sampling_params = self.generation_config.sampling_params
+            sampling_params = self.generation_config.sampling_params.make_jitable()
 
         assert graphstate is not None
         assert graphother is not None
@@ -1136,7 +1131,7 @@ class vInference:
                     es.extract_shardings(graphstate),
                     es.extract_shardings(graphother),
                     es.extract_shardings(state),
-                    es.extract_shardings(self.generation_config.sampling_params),
+                    es.extract_shardings(self.generation_config.sampling_params.make_jitable()),
                 ),
             ).lower(
                 self.graphdef,  # Static
@@ -1144,7 +1139,7 @@ class vInference:
                 graphother,
                 state,
                 self.generation_config,  # Static
-                self.generation_config.sampling_params,
+                self.generation_config.sampling_params.make_jitable(),
             )
             self.log("`prefill` lowered successfully.")
             compiled_prefill_func, _ = smart_compile(prefill_lowered, tag="vinference.prefill_func")
@@ -1154,7 +1149,7 @@ class vInference:
                 graphstate,
                 graphother,
                 state,
-                self.generation_config.sampling_params,
+                self.generation_config.sampling_params.make_jitable(),
             )
             sample_state_shardings = es.extract_shardings(sample_state)
             decode_lowered = jax.jit(
@@ -1165,7 +1160,7 @@ class vInference:
                     es.extract_shardings(graphstate),
                     es.extract_shardings(graphother),
                     sample_state_shardings,
-                    es.extract_shardings(self.generation_config.sampling_params),
+                    es.extract_shardings(self.generation_config.sampling_params.make_jitable()),
                     None,
                 ),
                 out_shardings=sample_state_shardings,
@@ -1175,7 +1170,7 @@ class vInference:
                 graphother,
                 sample_state,
                 self.generation_config,  # STATIC
-                self.generation_config.sampling_params,
+                self.generation_config.sampling_params.make_jitable(),
                 self.generation_config.streaming_chunks,
             )
             self.log("`decode` lowered successfully.")

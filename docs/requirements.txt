@@ -1,7 +1,5 @@
 git+https://github.com/erfanzar/EasyDeL.git
 datasets
-tensorflow-datasets
-tensorflow
 torch
 numpy
 sentencepiece

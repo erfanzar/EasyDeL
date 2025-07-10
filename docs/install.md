@@ -11,7 +11,6 @@ pip uninstall torch-xla -y -q  # Remove pre-installed torch-xla (for TPUs)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -qU  # Install PyTorch for model conversion
 pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
 pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
-pip install tensorflow tensorflow-datasets -qU  # Install TensorFlow and datasets for training
 ```
 
 ### Configuring TPU Hosts for Multi-Host or Multi-Slice Usage
@@ -45,7 +44,6 @@ Use `eopod` to install the necessary packages on all TPU slices:
 eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu -qU  # Required for model conversion
 eopod run pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
 eopod run pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
-eopod run pip install tensorflow tensorflow-datasets -qU  # Required for training and data loaders
 ```
 
 ## Using EasyDeL with Ray

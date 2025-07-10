@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@ import typing as tp
 import jax
 from eformer.common_types import NOT_GIVEN, _Empty
 
-from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
+from ..sampling_params import SamplingParams
 from .core import vDriver, vEngine
 from .utils import (
     ActiveRequest,
@@ -82,16 +82,7 @@ class vSurgeRequest:
     """
 
     prompt: str
-    max_tokens: int
-    top_p: float = 0.95
-    top_k: int = 0
-    min_p: float = 0.0
-    n: int = 1
-    stop: str | list[str] | None = None
-    temperature: float = 0.7
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    repetition_penalty: float = 1.0
+    sampling_params: SamplingParams
     metadata: vSurgeMetadata | None = None
     is_client_side_tokenization: bool = False
 
@@ -108,16 +99,18 @@ class vSurgeRequest:
         """
         return vSurgeRequest(
             prompt=prompt,
-            max_tokens=sampling_params.max_tokens,
-            top_p=sampling_params.top_p,
-            top_k=sampling_params.top_k,
-            min_p=sampling_params.min_p,
-            n=sampling_params.n,
-            stop=sampling_params.stop,
-            temperature=sampling_params.temperature,
-            presence_penalty=sampling_params.presence_penalty,
-            frequency_penalty=sampling_params.frequency_penalty,
-            repetition_penalty=sampling_params.repetition_penalty,
+            sampling_params=SamplingParams(
+                n=sampling_params.n,
+                max_tokens=sampling_params.max_tokens,
+                top_p=sampling_params.top_p,
+                top_k=sampling_params.top_k,
+                min_p=sampling_params.min_p,
+                stop=sampling_params.stop,
+                temperature=sampling_params.temperature,
+                presence_penalty=sampling_params.presence_penalty,
+                frequency_penalty=sampling_params.frequency_penalty,
+                repetition_penalty=sampling_params.repetition_penalty,
+            ),
         )
 
     def __post_init__(self):
@@ -603,10 +596,10 @@ class vSurge:
 
         Returns:
             ReturnSample: A `ReturnSample` instance with default (empty/zeroed) values,
-            structured according to `request.n` and the effective `bytecode_decode`
+            structured according to `request.sampling_params.n` and the effective `bytecode_decode`
             and `request.is_client_side_tokenization` settings.
         """
-        num_n = request.n if request.n > 0 else 0
+        num_n = request.sampling_params.n if request.sampling_params.n > 0 else 0
         empty_text_val_single: str | list
         if request.is_client_side_tokenization and not bytecode_decode:
             empty_text_val_single = []
@@ -967,7 +960,7 @@ class vSurge:
     ) -> tp.AsyncGenerator[list[ReturnSample], None]:
         """Performs text generation for a single `vSurgeRequest`.
 
-        This asynchronous generator streams results for `request.n` parallel
+        This asynchronous generator streams results for `request.sampling_params.n` parallel
         generations. Each yield is a list containing a single `ReturnSample` object.
         This `ReturnSample` aggregates the current state of all `n` generations.
 
@@ -997,44 +990,35 @@ class vSurge:
                 - Else (`bytecode_decode` is False AND `request.is_client_side_tokenization` is True):
                   `list[str]` (each string being a per-token decode of all tokens so far).
         """
-        if request.n == 0:
+        if request.sampling_params.n == 0:
             return
 
         bytecode_decode = self.bytecode_decode if isinstance(bytecode_decode, _Empty) else bytecode_decode
 
         logger.debug(
-            f"complete called for request (prompt: '...{request.prompt[-50:]}') with n={request.n}, "
+            f"complete called for request (prompt: '...{request.prompt[-50:]}') with n={request.sampling_params.n}, "
             f"bytecode_decode={bytecode_decode}, client_side_tok={request.is_client_side_tokenization}"
         )
 
         gen_states: list[ProcessState] = []
-        for i in range(request.n):
+        for i in range(request.sampling_params.n):
             return_channel = AsyncMultifuture()
-            active_req = ActiveRequest(
-                max_tokens=request.max_tokens,
+            start_time = request.metadata.start_time if request.metadata else time.time()
+            prefill_enqueue_time = time.perf_counter()
+            active_request = ActiveRequest(
+                return_channel=return_channel,
+                sampling_params=request.sampling_params,
                 prefill_content=request.prompt,
                 is_client_side_tokenization=request.is_client_side_tokenization,
-                return_channel=return_channel,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                min_p=request.min_p,
-                stop=request.stop,
-                temperature=request.temperature,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                repetition_penalty=request.repetition_penalty,
-                metadata=ActiveRequestMetadata(
-                    start_time=request.metadata.start_time if request.metadata else time.time(),
-                    prefill_enqueue_time=time.perf_counter(),
-                ),
+                metadata=ActiveRequestMetadata(start_time=start_time, prefill_enqueue_time=prefill_enqueue_time),
             )
             try:
-                self._driver.place_request_on_prefill_queue(active_req)
+                self._driver.place_request_on_prefill_queue(active_request)
             except queue.Full as e:
                 for state_idx in range(i):
                     if hasattr(gen_states[state_idx].active_request.return_channel, "cancel"):
                         gen_states[state_idx].active_request.return_channel.cancel()
-                raise RuntimeError(f"Prefill queue full for generation {i + 1}/{request.n}") from e
+                raise RuntimeError(f"Prefill queue full for generation {i + 1}/{request.sampling_params.n}") from e
 
             initial_current_step_text: str | list
             initial_full_accumulated_text: str | list
@@ -1048,8 +1032,8 @@ class vSurge:
             gen_states.append(
                 ProcessState(
                     id=i,
-                    active_request=active_req,
-                    channel_iter=active_req.return_channel.__aiter__(),
+                    active_request=active_request,
+                    channel_iter=active_request.return_channel.__aiter__(),
                     current_step_text=initial_current_step_text,
                     full_accumulated_text=initial_full_accumulated_text,
                     decoded_text_upto_previous_step="" if bytecode_decode else None,
@@ -1057,7 +1041,7 @@ class vSurge:
             )
 
         num_gens_fully_finished = 0
-        active_gen_indices_to_poll = list(range(request.n))
+        active_gen_indices_to_poll = list(range(request.sampling_params.n))
 
         async def _fetch_next_from_channel(iterator, original_idx_tag):
             try:
@@ -1067,7 +1051,7 @@ class vSurge:
             except Exception as exc:
                 return original_idx_tag, None, exc
 
-        while num_gens_fully_finished < request.n:
+        while num_gens_fully_finished < request.sampling_params.n:
             tasks_to_poll = [
                 asyncio.create_task(_fetch_next_from_channel(gen_states[idx].channel_iter, idx))
                 for idx in active_gen_indices_to_poll
@@ -1076,7 +1060,7 @@ class vSurge:
                 break
 
             done_tasks, pending_tasks = await asyncio.wait(tasks_to_poll, return_when=asyncio.FIRST_COMPLETED)
-            newly_set_current_step_text_flags = [False] * request.n
+            newly_set_current_step_text_flags = [False] * request.sampling_params.n
 
             for task in done_tasks:
                 original_idx, item_from_driver, error_status = task.result()
@@ -1140,7 +1124,7 @@ class vSurge:
                         p_task.cancel()
                     if pending_tasks:
                         await asyncio.gather(*pending_tasks, return_exceptions=True)
-                    for i_gen in range(request.n):
+                    for i_gen in range(request.sampling_params.n):
                         if i_gen != original_idx and not gen_states[i_gen].finished_streaming:
                             if hasattr(
                                 gen_states[i_gen].active_request.return_channel,
@@ -1248,13 +1232,15 @@ class vSurge:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
 
             any_stream_produced_new_text_this_cycle = any(newly_set_current_step_text_flags)
-            all_streams_definitively_done = num_gens_fully_finished == request.n and not active_gen_indices_to_poll
+            all_streams_definitively_done = (
+                num_gens_fully_finished == request.sampling_params.n and not active_gen_indices_to_poll
+            )
 
             if any_stream_produced_new_text_this_cycle or all_streams_definitively_done:
                 texts_for_yield, all_tokens_for_yield, full_texts_for_yield = [], [], []
                 times_spent_for_yield, tps_for_yield, num_tokens_for_yield = [], [], []
 
-                for idx in range(request.n):
+                for idx in range(request.sampling_params.n):
                     s = gen_states[idx]
                     if newly_set_current_step_text_flags[idx]:
                         texts_for_yield.append(s.current_step_text)
@@ -1278,7 +1264,7 @@ class vSurge:
                 )
                 yield [aggregated_sample]
 
-                for idx_reset in range(request.n):
+                for idx_reset in range(request.sampling_params.n):
                     if newly_set_current_step_text_flags[idx_reset]:
                         if request.is_client_side_tokenization and not bytecode_decode:
                             gen_states[idx_reset].current_step_text = []

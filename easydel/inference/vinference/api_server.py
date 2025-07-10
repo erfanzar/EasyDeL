@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
-from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
 from ..openai_api_modules import (
@@ -56,6 +55,7 @@ from ..openai_api_modules import (
     ToolCall,
     UsageInfo,
 )
+from ..sampling_params import SamplingParams
 
 if tp.TYPE_CHECKING:
     from ..vinference import vInference, vInferenceConfig

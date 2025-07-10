@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,8 +38,8 @@ from easydel.infra.utils import (
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
+    PagesCacheMetaData,
     PagesCacheView,
-    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -244,7 +244,7 @@ class XerxesAttention(AttentionModule):
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -468,6 +468,8 @@ class XerxesDecoderLayer(nn.Module):
             param_dtype=param_dtype,
         )
         identity = config.xe_kvnorm and not config.xe_moe
+        if config.xe_mlpnorm:
+            identity = False
         self.identity = identity
         self.input_layernorm = rms()
         self.post_attention_layernorm = rms()
@@ -482,7 +484,7 @@ class XerxesDecoderLayer(nn.Module):
         causal_mask: chex.Array | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
@@ -596,7 +598,7 @@ class XerxesModel(EasyDeLBaseModule):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.embedding_scale = float(1 if config.xe_kvnorm else config.hidden_size**0.5)
+        self.embedding_scale = float(1 if config.xe_kvnorm and not config.xe_mlpnorm else config.hidden_size**0.5)
 
     def __call__(
         self,
@@ -609,7 +611,7 @@ class XerxesModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
     ) -> BaseModelOutput:
         """
         Forward pass through the Xerxes module.
@@ -695,7 +697,6 @@ class XerxesModel(EasyDeLBaseModule):
                 dynamic_axes=common_types.HiddenStateSharding,
                 partition_manager=self.config.partition_manager,
             )
-
             if output_attentions:
                 all_attentions += (outputs.attention_weight,)
 
@@ -766,7 +767,7 @@ class XerxesForCausalLM(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | PagesCacheMetaData | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass through the Xerxes module.
@@ -805,7 +806,6 @@ class XerxesForCausalLM(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-
         if self.config.tie_word_embeddings:
             lm_logits = jax.lax.dot_general(
                 hidden_states,
@@ -814,7 +814,6 @@ class XerxesForCausalLM(EasyDeLBaseModule):
             )
         else:
             lm_logits = self.lm_head(hidden_states)
-
         return CausalLMOutput(
             logits=self.post_pross(lm_logits),
             hidden_states=outputs.hidden_states,

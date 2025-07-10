@@ -72,7 +72,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 Save the provided Python script as `orpo_finetune.py` (or any other `.py` name) on your TPU VM. Let's walk through its key components.
 
 ```python
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os

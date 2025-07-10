@@ -54,7 +54,6 @@ Install the necessary packages for model training and conversion:
 
 ```shell
 # Install required dependencies
-eopod run pip install tensorflow tensorflow-datasets
 eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install EasyDeL from the latest source

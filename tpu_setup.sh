@@ -148,7 +148,6 @@ install_package() {
 echo ""
 log_info "Starting package installations..."
 
-install_package "tensorflow tensorflow-datasets" || exit 1
 install_package "torch" "--index-url https://download.pytorch.org/whl/cpu" || exit 1
 
 log_info "Uninstalling existing easydel..."

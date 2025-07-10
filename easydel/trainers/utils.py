@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,16 @@ import random
 import typing as tp
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass
+from threading import current_thread
 
 import chex
 import jax
 import numpy as np
+from datasets import Dataset, IterableDataset
+from datasets.distributed import split_dataset_by_node
 from eformer.pytree import auto_pytree
+from grain import python as pygrain
 from jax import numpy as jnp
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
@@ -783,6 +788,73 @@ class DPODataCollatorWithPadding:
                 else:
                     padded_batch.pop(k)
         return padded_batch
+
+
+class HFDataSource(pygrain.RandomAccessDataSource):
+    """A Grain DataSource for Hugging Face IterableDatasets."""
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        shard_options: pygrain.ShardOptions,
+        num_threads: int = 1,
+    ):
+        self.dataset = dataset
+        self.shard_options = shard_options
+        self.num_threads = num_threads
+
+        if not hasattr(dataset, "n_shards"):
+            if dataset.n_shards < self.shard_options.shard_count:
+                warnings.warn(
+                    f"Dataset has {getattr(dataset, 'n_shards', 1)} shards, but {self.shard_options.shard_count} "
+                    "are expected by the dataloader. This may lead to inefficient loading or errors.",
+                    stacklevel=1,
+                )
+            self.n_shards = dataset.n_shards
+        else:
+            self.n_shards = 1
+        self.dataset_shards = [(self.shard_options.shard_index * self.num_threads) + i for i in range(self.num_threads)]
+        self.datasets = [
+            split_dataset_by_node(dataset, world_size=self.n_shards, rank=shard_rank)
+            for shard_rank in self.dataset_shards
+        ]
+        self.data_iters = []
+
+    def __len__(self):
+        return 10_000_000_000
+
+    def __getitem__(self, index):
+        if not self.data_iters:
+            self.data_iters = [iter(ds) for ds in self.datasets]
+        thread_id_str = current_thread().name.split("_")[-1]
+        if not thread_id_str.isdigit():
+            worker_idx = 0
+        else:
+            worker_idx = int(thread_id_str) % self.num_threads
+        try:
+            return next(self.data_iters[worker_idx])
+        except StopIteration as e:
+            raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
+
+
+@dataclass
+class CollateMapTransform(pygrain.MapTransform):
+    """A Grain MapTransform to apply a user-defined collation function."""
+
+    collate_fn: callable
+
+    def map(self, element):
+        return self.collate_fn(element)
+
+
+@dataclass
+class ToNumpy(pygrain.MapTransform):
+    """A Grain MapTransform to apply a user-defined collation function."""
+
+    def map(self, element):
+        for name, value in element.items():
+            element[name] = jnp.asarray(value)
+        return element
 
 
 def shift_and_pad(mask, *tensors):

@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from numbers import Number
 
 from eformer.common_types import ColumnWise, Replicated, RowWise
@@ -30,8 +31,6 @@ def make_divisible(
 ) -> float | int:
     """This function is taken from the original tf repo.
     It ensures that all layers have a channel number that is divisible by the divisor
-    It can be seen at:
-    https://github.com/tensorflow/models/blob/2cfc99eff5e5eb729c6793d2f3d03aa1c9be2b15/research/slim/nets/mobilenet/mobilenet.py#L62
     Args:
         v: input value
         divisor: default to 8
@@ -129,7 +128,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "openelm"
-    attribute_map = {"tie_word_embedding": "share_input_output_layers"}
+    attribute_map: typing.ClassVar = {"tie_word_embedding": "share_input_output_layers"}
 
     def __init__(
         self,
@@ -163,7 +162,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
     ):
         """The __init__ function is called when the class is instantiated.
         It allows the class to initialize the attributes of a class.
-        The self parameter is a reference to the current instance of the class, and is used to access variables that belong to the class.
+        The self parameter is a reference to the current instance of the class,
+        and is used to access variables that belong to the class.
 
         Args:
             vocab_size (`int`, *optional*, defaults to 32000): Vocabulary size.
@@ -171,10 +171,12 @@ class OpenELMConfig(EasyDeLBaseConfig):
             num_transformer_layers (`int`, *optional*, defaults to 12): Number of transformer layers.
             model_dim (`int`, *optional*, defaults to 2048): Model dimension (embedding size).
             head_dim (`int`, *optional*, defaults to 128): Dimension of each attention head.
-            qkv_multipliers (`float` or `list` of `float`, *optional*, defaults to 1.0): Multiplier(s) for QKV projection dimensions.
+            qkv_multipliers (`float` or `list` of `float`, *optional*, defaults to 1.0):
+                Multiplier(s) for QKV projection dimensions.
             num_query_heads (`int`, *optional*): Number of query heads. Calculated if None.
             num_gqa_groups (`int`, *optional*, defaults to 1): Number of GQA groups.
-            ffn_multipliers (`float` or `list` of `float`, *optional*, defaults to 4.0): Multiplier(s) for FFN intermediate dimension.
+            ffn_multipliers (`float` or `list` of `float`, *optional*, defaults to 4.0):
+                Multiplier(s) for FFN intermediate dimension.
             ffn_with_glu (`bool`, *optional*, defaults to `True`): Whether FFN uses GLU.
             ffn_dim_divisor (`int`, *optional*, defaults to 256): Divisor for FFN dimension calculation.
             activation_fn_name (`str`, *optional*, defaults to `"swish"`): Activation function name.
@@ -187,7 +189,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
             use_cache (`bool`, *optional*, defaults to `True`): Whether to use KV cache.
             bos_token_id (`int`, *optional*, defaults to 1): Beginning-of-sequence token ID.
             eos_token_id (`int`, *optional*, defaults to 2): End-of-sequence token ID.
-            rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*): RoPE scaling configuration. Defaults to None.
+            rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
+                RoPE scaling configuration. Defaults to None.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.
             use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
@@ -301,12 +304,10 @@ class OpenELMConfig(EasyDeLBaseConfig):
             ]
         else:
             raise NotImplementedError(
-                f"QKV multipliers should be a single number or a list containing exactly two numbers. Got: {qkv_multipliers}."
+                f"QKV multipliers should be a single number or a list containing exactly two numbers."
+                f" Got: {qkv_multipliers}."
             )
 
-        # compute the number of query, key, and value heads
-        # For multi-head and multi-query attention, the number of heads for query, key, and value are the same.
-        # For group query attention, the number of key and value heads are the same.
         self.num_query_heads = [int(compute_heads(q_dim, self.head_dim)) for q_dim in query_dims]
         self.num_kv_heads = [q_heads // self.num_gqa_groups for q_heads in self.num_query_heads]
 
@@ -334,7 +335,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
                 )
         else:
             raise NotImplementedError(
-                f"FFN multipliers should be a single number or a list containing exactly two numbers. Got: {qkv_multipliers}."
+                f"FFN multipliers should be a single number or a list containing exactly two numbers. "
+                f"Got: {qkv_multipliers}."
             )
 
         # check num_query_heads divisible by num_kv_heads for every layer

@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas.triton import TritonCompilerParams
+from jax.experimental.pallas.triton import CompilerParams
 
 from ._forward_pallas import _ragged_paged_attention_pallas_kernel  # type:ignore
 
@@ -72,7 +72,7 @@ def ragged_paged_attention(
         ],
         out_specs=pl.BlockSpec((1, 1, head_size), lambda q_idx, q_head_idx: (q_idx, q_head_idx, 0)),
         grid=grid,
-        compiler_params=TritonCompilerParams(4, 2),
+        compiler_params=CompilerParams(4, 2),
     )(queries, key_pages, value_pages, block_tables, context_lens, q_sequence_indices, q_token_positions)
 
     return attention_output

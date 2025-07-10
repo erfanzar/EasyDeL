@@ -58,7 +58,7 @@ Let's see this with the complete, runnable script you provided. This script perf
 ### The PEFT/LoRA Script for SFT
 
 ```python
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os

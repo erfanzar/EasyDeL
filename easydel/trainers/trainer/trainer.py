@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ import jax
 import jax.experimental
 import jax.lib
 from eformer.escale import with_sharding_constraint
-from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
@@ -58,23 +57,7 @@ class Trainer(BaseTrainer):
         """
 
         def collate_fn(batch):
-            results = {}
-            for key in batch[0].keys():
-                data_sample = batch[0][key]
-                try:
-                    data_sample = jnp.array(data_sample)
-                except TypeError:
-                    continue
-                if self.model.lossfn_type == "ForCausalLM":
-                    if truncation_mode == "keep_end":
-                        corrected_sequence = [jnp.array(f[key])[..., -max_sequence_length:] for f in batch]
-                    else:
-                        corrected_sequence = [jnp.array(f[key])[..., :max_sequence_length] for f in batch]
-                    results[key] = jnp.stack(corrected_sequence)
-                else:
-                    corrected_sequence = [jnp.array(f[key]) for f in batch]
-                    results[key] = jnp.stack(corrected_sequence)
-            return results
+            return batch
 
         return collate_fn
 
@@ -233,7 +216,7 @@ class Trainer(BaseTrainer):
     def _train_epoch(
         self,
         state: EasyDeLState,
-        train_dataset: int,
+        train_dataset,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -248,7 +231,7 @@ class Trainer(BaseTrainer):
 
         Args:
             state (EasyDeLState): The current model state.
-            train_dataset (int): The training dataset (or an iterator over it).
+            train_dataset: The training dataset (or an iterator over it).
             metrics_tracker (MetricsTracker): Tracker to update and store training metrics.
             step_metrics (StepMetrics): Object to calculate step-level metrics.
             pbar (BaseProgressBar): Progress bar instance for displaying training progress.
@@ -344,7 +327,7 @@ class Trainer(BaseTrainer):
     def _eval_epoch(
         self,
         state: EasyDeLState,
-        eval_dataset: int,
+        eval_dataset,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -357,7 +340,7 @@ class Trainer(BaseTrainer):
 
         Args:
             state (EasyDeLState): The model state used for evaluation.
-            eval_dataset (int): The evaluation dataset (or an iterator over it).
+            eval_dataset: The evaluation dataset (or an iterator over it).
             metrics_tracker (MetricsTracker): Tracker for accumulating evaluation metrics.
             step_metrics (StepMetrics): Object to calculate step-level metrics.
             pbar (BaseProgressBar): Progress bar instance for displaying evaluation progress.
