@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -146,9 +146,7 @@ def main():
     print("\nUse Ctrl+C to stop the server.\n")
 
     # Start the API server
-    ed.vInferenceApiServer(inference).fire(
-        port=args.port
-    )
+    ed.vInferenceApiServer(inference).fire(port=args.port)
 
 
 if __name__ == "__main__":

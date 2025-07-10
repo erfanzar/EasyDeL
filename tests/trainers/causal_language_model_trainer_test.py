@@ -4,7 +4,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import logging
 
-import flax
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
 
@@ -12,10 +11,7 @@ import easydel as ed
 from easydel.infra.loss_utils import LossConfig
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 TOTAL_BATCH_SIZE = 5
 UPPER = 2000
@@ -47,12 +43,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
         attn_mechanism=ed.AttentionMechanisms.VANILLA,
     )
 
-    model = ed.Xerxes2ForCausalLM(
-        config=config,
-        dtype=dtype,
-        param_dtype=dtype,
-        rngs=flax.nnx.Rngs(0),
-    )
+    model = ed.Xerxes2ForCausalLM(config=config, dtype=dtype, param_dtype=dtype, rngs=ed.Rngs(0))
 
     model = model.shard_model()
     logging.info("Model created.")
@@ -108,7 +99,7 @@ def create_training_args(
         do_eval=True,
         max_sequence_length=sequence_length,
         track_memory=True,
-        use_wandb=True,
+        use_wandb=False,
         weight_distribution_log_steps=5,
         learning_rate=learning_rate,
         do_last_save=DO_LAST_SAVE,
@@ -132,7 +123,7 @@ def create_training_args(
     return training_args
 
 
-def main(use_iterable_dataset: bool = True):
+def main(use_iterable_dataset: bool = False):
     model = create_model()
     train_dataset = create_dummy_dataset(NUM_TRAIN_EXAMPLES, use_iterable_dataset=use_iterable_dataset)
     eval_dataset = create_dummy_dataset(NUM_EVAL_EXAMPLES, use_iterable_dataset=use_iterable_dataset)
@@ -155,4 +146,4 @@ def main(use_iterable_dataset: bool = True):
 
 
 if __name__ == "__main__":
-    main(use_iterable_dataset=True)
+    main(use_iterable_dataset=False)

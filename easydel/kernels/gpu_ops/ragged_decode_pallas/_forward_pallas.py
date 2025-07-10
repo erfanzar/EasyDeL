@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -252,7 +252,7 @@ def decode_attn_sequence(
                 pl.BlockSpec((None, block_size_heads), lambda i, j: (j, i)),
                 pl.BlockSpec((None, block_size_heads), lambda i, j: (j, i)),
             ],
-            compiler_params=ptriton.TritonCompilerParams(
+            compiler_params=ptriton.CompilerParams(
                 num_warps=effective_num_warps,
                 num_stages=num_stages,
                 serialized_metadata=None,

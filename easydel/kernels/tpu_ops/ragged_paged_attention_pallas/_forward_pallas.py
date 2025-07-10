@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -235,7 +235,6 @@ def ragged_paged_attention_kernel(
     page_indices_ref,  # [max_num_seqs, pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     seq_buf_idx_ref,
-    # TODO(jevinjiang): if OOM in SMEM, consider pack to other scalar refs.
     num_seqs_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
@@ -287,7 +286,6 @@ def ragged_paged_attention_kernel(
         )
         return async_copy_kv
 
-    # TODO(jevinjiang): Add these to Mosaic:
     # 1. Support arbitrary strided load/store for int4 and int8 dtype.
     # 2. Support arbitrary strided load/store for any last dimension.
     def strided_load_kv(ref, start, step):
@@ -302,7 +300,6 @@ def ragged_paged_attention_kernel(
         b_ref = ref.bitcast(jnp.uint32)
         b = b_ref[b_start::b_step, :]
 
-        # TODO(chengjiyao): use the general strided loading logic for bf16 after
         # fixing the issue in mosaic's infer vector layout pass
         if ref.dtype == jnp.bfloat16:
             bk = b << 16
@@ -514,8 +511,6 @@ def ragged_paged_attention_kernel(
 
             @pl.when(next_heads_blk_idx < num_heads_blks)
             def prefetch_next_kv_blk():
-                # TODO(jevinjiang): reuse the same buffer if it is already prefetched!
-                # TODO(jevinjiang): only fetch effective dynamic size to hold kv_len and
                 # DMA to fixed size buffer!
                 next_async_copy_kv = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
@@ -589,14 +584,12 @@ def get_min_heads_per_blk(num_q_heads, num_combined_kv_heads, q_dtype, kv_dtype)
         x //= packing
         return x in (1, 2, 4, 8) or x % 8 == 0
 
-    # TODO(jevinjiang): support unaligned number of heads!
     if not can_be_xla_fully_tiled(num_combined_kv_heads, kv_packing):
         raise ValueError(f"Not implemented: {num_combined_kv_heads=} can not be XLA fully tiled.")
     assert num_combined_kv_heads % 2 == 0
     num_kv_heads = num_combined_kv_heads // 2
     assert num_q_heads % num_kv_heads == 0
     ratio = num_q_heads // num_kv_heads
-    # TODO(jevinjiang): we can choose smaller tiling for packed type if large
     # second minor tiling is not on.
     max_combined_kv_tiling = 8 * kv_packing
     min_combined_kv_heads = (

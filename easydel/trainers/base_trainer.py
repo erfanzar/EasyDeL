@@ -24,9 +24,9 @@ import contextlib2
 import flax
 import flax.core
 import flax.nnx
+import grain.python as grain
 import jax
 import jax.extend
-import numpy as np
 from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax.core import unfreeze
@@ -35,7 +35,9 @@ from jax._src.stages import Compiled
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
+from easydel import __version__
 from easydel.infra.base_config import EasyDeLBaseConfigDict
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.etils import (
@@ -46,21 +48,10 @@ from easydel.infra.etils import (
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import EasyPath, EasyPathLike
+from easydel.utils import EasyPath, EasyPathLike, Timers, readme_generator
 from easydel.utils.compiling_utils import cjit
-from easydel.utils.lazy_import import is_package_available
-from easydel.utils.traversals import specs_to_name_sharding
-
-try:
-    import wandb  # type:ignore
-except ImportError:
-    wandb = None
-
-
-from easydel import __version__
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.utils import Timers, readme_generator
 from easydel.utils.helpers import get_logger
+from easydel.utils.traversals import specs_to_name_sharding
 
 from .metrics import (
     BaseProgressBar,
@@ -77,6 +68,12 @@ from .trainer_protocol import (
     TrainerOutput,
 )
 from .training_configurations import MetricsType, TrainingArguments
+from .utils import CollateMapTransform, HFDataSource, ToNumpy
+
+try:
+    import wandb  # type:ignore
+except ImportError:
+    wandb = None
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
@@ -392,11 +389,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_wandb()
         self._initialize_timer()
         self._configure_dataloaders()
-
         self._configure_model()
-
         self._configure_state()
-
         self._configure_functions()
 
     def _initialize_wandb(self):
@@ -404,10 +398,7 @@ class BaseTrainer(BaseTrainerProtocol):
             self.wandb_runtime = self.arguments.get_wandb_init()
 
     def _initialize_timer(self):
-        self.timer = Timers(
-            use_wandb=False,
-            tensorboard_writer=self.arguments.get_tensorboard,
-        )
+        self.timer = Timers(use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard)
 
     def _configure_dataloaders(self):
         """
@@ -540,108 +531,52 @@ class BaseTrainer(BaseTrainerProtocol):
                                             maximum number of training and evaluation steps.
         """
 
-        def create_tf_dataset(
-            dataset: Dataset,
-            is_train: bool,
-        ) -> tp.Iterator[np.ndarray]:
-            """
-            Creates a TensorFlow dataset from a Hugging Face Dataset.
+        def _create_grain_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
+            """Creates a Grain DataLoader from a Hugging Face Dataset."""
 
-            Args:
-                dataset (Dataset): The Hugging Face Dataset.
-                is_train (bool): Whether the dataset is for training.
+            if is_train:
+                batch_size = self.training_batch_size
+                shuffle = self.arguments.shuffle_train_dataset
+                num_epochs = self.arguments.num_train_epochs
+            else:
+                batch_size = self.evaluation_batch_size
+                shuffle = False
+                num_epochs = 1
+            shard_options = grain.ShardByJaxProcess(drop_remainder=True)
+            from datasets import IterableDataset
 
-            Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
-            """
-            if not is_package_available("tensorflow"):
-                raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
-            import tensorflow as tf  # type:ignore
-
-            batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
-
-            return (
-                dataset.to_tf_dataset(
-                    collate_fn=self.create_collect_function(
-                        max_sequence_length=self.arguments.max_sequence_length,
-                        truncation_mode=self.arguments.truncation_mode,
-                    ),
-                    batch_size=batch_size,
-                    drop_remainder=True,
-                    shuffle=is_train and self.arguments.shuffle_train_dataset,
-                    num_workers=self.arguments.dataloader_num_workers,
-                )
-                .repeat(self.arguments.num_train_epochs if is_train else 1)
-                .prefetch(tf.data.AUTOTUNE)
-                .as_numpy_iterator()
+            if isinstance(dataset, IterableDataset):
+                data_source = HFDataSource(dataset=dataset, shard_options=shard_options, num_threads=1)
+            else:
+                data_source = grain.MapDataset.source(dataset)
+            sampler = grain.IndexSampler(
+                num_records=len(data_source),
+                shard_options=shard_options,
+                seed=self.arguments.shuffle_seed_train if is_train else 0,
+                num_epochs=num_epochs,
+                shuffle=shuffle,
             )
 
-        def create_tf_dataset_from_iterable(
-            dataset: IterableDataset,
-            is_train: bool,
-        ) -> tp.Iterator[np.ndarray]:
-            """
-            Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
-
-            Args:
-                dataset (IterableDataset): The iterable Hugging Face Dataset.
-                is_train (bool): Whether the dataset is for training.
-
-            Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
-            """
-
-            if not is_package_available("tensorflow"):
-                raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
-            import tensorflow as tf  # type:ignore
-
-            batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
-            tf_data_mapping = {
-                "float16": tf.float16,
-                "float32": tf.float32,
-                "float64": tf.float64,
-                "int16": tf.int16,
-                "int32": tf.int32,
-                "int64": tf.int64,
-                "bool": tf.bool,
-            }
-            return (
-                tf.data.Dataset.from_generator(
-                    lambda: dataset,
-                    output_signature={
-                        col: tf.TensorSpec(
-                            shape=vals.shape[1:]
-                            if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
-                            else vals.shape,
-                            dtype=tf_data_mapping[str(vals.dtype)],
-                        )
-                        for col, vals in next(iter(dataset)).items()
-                        if hasattr(vals, "shape")
-                    },
-                )
-                .repeat(self.arguments.num_train_epochs if is_train else 1)
-                .batch(batch_size, drop_remainder=False)
-                .prefetch(tf.data.AUTOTUNE)
-                .as_numpy_iterator()
+            collate_fn = self.create_collect_function(
+                max_sequence_length=self.arguments.max_sequence_length,
+                truncation_mode=self.arguments.truncation_mode,
             )
 
-        def calculate_steps(
-            dataset: Dataset | IterableDataset,
-            is_train: bool,
-        ) -> int:
-            """
-            Calculates the number of training or evaluation steps based on dataset length and arguments.
+            operations = [
+                grain.Batch(batch_size=batch_size, drop_remainder=True),
+                ToNumpy(),
+                CollateMapTransform(collate_fn=collate_fn),
+            ]
+            return grain.DataLoader(
+                data_source=data_source,
+                operations=operations,
+                sampler=sampler,
+                worker_count=1,
+                worker_buffer_size=1,
+                read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
+            )
 
-            Args:
-              dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-              is_train (bool): Whether the dataset is for training.
-
-            Returns:
-              int: The number of steps.
-
-            Raises:
-              ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
-            """
+        def calculate_steps(dataset, is_train: bool) -> int:
             if hasattr(dataset, "__len__"):
                 total_data_len = len(dataset)
             else:
@@ -664,34 +599,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 steps = steps // self.arguments.gradient_accumulation_steps
             return steps
 
-        def to_tf_dataloader(
-            dataset: Dataset | IterableDataset,
-            is_train: bool,
-        ) -> tp.Iterator[np.ndarray]:
-            """
-            Converts a Hugging Face Dataset to a TensorFlow dataloader.
-
-            Args:
-                dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
-                is_train (bool): Whether the dataset is for training.
-
-            Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
-            """
-            if hasattr(dataset, "__len__"):
-                return create_tf_dataset(dataset, is_train)
-            else:
-                return create_tf_dataset_from_iterable(dataset, is_train)
-
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
 
-        dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
-
+        dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
             max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
-            dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
-        else:
-            dataloader_eval, max_evaluation_steps = None, 0
+            dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
 
         return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,

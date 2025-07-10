@@ -61,7 +61,7 @@ The provided script uses a setup script from EasyDeL to prepare the TPU environm
 Let's break down the provided Python script. Save it as `launch.py` (or any name you prefer) on your TPU VM.
 
 ```python
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os

@@ -5,4 +5,4 @@ Server
    :maxdepth: 2
 
    inference_vsurge_server___init__
-   inference_vsurge_server__api_server
+   inference_vsurge_server_api_server

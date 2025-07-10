@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -151,12 +151,7 @@ class EmptyProcessor(LogitsProcessor):
     processing is desired at that stage.
     """
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         return scores
 
 
@@ -223,17 +218,12 @@ class TemperatureLogitsWarper(LogitsWarper):
             Setting to 0.0 disables the warper effectively.
     """
 
-    temperature: float
+    temperature: jnp.ndarray
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         return jax.lax.cond(
-            self.temperature != 0.0,
-            lambda x, temp: x / temp,
+            self.temperature != -1,
+            lambda x, temp: x / temp.astype(x.dtype),
             lambda *x: x[0],
             scores,
             self.temperature,
@@ -265,18 +255,12 @@ class TopPLogitsWarper(LogitsWarper):
     filter_value: float = -float("Inf")
     min_tokens_to_keep: int = 1
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         top_p = jnp.asarray(self.top_p)
         min_keep = self.min_tokens_to_keep
 
         def _apply(x):
             topk_scores, topk_indices = lax.top_k(x, x.shape[-1])
-
             mask_scores = jnp.full_like(x, self.filter_value)
             cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
             score_mask = cumulative_probs < top_p
@@ -285,15 +269,9 @@ class TopPLogitsWarper(LogitsWarper):
             score_mask = score_mask.at[:, :min_keep].set(True)
             topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
             x = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
-
             return x
 
-        return jax.lax.cond(
-            (top_p > 0) & (top_p < 1),
-            _apply,
-            lambda x: x,
-            scores,
-        )
+        return jax.lax.cond((top_p > 0) & (top_p < 1), _apply, lambda x: x, scores)
 
 
 @auto_pytree
@@ -319,12 +297,7 @@ class TopKLogitsWarper(LogitsWarper):
     filter_value: float = -float("Inf")
     min_tokens_to_keep: int = 1
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         k_val = jnp.asarray(self.top_k)
         vocab_size = scores.shape[-1]
         effective_k = jnp.maximum(k_val, self.min_tokens_to_keep)
@@ -368,18 +341,10 @@ class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
 
     bos_token_id: int
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         new_scores = jnp.full(scores.shape, -float("inf"))
-
         apply_penalty = 1 - jnp.bool_(cur_len - 1)
-
         scores = jnp.where(apply_penalty, new_scores.at[:, self.bos_token_id].set(0), scores)
-
         return scores
 
 
@@ -401,18 +366,10 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
     max_length: int
     eos_token_id: int
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         new_scores = jnp.full(scores.shape, -float("inf"))
-
         apply_penalty = 1 - jnp.bool_(cur_len - self.max_length + 1)
-
         scores = jnp.where(apply_penalty, new_scores.at[:, self.eos_token_id].set(0), scores)
-
         return scores
 
 
@@ -441,17 +398,9 @@ class MinLengthLogitsProcessor(LogitsProcessor):
         if not isinstance(self.eos_token_id, int) or self.eos_token_id < 0:
             raise ValueError(f"`eos_token_id` has to be a positive integer, but is {self.eos_token_id},")
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
-        # create boolean flag to decide if min length penalty should be applied
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         apply_penalty = 1 - jnp.clip(cur_len - self.min_length, 0, 1)
-
         scores = jnp.where(apply_penalty, scores.at[:, self.eos_token_id].set(-float("inf")), scores)
-
         return scores
 
 
@@ -476,20 +425,9 @@ class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
     begin_suppress_tokens: list
     begin_index: int
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         apply_penalty = 1 - jnp.bool_(cur_len - self.begin_index)
-
-        scores = jnp.where(
-            apply_penalty,
-            scores.at[:, self.begin_suppress_tokens].set(-float("inf")),
-            scores,
-        )
-
+        scores = jnp.where(apply_penalty, scores.at[:, self.begin_suppress_tokens].set(-float("inf")), scores)
         return scores
 
 
@@ -508,12 +446,7 @@ class SuppressTokensLogitsProcessor(LogitsProcessor):
 
     suppress_tokens: list
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         if len(self.suppress_tokens) != 0:
             scores = scores.at[..., self.suppress_tokens].set(-float("inf"))
         return scores
@@ -545,12 +478,7 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
                 force_token_array = force_token_array.at[index].set(token)
         self.force_token_array = jnp.int32(force_token_array)
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _force_token(generation_idx):
             batch_size = scores.shape[0]
             current_token = self.force_token_array[generation_idx]
@@ -701,24 +629,15 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
 
     presence_penalty: float
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, presence_penalty):
+            org_dtype = x.dtype
             batch_size, vocab_size = x.shape
-            one_hot_presence = jax.nn.one_hot(
-                ids,
-                num_classes=vocab_size,
-                dtype=x.dtype,
-            )
+            one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
             penalty_values = jnp.where(presence_mask, presence_penalty, 0.0)
             x = x - penalty_values
-
-            return x
+            return x.astype(org_dtype)
 
         return jax.lax.cond(
             self.presence_penalty == 0.0,
@@ -747,25 +666,15 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
 
     frequency_penalty: float
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, frequency_penalty):
+            org_dtype = x.dtype
             batch_size, vocab_size = x.shape
-
-            one_hot_counts = jax.nn.one_hot(
-                ids,
-                num_classes=vocab_size,
-                dtype=x.dtype,
-            )
+            one_hot_counts = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             token_counts = jnp.sum(one_hot_counts, axis=1)
             penalty_values = token_counts * frequency_penalty
             x = x - penalty_values
-
-            return x
+            return x.astype(org_dtype)
 
         return jax.lax.cond(
             self.frequency_penalty == 0.0,
@@ -802,33 +711,18 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
 
     repetition_penalty: float
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def _apply(x, ids, repetition_penalty):
+            org_dtype = x.dtype
             batch_size, vocab_size = x.shape
-            one_hot_presence = jax.nn.one_hot(
-                ids,
-                num_classes=vocab_size,
-                dtype=x.dtype,
-            )
+            one_hot_presence = jax.nn.one_hot(ids, num_classes=vocab_size, dtype=x.dtype)
             presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
             positive_penalized_scores = x / repetition_penalty
             negative_penalized_scores = x * repetition_penalty
-
             scores_intermediate = jnp.where(x > 0, positive_penalized_scores, scores)
-            penalized_scores = jnp.where(
-                x < 0,
-                negative_penalized_scores,
-                scores_intermediate,
-            )
-
+            penalized_scores = jnp.where(x < 0, negative_penalized_scores, scores_intermediate)
             x = jnp.where(presence_mask, penalized_scores, x)
-
-            return x
+            return x.astype(org_dtype)
 
         return jax.lax.cond(
             self.repetition_penalty == 1.0,
@@ -864,12 +758,7 @@ class MinPLogitsWarper(LogitsWarper):
     filter_value: float = -float("Inf")
     min_tokens_to_keep: int = 1
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         min_p = jnp.asarray(self.min_p)
 
         def _apply(x):
@@ -877,34 +766,18 @@ class MinPLogitsWarper(LogitsWarper):
             sorted_logits, sorted_indices = lax.top_k(x, k=vocab_size)
             sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
             cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
-
-            shifted_cum_probs = jnp.pad(
-                cumulative_probs[:, :-1],
-                ((0, 0), (1, 0)),
-                constant_values=0.0,
-            )
+            shifted_cum_probs = jnp.pad(cumulative_probs[:, :-1], ((0, 0), (1, 0)), constant_values=0.0)
             sorted_indices_to_remove_mask = shifted_cum_probs >= min_p
             min_keep_mask = jnp.arange(vocab_size) < self.min_tokens_to_keep
             sorted_indices_to_remove_mask = sorted_indices_to_remove_mask & (~min_keep_mask)
             indices_to_remove_mask = jnp.zeros_like(x, dtype=jnp.bool_)
-            batch_idx_mesh, _ = jnp.meshgrid(
-                jnp.arange(batch_size),
-                jnp.arange(vocab_size),
-                indexing="ij",
-            )
+            batch_idx_mesh, _ = jnp.meshgrid(jnp.arange(batch_size), jnp.arange(vocab_size), indexing="ij")
             update_indices = (batch_idx_mesh, sorted_indices)
             indices_to_remove_mask = indices_to_remove_mask.at[update_indices].set(sorted_indices_to_remove_mask)
-
             final_scores = jnp.where(indices_to_remove_mask, self.filter_value, x)
-
             return final_scores
 
-        return jax.lax.cond(
-            (min_p > 0) & (min_p < 1),
-            _apply,
-            lambda x: x,
-            scores,
-        )
+        return jax.lax.cond((min_p > 0) & (min_p < 1), _apply, lambda x: x, scores)
 
 
 @auto_pytree
@@ -926,18 +799,9 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
 
     ngram_size: int
 
-    def forward(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def forward(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         def true_fn():
-            def get_previous_ngrams(
-                input_ids: jnp.ndarray,
-                vocab_size: int,
-                cur_len: int,
-            ):
+            def get_previous_ngrams(input_ids: jnp.ndarray, vocab_size: int, cur_len: int):
                 batch_size, seq_len = input_ids.shape
                 seq_ngrams = seq_len - (self.ngram_size - 1)
                 cur_ngrams = cur_len - (self.ngram_size - 1)
@@ -946,12 +810,7 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
                     b = i % batch_size
                     pos = i // batch_size
                     return val.at[i].set(
-                        jnp.array(
-                            [
-                                b,
-                            ]
-                            + [jnp.array(input_ids)[b, pos + j] for j in range(self.ngram_size)]
-                        )
+                        jnp.array([b] + [jnp.array(input_ids)[b, pos + j] for j in range(self.ngram_size)])
                     )
 
                 shape = (batch_size * seq_ngrams, self.ngram_size + 1)
@@ -1006,12 +865,7 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
         output = jax.lax.cond((cur_len >= self.ngram_size - 1), true_fn, lambda: scores)
         return output
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        scores: jnp.ndarray,
-        cur_len: int,
-    ) -> jnp.ndarray:
+    def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
         return jax.lax.cond(
             self.ngram_size != 0,
             lambda a, b, c: self.forward(a, b, c),

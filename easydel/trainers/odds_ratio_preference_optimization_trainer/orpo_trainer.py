@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,15 +44,11 @@ from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-    from tensorflow import data
     from transformers import PreTrainedTokenizerBase
-
-    TFDataset = data.Dataset
 
 else:
     Dataset = tp.Any
     PreTrainedTokenizerBase = tp.Any
-    TFDataset = tp.Any
 
 logger = get_logger(__name__)
 

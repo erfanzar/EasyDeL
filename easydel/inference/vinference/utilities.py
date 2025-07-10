@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ from easydel.utils.compiling_utils import get_safe_hash_int
 from easydel.utils.helpers import get_logger
 
 from ..logits_process import hash_fn
-from ..utilities import SamplingParams
+from ..sampling_params import JitableSamplingParams, SamplingParams
 
 AmapType = tp.Mapping[str, dict[str, tp.Any]]
 PropType = AmapType | list[AmapType] | None
@@ -286,7 +286,7 @@ class SampleState:
 
 
 def create_sampling_step(
-    sampling_params: SamplingParams,
+    sampling_params: JitableSamplingParams,
     eos_token_id: jax.Array,
     pad_token_id: jax.Array,
 ) -> tp.Callable:
@@ -298,7 +298,7 @@ def create_sampling_step(
     used within a generation loop (e.g., `jax.lax.scan`).
 
     Args:
-        sampling_params: A `SamplingParams`.
+        sampling_params: A `JitableSamplingParams`.
         eos_token_id: A JAX array containing the token ID(s) representing the
             end-of-sequence. Generation stops for a sequence once an EOS token is sampled.
         pad_token_id: The JAX array representing the padding token ID. Once a sequence
@@ -329,10 +329,24 @@ def create_sampling_step(
 
         logits = model_outputs.logits[:, -1]
 
-        logits = sampling_params.logits_warper(state.sequences, logits, state.current_length)
-        logits = sampling_params.logits_warper(state.sequences, logits, state.current_length)
+        def _random(sequ, logits, length, key):
+            logits = sampling_params.logits_processor(sequ, logits, length)
+            logits = sampling_params.logits_warper(sequ, logits, length)
+            return jax.random.categorical(key, logits, axis=-1)
 
-        next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
+        def _gready(sequ, logits, length, key):
+            return jnp.argmax(logits, axis=-1)
+
+        next_token = jax.lax.cond(
+            sampling_params.random_sampling,
+            _random,
+            _gready,
+            state.sequences,
+            logits,
+            state.current_length,
+            state.prng_key,
+        )
+
         next_token = next_token * ~state.is_sequence_finished + pad_token_id * state.is_sequence_finished
 
         next_sequence_finished = jnp.logical_or(
@@ -394,9 +408,9 @@ class vInferenceConfig:
         _loop_rows: (Internal) The calculated number of iterations needed in the
             generation loop based on `max_new_tokens` and `streaming_chunks`.
             Automatically computed in `__post_init__`.
-        sampling_params: A `SamplingParams` object containing parameters for the
+        sampling_params: A `JitableSamplingParams` object containing parameters for the
             sampling process itself (e.g., temperature, top_k, top_p, repetition penalty).
-            If None, a default `SamplingParams` instance with `max_tokens` set to
+            If None, a default `JitableSamplingParams` instance with `max_tokens` set to
             `max_new_tokens` is created in `__post_init__`.
     """
 
@@ -412,7 +426,7 @@ class vInferenceConfig:
     partition_axis: PartitionAxis | None = None
     _loop_rows: int | None = None
 
-    sampling_params: SamplingParams | None = None
+    sampling_params: JitableSamplingParams | SamplingParams | None = None
 
     def get_partition_rules(
         self,
@@ -454,28 +468,19 @@ class vInferenceConfig:
             "partition axis is required for state sharding if partition_rules is not provided"
         )
         paxis = self.partition_axis
-        # Key/Value ProjectionSharding Spec
         kvps = PartitionSpec(
             paxis.batch_axis,
             paxis.key_sequence_axis,
             paxis.head_axis,
             paxis.attention_dim_axis,
         )
-        # Input ID ProjectionSharding Spec
         idps = PartitionSpec(paxis.batch_axis, paxis.sequence_axis)
-        # Default Rules
         return (
-            # Input sequences and running token
             ("(sequences|running_token)", idps),
-            # Attention mask and position IDs
             ("model_kwargs/(attention_mask|position_ids)", idps),
-            # Past Key/Value states (8-bit quantization)
             ("model_kwargs/past_key_values/views/[0-9]+/(key|value)/(scale|weight)", kvps),
-            # Past Key/Value states (NF4 quantization)
             ("model_kwargs/past_key_values/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
-            # Past Key/Value states (standard float types)
             ("model_kwargs/past_key_values/views/[0-9]+/(key|value)", kvps),
-            # Default rule for anything else (replicated)
             (".*", PartitionSpec()),
         )
 
@@ -490,11 +495,10 @@ class vInferenceConfig:
            instantiation, it creates a default `SamplingParams` instance, setting its
            `max_tokens` attribute to the value of `self.max_new_tokens`.
         """
+
         if isinstance(self.max_new_tokens, int):
             self._loop_rows = (self.max_new_tokens + self.streaming_chunks - 1) // self.streaming_chunks
         if self.sampling_params is None:
             self.sampling_params = SamplingParams(max_tokens=self.max_new_tokens)
-        self.sampling_params.n = None
-        self.sampling_params.stop = None
 
     __hash__ = hash_fn

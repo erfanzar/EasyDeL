@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -707,7 +707,6 @@ class Gemma3TextModel(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
-
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -823,7 +822,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-
         if self.config.tie_word_embeddings:
             lm_logits = jax.lax.dot_general(
                 hidden_states,
@@ -832,7 +830,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
             )
         else:
             lm_logits = self.lm_head(hidden_states)
-
         if self.config.final_logit_softcapping is not None:
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)

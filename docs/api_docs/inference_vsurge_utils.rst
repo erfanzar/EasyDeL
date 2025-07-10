@@ -1,8 +1,7 @@
-Utils
-=====
+easydel.inference.vsurge.utils
+==============================
 
-.. toctree::
-   :maxdepth: 2
-
-   inference_vsurge_utils___init__
-   inference_vsurge_utils__utils
+.. automodule:: easydel.inference.vsurge.utils
+    :members:
+    :undoc-members:
+    :show-inheritance:

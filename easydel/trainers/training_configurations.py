@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -290,6 +290,10 @@ class TrainingArguments:
     scheduler: AVAILABLE_SCHEDULERS = field(
         default=EasyDeLSchedulers.NONE,
         metadata={"help": "The scheduler to use."},
+    )
+    shuffle_seed_train: int = field(
+        default=64871,
+        metadata={"help": "seed used for trainer dataloader shuffle."},
     )
     sparsify_module: bool = field(
         default=False,

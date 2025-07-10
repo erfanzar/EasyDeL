@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,6 +55,7 @@ tpu_config = TpuAcceleratorConfig(
 )
 
 pprint.pprint(TPU_EXECUTION_ENV_VARS)
+
 
 @execute(tpu_config)
 @ray.remote
@@ -188,10 +189,7 @@ def main():
     # --- Dataset Preparation ---
     logger.info(f"Loading dataset: {DATASET_ID}")
     # Consider using streaming for very large datasets if memory is an issue
-    train_dataset, test_dataset = load_dataset(
-        DATASET_ID,
-        split=["train[:100%]", "test[:100%]"]
-    )
+    train_dataset, test_dataset = load_dataset(DATASET_ID, split=["train[:100%]", "test[:100%]"])
     logger.info(f"Train dataset size: {len(train_dataset)}, Test dataset size: {len(test_dataset)}")
 
     def map_conversation_format(example: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
