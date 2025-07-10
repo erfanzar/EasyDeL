@@ -414,7 +414,6 @@ class vInferenceApiServer:
             top_k=int(getattr(request, "top_k", 50)),
             top_p=float(request.top_p or 1.0),
             min_p=float(getattr(request, "min_p", 0.0)),
-            suppress_tokens=getattr(request, "suppress_tokens", None),
             stop=request.stop,
         )
 
