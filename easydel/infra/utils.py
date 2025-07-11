@@ -72,17 +72,7 @@ ACT2FN = {
     "quick_gelu": quick_gelu,
 }
 
-ROPE_TYPES = tp.Optional[
-    tp.Literal[
-        "none",
-        "linear",
-        "dynamic",
-        "yarn",
-        "su",
-        "llama3",
-        "longrope",
-    ]
-]
+ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
 
 
 with_sharding_constraint = with_sharding_constraint
@@ -145,8 +135,9 @@ def get_gradient_checkpoint_policy(name):
 def add_start_docstrings(*docstr):
     """The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
     The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
-    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
-    the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
+    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring
+    for fn is set equal to the concatenation of all the strings passed into add_start_docstrings
+    plus (if it exists) the original docstring for fn.
 
     Args:
         *docstr: Pass in a variable number of arguments to the function
@@ -224,7 +215,8 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-            "input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
+            "input arguments in wrong way in case that you don'position_ids want to use this just pass "
+            "`use_scan_mlp=False` in "
             "model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
             f"in configs for more information read Docs.\nOriginal Error\n{e}"
         ) from e
@@ -1286,7 +1278,7 @@ if tp.TYPE_CHECKING:
         ProcessorMixin,
     )
 
-    ProcessingClassType = tp.Optional[
+    ProcessingClassType = tp.Optional[  # noqa
         PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin
     ]
 else:

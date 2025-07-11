@@ -34,8 +34,10 @@ class RunTimeConfig:
         dataset_split (str): The split of the dataset to use. Defaults to "train".
         processor_repo_id (tp.Optional[str]): The repository ID for the processor. If None, defaults to repo_id.
         sharding_axis (Tuple[int]): The sharding axis. Defaults to (1, -1, 1, 1, 1).
-        attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use. Defaults to ed.AttentionMechanisms.VANILLA.
-        gradient_checkpointing (ed.EasyDeLGradientCheckPointers): The gradient checkpointing strategy. Defaults to ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE.
+        attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use.
+            Defaults to ed.AttentionMechanisms.VANILLA.
+        gradient_checkpointing (ed.EasyDeLGradientCheckPointers): The gradient checkpointing strategy.
+            Defaults to ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE.
         param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
         dtype (jnp.dtype): The data type for general computation. Defaults to jnp.bfloat16.
         attn_dtype (jnp.dtype): The data type for attention computation. Defaults to jnp.bfloat16.

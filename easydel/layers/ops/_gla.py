@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 from jax import lax
+
+from easydel.utils.compiling_utils import ejit
 
 from ._base_operation import BaseOperation
 
@@ -26,10 +26,7 @@ def ceildiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
-@partial(
-    jax.jit,
-    static_argnames=("chunk_size", "output_final_state", "dtype", "scale"),
-)
+@ejit(static_argnames=("chunk_size", "output_final_state", "dtype", "scale"))
 def recurrent_gla(
     query: jnp.ndarray,  # shape: (B, S, H, D)
     key: jnp.ndarray,  # shape: (B, S, H, D)

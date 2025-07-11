@@ -190,7 +190,7 @@ def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> tuple
 def torch_dict_to_easydel_params(
     state_dict: dict[str, tp.Any],
     *,
-    device: jax.Device | None = None,
+    device: jax.Device | None = None,  # type:ignore
     embedding_layer_names: list[str] | None = None,
     layernorm_names: list[str] | None = None,
     shard_fns: tp.Mapping[tuple, tp.Callable] | None = None,
@@ -230,7 +230,6 @@ def torch_dict_to_easydel_params(
         _clear = torch.cuda.empty_cache if torch.cuda.is_available() else gc.collect
     except ModuleNotFoundError:
         _clear = gc.collect
-
     # Configuration dictionary
     config = {
         "embedding_layer_names": set(embedding_layer_names or []),

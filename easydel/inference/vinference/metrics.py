@@ -233,7 +233,7 @@ class vInferenceMetrics:
 
 
         @metrics.track_compilation("my_compiled_function")
-        @jax.jit
+        @ed.jit
         def my_compiled_function(x):
           # ... JAX computation ...
           return x * 2

@@ -49,6 +49,7 @@ from easydel.layers.caching import (
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
+from easydel.utils.compiling_utils import ejit
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLVisionConfig
 
@@ -245,7 +246,7 @@ def create_attention_mask(cu_seqlens, seq_length, dtype):
 
 # some of my garbage ideas but they always endup workin
 # TODO: Fix this structure somehow
-@partial(jax.jit, static_argnames=["TKN_ID"])
+@ejit(static_argnames=["TKN_ID"])
 def jax_scatter(sec_embeds, ids, fir_embeds, TKN_ID):
     image_embeds = sec_embeds.astype(fir_embeds.dtype)
 

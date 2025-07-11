@@ -147,13 +147,15 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
             attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
             decoder_sparse_step (int, optional): Frequency of MoE layers. Defaults to 1.
             moe_intermediate_size (int, optional): Intermediate size for MoE MLP layers. Defaults to 1408.
-            shared_expert_intermediate_size (int, optional): Intermediate size for the shared expert MLP. Defaults to 5632.
+            shared_expert_intermediate_size (int, optional):
+                Intermediate size for the shared expert MLP. Defaults to 5632.
             num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 4.
             num_experts (int, optional): Total number of experts. Defaults to 60.
             norm_topk_prob (bool, optional): Whether to normalize top-k probabilities in router. Defaults to False.
             output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
             router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
-            mlp_only_layers (list[int], optional): List of layer indices that should only use MLP (no MoE). Defaults to None.
+            mlp_only_layers (list[int], optional):
+                List of layer indices that should only use MLP (no MoE). Defaults to None.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.

@@ -213,7 +213,8 @@ class DeepseekV2Config(EasyDeLBaseConfig):
           rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
           attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
           attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
           use_scan_mlp (bool, optional): Whether to use scan for MLP computation. Defaults to False.
           scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
           bits (int, optional): Quantization bits. Defaults to None.

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -100,7 +102,7 @@ class Olmo2Config(EasyDeLBaseConfig):
     """
 
     model_type = "olmo2"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
         self,

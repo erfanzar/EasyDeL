@@ -4,7 +4,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import time
-from functools import partial
 
 import jax
 from flax import nnx as nn
@@ -74,7 +73,7 @@ def main():
     model.generation_config.top_p = 0.95
     static_argnums = (0, 5)
 
-    @partial(jax.jit, static_argnums=static_argnums)
+    @ed.ejit(static_argnums=static_argnums)
     def generate(
         graphdef,
         graphstate,

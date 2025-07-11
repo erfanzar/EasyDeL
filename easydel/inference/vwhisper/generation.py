@@ -12,21 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 
-import jax
 from flax import nnx as nn
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 
+from easydel.utils.compiling_utils import ejit
 
-@partial(
-    jax.jit,
-    static_argnames=[
-        "graphdef",
-        "inference_config",
-        "return_timestamps",
-    ],
-)
+
+@ejit(static_argnames=["graphdef", "inference_config", "return_timestamps"])
 def _compiled_generate(
     graphdef,
     graphstate,

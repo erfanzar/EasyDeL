@@ -15,8 +15,10 @@
 import jax
 from jax import numpy as jnp
 
+from easydel.utils.compiling_utils import ejit
 
-@jax.jit
+
+@ejit
 def quantize_row_q8_0(x: jax.Array):
     """
     Quantize a row of float32 values to 8-bit integers with blockwise scaling.
@@ -38,7 +40,7 @@ def quantize_row_q8_0(x: jax.Array):
     return qweight, qscale
 
 
-@jax.jit
+@ejit
 def dequantize_row_q8_0(quants, scales):
     """
     Dequantize 8-bit integers back to float32 values using blockwise scaling.

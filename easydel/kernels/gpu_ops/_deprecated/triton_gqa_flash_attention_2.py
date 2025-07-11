@@ -19,6 +19,8 @@ import functools
 import math
 import os
 
+from easydel.utils.compiling_utils import ejit
+
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -902,7 +904,7 @@ def _fwd_attention_kernel_call_with_residual(
 
 
 @functools.partial(custom_vjp, nondiff_argnums=[4])
-@functools.partial(jax.jit, static_argnums=[4])
+@ejit(static_argnums=[4])
 def _flash_attn2_gqa(
     query: chex.Array,
     key: chex.Array,

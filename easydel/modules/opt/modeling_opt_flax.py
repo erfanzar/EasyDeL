@@ -254,7 +254,6 @@ class OPTAttention(AttentionModule):
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
             causal=self.causal,
-            dropout_rng=self.rngs.params(),
             query_sequence_length=query_states.shape[1],
             key_value_sequence_length=key_states.shape[1],
             uses_cache=cache_view is not None,

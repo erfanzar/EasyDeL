@@ -27,6 +27,7 @@ import flax.nnx
 import grain.python as grain
 import jax
 import jax.extend
+import numpy as np
 from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax.core import unfreeze
@@ -49,8 +50,8 @@ from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
 from easydel.utils import EasyPath, EasyPathLike, Timers, readme_generator
-from easydel.utils.compiling_utils import cjit
 from easydel.utils.helpers import get_logger
+from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
 from .metrics import (
@@ -451,9 +452,6 @@ class BaseTrainer(BaseTrainerProtocol):
             functions = self.configure_functions()
             sharded_training_step_function = functions.sharded_training_step_function
             sharded_evaluation_step_function = functions.sharded_evaluation_step_function
-            if self.arguments.use_cjit:
-                sharded_training_step_function = cjit(fn=sharded_training_step_function, verbose=False)
-                sharded_evaluation_step_function = cjit(fn=sharded_evaluation_step_function, verbose=False)
 
             self.sharded_training_step_function = sharded_training_step_function
             self.sharded_evaluation_step_function = sharded_evaluation_step_function
@@ -482,7 +480,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.timer.log("configure sharded state")
 
     @abstractmethod
-    def create_collect_function(
+    def create_grain_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"],
@@ -504,6 +502,49 @@ class BaseTrainer(BaseTrainerProtocol):
         raise NotImplementedError
 
     @abstractmethod
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+
+        This function handles padding or truncating sequences to the specified `max_sequence_length`
+        based on the chosen `truncation_mode`.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode. Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch of data and returns a processed batch.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def create_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+
+        This function handles padding or truncating sequences to the specified `max_sequence_length`
+        based on the chosen `truncation_mode`.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode. Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch of data and returns a processed batch.
+        """
+
+    @abstractmethod
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
         Configures and JIT-compiles the training and evaluation step functions.
@@ -518,19 +559,7 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         raise NotImplementedError
 
-    def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
-        """
-        Configures the dataloaders for training and evaluation.
-
-        This method creates the training and evaluation dataloaders using the provided
-        datasets and data collator. It also determines the maximum number of training
-        and evaluation steps based on the dataset sizes and training arguments.
-
-        Returns:
-            TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-                                            maximum number of training and evaluation steps.
-        """
-
+    def _configure_grain_dataloader(self):
         def _create_grain_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
             """Creates a Grain DataLoader from a Hugging Face Dataset."""
 
@@ -557,7 +586,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 shuffle=shuffle,
             )
 
-            collate_fn = self.create_collect_function(
+            collate_fn = self.create_grain_collect_function(
                 max_sequence_length=self.arguments.max_sequence_length,
                 truncation_mode=self.arguments.truncation_mode,
             )
@@ -613,6 +642,168 @@ class BaseTrainer(BaseTrainerProtocol):
             dataloader_eval=dataloader_eval,
             max_evaluation_steps=max_evaluation_steps,
         )
+
+    def _configure_tfds_dataloader(self):
+        if not is_package_available("tensorflow"):
+            raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
+        import tensorflow as tf  # type:ignore
+
+        def create_tf_dataset(dataset: Dataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+            """
+            Creates a TensorFlow dataset from a Hugging Face Dataset.
+
+            Args:
+                dataset (Dataset): The Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+            """
+
+            batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+
+            return (
+                dataset.to_tf_dataset(
+                    collate_fn=self.create_tfds_collect_function(
+                        max_sequence_length=self.arguments.max_sequence_length,
+                        truncation_mode=self.arguments.truncation_mode,
+                    ),
+                    batch_size=batch_size,
+                    drop_remainder=True,
+                    shuffle=is_train and self.arguments.shuffle_train_dataset,
+                    num_workers=self.arguments.dataloader_num_workers,
+                )
+                .repeat(self.arguments.num_train_epochs if is_train else 1)
+                .prefetch(tf.data.AUTOTUNE)
+                .as_numpy_iterator()
+            )
+
+        def create_tf_dataset_from_iterable(dataset: IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+            """
+            Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
+
+            Args:
+                dataset (IterableDataset): The iterable Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+            """
+
+            batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+            tf_data_mapping = {
+                "float16": tf.float16,
+                "float32": tf.float32,
+                "float64": tf.float64,
+                "int16": tf.int16,
+                "int32": tf.int32,
+                "int64": tf.int64,
+                "bool": tf.bool,
+            }
+            return (
+                tf.data.Dataset.from_generator(
+                    lambda: dataset,
+                    output_signature={
+                        col: tf.TensorSpec(
+                            shape=vals.shape[1:]
+                            if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
+                            else vals.shape,
+                            dtype=tf_data_mapping[str(vals.dtype)],
+                        )
+                        for col, vals in next(iter(dataset)).items()
+                        if hasattr(vals, "shape")
+                    },
+                )
+                .batch(batch_size, drop_remainder=False)
+                .prefetch(tf.data.AUTOTUNE)
+                .as_numpy_iterator()
+            )
+
+        def calculate_steps(dataset: Dataset | IterableDataset, is_train: bool) -> int:
+            """
+            Calculates the number of training or evaluation steps based on dataset length and arguments.
+
+            Args:
+              dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+              is_train (bool): Whether the dataset is for training.
+
+            Returns:
+              int: The number of steps.
+
+            Raises:
+              ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+            """
+            if hasattr(dataset, "__len__"):
+                total_data_len = len(dataset)
+            else:
+                total_data_len = (
+                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
+                )
+                if total_data_len is None:
+                    raise ValueError(
+                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                        "steps for a generator/streaming dataset."
+                    )
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_steps = (
+                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
+            )
+            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+            steps = forced_steps if forced_steps is not None else num_steps
+
+            if is_train:
+                steps = steps // self.arguments.gradient_accumulation_steps
+            return steps
+
+        def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+            """
+            Converts a Hugging Face Dataset to a TensorFlow dataloader.
+
+            Args:
+                dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+                is_train (bool): Whether the dataset is for training.
+
+            Returns:
+                tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+            """
+            if hasattr(dataset, "__len__"):
+                return create_tf_dataset(dataset, is_train)
+            else:
+                return create_tf_dataset_from_iterable(dataset, is_train)
+
+        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+
+        dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
+
+        if self.dataset_eval is not None and self.arguments.do_eval:
+            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
+        else:
+            dataloader_eval, max_evaluation_steps = None, 0
+
+        return TrainerConfigureDataloaderOutput(
+            dataloader_train=dataloader_train,
+            max_training_steps=max_training_steps,
+            dataloader_eval=dataloader_eval,
+            max_evaluation_steps=max_evaluation_steps,
+        )
+
+    def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
+        """
+        Configures the dataloaders for training and evaluation.
+
+        This method creates the training and evaluation dataloaders using the provided
+        datasets and data collator. It also determines the maximum number of training
+        and evaluation steps based on the dataset sizes and training arguments.
+
+        Returns:
+            TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+                                            maximum number of training and evaluation steps.
+        """
+        if self.arguments.use_grain:
+            return self._configure_grain_dataloader()
+        else:
+            return self._configure_tfds_dataloader()
 
     def configure_model(self) -> TrainerConfigureModelOutput:
         """

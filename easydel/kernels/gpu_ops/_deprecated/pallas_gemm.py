@@ -25,6 +25,8 @@ import jax.random
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 
+from easydel.utils.compiling_utils import ejit
+
 INTERPRET = False
 
 
@@ -160,16 +162,7 @@ def get_best_block_size(A, B):
     return bm, bk, bn
 
 
-@partial(
-    jax.jit,
-    static_argnames=[
-        "blocksize_m",
-        "blocksize_k",
-        "blocksize_n",
-        "prod_dtype",
-        "precision",
-    ],
-)
+@ejit(static_argnames=["blocksize_m", "blocksize_k", "blocksize_n", "prod_dtype", "precision"])
 def _call_gpu_matmul_kernel_fwd(
     A: jax.Array,
     B: jax.Array,

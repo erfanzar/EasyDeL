@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import os
 import pickle
-import re
 import typing as tp
 import warnings
 
@@ -27,153 +26,259 @@ import jax
 import numpy as np
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
-from .checkpoint_managers.path_utils import EasyPath
 from .helpers import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
-    from jax._src.stages import Compiled as JAXCompiled
-    from jax._src.stages import Lowered as JAXLowered
-    from jax.sharding import Mesh, Sharding
-    from jax.tree_util import PyTreeDef
-
-    Compiled = JAXCompiled
-    Lowered = JAXLowered
+    from jax._src.stages import Compiled, Lowered
 else:
     Compiled, Lowered = tp.Any, tp.Any
-    PyTreeDef, Mesh, Sharding = tp.Any, tp.Any, tp.Any
-
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
-F = tp.TypeVar("F", bound=tp.Callable[..., tp.Any])
-Pytree = tp.Any
 
-
-RECOMPILE_FORCE = check_bool_flag("RECOMPILE_FORCE", False)
-ECACHE_COMPILES = check_bool_flag("ECACHE_COMPILES", True)
+RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
+ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
+COMPILE_FUNC_DIR = CACHE_DIR / "ejit_compiled_functions"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
-COMPILED_FILE_NAME = "compiled.func"
+COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
-
-COMPILED_CACHE: dict[tuple, tp.Any] = {}
-
-
-def is_jit_wrapped(fn: tp.Any) -> bool:
-    return all(
-        [
-            hasattr(fn, "_fun"),
-            hasattr(fn, "lower"),
-            hasattr(fn, "eval_shape"),
-            hasattr(fn, "trace"),
-        ]
-    )
+COMPILED_CACHE: dict[str, Compiled] = {}
 
 
-def remove_memory_addresses(input_string: str) -> str:
+def _get_hardware_signature() -> str:
+    """Creates a signature for the current JAX hardware environment."""
+    return str(jax.devices())
+
+
+def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
+    """Generates a hashable signature for a leaf node in a PyTree."""
+    if isinstance(leaf, jax.Array | np.ndarray):
+        if hasattr(leaf, "sharding"):
+            return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)), repr(leaf.sharding))
+        return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)))
+    return type(leaf)
+
+
+def _get_args_signature(args: tuple, kwargs: dict) -> str:
+    """Creates a signature for arguments based on their tree structure, shapes, and dtypes."""
+    arg_leaves, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
+    leaf_signatures = tuple(map(_get_leaf_signature, arg_leaves))
+    return str((arg_tree, leaf_signatures))
+
+
+def ejit(
+    func: tp.Callable[P, R] | None = None,
+    *,
+    static_argnums: int | tp.Sequence[int] | None = None,
+    static_argnames: str | tp.Iterable[str] | None = None,
+    donate_argnums: int | tp.Sequence[int] | None = None,
+    in_shardings: tp.Any = None,
+    out_shardings: tp.Any = None,
+):
     """
-    Removes hexadecimal memory address patterns (e.g., 0x736a142445e0) from a string.
+    An optimized, minimal-overhead, drop-in replacement for `jax.jit` that
+    caches compiled functions to disk for reuse across script runs.
+
+    This decorator uses a two-level caching system to ensure maximum performance:
+    1.  An in-memory LRU (Least Recently Used) cache acts as a fast "dispatch"
+        cache, mapping argument shapes to the correct compiled executable.
+    2.  A persistent on-disk cache stores the executables, avoiding the need
+        to recompile the same function in a new process.
+
+    It is designed to be robust, falling back gracefully to standard `jax.jit`
+    behavior if any part of the caching process fails.
 
     Args:
-        input_string: The string to process.
+        func: The function to be JIT-compiled and cached.
+        ... (all other jax.jit args)
 
     Returns:
-        The string with memory address patterns removed.
+        A wrapped function that is JIT-compiled and cached with high performance.
     """
-    # Regex to find hexadecimal memory addresses:
-    # 0x     : matches the literal "0x"
-    # [0-9a-fA-F]+ : matches one or more hexadecimal characters (0-9, a-f, A-F)
-
-    return re.sub(r"0x[0-9a-fA-F]+", "", input_string)
-
-
-def cjit(fn: tp.Callable[P, R], verbose: bool = True):
-    """
-    A decorator that adds caching to a JAX JIT-compiled function.
-    The input `fn` must already be a JIT-transformed function (e.g., from @jax.jit).
-    """
-    assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
-
-    static_argnums = fn._jit_info.static_argnums
-    static_argnames = fn._jit_info.static_argnames
-
-    if len(static_argnames) == 0:
-        static_argnames = None
-    if len(static_argnums) == 0:
-        static_argnums = None
-
-    state_signature = remove_memory_addresses(
-        str(
-            (
-                fn.__signature__._hash_basis(),
-                fn.__annotations__,
-                fn._fun.__annotations__,
-                fn._fun.__kwdefaults__,
-                fn._fun.__name__,
-                static_argnums,
-                static_argnames,
-            )
+    if func is None:
+        return functools.partial(
+            ejit,
+            static_argnums=static_argnums,
+            static_argnames=static_argnames,
+            donate_argnums=donate_argnums,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
         )
+
+    if not ECACHE_COMPILES:
+        from jax.experimental.compilation_cache import compilation_cache as cc
+
+        cc.set_cache_dir(str(COMPILE_FUNC_DIR))
+        jax.config.update("jax_compilation_cache_dir", str(COMPILE_FUNC_DIR))
+        jitted_function = jax.jit(
+            func,
+            static_argnums=static_argnums,
+            static_argnames=static_argnames,
+            donate_argnums=donate_argnums,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
+        )
+        return jitted_function
+    jitted_function = jax.jit(
+        func,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        donate_argnums=donate_argnums,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+    )
+    try:
+        func_source = inspect.getsource(func)
+        hardware_sig = _get_hardware_signature()
+        jit_options_sig = str((static_argnums, static_argnames, donate_argnums, in_shardings, out_shardings))
+        static_key_part = "".join([func_source, hardware_sig, jit_options_sig])
+    except Exception as e:
+        warnings.warn(
+            f"Could not create static cache key for ejit function '{func.__name__}'. "
+            f"Falling back to regular jit. Error: {e}",
+            stacklevel=2,
+        )
+
+        return jitted_function
+
+    static_arg_indices = (
+        set(static_argnums)
+        if isinstance(static_argnums, list | tuple)
+        else {static_argnums}
+        if static_argnums is not None
+        else set()
+    )
+    static_arg_names_set = (
+        set(static_argnames)
+        if isinstance(static_argnames, list | tuple)
+        else {static_argnames}
+        if static_argnames is not None
+        else set()
     )
 
-    static_arg_indices = set(static_argnums) if static_argnums is not None else set()
+    def get_compiled_and_cache(args_sig: str, args, kwargs) -> Compiled | None:
+        """
+        This inner function handles the "slow path": looking up in the L2 cache,
+        on disk, or compiling. It's decorated with LRU cache so it only runs
+        once per unique set of argument shapes.
+        """
+        compilation_key = hashlib.md5((static_key_part + args_sig).encode("utf-8")).hexdigest()
 
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
+        if compilation_key in COMPILED_CACHE and not RECOMPILE_FORCE:
+            return COMPILED_CACHE[compilation_key]
+
+        func_dir = COMPILE_FUNC_DIR / compilation_key
+        filepath = func_dir / COMPILED_FILE_NAME
+        if filepath.exists() and not RECOMPILE_FORCE:
+            try:
+                with open(filepath, "rb") as f:
+                    serialized, in_tree, out_tree = pickle.load(f)
+                compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
+                COMPILED_CACHE[compilation_key] = compiled_func
+                return compiled_func
+            except Exception as e:
+                warnings.warn(f"Could not load ejit cache from '{filepath}'. Recompiling. Error: {e}", stacklevel=2)
+
+        try:
+            lowered_func = jitted_function.lower(*args, **kwargs)
+            compiled_func = lowered_func.compile()
+
+            try:
+                serialized, in_tree, out_tree = serialize(compiled_func)
+                func_dir.mkdir(parents=True, exist_ok=True)
+                with open(filepath, "wb") as f:
+                    pickle.dump((serialized, in_tree, out_tree), f)
+            except Exception:
+                pass
+
+            COMPILED_CACHE[compilation_key] = compiled_func
+            return compiled_func
+        except Exception as e:
+            warnings.warn(f"ejit compilation failed for '{func.__name__}'. Error: {e}", stacklevel=2)
+            return None
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            args_sig = _get_args_signature(args, kwargs)
+            compiled_func = get_compiled_and_cache(args_sig, args, kwargs)
+
+        except Exception as e:
+            warnings.warn(
+                f"ejit signature generation failed for '{func.__name__}'. Falling back. Error: {e}", stacklevel=2
+            )
+            return jitted_function(*args, **kwargs)
+        if compiled_func is None:
+            return jitted_function(*args, **kwargs)
         dynamic_args = tuple(arg for i, arg in enumerate(args) if i not in static_arg_indices)
-        dynamic_kwargs = kwargs.copy()
-        if static_argnames is not None:
-            for key in static_argnames:
-                dynamic_kwargs.pop(key, None)
-        signature = get_signature_tree_util(dynamic_args, dynamic_kwargs)
-        cache_key = (state_signature, signature)
-        if cache_key in COMPILED_CACHE:
-            compiled_func = COMPILED_CACHE[cache_key]
-            return compiled_func(*dynamic_args, **dynamic_kwargs)
-        lowered_func: Lowered = fn.lower(*args, **kwargs)
-        compiled_func, signature = smart_compile(
-            lowered_func=lowered_func,
-            tag="cached-jit",
-            verbose=verbose,
-            cache_key=cache_key,
-        )
-
-        COMPILED_CACHE[signature] = compiled_func
-
+        dynamic_kwargs = {k: v for k, v in kwargs.items() if k not in static_arg_names_set}
         return compiled_func(*dynamic_args, **dynamic_kwargs)
 
-    return wrapped
+    return wrapper
+
+
+def load_cached_functions(verbose: bool = True) -> None:
+    """Pre-loads all valid cached functions from disk into the persistent L2 cache."""
+    if not COMPILE_FUNC_DIR.exists():
+        return
+
+    loaded_count = 0
+    for cache_key_dir in COMPILE_FUNC_DIR.iterdir():
+        if not cache_key_dir.is_dir():
+            continue
+
+        cache_key = cache_key_dir.name
+        filepath = cache_key_dir / COMPILED_FILE_NAME
+
+        if filepath.exists():
+            try:
+                with open(filepath, "rb") as f:
+                    serialized, in_tree, out_tree = pickle.load(f)
+                compiled_func = deserialize_and_load(serialized, in_tree, out_tree)
+                COMPILED_CACHE[cache_key] = compiled_func
+                loaded_count += 1
+            except Exception as e:
+                if verbose:
+                    warnings.warn(f"Could not pre-load ejit cache for key {cache_key}. Error: {e}", stacklevel=2)
+
+    if verbose and loaded_count > 0:
+        print(f"Pre-loaded {loaded_count} functions into ejit's persistent memory cache.")
+
+
+def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None = None):
+    """Save a compiled function to disk with its serialization metadata."""
+    path.mkdir(parents=True, exist_ok=True)
+    prefix = prefix or ""
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+    serialized, in_tree, out_tree = serialize(fn)
+    try:
+        pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+    except Exception as e:
+        warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
+
+
+def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
+    """Load a compiled function from disk."""
+    prefix = prefix or ""
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+    (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
+    return deserialize_and_load(
+        serialized=serialized,
+        in_tree=in_tree,
+        out_tree=out_tree,
+    )
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values.
-
-    Args:
-        self: Object to hash
-
-    Returns:
-        Integer hash value
-    """
-    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | float | bool | dict | list))
+    """Generate a hash for an object based on its dictionary values."""
+    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)
 
 
 def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks.
-
-    Args:
-        text: Input text to hash
-        algorithm: Hash algorithm to use (default: md5)
-
-    Returns:
-        Integer representation of the hash digest
-
-    Raises:
-        ValueError: If specified algorithm is not supported
-        Exception: If any error occurs during hashing
-    """
+    """Generate a hash of text using specified algorithm with safety checks."""
     try:
         text_str = str(text)
         hash_object = getattr(hashlib, algorithm)(text_str.encode())
@@ -182,73 +287,6 @@ def get_safe_hash_int(text, algorithm="md5"):
         raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
     except Exception as e:
         raise Exception(f"Error generating hash: {e!s}") from e
-
-
-_leaf_types = (jax.Array, np.ndarray, int, float, bool, str, bytes, type(None))
-
-
-def _is_leaf_for_signature(node):
-    """Determine if a node should be considered a leaf for signature generation.
-
-    Args:
-        node: Node to check
-
-    Returns:
-        True if node is a leaf type (array, primitive type, or has shape/dtype attributes), False otherwise
-    """
-    if isinstance(node, jax.Array | np.ndarray):
-        return True
-    if isinstance(node, _leaf_types):
-        return True
-    if not isinstance(node, list | tuple | dict):
-        try:
-            _ = node.shape
-            _ = node.dtype
-            return True
-        except AttributeError:
-            return False
-    return False
-
-
-def get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
-    """Generate a hashable signature for a leaf node.
-
-    Args:
-        leaf: Input node to generate signature for
-
-    Returns:
-        Tuple of (shape, dtype) for array-like objects, type for others
-    """
-    if isinstance(leaf, jax.Array | np.ndarray) or (hasattr(leaf, "shape") and hasattr(leaf, "dtype")):
-        try:
-            shape = tuple(leaf.shape)
-            dtype_str = str(jax.dtypes.canonicalize_dtype(leaf.dtype))
-            return (shape, dtype_str)
-        except Exception:
-            return type(leaf)
-    else:
-        return type(leaf)
-
-
-def get_signature_tree_util(
-    args: tuple[tp.Any, ...],
-    kwargs: dict[str, tp.Any],
-) -> tuple:
-    """Generate a signature tree from function arguments.
-
-    Args:
-        args: Positional arguments to process
-        kwargs: Keyword arguments to process
-
-    Returns:
-        Tuple containing tree structure and leaf signatures
-    """
-    leaves, structure = jax.tree_util.tree_flatten(
-        (args, kwargs),
-        is_leaf=_is_leaf_for_signature,
-    )
-    leaf_signatures = leaf_signatures = tuple(map(get_leaf_signature, leaves))
-    return (structure, leaf_signatures)
 
 
 def get_hash_of_lowering(lowered_func: Lowered):
@@ -264,16 +302,7 @@ def smart_compile(
     verbose: bool = True,
     cache_key: tuple[str, tuple] | None = None,
 ) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with caching.
-
-    Args:
-        lowered_func: JAX function in lowered form
-        tag: Optional tag for the compiled function
-        verbose: Whether to show warning messages (default: True)
-
-    Returns:
-        Compiled JAX function
-    """
+    """Compile a lowered JAX function with caching."""
     func_hash = get_hash_of_lowering(lowered_func)
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
     func_dir = COMPILE_FUNC_DIR / foldername
@@ -281,6 +310,7 @@ def smart_compile(
     signature_filepath = func_dir / SIGNATURE_FILE_NAME
     post_fix = f" (TAG : {tag})" if tag else ""
     signature = cache_key
+
     if filepath.exists() and not RECOMPILE_FORCE:
         try:
             (serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
@@ -328,228 +358,10 @@ def smart_compile(
         return compiled_func, signature
 
 
-def save_compiled_fn(
-    path: str | os.PathLike,
-    fn: Compiled,
-    prefix: str | None = None,
-):
-    """Save a compiled function to disk with its serialization metadata.
-
-    Args:
-        path: Directory path to save the function
-        fn: Compiled function to save
-        prefix: Optional prefix for the filename
-
-    Raises:
-        Warning: If saving fails
-    """
-    path.mkdir(parents=True, exist_ok=True)
-    prefix = prefix or ""
-    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
-    serialized, in_tree, out_tree = serialize(fn)
-    try:
-        pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
-    except Exception as e:
-        warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
-
-
-def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
-    """Load a compiled function from disk.
-
-    Args:
-        path: Directory path to load from
-        prefix: Optional prefix used when saving the function
-
-    Returns:
-        Deserialized compiled function
-
-    Raises:
-        If file loading or deserialization fails
-    """
-    prefix = prefix or ""
-    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
-    (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
-    return deserialize_and_load(
-        serialized=serialized,
-        in_tree=in_tree,
-        out_tree=out_tree,
-    )
-
-
-def cache_compiles(
-    tag: str | None = None,
-    static_argnames: list[str] | None = None,
-):
-    """Create a decorator for caching compiled functions.
-
-    Args:
-        tag: Optional tag for cache identification
-        static_argnames: List of static argument names to exclude from signature
-
-    Returns:
-        Decorator function for caching compiled functions
-    """
-    static_argnames = static_argnames or []
-
-    def create_wrapper(func: tp.Callable, tag: str | None = None) -> tp.Callable:
-        original_func = getattr(func, "_fun", func)
-        func_id = str(
-            hashlib.sha256(
-                original_func.__code__.co_code,
-            )
-            .hexdigest()
-            .encode("utf-8")
-        )
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            signature = (func_id, get_signature_tree_util(args, kwargs))
-            if signature in COMPILED_CACHE:
-                for static_key in static_argnames:
-                    kwargs.pop(static_key)
-                return COMPILED_CACHE[signature](*args, **kwargs)
-            if hasattr(func, "lower"):
-                lowered = func.lower(*args, **kwargs)
-                for static_key in static_argnames:
-                    kwargs.pop(static_key)
-                func_hash = get_hash_of_lowering(lowered)
-                sig_hash = hashlib.sha256(str(signature).encode()).hexdigest()[:8]
-                foldername = f"{tag}-{func_hash}-{sig_hash}" if tag else f"{func_hash}-{sig_hash}"
-                func_dir = COMPILE_FUNC_DIR / foldername
-                filepath = func_dir / "compiled.func"
-
-                if filepath.exists() and not RECOMPILE_FORCE:
-                    with open(filepath, "rb") as f:
-                        serialized, in_tree, out_tree = pickle.load(f)
-                    compiled_func = deserialize_and_load(
-                        serialized=serialized,
-                        in_tree=in_tree,
-                        out_tree=out_tree,
-                    )
-                    COMPILED_CACHE[signature] = compiled_func
-                    return compiled_func(*args, **kwargs)
-
-                compiled_func = lowered.compile()
-                COMPILED_CACHE[signature] = compiled_func
-
-                try:
-                    serialized, in_tree, out_tree = serialize(compiled_func)
-                    func_dir.mkdir(parents=True, exist_ok=True)
-                    with open(filepath, "wb") as f:
-                        pickle.dump((serialized, in_tree, out_tree), f)
-                except Exception as e:
-                    print(f"Failed to cache compilation: {e}")
-
-                return compiled_func(*args, **kwargs)
-            return func(*args, **kwargs)
-
-        wrapper._COMPILED_CACHE = COMPILED_CACHE
-        return wrapper
-
-    def decorator(func: tp.Callable) -> tp.Callable:
-        return create_wrapper(func, tag)
-
-    return decorator
-
-
-def lower_function(
-    func: tp.Callable[P, R],
-    func_input_args: P.args,  # type:ignore
-    func_input_kwargs: P.kwargs,  # type:ignore
-    mesh: Mesh | None = None,
-    in_shardings: Pytree = None,
-    out_shardings: Pytree = None,
-    static_argnums: int | tp.Sequence[int] | None = None,
-    donate_argnums: int | tp.Sequence[int] | None = None,
-) -> Lowered:
-    """Lowers a JAX function with specified configurations."""
-    """
-    lower a JAX function with optional sharding and mesh configuration.
-
-    Args:
-        func: The JAX function to compile.
-        func_input_args: Input arguments for the function.
-        func_input_kwargs: Input keyword arguments for the function.
-        mesh: tp.Optional JAX mesh for distributed execution.
-        in_shardings: tp.Optional input sharding specifications.
-        out_shardings: tp.Optional output sharding specifications.
-        static_argnums: Indices of static arguments.
-        donate_argnums: Indices of arguments to donate.
-
-    Returns:
-        lowered JAX function.
-    """
-    jit_options: dict[str, tp.Any] = {
-        "in_shardings": in_shardings,
-        "out_shardings": out_shardings,
-        "static_argnums": static_argnums,
-        "donate_argnums": donate_argnums,
-    }
-
-    jitted_func = jax.jit(func, **jit_options)
-
-    if mesh is None:
-        return jitted_func.lower(*func_input_args, **func_input_kwargs)  # type: ignore[attr-defined]
-    else:
-        with mesh:  # type: ignore[attr-defined] # mesh is a context manager
-            return jitted_func.lower(*func_input_args, **func_input_kwargs)  # type: ignore[attr-defined]
-
-
-def compile_function(
-    func: tp.Callable[P, R],
-    func_input_args: P.args,  # type:ignore
-    func_input_kwargs: P.kwargs,  # type:ignore
-    mesh: Mesh | None = None,
-    in_shardings: Pytree = None,
-    out_shardings: Pytree = None,
-    static_argnums: int | tp.Sequence[int] | None = None,
-    donate_argnums: int | tp.Sequence[int] | None = None,
-) -> Compiled:
-    """
-    Compiles a JAX function with optional sharding and mesh configuration.
-
-    Args:
-        func: The JAX function to compile.
-        func_input_args: Input arguments for the function.
-        func_input_kwargs: Input keyword arguments for the function.
-        mesh: tp.Optional JAX mesh for distributed execution.
-        in_shardings: tp.Optional input sharding specifications.
-        out_shardings: tp.Optional output sharding specifications.
-        static_argnums: Indices of static arguments.
-        donate_argnums: Indices of arguments to donate.
-
-    Returns:
-        Compiled JAX function.
-    """
-    return lower_function(
-        func,
-        func_input_args,
-        func_input_kwargs,
-        mesh=mesh,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-    ).compile()
-
-
-def load_cached_functions() -> None:
-    files = [o for o in os.listdir(COMPILE_FUNC_DIR) if os.path.exists(os.path.join(COMPILE_FUNC_DIR, o))]
-    for file in files:
-        target_compiled_function = EasyPath(COMPILE_FUNC_DIR) / file / COMPILED_FILE_NAME
-        target_signature = EasyPath(COMPILE_FUNC_DIR) / file / SIGNATURE_FILE_NAME
-        (serialized, in_tree, out_tree) = pickle.loads(target_compiled_function.read_bytes())
-        signature = pickle.loads(target_signature.read_bytes())
-        compiled_function = deserialize_and_load(serialized=serialized, in_tree=in_tree, out_tree=out_tree)
-        COMPILED_CACHE[signature] = compiled_function
-
-
 if __name__ == "__main__":
     jnp = jax.numpy
-    load_cached_functions()
 
-    @cjit
-    @jax.jit
+    @ejit
     def my_function(x, y):
         return x * y + x
 

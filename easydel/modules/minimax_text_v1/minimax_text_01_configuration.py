@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -22,14 +24,14 @@ from easydel.infra.factory import register_config
 class MiniMaxText01Config(EasyDeLBaseConfig):
     r"""
     This is the configuration class to store the configuration of a [`MiniMaxText01Model`]. It is used to instantiate an
-    MiniMaxText01 model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of the MiniMaxText01.
+    MiniMaxText01 model according to the specified arguments, defining the model architecture. Instantiating
+    a configuration with the defaults will yield a similar configuration to that of the MiniMaxText01.
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
         vocab_size (`int`, *optional*, defaults to 32000):
-            Vocabulary size of the MiniMaxText01 model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`MiniMaxText01Model`]
+            Vocabulary size of the MiniMaxText01 model. Defines the number of different tokens that can
+            be represented by the `inputs_ids` passed when calling [`MiniMaxText01Model`]
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 14336):
@@ -94,7 +96,7 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
     ```"""
 
     model_type = "MiniMaxText01"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
         self,

@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .aya_vision_configuration import AyaVisionConfig
-from .modeling_aya_vision_flax import AyaVisionForConditionalGeneration
+from .modeling_aya_vision_flax import AyaVisionForConditionalGeneration, AyaVisionModel
 
-__all__ = "AyaVisionConfig", "AyaVisionForConditionalGeneration"
+__all__ = "AyaVisionConfig", "AyaVisionForConditionalGeneration", "AyaVisionModel"

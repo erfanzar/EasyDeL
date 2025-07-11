@@ -24,19 +24,13 @@ import jax.numpy as jnp
 import jax.sharding
 from jax import lax
 
+from easydel.utils.compiling_utils import ejit
+
 from ._backward_jax import _bwd_flash_attn
 from ._forward_jax import _fwd_flash_attn
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "dtype",
-        "precision",
-        "blocksize_q",
-        "blocksize_k",
-    ],
-)
+@ejit(static_argnames=["dtype", "precision", "blocksize_q", "blocksize_k"])
 def flash_attention(
     query_state: jax.Array,
     key_state: jax.Array,

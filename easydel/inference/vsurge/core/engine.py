@@ -26,7 +26,7 @@ from transformers import ProcessorMixin
 
 from easydel.inference.sampling_params import JitableSamplingParams
 from easydel.layers.attention import AttentionMechanisms
-from easydel.utils import check_bool_flag, cjit
+from easydel.utils import ejit
 
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
 from .functions import (
@@ -191,14 +191,14 @@ class vEngine:
                     min_size=0,
                 ),
             )
-            self._free_state_slots = jax.jit(
+            self._free_state_slots = ejit(
                 continuous_bulk_free_state_slots,
                 donate_argnums=(1,),
                 in_shardings=(None, self._decodes_state_sharding),
                 out_shardings=self._decodes_state_sharding,
             )
 
-            self.continuous_prefill = jax.jit(
+            self.continuous_prefill = ejit(
                 continuous_prefill,
                 static_argnums=(0, 8),
                 in_shardings=(
@@ -214,7 +214,7 @@ class vEngine:
                 ),
                 out_shardings=(self._prefill_state_sharding, None),
             )
-            self.continuous_decode = jax.jit(
+            self.continuous_decode = ejit(
                 continuous_decode,
                 static_argnums=(0,),
                 donate_argnums=(3,),
@@ -227,7 +227,7 @@ class vEngine:
                 ),
                 out_shardings=(self._decodes_state_sharding, None),
             )
-            self.continuous_insert = jax.jit(
+            self.continuous_insert = ejit(
                 continuous_insert,
                 donate_argnums=(0, 1),
                 static_argnums=(3, 4),
@@ -238,11 +238,6 @@ class vEngine:
                 ),
                 out_shardings=self._decodes_state_sharding,
             )
-            if check_bool_flag("EASYDEL_CJIT_COMPILE", False):
-                self._free_state_slots = cjit(self._free_state_slots)
-                self.continuous_prefill = cjit(self.continuous_prefill)
-                self.continuous_decode = cjit(self.continuous_decode)
-                self.continuous_insert = cjit(self.continuous_insert)
 
     @cached_property
     def pad_token_id(self):

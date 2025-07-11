@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
@@ -385,14 +386,9 @@ class ORPOTrainer(Trainer):
             padding_value=self.arguments.padding_value,
             max_length=self.arguments.max_length,
         )
-        jited_concatenated_forward = jax.jit(
+        jited_concatenated_forward = ejit(
             partial_concatenated_forward,
-            static_argnames=(
-                "is_encoder_decoder",
-                "label_pad_token_id",
-                "padding_value",
-                "max_length",
-            ),
+            static_argnames=("is_encoder_decoder", "label_pad_token_id", "padding_value", "max_length"),
         )
 
         self._train_shared_fn_static_args = (
@@ -446,7 +442,27 @@ class ORPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
-    def create_collect_function(
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a data collection function for batching.
+
+        For DPO training, this method simply returns the pre-configured `data_collator`.
+
+        Args:
+            max_sequence_length (int): The maximum sequence length (not used in this implementation).
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode (not used in this implementation). Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: The data collator function.
+        """
+        return self.input_data_collator
+
+    def create_tfds_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",

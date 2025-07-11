@@ -23,6 +23,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.prompt_utils import maybe_apply_chat_template
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
@@ -182,7 +183,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (2, 3, 4, 5, 6)
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             training_step,
             static_argnums=sharded_training_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -197,7 +198,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (2, 3, 4)
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             evaluation_step,
             static_argnums=sharded_evaluation_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),

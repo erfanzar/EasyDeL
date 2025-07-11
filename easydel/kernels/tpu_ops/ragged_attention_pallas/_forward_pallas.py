@@ -8,6 +8,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from easydel.utils.compiling_utils import ejit
+
 
 def get_mha_cost_estimate(shape_dtype):
     """Estimates the cost of MHA computation for use with Pallas.
@@ -167,7 +169,7 @@ def ragged_decode_mqa(
     return out
 
 
-@functools.partial(jax.jit, static_argnames=["block_size", "softmax_scale"])
+@ejit(static_argnames=["block_size", "softmax_scale"])
 def inner_decode_tpu(
     query_tensor: chex.Array,
     key_tensor: chex.Array,

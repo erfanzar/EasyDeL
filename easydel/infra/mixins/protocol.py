@@ -686,7 +686,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def get_static_arguments(self) -> tuple:
-        """return static arguments kwargs for jax.jit"""
+        """return static arguments kwargs for `jax.jit` / `ejit`"""
         ...
 
     @classmethod

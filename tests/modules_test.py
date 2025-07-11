@@ -5,7 +5,6 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # os.environ["JAX_PLATFORMS"] = "cpu"
 import sys
-from functools import partial
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import copy
@@ -56,7 +55,7 @@ class EasyModelsTest(unittest.TestCase):
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
         self.rope_scaling: dict[str, str | float] | None = None
-        self.use_scan_mlp: bool = True
+        self.use_scan_mlp: bool = False
         self.bits: int | None = None
         self.hidden_act: str = "silu"
         self.scan_layers: bool = False
@@ -192,8 +191,7 @@ class EasyModelsTest(unittest.TestCase):
             ed_model = ed_model.shard_model()
             try:
 
-                @ed.utils.cjit
-                @partial(jax.jit, static_argnums=(1,))
+                @ed.utils.ejit(static_argnums=(1,))
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(
                         input_ids=ids,
@@ -205,8 +203,7 @@ class EasyModelsTest(unittest.TestCase):
                 ed_output = jited(jax_input_ids, *ed_model.split_module())
             except Exception:
 
-                @ed.utils.cjit
-                @partial(jax.jit, static_argnums=(1,))
+                @ed.utils.ejit(static_argnums=(1,))
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(
                         input_ids=ids,
@@ -980,12 +977,12 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    # test.test_arctic()  # Passed
-    # test.test_cohere()  # Passed
-    # test.test_cohere2()  # Passed
+    test.test_arctic()  # Passed
+    test.test_cohere()  # Passed
+    test.test_cohere2()  # Passed
     # test.test_dbrx()  # Passed
     # test.test_deepseek_v2()  # Passed
-    test.test_deepseek_v3()  # Passed
+    # test.test_deepseek_v3()  # Passed
     # test.test_exaone()  # Passed
     # test.test_falcon()  # Passed
     # test.test_gemma()  # Passed

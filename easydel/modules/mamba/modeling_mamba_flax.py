@@ -136,9 +136,9 @@ class MambaConv1D(nn.Module):
             raise ValueError(
                 f"Input to `Conv` needs to have rank {unbatched_rank}, but input has shape {x.shape}.",
             )
-
+        org_x_dtype = x.dtype
         x = lax.conv_general_dilated(
-            lhs=x,
+            lhs=x.astype(self.dtype),
             rhs=jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype),
             window_strides=(self.stride,),
             padding=((self.padding, self.padding),),
@@ -149,7 +149,7 @@ class MambaConv1D(nn.Module):
         if self.use_bias:
             x = x + jnp.asarray(self.bias.value.reshape(1, -1, 1), dtype=self.dtype)
 
-        return x
+        return x.astype(org_x_dtype)
 
 
 class MambaMixer(nn.Module):

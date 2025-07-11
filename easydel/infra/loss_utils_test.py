@@ -17,6 +17,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from easydel.utils.compiling_utils import ejit
+
 from .loss_utils import (
     SpecialLossNormalizingFactor,
     auxiliary_load_balancing_loss_func,
@@ -276,7 +278,7 @@ def test_gradient_computation():
     Verifies that the gradient shape matches the input logits shape and contains no NaNs.
     """
 
-    @jax.jit
+    @ejit
     def loss_fn(logits, targets):
         loss, _ = cross_entropy_with_logits(logits, targets, z_loss=0.1)
         return jnp.mean(loss)
@@ -388,7 +390,7 @@ def test_custom_vjp():
     Verifies both the forward and backward passes execute without NaNs.
     """
 
-    @jax.jit
+    @ejit
     def loss_fn(logits, targets):
         return cross_entropy_with_logits(logits, targets, z_loss=0.1)[0]
 

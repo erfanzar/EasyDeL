@@ -229,6 +229,28 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+        """
+        ...
+
+    @abstractmethod
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+        """
+        ...
+
+    @abstractmethod
     def create_collect_function(
         self,
         max_sequence_length: int,

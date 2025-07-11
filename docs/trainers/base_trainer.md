@@ -76,7 +76,7 @@ import jax
 import jax.numpy as jnp # Assuming jnp is needed
 
 class CustomTrainer(BaseTrainer):
-    def create_collect_function(self, *args, **kwargs):
+    def create_tfds_collect_function(self, *args, **kwargs): # when using tfds
         # Example: Custom data collation
         def collect_fn(batch):
             # Implement your custom batch processing logic here
@@ -84,6 +84,14 @@ class CustomTrainer(BaseTrainer):
             return processed_batch
         return collect_fn
 
+    def create_grain_collect_function(self, *args, **kwargs): # when using grain
+        # Example: Custom data collation
+        def collect_fn(batch):
+            # Implement your custom batch processing logic here
+            processed_batch = batch # Placeholder
+            return processed_batch
+        return collect_fn
+    
     def configure_functions(self, *args, **kwargs) -> TrainerConfigureFunctionOutput:
         # Define your custom train and eval steps
         def train_step(state, batch):

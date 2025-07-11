@@ -23,6 +23,8 @@ from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
 
+from easydel.utils.compiling_utils import ejit
+
 
 def _attn_reference(query_states, key_states, value_states, bias):
     b, qs, num_q_heads, d = query_states.shape
@@ -68,18 +70,7 @@ def _attn_reference(query_states, key_states, value_states, bias):
     ).reshape(b, qs, num_q_heads, d)
 
 
-@partial(
-    jax.jit,
-    static_argnames=[
-        "dtype",
-        "BLOCK_M",
-        "BLOCK_N",
-        "softmax_scale",
-        "inference_mode",
-        "interpret",
-        "debug",
-    ],
-)
+@ejit(static_argnames=["dtype", "BLOCK_M", "BLOCK_N", "softmax_scale", "inference_mode", "interpret", "debug"])
 def forward_flash_attention(
     query: jax.Array,
     key: jax.Array,

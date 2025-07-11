@@ -20,6 +20,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from easydel.utils.compiling_utils import ejit
+
 from ._forward_pallas import (
     DEFAULT_MASK_VALUE,
     paged_flash_attention_kernel,
@@ -30,7 +32,7 @@ from ._forward_pallas import (
 MAX_SMEM_USAGE = 512 * 1024
 
 
-@jax.jit
+@ejit
 def _build_contiguous_kv_vectorized(pages, block_tables) -> tuple[jnp.ndarray, jnp.ndarray]:
     batch_size = block_tables.shape[0]
     num_heads, _, page_size, head_dim = pages.shape
@@ -44,16 +46,7 @@ def _build_contiguous_kv_vectorized(pages, block_tables) -> tuple[jnp.ndarray, j
     return gathered_swapped.reshape(batch_size, num_heads, max_seq_len, head_dim)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "block_size",
-        "num_total_blocks",
-        "max_blocks_per_seq",
-        "num_kv_heads",
-        "head_dim",
-    ],
-)
+@ejit(static_argnames=["block_size", "num_total_blocks", "max_blocks_per_seq", "num_kv_heads", "head_dim"])
 def _build_paged_kv(
     contiguous_k: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
     contiguous_v: jnp.ndarray,  # Shape: (batch, seq_len, num_kv_heads, head_dim)
@@ -282,8 +275,7 @@ def chunked_prefill_attention(
     return prefill_attention(q, k_pages, v_pages, context_lens, block_tables, sm_scale)
 
 
-@functools.partial(
-    jax.jit,
+@ejit(
     static_argnames=[
         "pages_per_compute_block",
         "attn_logits_soft_cap",

@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.factory import TaskType
 from easydel.utils.checkpoint_managers import CheckpointManager
 from easydel.utils.checkpoint_managers.path_utils import EasyPath, EasyPathLike
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -236,7 +237,7 @@ class EasyDeLState(struct.PyTreeNode):
         partition_specs = match_partition_rules(partition_rules, eval_opt_state)
         named_shardings = specs_to_name_sharding(partition_specs, self.model.mesh)
 
-        opt_state = jax.jit(
+        opt_state = ejit(
             make,
             out_shardings=named_shardings,
             in_shardings=(es.extract_shardings(self.graphstate, mesh=self.model.mesh),),
