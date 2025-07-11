@@ -443,7 +443,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _get_next_batch(self, train_iter):
+    def _get_next_batch(self, data_iter, dataloader):
         """Get next batch from iterator, reinitializing if needed."""
         ...
 
@@ -497,7 +497,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _train_epoch(
         self,
         state: EasyDeLState,
-        train_dataset: int,
+        train_dataset,
+        train_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -510,12 +511,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _eval_epoch(
         self,
         state: EasyDeLState,
-        eval_iter: int,
-        current_step: int,
+        eval_dataset,
+        eval_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
-        start_time: float,
     ):
         """Handles training for a single epoch."""
         ...

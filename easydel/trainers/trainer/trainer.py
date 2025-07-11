@@ -227,13 +227,15 @@ class Trainer(BaseTrainer):
             disabled=disabled,
             desc="training process",
         )
+        train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
             with self.mesh:
                 for epoch in range(self.arguments.num_train_epochs):
-                    state, run_exception = self._train_epoch(
+                    state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
+                        train_iter=train_iter,
                         metrics_tracker=metrics_tracker,
                         step_metrics=step_metrics,
                         pbar=pbar,
@@ -277,11 +279,14 @@ class Trainer(BaseTrainer):
             disabled=disabled,
             desc="evaluation process",
         )
+
+        eval_iter = iter(self.dataloader_eval)
         try:
             with self.mesh:
                 yield from self._eval_epoch(
                     state=state,
                     eval_dataset=self.dataloader_eval,
+                    eval_iter=eval_iter,
                     metrics_tracker=metrics_tracker,
                     step_metrics=step_metrics,
                     pbar=pbar,
@@ -293,6 +298,7 @@ class Trainer(BaseTrainer):
         self,
         state: EasyDeLState,
         train_dataset,
+        train_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -314,9 +320,8 @@ class Trainer(BaseTrainer):
             epoch (int): The current epoch index.
 
         Returns:
-            A tuple of (updated state, any exception encountered during the run).
+            A tuple of (updated state, any exception encountered during the run and train iterator).
         """
-        train_iter = iter(train_dataset)
         data_collator = self.data_collator
         if data_collator is None:
 
@@ -326,7 +331,7 @@ class Trainer(BaseTrainer):
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
             current_step = int(jax.device_get(state.step))
             try:
-                batch = self._get_next_batch(train_iter)
+                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 if self._should_skip_step(current_step):
                     pbar.update(1)
                     continue
@@ -395,15 +400,16 @@ class Trainer(BaseTrainer):
                     for _ in self.eval(model_state=state):
                         ...
             except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception
+                return state, run_exception, train_iter
             if run_exception is not None:
                 break
-        return state, run_exception
+        return state, run_exception, train_iter
 
     def _eval_epoch(
         self,
         state: EasyDeLState,
         eval_dataset,
+        eval_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -424,12 +430,7 @@ class Trainer(BaseTrainer):
         Yields:
             dict: A dictionary of evaluation metrics for each evaluation step.
         """
-        try:
-            eval_iter = iter(eval_dataset)
-        except TypeError as e:
-            raise RuntimeError(
-                f"Error {e} (make sure to evaluation dataset to trainer and set do_eval to True in arguments)"
-            ) from e
+        assert eval_dataset is not None, "Make sure to pass eval dataset to trainer or set `do_eval` to `False`."
         data_collator = self.data_collator
         if data_collator is None:
 
@@ -438,7 +439,7 @@ class Trainer(BaseTrainer):
 
         for current_step in range(1, self.max_evaluation_steps + 1):
             try:
-                batch = self._get_next_batch(eval_iter)
+                batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
                 step_metrics.start_step()
                 with self.evalu_tracker.trace_compilation():
                     with capture_time() as execution_time:
