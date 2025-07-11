@@ -589,8 +589,8 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
             operations = [
-                grain.Batch(batch_size=batch_size, drop_remainder=True),
                 ToNumpy(),
+                grain.Batch(batch_size=batch_size, drop_remainder=True),
                 CollateMapTransform(collate_fn=collate_fn),
             ]
             return grain.DataLoader(
