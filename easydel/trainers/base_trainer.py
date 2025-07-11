@@ -54,13 +54,7 @@ from easydel.utils.helpers import get_logger
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
-from .metrics import (
-    BaseProgressBar,
-    JSONProgressBar,
-    NullProgressBar,
-    RichProgressBar,
-    TqdmProgressBar,
-)
+from .metrics import BaseProgressBar, JSONProgressBar, NullProgressBar, RichProgressBar, TqdmProgressBar
 from .trainer_protocol import (
     BaseTrainerProtocol,
     TrainerConfigureDataloaderOutput,
@@ -499,7 +493,6 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             tp.Callable: A function that takes a batch of data and returns a processed batch.
         """
-        raise NotImplementedError
 
     @abstractmethod
     def create_tfds_collect_function(
@@ -521,7 +514,6 @@ class BaseTrainer(BaseTrainerProtocol):
         Returns:
             tp.Callable: A function that takes a batch of data and returns a processed batch.
         """
-        raise NotImplementedError
 
     @abstractmethod
     def create_collect_function(
@@ -571,7 +563,12 @@ class BaseTrainer(BaseTrainerProtocol):
                 batch_size = self.evaluation_batch_size
                 shuffle = False
                 num_epochs = 1
-            shard_options = grain.ShardByJaxProcess(drop_remainder=True)
+
+            shard_options = grain.ShardOptions(
+                shard_index=jax.process_index(),
+                shard_count=jax.process_count(),
+                drop_remainder=True,
+            )
             from datasets import IterableDataset
 
             if isinstance(dataset, IterableDataset):
@@ -598,8 +595,8 @@ class BaseTrainer(BaseTrainerProtocol):
             ]
             return grain.DataLoader(
                 data_source=data_source,
-                operations=operations,
                 sampler=sampler,
+                operations=operations,
                 worker_count=1,
                 worker_buffer_size=1,
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
