@@ -44,6 +44,7 @@ class TaskType(str, Enum):
     Attributes:
         CAUSAL_LM: Causal Language Modeling (e.g., GPT-style models).
         VISION_LM: Vision Language Modeling (models combining vision and text).
+        DIFFUSION_LM: Diffusion Language Modeling
         IMAGE_TEXT_TO_TEXT: Models that take image and text input to produce text output.
         BASE_MODULE: Basic, potentially abstract, modules.
         BASE_VISION: Basic vision modules.
@@ -58,6 +59,7 @@ class TaskType(str, Enum):
 
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
+    DIFFUSION_LM = "diffusion-language-model"
     IMAGE_TEXT_TO_TEXT = "image-text-to-text"
     BASE_MODULE = "base-module"
     BASE_VISION = "vision-module"

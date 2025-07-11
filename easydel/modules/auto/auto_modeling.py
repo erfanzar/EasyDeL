@@ -650,6 +650,24 @@ class AutoStateForCausalLM(BaseAutoEasyState):
     _base = AutoEasyDeLModelForCausalLM
 
 
+class AutoEasyDeLModelForDiffusionLM(BaseAutoEasyModel):
+    """
+    This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
+    and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed
+    training and inference with JAX.
+
+    This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+    parameter sharding, and interaction with the EasyDeL framework.
+
+    """
+
+    model_task: TaskType = TaskType.DIFFUSION_LM  # Static
+
+
+class AutoStateForDiffusionLM(BaseAutoEasyState):
+    _base = AutoEasyDeLModelForDiffusionLM
+
+
 class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
     """
     This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
