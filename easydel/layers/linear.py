@@ -210,6 +210,7 @@ class ParallelLinear(nn.Module):
         in_features: int,
         out_features: int,
         *,
+        scale: float | tp.Literal["fan_in"] = 1.0,
         use_bias: bool = True,
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
@@ -221,8 +222,12 @@ class ParallelLinear(nn.Module):
     ):
         if rngs is None:
             rngs = nn.Rngs(0)
+        if scale == "fan_in":
+            scale = jnp.rsqrt(in_features)
+
         self.in_features = in_features
         self.out_features = out_features
+        self.scale = scale
         self.use_bias = use_bias
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -297,6 +302,8 @@ class ParallelLinear(nn.Module):
 
         output = output_2d.reshape(orig_shape[:-1] + (self.out_features,))
 
+        output = output * self.scale
+
         if bias is not None:
             output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
 
@@ -333,6 +340,8 @@ class ParallelLinear(nn.Module):
             precision=self.precision,
             optimize=True,
         )
+
+        y = y * self.scale
 
         if bias is not None:
             y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
