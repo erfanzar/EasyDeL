@@ -612,7 +612,7 @@ class GiddModel(EasyDeLBaseModule):
     config=GiddConfig,
     model_type="Gidd",
 )
-class GiddForCausalLM(EasyDeLBaseModule):
+class GiddForDiffusionLM(EasyDeLBaseModule):
     """Gidd model with a language modeling head for causal language modeling tasks.
 
     This model is a transformer-based language model with causal attention masks
