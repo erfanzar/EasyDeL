@@ -573,15 +573,22 @@ class BaseTrainer(BaseTrainerProtocol):
 
             if isinstance(dataset, IterableDataset):
                 data_source = HFDataSource(dataset=dataset, shard_options=shard_options, num_threads=1)
+                sampler = grain.IndexSampler(
+                    num_records=len(data_source),
+                    shard_options=shard_options,
+                    seed=self.arguments.shuffle_seed_train if is_train else 0,
+                    num_epochs=num_epochs,
+                    shuffle=shuffle,
+                )
             else:
                 data_source = grain.MapDataset.source(dataset)
-            sampler = grain.IndexSampler(
-                num_records=len(data_source),
-                shard_options=shard_options,
-                seed=self.arguments.shuffle_seed_train if is_train else 0,
-                num_epochs=num_epochs,
-                shuffle=shuffle,
-            )
+                sampler = grain.IndexSampler(
+                    num_records=len(data_source),
+                    shard_options=shard_options,
+                    seed=self.arguments.shuffle_seed_train if is_train else 0,
+                    num_epochs=num_epochs,
+                    shuffle=shuffle,
+                )
 
             collate_fn = self.create_grain_collect_function(
                 max_sequence_length=self.arguments.max_sequence_length,
@@ -711,6 +718,7 @@ class BaseTrainer(BaseTrainerProtocol):
                         if hasattr(vals, "shape")
                     },
                 )
+                .repeat(self.arguments.num_train_epochs if is_train else 1)
                 .batch(batch_size, drop_remainder=False)
                 .prefetch(tf.data.AUTOTUNE)
                 .as_numpy_iterator()
@@ -1264,19 +1272,19 @@ class BaseTrainer(BaseTrainerProtocol):
             log_as="config",
         )
 
-    def _get_next_batch(self, train_iter):
+    def _get_next_batch(self, data_iter, dataloader):
         """Get next batch from iterator, reinitializing if needed."""
         try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(self.dataloader_train)
-            batch = next(train_iter)
+            batch = next(data_iter)
+        except (StopIteration, IndexError):
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
 
         # Remove specified ids from batch if needed
         for id_to_pop in self.arguments.ids_to_pop_from_dataset:
             _ = batch.pop(id_to_pop, None)
 
-        return batch
+        return batch, data_iter
 
     def create_progress_bar(
         self,
