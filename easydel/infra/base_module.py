@@ -509,12 +509,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
                     return sharding.spec
             return PartitionSpec()
 
-        return nn.from_tree(
-            jax.tree_util.tree_map(
-                _map,
-                nn.to_tree(self),
-            )
-        )
+        return nn.from_tree(jax.tree_util.tree_map(_map, nn.to_tree(self)))
 
     @property
     def _shardings(self):
@@ -737,7 +732,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Applies JAX sharding constraints to all parameters based on the partition rules.
 
         This function ensures that parameters are explicitly marked with their intended sharding,
-        which can be useful for performance and correctness checks. It uses `jax.jit` with
+        which can be useful for performance and correctness checks. It uses `ejit` with
         `out_shardings` to enforce the constraints.
 
         Args:
@@ -771,7 +766,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         Applies JAX sharding constraints to gather all parameters onto the host or a single device.
 
-        This function marks all parameters to have no sharding (PartitionSpec()). It uses `jax.jit`
+        This function marks all parameters to have no sharding (PartitionSpec()). It uses `ejit`
         with `out_shardings` to enforce these gathering constraints.
 
         Returns:

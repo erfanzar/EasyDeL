@@ -347,13 +347,13 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to track memory usage."},
     )
-    use_cjit: bool = field(
-        default=True,
-        metadata={"help": "Whether to use cjit for train and eval functions."},
-    )
     use_data_collactor: bool = field(
         default=True,
         metadata={"help": "Whether to use a data collator."},
+    )
+    use_grain: bool = field(
+        default=True,
+        metadata={"help": "Whether to use grain instead of `tensorflow-datasets`."},
     )
     use_wandb: bool = field(
         default=True,

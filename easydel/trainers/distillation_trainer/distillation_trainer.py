@@ -13,12 +13,12 @@
 # limitations under the License.
 import typing as tp
 
-import jax
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
@@ -100,7 +100,7 @@ class DistillationTrainer(Trainer):
         )
 
         static_argnames = (3, 4, 5, 6, 7, 8, 9)
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -118,7 +118,7 @@ class DistillationTrainer(Trainer):
             self.arguments.alpha,
         )
 
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
             out_shardings=empty_sharding,

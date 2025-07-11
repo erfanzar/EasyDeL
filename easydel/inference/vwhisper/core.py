@@ -230,7 +230,8 @@ class vWhisperInference:
             task (`str`, *optional*):
                 Task to perform (e.g., "transcribe", "translate"). Defaults to the `task` in `inference_config`.
             return_timestamps (`bool`, *optional*):
-                Whether to return timestamps with the transcription.  Defaults to the `return_timestamps` in `inference_config`.
+                Whether to return timestamps with the transcription.
+                    Defaults to the `return_timestamps` in `inference_config`.
 
         Returns:
             `dict`: A dictionary containing the transcribed text ("text") and optionally other information

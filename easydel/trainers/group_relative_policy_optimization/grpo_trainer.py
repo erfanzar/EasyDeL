@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, GenerationConfig, ProcessorMixin
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.compiling_utils import cjit
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 from easydel.utils.traversals import deepcopy_model
 
@@ -122,9 +122,7 @@ class GRPOTrainer(Trainer):
                     reward_func = reward_func.to_state()
                     sharding = reward_func.shardings
 
-                    @cjit
-                    @partial(
-                        jax.jit,
+                    @ejit(
                         static_argnums=(0,),
                         in_shardings=(
                             sharding.graphstate,
@@ -300,9 +298,7 @@ class GRPOTrainer(Trainer):
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
-        @partial(cjit, verbose=False)
-        @partial(
-            jax.jit,
+        @ejit(
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=(empty_sharding, empty_sharding, empty_sharding),
         )
@@ -351,7 +347,7 @@ class GRPOTrainer(Trainer):
 
         static_argnames = (2, 3, 4, 5, 6, 7, 8)
 
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             grpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
@@ -369,7 +365,7 @@ class GRPOTrainer(Trainer):
             False,  # is_train
         )
 
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             grpo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
@@ -383,7 +379,7 @@ class GRPOTrainer(Trainer):
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
                 return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
 
-        self.compute_refmodel_logps = jax.jit(
+        self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
             static_argnames=("graphdef"),
             in_shardings=(

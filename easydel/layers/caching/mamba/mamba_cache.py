@@ -180,8 +180,8 @@ class MambaCacheView(BaseCacheView):
 
     def __repr__(self):
         return (
-            self.__class__.__name__
-            + f"(conv_states={self.conv_states.shape}, ssm_states={self.ssm_states.shape}, layer_index={self.layer_index})"
+            self.__class__.__name__ + f"(conv_states={self.conv_states.shape}, ssm_states={self.ssm_states.shape},"
+            f" layer_index={self.layer_index})"
         )
 
     __str__ = __repr__

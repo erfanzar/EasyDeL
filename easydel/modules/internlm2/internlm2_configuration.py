@@ -126,7 +126,8 @@ class InternLM2Config(EasyDeLBaseConfig):
             intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 11008.
             num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
             num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to None (uses num_attention_heads).
+            num_key_value_heads (int, optional):
+                Number of key/value heads (for GQA). Defaults to None (uses num_attention_heads).
             hidden_act (str, optional): Activation function. Defaults to "silu".
             max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
             initializer_range (float, optional): Initializer range. Defaults to 0.02.
@@ -171,7 +172,9 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.bits = bits
         self.scan_layers = scan_layers
-        self.attn_implementation = "eager"  # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'. Did you mean: '_attn_implementation'?
+        self.attn_implementation = "eager"
+        # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'.
+        # Did you mean: '_attn_implementation'?
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

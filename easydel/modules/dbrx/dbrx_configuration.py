@@ -192,7 +192,7 @@ class DbrxConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "dbrx"
-    attribute_map = {
+    attribute_map: tp.ClassVar = {
         "num_attention_heads": "n_heads",
         "hidden_size": "d_model",
         "num_hidden_layers": "n_layers",
@@ -233,7 +233,8 @@ class DbrxConfig(EasyDeLBaseConfig):
                 initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
                 output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
                 router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.05.
-                gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+                gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                    Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
                 **kwargs (Any): Additional arguments.
         """
         if attn_config is None:

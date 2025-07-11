@@ -278,7 +278,8 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             )
         if not len(rope_scaling_short_factor) == self.hidden_size // self.num_attention_heads // 2:
             raise ValueError(
-                f"`rope_scaling`'s short_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
+                f"`rope_scaling`'s short_factor field must have length "
+                f"{self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
             )
         if not (
             isinstance(rope_scaling_long_factor, list)
@@ -289,7 +290,8 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             )
         if not len(rope_scaling_long_factor) == self.hidden_size // self.num_attention_heads // 2:
             raise ValueError(
-                f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
+                f"`rope_scaling`'s long_factor field must have length "
+                f"{self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
             )
         if not isinstance(rope_scaling_short_mscale, int | float):
             raise ValueError(f"`rope_scaling`'s short_mscale field must be a number, got {rope_scaling_short_mscale}")
@@ -297,5 +299,6 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             raise ValueError(f"`rope_scaling`'s long_mscale field must be a number, got {rope_scaling_long_mscale}")
         if not isinstance(original_max_position_embeddings, int):
             raise ValueError(
-                f"`rope_scaling`'s original_max_position_embeddings field must be an integer, got {original_max_position_embeddings}"
+                f"`rope_scaling`'s original_max_position_embeddings field must be an integer, "
+                f"got {original_max_position_embeddings}"
             )

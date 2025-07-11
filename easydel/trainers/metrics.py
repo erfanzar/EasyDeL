@@ -18,7 +18,6 @@ import re
 import time
 import typing as tp
 from collections import defaultdict
-from functools import partial
 
 import jax
 import numpy as np
@@ -34,6 +33,7 @@ from tqdm.autonotebook import tqdm
 
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils import traversals
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import flatten_dict
 
 try:
@@ -363,7 +363,7 @@ class MetricsHistogram:
     sum_squares: jax.Array
 
     @staticmethod
-    @jax.jit
+    @ejit
     def _create_histogram_bin_edges(arr: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Create histogram bins and counts.
 
@@ -447,7 +447,7 @@ class MetricsHistogram:
         return jnp.sqrt(self.variance).reshape(-1)
 
 
-@partial(jax.jit, static_argnums=(1,))
+@ejit(static_argnums=(1,))
 def compute_weight_stats(
     params: dict[str, tp.Any],
     repattern: str,

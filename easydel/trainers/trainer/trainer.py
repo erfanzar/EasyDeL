@@ -22,6 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 
 from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
@@ -33,7 +34,7 @@ logger = get_logger(__name__)
 
 
 class Trainer(BaseTrainer):
-    def create_collect_function(
+    def create_grain_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
@@ -61,6 +62,81 @@ class Trainer(BaseTrainer):
 
         return collate_fn
 
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a collate/collect function to process batches of data for training or evaluation.
+
+        This function returns a callable that takes a batch (a list of dictionaries) and converts it
+        into a dictionary of JAX arrays. For models of class "ForCausalLMLoss", it also performs
+        truncation (either keeping the end or the start of the sequence) so that each sequence does not
+        exceed the specified maximum length.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                Determines whether to keep the end or the start of the sequence when truncating.
+                Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch (list of dicts) and returns a processed dict of arrays.
+        """
+
+        def collate_fn(batch):
+            results = {}
+            for key in batch[0].keys():
+                data_sample = batch[0][key]
+                try:
+                    data_sample = jax.numpy.array(data_sample)
+                except TypeError:
+                    continue
+                if self.model.lossfn_type == "ForCausalLM":
+                    if truncation_mode == "keep_end":
+                        corrected_sequence = [jax.numpy.array(f[key])[..., -max_sequence_length:] for f in batch]
+                    else:
+                        corrected_sequence = [jax.numpy.array(f[key])[..., :max_sequence_length] for f in batch]
+                    results[key] = jax.numpy.stack(corrected_sequence)
+                else:
+                    corrected_sequence = [jax.numpy.array(f[key]) for f in batch]
+                    results[key] = jax.numpy.stack(corrected_sequence)
+            return results
+
+        return collate_fn
+
+    def create_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+
+        This function handles padding or truncating sequences to the specified `max_sequence_length`
+        based on the chosen `truncation_mode`.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode. Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch of data and returns a processed batch.
+        """
+        return (
+            self.create_grain_collect_function(
+                max_sequence_length=max_sequence_length,
+                truncation_mode=truncation_mode,
+            )
+            if self.arguments.use_grain
+            else self.create_tfds_collect_function(
+                max_sequence_length=max_sequence_length,
+                truncation_mode=truncation_mode,
+            )
+        )
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
         Configures and JIT-compiles the training and evaluation step functions.
@@ -84,7 +160,7 @@ class Trainer(BaseTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             training_step,
             static_argnums=(2, 3, 4, 5),
             in_shardings=(self.state_shardings, empty_sharding),
@@ -96,7 +172,7 @@ class Trainer(BaseTrainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
         )
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             evaluation_step,
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),

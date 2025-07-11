@@ -165,7 +165,7 @@ class GenerationState:
     This state is passed between consecutive `prefill` and `decode` steps,
     carrying information like the KV cache, the last generated tokens, and
     current sequence positions. It's decorated with `@auto_pytree` to allow
-    it to be seamlessly used within JAX transformations like `jax.jit`.
+    it to be seamlessly used within JAX transformations like `jax.jit` / `ejit`.
 
     Attributes:
         logits: The logits output from the model for the last generated token(s)

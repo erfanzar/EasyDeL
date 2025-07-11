@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 
 import jax
 from jax import numpy as jnp
+
+from easydel.utils.compiling_utils import ejit
 
 NF4_TABLE = jnp.array(
     [
@@ -62,7 +63,7 @@ NF4_BOUNDARIES = jnp.array(
 )
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def single_quantize_and_pack_nf4(blocks, block_size=64):
     """
     Combined quantization and packing for better performance.
@@ -77,7 +78,7 @@ def single_quantize_and_pack_nf4(blocks, block_size=64):
     return packed.astype(jnp.uint8), absmax
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def single_dequantize_nf4(packed_values, absmax, block_size):
     """
     Optimized dequantization combining unpacking and scaling in fewer operations.
@@ -91,7 +92,7 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
     return scaled
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def quantize_and_pack_nf4(
     blocks: jax.Array,
     block_size: int = 64,
@@ -105,7 +106,7 @@ def quantize_and_pack_nf4(
     return single_quantize_and_pack_nf4(blocks, block_size)
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def dequantize_nf4(
     packed_values: jax.Array,
     absmax: jax.Array,

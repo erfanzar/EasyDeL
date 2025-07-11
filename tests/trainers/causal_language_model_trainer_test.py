@@ -118,6 +118,7 @@ def create_training_args(
         report_steps=10,
         log_steps=100,
         progress_bar_type="json",
+        use_grain=True,
     )
     logging.info("Training arguments created.")
     return training_args

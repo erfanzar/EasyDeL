@@ -130,7 +130,8 @@ class GemmaConfig(EasyDeLBaseConfig):
           rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
           attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
           attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
           bits (Optional[int], optional): Quantization bits. Defaults to None.
           scan_layers (bool, optional): Whether to scan layers. Defaults to False.
           hidden_activation (str, optional): Activation for hidden layers. Defaults to "gelu_pytorch_tanh".

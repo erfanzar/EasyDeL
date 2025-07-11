@@ -364,7 +364,6 @@ class CLIPAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=None,
             causal=self.causal,
-            dropout_rng=self.rngs.params(),
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)

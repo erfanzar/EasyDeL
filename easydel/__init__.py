@@ -95,6 +95,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
+        "ejit",
         "traversals",
         "DataManager",
         "DatasetLoadError",
@@ -190,6 +191,7 @@ _import_structure = {
     "modules.aya_vision": [
         "AyaVisionConfig",
         "AyaVisionForConditionalGeneration",
+        "AyaVisionModel",
     ],
     "modules.clip": [
         "CLIPConfig",
@@ -308,6 +310,7 @@ _import_structure = {
     "modules.llava": [
         "LlavaConfig",
         "LlavaForConditionalGeneration",
+        "LlavaModel",
     ],
     "modules.mamba": [
         "MambaConfig",
@@ -563,6 +566,7 @@ if _tp.TYPE_CHECKING:
     from .modules.aya_vision import (
         AyaVisionConfig,
         AyaVisionForConditionalGeneration,
+        AyaVisionModel,
     )
     from .modules.clip import (
         CLIPConfig,
@@ -681,6 +685,7 @@ if _tp.TYPE_CHECKING:
     from .modules.llava import (
         LlavaConfig,
         LlavaForConditionalGeneration,
+        LlavaModel,
     )
     from .modules.mamba import (
         MambaConfig,
@@ -852,6 +857,7 @@ if _tp.TYPE_CHECKING:
         EasyPathLike,
         TextDatasetInform,
         VisualDatasetInform,
+        ejit,
         traversals,
     )
     from .utils.parameters_transformation import (

@@ -52,6 +52,7 @@ from easydel.layers.caching import (
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as Llama4TextRMSNorm
+from easydel.utils.compiling_utils import ejit
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
 
@@ -111,7 +112,7 @@ def bmm(inputs, kernel, precision):
     )
 
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+@ejit(static_argnums=(0, 1, 2, 3))
 def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
     img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
     img_idx = jnp.concatenate([img_idx, img_idx[:1]], axis=0)

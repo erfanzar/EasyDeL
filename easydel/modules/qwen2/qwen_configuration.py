@@ -156,7 +156,8 @@ class Qwen2Config(EasyDeLBaseConfig):
             number_rep_kv (int, optional): Number of repetitions for key/value vectors. Defaults to 1.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
             scan_layers (bool, optional): Whether to use scan for transformer layers. Defaults to True.
-            rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional): RoPE scaling configuration. Defaults to None.
+            rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional):
+                RoPE scaling configuration. Defaults to None.
             **kwargs: Additional keyword arguments passed to the parent class.
         """
         self.vocab_size = vocab_size

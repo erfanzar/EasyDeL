@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
+from easydel.utils.compiling_utils import ejit
 
 from ...logits_process import (
     FrequencyPenaltyLogitsProcessor,
@@ -40,7 +41,7 @@ else:
     EasyDeLBaseModule = tp.Any
 
 
-@partial(jax.jit, donate_argnums=(0, 1), static_argnums=(3,))
+@ejit(donate_argnums=(0, 1), static_argnums=(3,))
 def continuous_bulk_insert(
     prefix: GenerationState,
     decode_state: GenerationState,

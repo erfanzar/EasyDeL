@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -88,8 +90,8 @@ class GPT2Config(EasyDeLBaseConfig):
     """
 
     model_type: str = "gpt2"
-    keys_to_ignore_at_inference = ["past_key_values"]
-    attribute_map = {
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+    attribute_map: typing.ClassVar = {
         "hidden_size": "n_embd",
         "max_position_embeddings": "n_positions",
         "num_attention_heads": "n_head",
@@ -150,9 +152,11 @@ class GPT2Config(EasyDeLBaseConfig):
             use_cache (bool, optional): Whether to use KV cache. Defaults to True.
             bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 50256.
             eos_token_id (int, optional): End-of-sequence token ID. Defaults to 50256.
-            scale_attn_by_inverse_layer_idx (bool, optional): Whether to scale attention by inverse layer index. Defaults to False.
+            scale_attn_by_inverse_layer_idx (bool, optional):
+                Whether to scale attention by inverse layer index. Defaults to False.
             reorder_and_upcast_attn (bool, optional): Whether to reorder and upcast attention. Defaults to False.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+            gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+                Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
             tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
             **kwargs: Additional keyword arguments.

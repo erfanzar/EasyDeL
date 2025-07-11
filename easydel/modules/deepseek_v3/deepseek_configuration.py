@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -24,9 +26,9 @@ DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 @register_config("deepseek_v3")
 class DeepseekV3Config(EasyDeLBaseConfig):
     r"""
-    This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to instantiate an DeepSeek
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the DeepSeek-V3.
+    This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to
+    instantiate an DeepSeek model according to the specified arguments, defining the model architecture.
+    Instantiating a configuration with the defaults will yield a similar configuration to that of the DeepSeek-V3.
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
@@ -56,7 +58,8 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         n_group (`int`, *optional*, defaults to None):
             Number of groups for routed experts.
         topk_group (`int`, *optional*, defaults to None):
-            Number of selected groups for each token(for each token, ensuring the selected experts is only within `topk_group` groups).
+            Number of selected groups for each token(for each token, ensuring the selected experts
+            is only within `topk_group` groups).
         num_experts_per_tok (`int`, *optional*, defaults to None):
             Number of selected experts, None means dense model.
         moe_layer_freq (`int`, *optional*, defaults to 1):
@@ -124,7 +127,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
     ```"""
 
     model_type = "deepseek_v3"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
         self,
