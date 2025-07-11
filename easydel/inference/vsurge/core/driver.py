@@ -395,27 +395,6 @@ class vDriver:
         """
         return self._get_model_name(self._engine.model)
 
-    # def create_sequence_from_request(self, request: ActiveRequest) -> SequenceState:
-    #     (prompt_tokens, *_), sampling_params = self._process_prefill_content(
-    #         request,
-    #         self.engine.processor,
-    #         self.engine.max_prefill_length,
-    #         self.engine.prefill_lengths,
-    #         self.engine.pad_token_id,
-    #         do_pad=False,
-    #     )
-    #     return SequenceState(
-    #         metadata=SequenceMetadata(
-    #             seq_id=self._request_counter,
-    #             block_size=self._engine.page_metadata.page_size,
-    #             max_tokens=sampling_params.max_tokens,
-    #             temperature=sampling_params.temperature,
-    #             top_k=sampling_params.top_k,
-    #             top_p=sampling_params.top_p,
-    #         ),
-    #         prompt_tokens=prompt_tokens[0],
-    #     )
-
     def place_request_on_prefill_queue(self, request: ActiveRequest):
         """
         Places a new active request onto the prefill backlog queue.
@@ -512,7 +491,7 @@ class vDriver:
                     tokens=padded_tokens,
                     valids=padded_valids,
                     true_length=0,
-                    sampling_params=JitableSamplingParams.init_empty(1),
+                    sampling_params=JitableSamplingParams.init_empty(1).view_1d(),
                     rngs=engine.prng_key,
                     slot=0,
                 )
