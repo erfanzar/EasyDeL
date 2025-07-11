@@ -773,6 +773,7 @@ class BaseTrainer(BaseTrainerProtocol):
             TaskType.SEQUENCE_CLASSIFICATION: "SequenceClassification",
             TaskType.IMAGE_TEXT_TO_TEXT: "ImageTextToText",
             TaskType.VISION_LM: "ImageTextToText",
+            TaskType.DIFFUSION_LM: "DiffusionLM",
             TaskType.BASE_MODULE: "",
             TaskType.BASE_VISION: "",
             TaskType.SEQUENCE_TO_SEQUENCE: "sequence-to-sequence",
