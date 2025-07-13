@@ -576,6 +576,7 @@ class vDriver:
                     eos_token_id=engine.eos_token_ids,
                     is_client_side_tokenization=request.is_client_side_tokenization,
                     complete=request.complete,
+                    ignore_eos=request.sampling_params.ignore_eos,
                 )
                 request.complete = complete
                 final_results = []
@@ -608,7 +609,6 @@ class vDriver:
                         request: ActiveRequest = request_obj
                         if request.decode_start_time is None:
                             request.decode_start_time = time.perf_counter()
-
                         results_base, complete, num_valid_tokens_list = process_result_tokens(
                             processor=processor,
                             slot=slot,
@@ -617,19 +617,15 @@ class vDriver:
                             eos_token_id=engine.eos_token_ids,
                             is_client_side_tokenization=request.is_client_side_tokenization,
                             complete=request.complete,
+                            ignore_eos=request.sampling_params.ignore_eos,
                         )
                         request.complete = complete
                         elapsed_time = time.perf_counter() - request.decode_start_time
                         final_step_results = []
                         for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
                             if len(res_base.text) > 0:
-                                for idx, (accum, res) in enumerate(
-                                    zip(
-                                        request.accumulated_text,
-                                        res_base.text,
-                                        strict=False,
-                                    )
-                                ):
+                                szip = zip(request.accumulated_text, res_base.text, strict=False)
+                                for idx, (accum, res) in enumerate(szip):
                                     request.accumulated_text[idx] = accum + res
                             if request.sampling_params.stop is not None:
                                 for stop_sign in request.sampling_params.stop:

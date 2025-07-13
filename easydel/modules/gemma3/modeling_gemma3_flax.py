@@ -34,12 +34,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -151,17 +146,10 @@ class Gemma3Attention(AttentionModule):
         self.causal = causal
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(
-            config,
-            "head_dim",
-            config.hidden_size // config.num_attention_heads,
-        )
-
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
         kernel = jax.nn.initializers.normal(config.initializer_range)
-
         linear = partial(
             ParallelLinear,
             use_bias=config.attention_bias,
@@ -179,16 +167,8 @@ class Gemma3Attention(AttentionModule):
         self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
-        self.q_norm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-            dim=self.head_dim,
-        )
-        self.k_norm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-            dim=self.head_dim,
-        )
+        self.q_norm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype, dim=self.head_dim)
+        self.k_norm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype, dim=self.head_dim)
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
@@ -197,12 +177,7 @@ class Gemma3Attention(AttentionModule):
             dropout_prob=config.attention_dropout,
         )
 
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            self.head_dim,
-            self.head_dim,
-            True,
-        )
+        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
 
     def _merge_heads(self, hidden_states):
         """
@@ -296,29 +271,8 @@ class Gemma3Attention(AttentionModule):
             causal_mask=causal_mask,
             token_type_ids=token_type_ids,
             fcm_mask=fcm_mask,
-            sliding_window=None,
+            sliding_window=self.sliding_window,
         )
-
-        if self.is_sliding:
-            cache_pos = self.build_cache_pos(attention_mask, cache_view)
-            if isinstance(cache_view, TransformerCacheView):
-                curr_index = cache_view.indexs
-            else:
-                curr_index = jnp.repeat(jnp.array([0], "i4").reshape(-1), query_states.shape[0], 0)
-            sliding_mask = self._create_sliding_mask(
-                cache_pos=cache_pos,
-                curr_index=curr_index,
-                cache_length=attention_mask.shape[-1],
-                sliding_window=self.sliding_window,
-            )
-            attention_mask = jnp.logical_and(sliding_mask, attention_mask)
-
-            def init_attention_bias():
-                return jax.lax.select(
-                    attention_mask > 0,
-                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-                )
 
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -416,11 +370,7 @@ class Gemma3DecoderLayer(nn.Module):
         mlp_block = Gemma3MLP
         attn_block = Gemma3Attention
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-        )
+        attn_block, mlp_block = auto_remat(attn_block, mlp_block, policy=config.gradient_checkpointing)
 
         self.self_attn = attn_block(
             self.config,
@@ -439,22 +389,10 @@ class Gemma3DecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.input_layernorm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-        )
-        self.post_attention_layernorm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-        )
-        self.pre_feedforward_layernorm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-        )
-        self.post_feedforward_layernorm = Gemma3RMSNorm(
-            self.config,
-            param_dtype=self.param_dtype,
-        )
+        self.input_layernorm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype)
+        self.post_attention_layernorm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype)
+        self.pre_feedforward_layernorm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype)
+        self.post_feedforward_layernorm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype)
 
         self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window

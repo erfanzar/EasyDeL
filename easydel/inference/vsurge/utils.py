@@ -389,6 +389,7 @@ def process_result_tokens(
     complete: np.ndarray,
     eos_token_id: list[int],
     is_client_side_tokenization: bool = False,
+    ignore_eos: bool = False,
 ) -> tuple[list[ReturnSample], np.ndarray, list[int]]:
     """
     Processes the result tokens for a given slot, extracts text and token IDs,
@@ -428,19 +429,17 @@ def process_result_tokens(
             for spec_idx in range(speculations):
                 tok_id = slot_tokens[idx, spec_idx].item()
                 valid = slot_valid[idx, spec_idx].item()
-                if tok_id in eos_token_id or not valid:
+                if (tok_id in eos_token_id and not ignore_eos) or not valid:
                     complete[idx] = True
-                    # Include EOS token in count if valid
                     if valid and tok_id in eos_token_id:
                         tok_id_so_far.append(tok_id)
                         valid_tokens_count += 1
                     break
                 else:
                     if not is_client_side_tokenization:
-                        text_so_far.append(processor.decode([tok_id]))
+                        text_so_far.append(processor.decode([tok_id], skip_special_tokens=True))
                     tok_id_so_far.append(tok_id)
                     valid_tokens_count += 1
-        # Append a base ReturnSample without TPS/count yet
         return_samples.append(ReturnSample(text=text_so_far, token_ids=tok_id_so_far))
         num_valid_tokens_step.append(valid_tokens_count)
     return return_samples, complete, num_valid_tokens_step
