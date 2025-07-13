@@ -20,7 +20,7 @@ import typing as tp
 import msgspec
 
 from ..sampling_params import SamplingParams
-from .utils.utils import ConstantList, LogprobsLists, LogprobsTensors, SchedulerStats, UtilityOutput
+from .utils import ConstantList, LogprobsLists, LogprobsTensors, SchedulerStats, UtilityOutput
 
 T = tp.TypeVar("T")
 

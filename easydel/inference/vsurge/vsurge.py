@@ -97,21 +97,7 @@ class vSurgeRequest:
         Returns:
             vSurgeRequest: A new vSurgeRequest instance.
         """
-        return vSurgeRequest(
-            prompt=prompt,
-            sampling_params=SamplingParams(
-                n=sampling_params.n,
-                max_tokens=sampling_params.max_tokens,
-                top_p=sampling_params.top_p,
-                top_k=sampling_params.top_k,
-                min_p=sampling_params.min_p,
-                stop=sampling_params.stop,
-                temperature=sampling_params.temperature,
-                presence_penalty=sampling_params.presence_penalty,
-                frequency_penalty=sampling_params.frequency_penalty,
-                repetition_penalty=sampling_params.repetition_penalty,
-            ),
-        )
+        return vSurgeRequest(prompt=prompt, sampling_params=sampling_params)
 
     def __post_init__(self):
         """Ensures metadata is initialized and validates prompt type."""

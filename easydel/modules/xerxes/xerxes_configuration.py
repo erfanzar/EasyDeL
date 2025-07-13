@@ -20,7 +20,7 @@ from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
 
-@register_config("xerxe")
+@register_config("xerxes")
 class XerxesConfig(EasyDeLBaseConfig):
     """
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
@@ -100,6 +100,9 @@ class XerxesConfig(EasyDeLBaseConfig):
         num_experts_per_tok: int = 2,
         tie_word_embeddings=False,
         rope_theta=10000.0,
+        rope_scaling=None,
+        window_pattern: int | None = None,
+        sliding_window: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
@@ -126,6 +129,10 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.xe_moe = xe_moe
         self.xe_kvnorm = xe_kvnorm
         self.xe_mlpnorm = xe_mlpnorm
+        self.window_pattern = window_pattern
+        self.sliding_window = sliding_window
+
+        self.rope_scaling = rope_scaling
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

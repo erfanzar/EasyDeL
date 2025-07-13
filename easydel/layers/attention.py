@@ -394,52 +394,10 @@ class AttentionModule(nn.Module):
         )
         return q, k, v
 
-    def make_flexible_sliding_window(
-        self,
-        attention_mask: jax.Array,
-        cache_view: TransformerCacheView,
-        sliding_window: int,
-    ):
-        """
-        Applies a sliding window mask to the attention mask, considering cache state.
-
-        Args:
-            attention_mask (jax.Array): The original attention mask.
-            cache_view (TransformerCacheView): The current view of the KV cache.
-            sliding_window (int): The size of the sliding window.
-
-        Returns:
-            tp.Tuple[jax.Array, tp.Callable[[], jax.Array]]:
-                - The attention mask combined with the sliding window mask.
-                - A function (`init_attention_bias`) to create the corresponding attention bias.
-        """
-        cache_pos = self.build_cache_pos(attention_mask, cache_view)
-        if isinstance(cache_view, TransformerCacheView):
-            curr_index = cache_view.indexs
-        else:
-            curr_index = jnp.repeat(jnp.array([0], "i4").reshape(-1), attention_mask.shape[0], 0)
-        attention_mask = jnp.logical_and(
-            self._create_sliding_mask(
-                cache_pos=cache_pos,
-                curr_index=curr_index,
-                cache_length=attention_mask.shape[-1],
-                sliding_window=self.sliding_window,
-            ),
-            attention_mask,
-        )
-
-        def init_attention_bias():
-            return jax.lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-
-        return attention_mask, init_attention_bias
-
     @staticmethod
     def build_cache_pos(
         attention_mask: jax.Array,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView = None,
     ) -> jax.Array:
         """
@@ -447,16 +405,16 @@ class AttentionModule(nn.Module):
 
         Args:
             attention_mask (jax.Array): The attention mask (typically [batch, heads, q_len, k_len]).
+            mode (common_types.RUNTIME_MODE_TYPES): The runtime mode.
             cache_view (TransformerCacheView, optional): The current KV cache view. Defaults to None.
 
         Returns:
             jax.Array: An array representing the position of each token in the sequence,
                        adjusted by the cache index if provided. Shape usually [batch, q_len].
         """
-        if isinstance(cache_view, TransformerCacheView):
+        end_index = 0
+        if isinstance(cache_view, TransformerCacheView) and mode == common_types.MODE_DECODE:
             end_index = jnp.reshape(cache_view.indexs, (-1, 1))
-        else:
-            end_index = 0
         inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
         return (inipos - (inipos >= 1)) + end_index
 
@@ -547,6 +505,7 @@ class AttentionModule(nn.Module):
         @partial(jax.vmap, in_axes=(0, 0), out_axes=0)
         def _map(bindex, cache_pos):
             total_tokens = bindex + cache_pos.shape[1]
+            # jax.debug.print("{} segment {} endidx {} total", cache_pos, bindex, total_tokens)
 
             def _reconstruct_rotated_cache_positions():
                 cache_positions = jnp.arange(cache_length) + total_tokens - cache_length
@@ -576,7 +535,7 @@ class AttentionModule(nn.Module):
         key: Array,
         value: Array,
         attention_mask: Array,
-        # mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | common_types._Empty = common_types.NOT_GIVEN,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: Array | None = None,
@@ -613,6 +572,8 @@ class AttentionModule(nn.Module):
                 - attention_mask (Array): The final combined attention mask [Batch, Heads, q_len, kv_len].
                 - init_attention_bias (Callable): Function to create the attention bias tensor.
         """
+        if isinstance(mode, common_types._Empty):
+            mode = common_types.MODE_PREFILL if query.shape[1] != 1 else common_types.MODE_DECODE
         if attention_mask is not None:
             if attention_mask.dtype != jnp.bool:
                 warnings.warn("attention_mask should be a boolean array", stacklevel=1)
@@ -626,15 +587,13 @@ class AttentionModule(nn.Module):
             elif isinstance(cache_view, PagesCacheView):
                 causal_mask = None  # PagedAttention dont need mask
         if cache_view is None:
-            query_length = query.shape[1]
-            key_length = key.shape[1]
             if causal_mask is not None:
-                causal_mask = causal_mask[:, :, :query_length, :key_length]
+                causal_mask = causal_mask[:, :, : query.shape[1], : key.shape[1]]
                 causal_mask = jnp.broadcast_to(
                     causal_mask,
                     (query.shape[0], *causal_mask.shape[1:]),
                 )
-                if token_type_ids is not None and query_length != 1:
+                if token_type_ids is not None and query.shape[1] != 1:
                     token_type_mask = jnp.equal(
                         jnp.expand_dims(token_type_ids, 2),
                         jnp.expand_dims(token_type_ids, 1),
@@ -684,14 +643,28 @@ class AttentionModule(nn.Module):
             else:
                 raise NotImplementedError("requested type of CacheView is not supported for this attention module.")
         if sliding_window is not None and attention_mask is not None:
-            sliding_window_mask = jnp.tril(
-                jnp.ones_like(attention_mask, dtype=jnp.bool),
-                k=-sliding_window,
-            )
-            window_mask = jnp.where(sliding_window_mask, 0, 1)
-            attention_mask = jnp.logical_and(window_mask, attention_mask)
-            if attention_mask.shape[-1] <= 1:
-                attention_mask = attention_mask[:, :, :, -sliding_window:]
+            if mode == common_types.MODE_DECODE and cache_view is not None:
+                offsets = cache_view.indexs - 1  # [BATCH,]
+            else:
+                offsets = jnp.zeros((query.shape[0],), "i4")  # [BATCH,]
+
+            @partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0))
+            def _select_slices(ikey, ival, imsk, offset):
+                row_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (query.shape[1], 1), 0) + offset
+                col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, ikey.shape[0]), 1)
+                rhm = col_ids_sliding <= row_ids_sliding
+                lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
+                imsk = (lhm & rhm) & imsk.astype("b1")
+                if mode == common_types.MODE_DECODE:
+                    select_in = jax.lax.max(0, (offset + 1) - sliding_window)
+                    ikey, ival, imsk = (
+                        jax.lax.dynamic_slice_in_dim(ikey, select_in, sliding_window, 0),
+                        jax.lax.dynamic_slice_in_dim(ival, select_in, sliding_window, 0),
+                        jax.lax.dynamic_slice_in_dim(imsk, select_in, sliding_window, 2),
+                    )
+                return ikey, ival, imsk
+
+            key, value, attention_mask = _select_slices(key, value, attention_mask, offsets)
 
         def init_attention_bias():
             return lax.select(

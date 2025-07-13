@@ -24,17 +24,8 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    BaseModelOutput,
-    CausalLMOutput,
-    DecoderLayerOutput,
-)
-from easydel.infra.utils import (
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -217,9 +208,13 @@ class XerxesAttention(AttentionModule):
             self.head_dim,
             True,
         )
+        self.is_local_attn = False
         self.sliding_window = None
         if not config.xe_kvnorm:
             self.sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
+        if config.window_pattern is not None:
+            self.is_local_attn = bool((layer_idx + 1) % config.window_pattern)
+            self.sliding_window = config.sliding_window if self.is_local_attn else None
 
     def _merge_heads(self, hidden_states):
         """
@@ -267,40 +262,21 @@ class XerxesAttention(AttentionModule):
             tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
+        query_states, key_states, value_states = (
             self.q_proj(hidden_states),
             self.k_proj(hidden_states),
             self.v_proj(hidden_states),
         )
 
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
 
         if self.config.xe_kvnorm:
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
 
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -489,6 +465,7 @@ class XerxesDecoderLayer(nn.Module):
         output_attentions: bool = False,
         fcm_mask: chex.Array | None = None,
         frequencies: chex.Array | None = None,
+        default_frequencies: chex.Array | None = None,
     ):
         """
         Forward pass of the module block.
@@ -518,7 +495,7 @@ class XerxesDecoderLayer(nn.Module):
             segment_ids,
             output_attentions,
             fcm_mask,
-            frequencies,
+            default_frequencies if self.self_attn.is_local_attn else frequencies,
         )
         if self.identity:
             hidden_states = hidden_states + attn_outputs.attention_output
@@ -599,6 +576,21 @@ class XerxesModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
         self.embedding_scale = float(1 if config.xe_kvnorm and not config.xe_mlpnorm else config.hidden_size**0.5)
+
+    @functools.cached_property
+    def default_frequencies(self):
+        from easydel.infra.utils import ModuleCaches
+        from easydel.layers.rotary_embedding import get_frequencies
+
+        frequencies = get_frequencies(
+            head_size=self.config.head_dim,
+            rotary_dim=self.config.head_dim,
+            max_position=self.config.granted_freq_max_position_embedding,
+            base=10000,
+            rope_scaling=None,
+        )
+
+        return ModuleCaches(frequencies)
 
     def __call__(
         self,
@@ -689,6 +681,7 @@ class XerxesModel(EasyDeLBaseModule):
                 output_attentions=output_attentions,
                 segment_ids=segment_ids,
                 frequencies=self.frequencies,
+                default_frequencies=self.default_frequencies,
             )
             hidden_states = outputs.hidden_states
 
