@@ -46,13 +46,10 @@ from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset
     from jax._src.pjit import JitWrapped
 else:
-    JitWrapped = tp.Callable
-    Dataset = tp.Any
-    IterableDataset = tp.Any
-
+    JitWrapped = tp.Any
 logger = get_logger(__name__)
 
 

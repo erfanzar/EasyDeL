@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import copy
 import glob
 import json
@@ -50,8 +52,6 @@ from ..training_configurations import TrainingArguments
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-else:
-    Dataset = tp.Any
 
 logger = get_logger("RayTrainer")
 

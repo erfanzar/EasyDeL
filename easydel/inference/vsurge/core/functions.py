@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 import typing as tp
 from functools import partial
@@ -38,8 +40,6 @@ from ..utils import GenerationState, ResultTokens
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
-else:
-    EasyDeLBaseModule = tp.Any
 
 
 TOPK_FOR_COMPUTE = int(os.getenv("EASYDEL_VSURGE_TOPK_FOR_COMPUTE", "64"))

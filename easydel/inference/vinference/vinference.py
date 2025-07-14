@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import asyncio
 import concurrent.futures
 import contextlib
@@ -54,9 +56,6 @@ from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
-else:
-    EasyDeLBaseModule = tp.Any
-    ProcessingClassType = tp.Any
 
 logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
@@ -102,7 +101,7 @@ class vInference:
     def __init__(
         self,
         model: EasyDeLBaseModule | None = None,
-        processor_class: ProcessingClassType | None = None,
+        processor_class: ProcessingClassType = None,
         graphdef: nn.GraphDef | None = None,
         graphstate: nn.GraphState | None = None,
         graphother: nn.GraphState | None = None,

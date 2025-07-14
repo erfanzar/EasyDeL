@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 
 from jax.sharding import NamedSharding, PartitionSpec
@@ -29,8 +31,6 @@ from .distillation_config import DistillationConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-else:
-    Dataset = tp.Any
 
 logger = get_logger(__name__)
 

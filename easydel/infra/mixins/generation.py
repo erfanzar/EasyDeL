@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import copy
 import inspect
 import typing as tp
@@ -39,7 +41,6 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
 from easydel.layers.caching.page.paged_cache import (
     PagesCache,
     PagesCacheMetaData,
@@ -52,11 +53,8 @@ from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutpu
 if tp.TYPE_CHECKING:
     from easydel.inference import vInference, vInferenceConfig, vInferencePreCompileConfig
     from easydel.infra.utils import ProcessingClassType
-else:
-    vInference = tp.Any
-    vInferenceConfig = tp.Any
-    ProcessingClassType = tp.Any
-    vInferencePreCompileConfig = tp.Any
+    from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
+
 logger = get_logger(__name__)
 
 
@@ -215,6 +213,9 @@ class EasyGenerationMixin:
         num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
         if num_key_value_heads is None:
             num_key_value_heads = self.config.num_attention_heads
+
+        from easydel.layers.caching import TransformerCacheMetaData
+
         return TransformerCacheMetaData.create(
             num_hidden_layers=self.config.num_hidden_layers,
             pad_token_id=pad_token_id,
@@ -308,6 +309,9 @@ class EasyGenerationMixin:
         Returns:
             TransformerCache: An initialized standard TransformerCache object.
         """
+
+        from easydel.layers.caching import TransformerCache
+
         return TransformerCache.init_cache(
             dtype=self.config.kvdtype,
             partition_manager=self.config.partition_manager,

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import functools
 import inspect
 import re
@@ -1287,15 +1289,15 @@ class OverWriteWithGradient(nn.Param): ...
 
 
 if tp.TYPE_CHECKING:
-    from transformers import (
-        BaseImageProcessor,
-        FeatureExtractionMixin,
-        PreTrainedTokenizerBase,
-        ProcessorMixin,
-    )
+    from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
     ProcessingClassType = tp.Optional[  # noqa
-        PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin
+        tp.Union[  # noqa
+            PreTrainedTokenizerBase,
+            BaseImageProcessor,
+            FeatureExtractionMixin,
+            ProcessorMixin,
+        ]
     ]
 else:
     ProcessingClassType = tp.Any

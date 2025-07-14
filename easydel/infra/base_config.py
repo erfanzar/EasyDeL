@@ -52,9 +52,6 @@ if tp.TYPE_CHECKING:
     from easydel.layers.rotary_embedding import RopeConfig
 
     from .utils import AttnMaskDetail, ModuleCaches
-else:
-    RopeConfig = tp.Any
-    ModuleCaches = tp.Any
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"

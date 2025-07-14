@@ -15,6 +15,8 @@
 
 """Module for text generation pipeline using JAX/Flax."""
 
+from __future__ import annotations
+
 import time
 import typing as tp
 
@@ -27,8 +29,6 @@ from .utilities import SampleState, create_sampling_step, vInferenceConfig, vInf
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
-else:
-    EasyDeLBaseModule = object
 
 
 def measure_flops(func, *args, **kwargs):

@@ -41,17 +41,10 @@ try:
 except ImportError:
     wandb = None
 
+
 from jax import numpy as jnp
 
 from easydel.utils.helpers import get_logger
-
-if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
-    from jax._src.pjit import JitWrapped
-else:
-    JitWrapped = tp.Callable
-    Dataset = tp.Any
-    IterableDataset = tp.Any
 
 logger = get_logger(__name__)
 

@@ -17,8 +17,6 @@ import typing as tp
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-else:
-    Dataset = tp.Any
 
 
 def pack_sequences(

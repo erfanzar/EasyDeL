@@ -39,19 +39,7 @@ from .dpo_config import DPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
-    from transformers import (
-        BaseImageProcessor,
-        FeatureExtractionMixin,
-        PreTrainedTokenizerBase,
-        ProcessorMixin,
-    )
-else:
-    Dataset = tp.Any
-    IterableDataset = tp.Any
-    BaseImageProcessor = tp.Any
-    FeatureExtractionMixin = tp.Any
-    PreTrainedTokenizerBase = tp.Any
-    ProcessorMixin = tp.Any
+    from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
 logger = get_logger(__name__)
 
@@ -72,7 +60,7 @@ class DPOTrainer(Trainer):
         arguments: DPOConfig,
         model: EasyDeLBaseModule | EasyDeLState,
         reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
-        processing_class: ProcessingClassType | None = None,
+        processing_class: ProcessingClassType = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | None = None,
         data_collator: tp.Callable | None = None,

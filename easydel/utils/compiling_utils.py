@@ -30,8 +30,6 @@ from .helpers import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
     from jax._src.stages import Compiled, Lowered
-else:
-    Compiled, Lowered = tp.Any, tp.Any
 
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")

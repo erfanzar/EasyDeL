@@ -72,9 +72,7 @@ except ImportError:
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
-else:
-    Dataset = tp.Any
-    IterableDataset = tp.Any
+
 
 logger = get_logger(__name__)
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
