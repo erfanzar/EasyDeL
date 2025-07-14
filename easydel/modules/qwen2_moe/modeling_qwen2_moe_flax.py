@@ -226,7 +226,7 @@ class Qwen2MoeAttention(AttentionModule):
             rngs=rngs,
             use_bias=False,
         )
-
+        self.sliding_window = config.sliding_window if config.use_sliding_window else None
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
             base_config=self.config,
@@ -277,30 +277,10 @@ class Qwen2MoeAttention(AttentionModule):
             self.v_proj(hidden_states),
         )
 
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -324,6 +304,7 @@ class Qwen2MoeAttention(AttentionModule):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             fcm_mask=fcm_mask,
+            sliding_window=self.sliding_window,
         )
 
         attentions = self.attention_performer.forward(
@@ -338,6 +319,7 @@ class Qwen2MoeAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

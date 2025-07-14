@@ -212,11 +212,7 @@ class Gemma2Attention(AttentionModule):
             self.head_dim,
         )
 
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -240,7 +236,7 @@ class Gemma2Attention(AttentionModule):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             fcm_mask=fcm_mask,
-            sliding_window=self.sliding_window if bool((self.layer_idx % 2) == 0) else None,
+            sliding_window=self.sliding_window,
         )
 
         attentions = self.attention_performer.forward(
@@ -249,13 +245,13 @@ class Gemma2Attention(AttentionModule):
             value_states=value_states,
             mode=mode,
             bias=None,
-            sliding_window=self.sliding_window if bool((self.layer_idx % 2) == 0) else None,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = self.o_proj(attn_output)

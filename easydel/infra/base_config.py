@@ -51,7 +51,7 @@ from .etils import (
 if tp.TYPE_CHECKING:
     from easydel.layers.rotary_embedding import RopeConfig
 
-    from .utils import ModuleCaches
+    from .utils import AttnMaskDetail, ModuleCaches
 else:
     RopeConfig = tp.Any
     ModuleCaches = tp.Any
@@ -1146,6 +1146,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         causal_mask_bool = jnp.logical_and(causal_mask_bool, cache_mask)
         causal_mask_bool = causal_mask_bool[None, None, :, :].astype("b1")
         return causal_mask_bool
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail] | None:
+        if hasattr(self, "text_config"):
+            return self.get_text_config().get_mask_details()
+        return None
 
     def get_basic_causal_mask(self, *args, **kwargs):
         from .utils import ModuleCaches

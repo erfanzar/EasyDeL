@@ -29,6 +29,7 @@ import jax
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
+from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
 from tqdm.auto import tqdm
@@ -993,6 +994,21 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
         ActivationType.QUICK_GELU: 2,  # Simple approximation x * sigmoid(1.702 * x)
     }
     return flops_per_element.get(activation_type, 1) * dim
+
+
+class AttnMaskType(str, Enum):
+    FULL = "ATTN_MASK_FULL"
+    SLIDING = "ATTN_MASK_SLIDING"
+    CHUNK = "ATTN_MASK_CHUNK"
+
+
+@auto_pytree
+class AttnMaskDetail:
+    mask_type: AttnMaskType
+    size: int
+    offset: int | None = None
+    chunks: int | None = None
+    bricks: int | None = None
 
 
 class TaskType(str, Enum):

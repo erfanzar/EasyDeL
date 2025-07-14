@@ -31,6 +31,7 @@ from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.utils import AttnMaskType
 from easydel.utils.helpers import get_logger
 
 from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
@@ -572,62 +573,55 @@ class AttentionModule(nn.Module):
                 - attention_mask (Array): The final combined attention mask [Batch, Heads, q_len, kv_len].
                 - init_attention_bias (Callable): Function to create the attention bias tensor.
         """
+
+        if attention_mask.ndim == 2:
+            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        query_length, initial_key_length = query.shape[1], key.shape[1]
+        masking_details = None
+
         if isinstance(mode, common_types._Empty):
-            mode = common_types.MODE_PREFILL if query.shape[1] != 1 else common_types.MODE_DECODE
-        if attention_mask is not None:
-            if attention_mask.dtype != jnp.bool:
-                warnings.warn("attention_mask should be a boolean array", stacklevel=1)
-                attention_mask = (attention_mask == 1).astype("b1")
+            if cache_view is None:
+                mode = common_types.MODE_TRAIN
+            else:
+                mode = common_types.MODE_PREFILL if query_length != 1 else common_types.MODE_DECODE
+
+        if attention_mask.dtype != jnp.bool:
+            warnings.warn("attention_mask should be a boolean array", stacklevel=1)
+            attention_mask = (attention_mask == 1).astype("b1")
+
         if isinstance(causal_mask, bool) and causal_mask is False:
             if cache_view is None:
-                causal_mask = self.config._create_causal_mask(target_length=key.shape[1])
+                causal_mask = self.config._create_causal_mask(target_length=initial_key_length)
             elif isinstance(cache_view, TransformerCacheView):
                 target_length = cache_view.key.shape[1]
                 causal_mask = self.config._create_causal_mask(target_length)
             elif isinstance(cache_view, PagesCacheView):
                 causal_mask = None  # PagedAttention dont need mask
+
         if cache_view is None:
             if causal_mask is not None:
-                causal_mask = causal_mask[:, :, : query.shape[1], : key.shape[1]]
-                causal_mask = jnp.broadcast_to(
-                    causal_mask,
-                    (query.shape[0], *causal_mask.shape[1:]),
-                )
-                if token_type_ids is not None and query.shape[1] != 1:
-                    token_type_mask = jnp.equal(
-                        jnp.expand_dims(token_type_ids, 2),
-                        jnp.expand_dims(token_type_ids, 1),
-                    )
+                causal_mask = causal_mask[:, :, :query_length, :initial_key_length]
+                causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
+                if token_type_ids is not None and query_length != 1:
+                    token_type_mask = jnp.equal(jnp.expand_dims(token_type_ids, 2), jnp.expand_dims(token_type_ids, 1))
                     token_type_mask = jnp.where(
-                        jnp.broadcast_to(
-                            jnp.expand_dims(token_type_ids == 0, -1),
-                            token_type_mask.shape,
-                        ),
+                        jnp.broadcast_to(jnp.expand_dims(token_type_ids == 0, -1), token_type_mask.shape),
                         False,
                         token_type_mask,
                     )
 
                     token_type_mask = jnp.expand_dims(token_type_mask, 1)
                     sequence_length = token_type_ids.shape[1]
-
-                    masked_portion = jnp.logical_or(
-                        token_type_mask,
-                        causal_mask[:, :, :, :sequence_length],
-                    )
+                    masked_portion = jnp.logical_or(token_type_mask, causal_mask[:, :, :, :sequence_length])
                     causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-
-                if attention_mask.ndim == 2:
-                    attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
                 attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
                 attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
-
             else:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-                attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)
+                attention_mask = jnp.repeat(attention_mask, query_length, -2)
         else:
             if isinstance(cache_view, TransformerCacheView):
-                key, value, attention_mask, cache_view = cache_view.concatenate_to_cache(
+                key, value, attention_mask, cache_view, masking_details = cache_view.concatenate_to_cache(
                     query=query,
                     key=key,
                     value=value,
@@ -642,29 +636,39 @@ class AttentionModule(nn.Module):
                 cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
             else:
                 raise NotImplementedError("requested type of CacheView is not supported for this attention module.")
-        if sliding_window is not None and attention_mask is not None:
+        if sliding_window is None and masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING:
+            sliding_window = masking_details.size
+        if sliding_window is not None:
             if mode == common_types.MODE_DECODE and cache_view is not None:
-                offsets = cache_view.indexs - 1  # [BATCH,]
+                indexs = cache_view.indexs
+                offsets = indexs - 1
+            elif mode == common_types.MODE_PREFILL and sliding_window is not None:
+                indexs = jnp.array([query_length], "i4").repeat(query.shape[0], axis=0).reshape(-1)
+                offsets = jnp.sum(~jnp.any(attention_mask[:, -1, :, :], axis=-1), axis=-1).reshape(-1)
             else:
-                offsets = jnp.zeros((query.shape[0],), "i4")  # [BATCH,]
+                indexs = jnp.zeros((query.shape[0],), "i4") + 1
+                offsets = jnp.zeros((query.shape[0],), "i4")
 
-            @partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0, 0, 0))
-            def _select_slices(ikey, ival, imsk, offset):
-                row_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (query.shape[1], 1), 0) + offset
-                col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, ikey.shape[0]), 1)
+            @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0, 0))
+            def _select_slices(ikey, ival, imsk, offset, index):
+                krange = ikey.shape[0] if masking_details is None else imsk.shape[-1]
+                row_ids_sliding = offset + jax.lax.broadcasted_iota(jnp.int32, (query_length, 1), 0)
+                col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, krange), 1)
                 rhm = col_ids_sliding <= row_ids_sliding
                 lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
                 imsk = (lhm & rhm) & imsk.astype("b1")
-                if mode == common_types.MODE_DECODE:
-                    select_in = jax.lax.max(0, (offset + 1) - sliding_window)
-                    ikey, ival, imsk = (
-                        jax.lax.dynamic_slice_in_dim(ikey, select_in, sliding_window, 0),
-                        jax.lax.dynamic_slice_in_dim(ival, select_in, sliding_window, 0),
-                        jax.lax.dynamic_slice_in_dim(imsk, select_in, sliding_window, 2),
-                    )
+                start_index = jax.lax.max(0, index - sliding_window)
+                if mode != common_types.MODE_TRAIN:
+                    if imsk.shape[-1] > sliding_window:
+                        imsk = jax.lax.dynamic_slice_in_dim(imsk, start_index, sliding_window, 2)
+                    if ikey.shape[0] > sliding_window:
+                        ikey, ival = (
+                            jax.lax.dynamic_slice_in_dim(ikey, start_index, sliding_window, 0),
+                            jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0),
+                        )
                 return ikey, ival, imsk
 
-            key, value, attention_mask = _select_slices(key, value, attention_mask, offsets)
+            key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
 
         def init_attention_bias():
             return lax.select(

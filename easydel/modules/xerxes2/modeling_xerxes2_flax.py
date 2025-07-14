@@ -693,4 +693,5 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
             ),
             mesh=self.config.mesh,
             starts=starts,
+            mask_type_details=self.config.get_mask_details(),
         )
