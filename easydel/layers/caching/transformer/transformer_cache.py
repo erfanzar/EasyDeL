@@ -339,7 +339,7 @@ class TransformerCacheView(BaseCacheView):
                 return lax.dynamic_update_slice(old_cache, new_values.astype(old_cache.dtype), (current_index, 0, 0))
 
             def _overflow_window():
-                return jnp.concatenate([old_cache[1:, :, :], new_values.astype(old_cache.dtype)], axis=0)
+                return jnp.concatenate([old_cache[new_len:, :, :], new_values.astype(old_cache.dtype)], axis=0)
 
             return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
 
