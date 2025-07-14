@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 from collections import defaultdict
 from functools import partial
@@ -45,12 +47,6 @@ from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-    from transformers import PreTrainedTokenizerBase
-
-else:
-    Dataset = tp.Any
-    PreTrainedTokenizerBase = tp.Any
-
 logger = get_logger(__name__)
 
 
@@ -64,7 +60,7 @@ class ORPOTrainer(Trainer):
         data_collator: DPODataCollatorWithPadding | None = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
-        processing_class: ProcessingClassType | None = None,
+        processing_class: ProcessingClassType = None,
     ):
         assert arguments is not None, (
             "You Have to pass arguments that will be used for training but you have passed`arguments=None`"

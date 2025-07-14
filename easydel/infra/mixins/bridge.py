@@ -40,9 +40,6 @@ from ..etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethod
 
 if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
-else:
-    EasyDeLBaseModule = tp.Any
-
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"

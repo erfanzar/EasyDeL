@@ -39,12 +39,8 @@ from easydel.layers.caching.transformer.transformer_cache import TransformerCach
 from ..sampling_params import JitableSamplingParams, SamplingParams
 
 if tp.TYPE_CHECKING:
-    from easydel.infra import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
 
-else:
-    ProcessingClassType = tp.Any
-    EasyDeLBaseModule = tp.Any
 
 V = tp.TypeVar("V")
 

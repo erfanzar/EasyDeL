@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import contextlib
 import functools
 import gc
@@ -36,11 +38,6 @@ if tp.TYPE_CHECKING:
 
     from easydel.infra.base_config import EasyDeLBaseConfig
     from easydel.infra.base_module import EasyDeLBaseModule
-
-else:
-    PreTrainedModel = tp.Any
-    EasyDeLBaseModule = tp.Any
-    EasyDeLBaseConfig = tp.Any
 
 
 mem_ops = SMPMemoryMonitor(5)

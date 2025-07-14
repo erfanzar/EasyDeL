@@ -19,15 +19,6 @@ from abc import ABC, abstractmethod
 
 from eformer.pytree import auto_pytree
 
-if tp.TYPE_CHECKING:
-    from jax.sharding import Mesh, PartitionSpec
-
-    from easydel.layers.quantization.quantizers import EasyQuantizer
-else:
-    EasyQuantizer = object
-    PartitionSpec = tp.Any
-    Mesh = tp.Any
-
 
 @auto_pytree
 class BaseCacheMetadata(ABC):

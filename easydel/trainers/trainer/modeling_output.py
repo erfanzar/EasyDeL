@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 
 import jax
@@ -20,7 +22,6 @@ if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
 else:
     EasyDeLState = tp.Any
-
 CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | dict[str, tp.Callable]
 
 

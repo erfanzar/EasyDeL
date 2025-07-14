@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import typing as tp
 from functools import cached_property
 
@@ -40,9 +42,6 @@ from .functions import (
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
-else:
-    EasyDeLBaseModule = tp.Any
-    ProcessingClassType = tp.Any
 
 
 NOT_GIVEN = common_types.NOT_GIVEN

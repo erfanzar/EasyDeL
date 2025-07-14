@@ -58,14 +58,11 @@ if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
     from jax import Array
     from torch import Tensor  # type:ignore
-
-    MetricsType = dict[
-        str,
-        float | list | tuple | np.ndarray | Array | Tensor,
-    ]
 else:
-    SummaryWriter = tp.Any
-    MetricsType = tp.Any
+    Array, Tensor = [tp.Any] * 2
+
+
+MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
 logger = get_logger(__name__)
 
 

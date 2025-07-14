@@ -34,8 +34,6 @@ from .engine import vEngine
 
 if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
-else:
-    ProcessingClassType = tp.Any
 
 logger = get_logger("vSurge-vDriver")
 

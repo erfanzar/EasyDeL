@@ -38,10 +38,6 @@ from .utils import (
 if tp.TYPE_CHECKING:
     from easydel.infra.base_module import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
-else:
-    ProcessingClassType = tp.Any
-    EasyDeLBaseModule = tp.Any
-
 
 logger = get_logger("vSurge")
 

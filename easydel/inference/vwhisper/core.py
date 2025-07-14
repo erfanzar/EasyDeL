@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import typing as tp
 
 import jax
@@ -24,16 +26,9 @@ from .generation import _compiled_generate, get_decoder_input_ids
 from .utils import chunk_iter_with_batch, process_audio_input
 
 if tp.TYPE_CHECKING:
-    from transformers import GenerationConfig, WhisperProcessor, WhisperTokenizer
+    from transformers import WhisperProcessor, WhisperTokenizer
 
     from easydel.modules.whisper import WhisperForConditionalGeneration
-else:
-    (
-        GenerationConfig,
-        WhisperProcessor,
-        WhisperTokenizer,
-        WhisperForConditionalGeneration,
-    ) = [tp.Any] * 4
 
 
 class vWhisperInference:

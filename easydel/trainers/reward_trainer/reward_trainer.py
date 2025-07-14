@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import dataclasses
 import typing as tp
 import warnings
@@ -35,15 +37,10 @@ from .reward_config import RewardConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-else:
-    Dataset = tp.Any
 logger = get_logger(__name__)
 
 
-def _tokenize(
-    batch: dict[str, list[tp.Any]],
-    tokenizer: ProcessingClassType,
-) -> dict[str, list[tp.Any]]:
+def _tokenize(batch: dict[str, list[tp.Any]], tokenizer: ProcessingClassType) -> dict[str, list[tp.Any]]:
     """Tokenize a batch from a reward modelling dataset."""
     new_examples = {
         "input_ids_chosen": [],

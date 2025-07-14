@@ -47,9 +47,6 @@ from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
-else:
-    EasyDeLState = tp.Any
-
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
 
 

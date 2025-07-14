@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import typing as tp
 from functools import cached_property, partial
 
@@ -47,10 +49,6 @@ except ImportError:
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
-else:
-    IterableDataset = tp.Any
-    Dataset = tp.Any
-
 logger = get_logger(__name__)
 RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
 
@@ -77,8 +75,8 @@ class GRPOTrainer(Trainer):
         reward_funcs: RewardFunc | list[RewardFunc],
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
-        processing_class: ProcessingClassType | None = None,
-        reward_processing_classes: ProcessingClassType | None = None,
+        processing_class: ProcessingClassType = None,
+        reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
         assert arguments is not None, (

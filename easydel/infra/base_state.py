@@ -41,16 +41,6 @@ if tp.TYPE_CHECKING:
     from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 
     from .base_module import EasyDeLBaseModule, PartitionLike
-else:
-    (
-        EasyDeLBaseModule,
-        PartitionLike,
-        Mesh,
-        EasyDeLBackends,
-        EasyDeLPlatforms,
-        EasyDeLQuantizationMethods,
-        EasyDeLBaseConfigDict,
-    ) = [tp.Any] * 7
 
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
