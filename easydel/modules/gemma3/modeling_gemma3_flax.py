@@ -242,11 +242,7 @@ class Gemma3Attention(AttentionModule):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
 
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -280,13 +276,13 @@ class Gemma3Attention(AttentionModule):
             value_states=value_states,
             mode=mode,
             bias=None,
-            sliding_window=self.sliding_window,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = self.o_proj(attn_output)
@@ -738,7 +734,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
         Returns:
             CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
         """
-
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

@@ -349,21 +349,9 @@ class Llama4TextAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.k_proj = linear_class(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = linear_class(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
+        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
         self.o_proj = linear_class(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,

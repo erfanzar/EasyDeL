@@ -440,18 +440,9 @@ class Qwen3MoeAttention(AttentionModule):
                 self.head_dim,
             )
         )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -484,13 +475,13 @@ class Qwen3MoeAttention(AttentionModule):
             value_states=value_states,
             mode=mode,
             bias=None,
-            sliding_window=self.sliding_window,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attn_output)

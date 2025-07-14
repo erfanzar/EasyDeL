@@ -20,7 +20,7 @@ from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
 
-@register_config("xerxe2")
+@register_config("xerxes2")
 class Xerxes2Config(EasyDeLBaseConfig):
     """
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read

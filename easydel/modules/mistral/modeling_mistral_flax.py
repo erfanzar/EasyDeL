@@ -139,27 +139,11 @@ class MistralAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.k_proj = linear_class(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = linear_class(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.o_proj = linear_class(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-        )
-
+        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.sliding_window = config.sliding_window
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attention_dropout,
@@ -190,30 +174,11 @@ class MistralAttention(AttentionModule):
             self.v_proj(hidden_states),
         )
 
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
+        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
 
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -237,6 +202,7 @@ class MistralAttention(AttentionModule):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             fcm_mask=fcm_mask,
+            sliding_window=self.sliding_window,
         )
 
         attentions = self.attention_performer.forward(
@@ -251,6 +217,7 @@ class MistralAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

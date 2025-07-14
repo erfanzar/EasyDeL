@@ -20,6 +20,7 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 @register_config("qwen2")
@@ -230,3 +231,24 @@ class Qwen2Config(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        for layer_idx in range(self.num_hidden_layers):
+            if self.sliding_window is not None and self.use_sliding_window:
+                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        return mapping

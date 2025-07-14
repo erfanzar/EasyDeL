@@ -309,13 +309,13 @@ class XerxesAttention(AttentionModule):
             value_states=value_states,
             mode=mode,
             bias=None,
-            sliding_window=self.sliding_window,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)

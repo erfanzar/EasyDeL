@@ -23,12 +23,7 @@ from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from .._abstracts import (
-    BaseCache,
-    BaseCacheMetadata,
-    BaseCacheView,
-    BaseRunTimeMetadata,
-)
+from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer

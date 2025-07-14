@@ -21,7 +21,7 @@ import jax
 from eformer import common_types
 from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray, register
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from flax import nnx as nn
 from jax import Array, lax
 from jax import numpy as jnp
@@ -29,12 +29,9 @@ from jax.extend.core import Primitive
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
-from .._abstracts import (
-    BaseCache,
-    BaseCacheMetadata,
-    BaseCacheView,
-    BaseRunTimeMetadata,
-)
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -108,6 +105,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
     value_heads: int | None
     key_dim: int | None
     value_dim: int | None
+    sliding_window: int | None
 
     # Configuration flags
     update_causal_mask: bool
@@ -128,6 +126,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
         value_dim: int | None = None,
         update_causal_mask: bool = True,
         create_attention_bias: bool = True,
+        sliding_window: int | None = None,
     ) -> TransformerCacheMetaData:
         """
         Create a TransformerCacheMetaData instance with validation.
@@ -185,6 +184,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
             value_dim=value_dim,
             update_causal_mask=update_causal_mask,
             create_attention_bias=create_attention_bias,
+            sliding_window=sliding_window,
         )
 
 
@@ -197,7 +197,10 @@ class TransformerCacheView(BaseCacheView):
 
     metadata: TransformerCacheMetaData
 
+    maximum_sequence_length: int = field(pytree_node=False)
+
     layer_index: int | None = None
+    masking_details: AttnMaskDetail | None = None
 
     @classmethod
     def init(
@@ -209,46 +212,28 @@ class TransformerCacheView(BaseCacheView):
         partition_manager: PartitionManager,
         starts: jax.Array | None = None,
         layer_index: int | None = None,
+        masking_details: AttnMaskDetail | None = None,
     ):
         with jax.named_scope("easydel-transformer-cacheview-init"):
             mt = metadata
-
             kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
             vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
+            kv_sharding_axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
 
-            kshardings = Ns(
-                mesh,
-                partition_manager.resolve(
-                    axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
-                    mode=MODE_PREFILL,
-                    shape=kshape,
-                ),
-            )
-            vshardings = Ns(
-                mesh,
-                partition_manager.resolve(
-                    axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
-                    mode=MODE_PREFILL,
-                    shape=vshape,
-                ),
-            )
-            ishardings = Ns(
-                mesh,
-                partition_manager.resolve(
-                    axes=[BATCH],
-                    mode=MODE_PREFILL,
-                    shape=(mt.batch_size,),
-                ),
-            )
+            if masking_details is not None:
+                if masking_details.mask_type == AttnMaskType.SLIDING:
+                    kshape = (mt.batch_size, masking_details.size, mt.key_heads, mt.key_dim)
+                    vshape = (mt.batch_size, masking_details.size, mt.value_heads, mt.value_dim)
+
+            kshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape))
+            vshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape))
+            ishardings = Ns(mesh, partition_manager.resolve(axes=[BATCH], mode=MODE_PREFILL, shape=(mt.batch_size,)))
+
             if starts is None:
                 starts = jnp.zeros((mt.batch_size,), dtype=jnp.int32)
 
-            starts = apply_logical_sharding(
-                starts,
-                axes=[BATCH],
-                mode=MODE_PREFILL,
-                partition_manager=partition_manager,
-            )
+            starts = apply_logical_sharding(starts, axes=[BATCH], mode=MODE_PREFILL, partition_manager=partition_manager)
+
             out = cls(
                 key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=kshardings)),
                 value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=vshardings)),
@@ -256,6 +241,8 @@ class TransformerCacheView(BaseCacheView):
                 starts=starts,
                 metadata=metadata,
                 layer_index=layer_index,
+                masking_details=masking_details,
+                maximum_sequence_length=mt.sequence_length,
             )
         return out
 
@@ -271,7 +258,7 @@ class TransformerCacheView(BaseCacheView):
         partition_manager: PartitionManager,
         causal_mask: cx.Array | None = None,
         token_type_ids: cx.Array | None = None,
-    ) -> tuple[cx.Array, cx.Array, cx.Array]:
+    ) -> tuple[cx.Array, cx.Array, cx.Array, TransformerCacheView, AttnMaskDetail | None]:
         """
         Updates the KV cache functionally and returns the updated tensors along with the appropriate attention mask.
 
@@ -293,10 +280,9 @@ class TransformerCacheView(BaseCacheView):
         """
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
-
+        masking_details = self.masking_details
         indexs = self.indexs
-        batch_dims, max_length, num_heads, depth_per_head = self.value.shape
-
+        batch_dims = self.value.shape[0]
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
@@ -304,25 +290,19 @@ class TransformerCacheView(BaseCacheView):
             if hasattr(causal_mask, "value"):
                 causal_mask = causal_mask.value
             if causal_mask.shape[0] != query.shape[0]:
-                causal_mask = jnp.broadcast_to(
-                    causal_mask,
-                    (query.shape[0],) + causal_mask.shape[1:],
-                )
+                causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0],) + causal_mask.shape[1:])
 
             @partial(jax.vmap, in_axes=(0, 0), out_axes=0)
             def _mask_slice(mask, slot):
                 return lax.dynamic_slice(
                     mask,
                     (0, slot, 0),
-                    (1, num_updated_cache_vectors, max_length),
+                    (1, num_updated_cache_vectors, self.maximum_sequence_length),
                 )
 
             causal_mask = _mask_slice(causal_mask, self.indexs)
             if token_type_ids is not None and num_updated_cache_vectors != 1:
-                token_type_mask = jnp.equal(
-                    jnp.expand_dims(token_type_ids, 2),
-                    jnp.expand_dims(token_type_ids, 1),
-                )
+                token_type_mask = jnp.equal(jnp.expand_dims(token_type_ids, 2), jnp.expand_dims(token_type_ids, 1))
                 token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
                 token_type_mask = jnp.expand_dims(token_type_mask, 1)
                 sequence_length = token_type_ids.shape[1]
@@ -345,9 +325,36 @@ class TransformerCacheView(BaseCacheView):
         def _update_kv(old, new, slot):
             return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
 
-        value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexs)
-        key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
+        @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
+        def _update_kv_sliding(old_cache, new_values, current_index):
+            """Update sliding window KV cache."""
+            new_len = new_values.shape[0]
+            window_size = old_cache.shape[0]
+            if new_len >= window_size:
+                return new_values[-window_size:, :, :].astype(old_cache.dtype)
 
+            total_tokens = current_index + new_len
+
+            def _fits_in_window():
+                return lax.dynamic_update_slice(old_cache, new_values.astype(old_cache.dtype), (current_index, 0, 0))
+
+            def _overflow_window():
+                return jnp.concatenate([old_cache[1:, :, :], new_values.astype(old_cache.dtype)], axis=0)
+
+            return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
+
+        if masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING:
+            value_cache_updated = _update_kv_sliding(_maybe_materialize(self.value), value, indexs)
+            key_cache_updated = _update_kv_sliding(_maybe_materialize(self.key), key, indexs)
+        else:
+            value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexs)
+            key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
+
+        indexs = indexs + num_updated_cache_vectors
+        pad_mask = jnp.broadcast_to(
+            (jnp.arange(self.maximum_sequence_length)[None, :] < indexs[:, None])[:, None, None, :],
+            (batch_dims, 1, num_updated_cache_vectors, self.maximum_sequence_length),
+        )
         value_cache_updated = apply_logical_sharding(
             value_cache_updated,
             axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
@@ -359,13 +366,6 @@ class TransformerCacheView(BaseCacheView):
             axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
             mode=MODE_PREFILL,
             partition_manager=partition_manager,
-        )
-
-        indexs = indexs + num_updated_cache_vectors
-
-        pad_mask = jnp.broadcast_to(
-            (jnp.arange(max_length)[None, :] < indexs[:, None])[:, None, None, :],
-            (batch_dims, 1, num_updated_cache_vectors, max_length),
         )
 
         return (
@@ -387,6 +387,7 @@ class TransformerCacheView(BaseCacheView):
                     partition_manager=partition_manager,
                 ),
             ),
+            masking_details,
         )
 
     def __repr__(self):
@@ -418,6 +419,7 @@ class TransformerCache(BaseCache):
         dtype: jnp.dtype | None = None,
         starts: jax.Array | None = None,
         quantizer: EasyQuantizer | None = None,
+        mask_type_details: dict[int, AttnMaskDetail] | None = None,
     ):
         from easydel.infra.etils import EasyDeLQuantizationMethods
         from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -436,6 +438,7 @@ class TransformerCache(BaseCache):
                         metadata=metadata,
                         quantizer=quantizer,
                         layer_index=layer_index,
+                        masking_details=mask_type_details.get(layer_index) if mask_type_details is not None else None,
                         partition_manager=partition_manager,
                     )
                     for layer_index in range(metadata.num_hidden_layers)

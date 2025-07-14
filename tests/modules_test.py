@@ -66,6 +66,8 @@ class EasyModelsTest(unittest.TestCase):
         self.blocksize_k: int = 128
         self.blocksize_q: int = 128
         self.sequence_length = 4096
+        self.sliding_window = 2048
+        self.use_sliding_window = True
         self.scan_mlp_chunk_size = self.sequence_length // 2
         self.sharding_axis_dims = (1, 1, 1, 1, -1)
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -120,6 +122,8 @@ class EasyModelsTest(unittest.TestCase):
                 platform=self.platform,
                 use_scan_mlp=self.use_scan_mlp,
                 scan_mlp=self.use_scan_mlp,
+                sliding_window=self.sliding_window,
+                use_sliding_window=self.use_sliding_window,
             )
         else:
             config = self.header_config
@@ -525,6 +529,7 @@ class EasyModelsTest(unittest.TestCase):
                 moe_num_experts=self.num_local_experts,
             ),
             attn_config=ed.DbrxAttentionConfig(),
+            max_seq_len=self.max_position_embeddings,
         )
 
         res, err = self.create_test_for_models("dbrx", transformers.DbrxForCausalLM, ed.TaskType.CAUSAL_LM)
@@ -827,15 +832,15 @@ if __name__ == "__main__":
 
     # test.test_arctic()  # Passed
     # test.test_cohere()  # Passed
-    # test.test_cohere2()  # Passed
+    test.test_cohere2()  # Passed
     # test.test_dbrx()  # Passed
     # test.test_deepseek_v2()  # Passed
     # test.test_deepseek_v3()  # Passed
     # test.test_exaone()  # Passed
     # test.test_falcon()  # Passed
     # test.test_gemma()  # Passed
-    # test.test_gemma2()  # Passed
-    # test.test_gemma3_text()  # Passed
+    test.test_gemma2()  # Passed
+    test.test_gemma3_text()  # Passed
     # test.test_gemma3()  # Passed
     # test.test_gptj()  # Passed
     # test.test_gpt_noex()  # Passed
@@ -848,18 +853,18 @@ if __name__ == "__main__":
     # test.test_mamba()  # Passed
     # test.test_mamba2()  # Passed - ReCheck
     test.test_mistral()  # Passed
-    # test.test_mixtral()  # Passed
+    test.test_mixtral()  # Passed
     # test.test_mpt()  # Passed
     # test.test_olmo()  # Passed
     # test.test_olmo2()  # Passed
     # test.test_openelm()  # Passed
     # test.test_phi()  # Passed
-    # test.test_phi3()  # Passed
+    test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-    # test.test_qwen2()  # Passed
+    test.test_qwen2()  # Passed
     # test.test_qwen2_moe()  # Passed
     # test.test_qwen2_vl()  # Passed
-    # test.test_qwen3()  # Passed
-    # test.test_qwen3_moe()  # Passed
+    test.test_qwen3()  # Passed
+    test.test_qwen3_moe()  # Passed
     # test.test_stablelm()  # Passed
     # -----------------------------------------------

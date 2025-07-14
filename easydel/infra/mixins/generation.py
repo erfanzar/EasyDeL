@@ -323,6 +323,7 @@ class EasyGenerationMixin:
             ),
             mesh=self.config.mesh,
             starts=starts,
+            mask_type_details=self.config.get_mask_details(),
         )
 
     @cached_property

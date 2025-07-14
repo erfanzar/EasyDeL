@@ -186,30 +186,10 @@ class ExaoneAttentionInner(AttentionModule):
             self.v_proj(hidden_states),
         )
 
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,

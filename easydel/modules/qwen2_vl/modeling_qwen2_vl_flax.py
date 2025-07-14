@@ -698,6 +698,7 @@ class Qwen2VLAttention(AttentionModule):
             use_bias=False,
         )
 
+        self.sliding_window = config.sliding_window if config.use_sliding_window else None
         self.rotary = self.config.get_basic_rope(
             self.dtype,
             self.head_dim,
@@ -732,29 +733,15 @@ class Qwen2VLAttention(AttentionModule):
             self.k_proj(hidden_states),
             self.v_proj(hidden_states),
         )
-        qshape = (
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        kv_shape = (
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
+        qshape = (batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        kv_shape = (batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         query_states = query_states.reshape(qshape)
         key_states = key_states.reshape(kv_shape)
         value_states = value_states.reshape(kv_shape)
         if position_ids.ndim == 3:
             position_ids = position_ids[0]
             # cond vision gen issue will be fixed with no mem issue.
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -778,6 +765,7 @@ class Qwen2VLAttention(AttentionModule):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             fcm_mask=fcm_mask,
+            sliding_window=self.sliding_window,
         )
 
         attentions = self.attention_performer.forward(
@@ -792,6 +780,7 @@ class Qwen2VLAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
         attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))

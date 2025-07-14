@@ -93,26 +93,10 @@ class ArcticAttention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.q_proj = linear(
-            config.hidden_size,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.k_proj = linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = linear(
-            config.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.o_proj = linear(
-            self.num_heads * self.head_dim,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-        )
+        self.q_proj = linear(config.hidden_size, self.num_heads * self.head_dim, rngs=rngs)
+        self.k_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = linear(self.num_heads * self.head_dim, self.num_heads * self.head_dim, rngs=rngs)
 
         self.rotary = self.config.get_basic_rope(
             self.dtype,
@@ -125,6 +109,7 @@ class ArcticAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
         )
+        self.sliding_window = config.sliding_window
 
     def __call__(
         self,
@@ -147,30 +132,10 @@ class ArcticAttention(AttentionModule):
             self.v_proj(hidden_states),
         )
 
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
@@ -194,6 +159,7 @@ class ArcticAttention(AttentionModule):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             fcm_mask=fcm_mask,
+            sliding_window=self.sliding_window,
         )
 
         attentions = self.attention_performer.forward(
@@ -208,6 +174,7 @@ class ArcticAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=True,
+            sliding_window=self.sliding_window,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))

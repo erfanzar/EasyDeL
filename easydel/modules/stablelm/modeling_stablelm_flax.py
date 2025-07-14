@@ -389,11 +389,7 @@ class StableLmAttention(AttentionModule):
         if self.qk_layernorm:
             query_states = self.q_layernorm(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
             key_states = self.k_layernorm(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
-        (
-            query_states,
-            key_states,
-            value_states,
-        ) = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self.rotary(
             positions=position_ids,
