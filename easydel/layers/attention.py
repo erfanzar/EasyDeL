@@ -644,7 +644,7 @@ class AttentionModule(nn.Module):
                 offsets = indexs - 1
             elif mode == common_types.MODE_PREFILL and sliding_window is not None and masking_details is not None:
                 indexs = jnp.array([query_length], "i4").repeat(query.shape[0], axis=0).reshape(-1)
-                offsets = jnp.sum(~jnp.any(attention_mask[:, -1, :, :], axis=-1), axis=-1).reshape(-1) - 1
+                offsets = jnp.zeros((query.shape[0],), "i4")
             else:
                 indexs = jnp.zeros((query.shape[0],), "i4") + 1
                 offsets = jnp.zeros((query.shape[0],), "i4")
@@ -657,15 +657,18 @@ class AttentionModule(nn.Module):
                 rhm = col_ids_sliding <= row_ids_sliding
                 lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
                 imsk = (lhm & rhm) & imsk.astype("b1")
-                start_index = jax.lax.max(0, index - sliding_window)
-                if mode != common_types.MODE_TRAIN and masking_details is not None:
+                if mode == common_types.MODE_DECODE and masking_details is not None:
+                    start_index = jax.lax.max(0, index - sliding_window)
                     if imsk.shape[-1] > sliding_window:
                         imsk = jax.lax.dynamic_slice_in_dim(imsk, start_index, sliding_window, 2)
+
                     if ikey.shape[0] > sliding_window:
                         ikey, ival = (
                             jax.lax.dynamic_slice_in_dim(ikey, start_index, sliding_window, 0),
                             jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0),
                         )
+                elif cache_view is not None and masking_details is not None and mode == common_types.MODE_PREFILL:
+                    imsk = imsk[:, :, query_length - sliding_window : query_length]
                 return ikey, ival, imsk
 
             key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
