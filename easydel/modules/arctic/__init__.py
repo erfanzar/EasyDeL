@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .arctic_configuration import ArcticConfig
-from .modeling_arctic_flax import (
+from .modeling_arctic import (
     ArcticForCausalLM,
     ArcticForSequenceClassification,
     ArcticModel,

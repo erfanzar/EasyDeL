@@ -123,6 +123,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         number_rep_kv: int = 1,
         bits: int | None = None,
         scan_layers: bool = True,
+        layer_types=None,
         rope_scaling: tp.Mapping[str, str | float] | None = None,
         **kwargs,
     ):
@@ -195,7 +196,14 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         self.head_dim = hidden_size // num_attention_heads
-
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         super().__init__(

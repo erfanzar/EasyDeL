@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_mosaic_flax import MptForCausalLM, MptModel
+from .modeling_mosaic import MptForCausalLM, MptModel
 from .mosaic_configuration import MptAttentionConfig, MptConfig
 
 __all__ = ("MptAttentionConfig", "MptConfig", "MptForCausalLM", "MptModel")

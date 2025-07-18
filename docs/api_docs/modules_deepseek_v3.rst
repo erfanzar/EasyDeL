@@ -6,4 +6,4 @@ Deepseek V3
 
    modules_deepseek_v3___init__
    modules_deepseek_v3_deepseek_configuration
-   modules_deepseek_v3_modeling_deepseek_flax
+   modules_deepseek_v3_modeling_deepseek

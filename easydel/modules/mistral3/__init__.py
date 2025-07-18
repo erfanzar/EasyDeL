@@ -14,6 +14,6 @@
 
 from .mistral3_configuration import Mistral3Config
 from .mistral3_tokenizer import Mistral3Tokenizer
-from .modeling_mistral3_flax import Mistral3ForConditionalGeneration, Mistral3Model
+from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3Model
 
 __all__ = ("Mistral3Config", "Mistral3ForConditionalGeneration", "Mistral3Model", "Mistral3Tokenizer")

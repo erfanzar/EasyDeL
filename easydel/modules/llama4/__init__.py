@@ -18,7 +18,7 @@ from .llama4_configuration import (
     Llama4TextConfig,
     Llama4VisionConfig,
 )
-from .modeling_llama4_flax import (
+from .modeling_llama4 import (
     Llama4ForCausalLM,
     Llama4ForConditionalGeneration,
     Llama4ForSequenceClassification,

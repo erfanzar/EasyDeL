@@ -6,4 +6,4 @@ Dbrx
 
    modules_dbrx___init__
    modules_dbrx_dbrx_configuration
-   modules_dbrx_modeling_dbrx_flax
+   modules_dbrx_modeling_dbrx

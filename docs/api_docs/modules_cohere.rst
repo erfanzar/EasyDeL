@@ -6,4 +6,4 @@ Cohere
 
    modules_cohere___init__
    modules_cohere_cohere_configuration
-   modules_cohere_modeling_cohere_flax
+   modules_cohere_modeling_cohere

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_qwen2_vl_flax import (
+from .modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
     Qwen2VLModel,
 )

@@ -30,7 +30,7 @@ from jax import numpy as jnp
 from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
 
-from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskType
 from easydel.utils.helpers import get_logger
 
@@ -314,7 +314,7 @@ class AttentionModule(nn.Module):
         cache_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
     """
 
-    def __init__(self, config: SC):
+    def __init__(self, config: SC):  # type:ignore
         """
         Initializes the AttentionModule.
 
@@ -543,7 +543,7 @@ class AttentionModule(nn.Module):
         token_type_ids: Array | None = None,
         fcm_mask: Array | None = None,
         sliding_window: int | None = None,
-    ) -> tuple[Array, Array, Array, tp.Callable[[], Array]]:
+    ) -> tuple[Array, Array, Array, tp.Callable[[], Array], TransformerCacheView | PagesCacheView | None]:
         """
         Prepares inputs for attention calculation, handling KV caching and mask merging.
 
@@ -642,7 +642,7 @@ class AttentionModule(nn.Module):
             if mode == common_types.MODE_DECODE and cache_view is not None:
                 indexs = cache_view.indexs
                 offsets = indexs - 1
-            elif mode == common_types.MODE_PREFILL and sliding_window is not None and masking_details is not None:
+            elif mode == common_types.MODE_PREFILL and masking_details is not None:
                 indexs = jnp.array([query_length], "i4").repeat(query.shape[0], axis=0).reshape(-1)
                 offsets = jnp.zeros((query.shape[0],), "i4")
             else:
