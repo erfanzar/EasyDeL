@@ -113,3 +113,41 @@ python_version = "3.10"
 
 ignore_missing_imports = true
 exclude = ["easydel/"]
+
+
+[tool.basedpyright]
+
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"

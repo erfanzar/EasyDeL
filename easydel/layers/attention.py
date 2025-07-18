@@ -668,12 +668,10 @@ class AttentionModule(nn.Module):
                             jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0),
                         )
                 elif cache_view is not None and masking_details is not None and mode == common_types.MODE_PREFILL:
-                    imsk = jax.lax.dynamic_slice_in_dim(
-                        imsk,
-                        start_index=max(0, query_length - sliding_window),
-                        slice_size=min(sliding_window, imsk.shape[-1]),
-                        axis=2,
-                    )
+                    if query_length > sliding_window:
+                        imsk = imsk[:, :, query_length - sliding_window : query_length]
+                    else:
+                        imsk = imsk[:, :, :sliding_window]
                 return ikey, ival, imsk
 
             key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
