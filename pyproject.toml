@@ -50,6 +50,7 @@ dependencies = [
 	"gcsfs",
 	"zstandard>=0.23.0",
 	"msgspec~=0.19.0",
+	"contextlib2~=21.6.0",
 ]
 
 [project.urls]
@@ -71,8 +72,8 @@ where = ["."]
 "easydel" = ["py.typed"]
 
 [project.optional-dependencies]
-torch = ["torch~=2.6.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]==0.6.2", "tensorboard>=2.19.0"]
+torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]==0.6.2", "torch==2.6.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]==0.6.2", "tensorboard>=2.19.0"]
 
 [tool.black]
@@ -137,3 +138,11 @@ conflicts = [
 	[{ extra = "gpu" }, { extra = "tpu" }], 
 	[{ extra = "gpu" }, { extra = "torch" }],
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "extra == 'torch'" }
