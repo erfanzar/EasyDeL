@@ -2,14 +2,62 @@ version = 1
 revision = 2
 requires-python = ">=3.10, <3.14"
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'linux'",
-    "python_full_version == '3.12.*' and sys_platform != 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform != 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
 ]
 conflicts = [[
     { package = "easydel", extra = "gpu" },
@@ -420,6 +468,15 @@ wheels = [
 ]
 
 [[package]]
+name = "contextlib2"
+version = "21.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/13/37ea7805ae3057992e96ecb1cffa2fa35c2ef4498543b846f90dd2348d8f/contextlib2-21.6.0.tar.gz", hash = "sha256:ab1e2bfe1d01d968e1b7e8d9023bc51ef3509bba217bb730cee3827e1ee82869", size = 43795, upload-time = "2021-06-27T06:54:40.841Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/56/6d6872f79d14c0cb02f1646cbb4592eef935857c0951a105874b7b62a0c3/contextlib2-21.6.0-py2.py3-none-any.whl", hash = "sha256:3fbdb64466afd23abaf6c977627b75b6139a5a3e8ce38405c5b413aed7a0471f", size = 13277, upload-time = "2021-06-27T06:54:20.972Z" },
+]
+
+[[package]]
 name = "datasets"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -510,6 +567,7 @@ name = "easydel"
 version = "0.1.5.dev20"
 source = { editable = "." }
 dependencies = [
+    { name = "contextlib2" },
     { name = "datasets" },
     { name = "eformer" },
     { name = "einops" },
@@ -539,7 +597,8 @@ gpu = [
 ]
 torch = [
     { name = "tensorboard" },
-    { name = "torch" },
+    { name = "torch", version = "2.6.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "torch", version = "2.6.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
 ]
 tpu = [
     { name = "jax", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
@@ -548,6 +607,7 @@ tpu = [
 
 [package.metadata]
 requires-dist = [
+    { name = "contextlib2", specifier = "~=21.6.0" },
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.42" },
     { name = "einops", specifier = "~=0.8.0" },
@@ -566,9 +626,11 @@ requires-dist = [
     { name = "tensorboard", marker = "extra == 'gpu'", specifier = ">=2.19.0" },
     { name = "tensorboard", marker = "extra == 'torch'", specifier = ">=2.19.0" },
     { name = "tensorboard", marker = "extra == 'tpu'", specifier = ">=2.19.0" },
-    { name = "torch", marker = "extra == 'torch'", specifier = "~=2.6.0" },
+    { name = "torch", marker = "extra == 'gpu' and extra == 'torch'", specifier = "==2.6.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "extra == 'gpu' and extra != 'torch'", specifier = "==2.6.0" },
+    { name = "torch", marker = "extra == 'torch'", specifier = "==2.6.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=4.51.0" },
+    { name = "transformers", specifier = ">=4.53.1" },
     { name = "triton", specifier = "~=3.2.0" },
     { name = "uvicorn", specifier = ">=0.32.0" },
     { name = "uvloop", specifier = "==0.21.0" },
@@ -1189,7 +1251,7 @@ with-cuda = [
     { name = "nvidia-cuda-nvcc-cu12" },
     { name = "nvidia-cuda-nvrtc-cu12" },
     { name = "nvidia-cuda-runtime-cu12" },
-    { name = "nvidia-cudnn-cu12", version = "9.11.0.98", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cudnn-cu12" },
     { name = "nvidia-cufft-cu12" },
     { name = "nvidia-cusolver-cu12" },
     { name = "nvidia-cusparse-cu12" },
@@ -1666,8 +1728,10 @@ name = "networkx"
 version = "3.4.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/fd/1d/06475e1cd5264c0b870ea2cc6fdb3e37177c1e565c43f56ff17a10e3937f/networkx-3.4.2.tar.gz", hash = "sha256:307c3669428c5362aab27c8a1260aa8f47c4e91d3891f48be0141738d8d053e1", size = 2151368, upload-time = "2024-10-21T12:39:38.695Z" }
 wheels = [
@@ -1679,12 +1743,18 @@ name = "networkx"
 version = "3.5"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'linux'",
-    "python_full_version == '3.12.*' and sys_platform != 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6c/4f/ccdb8ad3a38e583f214547fd2f7ff1fc160c43a75af88e6aec213404b96a/networkx-3.5.tar.gz", hash = "sha256:d4c6f9cf81f52d69230866796b82afbccdec3db7ae4fbd1b65ea750feed50037", size = 2471065, upload-time = "2025-05-29T11:35:07.804Z" }
 wheels = [
@@ -1696,8 +1766,20 @@ name = "numpy"
 version = "2.2.6"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/76/21/7d2a95e4bba9dc13d043ee156a356c0a8f0c6309dff6b21b4d71a073b8a8/numpy-2.2.6.tar.gz", hash = "sha256:e29554e2bef54a90aa5cc07da6ce955accb83f21ab5de01a62c8478897b264fd", size = 20276440, upload-time = "2025-05-17T22:38:04.611Z" }
 wheels = [
@@ -1762,12 +1844,48 @@ name = "numpy"
 version = "2.3.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'linux'",
-    "python_full_version == '3.12.*' and sys_platform != 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2e/19/d7c972dfe90a353dbd3efbbe1d14a5951de80c99c9dc1b93cd998d51dc0f/numpy-2.3.1.tar.gz", hash = "sha256:1ec9ae20a4226da374362cca3c62cd753faf2f951440b0e3b98e93c235441d2b", size = 20390372, upload-time = "2025-06-21T12:28:33.469Z" }
 wheels = [
@@ -1875,36 +1993,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.1.0.70"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/fd/713452cd72343f682b1c7b9321e23829f00b842ceaedcda96e742ea0b0b3/nvidia_cudnn_cu12-9.1.0.70-py3-none-manylinux2014_x86_64.whl", hash = "sha256:165764f44ef8c61fcdfdfdbe769d687e06374059fbb388b6c89ecb0e28793a6f", size = 664752741, upload-time = "2024-04-22T15:24:15.253Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/d0/f90ee6956a628f9f04bf467932c0a25e5a7e706a684b896593c06c82f460/nvidia_cudnn_cu12-9.1.0.70-py3-none-win_amd64.whl", hash = "sha256:6278562929433d68365a07a4a1546c237ba2849852c0d4b2262a486e805b977a", size = 679925892, upload-time = "2024-04-22T15:24:53.333Z" },
-]
-
-[[package]]
-name = "nvidia-cudnn-cu12"
 version = "9.11.0.98"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'linux'",
-    "python_full_version == '3.12.*' and sys_platform != 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform != 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform != 'linux'",
-]
 dependencies = [
     { name = "nvidia-cublas-cu12" },
 ]
@@ -1919,7 +2009,7 @@ name = "nvidia-cufft-cu12"
 version = "11.2.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/8a/0e728f749baca3fbeffad762738276e5df60851958be7783af121a7221e7/nvidia_cufft_cu12-11.2.1.3-py3-none-manylinux2014_aarch64.whl", hash = "sha256:5dad8008fc7f92f5ddfa2101430917ce2ffacd86824914c82e28990ad7f00399", size = 211422548, upload-time = "2024-06-18T19:33:39.396Z" },
@@ -1928,23 +2018,13 @@ wheels = [
 ]
 
 [[package]]
-name = "nvidia-curand-cu12"
-version = "10.3.5.147"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/9c/a79180e4d70995fdf030c6946991d0171555c6edf95c265c6b2bf7011112/nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_aarch64.whl", hash = "sha256:1f173f09e3e3c76ab084aba0de819c49e56614feae5c12f69883f4ae9bb5fad9", size = 56314811, upload-time = "2024-06-18T19:34:48.575Z" },
-    { url = "https://files.pythonhosted.org/packages/8a/6d/44ad094874c6f1b9c654f8ed939590bdc408349f137f9b98a3a23ccec411/nvidia_curand_cu12-10.3.5.147-py3-none-manylinux2014_x86_64.whl", hash = "sha256:a88f583d4e0bb643c49743469964103aa59f7f708d862c3ddb0fc07f851e3b8b", size = 56305206, upload-time = "2024-04-03T20:58:08.722Z" },
-    { url = "https://files.pythonhosted.org/packages/1c/22/2573503d0d4e45673c263a313f79410e110eb562636b0617856fdb2ff5f6/nvidia_curand_cu12-10.3.5.147-py3-none-win_amd64.whl", hash = "sha256:f307cc191f96efe9e8f05a87096abc20d08845a841889ef78cb06924437f6771", size = 55799918, upload-time = "2024-04-03T21:04:34.45Z" },
-]
-
-[[package]]
 name = "nvidia-cusolver-cu12"
 version = "11.6.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cusparse-cu12" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/46/6b/a5c33cf16af09166845345275c34ad2190944bcc6026797a39f8e0a282e0/nvidia_cusolver_cu12-11.6.1.9-py3-none-manylinux2014_aarch64.whl", hash = "sha256:d338f155f174f90724bbde3758b7ac375a70ce8e706d70b018dd3375545fc84e", size = 127634111, upload-time = "2024-06-18T19:35:01.793Z" },
@@ -1957,22 +2037,12 @@ name = "nvidia-cusparse-cu12"
 version = "12.3.1.170"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-nvjitlink-cu12" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/96/a9/c0d2f83a53d40a4a41be14cea6a0bf9e668ffcf8b004bd65633f433050c0/nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_aarch64.whl", hash = "sha256:9d32f62896231ebe0480efd8a7f702e143c98cfaa0e8a76df3386c1ba2b54df3", size = 207381987, upload-time = "2024-06-18T19:35:32.989Z" },
     { url = "https://files.pythonhosted.org/packages/db/f7/97a9ea26ed4bbbfc2d470994b8b4f338ef663be97b8f677519ac195e113d/nvidia_cusparse_cu12-12.3.1.170-py3-none-manylinux2014_x86_64.whl", hash = "sha256:ea4f11a2904e2a8dc4b1833cc1b5181cde564edd0d5cd33e3c168eff2d1863f1", size = 207454763, upload-time = "2024-04-03T20:58:59.995Z" },
     { url = "https://files.pythonhosted.org/packages/a2/e0/3155ca539760a8118ec94cc279b34293309bcd14011fc724f87f31988843/nvidia_cusparse_cu12-12.3.1.170-py3-none-win_amd64.whl", hash = "sha256:9bc90fb087bc7b4c15641521f31c0371e9a612fc2ba12c338d3ae032e6b6797f", size = 204684315, upload-time = "2024-04-03T21:05:26.031Z" },
-]
-
-[[package]]
-name = "nvidia-cusparselt-cu12"
-version = "0.6.2"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/98/8e/675498726c605c9441cf46653bd29cb1b8666da1fb1469ffa25f67f20c58/nvidia_cusparselt_cu12-0.6.2-py3-none-manylinux2014_aarch64.whl", hash = "sha256:067a7f6d03ea0d4841c85f0c6f1991c5dda98211f6302cb83a4ab234ee95bef8", size = 149422781, upload-time = "2024-07-23T17:35:27.203Z" },
-    { url = "https://files.pythonhosted.org/packages/78/a8/bcbb63b53a4b1234feeafb65544ee55495e1bb37ec31b999b963cbccfd1d/nvidia_cusparselt_cu12-0.6.2-py3-none-manylinux2014_x86_64.whl", hash = "sha256:df2c24502fd76ebafe7457dbc4716b2fec071aabaed4fb7691a201cde03704d9", size = 150057751, upload-time = "2024-07-23T02:35:53.074Z" },
-    { url = "https://files.pythonhosted.org/packages/56/8f/2c33082238b6c5e783a877dc8786ab62619e3e6171c083bd3bba6e3fe75e/nvidia_cusparselt_cu12-0.6.2-py3-none-win_amd64.whl", hash = "sha256:0057c91d230703924c0422feabe4ce768841f9b4b44d28586b6f6d2eb86fbe70", size = 148755794, upload-time = "2024-07-23T02:35:00.261Z" },
 ]
 
 [[package]]
@@ -2000,16 +2070,6 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bf/f9/dcb91a671d5643ca132e4c8377982ab5c2cadc3a60957e08e30d678bfb81/nvidia_nvshmem_cu12-3.3.9-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:95ba1e98189c056eb5372bd355ab714b3741a03e6de1e32f167f5240fd967c5f", size = 124606673, upload-time = "2025-06-26T16:08:43.805Z" },
     { url = "https://files.pythonhosted.org/packages/16/eb/627abc1863df836111121070d21a719d659a2ccd513a6ab4fad6505a39c4/nvidia_nvshmem_cu12-3.3.9-py3-none-manylinux_2_29_aarch64.whl", hash = "sha256:2de43cbfe559e16b8e3cb777b95f1fe2ddd5c2cfd79414b09cf9cf099feba2ba", size = 124419114, upload-time = "2025-06-26T16:08:32.675Z" },
-]
-
-[[package]]
-name = "nvidia-nvtx-cu12"
-version = "12.4.127"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/06/39/471f581edbb7804b39e8063d92fc8305bdc7a80ae5c07dbe6ea5c50d14a5/nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_aarch64.whl", hash = "sha256:7959ad635db13edf4fc65c06a6e9f9e55fc2f92596db928d169c0bb031e88ef3", size = 100417, upload-time = "2024-06-18T20:16:22.484Z" },
-    { url = "https://files.pythonhosted.org/packages/87/20/199b8713428322a2f22b722c62b8cc278cc53dffa9705d744484b5035ee9/nvidia_nvtx_cu12-12.4.127-py3-none-manylinux2014_x86_64.whl", hash = "sha256:781e950d9b9f60d8241ccea575b32f5105a5baf4c2351cab5256a24869f12a1a", size = 99144, upload-time = "2024-04-03T20:56:12.406Z" },
-    { url = "https://files.pythonhosted.org/packages/54/1b/f77674fbb73af98843be25803bbd3b9a4f0a96c75b8d33a2854a5c7d2d77/nvidia_nvtx_cu12-12.4.127-py3-none-win_amd64.whl", hash = "sha256:641dccaaa1139f3ffb0d3164b4b84f9d253397e38246a4f2f36728b48566d485", size = 66307, upload-time = "2024-04-03T21:02:01.959Z" },
 ]
 
 [[package]]
@@ -3026,8 +3086,20 @@ name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version < '3.11' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
 ]
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3086,12 +3158,48 @@ name = "scipy"
 version = "1.16.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform != 'linux'",
-    "python_full_version == '3.12.*' and sys_platform != 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version >= '3.13' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra == 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin' and extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux' and extra != 'extra-7-easydel-gpu' and extra != 'extra-7-easydel-torch' and extra != 'extra-7-easydel-tpu'",
 ]
 dependencies = [
     { name = "numpy", version = "2.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -3393,48 +3501,73 @@ wheels = [
 [[package]]
 name = "torch"
 version = "2.6.0"
-source = { registry = "https://pypi.org/simple" }
+source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "networkx", version = "3.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-cupti-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-cu12", version = "9.1.0.70", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cufft-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-curand-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusolver-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusparse-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cusparselt-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nccl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-nvtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'" },
-    { name = "sympy" },
-    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "sys_platform == 'darwin'" },
+    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and sys_platform == 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "networkx", version = "3.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and sys_platform == 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform == 'darwin'" },
+    { name = "sympy", marker = "sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/37/81/aa9ab58ec10264c1abe62c8b73f5086c3c558885d6beecebf699f0dbeaeb/torch-2.6.0-cp310-cp310-manylinux1_x86_64.whl", hash = "sha256:6860df13d9911ac158f4c44031609700e1eba07916fff62e21e6ffa0a9e01961", size = 766685561, upload-time = "2025-01-29T16:19:12.12Z" },
-    { url = "https://files.pythonhosted.org/packages/86/86/e661e229df2f5bfc6eab4c97deb1286d598bbeff31ab0cdb99b3c0d53c6f/torch-2.6.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:c4f103a49830ce4c7561ef4434cc7926e5a5fe4e5eb100c19ab36ea1e2b634ab", size = 95751887, upload-time = "2025-01-29T16:27:50.77Z" },
-    { url = "https://files.pythonhosted.org/packages/20/e0/5cb2f8493571f0a5a7273cd7078f191ac252a402b5fb9cb6091f14879109/torch-2.6.0-cp310-cp310-win_amd64.whl", hash = "sha256:56eeaf2ecac90da5d9e35f7f35eb286da82673ec3c582e310a8d1631a1c02341", size = 204165139, upload-time = "2025-01-29T16:27:11.63Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/16/ea1b7842413a7b8a5aaa5e99e8eaf3da3183cc3ab345ad025a07ff636301/torch-2.6.0-cp310-none-macosx_11_0_arm64.whl", hash = "sha256:09e06f9949e1a0518c5b09fe95295bc9661f219d9ecb6f9893e5123e10696628", size = 66520221, upload-time = "2025-01-29T16:22:18.862Z" },
-    { url = "https://files.pythonhosted.org/packages/78/a9/97cbbc97002fff0de394a2da2cdfa859481fdca36996d7bd845d50aa9d8d/torch-2.6.0-cp311-cp311-manylinux1_x86_64.whl", hash = "sha256:7979834102cd5b7a43cc64e87f2f3b14bd0e1458f06e9f88ffa386d07c7446e1", size = 766715424, upload-time = "2025-01-29T16:25:15.874Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/fa/134ce8f8a7ea07f09588c9cc2cea0d69249efab977707cf67669431dcf5c/torch-2.6.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:ccbd0320411fe1a3b3fec7b4d3185aa7d0c52adac94480ab024b5c8f74a0bf1d", size = 95759416, upload-time = "2025-01-29T16:27:38.429Z" },
-    { url = "https://files.pythonhosted.org/packages/11/c5/2370d96b31eb1841c3a0883a492c15278a6718ccad61bb6a649c80d1d9eb/torch-2.6.0-cp311-cp311-win_amd64.whl", hash = "sha256:46763dcb051180ce1ed23d1891d9b1598e07d051ce4c9d14307029809c4d64f7", size = 204164970, upload-time = "2025-01-29T16:26:16.182Z" },
-    { url = "https://files.pythonhosted.org/packages/0b/fa/f33a4148c6fb46ca2a3f8de39c24d473822d5774d652b66ed9b1214da5f7/torch-2.6.0-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:94fc63b3b4bedd327af588696559f68c264440e2503cc9e6954019473d74ae21", size = 66530713, upload-time = "2025-01-29T16:26:38.881Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/35/0c52d708144c2deb595cd22819a609f78fdd699b95ff6f0ebcd456e3c7c1/torch-2.6.0-cp312-cp312-manylinux1_x86_64.whl", hash = "sha256:2bb8987f3bb1ef2675897034402373ddfc8f5ef0e156e2d8cfc47cacafdda4a9", size = 766624563, upload-time = "2025-01-29T16:23:19.084Z" },
-    { url = "https://files.pythonhosted.org/packages/01/d6/455ab3fbb2c61c71c8842753b566012e1ed111e7a4c82e0e1c20d0c76b62/torch-2.6.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b789069020c5588c70d5c2158ac0aa23fd24a028f34a8b4fcb8fcb4d7efcf5fb", size = 95607867, upload-time = "2025-01-29T16:25:55.649Z" },
-    { url = "https://files.pythonhosted.org/packages/18/cf/ae99bd066571656185be0d88ee70abc58467b76f2f7c8bfeb48735a71fe6/torch-2.6.0-cp312-cp312-win_amd64.whl", hash = "sha256:7e1448426d0ba3620408218b50aa6ada88aeae34f7a239ba5431f6c8774b1239", size = 204120469, upload-time = "2025-01-29T16:24:01.821Z" },
-    { url = "https://files.pythonhosted.org/packages/81/b4/605ae4173aa37fb5aa14605d100ff31f4f5d49f617928c9f486bb3aaec08/torch-2.6.0-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:9a610afe216a85a8b9bc9f8365ed561535c93e804c2a317ef7fabcc5deda0989", size = 66532538, upload-time = "2025-01-29T16:24:18.976Z" },
-    { url = "https://files.pythonhosted.org/packages/24/85/ead1349fc30fe5a32cadd947c91bda4a62fbfd7f8c34ee61f6398d38fb48/torch-2.6.0-cp313-cp313-manylinux1_x86_64.whl", hash = "sha256:4874a73507a300a5d089ceaff616a569e7bb7c613c56f37f63ec3ffac65259cf", size = 766626191, upload-time = "2025-01-29T16:17:26.26Z" },
-    { url = "https://files.pythonhosted.org/packages/dd/b0/26f06f9428b250d856f6d512413e9e800b78625f63801cbba13957432036/torch-2.6.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:a0d5e1b9874c1a6c25556840ab8920569a7a4137afa8a63a32cee0bc7d89bd4b", size = 95611439, upload-time = "2025-01-29T16:21:21.061Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/9c/fc5224e9770c83faed3a087112d73147cd7c7bfb7557dcf9ad87e1dda163/torch-2.6.0-cp313-cp313-win_amd64.whl", hash = "sha256:510c73251bee9ba02ae1cb6c9d4ee0907b3ce6020e62784e2d7598e0cfa4d6cc", size = 204126475, upload-time = "2025-01-29T16:21:55.394Z" },
-    { url = "https://files.pythonhosted.org/packages/88/8b/d60c0491ab63634763be1537ad488694d316ddc4a20eaadd639cedc53971/torch-2.6.0-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:ff96f4038f8af9f7ec4231710ed4549da1bdebad95923953a25045dcf6fd87e2", size = 66536783, upload-time = "2025-01-29T16:22:08.559Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp310-none-macosx_11_0_arm64.whl", hash = "sha256:09e06f9949e1a0518c5b09fe95295bc9661f219d9ecb6f9893e5123e10696628" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:94fc63b3b4bedd327af588696559f68c264440e2503cc9e6954019473d74ae21" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:9a610afe216a85a8b9bc9f8365ed561535c93e804c2a317ef7fabcc5deda0989" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:ff96f4038f8af9f7ec4231710ed4549da1bdebad95923953a25045dcf6fd87e2" },
+]
+
+[[package]]
+name = "torch"
+version = "2.6.0+cpu"
+source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "filelock", marker = "sys_platform != 'darwin'" },
+    { name = "fsspec", marker = "sys_platform != 'darwin'" },
+    { name = "jinja2", marker = "sys_platform != 'darwin'" },
+    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and sys_platform != 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "networkx", version = "3.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and sys_platform != 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "sympy", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-linux_x86_64.whl", hash = "sha256:35a9e78b7e4096968b54c1a198687b981569c50ae93e661aa430f9fd208da102" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:90832f4d118c566b8652a2196ac695fc1f14cf420db27b5a1b41c7eaaf2141e9" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-win_amd64.whl", hash = "sha256:6e22f0b13db8d53e55bcb3b46c9dd4b6676d1c44051b56753e745cec3075b333" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp311-cp311-linux_x86_64.whl", hash = "sha256:5b6ae523bfb67088a17ca7734d131548a2e60346c622621e4248ed09dd0790cc" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:d3dab9fb0294f268aec28e8aaba834e9d006b90a50db5bc2fe2191a9d48c6084" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp311-cp311-win_amd64.whl", hash = "sha256:24c9d3d13b9ea769dd7bd5c11cfa1fc463fd7391397156565484565ca685d908" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-linux_x86_64.whl", hash = "sha256:59e78aa0c690f70734e42670036d6b541930b8eabbaa18d94e090abf14cc4d91" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:318290e8924353c61b125cdc8768d15208704e279e7757c113b9620740deca98" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-win_amd64.whl", hash = "sha256:4027d982eb2781c93825ab9527f17fbbb12dbabf422298e4b954be60016f87d8" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp313-cp313-linux_x86_64.whl", hash = "sha256:e70ee2e37ad27a90201d101a41c2e10df7cf15a9ebd17c084f54cf2518c57bdf" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b5e7e8d561b263b5ad8049736281cd12c78e51e7bc1a913fd4098fd0e0b96347" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp313-cp313-win_amd64.whl", hash = "sha256:b436a6c62d086dc5b32f5721b59f0ca8ad3bf9de09ee9b5b83dbf1e7a7e22c60" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp313-cp313t-linux_x86_64.whl", hash = "sha256:fb34d6cc4e6e20e66d74852c3d84e0301dc5e1a7c822076ef288886f978390f0" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:7cac05af909ee1c5c2915e8f3efaa1ea015e7e414be0ff53071402b9e4f3c7df" },
 ]
 
 [[package]]
