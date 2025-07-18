@@ -1,16 +1,15 @@
-[tool.poetry]
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
 name = "easydel"
-version = "0.1.5.dev16"
-
+version = "0.1.5.dev20"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
-authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
-license = "Apache-2.0"
 readme = "README.md"
-
-homepage = "https://github.com/erfanzar/EasyDeL"
-repository = "https://github.com/erfanzar/EasyDeL"
-documentation = "https://easydel.readthedocs.io/en/latest/"
-
+requires-python = ">=3.10,<3.14"
+license = { text = "Apache-2.0" }
 keywords = [
 	"Deep Learning",
 	"Machine Learning",
@@ -20,7 +19,6 @@ keywords = [
 	"Triton",
 	"Pallas",
 ]
-
 classifiers = [
 	"Development Status :: 3 - Alpha",
 	"Intended Audience :: Developers",
@@ -31,58 +29,40 @@ classifiers = [
 	"Programming Language :: Python :: 3.12",
 	"Programming Language :: Python :: 3.13",
 ]
+dependencies = [
+	"jax==0.6.2",
+	"jaxlib==0.6.2",
+	"eformer==0.0.41",
+	"einops~=0.8.0",
+	"transformers>=4.51.0",
+	"flax==0.10.6",
+	"optax>=0.2.2",
+	"triton~=3.2.0",
+	"jaxtyping~=0.3.2",
+	"tqdm",
+	"fastapi>=0.115.2",
+	"wandb>=0.18.5",
+	"uvloop==0.21.0",
+	"uvicorn>=0.32.0",
+	"jinja2>=3.1.5",
+	"grain~=0.2.11",
+	"datasets>=3.6.0",
+	"gcsfs",
+	"zstandard>=0.23.0",
+	"msgspec~=0.19.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-jax = ">=0.6.0"
-jaxlib = ">=0.6.0"
-eformer = "0.0.41"
-einops = "~0.8.0"
-transformers = ">=4.51.0"
-flax = "0.10.6"
-optax = "^0.2.2"
-triton = "~3.2.0"
-jaxtyping = "~0.3.2"
-tqdm = "*"
-fastapi = "^0.115.2"
-wandb = ">=0.18.5"
-uvloop = "0.21.0"
-uvicorn = "^0.32.0"
-jinja2 = ">=3.1.5"
-grain = "~0.2.11"
-datasets = ">=3.6.0"
-gcsfs = "*"
-zstandard = ">=0.23.0"
-msgspec = "~0.19.0"
-tensorboard = { version = ">=2.19.0", optional = true }
-torch = { version = ">=2.7.0", source = "torch-cpu", optional = true }
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/EasyDeL"
+"Repository" = "https://github.com/erfanzar/EasyDeL"
+"Documentation" = "https://easydel.readthedocs.io/en/latest/"
 
-[[tool.poetry.source]]
-name = "torch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-priority = "explicit"
+[tool.uv.build-backend]
+module-name = "easydel"
+module-root = "."
 
-
-[tool.poetry.group.torch]
-optional = true
-
-[tool.poetry.group.torch.dependencies]
-torch = { version = ">=2.7.0", source = "torch-cpu", optional = true }
-
-
-[tool.poetry.group.all]
-optional = true
-
-[tool.poetry.group.all.dependencies]
-tensorboard = "^2.19.0"
-torch = { version = ">=2.7.0", source = "torch-cpu", optional = true }
-
-[tool.poetry.extras]
-all = ["tensorboard"]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.setuptools]
+package-dir = { "" = "." }
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -90,16 +70,19 @@ where = ["."]
 [tool.setuptools.package-data]
 "easydel" = ["py.typed"]
 
+[project.optional-dependencies]
+torch = ["torch~=2.6.0", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]==0.6.2", "tensorboard>=2.19.0"]
+tpu = ["jax[tpu]==0.6.2", "tensorboard>=2.19.0"]
+
 [tool.black]
 line-length = 121
 target-version = ["py310"]
 preview = true
 
-
 [tool.ruff]
 line-length = 121
 target-version = "py310"
-
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
@@ -110,13 +93,10 @@ ignore = ["F722", "B008", "UP015", "A005"]
 
 [tool.mypy]
 python_version = "3.10"
-
 ignore_missing_imports = true
 exclude = ["easydel/"]
 
-
 [tool.basedpyright]
-
 reportAssignmentType = "none"
 reportUnknownVariableType = "none"
 reportPrivateUsage = "none"
@@ -151,3 +131,9 @@ reportUninitializedInstanceVariable = "none"
 reportIncompatibleVariableOverride = "none"
 reportPrivateImportUsage = "none"
 reportUnusedParameter = "none"
+
+[tool.uv]
+conflicts = [
+	[{ extra = "gpu" }, { extra = "tpu" }], 
+	[{ extra = "gpu" }, { extra = "torch" }],
+]
