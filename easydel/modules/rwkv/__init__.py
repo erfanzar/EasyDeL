@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_rwkv_flax import RwkvForCausalLM, RwkvModel
+from .modeling_rwkv import RwkvForCausalLM, RwkvModel
 from .rwkv_configuration import RwkvConfig
 
 __all__ = "RwkvConfig", "RwkvForCausalLM", "RwkvModel"

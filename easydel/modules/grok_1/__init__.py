@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .grok_1_configuration import Grok1Config
-from .modeling_grok_1_flax import Grok1ForCausalLM, Grok1Model
+from .modeling_grok_1 import Grok1ForCausalLM, Grok1Model
 
 __all__ = "Grok1Config", "Grok1ForCausalLM", "Grok1Model"

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.1.5"
+# pyright:reportUnusedImport=none
+# pyright:reportImportCycles=none
 
+__version__ = "0.1.5"
 import os as _os
 import sys as _sys
 import typing as _tp
@@ -154,10 +156,12 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
-    "layers.attention": [
-        "AttentionMechanisms",
+    "layers.attention_operator._attention_impl": [
         "AttentionMetadata",
         "AttentionRegistry",
+    ],
+    "layers.attention": [
+        "AttentionMechanisms",
         "AttentionModule",
         "FlexibleAttentionModule",
     ],
@@ -532,10 +536,12 @@ if _tp.TYPE_CHECKING:
     )
     from .layers.attention import (
         AttentionMechanisms,
-        AttentionMetadata,
         AttentionModule,
-        AttentionRegistry,
         FlexibleAttentionModule,
+    )
+    from .layers.attention_operator._attention_impl import (
+        AttentionMetadata,
+        AttentionRegistry,
     )
     from .modules.arctic import (
         ArcticConfig,
@@ -875,7 +881,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.41"]
+    _targeted_versions = ["0.0.42"]
 
     from eformer import __version__ as _eform_version
 

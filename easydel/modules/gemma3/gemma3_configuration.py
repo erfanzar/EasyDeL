@@ -166,6 +166,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         rope_scaling=None,
         rope_local_base_freq=10_000.0,
         sliding_window_pattern=6,
+        layer_types=None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
@@ -211,8 +212,14 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.cache_implementation = cache_implementation
 
         self.rope_local_base_freq = rope_local_base_freq
-        # For configuring HybridCache to work with 5:1 attention pattern
         self.sliding_window_pattern = sliding_window_pattern
+        self.layer_types = layer_types
+
+        if self.layer_types is None:  # for transformers/ we dont use this
+            self.layer_types = [
+                "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         self.rope_scaling = rope_scaling
 
     def get_partition_rules(self, *args, **kwargs):
@@ -281,7 +288,7 @@ class Gemma3Config(EasyDeLBaseConfig):
             The begin-of-image token index to wrap the image prompt.
         eoi_token_index (`int`, *optional*, defaults to 256000):
             The end-of-image token index to wrap the image prompt.
-        image_token_index (`int`, *optional*, defaults to 262144):
+        image_token_id (`int`, *optional*, defaults to 262144):
             The image token index to encode the image prompt.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -318,7 +325,7 @@ class Gemma3Config(EasyDeLBaseConfig):
         mm_tokens_per_image: int = 256,
         boi_token_index: int = 255_999,
         eoi_token_index: int = 256_000,
-        image_token_index: int = 262_144,
+        image_token_id: int = 262_144,
         initializer_range: float = 0.02,
         **kwargs,
     ):
@@ -332,7 +339,7 @@ class Gemma3Config(EasyDeLBaseConfig):
           mm_tokens_per_image (int, optional): Number of tokens per image embedding. Defaults to 256.
           boi_token_index (int, optional): Begin-of-image token index to wrap the image prompt. Defaults to 255_999.
           eoi_token_index (int, optional): End-of-image token index to wrap the image prompt. Defaults to 256_000.
-          image_token_index (int, optional): Image token index to encode the image prompt. Defaults to 262_144.
+          image_token_id (int, optional): Image token index to encode the image prompt. Defaults to 262_144.
           initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
           **kwargs: Additional keyword arguments passed to the parent class constructor.
         """
@@ -351,7 +358,7 @@ class Gemma3Config(EasyDeLBaseConfig):
         self.mm_tokens_per_image = mm_tokens_per_image
         self.boi_token_index = boi_token_index
         self.eoi_token_index = eoi_token_index
-        self.image_token_index = image_token_index
+        self.image_token_id = image_token_id
         self.initializer_range = initializer_range
 
         super().__init__(**kwargs)

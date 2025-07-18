@@ -49,6 +49,7 @@ class Qwen3Config(EasyDeLBaseConfig):
         sliding_window=4096,
         max_window_layers=28,
         attention_dropout=0.0,
+        layer_types=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -75,8 +76,14 @@ class Qwen3Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        # Validate the correctness of rotary position embeddings parameters
-        # BC: if there is a 'type' field, move it to 'rope_type'.
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 

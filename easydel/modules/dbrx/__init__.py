@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .dbrx_configuration import DbrxAttentionConfig, DbrxConfig, DbrxFFNConfig
-from .modeling_dbrx_flax import (
+from .modeling_dbrx import (
     DbrxForCausalLM,
     DbrxForSequenceClassification,
     DbrxModel,

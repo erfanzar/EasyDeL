@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .mamba2_configuration import Mamba2Config
-from .modeling_mamba2_flax import Mamba2ForCausalLM, Mamba2Model
+from .modeling_mamba2 import Mamba2ForCausalLM, Mamba2Model
 
 __all__ = ("Mamba2Config", "Mamba2ForCausalLM", "Mamba2Model")

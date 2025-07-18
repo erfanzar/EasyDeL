@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_xerxes2_flax import Xerxes2ForCausalLM, Xerxes2Model
+from .modeling_xerxes2 import Xerxes2ForCausalLM, Xerxes2Model
 from .xerxes2_configuration import Xerxes2Config
 
 __all__ = ("Xerxes2Config", "Xerxes2ForCausalLM", "Xerxes2Model")

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_stablelm_flax import StableLmForCausalLM, StableLmModel
+from .modeling_stablelm import StableLmForCausalLM, StableLmModel
 from .stablelm_configuration import StableLmConfig
 
 __all__ = "StableLmConfig", "StableLmForCausalLM", "StableLmModel"

@@ -6,4 +6,4 @@ Arctic
 
    modules_arctic___init__
    modules_arctic_arctic_configuration
-   modules_arctic_modeling_arctic_flax
+   modules_arctic_modeling_arctic

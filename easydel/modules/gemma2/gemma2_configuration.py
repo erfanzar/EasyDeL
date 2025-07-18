@@ -111,6 +111,7 @@ class Gemma2Config(EasyDeLBaseConfig):
         query_pre_attn_scalar=224,
         sliding_window=4096,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types=None,
         bits: int | None = None,
         scan_layers: bool = False,
         attn_logit_softcapping: bool | None = None,
@@ -140,6 +141,12 @@ class Gemma2Config(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
+            ]
 
         super().__init__(
             bos_token_id=bos_token_id,

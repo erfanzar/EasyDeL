@@ -6,4 +6,4 @@ Llama4
 
    modules_llama4___init__
    modules_llama4_llama4_configuration
-   modules_llama4_modeling_llama4_flax
+   modules_llama4_modeling_llama4

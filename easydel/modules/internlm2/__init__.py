@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .internlm2_configuration import InternLM2Config
-from .modeling_internlm2_flax import (
+from .modeling_internlm2 import (
     InternLM2ForCausalLM,
     InternLM2ForSequenceClassification,
     InternLM2Model,

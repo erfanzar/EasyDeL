@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_opt_flax import OPTForCausalLM, OPTModel
+from .modeling_opt import OPTForCausalLM, OPTModel
 from .opt_configuration import OPTConfig
 
 __all__ = "OPTConfig", "OPTForCausalLM", "OPTModel"

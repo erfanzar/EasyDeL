@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .modeling_pixtral_flax import PixtralVisionModel
+from .modeling_pixtral import PixtralVisionModel
 from .pixtral_configuration import PixtralVisionConfig
 
 __all__ = "PixtralVisionConfig", "PixtralVisionModel"

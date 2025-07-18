@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .falcon_configuration import FalconConfig
-from .modeling_falcon_flax import FalconForCausalLM, FalconModel
+from .modeling_falcon import FalconForCausalLM, FalconModel
 
 __all__ = "FalconConfig", "FalconForCausalLM", "FalconModel"

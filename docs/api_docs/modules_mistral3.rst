@@ -7,4 +7,4 @@ Mistral3
    modules_mistral3___init__
    modules_mistral3_mistral3_configuration
    modules_mistral3_mistral3_tokenizer
-   modules_mistral3_modeling_mistral3_flax
+   modules_mistral3_modeling_mistral3

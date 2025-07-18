@@ -6,4 +6,4 @@ Mamba2
 
    modules_mamba2___init__
    modules_mamba2_mamba2_configuration
-   modules_mamba2_modeling_mamba2_flax
+   modules_mamba2_modeling_mamba2

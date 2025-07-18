@@ -105,6 +105,7 @@ class Cohere2Config(EasyDeLBaseConfig):
         attention_dropout=0.0,
         sliding_window=4096,
         sliding_window_pattern=4,
+        layer_types=None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         **kwargs,
@@ -163,6 +164,14 @@ class Cohere2Config(EasyDeLBaseConfig):
         self.head_dim = hidden_size // num_attention_heads
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

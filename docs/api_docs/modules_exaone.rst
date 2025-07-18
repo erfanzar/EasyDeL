@@ -6,4 +6,4 @@ Exaone
 
    modules_exaone___init__
    modules_exaone_exaone_configuration
-   modules_exaone_modeling_exaone_flax
+   modules_exaone_modeling_exaone

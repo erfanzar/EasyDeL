@@ -6,4 +6,4 @@ Internlm2
 
    modules_internlm2___init__
    modules_internlm2_internlm2_configuration
-   modules_internlm2_modeling_internlm2_flax
+   modules_internlm2_modeling_internlm2
