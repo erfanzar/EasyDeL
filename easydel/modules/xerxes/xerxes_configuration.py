@@ -137,12 +137,12 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.layer_types = layer_types
         if self.layer_types is None:
-            self.layer_types = []
+            self.layer_types = ["full_attention" for _ in range(self.num_hidden_layers)]
             for layer_idx in range(self.num_hidden_layers):
                 sliding_window = None
 
                 if not self.xe_kvnorm:
-                    sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
+                    sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
                 if self.window_pattern is not None:
                     sliding_window = self.sliding_window if bool((layer_idx + 1) % self.window_pattern) else None
 
