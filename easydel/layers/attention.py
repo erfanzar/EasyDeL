@@ -528,13 +528,12 @@ class AttentionModule(nn.Module):
         """Merges attention, causal, token-type, and FCM masks."""
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
         if cache_view is None:
             if causal:
                 target_length = initial_key_length
                 causal_mask = causal_mask or self.config._create_causal_mask(target_length=target_length)
                 causal_mask = causal_mask[:, :, :query_length, :initial_key_length]
-                causal_mask = jnp.broadcast_to(causal_mask, (query_length, *causal_mask.shape[1:]))
+                causal_mask = jnp.broadcast_to(causal_mask, (attention_mask.shape[0], *causal_mask.shape[1:]))
                 if token_type_ids is not None and query_length != 1:
                     token_type_mask = jnp.equal(jnp.expand_dims(token_type_ids, 2), jnp.expand_dims(token_type_ids, 1))
                     token_type_mask = jnp.where(
@@ -683,6 +682,17 @@ class AttentionModule(nn.Module):
             else:
                 mode = common_types.MODE_PREFILL if query_length != 1 else common_types.MODE_DECODE
 
+        attention_mask = self._merge_masks(
+            attention_mask=attention_mask,
+            causal=causal_mask is not None,
+            causal_mask=causal_mask,
+            token_type_ids=token_type_ids,
+            fcm_mask=fcm_mask,
+            query_length=query_length,
+            initial_key_length=initial_key_length,
+            cache_view=cache_view,
+        )
+
         if cache_view is not None:
             assert query.shape[0] == cache_view.key.shape[0], "Batch size mismatch between query and cache."
 
@@ -706,16 +716,6 @@ class AttentionModule(nn.Module):
             token_type_ids=token_type_ids,
         )
 
-        attention_mask = self._merge_masks(
-            attention_mask=attention_mask,
-            causal=causal_mask is not None,
-            causal_mask=causal_mask,
-            token_type_ids=token_type_ids,
-            fcm_mask=fcm_mask,
-            query_length=query_length,
-            initial_key_length=initial_key_length,
-            cache_view=cache_view,
-        )
         if cache_metadata is None and cache_view is not None:
             cache_metadata = TransformerMetadata(
                 starts=cache_view.starts,
