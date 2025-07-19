@@ -616,8 +616,10 @@ class TrainingArguments:
         Returns:
             flax.metrics.tensorboard.SummaryWriter: The TensorBoard SummaryWriter.
         """
-
-        return self._tensorboard
+        try:
+            return self._tensorboard
+        except ModuleNotFoundError:
+            return None
 
     def get_wandb_init(self):
         """
