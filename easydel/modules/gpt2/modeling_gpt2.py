@@ -219,7 +219,7 @@ class GPT2Attention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
         """
@@ -231,7 +231,7 @@ class GPT2Attention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
     def __call__(
         self,
@@ -286,11 +286,13 @@ class GPT2Attention(AttentionModule):
                 attention_mask,
                 init_attention_bias,
                 cache_view,
+                cache_metadata,
             ) = self.concatenate(
                 query=query,
                 key=key,
-                cache_view=cache_view,
                 value=value,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
                 attention_mask=attention_mask,
                 causal_mask=causal_mask,
                 fcm_mask=None,

@@ -252,6 +252,7 @@ class TransformerCacheView(BaseCacheView):
         query: cx.Array,
         key: cx.Array,
         value: cx.Array,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         quantizer: EasyQuantizer,
         cache_metadata: TransformerMetadata | None,
         attention_mask: cx.Array,
@@ -283,6 +284,11 @@ class TransformerCacheView(BaseCacheView):
         masking_details = self.masking_details
         indexs = self.indexs
         batch_dims = self.value.shape[0]
+        sharding_statics = dict(mode=MODE_PREFILL, partition_manager=partition_manager)
+
+        def _kv_struct_shard(x: cx.Array) -> cx.Array:
+            return apply_logical_sharding(x, axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM], **sharding_statics)
+
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
@@ -290,7 +296,7 @@ class TransformerCacheView(BaseCacheView):
             if hasattr(causal_mask, "value"):
                 causal_mask = causal_mask.value
             if causal_mask.shape[0] != query.shape[0]:
-                causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0],) + causal_mask.shape[1:])
+                causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
 
             @partial(jax.vmap, in_axes=(0, 0), out_axes=0)
             def _mask_slice(mask, slot):
@@ -355,38 +361,16 @@ class TransformerCacheView(BaseCacheView):
             (jnp.arange(self.maximum_sequence_length)[None, :] < indexs[:, None])[:, None, None, :],
             (batch_dims, 1, num_updated_cache_vectors, self.maximum_sequence_length),
         )
-        value_cache_updated = apply_logical_sharding(
-            value_cache_updated,
-            axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
-            mode=MODE_PREFILL,
-            partition_manager=partition_manager,
-        )
-        key_cache_updated = apply_logical_sharding(
-            key_cache_updated,
-            axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
-            mode=MODE_PREFILL,
-            partition_manager=partition_manager,
-        )
+
+        value_cache_updated = _kv_struct_shard(value_cache_updated).astype(runtime_dtype)
+        key_cache_updated = _kv_struct_shard(key_cache_updated).astype(runtime_dtype)
+        indexs_updated = apply_logical_sharding(indexs, axes=[BATCH], **sharding_statics)
 
         return (
-            key_cache_updated.astype(runtime_dtype),
-            value_cache_updated.astype(runtime_dtype),
-            apply_logical_sharding(
-                jnp.logical_and(pad_mask, attention_mask),
-                axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
-                mode=MODE_PREFILL,
-                partition_manager=partition_manager,
-            ),
-            self.replace(
-                key=quantizer(key_cache_updated),
-                value=quantizer(value_cache_updated),
-                indexs=apply_logical_sharding(
-                    indexs,
-                    axes=[BATCH],
-                    mode=MODE_PREFILL,
-                    partition_manager=partition_manager,
-                ),
-            ),
+            key_cache_updated,
+            value_cache_updated,
+            _kv_struct_shard(jnp.logical_and(pad_mask, attention_mask)),
+            self.replace(key=quantizer(key_cache_updated), value=quantizer(value_cache_updated), indexs=indexs_updated),
             masking_details,
         )
 
@@ -572,4 +556,5 @@ class TransformerMetadata(BaseRunTimeMetadata):
     """
 
     postpadded: bool = False
-    indexs: int | None = None
+    starts: jax.Array | None = None
+    indexs: jax.Array | None = None

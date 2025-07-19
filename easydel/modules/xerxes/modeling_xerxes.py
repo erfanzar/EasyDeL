@@ -221,10 +221,10 @@ class XerxesAttention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads * self.head_dim,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
     def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 
     def __call__(
         self,
@@ -286,6 +286,7 @@ class XerxesAttention(AttentionModule):
             attention_mask,
             init_attention_bias,
             cache_view,
+            cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,
@@ -693,9 +694,9 @@ class XerxesModel(EasyDeLBaseModule):
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
-            outputs = (hidden_states, all_hidden_states) + outputs[2:]
+            outputs = (hidden_states, all_hidden_states, *outputs[2:])
         else:
-            outputs = (hidden_states,) + outputs[1:]
+            outputs = (hidden_states, *outputs[1:])
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,

@@ -25,7 +25,7 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.gpu_ops import pallas_ragged_decode as gpu_pallas_ragged_decode
 from easydel.kernels.tpu_ops import pallas_ragged_decode as tpu_pallas_ragged_decode
-from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
+from easydel.layers.caching.transformer import TransformerMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
@@ -72,7 +72,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q: Array,
         k: Array,
         v: Array,
-        cache_view: TransformerCacheView,
+        cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
         """
@@ -81,14 +81,14 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         This implementation uses `shard_map` to distribute the computation and relies
         on standard JAX operations (`einsum`, `softmax`). It calculates attention weights
         between the single query token and the keys in the cache, applies masking
-        based on the valid range defined in `cache_view`, computes the softmax,
+        based on the valid range defined in `cache_metadata`, computes the softmax,
         and finally computes the weighted sum of values.
 
         Args:
             q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
             k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
             v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-            cache_view (TransformerCacheView): Contains metadata about the cache, specifically
+            cache_metadata (TransformerMetadata): Contains metadata about the cache, specifically
                 `starts` (start indexs for valid keys/values) and `indexs` (current indexs or length).
             **ignores: Ignored keyword arguments.
 
@@ -122,7 +122,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             weight = jax.nn.softmax(weight, axis=-1)
             return jnp.einsum("bkhm,bmkd->bkhd", weight, v).reshape(qb, qhead, qdim)
 
-        attn_output = _compute(q, k, v, cache_view.starts.reshape(-1, 1), cache_view.indexs.reshape(-1, 1))
+        attn_output = _compute(q, k, v, cache_metadata.starts.reshape(-1, 1), cache_metadata.indexs.reshape(-1, 1))
         attn_output = jnp.expand_dims(attn_output, 1)
         return AttentionOutput(
             attention_weights=None,
@@ -135,7 +135,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q: Array,
         k: Array,
         v: Array,
-        cache_view: TransformerCacheView,
+        cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
         """
@@ -148,8 +148,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q_sharding, k_sharding, v_sharding, *_, a_sharding = self.metadata.get_shardings(model_mode, True)
         views_sharding = Ps(q_sharding[0])
 
-        starts = cache_view.starts.reshape(-1, 1)
-        indexs = cache_view.indexs.reshape(-1, 1)
+        starts = cache_metadata.starts.reshape(-1, 1)
+        indexs = cache_metadata.indexs.reshape(-1, 1)
 
         @partial(
             shard_map,
@@ -185,7 +185,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q: Array,
         k: Array,
         v: Array,
-        cache_view: TransformerCacheView,
+        cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
         """
@@ -199,7 +199,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
             k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
             v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-            cache_view (TransformerCacheView): Contains cache metadata (`starts`, `index`).
+            cache_metadata (TransformerMetadata): Contains cache metadata (`starts`, `index`).
             **ignores: Ignored keyword arguments.
 
         Returns:
@@ -213,8 +213,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q_sharding, k_sharding, v_sharding, *_, a_sharding = self.metadata.get_shardings(model_mode, True)
         views_sharding = Ps(q_sharding[0])
 
-        starts = cache_view.starts.reshape(-1, 1)
-        indexs = cache_view.indexs.reshape(-1, 1)
+        starts = cache_metadata.starts.reshape(-1, 1)
+        indexs = cache_metadata.indexs.reshape(-1, 1)
 
         @partial(
             shard_map,
@@ -275,7 +275,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         q: Array,
         k: Array,
         v: Array,
-        cache_view: TransformerCacheView,
+        cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
         """
@@ -290,7 +290,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             q (Array): Query tensor.
             k (Array): Key tensor (from cache).
             v (Array): Value tensor (from cache).
-            cache_view (TransformerCacheView): Cache metadata.
+            cache_metadata (TransformerMetadata): Cache metadata.
             **kwargs: Additional keyword arguments passed to the underlying forward method.
 
         Returns:
@@ -300,7 +300,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             q=q,
             k=k,
             v=v,
-            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             **ignores,
         )
 
