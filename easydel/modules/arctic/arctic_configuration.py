@@ -140,6 +140,7 @@ class ArcticConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
+        layer_types: list[str] | None = None,
         bits: int | None = None,
         rope_scaling: dict[str, str | float] | None = None,
         **kwargs,
@@ -181,7 +182,12 @@ class ArcticConfig(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         self.rope_scaling = rope_scaling
-
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -227,7 +233,10 @@ class ArcticConfig(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None:
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping

@@ -217,6 +217,7 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         vision_token_id=151654,
         image_token_id=151655,
         video_token_id=151656,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -257,7 +258,14 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
             if self.rope_scaling["type"] == "mrope":
                 self.rope_scaling["type"] = "default"
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):

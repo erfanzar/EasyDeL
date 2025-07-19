@@ -1003,6 +1003,17 @@ class AttnMaskType(str, Enum):
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
 
+    @classmethod
+    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention"]):
+        if hf_type == "sliding_attention":
+            return AttnMaskType.SLIDING
+        elif hf_type == "full_attention":
+            return AttnMaskType.FULL
+        elif hf_type == "chunk_attention":
+            return AttnMaskType.CHUNK
+        else:
+            raise ValueError(f"`hf_type` {hf_type} is not available")
+
 
 @auto_pytree
 class AttnMaskDetail:
