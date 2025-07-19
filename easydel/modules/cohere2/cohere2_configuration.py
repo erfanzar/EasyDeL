@@ -105,7 +105,7 @@ class Cohere2Config(EasyDeLBaseConfig):
         attention_dropout=0.0,
         sliding_window=4096,
         sliding_window_pattern=4,
-        layer_types=None,
+        layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         **kwargs,
@@ -219,7 +219,10 @@ class Cohere2Config(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None and ((layer_idx + 1) % self.config.sliding_window_pattern != 0):
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping

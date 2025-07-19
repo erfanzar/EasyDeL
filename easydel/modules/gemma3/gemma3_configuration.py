@@ -166,7 +166,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         rope_scaling=None,
         rope_local_base_freq=10_000.0,
         sliding_window_pattern=6,
-        layer_types=None,
+        layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
@@ -215,7 +215,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.sliding_window_pattern = sliding_window_pattern
         self.layer_types = layer_types
 
-        if self.layer_types is None:  # for transformers/ we dont use this
+        if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
@@ -268,9 +268,12 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if bool((layer_idx + 1) % self.sliding_window_pattern):
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping
 
 

@@ -130,6 +130,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         embd_pdrop: float = 0.0,
         lm_head_bias=False,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ) -> None:
@@ -201,6 +202,12 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         self._rope_scaling_validation()
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -320,7 +327,10 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None:
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping

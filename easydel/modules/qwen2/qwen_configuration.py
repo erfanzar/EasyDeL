@@ -123,7 +123,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         number_rep_kv: int = 1,
         bits: int | None = None,
         scan_layers: bool = True,
-        layer_types=None,
+        layer_types: list[str] | None = None,
         rope_scaling: tp.Mapping[str, str | float] | None = None,
         **kwargs,
     ):
@@ -256,7 +256,10 @@ class Qwen2Config(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None and self.use_sliding_window:
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping

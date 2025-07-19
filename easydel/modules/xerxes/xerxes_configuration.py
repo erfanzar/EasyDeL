@@ -102,6 +102,7 @@ class XerxesConfig(EasyDeLBaseConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
+        layer_types: list[str] | None = None,
         window_pattern: int | None = None,
         sliding_window: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
@@ -134,6 +135,22 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.sliding_window = sliding_window
 
         self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = []
+            for layer_idx in range(self.num_hidden_layers):
+                sliding_window = None
+
+                if not self.xe_kvnorm:
+                    sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
+                if self.window_pattern is not None:
+                    sliding_window = self.sliding_window if bool((layer_idx + 1) % self.window_pattern) else None
+
+                if sliding_window is not None:
+                    self.layer_types[layer_idx] = "sliding_attention"
+                else:
+                    self.layer_types[layer_idx] = "full_attention"
+
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -189,13 +206,12 @@ class XerxesConfig(EasyDeLBaseConfig):
             - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
+
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            sliding_window = None
-            if not self.xe_kvnorm:
-                sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
-            if self.window_pattern is not None:
-                sliding_window = self.sliding_window if bool((layer_idx + 1) % self.window_pattern) else None
-            if sliding_window is not None:
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping

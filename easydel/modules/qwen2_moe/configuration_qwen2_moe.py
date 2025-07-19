@@ -123,6 +123,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         mlp_only_layers=None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a Qwen2MoeConfig object.
@@ -192,6 +193,14 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.mlp_only_layers = mlp_only_layers or []
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,

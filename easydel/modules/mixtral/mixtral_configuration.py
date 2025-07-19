@@ -131,6 +131,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         attention_bias: bool = False,
         initialization_of_moe: bool = False,
         router_jitter_noise=0.0,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a MixtralConfig object.
@@ -201,6 +202,12 @@ class MixtralConfig(EasyDeLBaseConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.router_jitter_noise = router_jitter_noise
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -279,7 +286,10 @@ class MixtralConfig(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        for layer_idx in range(self.num_hidden_layers):
-            if self.sliding_window is not None:
-                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
         return mapping
