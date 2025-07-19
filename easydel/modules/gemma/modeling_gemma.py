@@ -139,7 +139,7 @@ class GemmaAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 
     def __call__(
         self,
@@ -212,6 +212,7 @@ class GemmaAttention(AttentionModule):
             attention_mask,
             init_attention_bias,
             cache_view,
+            cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,

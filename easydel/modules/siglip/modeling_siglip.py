@@ -256,10 +256,10 @@ class SiglipAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
     def __call__(
         self,

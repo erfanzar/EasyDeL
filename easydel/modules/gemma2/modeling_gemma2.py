@@ -146,10 +146,10 @@ class Gemma2Attention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads * self.head_dim,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
     def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape(hidden_states.shape[:2] + (num_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 
     def __call__(
         self,
@@ -222,6 +222,7 @@ class Gemma2Attention(AttentionModule):
             attention_mask,
             init_attention_bias,
             cache_view,
+            cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,

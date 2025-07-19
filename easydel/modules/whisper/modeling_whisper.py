@@ -250,6 +250,7 @@ class WhisperAttention(AttentionModule):
                 attention_mask,
                 init_attention_bias,
                 cache_view,
+                cache_metadata,
             ) = self.concatenate(
                 query=query_states,
                 key=key_states,
@@ -285,11 +286,11 @@ class WhisperAttention(AttentionModule):
 
     def _split_heads(self, hidden_state) -> jnp.ndarray:
         """Splits the last dimension of the hidden state into (num_heads, head_dim)."""
-        return hidden_state.reshape(hidden_state.shape[:2] + (self.num_heads, self.head_dim))
+        return hidden_state.reshape((*hidden_state.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_state) -> jnp.ndarray:
         """Merges the last two dimensions (num_heads, head_dim) into embed_dim."""
-        return hidden_state.reshape(hidden_state.shape[:2] + (self.embed_dim,))
+        return hidden_state.reshape((*hidden_state.shape[:2], self.embed_dim))
 
 
 class WhisperEncoderLayer(nn.Module):

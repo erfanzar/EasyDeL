@@ -255,6 +255,7 @@ class MptAttention(AttentionModule):
             attention_mask,
             _,
             cache_view,
+            cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,

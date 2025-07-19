@@ -348,6 +348,7 @@ class PhiAttention(AttentionModule):
             attention_mask,
             init_attention_bias,
             cache_view,
+            cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,
