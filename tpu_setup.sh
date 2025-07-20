@@ -37,7 +37,7 @@ if os.path.exists(bashrc_path):
 else:
     with open(bashrc_path, 'a') as f:
         f.write(f'\n{bashrc_line}\n')
-os.environ['PATH'] = os.path.expanduser('~/.local/bin') + ':' + os.environ.get('PATH', '')
+os.environ['PATH'] = os.path.expanduser('~/easy-venv/bin') + ':' + os.environ.get('PATH', '')
 "
 
 log_info "Detecting current zone..."
@@ -133,6 +133,8 @@ echo ""
 read -p "Press Enter to continue with package installations..." < /dev/tty
  
 VENV_PATH="$HOME/easy-venv"
+ENV_EOPOD_PATH="$VENV_PATH/bin/eopod"
+export RAY_EXECUTABLE_PATH="$VENV_PATH/bin/ray"
 log_info "Setting up virtual environment with uv at $VENV_PATH..."
 if ! command -v uv &>/dev/null; then
     log_info "Installing uv..."
@@ -171,8 +173,11 @@ source "$VENV_PATH/bin/activate"
 install_package() {
     local package="$1"
     local extra_args="$2"
-    log_info "Installing $package in virtual environment..." 
-    if [[ "$package" == *git+* ]]; then 
+ 
+    export UV_PYTHON="${VENV_PATH}/bin/python"
+
+    log_info "Installing $package in virtual environment..."
+    if [[ "$package" == *git+* ]]; then
         local git_url="${package#*@}"
         local pkg_name_with_extras="${package%% @*}"
         if ! uv pip install "${pkg_name_with_extras}@${git_url}" $extra_args --quiet; then
@@ -193,10 +198,11 @@ log_info "Starting package installations in virtual environment..."
 
 log_info "Uninstalling existing easydel..."
 uv pip uninstall easydel -y --quiet 2>/dev/null || true
+install_package "eopod" || exit 1
 install_package "easydel[tpu,torch] @ git+https://github.com/erfanzar/easydel.git" || exit 1
 
 log_info "Configuring Ray..."
-if ! "$EOPOD_PATH" auto-config-ray --self-job; then
+if ! "$ENV_EOPOD_PATH" auto-config-ray --self-job; then
     log_error "Failed to configure Ray"
     exit 1
 fi
