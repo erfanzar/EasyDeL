@@ -22,8 +22,7 @@ log_warning() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
-
-# Set up PATH for ~/.local/bin
+ 
 python -c "
 import os
 bashrc_line = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
@@ -130,26 +129,22 @@ log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
 
-read -p "Press Enter to continue with package installations..." < /dev/tty
+# read -p "Press Enter to continue with package installations..." < /dev/tty
  
 VENV_PATH="$HOME/easy-venv"
 ENV_EOPOD_PATH="$VENV_PATH/bin/eopod"
 export RAY_EXECUTABLE_PATH="$VENV_PATH/bin/ray"
-log_info "Setting up virtual environment with uv at $VENV_PATH..."
-if ! command -v uv &>/dev/null; then
-    log_info "Installing uv..."
-    if ! pip install uv --quiet -U; then
-        log_error "Failed to install uv"
-        exit 1
-    fi
-fi
+log_info "Setting up virtual environment with uv at $VENV_PATH..." 
+log_info "Installing uv..."
+if ! eopod run "pip install uv --quiet -U"; then
+    log_error "Failed to install uv"
+    exit 1
+fi 
 
-if [ ! -d "$VENV_PATH" ]; then
-    log_info "Creating virtual environment..."
-    if ! uv venv "$VENV_PATH"; then
-        log_error "Failed to create virtual environment"
-        exit 1
-    fi
+log_info "Creating virtual environment..."
+if ! eopod run "~/.local/bin/uv venv $VENV_PATH"; then
+    log_error "Failed to create virtual environment"
+    exit 1
 fi
 
 # Add virtual environment activation to ~/.bashrc
@@ -166,30 +161,16 @@ else
     log_info "Creating $BASHRC_PATH and adding virtual environment activation..."
     echo "$VENV_ACTIVATE" > "$BASHRC_PATH"
 fi
-
-# Activate the virtual environment for the current session
-source "$VENV_PATH/bin/activate"
-
+ 
 install_package() {
     local package="$1"
     local extra_args="$2"
- 
-    export UV_PYTHON="${VENV_PATH}/bin/python"
-
-    log_info "Installing $package in virtual environment..."
-    if [[ "$package" == *git+* ]]; then
-        local git_url="${package#*@}"
-        local pkg_name_with_extras="${package%% @*}"
-        if ! uv pip install "${pkg_name_with_extras}@${git_url}" $extra_args --quiet; then
-            log_error "Failed to install $package"
-            return 1
-        fi
-    else
-        if ! uv pip install "$package" $extra_args --quiet; then
-            log_error "Failed to install $package"
-            return 1
-        fi
-    fi
+     
+    log_info "Installing $package in virtual environment..." 
+    if ! eopod run "~/.local/bin/uv pip install --python ${VENV_PATH}/bin/python $package $extra_args --quiet"; then
+        log_error "Failed to install $package"
+        return 1
+    fi 
     log_success "Successfully installed $package"
 }
 
@@ -197,12 +178,12 @@ echo ""
 log_info "Starting package installations in virtual environment..."
 
 log_info "Uninstalling existing easydel..."
-uv pip uninstall easydel -y --quiet 2>/dev/null || true
-install_package "eopod" || exit 1
-install_package "easydel[tpu,torch] @ git+https://github.com/erfanzar/easydel.git" || exit 1
+eopod run "~/.local/bin/uv pip uninstall  --python ${VENV_PATH}/bin/python easydel" 2>/dev/null || true
+install_package "eopod" || exit 1 
+install_package "git+https://github.com/erfanzar/easydel.git[tpu,torch]" || exit 1
 
 log_info "Configuring Ray..."
-if ! "$ENV_EOPOD_PATH" auto-config-ray --self-job; then
+if ! "$ENV_EOPOD_PATH" auto-config-ray --self-job --python-path "$VENV_PATH/bin/python"; then
     log_error "Failed to configure Ray"
     exit 1
 fi
