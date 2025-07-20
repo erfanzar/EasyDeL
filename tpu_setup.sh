@@ -22,10 +22,11 @@ log_warning() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+
+# Set up PATH for ~/.local/bin
 python -c "
 import os
 bashrc_line = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
-# Check if the line already exists to avoid duplicates
 bashrc_path = os.path.expanduser('~/.bashrc')
 if os.path.exists(bashrc_path):
     with open(bashrc_path, 'r') as f:
@@ -68,7 +69,6 @@ case ${#READY_TPUS[@]} in
     }
 
     echo ""
-    # FIX: Read from the terminal directly
     read -p "Enter your TPU name: " TPU_NAME < /dev/tty
 
     if [ -z "$TPU_NAME" ]; then
@@ -93,7 +93,6 @@ case ${#READY_TPUS[@]} in
     echo ""
 
     while true; do
-        # FIX: Read from the terminal directly
         read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input < /dev/tty
 
         if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#READY_TPUS[@]} ]; then
@@ -131,31 +130,70 @@ log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
 
-# FIX: Make the "Press Enter" explicit and read from the terminal
 read -p "Press Enter to continue with package installations..." < /dev/tty
+ 
+VENV_PATH="$HOME/easy-venv"
+log_info "Setting up virtual environment with uv at $VENV_PATH..."
+if ! command -v uv &>/dev/null; then
+    log_info "Installing uv..."
+    if ! pip install uv --quiet -U; then
+        log_error "Failed to install uv"
+        exit 1
+    fi
+fi
+
+if [ ! -d "$VENV_PATH" ]; then
+    log_info "Creating virtual environment..."
+    if ! uv venv "$VENV_PATH"; then
+        log_error "Failed to create virtual environment"
+        exit 1
+    fi
+fi
+
+# Add virtual environment activation to ~/.bashrc
+VENV_ACTIVATE="source $VENV_PATH/bin/activate"
+BASHRC_PATH="$HOME/.bashrc"
+if [ -f "$BASHRC_PATH" ]; then
+    if ! grep -Fx "$VENV_ACTIVATE" "$BASHRC_PATH" > /dev/null; then
+        log_info "Adding virtual environment activation to $BASHRC_PATH..."
+        echo "$VENV_ACTIVATE" >> "$BASHRC_PATH"
+    else
+        log_info "Virtual environment activation already in $BASHRC_PATH"
+    fi
+else
+    log_info "Creating $BASHRC_PATH and adding virtual environment activation..."
+    echo "$VENV_ACTIVATE" > "$BASHRC_PATH"
+fi
+
+# Activate the virtual environment for the current session
+source "$VENV_PATH/bin/activate"
 
 install_package() {
     local package="$1"
     local extra_args="$2"
-    log_info "Installing $package..."
-    if ! "$EOPOD_PATH" run pip install $package $extra_args --quiet; then
-        log_error "Failed to install $package"
-        return 1
+    log_info "Installing $package in virtual environment..." 
+    if [[ "$package" == *git+* ]]; then 
+        local git_url="${package#*@}"
+        local pkg_name_with_extras="${package%% @*}"
+        if ! uv pip install "${pkg_name_with_extras}@${git_url}" $extra_args --quiet; then
+            log_error "Failed to install $package"
+            return 1
+        fi
+    else
+        if ! uv pip install "$package" $extra_args --quiet; then
+            log_error "Failed to install $package"
+            return 1
+        fi
     fi
     log_success "Successfully installed $package"
 }
 
 echo ""
-log_info "Starting package installations..."
-
-install_package "torch" "--index-url https://download.pytorch.org/whl/cpu" || exit 1
+log_info "Starting package installations in virtual environment..."
 
 log_info "Uninstalling existing easydel..."
-"$EOPOD_PATH" run pip uninstall easydel -y --quiet 2>/dev/null || true
-
-install_package "git+https://github.com/erfanzar/easydel" || exit 1
-install_package "jax[tpu]" "-U" || exit 1
-install_package "ray[default]==2.46.0" "-U" || exit 1
+uv pip uninstall easydel -y --quiet 2>/dev/null || true
+install_package "easydel[tpu,torch] @ git+https://github.com/erfanzar/easydel.git" || exit 1
 
 log_info "Configuring Ray..."
 if ! "$EOPOD_PATH" auto-config-ray --self-job; then
@@ -169,7 +207,8 @@ echo ""
 log_success "🎉 TPU setup completed successfully!"
 log_info "TPU Name: $TPU_NAME"
 log_info "Zone: $ZONE"
-log_info "All packages installed and configured"
 echo ""
 log_info "Final TPU status:"
 gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)"
+log_info "Virtual Environment: $VENV_PATH"
+log_info "All packages installed and configured in virtual environment"
