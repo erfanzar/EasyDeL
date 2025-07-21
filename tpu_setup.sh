@@ -142,25 +142,10 @@ if ! eopod run "pip install uv --quiet -U"; then
 fi 
 
 log_info "Creating virtual environment..."
-if ! eopod run "~/.local/bin/uv venv $VENV_PATH"; then
+if ! eopod run "~/.local/bin/uv venv $VENV_PATH --clear"; then
     log_error "Failed to create virtual environment"
     exit 1
-fi
-
-# Add virtual environment activation to ~/.bashrc
-VENV_ACTIVATE="source $VENV_PATH/bin/activate"
-BASHRC_PATH="$HOME/.bashrc"
-if [ -f "$BASHRC_PATH" ]; then
-    if ! grep -Fx "$VENV_ACTIVATE" "$BASHRC_PATH" > /dev/null; then
-        log_info "Adding virtual environment activation to $BASHRC_PATH..."
-        echo "$VENV_ACTIVATE" >> "$BASHRC_PATH"
-    else
-        log_info "Virtual environment activation already in $BASHRC_PATH"
-    fi
-else
-    log_info "Creating $BASHRC_PATH and adding virtual environment activation..."
-    echo "$VENV_ACTIVATE" > "$BASHRC_PATH"
-fi
+fi 
  
 install_package() {
     local package="$1"
@@ -177,9 +162,10 @@ install_package() {
 echo ""
 log_info "Starting package installations in virtual environment..."
 
+~/.local/bin/uv pip install --python "${VENV_PATH}/bin/python" eopod --quiet
+
 log_info "Uninstalling existing easydel..."
 eopod run "~/.local/bin/uv pip uninstall  --python ${VENV_PATH}/bin/python easydel" 2>/dev/null || true
-install_package "eopod" || exit 1 
 install_package "git+https://github.com/erfanzar/easydel.git[tpu,torch]" || exit 1
 
 log_info "Configuring Ray..."
