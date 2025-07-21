@@ -99,7 +99,7 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None  # Ignored by EasyDeL
     user: str | None = None  # Ignored by EasyDeL
-    chat_template_kwargs: dict[str, int | float | str] | None = None
+    chat_template_kwargs: dict[str, int | float | str | bool] | None = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
