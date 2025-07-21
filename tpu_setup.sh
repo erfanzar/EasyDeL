@@ -22,22 +22,64 @@ log_warning() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
- 
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*)
+    :
+    ;;
+  *)
+    log_info "Adding $HOME/.local/bin to PATH for the current session."
+    export PATH="$HOME/.local/bin:$PATH"
+    ;;
+esac
+
+log_info "Checking shell configuration for persistent PATH..."
 python -c "
 import os
-bashrc_line = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
-bashrc_path = os.path.expanduser('~/.bashrc')
-if os.path.exists(bashrc_path):
-    with open(bashrc_path, 'r') as f:
-        content = f.read()
-    if bashrc_line not in content:
-        with open(bashrc_path, 'a') as f:
-            f.write(f'\n{bashrc_line}\n')
-else:
-    with open(bashrc_path, 'a') as f:
-        f.write(f'\n{bashrc_line}\n')
-os.environ['PATH'] = os.path.expanduser('~/easy-venv/bin') + ':' + os.environ.get('PATH', '')
+import sys
+BLUE = '\033[0;34m'
+GREEN = '\033[0;32m'
+NC = '\033[0m'
+
+def log_py_info(msg):
+    print(f'{BLUE}[INFO]{NC} (Python) {msg}', file=sys.stderr)
+
+def log_py_success(msg):
+    print(f'{GREEN}[SUCCESS]{NC} (Python) {msg}', file=sys.stderr)
+
+line_to_add = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
+home_dir = os.path.expanduser('~')
+shell_config_files = [os.path.join(home_dir, '.zshrc'), os.path.join(home_dir, '.bashrc')]
+
+config_file_to_modify = None
+for f in shell_config_files:
+    if os.path.exists(f):
+        config_file_to_modify = f
+        break
+
+if not config_file_to_modify:
+    config_file_to_modify = os.path.join(home_dir, '.bashrc')
+    log_py_info(f'No .zshrc or .bashrc found. Will create {config_file_to_modify}.')
+
+log_py_info(f'Checking shell configuration file: {config_file_to_modify}')
+
+try:
+    content = ''
+    if os.path.exists(config_file_to_modify):
+        with open(config_file_to_modify, 'r') as f:
+            content = f.read()
+
+    if line_to_add in content:
+        log_py_info('PATH configuration already exists. No changes needed.')
+    else:
+        log_py_info('Adding PATH configuration to shell config file.')
+        with open(config_file_to_modify, 'a') as f:
+            f.write(f'\n# Added by script to include local binaries\n{line_to_add}\n')
+        log_py_success(f'Successfully updated {config_file_to_modify}. Please run \"source {config_file_to_modify}\" or restart your terminal for it to take effect in other sessions.')
+except Exception as e:
+    RED = '\033[0;31m'
+    print(f'{RED}[ERROR]{NC} (Python) Failed to modify shell config: {e}', file=sys.stderr)
 "
+
 
 log_info "Detecting current zone..."
 ZONE=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4)
@@ -129,6 +171,7 @@ fi
 EOPOD_PATH="$HOME/.local/bin/eopod"
 if [ ! -f "$EOPOD_PATH" ]; then
     log_error "eopod not found at $EOPOD_PATH after installation"
+    log_error "This might be a PATH issue. The script tried to fix it, but you may need to 'source ~/.bashrc' or 'source ~/.zshrc' and re-run."
     exit 1
 fi
 log_info "Configuring eopod with TPU: $TPU_NAME"
@@ -142,32 +185,32 @@ log_warning "IMPORTANT: Press Enter during first execution to accept terms (term
 echo ""
 
 # read -p "Press Enter to continue with package installations..." < /dev/tty
- 
+
 VENV_PATH="$HOME/easy-venv"
 ENV_EOPOD_PATH="$VENV_PATH/bin/eopod"
 export RAY_EXECUTABLE_PATH="$VENV_PATH/bin/ray"
-log_info "Setting up virtual environment with uv at $VENV_PATH..." 
+log_info "Setting up virtual environment with uv at $VENV_PATH..."
 log_info "Installing uv..."
 if ! eopod run "pip install uv --quiet -U"; then
     log_error "Failed to install uv"
     exit 1
-fi 
+fi
 
 log_info "Creating virtual environment..."
 if ! eopod run "~/.local/bin/uv venv $VENV_PATH --clear"; then
     log_error "Failed to create virtual environment"
     exit 1
-fi 
- 
+fi
+
 install_package() {
     local package="$1"
     local extra_args="$2"
-     
-    log_info "Installing $package in virtual environment..." 
+
+    log_info "Installing $package in virtual environment..."
     if ! eopod run "~/.local/bin/uv pip install --python ${VENV_PATH}/bin/python $package $extra_args --quiet"; then
         log_error "Failed to install $package"
         return 1
-    fi 
+    fi
     log_success "Successfully installed $package"
 }
 
@@ -201,6 +244,7 @@ echo ""
 log_info "Virtual Environment: $VENV_PATH"
 log_info "All packages installed and configured in virtual environment."
 log_info "Running health check."
+log_info "(maybe health check fail but the setup is fine ;/ if ur on large pods like v4-2048 ... )."
 
 "${VENV_PATH}/bin/python" -c "
 from eformer.executor.ray import TpuAcceleratorConfig, execute
@@ -215,7 +259,7 @@ def health_check():
     import jax
 
     print(f'EasyDel version: {ed.__version__} | eformer version {eformer.__version__} | JAX version {jax.__version__}')
-    print(f'JAX devices: {[dev.coords for dev in jax.local_devices()]}') 
+    print(f'JAX devices: {[dev.coords for dev in jax.local_devices()]}')
     print(f'Device count: {jax.device_count()}')
     print(f'Local device count: {jax.local_device_count()}')
 
