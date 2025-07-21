@@ -108,6 +108,18 @@ case ${#READY_TPUS[@]} in
 esac
 
 log_success "Selected TPU: $TPU_NAME"
+
+# Get TPU accelerator type
+log_info "Getting TPU accelerator type..."
+TPU_TYPE=$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" --format="value(acceleratorType)" 2>/dev/null | awk -F'/' '{print $NF}')
+
+if [ -z "$TPU_TYPE" ]; then
+    log_warning "Could not determine TPU type, defaulting to v4-8"
+    TPU_TYPE="v4-8"
+else
+    log_success "Detected TPU type: $TPU_TYPE"
+fi
+
 log_info "Installing eopod..."
 if ! pip install eopod --quiet -U; then
     log_error "Failed to install eopod"
@@ -179,9 +191,37 @@ log_success "Ray configured successfully"
 echo ""
 log_success "🎉 TPU setup completed successfully!"
 log_info "TPU Name: $TPU_NAME"
+log_info "TPU Type: $TPU_TYPE"
 log_info "Zone: $ZONE"
 echo ""
 log_info "Final TPU status:"
 gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)"
+echo ""
+echo ""
 log_info "Virtual Environment: $VENV_PATH"
-log_info "All packages installed and configured in virtual environment"
+log_info "All packages installed and configured in virtual environment."
+log_info "Running health check."
+
+"${VENV_PATH}/bin/python" -c "
+from eformer.executor.ray import TpuAcceleratorConfig, execute
+import ray
+
+
+@execute(TpuAcceleratorConfig('$TPU_TYPE'))
+@ray.remote
+def health_check():
+    import easydel as ed
+    import eformer
+    import jax
+
+    print(f'EasyDel version: {ed.__version__} | eformer version {eformer.__version__} | JAX version {jax.__version__}')
+    print(f'JAX devices: {[dev.coords for dev in jax.local_devices()]}') 
+    print(f'Device count: {jax.device_count()}')
+    print(f'Local device count: {jax.local_device_count()}')
+
+
+if __name__ == '__main__':
+    health_check()
+"
+
+log_success "🎉 looks like the runtime is as healthy as it can be."
