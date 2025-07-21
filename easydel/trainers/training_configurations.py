@@ -55,8 +55,8 @@ except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter
-    from jax import Array
+    from flax.metrics.tensorboard import SummaryWriter  # type:ignore
+    from jax import Array  # type:ignore
     from torch import Tensor  # type:ignore
 else:
     Array, Tensor = [tp.Any] * 2
@@ -479,8 +479,9 @@ class TrainingArguments:
         """
         Checks and sets up variables for start.
         """
-
-        if not isinstance(self.step_partition_spec, PartitionSpec):
+        if isinstance(self.step_partition_spec, str):
+            self.step_partition_spec = eval(self.step_partition_spec)
+        elif not isinstance(self.step_partition_spec, PartitionSpec):
             self.step_partition_spec = PartitionSpec(*tuple(self.step_partition_spec))
 
         self.step_start_point = self.step_start_point or 0
@@ -600,7 +601,7 @@ class TrainingArguments:
 
     @functools.cached_property
     def _tensorboard(self):
-        from flax.metrics.tensorboard import SummaryWriter
+        from flax.metrics.tensorboard import SummaryWriter  # type:ignore
 
         path = self._get_save_directory(create=True)
         if path is None:
