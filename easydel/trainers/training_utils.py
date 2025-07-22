@@ -153,7 +153,7 @@ def minibatch_call(
 
         def reshape_to_minibatches(arr):
             """Reshape the batch into minibatches for accumulation."""
-            batch_shape = (num_accum_steps, minibatch_size) + arr.shape[1:]
+            batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
             return jnp.reshape(arr, batch_shape)
 
         batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
