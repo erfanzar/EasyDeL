@@ -75,7 +75,6 @@ def concatenated_inputs(
             and optionally image-related keys.
     """
     output = {}
-
     # Concatenate the prompt-related arrays (duplicated for chosen and rejected).
     output["prompt_input_ids"] = jnp.concatenate(
         [batch["prompt_input_ids"], batch["prompt_input_ids"]],

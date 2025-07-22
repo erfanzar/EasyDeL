@@ -14,10 +14,7 @@ from transformers import AutoTokenizer
 import easydel as ed
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def create_datasets(dataset_size=1000, train_split=500):
