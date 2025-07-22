@@ -3,6 +3,8 @@ import os
 import sys
 import typing as tp
 
+import easydel
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import jax
 import jaxlib
@@ -94,21 +96,21 @@ def mha_attention_benchmark(
     query, key, value, bias = _get_inputs(B, H, H, S, S, D, provider, BIAS)
     if mode == "fwd":
         if provider == "triton":
-            fn = lambda: triton_flash_attention(query, key, value, None, bias)
+            fn = lambda: triton_flash_attention(query, key, value, None, bias)  # noqa
         elif provider == "cudnn_sdpa":
-            _fn = jax.jit(
+            _fn = easydel.ejit(
                 functools.partial(
                     nn.dot_product_attention,
                     implementation="cudnn",
                 )
             )
-            fn = lambda: _fn(query, key, value, bias).block_until_ready()
+            fn = lambda: _fn(query, key, value, bias).block_until_ready()  # noqa
     elif mode == "bwd":
         if provider == "triton":
-            fn = lambda: jax.grad(lambda *x: triton_flash_attention(*x).sum())(query, key, value, None, bias)
+            fn = lambda: jax.grad(lambda *x: triton_flash_attention(*x).sum())(query, key, value, None, bias)  # noqa
         elif provider == "cudnn_sdpa":
-            _fn = jax.jit(functools.partial(nn.dot_product_attention, implementation="cudnn"))
-            fn = lambda: jax.grad(lambda *x: _fn(*x).sum())(query, key, value, bias).block_until_ready()
+            _fn = easydel.ejit(functools.partial(nn.dot_product_attention, implementation="cudnn"))
+            fn = lambda: jax.grad(lambda *x: _fn(*x).sum())(query, key, value, bias).block_until_ready()  # noqa
     try:
         ms = triton.testing.do_bench(fn)
     except jaxlib.xla_extension.XlaRuntimeError:

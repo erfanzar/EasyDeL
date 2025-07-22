@@ -39,7 +39,7 @@ def main():
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-            attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN,
+            attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
             attn_dtype=param_dtype,
             attn_softmax_dtype=jnp.float32,
         ),

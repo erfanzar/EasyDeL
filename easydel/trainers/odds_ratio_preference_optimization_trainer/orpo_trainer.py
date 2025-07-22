@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 from collections import defaultdict
 from functools import partial
@@ -24,6 +26,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
@@ -44,12 +47,6 @@ from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-    from transformers import PreTrainedTokenizerBase
-
-else:
-    Dataset = tp.Any
-    PreTrainedTokenizerBase = tp.Any
-
 logger = get_logger(__name__)
 
 
@@ -63,7 +60,7 @@ class ORPOTrainer(Trainer):
         data_collator: DPODataCollatorWithPadding | None = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
-        processing_class: ProcessingClassType | None = None,
+        processing_class: ProcessingClassType = None,
     ):
         assert arguments is not None, (
             "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
@@ -385,14 +382,9 @@ class ORPOTrainer(Trainer):
             padding_value=self.arguments.padding_value,
             max_length=self.arguments.max_length,
         )
-        jited_concatenated_forward = jax.jit(
+        jited_concatenated_forward = ejit(
             partial_concatenated_forward,
-            static_argnames=(
-                "is_encoder_decoder",
-                "label_pad_token_id",
-                "padding_value",
-                "max_length",
-            ),
+            static_argnames=("is_encoder_decoder", "label_pad_token_id", "padding_value", "max_length"),
         )
 
         self._train_shared_fn_static_args = (
@@ -446,7 +438,27 @@ class ORPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
-    def create_collect_function(
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a data collection function for batching.
+
+        For DPO training, this method simply returns the pre-configured `data_collator`.
+
+        Args:
+            max_sequence_length (int): The maximum sequence length (not used in this implementation).
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode (not used in this implementation). Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: The data collator function.
+        """
+        return self.input_data_collator
+
+    def create_tfds_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",

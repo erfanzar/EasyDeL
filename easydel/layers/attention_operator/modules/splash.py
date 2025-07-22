@@ -30,7 +30,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.tpu_ops import pallas_ragged_decode
-from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
+from easydel.layers.caching.transformer import TransformerMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 from .vanilla import VanillaAttn
@@ -92,7 +92,7 @@ class SplashAttn(AttentionImpl):
         v: Array,
         mask: Array | None = None,
         causal: bool = True,
-        cache_view: TransformerCacheView | None = None,
+        cache_metadata: TransformerMetadata | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -161,8 +161,8 @@ class SplashAttn(AttentionImpl):
             q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
 
         indexs, starts = [None] * 2
-        if cache_view is not None:
-            indexs, starts = cache_view.indexs, cache_view.starts
+        if cache_metadata is not None:
+            indexs, starts = cache_metadata.indexs, cache_metadata.starts
 
         @functools.partial(
             shard_map,
@@ -181,9 +181,9 @@ class SplashAttn(AttentionImpl):
         )
         def _wraped_flash_attn(q, k, v, q_mask, kv_mask, indexs, starts):
             if q.shape[-2] != 1:
-                output_shape = q.shape[:-1] + (v.shape[-1],)
+                output_shape = (*q.shape[:-1], v.shape[-1])
                 num_reps = q.shape[1] // k.shape[1]
-                q = q.reshape(q.shape[:-3] + (k.shape[-3], num_reps, q.shape[-2], q.shape[-1]))
+                q = q.reshape((*q.shape[:-3], k.shape[-3], num_reps, q.shape[-2], q.shape[-1]))
                 fn = jax.vmap(
                     jax.vmap(
                         make_splash_mqa_single_device(
@@ -236,7 +236,7 @@ class SplashAttn(AttentionImpl):
         v: Array,
         mask: Array | None = None,
         causal: bool = True,
-        cache_view: TransformerCacheView | None = None,
+        cache_metadata: TransformerMetadata | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -253,7 +253,7 @@ class SplashAttn(AttentionImpl):
             mask: Optional attention mask.
             causal: If True, applies causal masking. Affects fallback logic and
                 kernel configuration.
-                        cache_view: cache view for current layer.
+                        cache_metadata: cache view for current layer.
             **ignore: Additional ignored keyword arguments.
 
         Returns:
@@ -265,7 +265,7 @@ class SplashAttn(AttentionImpl):
             v=v,
             mask=mask,
             causal=causal,
-            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             **ignore,
         )
 

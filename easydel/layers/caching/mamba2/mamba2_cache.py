@@ -20,12 +20,7 @@ from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from .._abstracts import (
-    BaseCache,
-    BaseCacheMetadata,
-    BaseCacheView,
-    BaseRunTimeMetadata,
-)
+from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
 
 @auto_pytree

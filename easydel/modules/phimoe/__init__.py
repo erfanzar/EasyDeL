@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_phimoe_flax import PhiMoeForCausalLM, PhiMoeModel
+from .modeling_phimoe import PhiMoeForCausalLM, PhiMoeModel
 from .phimoe_configuration import PhiMoeConfig
 
 __all__ = "PhiMoeConfig", "PhiMoeForCausalLM", "PhiMoeModel"

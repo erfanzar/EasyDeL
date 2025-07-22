@@ -853,7 +853,7 @@ class ToNumpy(pygrain.MapTransform):
 
     def map(self, element):
         for name, value in element.items():
-            element[name] = jnp.asarray(value)
+            element[name] = np.asarray(value)
         return element
 
 

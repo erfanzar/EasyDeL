@@ -58,10 +58,7 @@ from ..openai_api_modules import (
 from ..sampling_params import SamplingParams
 
 if tp.TYPE_CHECKING:
-    from ..vinference import vInference, vInferenceConfig
-else:
-    vInference = tp.Any
-    vInferenceConfig = tp.Any
+    from ..vinference import vInference
 
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("vInferenceApiServer")

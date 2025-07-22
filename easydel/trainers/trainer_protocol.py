@@ -46,13 +46,10 @@ from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset
     from jax._src.pjit import JitWrapped
 else:
-    JitWrapped = tp.Callable
-    Dataset = tp.Any
-    IterableDataset = tp.Any
-
+    JitWrapped = tp.Any
 logger = get_logger(__name__)
 
 
@@ -226,6 +223,28 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def _configure_state(self):
         """Configures and JIT-compiles the sharded state"""
+        ...
+
+    @abstractmethod
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+        """
+        ...
+
+    @abstractmethod
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+        """
         ...
 
     @abstractmethod
@@ -421,7 +440,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _get_next_batch(self, train_iter):
+    def _get_next_batch(self, data_iter, dataloader):
         """Get next batch from iterator, reinitializing if needed."""
         ...
 
@@ -475,7 +494,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _train_epoch(
         self,
         state: EasyDeLState,
-        train_dataset: int,
+        train_dataset,
+        train_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -488,12 +508,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _eval_epoch(
         self,
         state: EasyDeLState,
-        eval_iter: int,
-        current_step: int,
+        eval_dataset,
+        eval_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
-        start_time: float,
     ):
         """Handles training for a single epoch."""
         ...

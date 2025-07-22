@@ -34,8 +34,6 @@ from .engine import vEngine
 
 if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
-else:
-    ProcessingClassType = tp.Any
 
 logger = get_logger("vSurge-vDriver")
 
@@ -395,27 +393,6 @@ class vDriver:
         """
         return self._get_model_name(self._engine.model)
 
-    # def create_sequence_from_request(self, request: ActiveRequest) -> SequenceState:
-    #     (prompt_tokens, *_), sampling_params = self._process_prefill_content(
-    #         request,
-    #         self.engine.processor,
-    #         self.engine.max_prefill_length,
-    #         self.engine.prefill_lengths,
-    #         self.engine.pad_token_id,
-    #         do_pad=False,
-    #     )
-    #     return SequenceState(
-    #         metadata=SequenceMetadata(
-    #             seq_id=self._request_counter,
-    #             block_size=self._engine.page_metadata.page_size,
-    #             max_tokens=sampling_params.max_tokens,
-    #             temperature=sampling_params.temperature,
-    #             top_k=sampling_params.top_k,
-    #             top_p=sampling_params.top_p,
-    #         ),
-    #         prompt_tokens=prompt_tokens[0],
-    #     )
-
     def place_request_on_prefill_queue(self, request: ActiveRequest):
         """
         Places a new active request onto the prefill backlog queue.
@@ -512,7 +489,7 @@ class vDriver:
                     tokens=padded_tokens,
                     valids=padded_valids,
                     true_length=0,
-                    sampling_params=JitableSamplingParams.init_empty(1),
+                    sampling_params=JitableSamplingParams.init_empty(1).view_1d(),
                     rngs=engine.prng_key,
                     slot=0,
                 )
@@ -597,6 +574,7 @@ class vDriver:
                     eos_token_id=engine.eos_token_ids,
                     is_client_side_tokenization=request.is_client_side_tokenization,
                     complete=request.complete,
+                    ignore_eos=request.sampling_params.ignore_eos,
                 )
                 request.complete = complete
                 final_results = []
@@ -629,7 +607,6 @@ class vDriver:
                         request: ActiveRequest = request_obj
                         if request.decode_start_time is None:
                             request.decode_start_time = time.perf_counter()
-
                         results_base, complete, num_valid_tokens_list = process_result_tokens(
                             processor=processor,
                             slot=slot,
@@ -638,19 +615,15 @@ class vDriver:
                             eos_token_id=engine.eos_token_ids,
                             is_client_side_tokenization=request.is_client_side_tokenization,
                             complete=request.complete,
+                            ignore_eos=request.sampling_params.ignore_eos,
                         )
                         request.complete = complete
                         elapsed_time = time.perf_counter() - request.decode_start_time
                         final_step_results = []
                         for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
                             if len(res_base.text) > 0:
-                                for idx, (accum, res) in enumerate(
-                                    zip(
-                                        request.accumulated_text,
-                                        res_base.text,
-                                        strict=False,
-                                    )
-                                ):
+                                szip = zip(request.accumulated_text, res_base.text, strict=False)
+                                for idx, (accum, res) in enumerate(szip):
                                     request.accumulated_text[idx] = accum + res
                             if request.sampling_params.stop is not None:
                                 for stop_sign in request.sampling_params.stop:

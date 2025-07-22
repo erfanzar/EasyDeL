@@ -26,6 +26,8 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from easydel.utils.compiling_utils import ejit
+
 
 def get_best_block_size_tpu(A, B):
     # A is assumed to be of shape (m, k) and B is of shape (k, n)
@@ -102,15 +104,7 @@ def _tpu_matmul_kernel_fwd(a_ref, b_ref, o_ref, ac_ref, *, precision, k_grid):
         o_ref[...] = ac_ref[...].astype(o_ref.dtype)
 
 
-@partial(
-    jax.jit,
-    static_argnames=[
-        "blocksize_m",
-        "blocksize_k",
-        "blocksize_n",
-        "precision",
-    ],
-)
+@ejit(static_argnames=["blocksize_m", "blocksize_k", "blocksize_n", "precision"])
 def _call_tpu_matmul_kernel_fwd(
     A: jax.Array,
     B: jax.Array,

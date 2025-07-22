@@ -26,6 +26,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as Ps
 
 # Import the distributed matmul functions
+import easydel
 from easydel.kernels.collective_matmul import (
     MatrixMultiplyMethod,
     create_distributed_matmul,
@@ -110,7 +111,7 @@ class MatrixMultiplyBenchmark:
         left_matrix_spec = Ps(("sp", "fsdp"), self.mesh_axis)
         right_matrix_spec = Ps(self.mesh_axis, ("sp", "fsdp"))
 
-        matmul_fn = jax.jit(
+        matmul_fn = easydel.ejit(
             lambda x, y: x @ y,
             in_shardings=(
                 NamedSharding(self.device_mesh, left_matrix_spec),
@@ -182,7 +183,7 @@ class MatrixMultiplyBenchmark:
             return create_distributed_matmul(method, dims)(left, right)
 
         # Create the distributed function
-        distributed_fn = jax.jit(
+        distributed_fn = easydel.ejit(
             jax.experimental.shard_map.shard_map(
                 f=functools.partial(
                     distributed_matmul_wrapper,
@@ -264,7 +265,7 @@ class MatrixMultiplyBenchmark:
 
         return self.results
 
-    def plot_results(self, save_path: str = None, figsize: tuple[int, int] = (12, 8)) -> None:
+    def plot_results(self, save_path: str | None = None, figsize: tuple[int, int] = (12, 8)) -> None:
         """
         Plot benchmark results.
 
@@ -368,7 +369,8 @@ class MatrixMultiplyBenchmark:
             rs_speedup = std_time / rs_time
 
             print(
-                f"{size_str:<15} {std_time:<15.2f} {ag_time:<15.2f} {ag_speedup:<15.2f} {rs_time:<15.2f} {rs_speedup:<15.2f}"
+                f"{size_str:<15} {std_time:<15.2f} {ag_time:<15.2f} {ag_speedup:<15.2f} {rs_time:<15.2f} "
+                f"{rs_speedup:<15.2f}"
             )
 
         print("-" * 90)

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import contextlib
 import datetime
 import logging
@@ -29,8 +31,6 @@ import jax
 
 if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
-else:
-    SummaryWriter = tp.Any
 try:
     import wandb  # type: ignore
 except ModuleNotFoundError:

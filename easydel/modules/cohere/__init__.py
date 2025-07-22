@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .cohere_configuration import CohereConfig
-from .modeling_cohere_flax import (
+from .modeling_cohere import (
     CohereForCausalLM,
     CohereForSequenceClassification,
     CohereModel,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_phi_flax import PhiForCausalLM, PhiModel
+from .modeling_phi import PhiForCausalLM, PhiModel
 from .phi_configuration import PhiConfig
 
 __all__ = "PhiConfig", "PhiForCausalLM", "PhiModel"

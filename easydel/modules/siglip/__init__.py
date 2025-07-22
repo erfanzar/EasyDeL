@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
-from .modeling_siglip_flax import SiglipForImageClassification, SiglipModel, SiglipTextModel, SiglipVisionModel
+from .modeling_siglip import SiglipForImageClassification, SiglipModel, SiglipTextModel, SiglipVisionModel
 
 __all__ = (
     "SiglipConfig",

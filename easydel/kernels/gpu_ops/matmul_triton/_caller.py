@@ -23,6 +23,8 @@ from jax import numpy as jnp
 from jax.interpreters import batching, mlir, xla
 from triton import language as tl
 
+from easydel.utils.compiling_utils import ejit
+
 from .._utils import safe_autotune
 
 
@@ -389,7 +391,7 @@ def _bwd_matmul(residual, gO):
 
 
 matmul.defvjp(_fwd_matmul, _bwd_matmul)
-matmul = jax.jit(matmul)
+matmul = ejit(matmul)
 
 
 def test_run(argv):

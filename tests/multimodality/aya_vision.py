@@ -3,17 +3,16 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
+import easydel as ed  # noqa
 import jax
 from jax import numpy as jnp
 from transformers import AutoProcessor
-
-import easydel as ed
 
 
 def main():
     sharding_axis_dims = (1, 1, 1, -1, 1)
 
-    prefill_length = 2048
+    prefill_length = 1024
     max_new_tokens = 1024
 
     max_length = max_new_tokens + prefill_length
@@ -38,7 +37,7 @@ def main():
             attn_dtype=param_dtype,
             attn_mechanism=ed.AttentionMechanisms.VANILLA,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NF4,
+        quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
         param_dtype=param_dtype,
         dtype=dtype,
         partition_axis=partition_axis,

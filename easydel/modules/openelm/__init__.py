@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_openelm_flax import OpenELMForCausalLM, OpenELMModel
+from .modeling_openelm import OpenELMForCausalLM, OpenELMModel
 from .openelm_configuration import OpenELMConfig
 
 __all__ = "OpenELMConfig", "OpenELMForCausalLM", "OpenELMModel"

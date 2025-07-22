@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import typing as tp
 from dataclasses import fields, is_dataclass
 
@@ -20,12 +22,11 @@ import chex
 from eformer.pytree import auto_pytree
 from jax.core import Tracer
 
-from easydel.layers.caching import TransformerCache
-
 if tp.TYPE_CHECKING:
-    from easydel.layers.caching import TransformerCacheView, TransformerMetadata
+    from easydel.layers.caching import TransformerCache, TransformerCacheView
 else:
-    TransformerCacheView, TransformerMetadata = [tp.Any] * 2
+    TransformerCacheView = tp.Any
+    TransformerCache = tp.Any
 
 
 def _is_array(array):

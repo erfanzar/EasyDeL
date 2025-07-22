@@ -18,9 +18,10 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
-@register_config("xerxe")
+@register_config("xerxes")
 class XerxesConfig(EasyDeLBaseConfig):
     """
     Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
@@ -100,6 +101,10 @@ class XerxesConfig(EasyDeLBaseConfig):
         num_experts_per_tok: int = 2,
         tie_word_embeddings=False,
         rope_theta=10000.0,
+        rope_scaling=None,
+        layer_types: list[str] | None = None,
+        window_pattern: int | None = None,
+        sliding_window: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
@@ -126,6 +131,26 @@ class XerxesConfig(EasyDeLBaseConfig):
         self.xe_moe = xe_moe
         self.xe_kvnorm = xe_kvnorm
         self.xe_mlpnorm = xe_mlpnorm
+        self.window_pattern = window_pattern
+        self.sliding_window = sliding_window
+
+        self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention" for _ in range(self.num_hidden_layers)]
+            for layer_idx in range(self.num_hidden_layers):
+                sliding_window = None
+
+                if not self.xe_kvnorm:
+                    sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
+                if self.window_pattern is not None:
+                    sliding_window = self.sliding_window if bool((layer_idx + 1) % self.window_pattern) else None
+
+                if sliding_window is not None:
+                    self.layer_types[layer_idx] = "sliding_attention"
+                else:
+                    self.layer_types[layer_idx] = "full_attention"
+
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -165,3 +190,28 @@ class XerxesConfig(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return mapping

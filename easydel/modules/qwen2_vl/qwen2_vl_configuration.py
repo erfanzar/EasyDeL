@@ -18,6 +18,7 @@ import typing
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 class Qwen2VLVisionConfig(EasyDeLBaseConfig):
@@ -216,6 +217,7 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         vision_token_id=151654,
         image_token_id=151655,
         video_token_id=151656,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -256,7 +258,14 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
             if self.rope_scaling["type"] == "mrope":
                 self.rope_scaling["type"] = "default"
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):
@@ -303,3 +312,24 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        for layer_idx in range(self.num_hidden_layers):
+            if self.sliding_window is not None and self.use_sliding_window:
+                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        return mapping

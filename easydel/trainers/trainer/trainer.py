@@ -22,6 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 
 from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
@@ -33,7 +34,7 @@ logger = get_logger(__name__)
 
 
 class Trainer(BaseTrainer):
-    def create_collect_function(
+    def create_grain_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
@@ -61,6 +62,81 @@ class Trainer(BaseTrainer):
 
         return collate_fn
 
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a collate/collect function to process batches of data for training or evaluation.
+
+        This function returns a callable that takes a batch (a list of dictionaries) and converts it
+        into a dictionary of JAX arrays. For models of class "ForCausalLMLoss", it also performs
+        truncation (either keeping the end or the start of the sequence) so that each sequence does not
+        exceed the specified maximum length.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                Determines whether to keep the end or the start of the sequence when truncating.
+                Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch (list of dicts) and returns a processed dict of arrays.
+        """
+
+        def collate_fn(batch):
+            results = {}
+            for key in batch[0].keys():
+                data_sample = batch[0][key]
+                try:
+                    data_sample = jax.numpy.array(data_sample)
+                except TypeError:
+                    continue
+                if self.model.lossfn_type == "ForCausalLM":
+                    if truncation_mode == "keep_end":
+                        corrected_sequence = [jax.numpy.array(f[key])[..., -max_sequence_length:] for f in batch]
+                    else:
+                        corrected_sequence = [jax.numpy.array(f[key])[..., :max_sequence_length] for f in batch]
+                    results[key] = jax.numpy.stack(corrected_sequence)
+                else:
+                    corrected_sequence = [jax.numpy.array(f[key]) for f in batch]
+                    results[key] = jax.numpy.stack(corrected_sequence)
+            return results
+
+        return collate_fn
+
+    def create_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"],
+    ) -> tp.Callable:
+        """
+        Creates a function to collect and process batches of data for training or evaluation.
+
+        This function handles padding or truncating sequences to the specified `max_sequence_length`
+        based on the chosen `truncation_mode`.
+
+        Args:
+            max_sequence_length (int): The maximum allowed sequence length.
+            truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode. Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: A function that takes a batch of data and returns a processed batch.
+        """
+        return (
+            self.create_grain_collect_function(
+                max_sequence_length=max_sequence_length,
+                truncation_mode=truncation_mode,
+            )
+            if self.arguments.use_grain
+            else self.create_tfds_collect_function(
+                max_sequence_length=max_sequence_length,
+                truncation_mode=truncation_mode,
+            )
+        )
+
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
         Configures and JIT-compiles the training and evaluation step functions.
@@ -84,7 +160,7 @@ class Trainer(BaseTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             training_step,
             static_argnums=(2, 3, 4, 5),
             in_shardings=(self.state_shardings, empty_sharding),
@@ -96,7 +172,7 @@ class Trainer(BaseTrainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
         )
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             evaluation_step,
             static_argnums=(2, 3),
             in_shardings=(self.state_shardings, empty_sharding),
@@ -151,13 +227,15 @@ class Trainer(BaseTrainer):
             disabled=disabled,
             desc="training process",
         )
+        train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
             with self.mesh:
                 for epoch in range(self.arguments.num_train_epochs):
-                    state, run_exception = self._train_epoch(
+                    state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
+                        train_iter=train_iter,
                         metrics_tracker=metrics_tracker,
                         step_metrics=step_metrics,
                         pbar=pbar,
@@ -201,11 +279,14 @@ class Trainer(BaseTrainer):
             disabled=disabled,
             desc="evaluation process",
         )
+
+        eval_iter = iter(self.dataloader_eval)
         try:
             with self.mesh:
                 yield from self._eval_epoch(
                     state=state,
                     eval_dataset=self.dataloader_eval,
+                    eval_iter=eval_iter,
                     metrics_tracker=metrics_tracker,
                     step_metrics=step_metrics,
                     pbar=pbar,
@@ -217,6 +298,7 @@ class Trainer(BaseTrainer):
         self,
         state: EasyDeLState,
         train_dataset,
+        train_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -238,9 +320,8 @@ class Trainer(BaseTrainer):
             epoch (int): The current epoch index.
 
         Returns:
-            A tuple of (updated state, any exception encountered during the run).
+            A tuple of (updated state, any exception encountered during the run and train iterator).
         """
-        train_iter = iter(train_dataset)
         data_collator = self.data_collator
         if data_collator is None:
 
@@ -250,7 +331,7 @@ class Trainer(BaseTrainer):
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
             current_step = int(jax.device_get(state.step))
             try:
-                batch = self._get_next_batch(train_iter)
+                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 if self._should_skip_step(current_step):
                     pbar.update(1)
                     continue
@@ -319,15 +400,16 @@ class Trainer(BaseTrainer):
                     for _ in self.eval(model_state=state):
                         ...
             except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception
+                return state, run_exception, train_iter
             if run_exception is not None:
                 break
-        return state, run_exception
+        return state, run_exception, train_iter
 
     def _eval_epoch(
         self,
         state: EasyDeLState,
         eval_dataset,
+        eval_iter,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
@@ -348,12 +430,7 @@ class Trainer(BaseTrainer):
         Yields:
             dict: A dictionary of evaluation metrics for each evaluation step.
         """
-        try:
-            eval_iter = iter(eval_dataset)
-        except TypeError as e:
-            raise RuntimeError(
-                f"Error {e} (make sure to evaluation dataset to trainer and set do_eval to True in arguments)"
-            ) from e
+        assert eval_dataset is not None, "Make sure to pass eval dataset to trainer or set `do_eval` to `False`."
         data_collator = self.data_collator
         if data_collator is None:
 
@@ -362,7 +439,7 @@ class Trainer(BaseTrainer):
 
         for current_step in range(1, self.max_evaluation_steps + 1):
             try:
-                batch = self._get_next_batch(eval_iter)
+                batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
                 step_metrics.start_step()
                 with self.evalu_tracker.trace_compilation():
                     with capture_time() as execution_time:

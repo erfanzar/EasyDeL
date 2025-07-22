@@ -141,9 +141,33 @@ class VanillaAttn(AttentionImpl):
                 bias = bias.reshape(b, 1, 1, qs, ks)
             else:
                 raise NotImplementedError("bias heads wont match!")
-            aw = jnp.add(aw, bias.astype(aw))
+            aw = jnp.add(aw, bias.astype(aw.dtype))
+
         elif mask is not None:
-            aw = jnp.where(jnp.expand_dims(mask, 1), aw, jnp.finfo(aw).min)
+            if mask.dtype != jnp.bool_:
+                mask = mask.astype(jnp.bool_)
+
+            if mask.ndim == 4:
+                if mask.shape[1] == 1:
+                    mask = jnp.broadcast_to(mask, (b, kh, qs, ks))
+                    mask = jnp.reshape(mask, (b, kh, 1, qs, ks))
+                elif mask.shape[1] == kh:
+                    mask = jnp.reshape(mask, (b, kh, 1, qs, ks))
+                elif mask.shape[1] == (kh * num_reps):
+                    mask = jnp.reshape(mask, (b, kh, num_reps, qs, ks))
+                else:
+                    mask = jnp.broadcast_to(mask[:, :1], (b, 1, qs, ks))
+                    mask = jnp.reshape(mask, (b, 1, 1, qs, ks))
+            elif mask.ndim == 3:
+                mask = jnp.reshape(mask, (b, 1, 1, qs, ks))
+            elif mask.ndim == 2:
+                mask = jnp.reshape(mask, (b, 1, 1, 1, ks))
+                mask = jnp.broadcast_to(mask, (b, 1, 1, qs, ks))
+            else:
+                raise ValueError(f"Unsupported mask shape: {mask.shape}")
+
+            aw = jnp.where(mask, aw, jnp.finfo(aw.dtype).min)
+
         aw = jax.nn.softmax(aw.astype(softmax_dtype)).astype(dtype)
         dp = self.metadata.dropout_prob
         if not deterministic and dp > 0.0 and dropout_rng is not None:

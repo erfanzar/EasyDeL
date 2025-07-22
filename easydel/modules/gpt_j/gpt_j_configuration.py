@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -72,7 +74,7 @@ class GPTJConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "gptj"
-    attribute_map = {
+    attribute_map: typing.ClassVar = {
         "max_position_embeddings": "n_positions",
         "hidden_size": "n_embd",
         "num_attention_heads": "n_head",

@@ -284,7 +284,7 @@ class JitableSamplingParams:
     __hash__ = hash_fn
 
 
-@auto_pytree
+@dataclass
 class SamplingParams:
     """
     Sampling parameters for text generation, designed for JAX compatibility.

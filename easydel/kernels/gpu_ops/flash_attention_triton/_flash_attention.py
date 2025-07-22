@@ -16,6 +16,8 @@ import functools
 import chex
 import jax
 
+from easydel.utils.compiling_utils import ejit
+
 from ._backward_triton import _bwd_attention_kernel_call
 from ._forward_triton import _fwd_attention_kernel_call
 
@@ -87,7 +89,7 @@ def _jax_bwd_attention_call(
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 9))
-@functools.partial(jax.jit, static_argnums=(5, 6, 7, 9))
+@ejit(static_argnums=(5, 6, 7, 9))
 def flash_attention_call(
     q: chex.Array | None,
     k: chex.Array | None,

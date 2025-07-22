@@ -18,6 +18,7 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 @register_config("qwen2_moe")
@@ -122,6 +123,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         mlp_only_layers=None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a Qwen2MoeConfig object.
@@ -147,13 +149,15 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
             attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
             decoder_sparse_step (int, optional): Frequency of MoE layers. Defaults to 1.
             moe_intermediate_size (int, optional): Intermediate size for MoE MLP layers. Defaults to 1408.
-            shared_expert_intermediate_size (int, optional): Intermediate size for the shared expert MLP. Defaults to 5632.
+            shared_expert_intermediate_size (int, optional):
+                Intermediate size for the shared expert MLP. Defaults to 5632.
             num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 4.
             num_experts (int, optional): Total number of experts. Defaults to 60.
             norm_topk_prob (bool, optional): Whether to normalize top-k probabilities in router. Defaults to False.
             output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
             router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
-            mlp_only_layers (list[int], optional): List of layer indices that should only use MLP (no MoE). Defaults to None.
+            mlp_only_layers (list[int], optional):
+                List of layer indices that should only use MLP (no MoE). Defaults to None.
             gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
                 Defaults to EasyDeLGradientCheckPointers.NONE.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
@@ -189,6 +193,14 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.mlp_only_layers = mlp_only_layers or []
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
@@ -246,11 +258,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         Returns:
             int: The granted maximum position embedding size for frequency encoding.
         """
-        return getattr(
-            self,
-            "freq_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
@@ -262,8 +270,25 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         Returns:
             int: The granted maximum position embedding size for mask encoding.
         """
-        return getattr(
-            self,
-            "mask_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        for layer_idx in range(self.num_hidden_layers):
+            if self.sliding_window is not None and self.use_sliding_window:
+                mapping[layer_idx] = AttnMaskDetail(mask_type=AttnMaskType.SLIDING, size=self.sliding_window)
+        return mapping

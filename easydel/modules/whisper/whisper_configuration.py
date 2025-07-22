@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
@@ -104,7 +106,7 @@ class WhisperConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "whisper"
-    attribute_map = {
+    attribute_map: typing.ClassVar = {
         "num_attention_heads": "encoder_attention_heads",
         "hidden_size": "d_model",
     }

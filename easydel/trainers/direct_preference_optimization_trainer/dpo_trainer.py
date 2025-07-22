@@ -25,6 +25,7 @@ from tqdm.autonotebook import tqdm
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
@@ -38,19 +39,7 @@ from .dpo_config import DPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
-    from transformers import (
-        BaseImageProcessor,
-        FeatureExtractionMixin,
-        PreTrainedTokenizerBase,
-        ProcessorMixin,
-    )
-else:
-    Dataset = tp.Any
-    IterableDataset = tp.Any
-    BaseImageProcessor = tp.Any
-    FeatureExtractionMixin = tp.Any
-    PreTrainedTokenizerBase = tp.Any
-    ProcessorMixin = tp.Any
+    from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
 logger = get_logger(__name__)
 
@@ -71,7 +60,7 @@ class DPOTrainer(Trainer):
         arguments: DPOConfig,
         model: EasyDeLBaseModule | EasyDeLState,
         reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
-        processing_class: ProcessingClassType | None = None,
+        processing_class: ProcessingClassType = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | None = None,
         data_collator: tp.Callable | None = None,
@@ -357,7 +346,7 @@ class DPOTrainer(Trainer):
             loss_type=self.arguments.loss_type,
         )
 
-        jited_concatenated_forward = jax.jit(
+        jited_concatenated_forward = ejit(
             partial_concatenated_forward,
             out_shardings=(empty_sharding,),
             static_argnames=(
@@ -384,7 +373,7 @@ class DPOTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11)
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             training_step,
             in_shardings=(
                 self.state_shardings,
@@ -406,7 +395,7 @@ class DPOTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (3, 4, 5, 6, 7)
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             evaluation_step,
             in_shardings=(
                 self.state_shardings,
@@ -436,7 +425,7 @@ class DPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
-    def create_collect_function(
+    def create_tfds_collect_function(
         self,
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",

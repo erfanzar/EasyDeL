@@ -18,6 +18,7 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 @register_config("mixtral")
@@ -130,6 +131,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         attention_bias: bool = False,
         initialization_of_moe: bool = False,
         router_jitter_noise=0.0,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a MixtralConfig object.
@@ -200,6 +202,12 @@ class MixtralConfig(EasyDeLBaseConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.router_jitter_noise = router_jitter_noise
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if self.sliding_window is not None else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -248,11 +256,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         Returns:
             int: The granted maximum position embedding size for frequency encoding.
         """
-        return getattr(
-            self,
-            "freq_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
@@ -264,8 +268,28 @@ class MixtralConfig(EasyDeLBaseConfig):
         Returns:
             int: The granted maximum position embedding size for mask encoding.
         """
-        return getattr(
-            self,
-            "mask_max_position_embeddings",
-            self.max_position_embeddings,
-        )
+        return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return mapping

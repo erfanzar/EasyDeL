@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_olmo_flax import (
+from .modeling_olmo import (
     OlmoForCausalLM,
     OlmoForSequenceClassification,
     OlmoModel,

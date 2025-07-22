@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import typing as tp
 
 from ..checkpoint_managers import EasyPath, EasyPathLike
@@ -19,8 +21,6 @@ from .types import DatasetMixture, TextDatasetInform, VisualDatasetInform
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset as DS
-else:
-    DS = tp.Any
 
 
 class DataManager:

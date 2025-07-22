@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import functools
 import inspect
 import re
@@ -29,6 +31,7 @@ import jax
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
+from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
 from tqdm.auto import tqdm
@@ -72,17 +75,7 @@ ACT2FN = {
     "quick_gelu": quick_gelu,
 }
 
-ROPE_TYPES = tp.Optional[
-    tp.Literal[
-        "none",
-        "linear",
-        "dynamic",
-        "yarn",
-        "su",
-        "llama3",
-        "longrope",
-    ]
-]
+ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
 
 
 with_sharding_constraint = with_sharding_constraint
@@ -145,8 +138,9 @@ def get_gradient_checkpoint_policy(name):
 def add_start_docstrings(*docstr):
     """The add_start_docstrings function is a decorator that adds the docstrings to the beginning of a function.
     The add_start_docstrings function takes in an arbitrary number of strings and returns a decorator.
-    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring for fn is set equal to
-    the concatenation of all the strings passed into add_start_docstrings plus (if it exists) the original docstring for fn.
+    The returned decorator takes in one argument, fn, which is assumed to be a function. The docstring
+    for fn is set equal to the concatenation of all the strings passed into add_start_docstrings
+    plus (if it exists) the original docstring for fn.
 
     Args:
         *docstr: Pass in a variable number of arguments to the function
@@ -224,7 +218,8 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-            "input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
+            "input arguments in wrong way in case that you don'position_ids want to use this just pass "
+            "`use_scan_mlp=False` in "
             "model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
             f"in configs for more information read Docs.\nOriginal Error\n{e}"
         ) from e
@@ -1003,6 +998,32 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
     return flops_per_element.get(activation_type, 1) * dim
 
 
+class AttnMaskType(str, Enum):
+    FULL = "ATTN_MASK_FULL"
+    SLIDING = "ATTN_MASK_SLIDING"
+    CHUNK = "ATTN_MASK_CHUNK"
+
+    @classmethod
+    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention"]):
+        if hf_type == "sliding_attention":
+            return AttnMaskType.SLIDING
+        elif hf_type == "full_attention":
+            return AttnMaskType.FULL
+        elif hf_type == "chunk_attention":
+            return AttnMaskType.CHUNK
+        else:
+            raise ValueError(f"`hf_type` {hf_type} is not available")
+
+
+@auto_pytree
+class AttnMaskDetail:
+    mask_type: AttnMaskType
+    size: int
+    offset: int | None = None
+    chunks: int | None = None
+    bricks: int | None = None
+
+
 class TaskType(str, Enum):
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
@@ -1283,15 +1304,15 @@ class OverWriteWithGradient(nn.Param): ...
 
 
 if tp.TYPE_CHECKING:
-    from transformers import (
-        BaseImageProcessor,
-        FeatureExtractionMixin,
-        PreTrainedTokenizerBase,
-        ProcessorMixin,
-    )
+    from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
-    ProcessingClassType = tp.Optional[
-        PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin
+    ProcessingClassType = tp.Optional[  # noqa
+        tp.Union[  # noqa
+            PreTrainedTokenizerBase,
+            BaseImageProcessor,
+            FeatureExtractionMixin,
+            ProcessorMixin,
+        ]
     ]
 else:
     ProcessingClassType = tp.Any

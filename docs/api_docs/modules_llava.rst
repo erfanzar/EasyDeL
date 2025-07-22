@@ -6,4 +6,4 @@ Llava
 
    modules_llava___init__
    modules_llava_llava_configuration
-   modules_llava_modeling_llava_flax
+   modules_llava_modeling_llava

@@ -20,6 +20,7 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
 @register_config("qwen2")
@@ -122,6 +123,7 @@ class Qwen2Config(EasyDeLBaseConfig):
         number_rep_kv: int = 1,
         bits: int | None = None,
         scan_layers: bool = True,
+        layer_types: list[str] | None = None,
         rope_scaling: tp.Mapping[str, str | float] | None = None,
         **kwargs,
     ):
@@ -156,7 +158,8 @@ class Qwen2Config(EasyDeLBaseConfig):
             number_rep_kv (int, optional): Number of repetitions for key/value vectors. Defaults to 1.
             bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
             scan_layers (bool, optional): Whether to use scan for transformer layers. Defaults to True.
-            rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional): RoPE scaling configuration. Defaults to None.
+            rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional):
+                RoPE scaling configuration. Defaults to None.
             **kwargs: Additional keyword arguments passed to the parent class.
         """
         self.vocab_size = vocab_size
@@ -193,7 +196,14 @@ class Qwen2Config(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
         self.head_dim = hidden_size // num_attention_heads
-
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         super().__init__(
@@ -229,3 +239,27 @@ class Qwen2Config(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
+
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return mapping

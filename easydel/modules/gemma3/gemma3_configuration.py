@@ -20,6 +20,7 @@ from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 from ..siglip.configuration_siglip import SiglipVisionConfig
 
@@ -165,6 +166,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         rope_scaling=None,
         rope_local_base_freq=10_000.0,
         sliding_window_pattern=6,
+        layer_types: list[str] | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
@@ -210,8 +212,14 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.cache_implementation = cache_implementation
 
         self.rope_local_base_freq = rope_local_base_freq
-        # For configuring HybridCache to work with 5:1 attention pattern
         self.sliding_window_pattern = sliding_window_pattern
+        self.layer_types = layer_types
+
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
         self.rope_scaling = rope_scaling
 
     def get_partition_rules(self, *args, **kwargs):
@@ -244,6 +252,30 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
             (r".*", pmag.resolve(Replicated)),
         )
 
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Retrieve attention mask details for each layer in the model.
+
+        This method generates a dictionary mapping layer indices to their corresponding attention mask details.
+        If a sliding window is defined, each layer is assigned a sliding window attention mask with the specified size.
+
+        Returns:
+            dict[int, AttnMaskDetail]: A dictionary where keys are layer indices (int) and values are AttnMaskDetail
+            objects specifying the attention mask type and size for each layer.
+
+        Notes:
+            - If `self.sliding_window` is None, an empty dictionary is returned.
+            - The method iterates over `self.num_hidden_layers` to assign mask details for each layer.
+            - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
+        """
+        mapping = {}
+        if self.layer_types is not None:
+            for layer_idx in range(self.num_hidden_layers):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
+                    size=self.sliding_window,
+                )
+        return mapping
+
 
 @register_config("gemma3")
 class Gemma3Config(EasyDeLBaseConfig):
@@ -259,7 +291,7 @@ class Gemma3Config(EasyDeLBaseConfig):
             The begin-of-image token index to wrap the image prompt.
         eoi_token_index (`int`, *optional*, defaults to 256000):
             The end-of-image token index to wrap the image prompt.
-        image_token_index (`int`, *optional*, defaults to 262144):
+        image_token_id (`int`, *optional*, defaults to 262144):
             The image token index to encode the image prompt.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -296,7 +328,7 @@ class Gemma3Config(EasyDeLBaseConfig):
         mm_tokens_per_image: int = 256,
         boi_token_index: int = 255_999,
         eoi_token_index: int = 256_000,
-        image_token_index: int = 262_144,
+        image_token_id: int = 262_144,
         initializer_range: float = 0.02,
         **kwargs,
     ):
@@ -310,7 +342,7 @@ class Gemma3Config(EasyDeLBaseConfig):
           mm_tokens_per_image (int, optional): Number of tokens per image embedding. Defaults to 256.
           boi_token_index (int, optional): Begin-of-image token index to wrap the image prompt. Defaults to 255_999.
           eoi_token_index (int, optional): End-of-image token index to wrap the image prompt. Defaults to 256_000.
-          image_token_index (int, optional): Image token index to encode the image prompt. Defaults to 262_144.
+          image_token_id (int, optional): Image token index to encode the image prompt. Defaults to 262_144.
           initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
           **kwargs: Additional keyword arguments passed to the parent class constructor.
         """
@@ -329,7 +361,7 @@ class Gemma3Config(EasyDeLBaseConfig):
         self.mm_tokens_per_image = mm_tokens_per_image
         self.boi_token_index = boi_token_index
         self.eoi_token_index = eoi_token_index
-        self.image_token_index = image_token_index
+        self.image_token_id = image_token_id
         self.initializer_range = initializer_range
 
         super().__init__(**kwargs)

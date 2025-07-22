@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_qwen_flax import (
+from .modeling_qwen import (
     Qwen2ForCausalLM,
     Qwen2ForSequenceClassification,
     Qwen2Model,

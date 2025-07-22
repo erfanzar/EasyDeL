@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import os
 import typing as tp
 from functools import partial
 
@@ -24,6 +27,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
+from easydel.utils.compiling_utils import ejit
 
 from ...logits_process import (
     FrequencyPenaltyLogitsProcessor,
@@ -36,11 +40,12 @@ from ..utils import GenerationState, ResultTokens
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
-else:
-    EasyDeLBaseModule = tp.Any
 
 
-@partial(jax.jit, donate_argnums=(0, 1), static_argnums=(3,))
+TOPK_FOR_COMPUTE = int(os.getenv("EASYDEL_VSURGE_TOPK_FOR_COMPUTE", "64"))
+
+
+@ejit(donate_argnums=(0, 1), static_argnums=(3,))
 def continuous_bulk_insert(
     prefix: GenerationState,
     decode_state: GenerationState,
@@ -276,7 +281,7 @@ def sample_top_p_efficient(
     top_p: jax.Array,
     temperature: jax.Array,
     rng: jax.random.PRNGKey,
-    top_k_for_computation: int = 50,
+    top_k_for_computation: int = TOPK_FOR_COMPUTE,
 ) -> jax.Array:
     vocab_size = logits.shape[-1]
     effective_k = min(top_k_for_computation, vocab_size)

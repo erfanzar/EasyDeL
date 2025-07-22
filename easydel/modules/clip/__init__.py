@@ -17,7 +17,7 @@ from .clip_configuration import (
     CLIPTextConfig,
     CLIPVisionConfig,
 )
-from .modeling_clip_flax import (
+from .modeling_clip import (
     CLIPForImageClassification,
     CLIPModel,
     CLIPTextModel,

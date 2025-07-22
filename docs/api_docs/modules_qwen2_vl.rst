@@ -5,5 +5,5 @@ Qwen2 Vl
    :maxdepth: 2
 
    modules_qwen2_vl___init__
-   modules_qwen2_vl_modeling_qwen2_vl_flax
+   modules_qwen2_vl_modeling_qwen2_vl
    modules_qwen2_vl_qwen2_vl_configuration

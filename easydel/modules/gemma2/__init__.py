@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .gemma2_configuration import Gemma2Config
-from .modeling_gemma2_flax import (
+from .modeling_gemma2 import (
     Gemma2ForCausalLM,
     Gemma2ForSequenceClassification,
     Gemma2Model,

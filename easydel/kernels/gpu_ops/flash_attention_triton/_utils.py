@@ -14,12 +14,13 @@
 
 
 import math
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 import triton
 import triton.language as tl
+
+from easydel.utils.compiling_utils import ejit
 
 from .._utils import get_strides
 
@@ -104,7 +105,7 @@ def calc_bias_strides(
     return stride_bz, stride_bh, stride_bm
 
 
-@partial(jax.jit, static_argnames=["max_tokens"])
+@ejit(static_argnames=["max_tokens"])
 def attention_pack_with_static_shape(
     x: jnp.ndarray,
     attention_mask: jnp.ndarray,
@@ -151,7 +152,7 @@ def attention_pack_with_static_shape(
     return packed
 
 
-@partial(jax.jit, static_argnames=["seqlen", "batch_size"])
+@ejit(static_argnames=["seqlen", "batch_size"])
 def attention_unpack_with_static_shape(
     x: jnp.ndarray,
     cum_seqlens: jnp.ndarray,

@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import asyncio
 import concurrent.futures
 import contextlib
@@ -47,16 +49,13 @@ from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.rngs_utils import GenerateRNG
 
-from ..sampling_params import SamplingParams
+from ..sampling_params import JitableSamplingParams, SamplingParams
 from .functions import expand_inputs_for_generation, get_compiled_funcs, interval_func, prefill_func, put_compiled_funcs
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
     from easydel.infra.utils import ProcessingClassType
-else:
-    EasyDeLBaseModule = tp.Any
-    ProcessingClassType = tp.Any
 
 logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
@@ -102,7 +101,7 @@ class vInference:
     def __init__(
         self,
         model: EasyDeLBaseModule | None = None,
-        processor_class: ProcessingClassType | None = None,
+        processor_class: ProcessingClassType = None,
         graphdef: nn.GraphDef | None = None,
         graphstate: nn.GraphState | None = None,
         graphother: nn.GraphState | None = None,
@@ -935,6 +934,7 @@ class vInference:
             if sampling_params.max_tokens > self.generation_config.max_new_tokens:
                 sampling_params.max_tokens = self.generation_config.max_new_tokens
             sampling_params = sampling_params.make_jitable()
+            assert isinstance(sampling_params, JitableSamplingParams)
         # Initial generation step
         state = self.execute_prefill(
             state,
@@ -944,7 +944,6 @@ class vInference:
             sampling_params=sampling_params,
             func=prefill_func,
         )
-
         if not state.is_sequence_finished.all():
             # Subsequent generation steps
             for _ in range(self.generation_config._loop_rows):
@@ -1017,7 +1016,7 @@ class vInference:
         if graphother is None:
             graphother = self.graphother
         if sampling_params is None:
-            sampling_params = self.generation_config.sampling_params
+            sampling_params = self.generation_config.sampling_params.make_jitable()
 
         if func is None:
             func = get_compiled_funcs(state._compile_config, self._uuid4)[1]

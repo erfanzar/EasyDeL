@@ -20,11 +20,12 @@ import chex
 import jax
 import jax.numpy as jnp
 
+from easydel.utils.compiling_utils import ejit
+
 from ._forward_pallas import decode_attn_sequence
 
 
-@partial(
-    jax.jit,
+@ejit(
     static_argnames=[
         "softmax_scale",
         "block_size_heads",

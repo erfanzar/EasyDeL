@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .gpt2_configuration import GPT2Config
-from .modeling_gpt2_flax import GPT2LMHeadModel, GPT2Model
+from .modeling_gpt2 import GPT2LMHeadModel, GPT2Model
 
 __all__ = "GPT2Config", "GPT2LMHeadModel", "GPT2Model"
