@@ -210,7 +210,7 @@ class ParallelLinear(nn.Module):
         in_features: int,
         out_features: int,
         *,
-        scale: float | tp.Literal["fan_in"] = 1.0,
+        scale: float | tp.Literal["fan_in", "fan_out"] = 1.0,
         use_bias: bool = True,
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
@@ -222,8 +222,11 @@ class ParallelLinear(nn.Module):
     ):
         if rngs is None:
             rngs = nn.Rngs(0)
+
         if scale == "fan_in":
-            scale = jnp.rsqrt(in_features)
+            scale = in_features ** -0.5
+        elif scale == "fan_out":
+            scale = out_features ** -0.5
 
         self.in_features = in_features
         self.out_features = out_features
