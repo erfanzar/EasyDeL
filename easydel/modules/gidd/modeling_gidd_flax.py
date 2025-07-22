@@ -81,7 +81,6 @@ class GiddMLP(nn.Module):
         )
         self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
         self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
-        self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
         h = apply_logical_sharding(
@@ -250,7 +249,7 @@ class GiddAttention(AttentionModule):
         kv_shape = (
             batch_size,
             sequence_length,
-            self.config.num_key_value_heads,
+            self.config.num_attention_heads,
             self.head_dim,
         )
         query_states = query_states.reshape(qshape)
@@ -285,7 +284,7 @@ class GiddAttention(AttentionModule):
             noise_mask=noise_mask,
         )
 
-        query_states = self.qk_scale * query_states
+        query_states = query_states * self.qk_scale[None, None, :, None]
 
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -299,7 +298,6 @@ class GiddAttention(AttentionModule):
             attention_mask=attention_mask,
             segment_ids=segment_ids,
             causal=False,
-            dropout_rng=self.rngs.params(),
         )
         attn_output = self.o_proj(
             self.shard_attention_prod(
@@ -314,11 +312,17 @@ class GiddAttention(AttentionModule):
 
 
 class GiddRMSNorm(nn.Module):
-    def __init__(self, config: GiddConfig, dtype: jnp.dtype = jnp.float32):
+    def __init__(
+        self,
+        config: GiddConfig,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+    ):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
-        self.kernel = nn.Param(jnp.zeros(self.config.hidden_size, dtype=dtype))
+        self.param_dtype = param_dtype
+        self.kernel = nn.Param(jnp.zeros(self.config.hidden_size, dtype=param_dtype))
 
     def __call__(self, hidden_states):
         variance = hidden_states.astype(jnp.float32)
@@ -355,7 +359,7 @@ class GiddLayer(nn.Module):
             policy=config.gradient_checkpointing,
         )
 
-        self.self_attn = attn_block(
+        self.self_attn: GiddAttention = attn_block(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -363,7 +367,7 @@ class GiddLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.mlp = mlp_block(
+        self.mlp: GiddMLP = mlp_block(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -371,18 +375,14 @@ class GiddLayer(nn.Module):
             rngs=rngs,
         )
         self.input_layernorm = GiddRMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
+            config=config,
             dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
+            param_dtype=jnp.float32,
         )
         self.post_attention_layernorm = GiddRMSNorm(
-            dim=config.hidden_size,
-            eps=config.rms_norm_eps,
+            config=config,
             dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
+            param_dtype=jnp.float32,
         )
 
     def __call__(
@@ -390,26 +390,24 @@ class GiddLayer(nn.Module):
         hidden_states: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        causal_mask: tp.Optional[chex.Array | bool],
+        noise_mask: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: tp.Optional[TransformerCacheView | PagesCacheView] = None,
         cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         output_attentions: bool = False,
-        fcm_mask: tp.Optional[chex.Array] = None,
         frequencies: tp.Optional[chex.Array] = None,
     ):
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             attention_mask,
+            noise_mask,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
             segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states = hidden_states + self.resid_scale * attn_outputs.attention_output
@@ -495,11 +493,9 @@ class GiddModel(EasyDeLBaseModule):
             for _ in range(self.config.num_hidden_layers)
         ]
         self.norm = GiddRMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            config=config,
             dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
+            param_dtype=jnp.float32,
         )
 
     def __call__(
@@ -508,6 +504,8 @@ class GiddModel(EasyDeLBaseModule):
         inputs_embeds: tp.Optional[chex.Array] = None,
         attention_mask: tp.Optional[chex.Array] = None,
         position_ids: tp.Optional[chex.Array] = None,
+        log_snr: tp.Optional[chex.Array] = None,
+        noise_mask: tp.Optional[chex.Array] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
         past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
@@ -579,12 +577,12 @@ class GiddModel(EasyDeLBaseModule):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                noise_mask=noise_mask,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
-                output_attentions=output_attentions,
                 segment_ids=segment_ids,
+                output_attentions=output_attentions,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -668,6 +666,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         attention_mask: tp.Optional[chex.Array] = None,
         position_ids: tp.Optional[chex.Array] = None,
         segment_ids: tp.Optional[chex.Array] = None,
+        log_snr: tp.Optional[chex.Array] = None,
+        noise_mask: tp.Optional[chex.Array] = None,
         mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
         past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
         cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
@@ -695,6 +695,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            log_snr=log_snr,
+            noise_mask=noise_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             mode=mode,

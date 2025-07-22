@@ -85,8 +85,6 @@ class GiddConfig(EasyDeLBaseConfig):
 	        The chunk size to use when scanning the MLP.
 	    bits (`int`, *optional*):
 	        The number of bits to quantize the model to.
-	    hidden_act (`str`, *optional*, defaults to `"silu"`):
-	        The hidden activation function to use.
 	    pretraining_tp (`int`, *optional*, defaults to 1):
 	        The tensor parallelism degree used during pretraining.
 	    mlp_bias (`bool`, *optional*, defaults to `False`):
@@ -121,6 +119,7 @@ class GiddConfig(EasyDeLBaseConfig):
 		scan_mlp_chunk_size: int = 1024,
 		bits: tp.Optional[int] = None,
 		pretraining_tp: int = 1,
+		attention_bias: bool = False,
 		mlp_bias: bool = False,
 		scan_layers: bool = False,
 		**kwargs,
@@ -140,7 +139,9 @@ class GiddConfig(EasyDeLBaseConfig):
 		self.rms_norm_eps = rms_norm_eps
 		self.qk_norm_eps = qk_norm_eps
 		self.pretraining_tp = pretraining_tp
+		self.tie_word_embeddings = tie_word_embeddings
 		self.gradient_checkpointing = gradient_checkpointing
+		self.attention_bias = attention_bias
 		self.mlp_bias = mlp_bias
 		self.rope_scaling = rope_scaling
 		self.bits = bits
@@ -151,7 +152,6 @@ class GiddConfig(EasyDeLBaseConfig):
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,
-			tie_word_embeddings=tie_word_embeddings,
 			scan_mlp_chunk_size=scan_mlp_chunk_size,
 			bits=bits,
 			**kwargs,
@@ -186,7 +186,7 @@ class GiddConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		rope_theta: float = 10000.0,
 		attention_bias: bool = False,
-		hidden_act: str = "silu",
+		mlp_bias: bool = False,
 		scan_layers: bool = True,
 		**kwargs,
 	):
@@ -214,14 +214,14 @@ class GiddConfig(EasyDeLBaseConfig):
 		        the quantization
 		    rope_theta: float : rope_theta for compute rope
 		    attention_bias: bool : whenever to use attention bias or no
-		    hidden_act: str : hidden_act for mlp
+			mlp_bias: bool : whenever to use bias in mlp
 		    scan_layers: bool: Determine whether to use scan layers or
 		        not
 		"""
 		self.scan_layers = scan_layers
 		self.rope_theta = rope_theta
 		self.attention_bias = attention_bias
-		self.hidden_act = hidden_act
+		self.mlp_bias = mlp_bias
 		self.tie_word_embeddings = tie_word_embeddings
 		self.gradient_checkpointing = gradient_checkpointing
 		self.bits = bits
