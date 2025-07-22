@@ -759,34 +759,34 @@ class DataCollatorForPreferenceGrain:
 
         # Pad sequences
         output = {
-            "prompt_input_ids": np_pad(
+            "prompt_input_ids": pad_single(
                 prompt_input_ids,
                 self.max_prompt_length,
                 padding_value=self.pad_token_id,
                 padding_side="left",
             ),
-            "prompt_attention_mask": np_pad(
+            "prompt_attention_mask": pad_single(
                 prompt_attention_mask,
                 self.max_prompt_length,
                 padding_value=0,
                 padding_side="left",
             ),
-            "chosen_input_ids": np_pad(
+            "chosen_input_ids": pad_single(
                 chosen_input_ids,
                 self.max_completion_length,
                 padding_value=self.pad_token_id,
             ),
-            "chosen_attention_mask": np_pad(
+            "chosen_attention_mask": pad_single(
                 chosen_attention_mask,
                 self.max_completion_length,
                 padding_value=0,
             ),
-            "rejected_input_ids": np_pad(
+            "rejected_input_ids": pad_single(
                 rejected_input_ids,
                 self.max_completion_length,
                 padding_value=self.pad_token_id,
             ),
-            "rejected_attention_mask": np_pad(
+            "rejected_attention_mask": pad_single(
                 rejected_attention_mask,
                 self.max_completion_length,
                 padding_value=0,
@@ -795,9 +795,9 @@ class DataCollatorForPreferenceGrain:
 
         # Add optional outputs
         if pixel_values is not None:
-            output["pixel_values"] = np_pad(pixel_values, self.max_prompt_length, padding_value=0.0)
+            output["pixel_values"] = pad_single(pixel_values, self.max_prompt_length, padding_value=0.0)
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = np_pad(pixel_attention_mask, self.max_prompt_length, padding_value=0)
+            output["pixel_attention_mask"] = pad_single(pixel_attention_mask, self.max_prompt_length, padding_value=0)
         if "image_sizes" in features.keys():
             output["image_sizes"] = np.array(features["image_sizes"])
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
@@ -994,7 +994,7 @@ class DPODataCollatorWithPaddingGrain:
 
                     to_pad = np.array(features[k], dtype=dtype)
 
-                    padded_batch[k] = np_pad(
+                    padded_batch[k] = pad_single(
                         to_pad,
                         None if self.prepadded else max_length,
                         padding_value=padding_value,
@@ -1128,6 +1128,38 @@ def pad(
     else:
         raise ValueError("padding_side must be 'left' or 'right'")
     return output
+
+
+def pad_single(
+    tensor: np.ndarray,
+    max_length: int | None = None,
+    padding_value: int = 0,
+    padding_side: str = "right",
+) -> np.ndarray:
+    """
+    Pads a single tensor to a specified length along the last dimension.
+    """
+    current_length = tensor.shape[-1]
+
+    if max_length is None:
+        return tensor
+
+    if current_length >= max_length:
+        if padding_side == "left":
+            return tensor[..., -max_length:]
+        else:
+            return tensor[..., :max_length]
+
+    pad_amount = max_length - current_length
+
+    if padding_side == "left":
+        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(pad_amount, 0)]
+    elif padding_side == "right":
+        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(0, pad_amount)]
+    else:
+        raise ValueError("padding_side must be 'left' or 'right'")
+
+    return np.pad(tensor, pad_config, mode="constant", constant_values=padding_value)
 
 
 def np_pad(
