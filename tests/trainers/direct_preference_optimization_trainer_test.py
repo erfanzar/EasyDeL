@@ -83,11 +83,11 @@ def create_model_and_tokenizer(model_name_or_path):
 def create_dpo_config(
     model_name="direct_preference_optimization_trainer",
     save_directory="tmp-files",
-    total_batch_size=1,
+    total_batch_size=4,
     learning_rate=7e-5,
-    max_length=512,
-    max_completion_length=256,
-    max_prompt_length=256,
+    max_length=256,
+    max_completion_length=128,
+    max_prompt_length=128,
 ):
     """Create DPO configurations"""
     logging.info("Creating DPO config")

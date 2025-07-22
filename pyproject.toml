@@ -49,7 +49,7 @@ dependencies = [
 	"datasets>=3.6.0",
 	"gcsfs",
 	"zstandard>=0.23.0",
-	"msgspec~=0.19.0", 
+	"msgspec~=0.19.0",
 ]
 
 [project.urls]
@@ -74,6 +74,7 @@ where = ["."]
 torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
 gpu = ["jax[cuda12]==0.6.2", "torch==2.6.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]==0.6.2", "tensorboard>=2.19.0"]
+tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 
 [tool.black]
 line-length = 121
@@ -134,8 +135,14 @@ reportUnusedParameter = "none"
 
 [tool.uv]
 conflicts = [
-	[{ extra = "gpu" }, { extra = "tpu" }], 
-	[{ extra = "gpu" }, { extra = "torch" }],
+	[
+		{ extra = "gpu" },
+		{ extra = "tpu" },
+	],
+	[
+		{ extra = "gpu" },
+		{ extra = "torch" },
+	],
 ]
 
 [[tool.uv.index]]

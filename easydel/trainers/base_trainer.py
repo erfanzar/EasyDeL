@@ -587,21 +587,18 @@ class BaseTrainer(BaseTrainerProtocol):
                     num_epochs=num_epochs,
                     shuffle=shuffle,
                 )
-
             collate_fn = self.create_grain_collect_function(
                 max_sequence_length=self.arguments.max_sequence_length,
                 truncation_mode=self.arguments.truncation_mode,
             )
-
-            operations = [
-                ToNumpy(),
-                grain.Batch(batch_size=batch_size, drop_remainder=True),
-                CollateMapTransform(collate_fn=collate_fn),
-            ]
             return grain.DataLoader(
                 data_source=data_source,
                 sampler=sampler,
-                operations=operations,
+                operations=[
+                    ToNumpy(),
+                    CollateMapTransform(collate_fn=collate_fn),
+                    grain.Batch(batch_size=batch_size, drop_remainder=True),
+                ],
                 worker_count=1,
                 worker_buffer_size=1,
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
