@@ -263,6 +263,11 @@ _import_structure = {
         "Gemma3TextConfig",
         "Gemma3TextModel",
     ],
+    "modules.gidd": [
+        "GiddConfig",
+        "GiddModel",
+        "GiddForDiffusionLM",
+    ],
     "modules.gpt2": [
         "GPT2Config",
         "GPT2LMHeadModel",
@@ -635,6 +640,11 @@ if _tp.TYPE_CHECKING:
         Gemma3MultiModalProjector,
         Gemma3TextConfig,
         Gemma3TextModel,
+    )
+    from .modules.gidd import (
+        GiddConfig,
+        GiddModel,
+        GiddForDiffusionLM,
     )
     from .modules.gpt2 import (
         GPT2Config,
