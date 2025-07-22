@@ -21,12 +21,6 @@ import chex
 from flax import nnx as nn
 from jax.sharding import Mesh
 
-from easydel.layers.caching import (
-    PagesCache,
-    PagesMetadata,
-    TransformerCache,
-    TransformerMetadata,
-)
 from easydel.layers.linear import ParallelLinear
 
 from ..base_config import EasyDeLBaseConfig
@@ -51,9 +45,7 @@ if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
     from easydel.infra.base_state import EasyDeLState
-else:
-    EasyDeLState = tp.Any
-    PreTrainedModel = tp.Any
+    from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
 
 
 def return_type_adjuster(
@@ -686,7 +678,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def get_static_arguments(self) -> tuple:
-        """return static arguments kwargs for jax.jit"""
+        """return static arguments kwargs for `jax.jit` / `ejit`"""
         ...
 
     @classmethod

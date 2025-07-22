@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .llama_configuration import LlamaConfig, VisionLlamaConfig
-from .modeling_llama_flax import (
+from .modeling_llama import (
     LlamaForCausalLM,
     LlamaForSequenceClassification,
     LlamaModel,

@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .gpt_neox_configuration import GPTNeoXConfig
-from .modeling_gpt_neox_flax import GPTNeoXForCausalLM, GPTNeoXModel
+from .modeling_gpt_neox import GPTNeoXForCausalLM, GPTNeoXModel
 
 __all__ = "GPTNeoXConfig", "GPTNeoXForCausalLM", "GPTNeoXModel"

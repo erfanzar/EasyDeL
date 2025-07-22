@@ -38,6 +38,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from easydel.utils.compiling_utils import ejit
+
 GroupMetadata = typing.TypeVar("GroupMetadata", bound=tuple[chex.Array, chex.Array, chex.Array])
 TilinFn = typing.Callable[[int, int, int], tuple[int, int, int] | None]
 
@@ -188,7 +190,7 @@ def _zero_uninitialized_memory(
     return jnp.where(valid_mask[:, None], out, 0)
 
 
-@partial(jax.jit, static_argnames=("preferred_element_type", "tiling", "transpose_rhs", "interpret"))
+@ejit(static_argnames=("preferred_element_type", "tiling", "transpose_rhs", "interpret"))
 def gmm(
     lhs: chex.Array,
     rhs: chex.Array,
@@ -374,7 +376,7 @@ def gmm(
     return out
 
 
-@partial(jax.jit, static_argnames=("preferred_element_type", "tiling", "num_actual_groups", "interpret"))
+@ejit(static_argnames=("preferred_element_type", "tiling", "num_actual_groups", "interpret"))
 def tgmm(
     lhs: chex.Array,
     rhs: chex.Array,

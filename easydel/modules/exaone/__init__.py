@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .exaone_configuration import ExaoneConfig
-from .modeling_exaone_flax import (
+from .modeling_exaone import (
     ExaoneForCausalLM,
     ExaoneForSequenceClassification,
     ExaoneModel,

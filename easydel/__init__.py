@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.1.5"
+# pyright:reportUnusedImport=none
+# pyright:reportImportCycles=none
 
+__version__ = "0.1.5"
 import os as _os
 import sys as _sys
 import typing as _tp
@@ -95,6 +97,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
+        "ejit",
         "traversals",
         "DataManager",
         "DatasetLoadError",
@@ -153,10 +156,12 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
-    "layers.attention": [
-        "AttentionMechanisms",
+    "layers.attention_operator._attention_impl": [
         "AttentionMetadata",
         "AttentionRegistry",
+    ],
+    "layers.attention": [
+        "AttentionMechanisms",
         "AttentionModule",
         "FlexibleAttentionModule",
     ],
@@ -190,6 +195,7 @@ _import_structure = {
     "modules.aya_vision": [
         "AyaVisionConfig",
         "AyaVisionForConditionalGeneration",
+        "AyaVisionModel",
     ],
     "modules.clip": [
         "CLIPConfig",
@@ -313,6 +319,7 @@ _import_structure = {
     "modules.llava": [
         "LlavaConfig",
         "LlavaForConditionalGeneration",
+        "LlavaModel",
     ],
     "modules.mamba": [
         "MambaConfig",
@@ -534,10 +541,12 @@ if _tp.TYPE_CHECKING:
     )
     from .layers.attention import (
         AttentionMechanisms,
-        AttentionMetadata,
         AttentionModule,
-        AttentionRegistry,
         FlexibleAttentionModule,
+    )
+    from .layers.attention_operator._attention_impl import (
+        AttentionMetadata,
+        AttentionRegistry,
     )
     from .modules.arctic import (
         ArcticConfig,
@@ -568,6 +577,7 @@ if _tp.TYPE_CHECKING:
     from .modules.aya_vision import (
         AyaVisionConfig,
         AyaVisionForConditionalGeneration,
+        AyaVisionModel,
     )
     from .modules.clip import (
         CLIPConfig,
@@ -691,6 +701,7 @@ if _tp.TYPE_CHECKING:
     from .modules.llava import (
         LlavaConfig,
         LlavaForConditionalGeneration,
+        LlavaModel,
     )
     from .modules.mamba import (
         MambaConfig,
@@ -862,6 +873,7 @@ if _tp.TYPE_CHECKING:
         EasyPathLike,
         TextDatasetInform,
         VisualDatasetInform,
+        ejit,
         traversals,
     )
     from .utils.parameters_transformation import (
@@ -879,7 +891,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.41"]
+    _targeted_versions = ["0.0.46"]
 
     from eformer import __version__ as _eform_version
 

@@ -18,6 +18,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from easydel.utils.compiling_utils import ejit
+
 try:
     from jax.experimental.pallas.ops.tpu.ragged_paged_attention.tuned_block_sizes import get_tuned_block_sizes
 except Exception:
@@ -32,8 +34,7 @@ from ._forward_pallas import (
 )
 
 
-@functools.partial(
-    jax.jit,
+@ejit(
     static_argnames=[
         "sm_scale",
         "mask_value",
@@ -42,7 +43,7 @@ from ._forward_pallas import (
         "vmem_limit_bytes",
         "sliding_window",
         "soft_cap",
-    ],
+    ]
 )
 def _ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]

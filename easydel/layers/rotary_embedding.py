@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import math
 import typing as tp
-from functools import partial
 
 import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
+
+from easydel.utils.compiling_utils import ejit
 
 
 @jax.named_scope("easydel-rotary-yarn-find-correction-dim")
@@ -1490,9 +1491,15 @@ def get_rope(
     return rotary_emb
 
 
-@partial(
-    jax.jit,
-    static_argnames=["head_size", "rotary_dim", "max_position", "base", "rope_scaling", "partial_rotary_factor"],
+@ejit(
+    static_argnames=[
+        "head_size",
+        "rotary_dim",
+        "max_position",
+        "base",
+        "rope_scaling",
+        "partial_rotary_factor",
+    ],
 )
 def get_frequencies(
     head_size: int,
@@ -1636,9 +1643,15 @@ def get_frequencies(
     return frequencies
 
 
-@partial(
-    jax.jit,
-    static_argnames=["head_size", "rotary_dim", "max_position", "base", "rope_scaling", "partial_rotary_factor"],
+@ejit(
+    static_argnames=[
+        "head_size",
+        "rotary_dim",
+        "max_position",
+        "base",
+        "rope_scaling",
+        "partial_rotary_factor",
+    ],
 )
 def get_inv_frequencies(
     head_size: int,

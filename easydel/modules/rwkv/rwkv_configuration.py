@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -62,7 +64,7 @@ class RwkvConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "rwkv"
-    attribute_map = {"max_position_embeddings": "context_length"}
+    attribute_map: typing.ClassVar = {"max_position_embeddings": "context_length"}
 
     def __init__(
         self,
@@ -105,7 +107,7 @@ class RwkvConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+    def get_partition_rules(self, *args, **kwargs):
         """
         Get the partition rules for the model.
 
@@ -116,8 +118,4 @@ class RwkvConfig(EasyDeLBaseConfig):
         Returns:
             `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
         """
-        return (
-            ((".*", PartitionSpec(("sp", "fsdp"))),)
-            if fully_sharded_data_parallel
-            else ((".*", PartitionSpec(("sp", "fsdp"))),)
-        )
+        return ((".*", PartitionSpec(("sp", "fsdp"))),)

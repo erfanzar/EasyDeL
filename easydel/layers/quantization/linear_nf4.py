@@ -13,8 +13,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -28,6 +26,8 @@ from flax.typing import (
 )
 from jax import lax
 
+from easydel.utils.compiling_utils import ejit
+
 from .base_quant import QauntModule
 
 Array = jax.Array
@@ -39,7 +39,7 @@ default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def single_quantize_and_pack_nf4(blocks, block_size=64):
     """
     Combined quantization and packing for better performance.
@@ -90,7 +90,7 @@ def single_quantize_and_pack_nf4(blocks, block_size=64):
     return packed.astype(jnp.uint8), absmax
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def single_dequantize_nf4(packed_values, absmax, block_size):
     """
     Optimized dequantization combining unpacking and scaling in fewer operations.
@@ -127,14 +127,14 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
     return scaled
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def quantize_and_pack_nf4(blocks, block_size=64):
     if blocks.ndim > 2:
         return jax.vmap(quantize_and_pack_nf4, in_axes=(0, None), out_axes=(0, 0))(blocks, block_size)
     return single_quantize_and_pack_nf4(blocks, block_size)
 
 
-@partial(jax.jit, static_argnames=["block_size"])
+@ejit(static_argnames=["block_size"])
 def dequantize_nf4(packed_values, absmax, block_size):
     if packed_values.ndim > 2:
         return jax.vmap(dequantize_nf4, in_axes=(0, 0, None), out_axes=(0,))(packed_values, absmax, block_size)
@@ -281,7 +281,8 @@ class LinearNF4(QauntModule):
         quant_kernel = self._dequantize_kernel()
 
         assert quant_kernel is not None, (
-            "loaded and dequantized quant_kernel is None, which means it have been loaded from another None Kernel Linear"
+            "loaded and dequantized quant_kernel is None, which means it have been loaded "
+            "from another None Kernel Linear"
         )
 
         bias = self.bias.value

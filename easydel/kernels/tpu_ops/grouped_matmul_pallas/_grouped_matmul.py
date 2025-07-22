@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 
 import chex
 import jax
 from jax import numpy as jnp
+
+from easydel.utils.compiling_utils import ejit
 
 from ._backward_pallas import _backward_fn
 from ._forward_pallas import _forward_fn
@@ -52,7 +53,7 @@ def grouped_matmul(
     )
 
 
-@partial(jax.jit, static_argnames=("tile_size", "do_hostsync", "sync_axes"))
+@ejit(static_argnames=("tile_size", "do_hostsync", "sync_axes"))
 def _grouped_matmul_sharded(
     lhs: chex.Array,
     rhs: chex.Array,

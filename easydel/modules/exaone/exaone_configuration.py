@@ -131,7 +131,8 @@ class ExaoneConfig(EasyDeLBaseConfig):
           tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
           rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
           rope_scaling (Dict[str, Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
+            Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
           attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
           use_scan_mlp (bool, optional): Whether to use scan for MLP computation. Defaults to False.
           scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.

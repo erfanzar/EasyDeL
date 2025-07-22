@@ -59,7 +59,7 @@ class SpecialLossNormalizingFactor(enum.Enum):
 SLNF = SpecialLossNormalizingFactor
 
 
-FACTOR_TYPE = tp.Optional[float | int | str | SLNF]
+FACTOR_TYPE = tp.Optional[float | int | str | SLNF]  # noqa
 
 
 @auto_pytree
@@ -93,7 +93,8 @@ class LossConfig:
             Defaults to None.
         num_classification_labels (tp.Optional[int]): Number of labels specifically for sequence
             classification. Alias for `num_labels`. Defaults to None.
-        classification_problem_type (tp.Optional[tp.Literal["regression", "single_label_classification", "multi_label_classification"]]):
+        classification_problem_type (tp.Optional[tp.Literal["regression", "single_label_classification",
+                "multi_label_classification"]]):
             Problem type specifically for sequence classification. Alias for `problem_type`.
             Defaults to None.
     """
@@ -638,23 +639,23 @@ def auxiliary_load_balancing_loss_func(
     experts is too unbalanced.
 
     Args:
-                    gate_logits:
-                                    Logits from the `gate`. Should be a tuple/list of JAX arrays,
-                                    with each array corresponding to a layer and having shape
-                                    [batch_size * sequence_length, num_experts].
-                                    Alternatively, can be a single stacked array of shape
-                                    [num_layers * batch_size * sequence_length, num_experts].
-                    num_experts:
-                                    Number of experts. Must be provided if `gate_logits` is not None.
-                    top_k:
-                                    The number of experts to route per-token, can be also interpreted as the `top-k` routing
-                                    parameter.
-                    attention_mask (`jax.numpy.ndarray`, *optional*):
-                                    The attention_mask used in forward function
-                                    shape [batch_size, sequence_length] if not None.
+        gate_logits:
+            Logits from the `gate`. Should be a tuple/list of JAX arrays,
+            with each array corresponding to a layer and having shape
+            [batch_size * sequence_length, num_experts].
+            Alternatively, can be a single stacked array of shape
+            [num_layers * batch_size * sequence_length, num_experts].
+        num_experts:
+            Number of experts. Must be provided if `gate_logits` is not None.
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`jax.numpy.ndarray`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size, sequence_length] if not None.
 
     Returns:
-                    The auxiliary loss as a JAX scalar array, or 0 if gate_logits is None.
+        The auxiliary loss as a JAX scalar array, or 0 if gate_logits is None.
     """
     if gate_logits is None:
         return 0

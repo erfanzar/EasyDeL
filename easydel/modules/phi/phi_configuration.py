@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -81,7 +83,7 @@ class PhiConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "phi"
-    attribute_map = {
+    attribute_map: typing.ClassVar = {
         "max_position_embeddings": "n_positions",
         "hidden_size": "n_embd",
         "num_attention_heads": "num_attention_heads",

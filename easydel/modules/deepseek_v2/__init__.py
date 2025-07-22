@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .deepseek_configuration import DeepseekV2Config
-from .modeling_deepseek_flax import DeepseekV2ForCausalLM, DeepseekV2Model
+from .modeling_deepseek import DeepseekV2ForCausalLM, DeepseekV2Model
 
 __all__ = "DeepseekV2Config", "DeepseekV2ForCausalLM", "DeepseekV2Model"

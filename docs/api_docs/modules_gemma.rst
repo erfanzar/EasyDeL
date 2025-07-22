@@ -6,4 +6,4 @@ Gemma
 
    modules_gemma___init__
    modules_gemma_gemma_configuration
-   modules_gemma_modeling_gemma_flax
+   modules_gemma_modeling_gemma

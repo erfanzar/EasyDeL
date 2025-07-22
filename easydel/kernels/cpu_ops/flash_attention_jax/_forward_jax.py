@@ -20,6 +20,8 @@ import jax.sharding
 from eformer.escale import with_sharding_constraint
 from jax import lax
 
+from easydel.utils.compiling_utils import ejit
+
 
 @functools.partial(jax.named_call, name="_fwd_flash_attn")
 def _fwd_flash_attn(
@@ -67,7 +69,7 @@ def _fwd_flash_attn(
 
     global_mask = mask
 
-    @jax.jit
+    @ejit
     @functools.partial(jax.named_call, name="_fwd_flash_attn_call_o")
     def call_o(state):
         i, o, lse = state
@@ -76,7 +78,7 @@ def _fwd_flash_attn(
         lse_i = jax.lax.dynamic_slice_in_dim(lse, i * blocksize_q, blocksize_q, 2)
         m_i = jnp.full((b, h, blocksize_q), fill_value=-jnp.inf, dtype=dtype)
 
-        @jax.jit
+        @ejit
         @functools.partial(jax.named_call, name="_fwd_flash_attn_call_o_call_qk")
         def call_qk(state):
             i, j, o_i, q_i, lse_i, m_i = state

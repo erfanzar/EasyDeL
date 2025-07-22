@@ -42,6 +42,8 @@ import jax.lax as lax
 from jax import numpy as jnp
 from jax import random as jrnd
 
+from easydel.utils.compiling_utils import ejit
+
 from ._backward_jax import _ring_attention_bwd
 from ._forward_jax import _ring_attention_fwd
 
@@ -120,23 +122,9 @@ def ring_attention(
 
 
 ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
-ring_attention = jax.jit(
+ring_attention = ejit(
     ring_attention,
-    static_argnums=(
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-    ),
+    static_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17),
 )
 
 

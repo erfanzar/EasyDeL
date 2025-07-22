@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 
+from easydel.utils.compiling_utils import ejit
 
-@partial(jax.jit, static_argnums=(7, 8))
+
+@ejit(static_argnums=(7, 8))
 def _ragged_paged_attention(
     queries: jnp.ndarray,
     key_pages: jnp.ndarray,

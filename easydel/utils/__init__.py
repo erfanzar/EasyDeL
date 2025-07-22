@@ -14,14 +14,7 @@
 from . import analyze_memory, compiling_utils, graph_utils, traversals
 from .checkpoint_managers import CheckpointManager, EasyPath, EasyPathLike
 from .cli_helpers import DataClassArgumentParser
-from .compiling_utils import (
-    cache_compiles,
-    cjit,
-    compile_function,
-    load_cached_functions,
-    load_compiled_fn,
-    save_compiled_fn,
-)
+from .compiling_utils import ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
 from .data_managers import (
     DataManager,
     DatasetLoadError,
@@ -51,12 +44,10 @@ __all__ = (
     "Timers",
     "VisualDatasetInform",
     "analyze_memory",
-    "cache_compiles",
     "capture_time",
     "check_bool_flag",
-    "cjit",
-    "compile_function",
     "compiling_utils",
+    "ejit",
     "get_cache_dir",
     "get_logger",
     "graph_utils",

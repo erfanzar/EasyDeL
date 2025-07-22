@@ -55,17 +55,14 @@ except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter
-    from jax import Array
+    from flax.metrics.tensorboard import SummaryWriter  # type:ignore
+    from jax import Array  # type:ignore
     from torch import Tensor  # type:ignore
-
-    MetricsType = dict[
-        str,
-        float | list | tuple | np.ndarray | Array | Tensor,
-    ]
 else:
-    SummaryWriter = tp.Any
-    MetricsType = tp.Any
+    Array, Tensor = [tp.Any] * 2
+
+
+MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
 logger = get_logger(__name__)
 
 
@@ -347,13 +344,13 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to track memory usage."},
     )
-    use_cjit: bool = field(
-        default=True,
-        metadata={"help": "Whether to use cjit for train and eval functions."},
-    )
     use_data_collactor: bool = field(
         default=True,
         metadata={"help": "Whether to use a data collator."},
+    )
+    use_grain: bool = field(
+        default=True,
+        metadata={"help": "Whether to use grain instead of `tensorflow-datasets`."},
     )
     use_wandb: bool = field(
         default=True,
@@ -482,8 +479,9 @@ class TrainingArguments:
         """
         Checks and sets up variables for start.
         """
-
-        if not isinstance(self.step_partition_spec, PartitionSpec):
+        if isinstance(self.step_partition_spec, str):
+            self.step_partition_spec = eval(self.step_partition_spec)
+        elif not isinstance(self.step_partition_spec, PartitionSpec):
             self.step_partition_spec = PartitionSpec(*tuple(self.step_partition_spec))
 
         self.step_start_point = self.step_start_point or 0
@@ -603,7 +601,7 @@ class TrainingArguments:
 
     @functools.cached_property
     def _tensorboard(self):
-        from flax.metrics.tensorboard import SummaryWriter
+        from flax.metrics.tensorboard import SummaryWriter  # type:ignore
 
         path = self._get_save_directory(create=True)
         if path is None:
@@ -619,8 +617,10 @@ class TrainingArguments:
         Returns:
             flax.metrics.tensorboard.SummaryWriter: The TensorBoard SummaryWriter.
         """
-
-        return self._tensorboard
+        try:
+            return self._tensorboard
+        except ModuleNotFoundError:
+            return None
 
     def get_wandb_init(self):
         """

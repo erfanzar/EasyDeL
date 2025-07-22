@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import dataclasses
 import typing as tp
 import warnings
@@ -23,6 +25,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.prompt_utils import maybe_apply_chat_template
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
@@ -34,15 +37,10 @@ from .reward_config import RewardConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
-else:
-    Dataset = tp.Any
 logger = get_logger(__name__)
 
 
-def _tokenize(
-    batch: dict[str, list[tp.Any]],
-    tokenizer: ProcessingClassType,
-) -> dict[str, list[tp.Any]]:
+def _tokenize(batch: dict[str, list[tp.Any]], tokenizer: ProcessingClassType) -> dict[str, list[tp.Any]]:
     """Tokenize a batch from a reward modelling dataset."""
     new_examples = {
         "input_ids_chosen": [],
@@ -182,7 +180,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_training_static_argnums = (2, 3, 4, 5, 6)
-        sharded_training_step_function = jax.jit(
+        sharded_training_step_function = ejit(
             training_step,
             static_argnums=sharded_training_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -197,7 +195,7 @@ class RewardTrainer(Trainer):
         )
 
         sharded_evaluation_static_argnums = (2, 3, 4)
-        sharded_evaluation_step_function = jax.jit(
+        sharded_evaluation_step_function = ejit(
             evaluation_step,
             static_argnums=sharded_evaluation_static_argnums,
             in_shardings=(self.state_shardings, empty_sharding),

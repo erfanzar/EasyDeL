@@ -19,8 +19,8 @@ def main():
     max_length = max_new_tokens + prefill_length
     pretrained_model_name_or_path = "llava-hf/llava-1.5-7b-hf"
 
-    dtype = jnp.bfloat16
-    param_dtype = jnp.bfloat16
+    dtype = jnp.float16
+    param_dtype = jnp.float16
     partition_axis = ed.PartitionAxis()
 
     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path)

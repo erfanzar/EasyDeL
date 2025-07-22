@@ -23,6 +23,8 @@ import jax.numpy as jnp
 import jax.sharding
 from jax import lax
 
+from easydel.utils.compiling_utils import ejit
+
 
 @functools.partial(jax.named_call, name="_bwd_flash_attn")
 def _bwd_flash_attn(
@@ -66,7 +68,7 @@ def _bwd_flash_attn(
     global_mask = mask
     is_causal = mask is not None
 
-    @jax.jit
+    @ejit
     @functools.partial(jax.named_call, name="_bwd_flash_attn_call_o")
     def call_o(state):
         j, dQ, dK, dV = state
@@ -76,7 +78,7 @@ def _bwd_flash_attn(
         dK_j = jax.lax.dynamic_slice_in_dim(dK, j * blocksize_k, blocksize_k, 2)
         dV_j = jax.lax.dynamic_slice_in_dim(dV, j * blocksize_k, blocksize_k, 2)
 
-        @jax.jit
+        @ejit
         @functools.partial(jax.named_call, name="_bwd_flash_attn_call_o_call_qk")
         def do_inner_block(state):
             i, j, dQ, dK_j, dV_j = state

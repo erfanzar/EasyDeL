@@ -13,6 +13,6 @@
 # limitations under the License.
 
 from .gpt_j_configuration import GPTJConfig
-from .modeling_gpt_j_flax import GPTJForCausalLM, GPTJModel
+from .modeling_gpt_j import GPTJForCausalLM, GPTJModel
 
 __all__ = "GPTJConfig", "GPTJForCausalLM", "GPTJModel"
