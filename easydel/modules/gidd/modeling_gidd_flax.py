@@ -40,9 +40,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagedAttentionCache,
-    PagedAttentionCacheView,
-    PagedAttentionMetadata,
+    PagesCache,
+    PagesCacheView,
+    PagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -184,8 +184,8 @@ class GiddAttention(AttentionModule):
         attention_mask: chex.Array,
         noise_mask: chex.Array,
         # mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> tp.Tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
         """
         Adapted from parent class
@@ -229,8 +229,8 @@ class GiddAttention(AttentionModule):
         noise_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+        cache_view: tp.Optional[TransformerCacheView | PagesCacheView] = None,
+        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         output_attentions: bool = False,
         frequencies: tp.Optional[chex.Array] = None,
@@ -392,8 +392,8 @@ class GiddLayer(nn.Module):
         position_ids: chex.Array,
         causal_mask: tp.Optional[chex.Array | bool],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+        cache_view: tp.Optional[TransformerCacheView | PagesCacheView] = None,
+        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         output_attentions: bool = False,
         fcm_mask: tp.Optional[chex.Array] = None,
@@ -510,8 +510,8 @@ class GiddModel(EasyDeLBaseModule):
         position_ids: tp.Optional[chex.Array] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
-        past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+        past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
+        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
         output_attentions: tp.Optional[bool] = None,
         output_hidden_states: tp.Optional[bool] = None,
     ) -> BaseModelOutput:
@@ -523,8 +523,8 @@ class GiddModel(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed key/value states.
+            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -669,8 +669,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         position_ids: tp.Optional[chex.Array] = None,
         segment_ids: tp.Optional[chex.Array] = None,
         mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
-        past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+        past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
+        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
         output_attentions: tp.Optional[bool] = None,
         output_hidden_states: tp.Optional[bool] = None,
     ) -> CausalLMOutput:
@@ -682,8 +682,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed key/value states.
+            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
