@@ -26,9 +26,8 @@ ray.init()
 # We are using Qwen/Qwen3-14B, a powerful large language model.
 MODEL_ID = "Qwen/Qwen3-14B"
 # DATASET_ID: The dataset for SFT training.
-# 'LDJnr/Pure-Dove' is a common dataset formatted for SFT,
-# containing 'chosen' and 'rejected' response pairs.
-DATASET_ID = "LDJnr/Pure-Dove"
+# 'allenai/WildChat' is a common dataset formatted for SFT
+DATASET_ID = "allenai/WildChat"
 # WANDB_ENTITY: Your Weights & Biases entity (username or organization).
 # Set to None if you don't want to use WandB for logging.
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
