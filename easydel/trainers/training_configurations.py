@@ -136,6 +136,14 @@ class TrainingArguments:
         default=None,
         metadata={"help": "A regex pattern of parameters to freeze (not train)."},
     )
+    grain_shard_index: int | None = field(
+        default=None,
+        metadata={"help": "sharding index to be used for grain dataloaders in both train and eval steps."},
+    )
+    grain_shard_count: int | None = field(
+        default=None,
+        metadata={"help": "sharding count to be used for grain dataloaders in both train and eval steps."},
+    )
     gradient_accumulation_steps: int = field(
         default=1,
         metadata={"help": "The number of steps to accumulate gradients over."},
