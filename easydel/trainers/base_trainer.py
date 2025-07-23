@@ -561,10 +561,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 batch_size = self.evaluation_batch_size
                 shuffle = False
                 num_epochs = 1
-
             shard_options = grain.ShardOptions(
-                shard_index=jax.process_index(),
-                shard_count=jax.process_count(),
+                shard_index=self.arguments.grain_shard_index or 0,
+                shard_count=self.arguments.grain_shard_count or 1,
                 drop_remainder=True,
             )
             from datasets import IterableDataset
