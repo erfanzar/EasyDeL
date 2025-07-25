@@ -89,7 +89,7 @@ class GiddMLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
         h = self.up_proj(h)
-        h = nn.relu(h) ** 2  # Squared ReLU activation
+        h = nn.relu(h) ** 2
         h = self.down_proj(h)
         h = apply_logical_sharding(
             h,
@@ -292,10 +292,8 @@ class GiddAttention(AttentionModule):
             noise_mask=noise_mask,
         )
 
-        query_states = query_states * self.qk_scale
-
         attentions = self.attention_performer.forward(
-            query_states=query_states,
+            query_states=query_states * self.qk_scale,
             key_states=key_states,
             value_states=value_states,
             mode=mode,
