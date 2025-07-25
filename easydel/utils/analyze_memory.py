@@ -38,14 +38,16 @@ except ImportError:
 
 
 class SMPMemoryMonitor:
-    def __init__(self, check_interval: int = 60):
+    def __init__(self, check_interval: int = 60, quiet: bool = False):
         """
         Initialize the memory monitor.
 
         Args:
             check_interval: How often to check memory in seconds (default: 60)
+            quiet: If True, suppresses output messages (default: False)
         """
         self.check_interval = check_interval
+        self.quiet = quiet
         self.running = False
         self.history = []
         self._monitor_thread = None
@@ -90,7 +92,10 @@ class SMPMemoryMonitor:
     def _monitor_loop(self):
         """Internal monitoring loop."""
         while self.running:
-            self.check_all_devices()
+            if self.quiet:
+                self.check_all_devices()
+            else:
+                self.print_current_status()
             time.sleep(self.check_interval)
 
     def check_all_devices(self) -> list[dict]:
