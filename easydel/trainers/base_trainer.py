@@ -109,7 +109,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_attributes()
         self.initialize_trainer_utils()
 
-        if self.arguments.track_memory:
+        if self.arguments.track_memory and self.arguments.track_memory > 0:
             self._initialize_memory_tracking()
 
     def load_trainer_state(
@@ -327,7 +327,8 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self.arguments.performance_mode:
             import easydel
 
-            self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(1)
+            interval = 1.0 if self.arguments.track_memory is True else self.arguments.track_memory
+            self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
         return pprint.pformat(self.__dict__, indent=2)
