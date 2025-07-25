@@ -650,6 +650,18 @@ class BaseTrainer(BaseTrainerProtocol):
             raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
         import tensorflow as tf  # type:ignore
 
+        try:
+            # Disable all GPUS
+            tf.config.set_visible_devices([], 'GPU')
+            visible_devices = tf.config.get_visible_devices()
+            for device in visible_devices:
+                assert device.device_type != 'GPU'
+        except RuntimeError as e:
+            # Invalid device or cannot modify virtual devices once initialized.
+            logger.error(f"Failed to disable GPU devices: {e}")
+        except AssertionError:
+            logger.warning("TensorFlow may be hogging GPU memory.")
+
         def create_tf_dataset(dataset: Dataset, is_train: bool) -> tp.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from a Hugging Face Dataset.
