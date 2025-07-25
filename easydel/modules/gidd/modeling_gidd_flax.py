@@ -119,14 +119,18 @@ class GiddAttention(AttentionModule):
         head_dim = config.hidden_size // config.num_attention_heads
         self.head_dim = getattr(config, "head_dim", head_dim)
 
+        self.use_qk_norm = config.use_qk_norm
         self.qk_norm_eps = config.qk_norm_eps
-        self.qk_scale = nn.Param(
-            jnp.full(
-                self.config.num_attention_heads,
-                2 * jnp.log(config.max_position_embeddings),
-                dtype=jnp.float32,
-            ),
-        )
+        if self.use_qk_norm:
+            self.qk_scale = nn.Param(
+                jnp.full(
+                    (1, 1, self.config.num_attention_heads, 1),
+                    2 * jnp.log(config.max_position_embeddings),
+                    dtype=self.param_dtype,
+                ),
+            )
+        else:
+            self.qk_scale = 1.0
 
         linear_class = partial(
             ParallelLinear,
@@ -168,7 +172,7 @@ class GiddAttention(AttentionModule):
 
         self.attention_performer = FlexibleAttentionModule(
             base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
+            softmax_scale=1.0 if self.use_qk_norm else 1.0 / self.head_dim**0.5,
             dropout_prob=0.0,
         )
 
@@ -219,7 +223,7 @@ class GiddAttention(AttentionModule):
         return key, value, attention_mask, init_attention_bias, cache_view
     
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.qk_norm_eps)
+        return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + self.qk_norm_eps)
 
     def __call__(
         self,
@@ -236,10 +240,14 @@ class GiddAttention(AttentionModule):
     ) -> tp.Tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self._norm(self.q_proj(hidden_states)),
-            self._norm(self.k_proj(hidden_states)),
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
             self.v_proj(hidden_states),
         )
+        if self.use_qk_norm:
+            query_states = self._norm(query_states)
+            key_states = self._norm(key_states)
+
         qshape = (
             batch_size,
             sequence_length,
@@ -284,7 +292,7 @@ class GiddAttention(AttentionModule):
             noise_mask=noise_mask,
         )
 
-        query_states = query_states * self.qk_scale[None, None, :, None]
+        query_states = query_states * self.qk_scale
 
         attentions = self.attention_performer.forward(
             query_states=query_states,
