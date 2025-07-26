@@ -11,7 +11,7 @@ class TestPageManager(unittest.TestCase):
         self.num_pages = 100
         self.max_sequences = 10
         self.page_size = 16
-        self.pages_per_sequence = 5
+        self.max_num_pages_per_req = 5
 
     def create_manager(self):
         """Helper to create a fresh PageManager instance."""
@@ -19,7 +19,7 @@ class TestPageManager(unittest.TestCase):
             num_pages=self.num_pages,
             max_sequences=self.max_sequences,
             page_size=self.page_size,
-            pages_per_sequence=self.pages_per_sequence,
+            max_num_pages_per_req=self.max_num_pages_per_req,
         )
 
     def test_create(self):

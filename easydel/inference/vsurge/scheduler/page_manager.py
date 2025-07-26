@@ -31,7 +31,7 @@ class PageManager:
     Each sequence is allocated pages as needed to store its tokens.
     """
 
-    sequence_page_table: jnp.ndarray  # [max_sequences, pages_per_sequence] - which pages belong to each sequence
+    sequence_page_table: jnp.ndarray  # [max_sequences, max_num_pages_per_req] - which pages belong to each sequence
     page_ownership: jnp.ndarray  # [num_pages] - which sequence owns each page (-1 if free)
     sequence_lengths: jnp.ndarray  # [max_sequences] - current token count for each sequence (-1 if inactive)
     page_size: int  # Number of tokens per page
@@ -51,7 +51,7 @@ class PageManager:
         num_pages: int,
         max_sequences: int,
         page_size: int,
-        pages_per_sequence: int,
+        max_num_pages_per_req: int,
     ) -> PageManager:
         """
         Create a new PageManager instance.
@@ -60,10 +60,10 @@ class PageManager:
             num_pages: Total number of pages available in the system
             max_sequences: Maximum number of concurrent sequences
             page_size: Number of tokens that fit in each page
-            pages_per_sequence: Maximum pages allocatable to each sequence
+            max_num_pages_per_req: Maximum pages allocatable to each sequence
         """
         return PageManager(
-            sequence_page_table=jnp.full((max_sequences, pages_per_sequence), -1, dtype=jnp.int32),
+            sequence_page_table=jnp.full((max_sequences, max_num_pages_per_req), -1, dtype=jnp.int32),
             page_ownership=jnp.full((num_pages,), -1, dtype=jnp.int32),
             sequence_lengths=jnp.full((max_sequences,), -1, dtype=jnp.int32),
             page_size=page_size,

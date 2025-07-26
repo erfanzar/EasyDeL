@@ -408,7 +408,7 @@ class ContinuousBatchingEngine:
         max_batch_tokens: int,
         num_pages: int,
         page_size: int,
-        pages_per_sequence: int,
+        max_num_pages_per_req: int,
         prefill_chunk_size: int = 256,
         decode_batch_size: int = 32,
         prefill_priority: float = 0.7,
@@ -428,7 +428,7 @@ class ContinuousBatchingEngine:
             num_pages=num_pages,
             max_sequences=max_requests,
             page_size=page_size,
-            pages_per_sequence=pages_per_sequence,
+            max_num_pages_per_req=max_num_pages_per_req,
         )
 
         return ContinuousBatchingEngine(
