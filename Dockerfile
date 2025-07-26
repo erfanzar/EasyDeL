@@ -22,9 +22,9 @@ ARG HARDWARE_TYPE=cpu
 RUN --mount=type=cache,target=/root/.cache/uv \
 	uv venv /app/.venv && \
 	if [ "$HARDWARE_TYPE" = "gpu" ]; then \
-		uv sync --frozen --no-install-project --no-dev --extra torch --extra gpu; \
+		uv sync --frozen --no-install-project --no-dev --extra gpu; \
 	elif [ "$HARDWARE_TYPE" = "tpu" ]; then \
-		uv sync --frozen --no-install-project --no-dev --extra torch --extra tpu; \
+		uv sync --frozen --no-install-project --no-dev --extra tpu; \
 	else \
 		uv sync --frozen --no-install-project --no-dev; \
 	fi
