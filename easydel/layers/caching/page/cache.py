@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import typing as tp
+from math import ceil
 
 import chex as cx
 import jax
@@ -47,12 +48,14 @@ class PagesCacheMetaData(BaseCacheMetadata):
     """
 
     num_hidden_layers: int
+    max_model_length: int
     num_kv_heads: int
     k_headdim: int
     v_headdim: int
     hbm_utilization: float = 0.9
     page_size: int = 128
     num_pages: int = -1
+    pages_per_sequence: int = -1
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
@@ -76,6 +79,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
         kvdtype: jnp.dtype,
         num_hidden_layers: int,
         num_kv_heads: int,
+        max_model_length: int,
         kv_head_dim_size: int | None = None,
         k_headdim: int | None = None,
         v_headdim: int | None = None,
@@ -100,12 +104,14 @@ class PagesCacheMetaData(BaseCacheMetadata):
         num_pages = int(free) // block_bytes
         return cls(
             num_hidden_layers=num_hidden_layers,
+            max_model_length=max_model_length,
             num_kv_heads=num_kv_heads,
             k_headdim=k_headdim,
             v_headdim=v_headdim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             num_pages=num_pages,
+            pages_per_sequence=ceil(max_model_length / page_size),
         )
 
 
@@ -176,8 +182,8 @@ class PagesCacheView(BaseCacheView):
     def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
         num_blocks, block_size, num_combined_kv_heads, head_size = self.kv_pages.shape
         num_kv_heads = num_combined_kv_heads // 2
-        key = key.reshape(-1, num_kv_heads, head_size)
-        value = value.reshape(-1, num_kv_heads, head_size)
+        key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
+        value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         kv = jnp.concatenate([key, value], axis=-1).reshape(-1, num_combined_kv_heads, head_size)
         kv_cache_flat = self.kv_pages.reshape(-1, num_combined_kv_heads, head_size)
         updated_kv_cache_flat = kv_cache_flat.at[cache_metadata.slot_mapping].set(kv)
@@ -275,12 +281,12 @@ class PagesCache(BaseCache):
 
 @auto_pytree
 class PagesMetadata:
-    slot_mapping: jax.Array  # [num_tokens] i32
-    block_tables: jax.Array  # [sequence, page] i32
-    context_lens: jax.Array  # [sequence] i32
-    query_start_loc: jax.Array  # [sequence + 1] i32
-    num_seqs: jax.Array  # [1] i32
-
+    pages_tables: jax.Array
+    context_lens: jax.Array
+    query_start_loc: jax.Array
+    num_seqs: jax.Array
+    slot_mapping: jax.Array
+    position_ids: jax.Array
     page_size: int = 128
     prefill_chunk_size: int = 512
     blocksize: int = 256
@@ -290,10 +296,10 @@ class PagesMetadata:
         """Create empty metadata with proper shapes."""
         return cls(
             slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32),
-            block_tables=jnp.zeros((max_num_reqs, max_blocks), dtype=jnp.int32),
+            pages_tables=jnp.zeros((max_num_reqs, max_blocks), dtype=jnp.int32),
             context_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             query_start_loc=jnp.zeros([max_num_reqs + 1], dtype=jnp.int32),
+            position_ids=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
-            block_table_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             page_size=page_size,
         )

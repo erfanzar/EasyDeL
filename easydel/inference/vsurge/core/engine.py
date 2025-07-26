@@ -28,6 +28,7 @@ from transformers import ProcessorMixin
 
 from easydel.inference.sampling_params import JitableSamplingParams
 from easydel.layers.attention import AttentionMechanisms
+from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
 from easydel.utils import ejit
 
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
@@ -133,6 +134,7 @@ class vEngine:
             dtype=model.config.kvdtype or model.dtype,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            max_model_length=self.max_decodes_length * max_concurrent_decodes,
         )
         if extra_eos_token_ids is not None:
             if isinstance(extra_eos_token_ids, int):
@@ -209,6 +211,8 @@ class vEngine:
                     None,
                     self._empty_sharding,
                     None,
+                    self._decodes_state_sharding.cache if self.is_paged_runtime else None,
+                    self._empty_sharding if self.is_paged_runtime else None,
                     None,
                 ),
                 out_shardings=(self._prefill_state_sharding, None),
@@ -221,6 +225,7 @@ class vEngine:
                     es.extract_shardings(self.graphstate),
                     es.extract_shardings(self.graphothers),
                     self._decodes_state_sharding,
+                    self._empty_sharding,
                     None,
                     None,
                 ),
@@ -316,6 +321,7 @@ class vEngine:
         """Returns the configured batch size for the engine, if specified."""
         return self._batch_size
 
+    @property
     def max_decodes_length(self) -> int:
         """Maximum allowed length for the decode phase.
 
@@ -375,14 +381,18 @@ class vEngine:
         if vocab_size is None and hasattr(self.model.config, "text_config"):
             vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
         assert vocab_size is not None, "couldn't find `vocab_size` in model config"
-        dt = self.model.dtype
+
         if self.is_paged_runtime:
-            cache = self.model.init_pages(metadata=self.page_metadata)
+            cache = self.model.init_pages(
+                metadata=self.page_metadata,
+                dtype=self.model.config.kvdtype or self.model.dtype,
+            )
         else:
             cache = self.model.init_cache(concurrent_decode, self.max_length)
+
         with self.model.mesh:
             return GenerationState(
-                logits=jnp.zeros((concurrent_decode, vocab_size), dt, device=sharding),
+                logits=jnp.zeros((concurrent_decode, vocab_size), self.model.dtype, device=sharding),
                 cache=cache,
                 index=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
                 tokens=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
@@ -433,6 +443,8 @@ class vEngine:
         true_length: int,
         sampling_params: JitableSamplingParams,
         rngs: jax.random.PRNGKey,
+        cache: TransformerCache | PagesCache | None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None,
         slot: int,
     ) -> tuple[GenerationState, ResultTokens]:
         """Performs the prefill step for initializing the generation process.
@@ -470,6 +482,8 @@ class vEngine:
             sampling_params,
             self.max_length,
             self.samples_per_slot,
+            cache,
+            cache_metadata,
             rngs,
         )
 
@@ -478,6 +492,7 @@ class vEngine:
         graphstate: nn.GraphState,
         graphothers: nn.GraphState,
         state: GenerationState,
+        cache_metadata: TransformerMetadata | PagesMetadata | None,
         rngs: jax.random.PRNGKey,
         slot: int,
     ) -> tuple[GenerationState, ResultTokens]:
@@ -507,6 +522,7 @@ class vEngine:
             graphstate,
             graphothers,
             state,
+            cache_metadata,
             self.samples_per_slot,
             rngs,
         )

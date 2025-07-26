@@ -78,7 +78,7 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
     causal_mask = jnp.full((seq_len, seq_len), fill_value=d_min, dtype=dtype)
 
     block_end_idx = jnp.cumsum(jnp.array(patch_embeds_list))
-    block_start_idx = jnp.cumsum(jnp.array([0] + patch_embeds_list[:-1]))
+    block_start_idx = jnp.cumsum(jnp.array([0, *patch_embeds_list[:-1]]))
 
     def update_mask(mask, start_end):
         start, end = start_end

@@ -1,12 +1,6 @@
-import os
-import sys
-
-import datasets
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-
 import logging
 
+import datasets
 import flax
 import jax.numpy as jnp
 from transformers import AutoTokenizer

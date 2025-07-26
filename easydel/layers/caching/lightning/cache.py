@@ -153,10 +153,7 @@ class LightningCacheView(BaseCacheView):
                 )
                 causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
 
-            causal_mask = jnp.broadcast_to(
-                causal_mask,
-                (query.shape[0],) + causal_mask.shape[1:],
-            )
+            causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
 
             attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
             attention_mask = jnp.logical_and(attention_mask, causal_mask)

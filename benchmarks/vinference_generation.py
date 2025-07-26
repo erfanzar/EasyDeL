@@ -1,8 +1,5 @@
 import asyncio
-import os
-import sys
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import jax
 from huggingface_hub import HfApi
 from jax import lax, sharding

@@ -144,7 +144,7 @@ class SiglipVisionEmbeddings(nn.Module):
         pixel_values = pixel_values.transpose(0, 2, 3, 1).astype(dtype=target_dtype)
         patch_embeds = self.patch_embedding(pixel_values).transpose(0, 3, 1, 2)
 
-        embeddings = jnp.reshape(patch_embeds, patch_embeds.shape[:2] + (-1,))
+        embeddings = jnp.reshape(patch_embeds, (*patch_embeds.shape[:2], -1))
         embeddings = jnp.transpose(embeddings, (0, 2, 1))
         if interpolate_pos_encoding:
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)

@@ -179,7 +179,7 @@ def _rotate_gptj(x: jnp.ndarray) -> jnp.ndarray:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     x = jnp.stack((-x2, x1), axis=-1)
-    return x.reshape(x.shape[:-2] + (-1,))
+    return x.reshape((*x.shape[:-2], -1))
 
 
 @jax.named_scope("easydel-rotary-apply-rotary-emb")
