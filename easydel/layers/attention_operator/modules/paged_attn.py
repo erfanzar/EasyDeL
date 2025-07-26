@@ -142,7 +142,7 @@ class PagedAttn(AttentionImpl):
                 qaxes,
                 resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.block_tables.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.pages_tables.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
             ),
@@ -153,7 +153,7 @@ class PagedAttn(AttentionImpl):
             q,
             kv_pages,
             cache_metadata.context_lens,
-            cache_metadata.block_tables,
+            cache_metadata.pages_tables,
             cache_metadata.query_start_loc,
             cache_metadata.num_seqs,
         )

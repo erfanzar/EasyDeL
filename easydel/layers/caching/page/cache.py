@@ -25,16 +25,32 @@ from eformer import common_types
 from eformer import escale as es
 from eformer.escale import PartitionManager
 from eformer.jaximus import ImplicitArray
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
+from .utils import kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+
+
+def previous_power_of_2(n: int) -> int:
+    if n <= 0:
+        return 0
+    return 1 << (n.bit_length() - 1)
+
+
+def get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
+    num_slices_per_block = (16 * 1024 * 1024) // page_size_bytes
+    assert num_slices_per_block > 0, "Number of slices should be positive"
+    num_slices_per_block = previous_power_of_2(num_slices_per_block)
+    if num_slices_per_block > 64:
+        num_slices_per_block = 64
+    return num_slices_per_block
 
 
 @auto_pytree
@@ -55,7 +71,8 @@ class PagesCacheMetaData(BaseCacheMetadata):
     hbm_utilization: float = 0.9
     page_size: int = 128
     num_pages: int = -1
-    pages_per_sequence: int = -1
+    max_num_pages_per_req: int = -1
+    num_slices_per_kv_cache_update_block: int = -1
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
@@ -102,6 +119,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         block_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // block_bytes
+
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -111,8 +129,19 @@ class PagesCacheMetaData(BaseCacheMetadata):
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             num_pages=num_pages,
-            pages_per_sequence=ceil(max_model_length / page_size),
+            max_num_pages_per_req=ceil(max_model_length / page_size),
+            num_slices_per_kv_cache_update_block=get_num_slices_per_kv_cache_update_block(block_bytes),
         )
+
+    def get_padded_num_slices(self, num_tokens: int, max_num_reqs: int):
+        padded_num_slices = 2 * max_num_reqs + num_tokens // self.page_size
+        padded_num_slices = min(padded_num_slices, num_tokens)
+        padded_num_slices = (
+            (padded_num_slices + self.num_slices_per_kv_cache_update_block - 1)
+            // self.num_slices_per_kv_cache_update_block
+            * self.num_slices_per_kv_cache_update_block
+        )
+        return padded_num_slices
 
 
 @auto_pytree
@@ -180,14 +209,28 @@ class PagesCacheView(BaseCacheView):
         return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages)
 
     def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
-        num_blocks, block_size, num_combined_kv_heads, head_size = self.kv_pages.shape
-        num_kv_heads = num_combined_kv_heads // 2
+        num_kv_heads = key.shape[2]
+        head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
-        kv = jnp.concatenate([key, value], axis=-1).reshape(-1, num_combined_kv_heads, head_size)
-        kv_cache_flat = self.kv_pages.reshape(-1, num_combined_kv_heads, head_size)
-        updated_kv_cache_flat = kv_cache_flat.at[cache_metadata.slot_mapping].set(kv)
-        self.kv_pages = updated_kv_cache_flat.reshape(num_blocks, block_size, num_combined_kv_heads, head_size)
+
+        # self.kv_pages = kv_cache_update(
+        #     jnp.concatenate([key, value], 1),
+        #     cache_metadata.slot_mapping,
+        #     self.kv_pages.reshape(-1, *self.kv_pages.shape[2:]),
+        #     cache_metadata.num_kv_update_slices,
+        #     page_size=cache_metadata.page_size,
+        #     slices_per_processing_block=cache_metadata.num_slices_per_kv_cache_update_block,
+        # ).reshape(self.kv_pages.shape)
+
+        self.kv_pages = kv_cache_update_jax(
+            jnp.concatenate([key, value], 1),
+            cache_metadata.slot_mapping,
+            self.kv_pages.reshape(-1, *self.kv_pages.shape[2:]),
+            cache_metadata.num_kv_update_slices,
+            page_size=cache_metadata.page_size,
+        ).reshape(self.kv_pages.shape)
+
         return self
 
     @property
@@ -286,10 +329,12 @@ class PagesMetadata:
     query_start_loc: jax.Array
     num_seqs: jax.Array
     slot_mapping: jax.Array
-    position_ids: jax.Array
-    page_size: int = 128
-    prefill_chunk_size: int = 512
-    blocksize: int = 256
+    position_ids: jax.Array | None = None
+    num_kv_update_slices: jax.Array | None = None
+    num_slices_per_kv_cache_update_block: int | None = field(pytree_node=False, default_factory=lambda: None)
+    page_size: int = field(pytree_node=False, default=128)
+    prefill_chunk_size: int = field(pytree_node=False, default=512)
+    blocksize: int = field(pytree_node=False, default=256)
 
     @classmethod
     def create_empty(cls, num_tokens: int, max_num_reqs: int, max_blocks: int, page_size: int = 128) -> PagesMetadata:

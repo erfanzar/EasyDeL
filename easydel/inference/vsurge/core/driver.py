@@ -147,11 +147,11 @@ class vDriver:
         self.pages_metadata = PagesMetadata.create_empty(
             num_tokens=engine.max_prefill_length,
             max_num_reqs=engine.max_concurrent_decodes,
-            max_blocks=metadata.pages_per_sequence,
+            max_blocks=metadata.max_num_pages_per_req,
             page_size=metadata.page_size,
         )
         self.log(
-            f"Initialized PagesMetadata with page_size={metadata.page_size}, max_blocks={metadata.pages_per_sequence}"
+            f"Initialized PagesMetadata with page_size={metadata.page_size}, max_blocks={metadata.max_num_pages_per_req}"
         )
 
     @cached_property

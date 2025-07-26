@@ -54,7 +54,7 @@ class PagedScheduler:
             num_pages=metadata.num_pages,
             max_sequences=max_batch_size,
             page_size=metadata.page_size,
-            pages_per_sequence=metadata.pages_per_sequence,
+            max_num_pages_per_req=metadata.max_num_pages_per_req,
         )
 
         self.prefill_queue: queue.PriorityQueue = queue.PriorityQueue()
