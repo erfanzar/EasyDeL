@@ -303,3 +303,35 @@ class PagesMetadata:
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             page_size=page_size,
         )
+
+
+class BlockAllocator:
+    """
+    Manages allocation and freeing of physical blocks (pages) within the EasyDeL cache.
+    This interacts with the cache's metadata to determine total pages and tracks free ones.
+    """
+
+    def __init__(self, cache_metadata: PagesCacheMetaData):
+        if not hasattr(cache_metadata, "num_pages") or cache_metadata.num_pages <= 0:
+            raise ValueError("Cache metadata must have a positive 'num_pages' attribute.")
+        self.total_pages = cache_metadata.num_pages
+        self.free_pages: set[int] = set(range(self.total_pages))
+
+    def allocate(self, num_pages: int) -> list[int]:
+        if num_pages <= 0:
+            return []
+        if len(self.free_pages) < num_pages:
+            raise RuntimeError(f"Out of KV cache pages! Requested: {num_pages}, Available: {len(self.free_pages)}")
+
+        free_list = sorted(list(self.free_pages))
+        allocated_ids = free_list[:num_pages]
+        self.free_pages.difference_update(allocated_ids)
+        return allocated_ids
+
+    def free(self, page_ids: list[int]):
+        if not page_ids:
+            return
+        invalid_ids = [pid for pid in page_ids if pid < 0 or pid >= self.total_pages]
+        if invalid_ids:
+            raise ValueError(f"Attempting to free invalid page IDs: {invalid_ids}")
+        self.free_pages.update(page_ids)

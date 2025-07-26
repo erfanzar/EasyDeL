@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import typing
 
 from jax import numpy as jnp
 
 from easydel.layers.caching import PagesMetadata
 
-from ..utils import ActiveRequest
-from .page_manager import PageManager
+if typing.TYPE_CHECKING:
+    from ..utils import ActiveRequest
+    from .page_manager import PageManager
 
 
 @dataclasses.dataclass
