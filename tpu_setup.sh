@@ -197,7 +197,7 @@ if ! eopod run "pip install uv --quiet -U"; then
 fi
 
 log_info "Creating virtual environment..."
-if ! eopod run "~/.local/bin/uv venv $VENV_PATH --clear"; then
+if ! eopod run "~/.local/bin/uv venv $VENV_PATH --clear --python 3.11.6"; then
     log_error "Failed to create virtual environment"
     exit 1
 fi
