@@ -503,7 +503,7 @@ wheels = [
 
 [[package]]
 name = "easydel"
-version = "0.1.5.dev20"
+version = "0.1.5.dev22"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
