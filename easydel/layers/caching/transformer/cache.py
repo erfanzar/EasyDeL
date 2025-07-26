@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import typing as tp
+from enum import Enum
 from functools import partial
 
 import chex as cx
@@ -29,14 +30,21 @@ from jax.extend.core import Primitive
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
-from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+
+
+@auto_pytree
+class AttnMaskDetail:
+    mask_type: Enum
+    size: int
+    offset: int | None = None
+    chunks: int | None = None
+    bricks: int | None = None
 
 
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -214,6 +222,8 @@ class TransformerCacheView(BaseCacheView):
         layer_index: int | None = None,
         masking_details: AttnMaskDetail | None = None,
     ):
+        from easydel.infra.utils import AttnMaskType
+
         with jax.named_scope("easydel-transformer-cacheview-init"):
             mt = metadata
             kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
@@ -279,6 +289,8 @@ class TransformerCacheView(BaseCacheView):
                 - Updated value cache tensor (functional update).
                 - Final attention mask to be used (either original or calculated).
         """
+        from easydel.infra.utils import AttnMaskType
+
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
         masking_details = self.masking_details
