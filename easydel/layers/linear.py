@@ -251,8 +251,12 @@ class ParallelLinear(nn.Module):
                 parallel_config.axis_name,
             )
 
-    def collective_forward(self, inputs: Shaped[Array, "... in_features"]) -> Shaped[Array, "... out_features"]:
-        kernel = self.kernel.value
+    def collective_forward(
+        self,
+        inputs: Shaped[Array, "... in_features"],
+        w: Array | None = None,
+    ) -> Shaped[Array, "... out_features"]:
+        kernel = self.kernel.value if w is None else w
         bias = self.bias.value if self.use_bias else None
 
         if bias is not None:
@@ -295,14 +299,18 @@ class ParallelLinear(nn.Module):
             check_rep=False,
         )(inputs_2d, kernel)
 
-        output = output_2d.reshape(orig_shape[:-1] + (self.out_features,))
+        output = output_2d.reshape((*orig_shape[:-1], self.out_features))
 
         if bias is not None:
             output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
 
         return output
 
-    def native_forward(self, inputs: Shaped[Array, "... in_features"]) -> Shaped[Array, "... out_features"]:
+    def native_forward(
+        self,
+        inputs: Shaped[Array, "... in_features"],
+        w: Array | None = None,
+    ) -> Shaped[Array, "... out_features"]:
         """Applies the linear transformation with optional tensor parallelism.
 
         Args:
@@ -316,7 +324,7 @@ class ParallelLinear(nn.Module):
             Output is sharded for COLUMN parallelism if `reduce_scatter_output` is True.
             Otherwise, output is fully replicated.
         """
-        kernel = self.kernel.value
+        kernel = self.kernel.value if w is None else w
         bias = self.bias.value if self.use_bias else None
 
         if bias is not None:
@@ -339,10 +347,14 @@ class ParallelLinear(nn.Module):
 
         return y
 
-    def __call__(self, inputs: Shaped[Array, "... in_features"]) -> Shaped[Array, "... out_features"]:
+    def __call__(
+        self,
+        inputs: Shaped[Array, "... in_features"],
+        w: Array | None = None,
+    ) -> Shaped[Array, "... out_features"]:
         if self.distributed_matmul is None:
-            return self.native_forward(inputs=inputs)
-        return self.collective_forward(inputs=inputs)
+            return self.native_forward(inputs=inputs, w=w)
+        return self.collective_forward(inputs=inputs, w=w)
 
 
 class RowParallelLinear(ParallelLinear):

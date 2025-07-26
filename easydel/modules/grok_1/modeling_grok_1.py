@@ -152,7 +152,7 @@ class Grok1Attention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.hidden_size))
 
     def __call__(
         self,

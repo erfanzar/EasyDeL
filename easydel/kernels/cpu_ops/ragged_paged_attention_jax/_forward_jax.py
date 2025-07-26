@@ -152,7 +152,12 @@ def _ragged_paged_attention(
         )
 
     return jax.lax.slice(
-        jax.lax.fori_loop(0, num_seqs[0], _compute_attention_for_sequence, attention_output),
+        jax.lax.fori_loop(
+            0,
+            num_seqs[0] if num_seqs.shape != () else num_seqs,
+            _compute_attention_for_sequence,
+            attention_output,
+        ),
         (0, 0, 0, 0),
         (total_query_tokens, num_kv_heads, q_heads_per_group, head_size),
     ).reshape(out_shape)

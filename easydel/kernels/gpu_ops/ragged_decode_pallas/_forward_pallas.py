@@ -255,7 +255,6 @@ def decode_attn_sequence(
             compiler_params=ptriton.CompilerParams(
                 num_warps=effective_num_warps,
                 num_stages=num_stages,
-                serialized_metadata=None,
             ),
             out_shape=[
                 jax.ShapeDtypeStruct(shape=(num_key_splits, *query_tensor.shape), dtype=query_tensor.dtype),

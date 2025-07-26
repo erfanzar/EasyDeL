@@ -4,11 +4,11 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.1.5.dev20"
+version = "0.1.5.dev22"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = { text = "Apache-2.0" }
 keywords = [
 	"Deep Learning",
@@ -30,9 +30,9 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax==0.6.2",
-	"jaxlib==0.6.2",
-	"eformer==0.0.46",
+	"jax==0.7.0",
+	"jaxlib==0.7.0",
+	"eformer==0.0.47",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
 	"flax==0.10.7",
@@ -72,8 +72,8 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]==0.6.2", "torch==2.6.0", "tensorboard>=2.19.0"]
-tpu = ["jax[tpu]==0.6.2", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]==0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
+tpu = ["jax[tpu]==0.7.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 
 [tool.black]

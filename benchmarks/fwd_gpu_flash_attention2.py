@@ -1,11 +1,6 @@
 import functools
-import os
-import sys
 import typing as tp
 
-import easydel
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import jax
 import jaxlib
 import triton
@@ -15,6 +10,7 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from jax.sharding import NamedSharding, PartitionSpec
 
+import easydel
 from easydel.kernels.gpu_ops import triton_flash_attention
 
 mesh = create_mesh(

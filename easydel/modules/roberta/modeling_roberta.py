@@ -178,7 +178,7 @@ class RobertaSelfAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.config.num_attention_heads, self.head_dim))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
         """
@@ -190,7 +190,7 @@ class RobertaSelfAttention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.config.hidden_size,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.config.hidden_size))
 
     def __call__(
         self,
@@ -264,7 +264,7 @@ class RobertaSelfAttention(AttentionModule):
             attn_weights = jnp.einsum("...hqk,h->...hqk", attn_weights, layer_head_mask)
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
 
-        attn_output = self.shard_attention_prod(attn_output.reshape(attn_output.shape[:2] + (-1,)))
+        attn_output = self.shard_attention_prod(attn_output.reshape((*attn_output.shape[:2], -1)))
 
         return AttentionLayerOutput(
             attention_output=attn_output,

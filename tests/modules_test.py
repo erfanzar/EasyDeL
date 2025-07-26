@@ -1,13 +1,9 @@
+import copy
 import gc
-import os
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
 # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # os.environ["JAX_PLATFORMS"] = "cpu"
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import copy
 import unittest
 
 import jax
