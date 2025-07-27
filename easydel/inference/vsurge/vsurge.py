@@ -26,11 +26,13 @@ from easydel.utils.helpers import get_logger
 
 from ..sampling_params import SamplingParams
 from .core import vDriver, vEngine
+from .request_type import vSurgeRequest
 from .utils import (
     ActiveRequest,
     ActiveRequestMetadata,
     AsyncMultifuture,
     ReturnSample,
+    SmartBytecodeDecoder,
     calculate_pefill_lengths,
     text_tokens_to_string,
 )
@@ -40,152 +42,6 @@ if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
 
 logger = get_logger("vSurge")
-
-
-class vSurgeMetadata:
-    """Tracks timing information for requests processed by vSurge.
-
-    Attributes:
-        start_time (float): The Unix timestamp (seconds) when request processing began.
-    """
-
-    def __init__(self):
-        """Initializes the metadata, capturing the current time as the start time."""
-        self.start_time = time.time()
-
-
-@dataclasses.dataclass
-class vSurgeRequest:
-    """Represents a request for text completion within the vSurge system.
-
-    Attributes:
-        prompt (str): The input prompt for text completion.
-        max_tokens (int): The maximum number of tokens to generate.
-        top_p (float): Nucleus sampling probability. Defaults to 0.95.
-        top_k (int): Number of highest probability tokens for top-k filtering. Defaults to 0.
-        min_p (float): Minimum probability for a token to be considered. Defaults to 0.0.
-        n (int): Number of independent samples to generate. Defaults to 1.
-        stop (tp.Optional[tp.Union[str, tp.list[str]]]): String or list of strings to
-            stop generation if encountered. Defaults to None.
-        temperature (float): Sampling temperature. Defaults to 0.7.
-        presence_penalty (float): Penalty for token presence. Defaults to 0.0.
-        frequency_penalty (float): Penalty for token frequency. Defaults to 0.0.
-        repetition_penalty (float): Penalty for repeated tokens. Defaults to 1.0.
-        metadata (tp.Optional[vSurgeMetadata]): Metadata associated with the request.
-            Auto-initialized if None.
-        is_client_side_tokenization (bool): If True, prompt is tokenized and client expects
-            token IDs. Defaults to False.
-    """
-
-    prompt: str
-    sampling_params: SamplingParams
-    metadata: vSurgeMetadata | None = None
-    is_client_side_tokenization: bool = False
-
-    @classmethod
-    def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams) -> vSurgeRequest:
-        """Creates a vSurgeRequest from a prompt and SamplingParams.
-
-        Args:
-            prompt (str): The input prompt string.
-            sampling_params (SamplingParams): An object containing sampling parameters.
-
-        Returns:
-            vSurgeRequest: A new vSurgeRequest instance.
-        """
-        return vSurgeRequest(prompt=prompt, sampling_params=sampling_params)
-
-    def __post_init__(self):
-        """Ensures metadata is initialized and validates prompt type."""
-        if self.metadata is None:
-            self.metadata = vSurgeMetadata()
-        assert isinstance(self.prompt, str), "prompt should be a single string"
-
-
-class SmartBytecodeDecoder:
-    """A smart decoder that handles partial token sequences and recovers from malformed characters."""
-
-    def __init__(self, processor, fallback_char: str = ""):
-        self.processor = processor
-        self.fallback_char = fallback_char
-        self.malformed_indicators = {"�", "\\ufffd", "\ufffd"}  # noqa
-
-    def contains_malformed_chars(self, text: str) -> bool:
-        """Check if text contains malformed Unicode characters."""
-        return any(indicator in text for indicator in self.malformed_indicators)
-
-    def decode_with_recovery(
-        self,
-        all_tokens: list[int],
-        previous_good_text: str = "",
-        buffer_tokens: list[int] | None = None,
-    ) -> tuple[str, list[int], bool]:
-        """Decode tokens with smart error recovery."""
-        if not all_tokens:
-            return "", [], False
-        if buffer_tokens:
-            tokens_to_decode = buffer_tokens + all_tokens
-        else:
-            tokens_to_decode = all_tokens
-        try:
-            full_decoded = self.processor.decode(tokens_to_decode, skip_special_tokens=True)
-            if self.contains_malformed_chars(full_decoded):
-                logger.debug("Malformed characters detected in full decode")
-                return self._handle_malformed_decode(tokens_to_decode, previous_good_text)
-            else:
-                if previous_good_text and full_decoded.startswith(previous_good_text):
-                    new_text = full_decoded[len(previous_good_text) :]
-                else:
-                    new_text = full_decoded
-                return new_text, [], False
-
-        except Exception as e:
-            logger.debug(f"Decode error: {e}, attempting recovery")
-            return self._handle_decode_error(tokens_to_decode, previous_good_text)
-
-    def _handle_malformed_decode(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
-        """Handle cases where decoding produces malformed characters."""
-        if len(tokens) <= 1:
-            return self.fallback_char, [], True
-        for i in range(len(tokens) - 1, 0, -1):
-            try:
-                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
-                if not self.contains_malformed_chars(partial_decoded):
-                    if previous_good_text and partial_decoded.startswith(previous_good_text):
-                        good_new_text = partial_decoded[len(previous_good_text) :]
-                    else:
-                        good_new_text = partial_decoded
-                    remaining_tokens = tokens[i:]
-                    logger.debug(f"Buffering {len(remaining_tokens)} tokens due to malformed chars")
-                    return good_new_text, remaining_tokens, True
-
-            except Exception:
-                continue
-
-        logger.warning("Could not find any good partial decode, using fallback")
-        return self.fallback_char, [], True
-
-    def _handle_decode_error(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
-        """Handle decode exceptions by trying progressive decoding."""
-        if len(tokens) <= 1:
-            return self.fallback_char, [], True
-
-        for i in range(len(tokens) - 1, 0, -1):
-            try:
-                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
-                if previous_good_text and partial_decoded.startswith(previous_good_text):
-                    good_new_text = partial_decoded[len(previous_good_text) :]
-                else:
-                    good_new_text = partial_decoded
-                remaining_tokens = tokens[i:]
-                logger.debug(f"Decode error recovery: buffering {len(remaining_tokens)} tokens")
-                return good_new_text, remaining_tokens, True
-
-            except Exception:
-                continue
-
-        logger.warning("Complete decode failure, using fallback")
-        return self.fallback_char, [], True
 
 
 @dataclasses.dataclass
@@ -319,8 +175,8 @@ class vSurge:
         Returns:
             tp.Optional[dict]: A dictionary of memory stats or None.
         """
-        if hasattr(self._driver, "get_device_memory_stats"):
-            return self._driver.get_device_memory_stats()
+        if hasattr(self.driver, "get_device_memory_stats"):
+            return self.driver.get_device_memory_stats()
         return None
 
     def get_vdriver_metrics(self, aggregated: bool = True, window_size: int = 100) -> dict | None:
@@ -333,8 +189,8 @@ class vSurge:
         Returns:
             tp.Optional[dict]: A dictionary of metrics or None.
         """
-        if hasattr(self._driver, "get_metrics"):
-            return self._driver.get_metrics(aggregated=aggregated, window_size=window_size)
+        if hasattr(self.driver, "get_metrics"):
+            return self.driver.get_metrics(aggregated=aggregated, window_size=window_size)
         return None
 
     @classmethod
@@ -997,7 +853,7 @@ class vSurge:
                 metadata=ActiveRequestMetadata(start_time=start_time, prefill_enqueue_time=prefill_enqueue_time),
             )
             try:
-                self._driver.place_request_on_prefill_queue(active_request)
+                self.driver.submit_request(active_request)
             except queue.Full as e:
                 for state_idx in range(i):
                     if hasattr(gen_states[state_idx].active_request.return_channel, "cancel"):

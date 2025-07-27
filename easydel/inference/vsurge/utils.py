@@ -33,8 +33,8 @@ import numpy as np
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
-from easydel.layers.caching.page.paged_cache import PagesCache
-from easydel.layers.caching.transformer.transformer_cache import TransformerCache
+from easydel.layers.caching import PagesCache, TransformerCache
+from easydel.utils.helpers import get_logger
 
 from ..sampling_params import JitableSamplingParams, SamplingParams
 
@@ -136,18 +136,9 @@ class ResultTokens(tp.NamedTuple):
         start_idx = slot * self.samples_per_slot
         end_idx = (slot + 1) * self.samples_per_slot
         return SlotData(
-            tokens=self.data[
-                start_idx:end_idx,
-                self.tokens_idx[0] : self.tokens_idx[1],
-            ],
-            valid=self.data[
-                start_idx:end_idx,
-                self.valid_idx[0] : self.valid_idx[1],
-            ],
-            lengths=self.data[
-                start_idx:end_idx,
-                self.length_idx[0] : self.length_idx[1],
-            ][:, 0],
+            tokens=self.data[start_idx:end_idx, self.tokens_idx[0] : self.tokens_idx[1]],
+            valid=self.data[start_idx:end_idx, self.valid_idx[0] : self.valid_idx[1]],
+            lengths=self.data[start_idx:end_idx, self.length_idx[0] : self.length_idx[1]][:, 0],
         )
 
     def __str__(self):
@@ -248,7 +239,6 @@ class AsyncMultifuture(tp.Generic[V]):
 
     def cancel(self, unused: tp.Any = None) -> None:
         """Cancels the asyncmultifuture."""
-        # Needed for compatibility with grpc.aio.ServicerContext.add_done_callback.
         del unused
         self._cancelled.set()
         self.set_exception(futures.CancelledError())
@@ -329,8 +319,14 @@ class ActiveRequest:
     sampling_params: SamplingParams
 
     complete: np.ndarray | None = None
+
     prefill_result: tp.Any = None
     prefill_content: str | list[int] | None = None
+    prefill_tokens_processed: int | None = None
+    prefill_tokens_remaining: list[int] | None = None  # Remaining token IDs to process
+    is_prefill_complete: bool = False
+    current_seq_id: int = -1  # For paged attention
+
     generate_timestep_added: int | None = None
     is_client_side_tokenization: bool | None = False
 
@@ -342,6 +338,9 @@ class ActiveRequest:
     id: str = field(default_factory=uuid.uuid4)
 
     accumulated_text: str | list[str] | None = None
+
+    _token_ids: list[int] | None = None
+    _attention_mask: np.ndarray | None = None
 
     def enqueue_samples(self, generated_samples: list[ReturnSample]):
         """Adds the generated sample(s) to return channel for current step.
@@ -811,3 +810,295 @@ class UtilityOutput(msgspec.Struct, array_like=True, gc=False):
     call_id: int
     failure_message: str | None = None
     result: tp.Any = None
+
+
+class MetricsRecorder:
+    """
+    Records and provides access to various operational metrics.
+
+    This class is responsible for collecting time-series data for various
+    durations, counts, and queue sizes within the vDriver system. It provides
+    methods to update these metrics and retrieve them in raw or aggregated forms.
+
+    Attributes:
+        metrics (dict): A dictionary holding all recorded metrics.
+        metrics_log_interval_sec (float): Interval for logging metrics by a monitor.
+        _lock (threading.Lock): A lock to ensure thread-safe updates to metrics.
+        _max_list_len (int): Maximum length for lists storing time-series data
+                             to prevent unbounded memory growth.
+    """
+
+    def __init__(self, metrics_log_interval_sec: float = 10.0):
+        """
+        Initializes the MetricsRecorder.
+
+        Args:
+            metrics_log_interval_sec (float): The interval in seconds at which
+                a monitoring thread might log these metrics. Defaults to 10.0.
+        """
+        self.metrics = {
+            "queue_sizes": {},
+            "active_requests_count": 0,
+            "ttft_ms": [],
+            "prefill_op_ms": [],
+            "decode_op_ms": [],
+            "insert_op_ms": [],
+            "transfer_op_ms": [],
+            "operation_lock_wait_ms": [],
+            "prefill_ops_count": 0,
+            "decode_ops_count": 0,
+            "insert_ops_count": 0,
+            "completed_requests_count": 0,
+            "submitted_requests_count": 0,
+        }
+        self._lock = threading.Lock()
+        self.metrics_log_interval_sec = metrics_log_interval_sec
+        self._max_list_len = 1000
+
+    def _append_to_list(self, key: str, value: float):
+        """
+        Appends a value to a list metric, ensuring it doesn't exceed max length.
+
+        Args:
+            key (str): The key of the list metric in `self.metrics`.
+            value (float): The value to append.
+        """
+        lst = self.metrics.get(key, [])
+        lst.append(value)
+        self.metrics[key] = lst[-self._max_list_len :]
+
+    def update_queue_size(self, queue_name: str, size: int):
+        """
+        Updates the recorded size for a specific queue.
+
+        Args:
+            queue_name (str): The name of the queue.
+            size (int): The current size of the queue.
+        """
+        with self._lock:
+            self.metrics["queue_sizes"][queue_name] = size
+
+    def set_active_requests_count(self, count: int):
+        """
+        Sets the current count of active requests.
+
+        Args:
+            count (int): The number of currently active requests.
+        """
+        with self._lock:
+            self.metrics["active_requests_count"] = count
+
+    def record_ttft(self, ttft_ms: float):
+        """
+        Records a Time To First Token (TTFT) duration.
+
+        Args:
+            ttft_ms (float): The TTFT duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("ttft_ms", ttft_ms)
+
+    def record_prefill_op_time(self, duration_ms: float):
+        """
+        Records the duration of a prefill operation and increments its count.
+
+        Args:
+            duration_ms (float): The prefill operation duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("prefill_op_ms", duration_ms)
+            self.metrics["prefill_ops_count"] += 1
+
+    def record_decode_op_time(self, duration_ms: float):
+        """
+        Records the duration of a decode operation and increments its count.
+
+        Args:
+            duration_ms (float): The decode operation duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("decode_op_ms", duration_ms)
+            self.metrics["decode_ops_count"] += 1
+
+    def record_insert_op_time(self, duration_ms: float):
+        """
+        Records the duration of an insert operation and increments its count.
+
+        Args:
+            duration_ms (float): The insert operation duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("insert_op_ms", duration_ms)
+            self.metrics["insert_ops_count"] += 1
+
+    def record_transfer_op_time(self, duration_ms: float):
+        """
+        Records the duration of a transfer operation.
+
+        Args:
+            duration_ms (float): The transfer operation duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("transfer_op_ms", duration_ms)
+
+    def record_operation_lock_wait_time(self, duration_ms: float):
+        """
+        Records the time spent waiting for an operation lock.
+
+        Args:
+            duration_ms (float): The lock wait duration in milliseconds.
+        """
+        with self._lock:
+            self._append_to_list("operation_lock_wait_ms", duration_ms)
+
+    def increment_completed_requests(self):
+        """Increments the count of completed requests."""
+        with self._lock:
+            self.metrics["completed_requests_count"] += 1
+
+    def increment_submitted_requests(self):
+        """Increments the count of submitted requests."""
+        with self._lock:
+            self.metrics["submitted_requests_count"] += 1
+
+    def get_all_metrics(self) -> dict:
+        """
+        Returns a deep copy of all currently recorded metrics.
+
+        Returns:
+            dict: A copy of the metrics dictionary.
+        """
+        with self._lock:
+            copied_metrics = {}
+            for k, v in self.metrics.items():
+                if isinstance(v, list):
+                    copied_metrics[k] = list(v)
+                elif isinstance(v, dict):
+                    copied_metrics[k] = dict(v)
+                else:
+                    copied_metrics[k] = v
+            return copied_metrics
+
+    def get_aggregated_metrics_snapshot(self, window_size=100) -> dict:
+        """
+        Returns a snapshot of aggregated metrics.
+
+        For list-based metrics (e.g., durations), it calculates average,
+        percentiles (p50, p90, p99), min, and max over a specified window
+        of recent samples.
+
+        Args:
+            window_size (int): The number of recent samples to use for
+                aggregation. If 0, all samples are used. Defaults to 100.
+
+        Returns:
+            dict: A dictionary of aggregated metrics.
+        """
+        snapshot = self.get_all_metrics()
+        aggregated = {}
+        for key, value in snapshot.items():
+            if isinstance(value, list) and value:
+                sample = value[-window_size:] if window_size > 0 else value
+                if sample:
+                    aggregated[f"{key}_avg"] = round(np.mean(sample), 2)
+                    aggregated[f"{key}_p50"] = round(np.percentile(sample, 50), 2)
+                    aggregated[f"{key}_p90"] = round(np.percentile(sample, 90), 2)
+                    aggregated[f"{key}_p99"] = round(np.percentile(sample, 99), 2)
+                    aggregated[f"{key}_min"] = round(np.min(sample), 2)
+                    aggregated[f"{key}_max"] = round(np.max(sample), 2)
+                    aggregated[f"{key}_count_total"] = snapshot.get(f"{key.split('_ms')[0]}_ops_count", len(value))
+                    aggregated[f"{key}_count_window"] = len(sample)
+            elif isinstance(value, dict):
+                aggregated[key] = dict(value)
+            elif isinstance(value, int | float):
+                aggregated[key] = value
+        return aggregated
+
+
+logger = get_logger("vSurge-Utils")
+
+
+class SmartBytecodeDecoder:
+    """A smart decoder that handles partial token sequences and recovers from malformed characters."""
+
+    def __init__(self, processor, fallback_char: str = ""):
+        self.processor = processor
+        self.fallback_char = fallback_char
+        self.malformed_indicators = {"�", "\\ufffd", "\ufffd"}  # noqa
+
+    def contains_malformed_chars(self, text: str) -> bool:
+        """Check if text contains malformed Unicode characters."""
+        return any(indicator in text for indicator in self.malformed_indicators)
+
+    def decode_with_recovery(
+        self,
+        all_tokens: list[int],
+        previous_good_text: str = "",
+        buffer_tokens: list[int] | None = None,
+    ) -> tuple[str, list[int], bool]:
+        """Decode tokens with smart error recovery."""
+        if not all_tokens:
+            return "", [], False
+        if buffer_tokens:
+            tokens_to_decode = buffer_tokens + all_tokens
+        else:
+            tokens_to_decode = all_tokens
+        try:
+            full_decoded = self.processor.decode(tokens_to_decode, skip_special_tokens=True)
+            if self.contains_malformed_chars(full_decoded):
+                logger.debug("Malformed characters detected in full decode")
+                return self._handle_malformed_decode(tokens_to_decode, previous_good_text)
+            else:
+                if previous_good_text and full_decoded.startswith(previous_good_text):
+                    new_text = full_decoded[len(previous_good_text) :]
+                else:
+                    new_text = full_decoded
+                return new_text, [], False
+
+        except Exception as e:
+            logger.debug(f"Decode error: {e}, attempting recovery")
+            return self._handle_decode_error(tokens_to_decode, previous_good_text)
+
+    def _handle_malformed_decode(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
+        """Handle cases where decoding produces malformed characters."""
+        if len(tokens) <= 1:
+            return self.fallback_char, [], True
+        for i in range(len(tokens) - 1, 0, -1):
+            try:
+                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
+                if not self.contains_malformed_chars(partial_decoded):
+                    if previous_good_text and partial_decoded.startswith(previous_good_text):
+                        good_new_text = partial_decoded[len(previous_good_text) :]
+                    else:
+                        good_new_text = partial_decoded
+                    remaining_tokens = tokens[i:]
+                    logger.debug(f"Buffering {len(remaining_tokens)} tokens due to malformed chars")
+                    return good_new_text, remaining_tokens, True
+
+            except Exception:
+                continue
+
+        logger.warning("Could not find any good partial decode, using fallback")
+        return self.fallback_char, [], True
+
+    def _handle_decode_error(self, tokens: list[int], previous_good_text: str) -> tuple[str, list[int], bool]:
+        """Handle decode exceptions by trying progressive decoding."""
+        if len(tokens) <= 1:
+            return self.fallback_char, [], True
+
+        for i in range(len(tokens) - 1, 0, -1):
+            try:
+                partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
+                if previous_good_text and partial_decoded.startswith(previous_good_text):
+                    good_new_text = partial_decoded[len(previous_good_text) :]
+                else:
+                    good_new_text = partial_decoded
+                remaining_tokens = tokens[i:]
+                logger.debug(f"Decode error recovery: buffering {len(remaining_tokens)} tokens")
+                return good_new_text, remaining_tokens, True
+
+            except Exception:
+                continue
+
+        logger.warning("Complete decode failure, using fallback")
+        return self.fallback_char, [], True

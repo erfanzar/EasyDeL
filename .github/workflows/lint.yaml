@@ -30,11 +30,7 @@ jobs:
       - name: Extract version from pyproject.toml
         id: meta
         run: |
-          VERSION=$(python -c "import toml; print(toml.load('pyproject.toml')['project']['version'])")
-          if [ -z "$VERSION" ]; then
-            echo "Error: Could not extract version from pyproject.toml"
-            exit 1
-          fi
+          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Run linters

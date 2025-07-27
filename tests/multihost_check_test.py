@@ -1,11 +1,5 @@
-import os
-import sys
-
-import transformers
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
 import jax
+import transformers
 from jax import numpy as jnp
 
 import easydel as ed

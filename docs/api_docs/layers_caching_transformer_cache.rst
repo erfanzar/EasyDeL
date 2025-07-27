@@ -1,7 +1,7 @@
-easydel.layers.caching.mamba.mamba_cache
+easydel.layers.caching.transformer.cache
 ========================================
 
-.. automodule:: easydel.layers.caching.mamba.mamba_cache
+.. automodule:: easydel.layers.caching.transformer.cache
     :members:
     :undoc-members:
     :show-inheritance:

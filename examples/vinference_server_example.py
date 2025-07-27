@@ -24,11 +24,8 @@ This script demonstrates:
 
 import argparse
 import os
-import sys
 
 # Add the parent directory to the path so we can import easydel
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
 import jax
 from jax import numpy as jnp
 from transformers import AutoTokenizer

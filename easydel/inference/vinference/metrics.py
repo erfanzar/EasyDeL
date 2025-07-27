@@ -19,19 +19,13 @@ import time
 from dataclasses import fields
 
 import jax
-import psutil
 from eformer.pytree import auto_pytree
 
 try:
-    from prometheus_client import (  # type:ignore
-        Counter,
-        Gauge,
-        Histogram,
-        Info,
-        start_http_server,
-    )
+    import psutil  # type:ignore
+    from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server  # type:ignore
 except ModuleNotFoundError:
-    Counter, Gauge, Histogram, Info, start_http_server = [None] * 5
+    Counter, Gauge, Histogram, Info, start_http_server, psutil = [None] * 6
 
 
 @auto_pytree
@@ -284,7 +278,6 @@ class vInferenceMetrics:
         """
 
         def wrapper(*args, **kwargs):
-            # Track queue size
             self.queue_size.labels(model_name=self.model_name).inc()
 
             try:

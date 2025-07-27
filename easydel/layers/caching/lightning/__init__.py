@@ -11,16 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .lightning_cache import (
-    LightningCache,
-    LightningCacheMetaData,
-    LightningCacheView,
-    LightningMetadata,
-)
+from .cache import LightningCache, LightningCacheMetaData, LightningCacheView, LightningMetadata
 
-__all__ = (
-    "LightningCache",
-    "LightningCacheMetaData",
-    "LightningCacheView",
-    "LightningMetadata",
-)
+__all__ = ("LightningCache", "LightningCacheMetaData", "LightningCacheView", "LightningMetadata")

@@ -265,7 +265,6 @@ class FlexibleAttentionModule(nn.Module):
         try:
             rngs = self.rngs()
         except flax.errors.TraceContextError:
-            warnings.warn("couldn't renew rng due to `flax.errors.TraceContextError` error.", stacklevel=1)
             rngs = None
         with self.config.mesh:
             input_dict = dict(
@@ -693,17 +692,16 @@ class AttentionModule(nn.Module):
             cache_view=cache_view,
         )
 
-        if cache_view is not None:
-            assert query.shape[0] == cache_view.key.shape[0], "Batch size mismatch between query and cache."
-
         if isinstance(cache_view, PagesCacheView):
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             def init_attention_bias():
                 return jnp.zeros((query.shape[0], 1, query_length, initial_key_length), dtype=self.dtype)
 
-            return key, value, attention_mask, init_attention_bias, cache_view
+            return key, value, attention_mask, init_attention_bias, cache_view, cache_metadata
 
+        if cache_view is not None:
+            assert query.shape[0] == cache_view.key.shape[0], "Batch size mismatch between query and cache."
         key, value, attention_mask, cache_view, masking_details = self._handle_cache_concat(
             query=query,
             key=key,

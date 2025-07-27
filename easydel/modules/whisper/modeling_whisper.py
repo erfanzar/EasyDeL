@@ -1376,10 +1376,12 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            self.proj_out.kernel.value = self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
-
-        lm_logits = self.proj_out(hidden_states)
+        lm_logits = self.proj_out(
+            hidden_states,
+            self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
+            if self.config.tie_word_embeddings
+            else None,
+        )
 
         return Seq2SeqLMOutput(
             logits=lm_logits,

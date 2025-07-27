@@ -1,8 +1,5 @@
-import os
-import sys
 import unittest
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from flax.nnx import Rngs
 
 import easydel as ed

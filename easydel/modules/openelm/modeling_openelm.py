@@ -178,7 +178,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_q_heads * self.head_dim,))
+        return hidden_states.reshape((*hidden_states.shape[:2], self.num_q_heads * self.head_dim))
 
     def __call__(
         self,

@@ -348,10 +348,7 @@ class Trainer(BaseTrainer):
             # Execute training step
             with self.train_tracker.trace_compilation():
                 with capture_time() as execution_time:
-                    state, metrics, run_exception = self._execute_train_step(
-                        state=state,
-                        batch=data_collator(batch),
-                    )
+                    state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
                     metrics.execution_time = execution_time()
                     current_step = int(jax.device_get(state.step))
             # Update and log metrics

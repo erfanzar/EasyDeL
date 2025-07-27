@@ -41,7 +41,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching.page.paged_cache import (
+from easydel.layers.caching import (
     PagesCache,
     PagesCacheMetaData,
 )
@@ -138,7 +138,13 @@ class EasyGenerationMixin:
     _model_task: str | None = None
     _model_type: str | None = None
 
-    def create_paged_metadata(self, hbm_utilization: float, page_size: int, dtype: jnp.dtype) -> PagesCacheMetaData:
+    def create_paged_metadata(
+        self,
+        hbm_utilization: float,
+        page_size: int,
+        dtype: jnp.dtype,
+        max_model_length: int,
+    ) -> PagesCacheMetaData:
         """
         Creates the static configuration metadata required for initializing a Paged KV Cache.
 
@@ -169,6 +175,7 @@ class EasyGenerationMixin:
             mesh=self.mesh,
             partition_manager=self.config.partition_manager,
             kvdtype=dtype,
+            max_model_length=max_model_length,
             num_hidden_layers=num_hidden_layers,
             num_kv_heads=num_key_value_heads,
             kv_head_dim_size=head_dim,
@@ -1093,10 +1100,9 @@ class EasyGenerationMixin:
                 else begin_index + 1
             )
             if generation_config.forced_decoder_ids is not None and len(generation_config.forced_decoder_ids) > 0:
-                # generation starts after the last token that is forced
                 begin_index += generation_config.forced_decoder_ids[-1][0]
             processors.append(SuppressTokensAtBeginLogitsProcessor(generation_config.begin_suppress_tokens, begin_index))
-        if generation_config.forced_decoder_ids is not None:
+        if getattr(generation_config, "forced_decoder_ids", None) is not None:
             forced_decoder_ids = [[input_ids_seq_length + i[0] - 1, i[1]] for i in generation_config.forced_decoder_ids]
             processors.append(ForceTokensLogitsProcessor(forced_decoder_ids))
         if generation_config.no_repeat_ngram_size is not None and generation_config.no_repeat_ngram_size > 0:

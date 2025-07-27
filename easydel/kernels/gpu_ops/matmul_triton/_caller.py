@@ -359,8 +359,8 @@ def triton_matmul_batch(args, batch_axes):
 
     # Ensure both A and B have the same batch dimension
     batch_size = max(A.shape[0], B.shape[0])
-    A = jnp.broadcast_to(A, (batch_size,) + A.shape[1:])
-    B = jnp.broadcast_to(B, (batch_size,) + B.shape[1:])
+    A = jnp.broadcast_to(A, (batch_size, *A.shape[1:]))
+    B = jnp.broadcast_to(B, (batch_size, *B.shape[1:]))
 
     # Perform batched matrix multiplication
     def batched_matmul(A, B):

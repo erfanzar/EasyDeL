@@ -33,7 +33,7 @@ from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
-from ..utils import DataCollatorForPreference
+from ..utils import DataCollatorForPreferenceGrain, DataCollatorForPreferenceTFDS
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
 
@@ -93,8 +93,8 @@ class DPOTrainer(Trainer):
                     "the trainer."
                 )
         arguments.padding_value = self.padding_value
-        input_data_collator = (
-            DataCollatorForPreference(
+        input_data_collator_tfds = (
+            DataCollatorForPreferenceTFDS(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,  # type: ignore
                 pad_token_id=self.padding_value,  # type: ignore
@@ -104,7 +104,19 @@ class DPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-        self.input_data_collator = input_data_collator
+        input_data_collator_grain = (
+            DataCollatorForPreferenceGrain(
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,  # type: ignore
+                pad_token_id=self.padding_value,  # type: ignore
+                label_pad_token_id=arguments.label_pad_token_id,
+                is_encoder_decoder=arguments.is_encoder_decoder,
+            )
+            if data_collator is None
+            else data_collator
+        )
+        self.input_data_collator_grain = input_data_collator_grain
+        self.input_data_collator_tfds = input_data_collator_tfds
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
@@ -425,6 +437,26 @@ class DPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a data collection function for batching.
+
+        For DPO training, this method simply returns the pre-configured `data_collator`.
+
+        Args:
+            max_sequence_length (int): The maximum sequence length (not used in this implementation).
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode (not used in this implementation). Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: The data collator function.
+        """
+        return self.input_data_collator_grain
+
     def create_tfds_collect_function(
         self,
         max_sequence_length: int,
@@ -443,7 +475,7 @@ class DPOTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
-        return self.input_data_collator
+        return self.input_data_collator_tfds
 
     def configure_dataloaders(self):
         """

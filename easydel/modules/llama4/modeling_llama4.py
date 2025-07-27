@@ -1134,8 +1134,8 @@ def vision_apply_rotary_emb(
 ) -> tuple[jax.Array, jax.Array]:
     query_dtype = query.dtype
     key_dtype = key.dtype
-    query_reshaped = query.astype(jnp.float32).reshape(query.shape[:-1] + (-1, 2))
-    key_reshaped = key.astype(jnp.float32).reshape(key.shape[:-1] + (-1, 2))
+    query_reshaped = query.astype(jnp.float32).reshape((*query.shape[:-1], -1, 2))
+    key_reshaped = key.astype(jnp.float32).reshape((*key.shape[:-1], -1, 2))
     query_complex = jax.lax.complex(query_reshaped[..., 0], query_reshaped[..., 1])
     key_complex = jax.lax.complex(key_reshaped[..., 0], key_reshaped[..., 1])
     frequencies_broadcast = reshape_for_broadcast(frequencies, query_complex)

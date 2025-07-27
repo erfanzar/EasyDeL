@@ -518,7 +518,7 @@ class DataCollatorForCompletionOnlyLM:
 
 
 @auto_pytree
-class RewardDataCollatorWithPadding:
+class RewardDataCollatorWithPaddingTFDS:
     r"""
     Reward DataCollator class that pads the inputs to the maximum length of the batch.
 
@@ -592,7 +592,81 @@ class RewardDataCollatorWithPadding:
 
 
 @auto_pytree
-class DataCollatorForPreference:
+class RewardDataCollatorWithPaddingGrain:
+    r"""
+    Reward DataCollator class that pads the inputs to the maximum length of the batch.
+
+    Args:
+        tokenizer (`ProcessingClassType`):
+            The tokenizer used for encoding the data.
+        padding (`Union[bool, str, `PaddingStrategy`]`, `optional`, defaults to `True`):
+            padding_strategy to pass to the tokenizer.
+        max_length (`int` or `None`, `optional`, defaults to `None`):
+            If set will pad the sequence to a maximum provided value.
+    """
+
+    tokenizer: ProcessingClassType
+    padding: bool | str = "max_length"
+    max_length: int | None = None
+    truncation_mode: str = "keep_end"
+
+    def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        features_chosen = []
+        features_rejected = []
+        margin = []
+        has_margin = "margin" in features.keys()
+
+        if (
+            "input_ids_chosen" not in features.keys()
+            or "input_ids_rejected" not in features.keys()
+            or "attention_mask_chosen" not in features.keys()
+            or "attention_mask_rejected" not in features.keys()
+        ):
+            raise ValueError(
+                "The features should include `input_ids_chosen`, `attention_mask_chosen`, "
+                "`input_ids_rejected` and `attention_mask_rejected`"
+            )
+
+        features_chosen.append(
+            {
+                "input_ids": features["input_ids_chosen"],
+                "attention_mask": features["attention_mask_chosen"],
+            }
+        )
+        features_rejected.append(
+            {
+                "input_ids": features["input_ids_rejected"],
+                "attention_mask": features["attention_mask_rejected"],
+            }
+        )
+        if has_margin:
+            margin.append(features["margin"])
+        batch_chosen = self.tokenizer.pad(
+            features_chosen,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors="np",
+        )
+        batch_rejected = self.tokenizer.pad(
+            features_rejected,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors="np",
+        )
+        batch = {
+            "input_ids_chosen": batch_chosen["input_ids"],
+            "attention_mask_chosen": batch_chosen["attention_mask"],
+            "input_ids_rejected": batch_rejected["input_ids"],
+            "attention_mask_rejected": batch_rejected["attention_mask"],
+        }
+        if has_margin:
+            margin = np.array(margin, dtype="f4")
+            batch["margin"] = margin
+        return batch
+
+
+@auto_pytree
+class DataCollatorForPreferenceTFDS:
     r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
 
     max_prompt_length: int
@@ -636,41 +710,15 @@ class DataCollatorForPreference:
                 padding_value=0,
                 padding_side="left",
             ),
-            "chosen_input_ids": pad(
-                chosen_input_ids,
-                self.max_completion_length,
-                padding_value=self.pad_token_id,
-            ),
-            "chosen_attention_mask": pad(
-                chosen_attention_mask,
-                self.max_completion_length,
-                padding_value=0,
-            ),
-            "rejected_input_ids": pad(
-                rejected_input_ids,
-                self.max_completion_length,
-                padding_value=self.pad_token_id,
-            ),
-            "rejected_attention_mask": pad(
-                rejected_attention_mask,
-                self.max_completion_length,
-                padding_value=0,
-            ),
+            "chosen_input_ids": pad(chosen_input_ids, self.max_completion_length, padding_value=self.pad_token_id),
+            "chosen_attention_mask": pad(chosen_attention_mask, self.max_completion_length, padding_value=0),
+            "rejected_input_ids": pad(rejected_input_ids, self.max_completion_length, padding_value=self.pad_token_id),
+            "rejected_attention_mask": pad(rejected_attention_mask, self.max_completion_length, padding_value=0),
         }
-
-        # Add optional outputs
         if pixel_values is not None:
-            output["pixel_values"] = pad(
-                pixel_values,
-                self.max_prompt_length,
-                padding_value=0.0,
-            )
+            output["pixel_values"] = pad(pixel_values, self.max_prompt_length, padding_value=0.0)
         if pixel_attention_mask is not None:
-            output["pixel_attention_mask"] = pad(
-                pixel_attention_mask,
-                self.max_prompt_length,
-                padding_value=0,
-            )
+            output["pixel_attention_mask"] = pad(pixel_attention_mask, self.max_prompt_length, padding_value=0)
         if "image_sizes" in features[0]:
             output["image_sizes"] = jnp.array([feature["image_sizes"] for feature in features])
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
@@ -680,7 +728,86 @@ class DataCollatorForPreference:
 
 
 @auto_pytree
-class DPODataCollatorWithPadding:
+class DataCollatorForPreferenceGrain:
+    r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
+
+    max_prompt_length: int
+    max_completion_length: int
+    pad_token_id: int = 0
+    label_pad_token_id: int = -100
+    is_encoder_decoder: bool | None = False
+
+    def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        prompt_input_ids = np.array(features["prompt_input_ids"])
+        prompt_attention_mask = np.ones_like(prompt_input_ids)
+        chosen_input_ids = np.array(features["chosen_input_ids"])
+        chosen_attention_mask = np.ones_like(chosen_input_ids)
+        rejected_input_ids = np.array(features["rejected_input_ids"])
+        rejected_attention_mask = np.ones_like(rejected_input_ids)
+        pixel_values = None
+        pixel_attention_mask = None
+        if "pixel_values" in features.keys():
+            pixel_values = np.array(features["pixel_values"])
+        if "pixel_attention_mask" in features.keys():
+            pixel_attention_mask = np.array(features["pixel_attention_mask"])
+
+        ref_chosen_logps = None
+        ref_rejected_logps = None
+        if "ref_chosen_logps" in features.keys() and "ref_rejected_logps" in features.keys():
+            ref_chosen_logps = np.array(features["ref_chosen_logps"])
+            ref_rejected_logps = np.array(features["ref_rejected_logps"])
+
+        # Pad sequences
+        output = {
+            "prompt_input_ids": pad_single(
+                prompt_input_ids,
+                self.max_prompt_length,
+                padding_value=self.pad_token_id,
+                padding_side="left",
+            ),
+            "prompt_attention_mask": pad_single(
+                prompt_attention_mask,
+                self.max_prompt_length,
+                padding_value=0,
+                padding_side="left",
+            ),
+            "chosen_input_ids": pad_single(
+                chosen_input_ids,
+                self.max_completion_length,
+                padding_value=self.pad_token_id,
+            ),
+            "chosen_attention_mask": pad_single(
+                chosen_attention_mask,
+                self.max_completion_length,
+                padding_value=0,
+            ),
+            "rejected_input_ids": pad_single(
+                rejected_input_ids,
+                self.max_completion_length,
+                padding_value=self.pad_token_id,
+            ),
+            "rejected_attention_mask": pad_single(
+                rejected_attention_mask,
+                self.max_completion_length,
+                padding_value=0,
+            ),
+        }
+
+        # Add optional outputs
+        if pixel_values is not None:
+            output["pixel_values"] = pad_single(pixel_values, self.max_prompt_length, padding_value=0.0)
+        if pixel_attention_mask is not None:
+            output["pixel_attention_mask"] = pad_single(pixel_attention_mask, self.max_prompt_length, padding_value=0)
+        if "image_sizes" in features.keys():
+            output["image_sizes"] = np.array(features["image_sizes"])
+        if ref_chosen_logps is not None and ref_rejected_logps is not None:
+            output["ref_chosen_logps"] = ref_chosen_logps
+            output["ref_rejected_logps"] = ref_rejected_logps
+        return output
+
+
+@auto_pytree
+class DPODataCollatorWithPaddingTFDS:
     r"""
     DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
     """
@@ -776,14 +903,111 @@ class DPODataCollatorWithPadding:
             if self.output_arrays_only:
                 val = padded_batch.get(k)
                 if hasattr(val, "dtype"):
-                    if val.dtype not in [
-                        jnp.float64,
-                        jnp.float32,
-                        jnp.float16,
-                        jnp.int32,
-                        jnp.int16,
-                        jnp.int8,
-                    ]:
+                    if val.dtype not in [jnp.float64, jnp.float32, jnp.float16, jnp.int32, jnp.int16, jnp.int8]:
+                        padded_batch.pop(k)
+                else:
+                    padded_batch.pop(k)
+        return padded_batch
+
+
+@auto_pytree
+class DPODataCollatorWithPaddingGrain:
+    r"""
+    DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
+    """
+
+    max_prompt_length: int
+    max_completion_length: int
+    pad_token_id: int = 0
+    label_pad_token_id: int = -100
+    is_encoder_decoder: bool | None = False
+    output_arrays_only: bool = True
+    prepadded: bool = True
+
+    def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        camax_length = self.max_completion_length + self.max_prompt_length
+        padded_batch = {}
+        for k in features.keys():
+            if k.endswith(("_input_ids", "_attention_mask", "_labels", "_pixel_values")):
+                match k.split("_")[0]:
+                    case "rejected":
+                        max_length = self.max_completion_length
+                    case "chosen":
+                        max_length = self.max_completion_length
+                    case "prompt":
+                        max_length = self.max_prompt_length
+                    case _:
+                        max_length = camax_length
+
+                if self.is_encoder_decoder:
+                    to_pad = np.array(features[k], dtype="i4")
+
+                    if (k.startswith("prompt")) and (k.endswith("input_ids")):
+                        if self.pad_token_id is None:
+                            raise ValueError(
+                                "Padding is enabled, but the tokenizer is not configured with a padding token."
+                                " Explicitly set `tokenizer.pad_token` "
+                                "(e.g. `tokenizer.pad_token = tokenizer.eos_token`)"
+                                " before calling the trainer."
+                            )
+                        padding_value = self.pad_token_id
+                    elif k.endswith("_attention_mask"):
+                        padding_value = 0
+                    elif k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
+                        padding_value = self.label_pad_token_id
+                    else:
+                        raise ValueError(f"Unexpected key in batch '{k}'")
+
+                    padded_batch[k] = pad_sequence(
+                        to_pad,
+                        batch_first=False,
+                        padding_value=padding_value,
+                        max_len=None if self.prepadded else max_length,
+                    )
+                else:
+                    if k.endswith("_input_ids"):
+                        if self.pad_token_id is None:
+                            raise ValueError(
+                                "Padding is enabled, but the tokenizer is not configured with a padding token."
+                                " Explicitly set `tokenizer.pad_token` "
+                                "(e.g. `tokenizer.pad_token = tokenizer.eos_token`)"
+                                " before calling the trainer."
+                            )
+                        padding_value = self.pad_token_id
+                    elif k.endswith("_labels"):
+                        padding_value = self.label_pad_token_id
+                    elif k.endswith("_attention_mask"):
+                        padding_value = 0
+                    elif k.endswith("_pixel_values"):
+                        padding_value = 0
+                    else:
+                        raise ValueError(f"Unexpected key in batch '{k}'")
+
+                    if k in ["prompt_input_ids", "prompt_attention_mask"]:
+                        padding_side = "left"
+                    else:
+                        padding_side = "right"
+                    if k.endswith("_pixel_values"):
+                        dtype = np.float32
+                    else:
+                        dtype = np.int32
+
+                    to_pad = np.array(features[k], dtype=dtype)
+
+                    padded_batch[k] = pad_single(
+                        to_pad,
+                        None if self.prepadded else max_length,
+                        padding_value=padding_value,
+                        padding_side=padding_side,
+                    )
+            elif k.endswith("_logps"):
+                padded_batch[k] = np.array(features[k])
+            else:
+                padded_batch[k] = features[k]
+            if self.output_arrays_only:
+                val = padded_batch.get(k)
+                if hasattr(val, "dtype"):
+                    if val.dtype not in [np.float64, np.float32, np.float16, np.int32, np.int16, np.int8]:
                         padded_batch.pop(k)
                 else:
                     padded_batch.pop(k)
@@ -885,11 +1109,7 @@ def pad(
         max_lenght = current_max
     x_lenght = max(current_max, max_lenght)
     output_shape += (x_lenght,)
-    output = jnp.full(
-        (len(tensors), *output_shape),
-        padding_value,
-        dtype=tensors[0].dtype,
-    )
+    output = jnp.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
         if padding_side == "left":
             seq_slice = slice(output_shape[0] - t.shape[0], output_shape[0])
@@ -900,6 +1120,74 @@ def pad(
 
         slices = (i, seq_slice, *tuple(slice(0, s) for s in t.shape[1:]))
         output = output.at[slices].set(t)
+
+    if padding_side == "left":
+        output = output[..., -max_lenght:]
+    elif padding_side == "right":
+        output = output[..., :max_lenght]
+    else:
+        raise ValueError("padding_side must be 'left' or 'right'")
+    return output
+
+
+def pad_single(
+    tensor: np.ndarray,
+    max_length: int | None = None,
+    padding_value: int = 0,
+    padding_side: str = "right",
+) -> np.ndarray:
+    """
+    Pads a single tensor to a specified length along the last dimension.
+    """
+    current_length = tensor.shape[-1]
+
+    if max_length is None:
+        return tensor
+
+    if current_length >= max_length:
+        if padding_side == "left":
+            return tensor[..., -max_length:]
+        else:
+            return tensor[..., :max_length]
+
+    pad_amount = max_length - current_length
+
+    if padding_side == "left":
+        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(pad_amount, 0)]
+    elif padding_side == "right":
+        pad_config = [(0, 0)] * (tensor.ndim - 1) + [(0, pad_amount)]
+    else:
+        raise ValueError("padding_side must be 'left' or 'right'")
+
+    return np.pad(tensor, pad_config, mode="constant", constant_values=padding_value)
+
+
+def np_pad(
+    tensors: list[np.ndarray],
+    max_lenght: int | None,
+    padding_value: int = 0,
+    padding_side: str = "right",
+) -> np.ndarray:
+    """
+    Pads a list of tensors to the same shape along the first dimension.
+    """
+    output_shape = tensors[0].shape[:-1]
+    current_max = tensors[0].shape[-1]
+    if max_lenght is None:
+        max_lenght = current_max
+    x_lenght = max(current_max, max_lenght)
+    output_shape += (x_lenght,)
+    output = np.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
+    for i, t in enumerate(tensors):
+        if padding_side == "left":
+            seq_slice = slice(output_shape[0] - t.shape[0], output_shape[0])
+        elif padding_side == "right":
+            seq_slice = slice(0, t.shape[0])
+        else:
+            raise ValueError("padding_side must be 'left' or 'right'")
+
+        slices = (i, seq_slice, *tuple(slice(0, s) for s in t.shape[1:]))
+        output[slices] = t
 
     if padding_side == "left":
         output = output[..., -max_lenght:]

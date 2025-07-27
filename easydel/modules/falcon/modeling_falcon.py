@@ -200,7 +200,7 @@ class FalconAttention(AttentionModule):
             value_states = jnp.broadcast_to(value_states, query_states.shape)
 
             query_states, key_states, value_states = [
-                x.reshape(x.shape[:-2] + (x.shape[-2] * x.shape[-1],)) for x in (query_states, key_states, value_states)
+                x.reshape((*x.shape[:-2], x.shape[-2] * x.shape[-1])) for x in (query_states, key_states, value_states)
             ]
 
             return query_states, key_states, value_states
@@ -338,7 +338,7 @@ class FalconAttention(AttentionModule):
             attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
             # matmul: [batch_size * num_heads, q_length, head_dim]
             attn_output = jax.lax.batch_matmul(attention_scores, value_states.transpose(0, 2, 1, 3))
-            attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:])
+            attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0], *attn_output.shape[2:]))
             attn_output = self.shard_attention_prod(self._merge_heads(attn_output))
 
             output_tensor = self.dense(attn_output)

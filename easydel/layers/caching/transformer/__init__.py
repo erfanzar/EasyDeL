@@ -11,16 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .transformer_cache import (
-    TransformerCache,
-    TransformerCacheMetaData,
-    TransformerCacheView,
-    TransformerMetadata,
-)
+from .cache import TransformerCache, TransformerCacheMetaData, TransformerCacheView, TransformerMetadata
 
-__all__ = (
-    "TransformerCache",
-    "TransformerCacheMetaData",
-    "TransformerCacheView",
-    "TransformerMetadata",
-)
+__all__ = ("TransformerCache", "TransformerCacheMetaData", "TransformerCacheView", "TransformerMetadata")
