@@ -31,7 +31,7 @@ The provided script uses a setup script from EasyDeL to prepare the TPU environm
 2. **Run the setup script:**
 
     ```bash
-    curl -Ls https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh | bash
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
     ```
 
     This script will install necessary dependencies like JAX, EasyDeL, Ray, and other Python packages required for TPU operation. It might take a few minutes.

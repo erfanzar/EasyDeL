@@ -211,14 +211,15 @@ class vInference:
         metrics_enabled = check_bool_flag("EASYDEL_RECORDS_METRICS")
         is_main_process = jax.process_count() == 1
         has_prometheus = is_package_available("prometheus_client")
+        has_psutil = is_package_available("psutil")
 
-        self._report_metrics = metrics_enabled and is_main_process and has_prometheus and report_metrics
+        self._report_metrics = metrics_enabled and is_main_process and has_prometheus and report_metrics and has_psutil
 
         if not self._report_metrics:
             if has_prometheus:
                 self.log("vInference metrics reporting is disabled")
             else:
-                self.log("prometheus_client not found - vInference metrics will be disabled")
+                self.log("prometheus_client or psutil not found - vInference metrics will be disabled")
 
     def get_model(self, graphstate: nn.GraphState | None = None, graphother: nn.GraphState | None = None):
         if graphstate is None:

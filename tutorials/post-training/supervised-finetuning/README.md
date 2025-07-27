@@ -36,7 +36,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    curl -Ls https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh | bash
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
     ```
 
     This command downloads and executes a script that installs required packages such as JAX, EasyDeL, Ray, Hugging Face libraries, and other Python dependencies optimized for TPU operation. This process might take several minutes.
@@ -89,9 +89,9 @@ ray.init()
 # --- Configuration Constants ---
 # MODEL_ID: Specifies the base model to be fine-tuned.
 MODEL_ID = "Qwen/Qwen3-14B"
-# DATASET_ID: The dataset for SFT. 'LDJnr/Pure-Dove' is a dataset with
+# DATASET_ID: The dataset for SFT. 'allenai/WildChat' is a dataset with
 # conversational data suitable for instruction/chat tuning.
-DATASET_ID = "LDJnr/Pure-Dove"
+DATASET_ID = "allenai/WildChat"
 # WANDB_ENTITY: Your Weights & Biases entity (username or organization).
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
 

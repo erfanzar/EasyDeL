@@ -29,9 +29,7 @@ from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
-from ..utils import (
-    RewardDataCollatorWithPadding,
-)
+from ..utils import RewardDataCollatorWithPaddingGrain, RewardDataCollatorWithPaddingTFDS
 from ._fn import evaluation_step, training_step
 from .reward_config import RewardConfig
 
@@ -71,11 +69,13 @@ class RewardTrainer(Trainer):
         model: EasyDeLBaseModule | EasyDeLState | None = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
-        data_collator: RewardDataCollatorWithPadding | None = None,
+        data_collator: RewardDataCollatorWithPaddingTFDS | RewardDataCollatorWithPaddingGrain | None = None,
     ):
         if getattr(processing_class, "pad_token", None) is None:
             processing_class.pad_token = processing_class.eos_token
         assert isinstance(arguments, RewardConfig), "passed argument must be a `RewardConfig`."
+        self.input_data_collator_tfds = data_collator
+        self.input_data_collator_grain = data_collator
         if data_collator is None:
             if processing_class is None:
                 raise ValueError(
@@ -83,12 +83,16 @@ class RewardTrainer(Trainer):
                 )
 
             max_sequence_length = arguments.max_sequence_length
-            data_collator = RewardDataCollatorWithPadding(
+            self.input_data_collator_tfds = RewardDataCollatorWithPaddingTFDS(
                 processing_class,
                 max_length=arguments.max_sequence_length,
                 truncation_mode=arguments.truncation_mode,
             )
-
+            self.input_data_collator_grain = RewardDataCollatorWithPaddingTFDS(
+                processing_class,
+                max_length=arguments.max_sequence_length,
+                truncation_mode=arguments.truncation_mode,
+            )
             if arguments.remove_unused_columns:
                 try:
                     arguments.remove_unused_columns = False
@@ -137,7 +141,6 @@ class RewardTrainer(Trainer):
                 )
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
-        self.org_data_collator = data_collator
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
@@ -215,3 +218,43 @@ class RewardTrainer(Trainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
+
+    def create_grain_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a data collection function for batching.
+
+        For DPO training, this method simply returns the pre-configured `data_collator`.
+
+        Args:
+            max_sequence_length (int): The maximum sequence length (not used in this implementation).
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode (not used in this implementation). Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: The data collator function.
+        """
+        return self.input_data_collator_grain
+
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """
+        Creates a data collection function for batching.
+
+        For DPO training, this method simply returns the pre-configured `data_collator`.
+
+        Args:
+            max_sequence_length (int): The maximum sequence length (not used in this implementation).
+            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+                The truncation mode (not used in this implementation). Defaults to "keep_end".
+
+        Returns:
+            tp.Callable: The data collator function.
+        """
+        return self.input_data_collator_tfds

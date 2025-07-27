@@ -18,6 +18,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install toml package
+        run: pip install toml
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -32,11 +40,7 @@ jobs:
       - name: Extract version from pyproject.toml
         id: meta
         run: |
-          VERSION=$(python -c "import toml; print(toml.load('pyproject.toml')['project']['version'])")
-          if [ -z "$VERSION" ]; then
-            echo "Error: Could not extract version from pyproject.toml"
-            exit 1
-          fi
+          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
 
@@ -46,7 +50,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -62,3 +66,36 @@ jobs:
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
+            HARDWARE_TYPE=cpu
+
+      - name: Build and push GPU Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-gpu
+            ghcr.io/erfanzar/easydel:latest-gpu
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-gpu
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            HARDWARE_TYPE=gpu
+
+      - name: Build and push TPU Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-tpu
+            ghcr.io/erfanzar/easydel:latest-tpu
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-tpu
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            HARDWARE_TYPE=tpu

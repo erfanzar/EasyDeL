@@ -22,8 +22,7 @@ from jax.experimental.shard_map import shard_map
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
-from easydel.layers.caching import PagesCacheView
-from easydel.layers.caching.page.paged_cache import PagesMetadata
+from easydel.layers.caching import PagesCacheView, PagesMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
@@ -77,13 +76,14 @@ class PagedAttn(AttentionImpl):
         """
         Native (XLA) forward pass.
         """
+
         output = jax_ragged_paged_attention(
-            queries=q,
+            queries=q.astype(cache_view.key_pages.dtype),
             key_pages=cache_view.key_pages,
             value_pages=cache_view.value_pages,
             query_start_loc=cache_metadata.query_start_loc,
             context_lens=cache_metadata.context_lens,
-            block_tables=cache_metadata.block_tables,
+            block_tables=cache_metadata.pages_tables,
             num_seqs=cache_metadata.num_seqs,
             softmax_scale=self.metadata.softmax_scale,
             soft_cap=self.metadata.soft_cap,
@@ -142,7 +142,7 @@ class PagedAttn(AttentionImpl):
                 qaxes,
                 resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.block_tables.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.pages_tables.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
                 resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
             ),
@@ -153,7 +153,7 @@ class PagedAttn(AttentionImpl):
             q,
             kv_pages,
             cache_metadata.context_lens,
-            cache_metadata.block_tables,
+            cache_metadata.pages_tables,
             cache_metadata.query_start_loc,
             cache_metadata.num_seqs,
         )

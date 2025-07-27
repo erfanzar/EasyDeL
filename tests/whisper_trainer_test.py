@@ -1,10 +1,7 @@
 from datasets import Audio, load_dataset
 from jax import lax
 from jax import numpy as jnp
-from transformers import (
-    WhisperProcessor,
-    WhisperTokenizer,
-)
+from transformers import WhisperProcessor, WhisperTokenizer
 
 import easydel as ed
 

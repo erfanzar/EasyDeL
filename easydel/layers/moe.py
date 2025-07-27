@@ -365,7 +365,7 @@ class MoELayer(nn.Module):
                 elif strategy == TransformStrategy.SEND_SIZE:
                     return input_array[shard_id]
                 elif strategy == TransformStrategy.OUTPUT_OFFSET:
-                    zero_row = jnp.zeros((1,) + input_array.shape[1:], dtype=input_array.dtype)
+                    zero_row = jnp.zeros((1, *input_array.shape[1:]), dtype=input_array.dtype)
                     array_with_zeros = jnp.concatenate((zero_row, input_array), axis=0)
                     cumulated_array = jnp.cumsum(array_with_zeros, axis=0, dtype=input_array.dtype)
                     return cumulated_array[shard_id]

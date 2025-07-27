@@ -1,12 +1,7 @@
-import os
-import sys
-
-import flax.nnx
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import typing as tp
 
 import flax.core
+import flax.nnx
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
 from jax import random

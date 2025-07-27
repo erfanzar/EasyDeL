@@ -1,12 +1,8 @@
-import os
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-
-import easydel as ed  # noqa
 import jax
 from jax import numpy as jnp
 from transformers import AutoProcessor
+
+import easydel as ed
 
 
 def main():

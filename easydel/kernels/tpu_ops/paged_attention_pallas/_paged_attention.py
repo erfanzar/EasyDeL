@@ -305,7 +305,7 @@ def paged_attention(
       k_pages: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
       v_pages: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
       context_lens: A i32[batch_size] jax.Array the context_lens of each example.
-      block_tables: A i32[batch_size, pages_per_sequence] jax.Array. Each entry
+      block_tables: A i32[batch_size, max_num_pages_per_req] jax.Array. Each entry
         should be in the range of [0, total_num_pages), indicating where to locate
         the page in `k_pages` or `v_pages`.
       sm_scale: normal softmax scale. By default it is 1.0.
@@ -332,7 +332,7 @@ def paged_attention(
 
     batch_size, num_heads, head_dim = q.shape
     num_kv_heads, _, page_size, head_dim_k = k_pages.shape
-    batch_size_paged_indices, pages_per_sequence = block_tables.shape
+    batch_size_paged_indices, max_num_pages_per_req = block_tables.shape
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -348,10 +348,10 @@ def paged_attention(
         )
     if head_dim_k != head_dim:
         raise ValueError(f"head_dim of Q must be the same as that of K/V. Got {head_dim} and {head_dim_k}.")
-    if pages_per_sequence % pages_per_compute_block != 0:
+    if max_num_pages_per_req % pages_per_compute_block != 0:
         raise ValueError(
             "pages_per_compute_block must be divisible by pages per sequence. Got"
-            f" {pages_per_compute_block} and {pages_per_sequence}."
+            f" {pages_per_compute_block} and {max_num_pages_per_req}."
         )
     if context_lens.shape != (batch_size,):
         raise ValueError("`context_lens` and `q` must have the same batch size")
@@ -423,7 +423,7 @@ def paged_attention(
             num_cores,
             batch_size // num_cores if megacore_mode == "batch" else batch_size,
             num_kv_heads // num_cores if megacore_mode == "kv_head" else num_kv_heads,
-            pages_per_sequence // pages_per_compute_block,
+            max_num_pages_per_req // pages_per_compute_block,
         )
         dimension_semantics = ("parallel", "arbitrary", "arbitrary", "arbitrary")
 
@@ -441,7 +441,7 @@ def paged_attention(
     out, _, _ = pl.pallas_call(
         functools.partial(
             kernel,
-            pages_per_sequence=pages_per_sequence,
+            max_num_pages_per_req=max_num_pages_per_req,
             batch_size=batch_size,
             pages_per_compute_block=pages_per_compute_block,
             mask_value=mask_value,

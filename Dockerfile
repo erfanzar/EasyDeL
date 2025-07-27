@@ -1,42 +1,71 @@
 # syntax=docker/dockerfile:1
-FROM python:3.10-slim as builder
+FROM python:3.11-slim as builder
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	libgomp1 \
 	git \
-	build-essential && rm -rf /var/lib/apt/lists/*
+	build-essential \
+	curl && rm -rf /var/lib/apt/lists/*
 
-ENV POETRY_VERSION=1.8.2
-RUN pip install --no-cache-dir "poetry==$POETRY_VERSION"
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-COPY pyproject.toml poetry.lock* ./ 
+# Copy dependency files
+COPY pyproject.toml uv.lock* ./
 
-RUN poetry config virtualenvs.in-project true && poetry install --no-interaction --no-ansi --only main --no-root
+# Build argument for hardware type (cpu, gpu, tpu)
+ARG HARDWARE_TYPE=cpu
+
+# Create virtual environment and install dependencies with caching
+RUN --mount=type=cache,target=/root/.cache/uv \
+	uv venv /app/.venv && \
+	if [ "$HARDWARE_TYPE" = "gpu" ]; then \
+		uv sync --frozen --no-install-project --no-dev --extra gpu; \
+	elif [ "$HARDWARE_TYPE" = "tpu" ]; then \
+		uv sync --frozen --no-install-project --no-dev --extra tpu; \
+	else \
+		uv sync --frozen --no-install-project --no-dev; \
+	fi
 
 # ----------------------------------
 # Runtime Stage  
 # ----------------------------------
-FROM python:3.10-slim as runtime
+FROM python:3.11-slim as runtime
 
 WORKDIR /app
 
-COPY --from=builder /app /app
+# Copy the virtual environment from builder
+COPY --from=builder /app/.venv /app/.venv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	libgomp1 && rm -rf /var/lib/apt/lists/*
 
+# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
 	PYTHONDONTWRITEBYTECODE=1 \
 	PATH="/app/.venv/bin:$PATH" \
-	PYTHONPATH="/app/.venv/lib/python3.10/site-packages:$PYTHONPATH"
+	VIRTUAL_ENV="/app/.venv"
 
+# Copy source code
+COPY . .
+
+# Install the project itself
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+RUN uv pip install -e . --no-deps
+
+# Verify installations based on hardware type
 RUN python -c "import jax; print(f'JAX version: {jax.__version__}')" && \
-	python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+	python -c "import easydel; print('EasyDeL imported successfully')" && \
+	if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
+		python -c "import torch; print(f'PyTorch version: {torch.__version__}')"; \
+	fi
 
 ARG VERSION
-ENV VERSION=$VERSION
+ARG HARDWARE_TYPE=cpu
+ENV VERSION=$VERSION \
+	HARDWARE_TYPE=$HARDWARE_TYPE
 
 LABEL org.opencontainers.image.version=$VERSION \
 	org.opencontainers.image.description="EasyDeL: An open-source library to make training faster and more optimized in JAX" \

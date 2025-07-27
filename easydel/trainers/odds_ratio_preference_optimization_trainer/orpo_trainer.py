@@ -29,16 +29,12 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import get_logger
 
-from ..base_trainer import (
-    TrainerConfigureFunctionOutput,
-)
-from ..prompt_utils import (
-    maybe_apply_chat_template,
-    maybe_extract_prompt,
-)
+from ..base_trainer import TrainerConfigureFunctionOutput
+from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..trainer.trainer import Trainer
 from ..utils import (
-    DPODataCollatorWithPadding,
+    DPODataCollatorWithPaddingGrain,
+    DPODataCollatorWithPaddingTFDS,
     add_bos_token_if_needed,
     add_eos_token_if_needed,
 )
@@ -57,7 +53,7 @@ class ORPOTrainer(Trainer):
         self,
         arguments: ORPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None = None,
-        data_collator: DPODataCollatorWithPadding | None = None,
+        data_collator: DPODataCollatorWithPaddingTFDS | DPODataCollatorWithPaddingGrain | None = None,
         train_dataset: Dataset | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
@@ -88,8 +84,8 @@ class ORPOTrainer(Trainer):
                     "the trainer."
                 )
         arguments.padding_value = self.padding_value
-        input_data_collator = (
-            DPODataCollatorWithPadding(
+        input_data_collator_tfds = (
+            DPODataCollatorWithPaddingTFDS(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
                 pad_token_id=self.padding_value,
@@ -100,7 +96,20 @@ class ORPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-        self.input_data_collator = input_data_collator
+        input_data_collator_grain = (
+            DPODataCollatorWithPaddingGrain(
+                max_prompt_length=arguments.max_prompt_length,
+                max_completion_length=arguments.max_completion_length,
+                pad_token_id=self.padding_value,
+                label_pad_token_id=arguments.label_pad_token_id,
+                is_encoder_decoder=arguments.is_encoder_decoder,
+                prepadded=True,
+            )
+            if data_collator is None
+            else data_collator
+        )
+        self.input_data_collator_grain = input_data_collator_grain
+        self.input_data_collator_tfds = input_data_collator_tfds
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
@@ -123,19 +132,13 @@ class ORPOTrainer(Trainer):
             num_proc=arguments.dataset_num_proc,
         )
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(
-                maybe_extract_prompt,
-                num_proc=arguments.dataset_num_proc,
-            )
+            eval_dataset = eval_dataset.map(maybe_extract_prompt, num_proc=arguments.dataset_num_proc)
             eval_dataset = eval_dataset.map(
                 maybe_apply_chat_template,
                 fn_kwargs={"tokenizer": processing_class},
                 num_proc=arguments.dataset_num_proc,
             )
-            eval_dataset = eval_dataset.map(
-                self.tokenize_row,
-                num_proc=arguments.dataset_num_proc,
-            )
+            eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=arguments.dataset_num_proc)
         self.arguments = arguments
         self.processing_class = processing_class
         super().__init__(
@@ -456,7 +459,7 @@ class ORPOTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
-        return self.input_data_collator
+        return self.input_data_collator_grain
 
     def create_tfds_collect_function(
         self,
@@ -476,4 +479,4 @@ class ORPOTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
-        return self.input_data_collator
+        return self.input_data_collator_tfds

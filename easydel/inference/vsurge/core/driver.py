@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import queue
-import threading
 import time
 import traceback
 import typing as tp
@@ -25,11 +24,22 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 
-from easydel.inference.vsurge.worker.io_batch import InputBatch
+from easydel.inference.vsurge.scheduler.page_scheduler import DecodeScheduleInfo
+from easydel.layers.caching import PagesMetadata
 from easydel.utils.helpers import get_logger
 
-from ...sampling_params import JitableSamplingParams, SamplingParams
-from ..utils import ActiveRequest, ResultTokens, ReturnSample, SafeThread, pad_tokens, process_result_tokens
+from ...sampling_params import JitableSamplingParams
+from ..scheduler import BatchConfig, PagedScheduler, PrefillScheduleInfo, RequestPriority, SchedulePolicy, Scheduler
+from ..utils import (
+    ActiveRequest,
+    GenerationState,
+    MetricsRecorder,
+    ResultTokens,
+    ReturnSample,
+    SafeThread,
+    pad_tokens,
+    process_result_tokens,
+)
 from .engine import vEngine
 
 if tp.TYPE_CHECKING:
@@ -38,348 +48,123 @@ if tp.TYPE_CHECKING:
 logger = get_logger("vSurge-vDriver")
 
 
-class MetricsRecorder:
-    """
-    Records and provides access to various operational metrics.
-
-    This class is responsible for collecting time-series data for various
-    durations, counts, and queue sizes within the vDriver system. It provides
-    methods to update these metrics and retrieve them in raw or aggregated forms.
-
-    Attributes:
-        metrics (dict): A dictionary holding all recorded metrics.
-        metrics_log_interval_sec (float): Interval for logging metrics by a monitor.
-        _lock (threading.Lock): A lock to ensure thread-safe updates to metrics.
-        _max_list_len (int): Maximum length for lists storing time-series data
-                             to prevent unbounded memory growth.
-    """
-
-    def __init__(self, metrics_log_interval_sec: float = 10.0):
-        """
-        Initializes the MetricsRecorder.
-
-        Args:
-            metrics_log_interval_sec (float): The interval in seconds at which
-                a monitoring thread might log these metrics. Defaults to 10.0.
-        """
-        self.metrics = {
-            "queue_sizes": {},
-            "active_requests_count": 0,
-            "ttft_ms": [],
-            "prefill_op_ms": [],
-            "decode_op_ms": [],
-            "insert_op_ms": [],
-            "transfer_op_ms": [],
-            "operation_lock_wait_ms": [],
-            "prefill_ops_count": 0,
-            "decode_ops_count": 0,
-            "insert_ops_count": 0,
-            "completed_requests_count": 0,
-            "submitted_requests_count": 0,
-        }
-        self._lock = threading.Lock()
-        self.metrics_log_interval_sec = metrics_log_interval_sec
-        self._max_list_len = 1000
-
-    def _append_to_list(self, key: str, value: float):
-        """
-        Appends a value to a list metric, ensuring it doesn't exceed max length.
-
-        Args:
-            key (str): The key of the list metric in `self.metrics`.
-            value (float): The value to append.
-        """
-        lst = self.metrics.get(key, [])
-        lst.append(value)
-        self.metrics[key] = lst[-self._max_list_len :]
-
-    def update_queue_size(self, queue_name: str, size: int):
-        """
-        Updates the recorded size for a specific queue.
-
-        Args:
-            queue_name (str): The name of the queue.
-            size (int): The current size of the queue.
-        """
-        with self._lock:
-            self.metrics["queue_sizes"][queue_name] = size
-
-    def set_active_requests_count(self, count: int):
-        """
-        Sets the current count of active requests.
-
-        Args:
-            count (int): The number of currently active requests.
-        """
-        with self._lock:
-            self.metrics["active_requests_count"] = count
-
-    def record_ttft(self, ttft_ms: float):
-        """
-        Records a Time To First Token (TTFT) duration.
-
-        Args:
-            ttft_ms (float): The TTFT duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("ttft_ms", ttft_ms)
-
-    def record_prefill_op_time(self, duration_ms: float):
-        """
-        Records the duration of a prefill operation and increments its count.
-
-        Args:
-            duration_ms (float): The prefill operation duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("prefill_op_ms", duration_ms)
-            self.metrics["prefill_ops_count"] += 1
-
-    def record_decode_op_time(self, duration_ms: float):
-        """
-        Records the duration of a decode operation and increments its count.
-
-        Args:
-            duration_ms (float): The decode operation duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("decode_op_ms", duration_ms)
-            self.metrics["decode_ops_count"] += 1
-
-    def record_insert_op_time(self, duration_ms: float):
-        """
-        Records the duration of an insert operation and increments its count.
-
-        Args:
-            duration_ms (float): The insert operation duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("insert_op_ms", duration_ms)
-            self.metrics["insert_ops_count"] += 1
-
-    def record_transfer_op_time(self, duration_ms: float):
-        """
-        Records the duration of a transfer operation.
-
-        Args:
-            duration_ms (float): The transfer operation duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("transfer_op_ms", duration_ms)
-
-    def record_operation_lock_wait_time(self, duration_ms: float):
-        """
-        Records the time spent waiting for an operation lock.
-
-        Args:
-            duration_ms (float): The lock wait duration in milliseconds.
-        """
-        with self._lock:
-            self._append_to_list("operation_lock_wait_ms", duration_ms)
-
-    def increment_completed_requests(self):
-        """Increments the count of completed requests."""
-        with self._lock:
-            self.metrics["completed_requests_count"] += 1
-
-    def increment_submitted_requests(self):
-        """Increments the count of submitted requests."""
-        with self._lock:
-            self.metrics["submitted_requests_count"] += 1
-
-    def get_all_metrics(self) -> dict:
-        """
-        Returns a deep copy of all currently recorded metrics.
-
-        Returns:
-            dict: A copy of the metrics dictionary.
-        """
-        with self._lock:
-            copied_metrics = {}
-            for k, v in self.metrics.items():
-                if isinstance(v, list):
-                    copied_metrics[k] = list(v)
-                elif isinstance(v, dict):
-                    copied_metrics[k] = dict(v)
-                else:
-                    copied_metrics[k] = v
-            return copied_metrics
-
-    def get_aggregated_metrics_snapshot(self, window_size=100) -> dict:
-        """
-        Returns a snapshot of aggregated metrics.
-
-        For list-based metrics (e.g., durations), it calculates average,
-        percentiles (p50, p90, p99), min, and max over a specified window
-        of recent samples.
-
-        Args:
-            window_size (int): The number of recent samples to use for
-                aggregation. If 0, all samples are used. Defaults to 100.
-
-        Returns:
-            dict: A dictionary of aggregated metrics.
-        """
-        snapshot = self.get_all_metrics()
-        aggregated = {}
-        for key, value in snapshot.items():
-            if isinstance(value, list) and value:
-                sample = value[-window_size:] if window_size > 0 else value
-                if sample:
-                    aggregated[f"{key}_avg"] = round(np.mean(sample), 2)
-                    aggregated[f"{key}_p50"] = round(np.percentile(sample, 50), 2)
-                    aggregated[f"{key}_p90"] = round(np.percentile(sample, 90), 2)
-                    aggregated[f"{key}_p99"] = round(np.percentile(sample, 99), 2)
-                    aggregated[f"{key}_min"] = round(np.min(sample), 2)
-                    aggregated[f"{key}_max"] = round(np.max(sample), 2)
-                    aggregated[f"{key}_count_total"] = snapshot.get(f"{key.split('_ms')[0]}_ops_count", len(value))
-                    aggregated[f"{key}_count_window"] = len(sample)
-            elif isinstance(value, dict):
-                aggregated[key] = dict(value)
-            elif isinstance(value, int | float):
-                aggregated[key] = value
-        return aggregated
-
-
 class vDriver:
     """
     Drives the vEngine for prefill and decode operations, managing request flow.
 
     The `vDriver` orchestrates the entire inference pipeline, including request
     submission, prefilling, KV cache transfer, decoding, and detokenization.
-    It uses a series of background threads and queues to manage these stages
-    concurrently. It also incorporates a `MetricsRecorder` to track operational
+    It uses a unified inference thread and scheduler to manage these stages
+    efficiently. It also incorporates a `MetricsRecorder` to track operational
     statistics.
 
     Attributes:
         _engine (vEngine): The underlying engine performing model computations.
-        _prefill_backlog (queue.Queue): Queue for incoming prefill requests.
-        _transfer_backlog (queue.Queue): Queue for requests awaiting KV cache transfer.
-        _decode_backlog (queue.Queue): Queue for requests ready for decoding.
         _detokenize_backlog (queue.Queue): Queue for results awaiting detokenization.
-        _decode_slots (queue.Queue): Queue managing available decode slots in the engine.
         _live_requests (dict): Tracks requests currently active in decode slots.
         _interleaved_mode (bool): If True, prioritizes new requests for lower latency.
         _slot_clear_steps (int): Interval for clearing unused resources in decode state.
         _detokenizing_blocks (int): Max size for the detokenize backlog.
-        _use_operation_lock (bool): If True, serializes device operations (prefill,
-                                    insert, decode) to prevent OOMs.
         metrics_recorder (MetricsRecorder): Instance for recording metrics.
         log (function): Logger instance for outputting messages.
         live (bool): Flag indicating if the driver's worker threads are active.
         _pause (bool): Flag indicating if the driver is paused.
-        _operation_lock (threading.Lock | None): Lock for serializing device ops.
-        _all_threads (list[SafeThread]): List of all managed background threads.
+        _all_threads (list[SafeThread]): list of all managed background threads.
         _metrics_thread (SafeThread | None): Thread for monitoring and logging metrics.
     """
 
     _engine: vEngine
-    _prefill_backlog: queue.Queue[ActiveRequest | None]
-    _transfer_backlog: queue.Queue[ActiveRequest]
-    _decode_backlog: queue.Queue[ActiveRequest]
     _detokenize_backlog: queue.Queue[tp.Any]
-    _decode_slots: queue.Queue[int]
-    _active_requests: dict[int, ActiveRequest | None]
 
     def __init__(
         self,
         engine: vEngine,
-        interleaved_mode: bool = False,
+        schedule_policy: SchedulePolicy = SchedulePolicy.ADAPTIVE,
+        batch_config: BatchConfig | None = None,
         detokenizing_blocks: int = 8,
+        max_prefill_chunk_size: int = 512,
         slot_clear_steps: int = 512,
         verbose: bool = True,
-        prefill_backlog_maxsize: int = 0,
-        transfer_backlog_maxsize: int | None = None,
-        decode_backlog_maxsize: int | None = None,
-        use_operation_lock: bool = True,
         metrics_log_interval_sec: float = 10.0,
+        interleaved_mode: bool = False,
     ):
         """
-        Initializes the vDriver.
+        Initialize the vDriver.
 
         Args:
-            engine: The `vEngine` instance to drive.
-            interleaved_mode: If True, operates in a mode that may prioritize
-                new requests for latency. Defaults to False.
-            detokenizing_blocks: The capacity of the detokenization queue.
-                Defaults to 8.
-            slot_clear_steps: Number of decode steps after which unused slot
-                resources are freed. Defaults to 512.
-            verbose: If True, enables informational logging. Defaults to True.
-            prefill_backlog_maxsize: Maximum size of the prefill request queue.
-                0 means unbounded. Defaults to 0.
-            transfer_backlog_maxsize: Maximum size of the KV cache transfer queue.
-                If None, uses a default based on `interleaved_mode`.
-            decode_backlog_maxsize: Maximum size of the decode request queue.
-                If None, uses a default based on `interleaved_mode`.
-            use_operation_lock: If True, a lock serializes device-heavy operations
-                (prefill, insert, decode) to potentially prevent OOM errors at the
-                cost of some parallelism. Defaults to True.
-            metrics_log_interval_sec: Interval in seconds for the metrics
-                monitor to log aggregated metrics. If 0 or less, periodic
-                logging by the monitor is disabled. Defaults to 10.0.
+            engine: The vEngine instance to drive
+            schedule_policy: Scheduling policy (ONLINE, OFFLINE, ADAPTIVE)
+            batch_config: Configuration for request batching (SimpleScheduler only)
+            detokenizing_blocks: Size of detokenization queue
+            slot_clear_steps: Steps between resource cleanup
+            verbose: Enable verbose logging
+            metrics_log_interval_sec: Interval for metrics logging
+            interleaved_mode: If True, skip KV cache transfer step
         """
-        self._pause = False
         self._engine = engine
-        self._interleaved_mode = interleaved_mode
         self._detokenizing_blocks = detokenizing_blocks
         self._slot_clear_steps = slot_clear_steps
-        self._use_operation_lock = use_operation_lock
+        self._interleaved_mode = interleaved_mode
+        self._max_prefill_chunk_size = max_prefill_chunk_size
+        self._pause = False
 
-        self.prefill_backlog_maxsize = prefill_backlog_maxsize
-        self.transfer_backlog_maxsize = transfer_backlog_maxsize
-        self.decode_backlog_maxsize = decode_backlog_maxsize
+        if self.is_paged_runtime:
+            self.scheduler = PagedScheduler(
+                metadata=engine.page_metadata,
+                max_batch_size=engine.max_concurrent_decodes,
+                max_prefill_batch_size=engine.max_concurrent_prefill,
+                max_prefill_chunk_size=max_prefill_chunk_size,
+                schedule_policy=schedule_policy,
+            )
+        else:
+            self.scheduler = Scheduler(
+                max_batch_size=engine.max_concurrent_decodes,
+                max_prefill_batch_size=engine.max_concurrent_prefill,
+                schedule_policy=schedule_policy,
+                batch_config=batch_config,
+            )
+
+        self._detokenize_backlog = queue.Queue(maxsize=self._detokenizing_blocks if self._detokenizing_blocks > 0 else 0)
+
+        self._live_requests: dict[int, ActiveRequest | None] = {i: None for i in range(engine.max_concurrent_decodes)}
 
         self.metrics_recorder = MetricsRecorder(metrics_log_interval_sec)
         self._request_counter = 0
-        if self._use_operation_lock:
-            self._operation_lock = threading.Lock()
-        else:
-            self._operation_lock = None
 
-        self._setup_scheduler()
         self.log = logger.info if verbose else logger.debug
+
         self.live = False
-        self._metrics_thread = None
+        self._all_threads: list[SafeThread] = []
+        self._metrics_thread: SafeThread | None = None
+
         if self.is_paged_runtime:
             self._setup_pages_requirements()
 
     def _setup_pages_requirements(self):
+        """Setup requirements for paged attention using PagesMetadata"""
         engine = self.engine
-        self.input_batch = InputBatch(
+        metadata = engine.page_metadata
+        self.pages_metadata = PagesMetadata.create_empty(
+            num_tokens=engine.max_prefill_length,
             max_num_reqs=engine.max_concurrent_decodes,
-            max_model_len=engine.max_length,
-            max_num_batched_tokens=engine.max_prefill_length,
-            vocab_size=engine.model.config.vocab_size,
-            block_sizes=engine.page_metadata.page_size,
+            max_blocks=metadata.max_num_pages_per_req,
+            page_size=metadata.page_size,
         )
-        self.input_ids = jnp.zeros([self.max_num_tokens], dtype="i4")
-        self.positions = jnp.zeros([self.max_num_tokens], dtype="i4")
-        self.block_table = jnp.zeros([self.max_num_reqs, self.max_num_blocks_per_req], dtype="i4")
-        self.query_start_loc = jnp.zeros([self.max_num_tokens + 1], dtype="i4")
-        self.seq_lens = jnp.zeros([self.max_num_tokens], dtype="i4")
+        self.log(
+            f"Initialized PagesMetadata with page_size={metadata.page_size}, max_blocks={metadata.max_num_pages_per_req}"
+        )
 
     @cached_property
     def is_paged_runtime(self) -> bool:
-        return self._engine.is_paged_runtime
-
-    def _acquire_operation_lock_if_needed(self):
-        """Acquires the operation lock if it's enabled and records wait time."""
-        if self._operation_lock:
-            start_wait = time.perf_counter()
-            self._operation_lock.acquire()
-            wait_time_ms = (time.perf_counter() - start_wait) * 1000
-            if wait_time_ms > 0.1:
-                self.metrics_recorder.record_operation_lock_wait_time(wait_time_ms)
-
-    def _release_operation_lock_if_needed(self):
-        """Releases the operation lock if it's enabled."""
-        if self._operation_lock:
-            self._operation_lock.release()
+        return self.engine.is_paged_runtime
 
     @property
     def engine(self) -> vEngine:
         return self._engine
+
+    @property
+    def max_prefill_chunk_size(self) -> int:
+        return self._max_prefill_chunk_size
 
     @property
     def driver_name(self) -> str:
@@ -392,29 +177,6 @@ class vDriver:
             str: The driver name.
         """
         return self._get_model_name(self._engine.model)
-
-    def place_request_on_prefill_queue(self, request: ActiveRequest):
-        """
-        Places a new active request onto the prefill backlog queue.
-
-        If the queue is full (and has a max size), this method will block
-        until space is available.
-
-        Args:
-            request (ActiveRequest): The request to be prefilled.
-        """
-        if self.is_paged_runtime:
-            sequence = self.create_sequence_from_request(request)
-            self.scheduler.add_sequence(sequence)
-            self._request_counter += 1
-        else:
-            try:
-                self._prefill_backlog.put(request, block=False)
-            except queue.Full:
-                self.log(
-                    f"Prefill backlog is full (max_size={self.prefill_backlog_maxsize}). Blocking to place request."
-                )
-                self._prefill_backlog.put(request, block=True)
 
     @property
     def processor(self) -> ProcessingClassType:
@@ -479,6 +241,7 @@ class vDriver:
         """
         engine = self._engine
         try:
+            self.log("Starting engine compilation...")
             decode_state = engine.init_decode_state()
             for length in engine.prefill_lengths:
                 padded_tokens = padded_valids = jnp.ones((1, length), "i4")
@@ -491,22 +254,27 @@ class vDriver:
                     true_length=0,
                     sampling_params=JitableSamplingParams.init_empty(1).view_1d(),
                     rngs=engine.prng_key,
+                    cache=None,
+                    cache_metadata=None,
                     slot=0,
                 )
                 decode_state = engine.insert(state_new, decode_state, 0)
 
             self.log("Compiling decode")
             decode_state = engine.free_state_resources([0], decode_state)
-            decode_state = engine.decode(
+            decode_state, _ = engine.decode(
                 graphstate=engine.graphstate,
                 graphothers=engine.graphothers,
                 state=decode_state,
+                cache_metadata=None,
                 rngs=engine.prng_key,
                 slot=0,
             )
             engine.free_resource(0)
             del decode_state
-        except Exception:
+            self.log("Engine compilation completed successfully")
+        except Exception as e:
+            self.log(f"Compilation failed: {e}")
             traceback.print_exc()
             self.stop()
             exit(1)
@@ -518,25 +286,7 @@ class vDriver:
         Returns:
             int: Maximum concurrent decodes supported by the engine.
         """
-        return self._engine.total_max_concurrent_decodes
-
-    def _jax_transfer_prefill_result(self, new_request: ActiveRequest):
-        """
-        Transfers prefill results (KV cache) to the engine's device.
-
-        Uses `jax.device_put` and blocks until the transfer is complete.
-        Records the duration of this transfer operation.
-
-        Args:
-            new_request (ActiveRequest): The request whose `prefill_result`
-                needs to be transferred.
-        """
-        start_time = time.perf_counter()
-        dst_sharding = self._engine.get_prefix_destination_sharding()
-        new_request.prefill_result = jax.device_put(new_request.prefill_result, dst_sharding)
-        jax.block_until_ready(new_request.prefill_result)
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        self.metrics_recorder.record_transfer_op_time(duration_ms)
+        return self._engine.max_concurrent_decodes  # Fixed: removed 'total_' prefix
 
     def _detokenize_action_thread(self):
         """
@@ -596,7 +346,7 @@ class vDriver:
 
                 first_token_return_time = (time.perf_counter() - prefill_dequeue_time) * 1000
                 self.metrics_recorder.record_ttft(first_token_return_time)
-                self.log(f"TTFT: {first_token_return_time:.2f}ms for a request.")
+                self.log(f"TTFT: {first_token_return_time:.2f}ms for request {request.id}")
 
             elif len(data) == 2 and isinstance(data[1], ResultTokens):
                 _, result_tokens = data
@@ -622,14 +372,22 @@ class vDriver:
                         final_step_results = []
                         for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
                             if len(res_base.text) > 0:
-                                szip = zip(request.accumulated_text, res_base.text, strict=False)
-                                for idx, (accum, res) in enumerate(szip):
-                                    request.accumulated_text[idx] = accum + res
+                                if isinstance(request.accumulated_text, list):
+                                    for idx, (accum, res) in enumerate(
+                                        zip(request.accumulated_text, res_base.text, strict=False)
+                                    ):
+                                        request.accumulated_text[idx] = accum + res
+                                else:
+                                    request.accumulated_text = request.accumulated_text + res_base.text
                             if request.sampling_params.stop is not None:
                                 for stop_sign in request.sampling_params.stop:
-                                    for idx, accum in enumerate(request.accumulated_text):
-                                        if stop_sign in accum:
-                                            request.complete[idx] = True
+                                    if isinstance(request.accumulated_text, list):
+                                        for idx, accum in enumerate(request.accumulated_text):
+                                            if stop_sign in accum:
+                                                request.complete[idx] = True
+                                    else:
+                                        if stop_sign in request.accumulated_text:
+                                            request.complete = np.ones_like(request.complete, dtype=bool)
                             request.total_generated_tokens += num_valid
                             tps = request.total_generated_tokens / elapsed_time if elapsed_time > 1e-6 else 0.0
                             final_step_results.append(
@@ -648,183 +406,500 @@ class vDriver:
                         if request.complete.all():
                             if request.return_channel:
                                 request.return_channel.close()
-                            self.log(f"Request in slot {slot} completed.")
+                            self.log(
+                                f"Request {request.id} in slot {slot} completed. "
+                                f"Generated {request.total_generated_tokens} tokens in {elapsed_time:.2f}s "
+                                f"({tps:.2f} tokens/s)"
+                            )
                             self.metrics_recorder.increment_completed_requests()
                             self._live_requests[slot] = None
-                            try:
-                                self._decode_slots.put(slot, block=False)
-                            except queue.Full:
-                                self.log(
-                                    f"Decode slots queue full when trying to return slot {slot}. This should not happen."
-                                )
+                            # Notify scheduler that request is complete
+                            self.scheduler.complete_request(request.id)
                             engine.free_resource(slot)
             elif len(data) == 2 and isinstance(data[1], ActiveRequest):
                 slot, active_request = data
-                self.log(f"Tracking new active request in slot {slot}.")
+                self.log(f"Tracking new active request {active_request.id} in slot {slot}.")
                 self._live_requests[slot] = active_request
             else:
                 self.log(
                     f"Warning: Unknown data type received in detokenize backlog: {type(data[0]) if data else 'None'}"
                 )
 
-    def _decode_action_thread(self):
-        """
-        Background thread action for inserting prefills and performing decode steps.
-
-        This thread consumes requests from `_decode_backlog`, inserts their
-        prefill results (KV caches) into the engine's decode state using
-        available slots. It then calls the engine's decode method to generate
-        the next set of tokens for all active requests. Results are passed to
-        the `_detokenize_backlog`.
-        Device-heavy operations (`engine.insert`, `engine.decode`) are
-        optionally serialized by `_operation_lock`.
-        """
-        engine = self._engine
-        generate_timestep = 0
-        decode_state = engine.init_decode_state()
-
-        while self.live:
-            try:
-                self._acquire_operation_lock_if_needed()
-                while not self._decode_slots.empty() and not self._decode_backlog.empty():
-                    try:
-                        slot_for_insert = self._decode_slots.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        new_request = self._decode_backlog.get_nowait()
-                        if new_request is None:
-                            self._decode_slots.put(slot_for_insert, block=False)
-                            if not self.live:
-                                break
-                            continue
-                    except queue.Empty:
-                        self._decode_slots.put(slot_for_insert, block=False)
-                        break
-
-                    self.log(f"Decode filling slot {slot_for_insert} with a new request at step {generate_timestep}.")
-                    insert_start_time = time.perf_counter()
-                    decode_state = engine.insert(
-                        prefix=new_request.prefill_result,
-                        decode_state=decode_state,
-                        slot=slot_for_insert,
-                    )
-                    insert_duration_ms = (time.perf_counter() - insert_start_time) * 1000
-                    self.metrics_recorder.record_insert_op_time(insert_duration_ms)
-
-                    del new_request.prefill_result
-                    new_request.generate_timestep_added = generate_timestep
-                    new_request.complete = np.zeros((engine.samples_per_slot,), "b1")
-                    self._detokenize_backlog.put((slot_for_insert, new_request), block=True)
-            finally:
-                self._release_operation_lock_if_needed()
-
-            if not self.live and self._decode_backlog.empty():
-                break
-
-            if any(v is not None for v in self._live_requests.values()):
-                time_before_decode_call = time.perf_counter()
-                try:
-                    self._acquire_operation_lock_if_needed()
-
-                    decode_state, sampled_tokens = engine.decode(
-                        graphstate=engine.graphstate,
-                        graphothers=engine.graphothers,
-                        state=decode_state,
-                        rngs=engine.prng_key,
-                        slot=0,
-                    )
-                    decode_op_duration_ms = (time.perf_counter() - time_before_decode_call) * 1000
-                    self.metrics_recorder.record_decode_op_time(decode_op_duration_ms)
-
-                    sampled_tokens.copy_to_host_async()
-                    self._detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
-                    generate_timestep += 1
-                finally:
-                    self._release_operation_lock_if_needed()
-
-                total_decode_cycle_ms = (time.perf_counter() - time_before_decode_call) * 1000
-                self.log(
-                    f"Decode engine step {generate_timestep} - "
-                    f"UsedSlotForDecode: {sum([1 for v in self._live_requests.values() if v is not None])}, "
-                    f"DecodeOpTook: {decode_op_duration_ms:.2f}ms, "
-                    f"TotalCycleTook: {total_decode_cycle_ms:.2f}ms"
-                )
-
-            if self._slot_clear_steps:
-                if (generate_timestep % self._slot_clear_steps) == 0:
-                    self.log(f"Decode step {generate_timestep}: Clearing unused slot resources.")
-                    try:
-                        self._acquire_operation_lock_if_needed()
-                        decode_state = engine.free_state_resources(
-                            [i for i, v in self._live_requests.items() if v is None],
-                            decode_state,
-                        )
-                    finally:
-                        self._release_operation_lock_if_needed()
-
-    def _prefill_action_thread(self):
-        """
-        Background thread action for performing prefill operations.
-
-        This thread consumes requests from the `_prefill_backlog`, processes
-        their content (tokenization, padding), and calls the engine's prefill
-        method. The prefill result (KV cache and first token) is then passed
-        to the `_detokenize_backlog` (for the first token) and the main request
-        object is put onto the `_transfer_backlog`.
-        The device-heavy `engine.prefill` operation is optionally serialized
-        by `_operation_lock`.
-        """
+    def _unified_inference_thread(self):
+        """Unified inference thread that handles both paged and non-paged modes"""
         engine = self._engine
         processor = engine.processor
+        decode_state = engine.init_decode_state()
+        generate_timestep = 0
+
+        # Initialize prefill accumulator for paged mode
+        prefill_accumulator = {} if self.is_paged_runtime else None
+
+        # Initialize page manager if needed
+        if self.is_paged_runtime and not hasattr(self, "page_manager"):
+            self.page_manager = self.scheduler.page_manager
+
         while self.live:
             try:
-                request = self._prefill_backlog.get(block=True, timeout=0.1)
-            except queue.Empty:
-                if not self.live:
-                    break
-                continue
-            if request is None:
+                if self.is_paged_runtime:
+                    schedule_result = self.scheduler.schedule()
+
+                    # Update page manager
+                    if schedule_result.updated_page_manager:
+                        self.page_manager = schedule_result.updated_page_manager
+
+                    # Process prefills
+                    if schedule_result.should_prefill:
+                        decode_state = self._process_paged_prefill(
+                            engine,
+                            processor,
+                            schedule_result.prefill_infos,
+                            prefill_accumulator,
+                            decode_state,
+                            generate_timestep,
+                        )
+
+                    # Process decodes
+                    if schedule_result.should_decode and schedule_result.decode_info:
+                        decode_state, sampled_tokens = self._process_paged_decode(
+                            engine,
+                            decode_state,
+                            schedule_result.decode_info,
+                            generate_timestep,
+                        )
+                        generate_timestep += 1
+                else:
+                    # Simple scheduler path remains the same
+                    simple_result = self.scheduler.schedule()
+
+                    if simple_result.should_prefill:
+                        decode_state = self._process_fifo_prefill(
+                            engine,
+                            processor,
+                            simple_result.prefill_requests,
+                            decode_state,
+                            generate_timestep,
+                        )
+
+                    if simple_result.should_decode:
+                        decode_state, sampled_tokens = self._process_fifo_decode(
+                            engine,
+                            decode_state,
+                            simple_result.decode_slots,
+                            generate_timestep,
+                        )
+                        generate_timestep += 1
+
+                # Periodic cleanup
+                if self._slot_clear_steps and (generate_timestep % self._slot_clear_steps) == 0:
+                    decode_state = self._perform_cleanup(engine, decode_state)
+
+                # Sleep if nothing to do
+                should_sleep = True
+                if self.is_paged_runtime:
+                    should_sleep = not (schedule_result.should_prefill or schedule_result.should_decode)
+                else:
+                    should_sleep = not (simple_result.should_prefill or simple_result.should_decode)
+
+                if should_sleep:
+                    time.sleep(0.001)
+
+            except Exception as e:
+                self.log(f"Fatal error in inference thread: {e}")
+                traceback.print_exc()
                 break
 
-            request.metadata.prefill_dequeue_time = time.perf_counter()
-            sampling_params = request.sampling_params
-            padded_tokens, padded_valids, true_length = self._process_prefill_content(
-                request,
-                processor,
-                engine.max_prefill_length,
-                engine.prefill_lengths,
-                engine.pad_token_id,
-            )
-            self.log(f"Prefill for a request: BLSize={self._prefill_backlog.qsize()}, Tokens={padded_valids.shape[-1]}")
+    def _update_periodic_metrics(self):
+        """Update metrics that are tracked periodically"""
+        if hasattr(self.scheduler, "prefill_queue"):
+            self.metrics_recorder.update_queue_size("prefill_pending", self.scheduler.prefill_queue.qsize())
 
-            prefill_start_time = time.perf_counter()
+        self.metrics_recorder.update_queue_size("detokenize_backlog", self._detokenize_backlog.qsize())
+
+        active_count = sum(1 for req in self._live_requests.values() if req is not None)
+        self.metrics_recorder.set_active_requests_count(active_count)
+
+    def _perform_cleanup(self, engine, decode_state):
+        """Perform periodic cleanup of unused resources"""
+        self.log("Performing periodic cleanup")
+
+        inactive_slots = [slot for slot, req in self._live_requests.items() if req is None]
+
+        if inactive_slots:
+            self.log(f"Clearing {len(inactive_slots)} unused slots: {inactive_slots}")
+            decode_state = engine.free_state_resources(inactive_slots, decode_state)
+
+        return decode_state
+
+    def _process_fifo_prefill(
+        self,
+        engine,
+        processor,
+        prefill_requests: list[tuple[int, ActiveRequest]],
+        decode_state,
+        generate_timestep: int,
+    ):
+        """Process prefill for simple scheduler (entire prompts at once)"""
+        prefill_start_batch = time.perf_counter()
+
+        for slot, request in prefill_requests:
             try:
-                self._acquire_operation_lock_if_needed()
+                request.metadata.prefill_dequeue_time = time.perf_counter()
+
+                padded_tokens, padded_valids, true_length = self._process_prefill_content(
+                    request,
+                    processor,
+                    engine.max_prefill_length,
+                    engine.prefill_lengths,
+                    engine.pad_token_id,
+                )
+
+                self.log(f"Prefilling request {request.id} in slot {slot} (simple mode)")
+
+                prefill_start = time.perf_counter()
+
                 prefill_result, first_token = engine.prefill(
                     graphstate=engine.graphstate,
                     graphothers=engine.graphothers,
                     tokens=padded_tokens,
                     valids=padded_valids,
                     true_length=true_length,
-                    sampling_params=sampling_params.make_jitable().view_1d(),
+                    sampling_params=request.sampling_params.make_jitable().view_1d(),
+                    cache=None,  # No cache for simple mode
+                    cache_metadata=None,  # No metadata for simple mode
                     rngs=engine.prng_key,
-                    slot=0,
+                    slot=slot,
                 )
-            finally:
-                self._release_operation_lock_if_needed()
-            prefill_duration_ms = (time.perf_counter() - prefill_start_time) * 1000
-            self.metrics_recorder.record_prefill_op_time(prefill_duration_ms)
-            request.prefill_result = prefill_result
-            request.complete = np.zeros((engine.samples_per_slot,), "b1")
-            self._detokenize_backlog.put((first_token, request, request.metadata.prefill_dequeue_time), block=True)
+
+                prefill_duration_ms = (time.perf_counter() - prefill_start) * 1000
+                self.metrics_recorder.record_prefill_op_time(prefill_duration_ms)
+
+                if not self._interleaved_mode:
+                    transfer_start = time.perf_counter()
+                    dst_sharding = engine.get_prefix_destination_sharding()
+                    prefill_result = jax.device_put(prefill_result, dst_sharding)
+                    jax.block_until_ready(prefill_result)
+                    transfer_duration_ms = (time.perf_counter() - transfer_start) * 1000
+                    self.metrics_recorder.record_transfer_op_time(transfer_duration_ms)
+
+                insert_start = time.perf_counter()
+                decode_state = engine.insert(prefix=prefill_result, decode_state=decode_state, slot=slot)
+                insert_duration_ms = (time.perf_counter() - insert_start) * 1000
+                self.metrics_recorder.record_insert_op_time(insert_duration_ms)
+
+                request.prefill_result = prefill_result
+                request.complete = np.zeros((engine.samples_per_slot,), "b1")
+                request.generate_timestep_added = generate_timestep
+                request.decode_start_time = None
+
+                self._detokenize_backlog.put(
+                    (first_token, request, request.metadata.prefill_dequeue_time),
+                    block=True,
+                )
+
+                self._detokenize_backlog.put((slot, request), block=True)
+                self._live_requests[slot] = request
+
+                del prefill_result
+
+            except Exception as e:
+                self.log(f"Error processing prefill for request {request.id}: {e}")
+                if request.return_channel:
+                    request.return_channel.set_exception(e)
+                self.scheduler.complete_request(request.id)
+
+        prefill_batch_duration = (time.perf_counter() - prefill_start_batch) * 1000
+        self.log(
+            f"Simple prefill batch completed: {len(prefill_requests)} requests, "
+            f"total time: {prefill_batch_duration:.2f}ms"
+        )
+        return decode_state
+
+    def _process_fifo_decode(self, engine, decode_state, decode_slots: list[int], generate_timestep: int):
+        """Process decode for simple scheduler"""
+        decode_start = time.perf_counter()
+        active_in_decode_slots = sum(
+            1 for slot in decode_slots if slot < len(self._live_requests) and self._live_requests[slot] is not None
+        )
+
+        try:
+            decode_state, sampled_tokens = engine.decode(
+                graphstate=engine.graphstate,
+                graphothers=engine.graphothers,
+                state=decode_state,
+                cache_metadata=None,
+                rngs=engine.prng_key,
+                slot=0,
+            )
+
+            decode_duration_ms = (time.perf_counter() - decode_start) * 1000
+            self.metrics_recorder.record_decode_op_time(decode_duration_ms)
+
+            sampled_tokens.copy_to_host_async()
+            self._detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
+
+            total_cycle_time = (time.perf_counter() - decode_start) * 1000
+            self.log(
+                f"Simple decode completed - "
+                f"DecodeOp: {decode_duration_ms:.2f}ms, "
+                f"TotalCycle: {total_cycle_time:.2f}ms, "
+                f"ActiveSlots: {active_in_decode_slots}/{engine.max_concurrent_decodes}, "
+                f"step: {generate_timestep}"
+            )
+
+            return decode_state, sampled_tokens
+
+        except Exception as e:
+            self.log(f"Error in simple decode step: {e}")
+            traceback.print_exc()
+            return decode_state, None
+
+    def _process_paged_prefill(
+        self,
+        engine,
+        processor,
+        prefill_infos: list[PrefillScheduleInfo],
+        prefill_accumulator: dict,
+        decode_state,
+        generate_timestep: int,
+    ):
+        """Process prefill for paged scheduler (chunked)"""
+        prefill_start_batch = time.perf_counter()
+
+        for info in prefill_infos:
+            slot = info.slot
+            request = info.request
+            page_info = info.page_batch_info
+
             try:
-                self._transfer_backlog.put(request, block=True)
-                self.log(f"Placed a request on transfer queue ({self._transfer_backlog.qsize()} items).")
-            except queue.Full:
-                self.log("Transfer backlog full. Blocking to place a request.")
-                self._transfer_backlog.put(request, block=True)
-            del prefill_result, request
+                # Initialize request state if first chunk
+                if not hasattr(request, "_tokenized_ids"):
+                    if isinstance(request.prefill_content, str):
+                        content = processor(
+                            text=request.prefill_content, return_tensors="np", return_attention_mask=True
+                        )
+                        request._tokenized_ids = content["input_ids"][0].tolist()
+                        request._attention_mask = content["attention_mask"][0]
+                    else:
+                        request._tokenized_ids = list(request.prefill_content)
+                        request._attention_mask = [1] * len(request._tokenized_ids)
+
+                # Get the actual chunk tokens
+                chunk_start = request.prefill_tokens_processed - len(info.token_ids)
+                chunk_end = request.prefill_tokens_processed
+                actual_tokens = jnp.array(request._tokenized_ids[chunk_start:chunk_end])
+                actual_mask = jnp.array(request._attention_mask[chunk_start:chunk_end])
+
+                # Get existing cache for this slot if continuing
+                existing_cache = None
+                if slot in prefill_accumulator:
+                    existing_cache = prefill_accumulator[slot]["cache"]
+
+                # Process the chunk
+                prefill_result, chunk_output = self._process_prefill_chunk(
+                    engine=engine,
+                    tokens=actual_tokens,
+                    mask=actual_mask,
+                    request=request,
+                    slot=slot,
+                    page_info=page_info,
+                    decode_state=decode_state,
+                    existing_cache=existing_cache,
+                    is_first_chunk=(chunk_start == 0),
+                )
+
+                # Store accumulated state
+                if slot not in prefill_accumulator:
+                    prefill_accumulator[slot] = {}
+
+                prefill_accumulator[slot]["cache"] = prefill_result.cache
+                prefill_accumulator[slot]["last_output"] = chunk_output
+                prefill_accumulator[slot]["request"] = request
+
+                # Handle completion
+                if request.is_prefill_complete:
+                    self._finalize_prefill(
+                        engine=engine,
+                        request=request,
+                        slot=slot,
+                        prefill_result=prefill_result,
+                        decode_state=decode_state,
+                        generate_timestep=generate_timestep,
+                        first_token=prefill_accumulator[slot].get("last_output"),
+                    )
+                    # Clean up accumulator
+                    prefill_accumulator.pop(slot, None)
+
+            except Exception as e:
+                self.log(f"Error processing paged prefill chunk for request {request.id}: {e}")
+                traceback.print_exc()
+                if request.return_channel:
+                    request.return_channel.set_exception(e)
+                self.scheduler.complete_request(request.id)
+                prefill_accumulator.pop(slot, None)
+
+        prefill_batch_duration = (time.perf_counter() - prefill_start_batch) * 1000
+        self.log(
+            f"Paged prefill batch completed: {len(prefill_infos)} chunks, total time: {prefill_batch_duration:.2f}ms"
+        )
+
+    def _process_prefill_chunk(
+        self,
+        engine,
+        tokens: jnp.ndarray,
+        mask: jnp.ndarray,
+        request: ActiveRequest,
+        slot: int,
+        page_info: PagesMetadata,
+        decode_state: GenerationState,
+        existing_cache=None,
+        is_first_chunk: bool = False,
+    ) -> tuple:
+        """Process a single prefill chunk"""
+        # Prepare tokens with proper padding
+        padded_tokens, padded_valids, true_length = pad_tokens(
+            tokens=tokens[None, :],
+            valids=mask[None, :],
+            pad_token_id=engine.pad_token_id,
+            max_prefill_length=self.max_prefill_chunk_size,
+            prefill_lengths=engine.prefill_lengths,
+            right_padding=False,
+        )
+
+        # Use existing cache or get from decode_state
+        cache_to_use = existing_cache if existing_cache is not None else decode_state.cache
+
+        # Call prefill with proper cache
+        prefill_result, chunk_output = engine.prefill(
+            graphstate=engine.graphstate,
+            graphothers=engine.graphothers,
+            tokens=padded_tokens,
+            valids=padded_valids,
+            true_length=true_length,
+            sampling_params=request.sampling_params.make_jitable().view_1d(),
+            cache=cache_to_use,
+            cache_metadata=page_info,
+            rngs=engine.prng_key,
+            slot=slot,
+        )
+
+        if is_first_chunk:
+            request.metadata.prefill_dequeue_time = time.perf_counter()
+            self._detokenize_backlog.put(
+                (chunk_output, request, request.metadata.prefill_dequeue_time),
+                block=True,
+            )
+
+        return prefill_result, chunk_output
+
+    def _process_prefill_chunk(
+        self,
+        engine,
+        tokens: jnp.ndarray,
+        mask: jnp.ndarray,
+        request: ActiveRequest,
+        slot: int,
+        page_info: PagesMetadata,
+        decode_state: GenerationState,
+        existing_state=None,
+        is_first_chunk: bool = False,
+    ) -> tuple:
+        """Process a single prefill chunk"""
+        padded_tokens, padded_valids, true_length = pad_tokens(
+            tokens=tokens[None, :],
+            valids=mask[None, :],
+            pad_token_id=engine.pad_token_id,
+            max_prefill_length=self.max_prefill_chunk_size,
+            prefill_lengths=engine.prefill_lengths,
+            right_padding=False,
+        )
+
+        prefill_result, chunk_output = engine.prefill(
+            graphstate=engine.graphstate,
+            graphothers=engine.graphothers,
+            tokens=padded_tokens,
+            valids=padded_valids,
+            true_length=true_length,
+            sampling_params=request.sampling_params.make_jitable().view_1d(),
+            cache=decode_state.cache,
+            cache_metadata=page_info,
+            rngs=engine.prng_key,
+            slot=slot,
+        )
+
+        if is_first_chunk:
+            request.metadata.prefill_dequeue_time = time.perf_counter()
+            self._detokenize_backlog.put(
+                (chunk_output, request, request.metadata.prefill_dequeue_time),
+                block=True,
+            )
+
+        return prefill_result, chunk_output
+
+    def _finalize_prefill(
+        self,
+        engine,
+        request: ActiveRequest,
+        slot: int,
+        prefill_result,
+        decode_state,
+        generate_timestep: int,
+        first_token=None,
+    ):
+        """Finalize prefill and prepare for decode"""
+        if not self._interleaved_mode:
+            transfer_start = time.perf_counter()
+            dst_sharding = engine.get_prefix_destination_sharding()
+            prefill_result = jax.device_put(prefill_result, dst_sharding)
+            jax.block_until_ready(prefill_result)
+            transfer_duration_ms = (time.perf_counter() - transfer_start) * 1000
+            self.metrics_recorder.record_transfer_op_time(transfer_duration_ms)
+
+        # Insert into decode state
+        insert_start = time.perf_counter()
+        decode_state = engine.insert(prefix=prefill_result, decode_state=decode_state, slot=slot)
+        insert_duration_ms = (time.perf_counter() - insert_start) * 1000
+        self.metrics_recorder.record_insert_op_time(insert_duration_ms)
+
+        # Setup request state
+        request.prefill_result = prefill_result
+        request.complete = np.zeros((engine.samples_per_slot,), "b1")
+        request.generate_timestep_added = generate_timestep
+        request.decode_start_time = None
+
+        # Track in live requests
+        self._detokenize_backlog.put((slot, request), block=True)
+        self._live_requests[slot] = request
+
+        self.log(f"Finalized prefill for request {request.id} in slot {slot}")
+
+    def _process_decode_batch(
+        self,
+        engine,
+        decode_state,
+        decode_info: DecodeScheduleInfo,
+        generate_timestep: int,
+    ):
+        """Process a batch of decode operations"""
+        decode_start = time.perf_counter()
+
+        # Run decode
+        decode_state, sampled_tokens = engine.decode(
+            graphstate=engine.graphstate,
+            graphothers=engine.graphothers,
+            state=decode_state,
+            cache_metadata=decode_info.page_batch_info,
+            rngs=engine.prng_key,
+            slot=0,
+        )
+
+        decode_duration_ms = (time.perf_counter() - decode_start) * 1000
+        self.metrics_recorder.record_decode_op_time(decode_duration_ms)
+
+        sampled_tokens.copy_to_host_async()
+        self._detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
+
+        return decode_state, sampled_tokens
 
     def _process_prefill_content(
         self,
@@ -835,25 +910,22 @@ class vDriver:
         pad_token_id: int,
         do_pad: bool = True,
         right_padding: bool = False,
-    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, int]:  # Fixed: removed SamplingParams from return type
         """
         Processes the content of a prefill request for the engine.
 
         This involves tokenizing the input (if it's a string), padding it to
-        an appropriate length based on engine capabilities and bucketing,
-        and preparing sampling parameters.
+        an appropriate length based on engine capabilities and bucketing.
 
         Args:
             request: The `ActiveRequest` containing the prompt and settings.
             processor: The tokenizer/processor instance.
             max_prefill_length: Maximum allowed length for prefill.
-            prefill_lengths: List of supported prefill bucket lengths.
+            prefill_lengths: list of supported prefill bucket lengths.
             pad_token_id: The ID of the padding token.
 
         Returns:
-            A tuple containing:
-                - A nested tuple: (padded_tokens, padded_valids, true_length)
-                - The constructed `SamplingParams` object.
+            A tuple containing: (padded_tokens, padded_valids, true_length)
         """
         content = request.prefill_content
         if isinstance(content, str):
@@ -861,9 +933,15 @@ class vDriver:
             tokens = jnp.array(content["input_ids"])
             valids = jnp.array(content["attention_mask"])
         else:
-            tokens, valids = content
+            tokens = jnp.array(content)
+            valids = jnp.ones_like(tokens)
 
-        true_length = len(tokens)
+        # Ensure proper shape
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]  # Add batch dimension
+            valids = valids[None, :]
+
+        true_length = tokens.shape[1]  # Fixed: get sequence length, not shape
         if do_pad:
             tokens, valids, true_length = pad_tokens(
                 tokens=tokens,
@@ -874,58 +952,6 @@ class vDriver:
                 right_padding=right_padding,
             )
         return tokens, valids, true_length
-
-    def _setup_scheduler(self):
-        """
-        Sets up the internal queues and request tracking structures.
-
-        Queue sizes are determined based on configuration parameters and
-        `interleaved_mode`.
-        """
-        engine = self._engine
-        _transfer_q_size = self.transfer_backlog_maxsize
-        if _transfer_q_size is None:
-            _transfer_q_size = 1 if self._interleaved_mode else 4
-        if _transfer_q_size <= 0 and self.transfer_backlog_maxsize is not None:
-            _transfer_q_size = 1
-
-        _decode_q_size = self.decode_backlog_maxsize
-        if _decode_q_size is None:
-            _decode_q_size = 1 if self._interleaved_mode else max(1, engine.max_concurrent_decodes // 3)
-        if _decode_q_size <= 0 and self.decode_backlog_maxsize is not None:
-            _decode_q_size = 1
-
-        self._prefill_backlog = queue.Queue(
-            maxsize=self.prefill_backlog_maxsize if self.prefill_backlog_maxsize > 0 else 0
-        )
-        self._transfer_backlog = queue.Queue(maxsize=_transfer_q_size)
-        self._decode_backlog = queue.Queue(maxsize=_decode_q_size)
-        self._detokenize_backlog = queue.Queue(maxsize=self._detokenizing_blocks if self._detokenizing_blocks > 0 else 0)
-        self._decode_slots = queue.Queue(maxsize=engine.max_concurrent_decodes)
-        self._live_requests: dict[int, ActiveRequest | None] = {i: None for i in range(engine.max_concurrent_decodes)}
-        for i in range(engine.max_concurrent_decodes):
-            self._decode_slots.put(i)
-
-        self._prefill_thread = SafeThread(
-            target=self._prefill_action_thread,
-            name="prefill-thread",
-            daemon=True,
-        )
-        self._transfer_thread = SafeThread(
-            target=self._transfer_action_thread,
-            name="transfer-thread",
-            daemon=True,
-        )
-        self._decode_thread = SafeThread(
-            target=self._decode_action_thread,
-            name="decode-thread",
-            daemon=True,
-        )
-        self._detokenize_thread = SafeThread(
-            target=self._detokenize_action_thread,
-            name="detokenize-thread",
-            daemon=True,
-        )
 
     def _metrics_monitor_thread_action(self):
         """
@@ -938,11 +964,8 @@ class vDriver:
         """
         while self.live:
             try:
-                self.metrics_recorder.update_queue_size("prefill_backlog", self._prefill_backlog.qsize())
-                self.metrics_recorder.update_queue_size("transfer_backlog", self._transfer_backlog.qsize())
-                self.metrics_recorder.update_queue_size("decode_backlog", self._decode_backlog.qsize())
                 self.metrics_recorder.update_queue_size("detokenize_backlog", self._detokenize_backlog.qsize())
-                self.metrics_recorder.update_queue_size("free_decode_slots", self._decode_slots.qsize())
+                # Fixed: removed reference to non-existent _decode_slots
 
                 active_count = sum(1 for r in self._live_requests.values() if r is not None)
                 self.metrics_recorder.set_active_requests_count(active_count)
@@ -958,7 +981,6 @@ class vDriver:
                         "prefill_op_ms_avg": aggregated_metrics.get("prefill_op_ms_avg"),
                         "decode_op_ms_avg": aggregated_metrics.get("decode_op_ms_avg"),
                         "insert_op_ms_avg": aggregated_metrics.get("insert_op_ms_avg"),
-                        "lock_wait_ms_avg": aggregated_metrics.get("operation_lock_wait_ms_avg"),
                         "prefill_ops_total": aggregated_metrics.get("prefill_ops_count"),
                         "decode_ops_total": aggregated_metrics.get("decode_ops_count"),
                     }
@@ -967,6 +989,8 @@ class vDriver:
                     device_stats = self.get_device_memory_stats()
                     if device_stats:
                         log_summary_filtered["device_memory"] = device_stats
+
+                    # self.log(f"Metrics: {log_summary_filtered}")
 
                 sleep_duration = self.metrics_recorder.metrics_log_interval_sec
                 if sleep_duration <= 0:
@@ -994,104 +1018,88 @@ class vDriver:
             state: The new graph state to be used by the engine.
         """
         self._engine.graphstate = state
+        self.log("Replaced engine graph state")
 
     def start(self):
-        """
-        Starts the vDriver and all its background worker threads.
-
-        This includes threads for prefill, transfer, decode, detokenization,
-        and metrics monitoring. Sets the `live` flag to True.
-        """
+        """Start the driver and all worker threads"""
         if not self.live:
             self.log("Starting vDriver...")
-            self._all_threads = [
-                self._prefill_thread,
-                self._transfer_thread,
-                self._decode_thread,
-                self._detokenize_thread,
-            ]
-            self.live = True
-            for t in self._all_threads:
-                if not t.is_alive():
-                    self.log(f"Starting thread: {t.name}")
-                    t.start()
 
+            # Create threads
+            self._inference_thread = SafeThread(
+                target=self._unified_inference_thread,  # Fixed: use correct method name
+                name="unified-inference-thread",
+                daemon=True,
+            )
+
+            self._detokenize_thread = SafeThread(
+                target=self._detokenize_action_thread,
+                name="detokenize-thread",
+                daemon=True,
+            )
+
+            self._all_threads = [self._inference_thread, self._detokenize_thread]
+
+            # Set live flag
+            self.live = True
+
+            # Start threads
+            for thread in self._all_threads:
+                if not thread.is_alive():
+                    self.log(f"Starting thread: {thread.name}")
+                    thread.start()
+
+            # Start metrics thread
             if self._metrics_thread is None or not self._metrics_thread.is_alive():
                 self._metrics_thread = SafeThread(
                     target=self._metrics_monitor_thread_action,
                     name="metrics-monitor-thread",
                     daemon=True,
                 )
-                self.log("Starting metrics monitor thread.")
+                self.log("Starting metrics monitor thread")
                 self._metrics_thread.start()
                 self._all_threads.append(self._metrics_thread)
 
-            self.log("vDriver started.")
+            self.log("vDriver started successfully")
 
     def stop(self):
-        """
-        Stops the vDriver and all its background worker threads gracefully.
-
-        Sets the `live` flag to False, signals threads to terminate by putting
-        `None` sentinels in queues, and attempts to join all threads.
-        Orphaned requests in queues have their return channels closed.
-        """
+        """Stop the driver and all worker threads gracefully"""
         if self.live:
             self.log("Stopping vDriver...")
             self.live = False
 
-            queues_to_signal = [
-                self._prefill_backlog,
-                self._transfer_backlog,
-                self._decode_backlog,
-                self._detokenize_backlog,
-            ]
-            for q_safe in queues_to_signal:
-                try:
-                    q_safe.put_nowait(None)
-                except queue.Full:
-                    self.log(f"Queue {q_safe} full while trying to send sentinel. May delay shutdown.")
+            # Signal threads to stop
+            try:
+                self._detokenize_backlog.put_nowait(None)
+            except queue.Full:
+                self.log("Detokenize queue full while sending stop signal")
 
-            current_threads_to_join = list(self._all_threads)
-            for t in current_threads_to_join:
-                if t.is_alive():
-                    self.log(f"Joining thread: {t.name}")
-                    t.join(timeout=1.0)
+            # Join threads
+            for thread in self._all_threads:
+                if thread.is_alive():
+                    self.log(f"Joining thread: {thread.name}")
+                    thread.join(timeout=2.0)
+                    if thread.is_alive():
+                        self.log(f"Warning: Thread {thread.name} did not stop cleanly")
 
-            self.log("Draining queues and closing request channels...")
-            for q_final_drain in queues_to_signal:
-                while True:
-                    try:
-                        r = q_final_drain.get_nowait()
-                        if r is None:
-                            continue
+            # Clean up any remaining requests
+            self._cleanup_active_requests()
 
-                        request_to_close = None
-                        if isinstance(r, ActiveRequest):
-                            request_to_close = r
-                        elif isinstance(r, tuple) and r:
-                            if isinstance(r[0], ActiveRequest):
-                                request_to_close = r[0]
-                            elif len(r) > 1 and isinstance(r[1], ActiveRequest):
-                                request_to_close = r[1]
+            self.log("vDriver stopped")
 
-                        if request_to_close and request_to_close.return_channel:
-                            self.log("Closing return channel for an orphaned request.")
-                            request_to_close.return_channel.close()
-                            request_to_close.return_channel = None
-                    except queue.Empty:
-                        break
+    def _cleanup_active_requests(self):
+        """Clean up any active requests by closing their channels"""
+        for slot, request in self._live_requests.items():
+            if request and request.return_channel:
+                self.log(f"Closing return channel for request in slot {slot}")
+                request.return_channel.close()
 
-            for t_final in current_threads_to_join:
-                if t_final.is_alive():
-                    self.log(f"Thread {t_final.name} still alive after initial join. Attempting longer join...")
-                    t_final.join(timeout=3.0)
-                    if t_final.is_alive():
-                        self.log(f"ERROR: Thread {t_final.name} FAILED to terminate.")
-            self.log("vDriver stopped.")
-            if self._metrics_thread and self._metrics_thread.is_alive():
-                self.log("Metrics thread still alive after main stop, forcing join.")
-                self._metrics_thread.join(timeout=1.0)
+        # Also check scheduler for pending requests
+        if hasattr(self.scheduler, "active_requests"):
+            for request_id, request in self.scheduler.active_requests.items():
+                if request and request.return_channel:
+                    self.log(f"Closing return channel for pending request {request_id}")
+                    request.return_channel.close()
 
     def resume(self):
         """
@@ -1102,7 +1110,6 @@ class vDriver:
         """
         if self._pause:
             self.log("Resuming vDriver...")
-            self._setup_scheduler()
             self.start()
             self._pause = False
             self.log("vDriver resumed.")
@@ -1121,15 +1128,13 @@ class vDriver:
             self._pause = True
             self.log("vDriver paused.")
 
-    def submit_request(self, request: tp.Any):
+    def submit_request(self, request: ActiveRequest, priority: RequestPriority = RequestPriority.NORMAL):
         """
         Submits a new request for processing by the vDriver.
 
-        The request is placed on the prefill queue.
-
         Args:
-            request (tp.Any): The request to submit. Must be an instance
-                of `ActiveRequest`.
+            request: The request to submit. Must be an instance of `ActiveRequest`.
+            priority: Priority level for the request.
 
         Raises:
             TypeError: If the submitted request is not an `ActiveRequest`.
@@ -1138,58 +1143,11 @@ class vDriver:
             raise TypeError("Request must be of type ActiveRequest")
         if not self.live and not self._pause:
             self.log("Warning: Driver is not live and not paused. Request may not be processed.")
-        self.log("Submitting a new request.")
+
+        self.log(f"Submitting new request {request.id} with priority {priority.name}")
         self.metrics_recorder.increment_submitted_requests()
-        self.place_request_on_prefill_queue(request)
-
-    def _transfer_prefill_result(self, new_request: ActiveRequest):
-        """
-        Helper method to invoke the JAX-specific KV cache transfer.
-
-        Args:
-            new_request (ActiveRequest): The request whose prefill result
-                (KV cache) needs to be transferred.
-        """
-        self._jax_transfer_prefill_result(new_request)
-
-    def _transfer_action_thread(self):
-        """
-        Background thread action for transferring prefill results (KV caches).
-
-        This thread consumes requests from the `_transfer_backlog`. If not in
-        `interleaved_mode`, it explicitly transfers the KV cache to the
-        engine's device (optionally guarded by `_operation_lock`). The request
-        is then placed on the `_decode_backlog`.
-        """
-        while self.live:
-            try:
-                new_request = self._transfer_backlog.get(block=True, timeout=0.1)
-            except queue.Empty:
-                if not self.live:
-                    break
-                continue
-            if new_request is None:
-                break
-
-            self.log("Transferring a request.")
-            if not self._interleaved_mode:
-                self.log("Transferring prefill for a request to Decode engine (interleaved_mode=False).")
-                try:
-                    self._acquire_operation_lock_if_needed()
-                    self._transfer_prefill_result(new_request)
-                finally:
-                    self._release_operation_lock_if_needed()
-
-            current_decode_backlog_size = self._decode_backlog.qsize()
-            try:
-                self._decode_backlog.put(new_request, block=True)
-                self.log(
-                    f"Successfully transferred a request to Decode engine ({current_decode_backlog_size + 1} "
-                    "requests now in decode backlog)."
-                )
-            except queue.Full:
-                self.log("Decode backlog full during transfer for a request. Blocking.")
-                self._decode_backlog.put(new_request, block=True)
+        self._request_counter += 1
+        self.scheduler.add_request(request=request, priority=priority)
 
     def get_metrics(self, aggregated: bool = True, window_size: int = 100) -> dict:
         """
@@ -1206,9 +1164,15 @@ class vDriver:
             dict: A dictionary containing either raw or aggregated metrics.
         """
         if aggregated:
-            return self.metrics_recorder.get_aggregated_metrics_snapshot(window_size)
+            metrics = self.metrics_recorder.get_aggregated_metrics_snapshot(window_size)
         else:
-            return self.metrics_recorder.get_all_metrics()
+            metrics = self.metrics_recorder.get_all_metrics()
+
+        # Add scheduler stats if available
+        if hasattr(self.scheduler, "get_stats"):
+            metrics["scheduler"] = self.scheduler.get_stats()
+
+        return metrics
 
     def get_device_memory_stats(self) -> list[dict] | None:
         """
@@ -1218,7 +1182,7 @@ class vDriver:
         which may not be available on all platforms or JAX versions.
 
         Returns:
-            tp.Optional[list[dict]]: A list of dictionary with memory statistics (e.g.,
+            Optional[list[dict]]: A list of dictionaries with memory statistics (e.g.,
                 'bytes_used', 'bytes_limit') if available, otherwise None.
         """
         try:
@@ -1239,13 +1203,12 @@ class vDriver:
                             "bytes_limit": stats.get("bytes_limit"),
                             "bytes_used": stats.get("bytes_used"),
                             "peak_bytes_in_use": stats.get("peak_bytes_in_use"),
-                            "bytes_available": stats.get("bytes_available", bytes_available),
+                            "bytes_available": bytes_available,
                         }
                     )
                 else:
                     self.log(f"Device {device.id} ({device.device_kind}) object does not have memory_stats method.")
-            if len(infos) == 0:
-                return None
+            return infos if infos else None
         except Exception as e:
             self.log(f"Could not retrieve JAX device memory stats: {e}")
             return None

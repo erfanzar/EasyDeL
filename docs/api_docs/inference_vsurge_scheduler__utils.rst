@@ -1,7 +1,7 @@
-easydel.inference.vsurge.scheduler.output
+easydel.inference.vsurge.scheduler._utils
 =========================================
 
-.. automodule:: easydel.inference.vsurge.scheduler.output
+.. automodule:: easydel.inference.vsurge.scheduler._utils
     :members:
     :undoc-members:
     :show-inheritance:

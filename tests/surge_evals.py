@@ -13,10 +13,7 @@
 # limitations under the License.
 
 import json
-import os
-import sys
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from jax import lax
 from jax import numpy as jnp
 from lm_eval import evaluator

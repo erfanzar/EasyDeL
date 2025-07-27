@@ -22,14 +22,10 @@ This script demonstrates:
 """
 
 import argparse
-import os
-import sys
 
 from jax import numpy as jnp
 
 # Add the parent directory to the path so that we can import easydel
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
 from easydel.inference.vwhisper.server import run_server
 
 

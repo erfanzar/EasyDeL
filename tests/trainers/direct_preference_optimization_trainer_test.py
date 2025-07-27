@@ -1,12 +1,6 @@
-import os
-import sys
-
-import datasets
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-
 import logging
 
+import datasets
 import flax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
@@ -14,10 +8,7 @@ from transformers import AutoTokenizer
 import easydel as ed
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def create_datasets(dataset_size=1000, train_split=500):
@@ -86,11 +77,11 @@ def create_model_and_tokenizer(model_name_or_path):
 def create_dpo_config(
     model_name="direct_preference_optimization_trainer",
     save_directory="tmp-files",
-    total_batch_size=1,
+    total_batch_size=4,
     learning_rate=7e-5,
-    max_length=512,
-    max_completion_length=256,
-    max_prompt_length=256,
+    max_length=256,
+    max_completion_length=128,
+    max_prompt_length=128,
 ):
     """Create DPO configurations"""
     logging.info("Creating DPO config")

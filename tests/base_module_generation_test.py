@@ -1,8 +1,3 @@
-import os
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
 import time
 
 import jax
@@ -33,7 +28,7 @@ def main():
             freq_max_position_embeddings=max_model_len,
             mask_max_position_embeddings=max_model_len,
             kvdtype=jnp.bfloat16,
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            attn_mechanism=ed.AttentionMechanisms.SDPA,
             decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         ),
