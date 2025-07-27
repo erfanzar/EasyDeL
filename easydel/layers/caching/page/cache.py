@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import typing as tp
+from functools import partial
 from math import ceil
 
 import chex as cx
@@ -23,19 +24,22 @@ import jax.experimental
 import jax.numpy as jnp
 from eformer import common_types
 from eformer import escale as es
-from eformer.escale import PartitionManager
+from eformer.escale import PartitionAxis, PartitionManager
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
-from .utils import kv_cache_update_jax
+from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+EMPTY = common_types.EMPTY
+KV_HEAD = common_types.KV_HEAD
+MODE_PREFILL = common_types.MODE_PREFILL
 
 
 def previous_power_of_2(n: int) -> int:
@@ -166,6 +170,10 @@ class PagesCacheView(BaseCacheView):
     layer_index: int
 
     kv_pages: cx.Array | ImplicitArray
+    partition_manager: PartitionManager = field(
+        pytree_node=False,
+        default_factory=lambda: PartitionManager(PartitionAxis()),
+    )
 
     @classmethod
     def init(
@@ -200,36 +208,56 @@ class PagesCacheView(BaseCacheView):
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
         kv_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads * 2, metadata.k_headdim)
-        axes = [common_types.HEAD, common_types.EMPTY, common_types.EMPTY, common_types.EMPTY]
+        axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
             kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding))
 
-        return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages)
+        return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages, partition_manager=partition_manager)
 
     def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
         num_kv_heads = key.shape[2]
         head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
+        resolve = self.partition_manager.resolve
 
-        # self.kv_pages = kv_cache_update(
-        #     jnp.concatenate([key, value], 1),
-        #     cache_metadata.slot_mapping,
-        #     self.kv_pages.reshape(-1, *self.kv_pages.shape[2:]),
-        #     cache_metadata.num_kv_update_slices,
-        #     page_size=cache_metadata.page_size,
-        #     slices_per_processing_block=cache_metadata.num_slices_per_kv_cache_update_block,
-        # ).reshape(self.kv_pages.shape)
+        @partial(
+            jax.shard_map,
+            in_specs=(
+                resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
+                resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                resolve([EMPTY], mode=MODE_PREFILL),
+            ),
+            out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+            mesh=es.get_incontext_mesh(),
+            check_vma=False,
+        )
+        def _update(kv, slots, pages, num_update_slices):
+            if jax.default_backend() == "tpu":
+                return kv_cache_update(
+                    kv,
+                    slots,
+                    pages.reshape(-1, *pages.shape[2:]),
+                    num_update_slices,
+                ).reshape(pages.shape)
+            else:
+                return kv_cache_update_jax(
+                    kv,
+                    slots,
+                    pages.reshape(-1, *pages.shape[2:]),
+                    num_update_slices,
+                    page_size=cache_metadata.page_size,
+                ).reshape(pages.shape)
 
-        self.kv_pages = kv_cache_update_jax(
+        self.kv_pages = _update(
             jnp.concatenate([key, value], 1),
             cache_metadata.slot_mapping,
-            self.kv_pages.reshape(-1, *self.kv_pages.shape[2:]),
+            self.kv_pages,
             cache_metadata.num_kv_update_slices,
-            page_size=cache_metadata.page_size,
-        ).reshape(self.kv_pages.shape)
+        )
 
         return self
 
