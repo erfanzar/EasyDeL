@@ -78,6 +78,22 @@ class BaseOperation(ABC):
             The result of the operation, potentially optimized for TPU.
         """
         return self.forward_native(*args, **kwargs)
+    
+    def forward_tt(self, *args, **kwargs) -> tp.Any:
+        """
+        TT-specific implementation of the operation.
+
+        Defaults to calling `forward_native`. Subclasses can override this for
+        TT-specific optimizations.
+
+        Args:
+            *args: Positional arguments for the operation.
+            **kwargs: Keyword arguments for the operation.
+
+        Returns:
+            The result of the operation, potentially optimized for TT.
+        """
+        return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> tp.Any:
         """
