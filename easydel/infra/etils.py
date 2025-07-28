@@ -120,11 +120,13 @@ class EasyDeLBackends(str, Enum):
         CPU: Use the CPU backend.
         GPU: Use the GPU backend.
         TPU: Use the TPU backend.
+        TT: Use the Tenstorrent backend.
     """
 
     CPU = "cpu"
     GPU = "gpu"
     TPU = "tpu"
+    TT = "tt"
 
 
 AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
