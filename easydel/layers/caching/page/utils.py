@@ -19,12 +19,12 @@ def _kv_cache_update_kernel(
     dma_semaphore,
 ):
     pending_async_copies = []
-    current_block_id = pl.program_id(0)
-    slices_per_processing_block = vmem_scratch_buffer.shape[0]
+    current_page_id = pl.program_id(0)
+    slices_per_processing_page = vmem_scratch_buffer.shape[0]
 
     # First phase: Copy from new KV tokens to scratch buffer
-    for slice_idx in range(slices_per_processing_block):
-        global_slice_idx = slice_idx + current_block_id * slices_per_processing_block
+    for slice_idx in range(slices_per_processing_page):
+        global_slice_idx = slice_idx + current_page_id * slices_per_processing_page
         new_kv_start_pos = slice_indices_ref[1, global_slice_idx]
         slice_length = slice_indices_ref[2, global_slice_idx]
 
@@ -42,8 +42,8 @@ def _kv_cache_update_kernel(
 
     # Second phase: Copy from scratch buffer to KV cache
     pending_async_copies.clear()
-    for slice_idx in range(slices_per_processing_block):
-        global_slice_idx = slice_idx + current_block_id * slices_per_processing_block
+    for slice_idx in range(slices_per_processing_page):
+        global_slice_idx = slice_idx + current_page_id * slices_per_processing_page
         kv_cache_start_pos = slice_indices_ref[0, global_slice_idx]
         slice_length = slice_indices_ref[2, global_slice_idx]
 
@@ -60,7 +60,7 @@ def _kv_cache_update_kernel(
         copy_operation.wait()
 
 
-@ejit(static_argnames=["page_size", "slices_per_processing_block"])
+@ejit(static_argnames=["page_size", "slices_per_processing_page"])
 def kv_cache_update(
     new_kv_tokens: jax.Array,  # [total_num_token, num_combined_kv_heads, head_dim]
     slice_indices: jax.Array,  # [3, slices], list of (kv_cache_start, new_kv_start, slice_len)
@@ -68,9 +68,11 @@ def kv_cache_update(
     total_update_slices: jax.Array,  # [1]
     *,
     page_size: int = 32,
-    slices_per_processing_block: int = 8,
+    slices_per_processing_page: int = 8,
 ):
-    assert slice_indices.shape[1] % slices_per_processing_block == 0
+    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
+        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
+    )
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
     assert kv_cache_pages.shape[1] == num_kv_heads
     assert kv_cache_pages.shape[2] == head_dimension
@@ -78,7 +80,7 @@ def kv_cache_update(
 
     prefetch_scalars = [slice_indices]
     vmem_scratch_buffer = pltpu.VMEM(
-        (slices_per_processing_block, page_size, num_kv_heads, head_dimension), new_kv_tokens.dtype
+        (slices_per_processing_page, page_size, num_kv_heads, head_dimension), new_kv_tokens.dtype
     )
 
     pallas_kernel = pl.pallas_call(
@@ -90,7 +92,7 @@ def kv_cache_update(
                 pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
             ],
             out_specs=[pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY)],
-            grid=(cdiv(total_update_slices[0], slices_per_processing_block),),
+            grid=(cdiv(total_update_slices[0], slices_per_processing_page),),
             scratch_shapes=[vmem_scratch_buffer, pltpu.SemaphoreType.DMA],
         ),
         out_shape=[jax.ShapeDtypeStruct(kv_cache_pages.shape, dtype=kv_cache_pages.dtype)],

@@ -653,8 +653,8 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.gidd import (
         GiddConfig,
-        GiddModel,
         GiddForDiffusionLM,
+        GiddModel,
     )
     from .modules.gpt2 import (
         GPT2Config,

@@ -76,17 +76,37 @@ class PagedAttn(AttentionImpl):
         """
         Native (XLA) forward pass.
         """
-
-        output = jax_ragged_paged_attention(
-            queries=q.astype(cache_view.key_pages.dtype),
-            key_pages=cache_view.key_pages,
-            value_pages=cache_view.value_pages,
-            query_start_loc=cache_metadata.query_start_loc,
-            context_lens=cache_metadata.context_lens,
-            block_tables=cache_metadata.pages_tables,
-            num_seqs=cache_metadata.num_seqs,
-            softmax_scale=self.metadata.softmax_scale,
-            soft_cap=self.metadata.soft_cap,
+        kpages = cache_view.key_pages
+        vpages = cache_view.value_pages
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
+        output = shard_map(
+            f=partial(
+                jax_ragged_paged_attention,
+                softmax_scale=self.metadata.softmax_scale,
+                soft_cap=self.metadata.soft_cap,
+            ),
+            in_specs=(
+                qaxes,
+                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kpages.shape),
+                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=vpages.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.pages_tables.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
+                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
+            ),
+            out_specs=qaxes,
+            mesh=self.metadata.mesh,
+            check_rep=False,
+        )(
+            q,
+            kpages,
+            vpages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables,
+            cache_metadata.query_start_loc,
+            cache_metadata.num_seqs,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=output)
 
@@ -134,8 +154,8 @@ class PagedAttn(AttentionImpl):
                 pallas_ragged_paged_attention,
                 sm_scale=self.metadata.softmax_scale,
                 soft_cap=self.metadata.soft_cap,
-                num_kv_pages_per_block=8,
-                num_queries_per_block=64,
+                num_kv_pages_per_block=None,
+                num_queries_per_block=None,
                 vmem_limit_bytes=None,
             ),
             in_specs=(

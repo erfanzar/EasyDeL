@@ -224,13 +224,23 @@ class ParallelLinear(nn.Module):
             rngs = nn.Rngs(0)
 
         if scale == "fan_in":
-            scale = in_features ** -0.5
+            scale = in_features**-0.5
         elif scale == "fan_out":
-            scale = out_features ** -0.5
+            scale = out_features**-0.5
 
+        if scale != 1.0:
+
+            def _scale_operator(x):
+                return x * scale
+        else:
+
+            def _scale_operator(x):
+                return x
+
+        self._scale_operator = _scale_operator
         self.in_features = in_features
         self.out_features = out_features
-        self.scale = scale
+
         self.use_bias = use_bias
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -309,7 +319,7 @@ class ParallelLinear(nn.Module):
 
         output = output_2d.reshape((*orig_shape[:-1], self.out_features))
 
-        output = output * self.scale
+        output = self._scale_operator(output)
 
         if bias is not None:
             output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
@@ -352,7 +362,7 @@ class ParallelLinear(nn.Module):
             optimize=True,
         )
 
-        y = y * self.scale
+        y = self._scale_operator(y)
 
         if bias is not None:
             y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))

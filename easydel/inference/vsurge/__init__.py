@@ -12,8 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .core import vDriver, vEngine
+from .core import vDriver, vEngine, vSurgeExecutionManager
+from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .server import vSurgeApiServer
 from .vsurge import vSurge, vSurgeRequest
 
-__all__ = ("vDriver", "vEngine", "vSurge", "vSurgeApiServer", "vSurgeRequest")
+__all__ = (
+    "Scheduler",
+    "SchedulerConfig",
+    "SchedulerOutput",
+    "vDriver",
+    "vEngine",
+    "vSurge",
+    "vSurgeApiServer",
+    "vSurgeExecutionManager",
+    "vSurgeRequest",
+)

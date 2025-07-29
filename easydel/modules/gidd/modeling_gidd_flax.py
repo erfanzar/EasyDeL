@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi) and @dvruette.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 
 import typing as tp
-from functools import partial
 import warnings
+from functools import partial
 
 import chex
 import jax
@@ -33,7 +33,6 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.utils import (
-    ACT2FN,
     auto_remat,
     block_wise_ffn,
     get_dot_general_by_bits,
@@ -50,8 +49,6 @@ from easydel.layers.caching import (
 from easydel.layers.linear import ParallelLinear
 
 from .gidd_configuration import GiddConfig
-
-
 
 
 class GiddMLP(nn.Module):
@@ -176,7 +173,6 @@ class GiddAttention(AttentionModule):
             dropout_prob=0.0,
         )
 
-        
     @jax.named_scope("gidd-flax-attention-concatenate")
     def concatenate(
         self,
@@ -189,7 +185,7 @@ class GiddAttention(AttentionModule):
         # mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-    ) -> tp.Tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
+    ) -> tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
         """
         Adapted from parent class
         """
@@ -221,7 +217,7 @@ class GiddAttention(AttentionModule):
             )
 
         return key, value, attention_mask, init_attention_bias, cache_view
-    
+
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
         return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + self.qk_norm_eps)
 
@@ -232,12 +228,12 @@ class GiddAttention(AttentionModule):
         noise_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: tp.Optional[TransformerCacheView | PagesCacheView] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
-        segment_ids: tp.Optional[chex.Array] = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        frequencies: tp.Optional[chex.Array] = None,
-    ) -> tp.Tuple[chex.Array, chex.Array]:
+        frequencies: chex.Array | None = None,
+    ) -> tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
             self.q_proj(hidden_states),
@@ -305,11 +301,7 @@ class GiddAttention(AttentionModule):
             segment_ids=segment_ids,
             causal=False,
         )
-        attn_output = self.o_proj(
-            self.shard_attention_prod(
-                attn_output=self._merge_heads(attentions.attention_outputs)
-            )
-        )
+        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -336,9 +328,7 @@ class GiddRMSNorm(nn.Module):
         variance = variance.mean(-1, keepdims=True)
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
 
-        return (1 + self.kernel.value.astype(self.dtype)) * jnp.asarray(
-            hidden_states, dtype=self.dtype
-        )
+        return (1 + self.kernel.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
 
 
 class GiddLayer(nn.Module):
@@ -398,11 +388,11 @@ class GiddLayer(nn.Module):
         position_ids: chex.Array,
         noise_mask: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: tp.Optional[TransformerCacheView | PagesCacheView] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
-        segment_ids: tp.Optional[chex.Array] = None,
+        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        frequencies: tp.Optional[chex.Array] = None,
+        frequencies: chex.Array | None = None,
     ):
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -506,18 +496,18 @@ class GiddModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: tp.Optional[chex.Array] = None,
-        inputs_embeds: tp.Optional[chex.Array] = None,
-        attention_mask: tp.Optional[chex.Array] = None,
-        position_ids: tp.Optional[chex.Array] = None,
-        log_snr: tp.Optional[chex.Array] = None,
-        noise_mask: tp.Optional[chex.Array] = None,
-        segment_ids: tp.Optional[chex.Array] = None,
-        mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
-        past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
-        output_attentions: tp.Optional[bool] = None,
-        output_hidden_states: tp.Optional[bool] = None,
+        input_ids: chex.Array | None = None,
+        inputs_embeds: chex.Array | None = None,
+        attention_mask: chex.Array | None = None,
+        position_ids: chex.Array | None = None,
+        log_snr: chex.Array | None = None,
+        noise_mask: chex.Array | None = None,
+        segment_ids: chex.Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass through the Gidd model.
 
@@ -547,7 +537,8 @@ class GiddModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         assert sequence_length <= self.config.max_position_embeddings, (
-            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+            f"Maximum Position Embedding Reached ! "
+            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
@@ -667,18 +658,18 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: tp.Optional[chex.Array] = None,
-        inputs_embeds: tp.Optional[chex.Array] = None,
-        attention_mask: tp.Optional[chex.Array] = None,
-        position_ids: tp.Optional[chex.Array] = None,
-        segment_ids: tp.Optional[chex.Array] = None,
-        log_snr: tp.Optional[chex.Array] = None,
-        noise_mask: tp.Optional[chex.Array] = None,
-        mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
-        past_key_values: tp.Optional[TransformerCache | PagesCache] = None,
-        cache_metadata: tp.Optional[TransformerMetadata | PagesMetadata] = None,
-        output_attentions: tp.Optional[bool] = None,
-        output_hidden_states: tp.Optional[bool] = None,
+        input_ids: chex.Array | None = None,
+        inputs_embeds: chex.Array | None = None,
+        attention_mask: chex.Array | None = None,
+        position_ids: chex.Array | None = None,
+        segment_ids: chex.Array | None = None,
+        log_snr: chex.Array | None = None,
+        noise_mask: chex.Array | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
         """Forward pass through the Gidd model for causal language modeling.
 

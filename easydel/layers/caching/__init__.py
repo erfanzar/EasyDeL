@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, MambaSpec, SlidingWindowSpec
 from .lightning import LightningCache, LightningCacheMetaData, LightningCacheView, LightningMetadata
 from .mamba import MambaCache, MambaCacheMetaData, MambaCacheView, MambaMetadata
 from .mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView, Mamba2Metadata
-from .page import BlockAllocator, PagesCache, PagesCacheMetaData, PagesCacheView, PagesMetadata
+from .page import PagesCache, PagesCacheMetaData, PagesCacheView, PagesMetadata
 from .transformer import TransformerCache, TransformerCacheMetaData, TransformerCacheView, TransformerMetadata
 
 __all__ = (
-    "BlockAllocator",
+    "ChunkedLocalAttentionSpec",
+    "FullAttentionSpec",
+    "KVCacheSpec",
     "LightningCache",
     "LightningCacheMetaData",
     "LightningCacheView",
@@ -32,10 +35,12 @@ __all__ = (
     "MambaCacheMetaData",
     "MambaCacheView",
     "MambaMetadata",
+    "MambaSpec",
     "PagesCache",
     "PagesCacheMetaData",
     "PagesCacheView",
     "PagesMetadata",
+    "SlidingWindowSpec",
     "TransformerCache",
     "TransformerCacheMetaData",
     "TransformerCacheView",

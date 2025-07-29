@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi) and @dvruette.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,7 @@
 # limitations under the License.
 
 
-import typing as tp
-
 from eformer.common_types import ColumnWise, Replicated, RowWise
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -103,7 +100,7 @@ class GiddConfig(EasyDeLBaseConfig):
         intermediate_size: int = 3072,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
-        head_dim: tp.Optional[int] = None,
+        head_dim: int | None = None,
         max_position_embeddings: int = 1024,
         resid_scale: float = 4.0,
         rms_norm_eps: float = 1e-6,
@@ -117,9 +114,9 @@ class GiddConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         tie_word_embeddings: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-        rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
+        rope_scaling: dict[str, str | float] | None = None,
         scan_mlp_chunk_size: int = 1024,
-        bits: tp.Optional[int] = None,
+        bits: int | None = None,
         pretraining_tp: int = 1,
         attention_bias: bool = False,
         mlp_bias: bool = False,
@@ -149,9 +146,7 @@ class GiddConfig(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.bits = bits
         self.scan_layers = scan_layers
-        self.head_dim = (
-            head_dim if head_dim is not None else hidden_size // num_attention_heads
-        )
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -170,7 +165,7 @@ class GiddConfig(EasyDeLBaseConfig):
         return (
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (f"qk_scale/kernel", pmag.resolve(Replicated)),
+            ("qk_scale/kernel", pmag.resolve(Replicated)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
@@ -187,7 +182,7 @@ class GiddConfig(EasyDeLBaseConfig):
         self,
         tie_word_embeddings: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-        bits: tp.Optional[int] = None,
+        bits: int | None = None,
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
         mlp_bias: bool = False,

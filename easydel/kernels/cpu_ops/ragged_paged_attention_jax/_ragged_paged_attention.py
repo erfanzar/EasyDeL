@@ -64,7 +64,8 @@ def ragged_paged_attention(
         The attention output tensor, with the same shape and dtype as `queries`.
         Shape: `[total_query_tokens, num_q_heads, head_size]`.
     """
-    softmax_scale = queries.shape[-1] ** -0.5
+    if softmax_scale is None:
+        softmax_scale = queries.shape[-1] ** -0.5
     return _ragged_paged_attention(
         queries=queries,
         key_pages=key_pages,

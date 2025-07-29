@@ -313,6 +313,9 @@ def sample_top_p_efficient(
     return jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
 
 
+vmaped_sample_top_p_efficient = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)
+
+
 @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=(0))
 def dynamic_sample_tokens(
     tokens: jax.Array,  # [vocab / 1] i4
