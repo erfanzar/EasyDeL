@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import os
+import pickle
 import signal
 import threading
+import time
 import traceback
 import typing as tp
 import uuid
 from asyncio import futures
 from bisect import bisect_left
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, field
+from typing import Any, NamedTuple
 
 import jax
 import msgspec
@@ -41,8 +45,11 @@ from ..sampling_params import JitableSamplingParams, SamplingParams
 if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
 
+    from .request_type import FinishReason
 
-V = tp.TypeVar("V")
+
+_K = tp.TypeVar("_K", bound=Hashable)
+_V = tp.TypeVar("_V")
 
 
 class SlotData(tp.NamedTuple):
@@ -214,14 +221,14 @@ class _Exception:
     """A class for propagating exceptions through a queue.
 
     By wrapping them with a custom private class we ensure that any type
-    (including Exception) can be used as a V.
+    (including Exception) can be used as a _V.
     """
 
     def __init__(self, exception: Exception) -> None:
         self.exception = exception
 
 
-class AsyncMultifuture(tp.Generic[V]):
+class AsyncMultifuture(tp.Generic[_V]):
     """AsyncMultifuture is like concurrent.futures.Future but supports returning
 
     multiple results. It provides an unidirectional stream with buffering and
@@ -235,7 +242,7 @@ class AsyncMultifuture(tp.Generic[V]):
         self._cancelled = threading.Event()
         self._done = threading.Event()
         self._loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue[V | _Exception]()
+        self._queue = asyncio.Queue[_V | _Exception]()
 
     def cancel(self, unused: tp.Any = None) -> None:
         """Cancels the asyncmultifuture."""
@@ -267,7 +274,7 @@ class AsyncMultifuture(tp.Generic[V]):
         self._loop.call_soon_threadsafe(self._queue.put_nowait, _Exception(exception))
         self._loop.call_soon_threadsafe(self._done.set)
 
-    def add_result(self, result: V) -> None:
+    def add_result(self, result: _V) -> None:
         """Adds the result to the asyncmultifuture.
 
         Caller must call .close() once all results are added.
@@ -284,7 +291,7 @@ class AsyncMultifuture(tp.Generic[V]):
     def __aiter__(self) -> AsyncMultifuture:
         return self
 
-    async def __anext__(self) -> V:
+    async def __anext__(self) -> _V:
         """Returns the next value."""
         value = await self._queue.get()
         if isinstance(value, _Exception):
@@ -648,39 +655,6 @@ def calculate_pefill_lengths(max_prefill_length: int, num_pages: int = 128):
     )
 
 
-class LogprobsLists(tp.NamedTuple):
-    logprob_token_ids: list[list[int]]
-    logprobs: list[list[float]]
-    sampled_token_ranks: list[int]
-
-    def slice(self, start: int, end: int):
-        return LogprobsLists(
-            self.logprob_token_ids[start:end],
-            self.logprobs[start:end],
-            self.sampled_token_ranks[start:end],
-        )
-
-
-class LogprobsTensors(tp.NamedTuple):
-    logprob_token_ids: jax.Array
-    logprobs: jax.Array
-    selected_token_ranks: jax.Array
-
-    def tolists(self):
-        return LogprobsLists(self.logprob_token_ids.tolist(), self.logprobs.tolist(), self.selected_token_ranks.tolist())
-
-    @staticmethod
-    def empty(num_positions: int, num_tokens_per_position: int) -> LogprobsTensors:
-        logprob_token_ids = jnp.empty((num_positions, num_tokens_per_position), dtype="i4")
-        logprobs = jnp.empty_like(logprob_token_ids, dtype=jnp.float32)
-        selected_token_ranks = jnp.empty(num_positions, dtype="i4")
-        return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids,
-            logprobs=logprobs,
-            selected_token_ranks=selected_token_ranks,
-        )
-
-
 @dataclass
 class PrefixCacheStats:
     """Stores prefix cache hit statistics."""
@@ -732,10 +706,10 @@ class SchedulerStats:
 
 def is_list_of(
     value: object,
-    typ: type[V] | tuple[type[V], ...],
+    typ: type[_V] | tuple[type[_V], ...],
     *,
     check: tp.Literal["first", "all"] = "first",
-) -> list[V]:
+) -> list[_V]:
     if not isinstance(value, list):
         return False
 
@@ -747,8 +721,8 @@ def is_list_of(
     tp.assert_never(check)
 
 
-class ConstantList(tp.Generic[V], Sequence):
-    def __init__(self, x: list[V]) -> None:
+class ConstantList(tp.Generic[_V], Sequence):
+    def __init__(self, x: list[_V]) -> None:
         self._x = x
 
     def append(self, item):
@@ -769,25 +743,25 @@ class ConstantList(tp.Generic[V], Sequence):
     def clear(self):
         raise Exception("Cannot clear a constant list")
 
-    def index(self, item: V, start: int = 0, stop: int | None = None) -> int:
+    def index(self, item: _V, start: int = 0, stop: int | None = None) -> int:
         return self._x.index(item, start, stop if stop is not None else len(self._x))
 
     @tp.overload
-    def __getitem__(self, item: int) -> V: ...
+    def __getitem__(self, item: int) -> _V: ...
 
     @tp.overload
-    def __getitem__(self, s: slice, /) -> list[V]: ...
+    def __getitem__(self, s: slice, /) -> list[_V]: ...
 
-    def __getitem__(self, item: int | slice) -> V | list[V]:
+    def __getitem__(self, item: int | slice) -> _V | list[_V]:
         return self._x[item]
 
     @tp.overload
-    def __setitem__(self, item: int, value: V): ...
+    def __setitem__(self, item: int, value: _V): ...
 
     @tp.overload
-    def __setitem__(self, s: slice, value: V, /): ...
+    def __setitem__(self, s: slice, value: _V, /): ...
 
-    def __setitem__(self, item: int | slice, value: V | list[V]):
+    def __setitem__(self, item: int | slice, value: _V | list[_V]):
         raise Exception("Cannot set item in a constant list")
 
     def __delitem__(self, item):
@@ -1102,3 +1076,139 @@ class SmartBytecodeDecoder:
 
         logger.warning("Complete decode failure, using fallback")
         return self.fallback_char, [], True
+
+
+class LogprobsLists(tp.NamedTuple):
+    logprob_token_ids: list[list[int]]  # [num_reqs, max_num_logprobs + 1]
+    logprobs: list[list[float]]  # [num_reqs, max_num_logprobs + 1]
+    sampled_token_ranks: list[int]  # [num_reqs]
+
+    def slice(self, start: int, end: int):
+        return LogprobsLists(
+            self.logprob_token_ids[start:end],
+            self.logprobs[start:end],
+            self.sampled_token_ranks[start:end],
+        )
+
+
+class LogprobsTensors(tp.NamedTuple):
+    logprob_token_ids: jax.Array  # [num_reqs, max_num_logprobs + 1]
+    logprobs: jax.Array  # [num_reqs, max_num_logprobs + 1]
+    selected_token_ranks: jax.Array  # [num_reqs]
+
+    def tolists(self):
+        return LogprobsLists(
+            self.logprob_token_ids.tolist(),
+            self.logprobs.tolist(),
+            self.selected_token_ranks.tolist(),
+        )
+
+    @staticmethod
+    def empty_cpu(num_positions: int, num_tokens_per_position: int) -> LogprobsTensors:
+        """Create empty LogprobsTensors on CPU."""
+
+        logprob_token_ids = jnp.empty((num_positions, num_tokens_per_position), dtype=jnp.int32)
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=jnp.empty_like(logprob_token_ids, dtype=jnp.float32),
+            selected_token_ranks=jnp.empty(num_positions, dtype=jnp.int32),
+        )
+
+
+@auto_pytree
+class ModelRunnerOutput:
+    req_ids: list[str]
+    req_id_to_index: dict[str, int]
+    sampled_token_ids: list[list[int]]
+    spec_token_ids: list[list[int]] | None
+    logprobs: LogprobsLists | None
+    prompt_logprobs_dict: dict[str, LogprobsTensors | None]
+    pooler_output: list[jax.Array | None]
+    finished_sending: set[str] | None = None
+    finished_recving: set[str] | None = None
+    num_nans_in_logits: dict[str, int] | None = None
+
+
+def swap_dict_values(obj: dict[_K, _V], key1: _K, key2: _K) -> None:
+    """
+    Helper function to swap values for two keys
+    """
+    v1 = obj.get(key1)
+    v2 = obj.get(key2)
+    if v1 is not None:
+        obj[key2] = v1
+    else:
+        obj.pop(key2, None)
+    if v2 is not None:
+        obj[key1] = v2
+    else:
+        obj.pop(key1, None)
+
+
+class EngineCoreOutput(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
+    request_id: str
+    new_token_ids: list[int]
+    new_logprobs: LogprobsLists | None = None
+    new_prompt_logprobs_tensors: LogprobsTensors | None = None
+    finish_reason: FinishReason | None = None
+    stop_reason: int | str | None = None
+    kv_transfer_params: dict[str, tp.Any] | None = None
+    num_cached_tokens: int = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.finish_reason is not None
+
+
+class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
+    engine_index: int = 0
+
+    outputs: list[EngineCoreOutput] = []
+    scheduler_stats: SchedulerStats | None = None
+    timestamp: float = 0.0
+    utility_output: UtilityOutput | None = None
+    finished_requests: set[str] | None = None
+    wave_complete: int | None = None
+    start_wave: int | None = None
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.monotonic()
+
+
+def sha256(input) -> int:  # noqa
+    """Hash any picklable Python object using SHA-256.
+
+    The input is serialized using pickle before hashing, which allows
+    arbitrary Python objects to be used. Note that this function does
+    not use a hash seed—if you need one, prepend it explicitly to the input.
+
+    Args:
+        input: Any picklable Python object.
+
+    Returns:
+        An integer representing the SHA-256 hash of the serialized input.
+    """
+    input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
+    return int.from_bytes(hashlib.sha256(input_bytes).digest(), byteorder="big")
+
+
+class PageHash(NamedTuple):
+    """Hash value of a page (int), the token IDs in the page, and extra keys.
+    We keep a tuple of token IDs and extra keys to reduce the likelihood of
+    hash collisions when the hash value is the same. By using SHA256 however,
+    hash collisions are practically impossible.
+    """
+
+    hash_value: int
+    token_ids: tuple[int, ...]
+    extra_keys: Any | None = None
+
+
+class PageHashWithGroupId(NamedTuple):
+    page_hash: PageHash
+
+    group_id: int
+
+    def get_hash_value(self) -> int:
+        return self.page_hash.hash_value

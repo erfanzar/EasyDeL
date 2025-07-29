@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import typing as tp
 from functools import partial
-from math import ceil
 
 import chex as cx
 import jax
@@ -37,9 +36,14 @@ if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+
 EMPTY = common_types.EMPTY
 KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
+
+
+def cdiv(a, b):
+    return (a + b - 1) // b
 
 
 def previous_power_of_2(n: int) -> int:
@@ -48,13 +52,35 @@ def previous_power_of_2(n: int) -> int:
     return 1 << (n.bit_length() - 1)
 
 
-def get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
-    num_slices_per_block = (16 * 1024 * 1024) // page_size_bytes
-    assert num_slices_per_block > 0, "Number of slices should be positive"
-    num_slices_per_block = previous_power_of_2(num_slices_per_block)
-    if num_slices_per_block > 64:
-        num_slices_per_block = 64
-    return num_slices_per_block
+def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
+    num_slices_per_page = (16 * 1024 * 1024) // page_size_bytes
+    assert num_slices_per_page > 0, "Number of slices should be positive"
+    num_slices_per_page = previous_power_of_2(num_slices_per_page)
+    if num_slices_per_page > 64:
+        num_slices_per_page = 64
+    return num_slices_per_page
+
+
+def get_dtype_packing(dtype):
+    bits = jnp.finfo(dtype).bits
+    if 32 % bits != 0:
+        raise ValueError(f"The bit width must be divisible by 32, but got bits={bits}, dtype={{dtype}}")
+    return 32 // bits
+
+
+def get_page_size_bytes(
+    page_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    kv_cache_dtype: jnp.dtype,
+) -> int:
+    """Returns the size in bytes of one page of the KV cache."""
+    padded_head_size = cdiv(head_size, 128) * 128
+    num_combined_kv_heads = num_kv_heads * 2
+    packing = get_dtype_packing(kv_cache_dtype)
+    num_combined_kv_heads = cdiv(num_combined_kv_heads, packing) * packing
+    kv_cache_dtype_bits = jnp.finfo(kv_cache_dtype).bits
+    return page_size * num_combined_kv_heads * padded_head_size * kv_cache_dtype_bits // 8
 
 
 @auto_pytree
@@ -76,7 +102,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
     page_size: int = 128
     num_pages: int = -1
     max_num_pages_per_req: int = -1
-    num_slices_per_kv_cache_update_block: int = -1
+    num_slices_per_kv_cache_update_page: int = -1
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
@@ -87,7 +113,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
             limit = per_device_memory_stats.get("bytes_limit", per_device_memory_stats.get("bytes_reservable_limit"))
             used = per_device_memory_stats["bytes_in_use"]
             usable = int(limit * hbm_utilization) - used
-            return usable * size
+            return abs(usable * size)
         except Exception as e:
             print(e)
             return 4 * (1024**3)
@@ -121,9 +147,8 @@ class PagesCacheMetaData(BaseCacheMetadata):
             raise ValueError("`kv_head_dim_size` must be positive")
         free = cls._compute_free_hbm(mesh=mesh, partition_manager=partition_manager, hbm_utilization=hbm_utilization)
         bytes_av = jnp.finfo(kvdtype).bits // 8
-        block_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
-        num_pages = int(free) // block_bytes
-
+        page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
+        num_pages = int(free) // page_bytes
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -133,19 +158,30 @@ class PagesCacheMetaData(BaseCacheMetadata):
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             num_pages=num_pages,
-            max_num_pages_per_req=ceil(max_model_length / page_size),
-            num_slices_per_kv_cache_update_block=get_num_slices_per_kv_cache_update_block(block_bytes),
+            max_num_pages_per_req=cdiv(max_model_length, page_size),
+            num_slices_per_kv_cache_update_page=get_num_slices_per_kv_cache_update_page(
+                get_page_size_bytes(
+                    page_size=page_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=k_headdim,
+                    kv_cache_dtype=kvdtype,
+                )
+            ),
         )
 
     def get_padded_num_slices(self, num_tokens: int, max_num_reqs: int):
         padded_num_slices = 2 * max_num_reqs + num_tokens // self.page_size
         padded_num_slices = min(padded_num_slices, num_tokens)
         padded_num_slices = (
-            (padded_num_slices + self.num_slices_per_kv_cache_update_block - 1)
-            // self.num_slices_per_kv_cache_update_block
-            * self.num_slices_per_kv_cache_update_block
+            (padded_num_slices + self.num_slices_per_kv_cache_update_page - 1)
+            // self.num_slices_per_kv_cache_update_page
+            * self.num_slices_per_kv_cache_update_page
         )
         return padded_num_slices
+
+    def get_max_num_seqs(self) -> int:
+        num_page_per_req = cdiv(self.max_model_length, self.page_size)
+        return 1024 * 1024 // 2 // num_page_per_req // 4
 
 
 @auto_pytree
@@ -242,6 +278,8 @@ class PagesCacheView(BaseCacheView):
                     slots,
                     pages.reshape(-1, *pages.shape[2:]),
                     num_update_slices,
+                    page_size=cache_metadata.page_size,
+                    slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
                 ).reshape(pages.shape)
             else:
                 return kv_cache_update_jax(
@@ -350,7 +388,7 @@ class PagesCache(BaseCache):
     __str__ = __repr__
 
 
-@auto_pytree
+@auto_pytree(max_print_length=3000)
 class PagesMetadata:
     pages_tables: jax.Array
     context_lens: jax.Array
@@ -359,52 +397,19 @@ class PagesMetadata:
     slot_mapping: jax.Array
     position_ids: jax.Array | None = None
     num_kv_update_slices: jax.Array | None = None
-    num_slices_per_kv_cache_update_block: int | None = field(pytree_node=False, default_factory=lambda: None)
+    num_slices_per_kv_cache_update_page: int | None = field(pytree_node=False, default_factory=lambda: None)
     page_size: int = field(pytree_node=False, default=128)
     prefill_chunk_size: int = field(pytree_node=False, default=512)
-    blocksize: int = field(pytree_node=False, default=256)
 
     @classmethod
-    def create_empty(cls, num_tokens: int, max_num_reqs: int, max_blocks: int, page_size: int = 128) -> PagesMetadata:
+    def create_empty(cls, num_tokens: int, max_num_reqs: int, max_pages: int, page_size: int = 128) -> PagesMetadata:
         """Create empty metadata with proper shapes."""
         return cls(
             slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32),
-            pages_tables=jnp.zeros((max_num_reqs, max_blocks), dtype=jnp.int32),
+            pages_tables=jnp.zeros((max_num_reqs, max_pages), dtype=jnp.int32),
             context_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             query_start_loc=jnp.zeros([max_num_reqs + 1], dtype=jnp.int32),
             position_ids=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             page_size=page_size,
         )
-
-
-class BlockAllocator:
-    """
-    Manages allocation and freeing of physical blocks (pages) within the EasyDeL cache.
-    This interacts with the cache's metadata to determine total pages and tracks free ones.
-    """
-
-    def __init__(self, cache_metadata: PagesCacheMetaData):
-        if not hasattr(cache_metadata, "num_pages") or cache_metadata.num_pages <= 0:
-            raise ValueError("Cache metadata must have a positive 'num_pages' attribute.")
-        self.total_pages = cache_metadata.num_pages
-        self.free_pages: set[int] = set(range(self.total_pages))
-
-    def allocate(self, num_pages: int) -> list[int]:
-        if num_pages <= 0:
-            return []
-        if len(self.free_pages) < num_pages:
-            raise RuntimeError(f"Out of KV cache pages! Requested: {num_pages}, Available: {len(self.free_pages)}")
-
-        free_list = sorted(list(self.free_pages))
-        allocated_ids = free_list[:num_pages]
-        self.free_pages.difference_update(allocated_ids)
-        return allocated_ids
-
-    def free(self, page_ids: list[int]):
-        if not page_ids:
-            return
-        invalid_ids = [pid for pid in page_ids if pid < 0 or pid >= self.total_pages]
-        if invalid_ids:
-            raise ValueError(f"Attempting to free invalid page IDs: {invalid_ids}")
-        self.free_pages.update(page_ids)

@@ -15,12 +15,39 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import queue
 import threading
 import time
 
 from ..utils import ActiveRequest
-from ._utils import RequestPriority, ScheduleDecision, SchedulePolicy
+
+
+@enum.unique
+class SchedulePolicy(enum.Enum):
+    """Scheduling policies for request batching"""
+
+    OFFLINE = enum.auto()
+    ONLINE = enum.auto()
+    ADAPTIVE = enum.auto()
+
+
+@dataclasses.dataclass
+class FIFOScheduleDecision:
+    """Result of a simple scheduling decision"""
+
+    prefill_requests: list[tuple[int, ActiveRequest]]  # (slot, request) pairs
+    decode_slots: list[int]  # slots ready for decode
+    should_decode: bool
+    should_prefill: bool
+
+
+class RequestPriority(enum.Enum):
+    """Priority levels for request scheduling"""
+
+    HIGH = 0
+    NORMAL = 1
+    LOW = 2
 
 
 @dataclasses.dataclass
@@ -32,7 +59,7 @@ class BatchConfig:
     force_batch_on_timeout: bool = True
 
 
-class Scheduler:
+class FIFOScheduler:
     """
     Simple FIFO scheduler for non-paged attention systems.
     Does NOT use chunked prefill - processes entire prompts at once.
@@ -96,7 +123,7 @@ class Scheduler:
 
         return False
 
-    def schedule(self) -> ScheduleDecision:
+    def schedule(self) -> FIFOScheduleDecision:
         """Make scheduling decisions for simple scheduler"""
         with self._lock:
             prefill_requests = []
@@ -143,7 +170,7 @@ class Scheduler:
                 if len(decode_slots) < self.max_batch_size * 0.5:
                     should_decode = False
 
-            return ScheduleDecision(
+            return FIFOScheduleDecision(
                 prefill_requests=prefill_requests,
                 decode_slots=decode_slots,
                 should_prefill=len(prefill_requests) > 0,

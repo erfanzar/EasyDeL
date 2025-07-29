@@ -13,5 +13,6 @@
 # limitations under the License.
 from .driver import vDriver
 from .engine import vEngine
+from .execution_manager import vSurgeExecutionManager
 
-__all__ = ("vDriver", "vEngine")
+__all__ = ("vDriver", "vEngine", "vSurgeExecutionManager")

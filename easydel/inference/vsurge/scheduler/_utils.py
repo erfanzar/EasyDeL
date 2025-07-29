@@ -13,93 +13,23 @@
 # limitations under the License.
 from __future__ import annotations
 
-import dataclasses
-import enum
-import typing
-
-from jax import numpy as jnp
-
-from easydel.layers.caching import PagesMetadata
-
-if typing.TYPE_CHECKING:
-    from ..utils import ActiveRequest
-    from .page_manager import PageManager
+from ..request_type import EngineRequest, EngineRequestStatus
 
 
-@dataclasses.dataclass
-class PageAllocation:
-    """Tracks page allocations for a request"""
+def check_stop(request: EngineRequest, max_model_len: int) -> bool:
+    if request.num_tokens >= max_model_len or request.num_output_tokens >= request.max_tokens:
+        request.status = EngineRequestStatus.FINISHED_LENGTH_CAPPED
+        return True
 
-    page_indices: list[int]
-    num_pages: int
-    sequence_id: int
+    sampling_params = request.sampling_params
+    assert sampling_params is not None
+    last_token_id = request.output_token_ids[-1]
+    if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:
+        request.status = EngineRequestStatus.FINISHED_STOPPED
+        return True
 
-
-@dataclasses.dataclass
-class PagedScheduleResult:
-    """Result of a scheduling decision"""
-
-    prefill_infos: list[PrefillScheduleInfo]
-    decode_info: DecodeScheduleInfo
-    updated_page_manager: PageManager
-    should_decode: bool
-    should_prefill: bool
-
-
-@dataclasses.dataclass
-class ScheduleDecision:
-    """Result of a simple scheduling decision"""
-
-    prefill_requests: list[tuple[int, ActiveRequest]]  # (slot, request) pairs
-    decode_slots: list[int]  # slots ready for decode
-    should_decode: bool
-    should_prefill: bool
-
-
-@dataclasses.dataclass
-class PrefillScheduleInfo:
-    """Information about a scheduled prefill operation"""
-
-    slot: int
-    request: ActiveRequest
-    seq_id: int
-    token_ids: jnp.ndarray
-    page_batch_info: PagesMetadata | None
-
-
-@dataclasses.dataclass
-class DecodeScheduleInfo:
-    """Information about scheduled decode operations"""
-
-    active_slots: list[int]
-    active_requests: dict[int, ActiveRequest]
-    sequence_ids: jnp.ndarray
-    page_batch_info: PagesMetadata | None
-
-
-@dataclasses.dataclass
-class ScheduleResult:
-    """Complete scheduling decision"""
-
-    prefill_info: list[PrefillScheduleInfo]
-    decode_info: DecodeScheduleInfo | None
-    updated_page_manager: PageManager | None
-    should_prefill: bool
-    should_decode: bool
-
-
-@enum.unique
-class SchedulePolicy(enum.Enum):
-    """Scheduling policies for request batching"""
-
-    OFFLINE = enum.auto()
-    ONLINE = enum.auto()
-    ADAPTIVE = enum.auto()
-
-
-class RequestPriority(enum.Enum):
-    """Priority levels for request scheduling"""
-
-    HIGH = 0
-    NORMAL = 1
-    LOW = 2
+    if last_token_id in (sampling_params.stop_token_ids or ()):
+        request.status = EngineRequestStatus.FINISHED_STOPPED
+        request.stop_reason = last_token_id
+        return True
+    return False

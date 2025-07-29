@@ -26,6 +26,7 @@ from flax import nnx as nn
 from flax import struct
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from typing_extensions import Self
 
 from easydel.infra.factory import TaskType
 from easydel.utils.checkpoint_managers import CheckpointManager
@@ -83,7 +84,7 @@ class EasyDeLState(struct.PyTreeNode):
     opt_state: optax.OptState | None = struct.field(pytree_node=True)
     apply_fn: tp.Callable | None = struct.field(pytree_node=False, default=None)
 
-    def apply_gradients(self, *, grads):
+    def apply_gradients(self: Self, *, grads):
         """Updates the model's parameters and optimizer state based on calculated gradients.
 
         Args:
@@ -120,7 +121,7 @@ class EasyDeLState(struct.PyTreeNode):
         tx: optax.GradientTransformation | None = None,
         opt_state: optax.OptState | None = None,
         init_opt_state: bool = False,
-    ) -> EasyDeLState:
+    ) -> Self:
         """Creates a new `EasyDeLState` instance.
 
         This class method provides a flexible way to initialize the state, either from an
@@ -198,7 +199,7 @@ class EasyDeLState(struct.PyTreeNode):
             opt_state=opt_state,
         )
 
-    def init_tx(self, tx: optax.GradientTransformation, partition_rules: PartitionLike = None) -> EasyDeLState:
+    def init_tx(self: Self, tx: optax.GradientTransformation, partition_rules: PartitionLike = None) -> Self:
         """Initializes the optimizer state (`opt_state`) for the current `graphstate`
         using the provided optimizer transformation (`tx`).
 
@@ -270,7 +271,7 @@ class EasyDeLState(struct.PyTreeNode):
             opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
             return self.replace(opt_state=opt_state)
 
-    def gather_optimizer_state(self, partition_rules=None):
+    def gather_optimizer_state(self: Self, partition_rules=None):
         """Gathers the optimizer state from potentially distributed devices.
 
         Args:
@@ -295,7 +296,7 @@ class EasyDeLState(struct.PyTreeNode):
         self = self.replace(opt_state=jax.tree_util.tree_map(lambda f, o: f(o), gather, self.opt_state))
         return self
 
-    def merge(self, tree) -> EasyDeLBaseModule:
+    def merge(self: Self, tree) -> EasyDeLBaseModule:
         """Merges a given state tree (usually parameters) with the graph definition and other state
         components to reconstruct the full model module.
 
@@ -307,7 +308,7 @@ class EasyDeLState(struct.PyTreeNode):
         """
         return nn.merge(self.graphdef, tree, self.graphother)
 
-    def merge_to_state(self, tree) -> EasyDeLState:
+    def merge_to_state(self: Self, tree) -> Self:
         """Creates a new `EasyDeLState` by replacing the current `graphstate` with the provided tree.
 
         Args:
@@ -346,7 +347,7 @@ class EasyDeLState(struct.PyTreeNode):
         graphstate_size = calculate_size(self.graphstate)
         return opt_state_size + graphstate_size
 
-    def load_optimizer(self, load_directory: str | os.PathLike):
+    def load_optimizer(self: Self, load_directory: str | os.PathLike):
         """Loads the optimizer state from saved files.
 
         Reads the optimizer state structure from a pickle file (`OPTIMIZER_STRUCT_NAME`)
@@ -636,7 +637,7 @@ class EasyDeLState(struct.PyTreeNode):
             state = state.shard_state()
         return state
 
-    def shard_with_shape(self, shape) -> EasyDeLState:
+    def shard_with_shape(self: Self, shape) -> Self:
         """Applies sharding constraints to the entire state based on a reference shape pytree.
 
         This method takes a pytree `shape` which has the same structure as the `EasyDeLState`
@@ -663,7 +664,7 @@ class EasyDeLState(struct.PyTreeNode):
         self,
         partition_rules: PartitionLike = None,
         mesh: Mesh = None,
-    ) -> EasyDeLState:
+    ) -> Self:
         """Shards the entire state (model parameters and optimizer state) based on partition rules.
 
         This is a convenience method that calls `shard_model` and `shard_optimizer_state`.
@@ -706,7 +707,7 @@ class EasyDeLState(struct.PyTreeNode):
         self,
         partition_rules: PartitionLike = None,
         mesh: Mesh | None = None,
-    ) -> EasyDeLState:
+    ) -> Self:
         """Gathers the model parameters (`graphstate` and `graphother`) from distributed devices.
 
         Args:
@@ -729,7 +730,7 @@ class EasyDeLState(struct.PyTreeNode):
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self
 
-    def shard_model(self, partition_rules: PartitionLike = None, mesh: Mesh | None = None) -> EasyDeLState:
+    def shard_model(self: Self, partition_rules: PartitionLike = None, mesh: Mesh | None = None) -> Self:
         """
         Shards the model parameters (`graphstate` and `graphother`) based on partition rules.
 

@@ -27,7 +27,6 @@ from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
 from easydel.inference.sampling_params import JitableSamplingParams
-from easydel.layers.attention import AttentionMechanisms
 from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
 from easydel.utils import ejit
 
@@ -130,12 +129,6 @@ class vEngine:
             page_size=page_size,
         )
 
-        self.page_metadata = model.create_paged_metadata(
-            dtype=model.config.kvdtype or model.dtype,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_model_length=self.max_decodes_length * max_concurrent_decodes,
-        )
         if extra_eos_token_ids is not None:
             if isinstance(extra_eos_token_ids, int):
                 extra_eos_token_ids = [extra_eos_token_ids]
@@ -211,8 +204,8 @@ class vEngine:
                     None,
                     self._empty_sharding,
                     None,
-                    self._decodes_state_sharding.cache if self.is_paged_runtime else None,
-                    self._empty_sharding if self.is_paged_runtime else None,
+                    None,
+                    None,
                     None,
                 ),
                 out_shardings=(self._prefill_state_sharding, None),
@@ -296,12 +289,6 @@ class vEngine:
         return new_key
 
     @property
-    def is_paged_runtime(self) -> bool:
-        attn_mechanism = self.model.config.attn_mechanism
-        value_to_compare = getattr(attn_mechanism, "value", attn_mechanism)
-        return value_to_compare == AttentionMechanisms.PAGED_ATTENTION.value
-
-    @property
     def prefill_lengths(self) -> list[int]:
         """Returns the configured list of max prefill length buckets for the engine."""
         return self._max_prefill_lengths
@@ -382,13 +369,7 @@ class vEngine:
             vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
         assert vocab_size is not None, "couldn't find `vocab_size` in model config"
 
-        if self.is_paged_runtime:
-            cache = self.model.init_pages(
-                metadata=self.page_metadata,
-                dtype=self.model.config.kvdtype or self.model.dtype,
-            )
-        else:
-            cache = self.model.init_cache(concurrent_decode, self.max_length)
+        cache = self.model.init_cache(concurrent_decode, self.max_length)
 
         with self.model.mesh:
             return GenerationState(

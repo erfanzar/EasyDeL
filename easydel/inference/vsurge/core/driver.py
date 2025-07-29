@@ -18,18 +18,21 @@ import queue
 import time
 import traceback
 import typing as tp
-from functools import cached_property
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
-from easydel.inference.vsurge.scheduler.page_scheduler import DecodeScheduleInfo
 from easydel.layers.caching import PagesMetadata
 from easydel.utils.helpers import get_logger
 
 from ...sampling_params import JitableSamplingParams
-from ..scheduler import BatchConfig, PagedScheduler, PrefillScheduleInfo, RequestPriority, SchedulePolicy, Scheduler
+from ..scheduler.deprecated_scheduler import (
+    BatchConfig,
+    FIFOScheduler,
+    RequestPriority,
+    SchedulePolicy,
+)
 from ..utils import (
     ActiveRequest,
     GenerationState,
@@ -80,7 +83,7 @@ class vDriver:
         self,
         engine: vEngine,
         schedule_policy: SchedulePolicy = SchedulePolicy.ADAPTIVE,
-        batch_config: BatchConfig | None = None,
+        batch_config: BatchConfig = None,
         detokenizing_blocks: int = 8,
         max_prefill_chunk_size: int = 512,
         slot_clear_steps: int = 512,
@@ -108,21 +111,12 @@ class vDriver:
         self._max_prefill_chunk_size = max_prefill_chunk_size
         self._pause = False
 
-        if self.is_paged_runtime:
-            self.scheduler = PagedScheduler(
-                metadata=engine.page_metadata,
-                max_batch_size=engine.max_concurrent_decodes,
-                max_prefill_batch_size=engine.max_concurrent_prefill,
-                max_prefill_chunk_size=max_prefill_chunk_size,
-                schedule_policy=schedule_policy,
-            )
-        else:
-            self.scheduler = Scheduler(
-                max_batch_size=engine.max_concurrent_decodes,
-                max_prefill_batch_size=engine.max_concurrent_prefill,
-                schedule_policy=schedule_policy,
-                batch_config=batch_config,
-            )
+        self.scheduler = FIFOScheduler(
+            max_batch_size=engine.max_concurrent_decodes,
+            max_prefill_batch_size=engine.max_concurrent_prefill,
+            schedule_policy=schedule_policy,
+            batch_config=batch_config,
+        )
 
         self._detokenize_backlog = queue.Queue(maxsize=self._detokenizing_blocks if self._detokenizing_blocks > 0 else 0)
 
@@ -136,27 +130,6 @@ class vDriver:
         self.live = False
         self._all_threads: list[SafeThread] = []
         self._metrics_thread: SafeThread | None = None
-
-        if self.is_paged_runtime:
-            self._setup_pages_requirements()
-
-    def _setup_pages_requirements(self):
-        """Setup requirements for paged attention using PagesMetadata"""
-        engine = self.engine
-        metadata = engine.page_metadata
-        self.pages_metadata = PagesMetadata.create_empty(
-            num_tokens=engine.max_prefill_length,
-            max_num_reqs=engine.max_concurrent_decodes,
-            max_blocks=metadata.max_num_pages_per_req,
-            page_size=metadata.page_size,
-        )
-        self.log(
-            f"Initialized PagesMetadata with page_size={metadata.page_size}, max_blocks={metadata.max_num_pages_per_req}"
-        )
-
-    @cached_property
-    def is_paged_runtime(self) -> bool:
-        return self.engine.is_paged_runtime
 
     @property
     def engine(self) -> vEngine:
@@ -432,63 +405,27 @@ class vDriver:
         decode_state = engine.init_decode_state()
         generate_timestep = 0
 
-        # Initialize prefill accumulator for paged mode
-        prefill_accumulator = {} if self.is_paged_runtime else None
-
-        # Initialize page manager if needed
-        if self.is_paged_runtime and not hasattr(self, "page_manager"):
-            self.page_manager = self.scheduler.page_manager
-
         while self.live:
             try:
-                if self.is_paged_runtime:
-                    schedule_result = self.scheduler.schedule()
+                simple_result = self.scheduler.schedule()
 
-                    # Update page manager
-                    if schedule_result.updated_page_manager:
-                        self.page_manager = schedule_result.updated_page_manager
+                if simple_result.should_prefill:
+                    decode_state = self._process_fifo_prefill(
+                        engine,
+                        processor,
+                        simple_result.prefill_requests,
+                        decode_state,
+                        generate_timestep,
+                    )
 
-                    # Process prefills
-                    if schedule_result.should_prefill:
-                        decode_state = self._process_paged_prefill(
-                            engine,
-                            processor,
-                            schedule_result.prefill_infos,
-                            prefill_accumulator,
-                            decode_state,
-                            generate_timestep,
-                        )
-
-                    # Process decodes
-                    if schedule_result.should_decode and schedule_result.decode_info:
-                        decode_state, sampled_tokens = self._process_paged_decode(
-                            engine,
-                            decode_state,
-                            schedule_result.decode_info,
-                            generate_timestep,
-                        )
-                        generate_timestep += 1
-                else:
-                    # Simple scheduler path remains the same
-                    simple_result = self.scheduler.schedule()
-
-                    if simple_result.should_prefill:
-                        decode_state = self._process_fifo_prefill(
-                            engine,
-                            processor,
-                            simple_result.prefill_requests,
-                            decode_state,
-                            generate_timestep,
-                        )
-
-                    if simple_result.should_decode:
-                        decode_state, sampled_tokens = self._process_fifo_decode(
-                            engine,
-                            decode_state,
-                            simple_result.decode_slots,
-                            generate_timestep,
-                        )
-                        generate_timestep += 1
+                if simple_result.should_decode:
+                    decode_state, sampled_tokens = self._process_fifo_decode(
+                        engine,
+                        decode_state,
+                        simple_result.decode_slots,
+                        generate_timestep,
+                    )
+                    generate_timestep += 1
 
                 # Periodic cleanup
                 if self._slot_clear_steps and (generate_timestep % self._slot_clear_steps) == 0:
@@ -496,10 +433,7 @@ class vDriver:
 
                 # Sleep if nothing to do
                 should_sleep = True
-                if self.is_paged_runtime:
-                    should_sleep = not (schedule_result.should_prefill or schedule_result.should_decode)
-                else:
-                    should_sleep = not (simple_result.should_prefill or simple_result.should_decode)
+                should_sleep = not (simple_result.should_prefill or simple_result.should_decode)
 
                 if should_sleep:
                     time.sleep(0.001)
@@ -658,7 +592,7 @@ class vDriver:
         self,
         engine,
         processor,
-        prefill_infos: list[PrefillScheduleInfo],
+        prefill_infos,
         prefill_accumulator: dict,
         decode_state,
         generate_timestep: int,
@@ -877,7 +811,7 @@ class vDriver:
         self,
         engine,
         decode_state,
-        decode_info: DecodeScheduleInfo,
+        decode_info,
         generate_timestep: int,
     ):
         """Process a batch of decode operations"""
