@@ -1027,6 +1027,7 @@ class AttnMaskDetail:
 class TaskType(str, Enum):
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
+    DIFFUSION_LM = "diffusion-language-model"
     IMAGE_TEXT_TO_TEXT = "image-text-to-text"
     BASE_MODULE = "base-module"
     BASE_VISION = "vision-module"
@@ -1204,7 +1205,10 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
     head_cost = 0
     loss_cost = 0
 
-    if cfg.task == TaskType.CAUSAL_LM:
+    if cfg.task in {
+        TaskType.CAUSAL_LM,
+        TaskType.DIFFUSION_LM,
+    }:
         body_cost = flop_transformer_body(
             cfg.num_layers,
             cfg.seq_len,

@@ -109,7 +109,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_attributes()
         self.initialize_trainer_utils()
 
-        if self.arguments.track_memory:
+        if self.arguments.track_memory and self.arguments.track_memory > 0:
             self._initialize_memory_tracking()
 
     def load_trainer_state(
@@ -327,7 +327,8 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self.arguments.performance_mode:
             import easydel
 
-            self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(1)
+            interval = 1.0 if self.arguments.track_memory is True else self.arguments.track_memory
+            self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
         return pprint.pformat(self.__dict__, indent=2)
@@ -646,6 +647,18 @@ class BaseTrainer(BaseTrainerProtocol):
             raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
         import tensorflow as tf  # type:ignore
 
+        try:
+            # Disable all GPUS
+            tf.config.set_visible_devices([], 'GPU')
+            visible_devices = tf.config.get_visible_devices()
+            for device in visible_devices:
+                assert device.device_type != 'GPU'
+        except RuntimeError as e:
+            # Invalid device or cannot modify virtual devices once initialized.
+            logger.error(f"Failed to disable GPU devices: {e}")
+        except AssertionError:
+            logger.warning("TensorFlow may be hogging GPU memory.")
+
         def create_tf_dataset(dataset: Dataset, is_train: bool) -> tp.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from a Hugging Face Dataset.
@@ -963,6 +976,7 @@ class BaseTrainer(BaseTrainerProtocol):
             TaskType.SEQUENCE_CLASSIFICATION: "SequenceClassification",
             TaskType.IMAGE_TEXT_TO_TEXT: "ImageTextToText",
             TaskType.VISION_LM: "ImageTextToText",
+            TaskType.DIFFUSION_LM: "DiffusionLM",
             TaskType.BASE_MODULE: "",
             TaskType.BASE_VISION: "",
             TaskType.SEQUENCE_TO_SEQUENCE: "sequence-to-sequence",
