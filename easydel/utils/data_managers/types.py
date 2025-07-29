@@ -21,6 +21,7 @@ from enum import Enum
 from eformer.pytree import auto_pytree as dataclass
 from eformer.pytree import field
 
+from ..helpers import get_cache_dir
 from ..checkpoint_managers import EasyPath, EasyPathLike
 
 
@@ -115,7 +116,7 @@ class DatasetMixture:
     """Configuration for a mixture of datasets."""
 
     informs: list[VisualDatasetInform | TextDatasetInform]
-    cache_dir: str | EasyPathLike = field(default="~/.cache/data-mixture")
+    cache_dir: str | EasyPathLike = field(default_factory=get_cache_dir)
     streaming: bool = True
     text_target_field: str = "text"
     image_target_field: str = "image"
