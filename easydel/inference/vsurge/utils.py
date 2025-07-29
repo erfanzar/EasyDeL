@@ -211,7 +211,7 @@ class ReturnSample:
     text: list[str] | str
     token_ids: list[int]
     time_spent_computing: float = 0.0
-    accumulated_text: list[str] | str = None
+    accumulated_text: list[str] | str = dataclasses.field(default_factory=list)
     tokens_per_second: float | None = dataclasses.field(default=None)
     num_generated_tokens: int | None = dataclasses.field(default=None)
     generation_idx: int | None = dataclasses.field(default=None)
@@ -344,7 +344,7 @@ class ActiveRequest:
 
     id: str = field(default_factory=uuid.uuid4)
 
-    accumulated_text: str | list[str] | None = None
+    accumulated_text: str | list[str] = dataclasses.field(default_factory=list)
 
     _token_ids: list[int] | None = None
     _attention_mask: np.ndarray | None = None
