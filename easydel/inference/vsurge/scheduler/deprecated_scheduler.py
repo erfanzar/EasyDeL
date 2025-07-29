@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import dataclasses
@@ -72,18 +71,24 @@ class FIFOScheduler:
         schedule_policy: SchedulePolicy = SchedulePolicy.ADAPTIVE,
         batch_config: BatchConfig | None = None,
         high_load_threshold: float = 0.8,
+        max_decode_wait_iterations: int = 3,
     ):
         self.max_batch_size = max_batch_size
         self.max_prefill_batch_size = max_prefill_batch_size
         self.schedule_policy = schedule_policy
         self.high_load_threshold = high_load_threshold
         self.batch_config = batch_config or BatchConfig()
+        self.max_decode_wait_iterations = max_decode_wait_iterations
 
         self.prefill_queue: queue.PriorityQueue = queue.PriorityQueue()
 
         # Active request tracking
         self.active_requests: dict[int, ActiveRequest] = {}  # slot -> request
         self.request_to_slot: dict[str, int] = {}  # request.id -> slot
+
+        # Decode request tracking
+        self.pending_decode_slots: set[int] = set()  # Slots waiting to decode
+        self.decode_wait_counts: dict[int, int] = {}  # slot -> wait iterations
 
         self.pending_batch: list[tuple[float, int, ActiveRequest]] = []
         self.batch_start_time: float | None = None
@@ -123,8 +128,31 @@ class FIFOScheduler:
 
         return False
 
+    def _update_pending_decode_slots(self):
+        """Update the set of slots ready for decode"""
+        self.pending_decode_slots.clear()
+
+        for slot, request in self.active_requests.items():
+            if request is None:
+                continue
+
+            # Check if ready for decode (has completed prefill)
+            if hasattr(request, "prefill_result") and request.prefill_result is not None:
+                self.pending_decode_slots.add(slot)
+
+    def _get_starved_decode_slots(self) -> set[int]:
+        """Get decode slots that have been waiting too long"""
+        starved_slots = set()
+
+        for slot in self.pending_decode_slots:
+            wait_count = self.decode_wait_counts.get(slot, 0)
+            if wait_count >= self.max_decode_wait_iterations:
+                starved_slots.add(slot)
+
+        return starved_slots
+
     def schedule(self) -> FIFOScheduleDecision:
-        """Make scheduling decisions for simple scheduler"""
+        """Make scheduling decisions with decode request protection"""
         with self._lock:
             prefill_requests = []
             active_count = len([r for r in self.active_requests.values() if r is not None])
@@ -136,43 +164,68 @@ class FIFOScheduler:
             else:
                 effective_policy = self.schedule_policy
 
-            # Calculate prefill budget
-            prefill_budget = min(self.max_prefill_batch_size, self.max_batch_size - active_count)
+            # Update pending decode slots
+            self._update_pending_decode_slots()
+
+            # Check for starved decode requests
+            starved_decode_slots = self._get_starved_decode_slots()
+
+            # If we have starved decode requests, prioritize them
+            if starved_decode_slots:
+                # Reset wait counts for starved slots that will be processed
+                for slot in starved_decode_slots:
+                    self.decode_wait_counts[slot] = 0
+
+                return FIFOScheduleDecision(
+                    prefill_requests=[],
+                    decode_slots=list(starved_decode_slots),
+                    should_prefill=False,
+                    should_decode=True,
+                )
+
+            # Calculate prefill budget (reduced if decode requests are waiting)
+            base_prefill_budget = min(self.max_prefill_batch_size, self.max_batch_size - active_count)
+
+            # Reduce prefill budget if decode requests are waiting
+            if self.pending_decode_slots:
+                prefill_budget = max(1, base_prefill_budget // 2)  # Allow at least 1 prefill
+            else:
+                prefill_budget = base_prefill_budget
 
             # Handle new requests
             if effective_policy == SchedulePolicy.ONLINE:
-                # Process immediately
                 self._process_new_requests_online(prefill_requests, prefill_budget)
             else:
-                # Batch formation for offline mode
                 self._process_new_requests_offline(prefill_requests, prefill_budget)
 
-            # Handle decode scheduling
-            decode_slots = []
-
-            for slot, request in self.active_requests.items():
-                if request is None:
-                    continue
-
-                # Check if ready for decode (has completed prefill)
-                if (
-                    hasattr(request, "prefill_result")
-                    and request.prefill_result is not None
-                    and slot not in [slot for slot, _ in prefill_requests]
-                ):
-                    decode_slots.append(slot)
+            # Get decode slots to process
+            decode_slots = list(self.pending_decode_slots)
 
             # Determine if we should decode
             should_decode = len(decode_slots) > 0
 
             if effective_policy == SchedulePolicy.OFFLINE and should_decode:
-                # In offline mode, wait for more requests
-                if len(decode_slots) < self.max_batch_size * 0.5:
+                # In offline mode, be less strict about batch size if requests are waiting
+                min_decode_batch = self.max_batch_size * 0.5
+                if any(self.decode_wait_counts.get(slot, 0) > 0 for slot in decode_slots):
+                    min_decode_batch = max(1, self.max_batch_size * 0.25)  # Lower threshold for waiting requests
+
+                if len(decode_slots) < min_decode_batch:
                     should_decode = False
+
+            # Update wait counts for decode slots
+            if should_decode:
+                # Reset wait counts for slots that will be processed
+                for slot in decode_slots:
+                    self.decode_wait_counts[slot] = 0
+            else:
+                # Increment wait counts for slots that won't be processed
+                for slot in decode_slots:
+                    self.decode_wait_counts[slot] = self.decode_wait_counts.get(slot, 0) + 1
 
             return FIFOScheduleDecision(
                 prefill_requests=prefill_requests,
-                decode_slots=decode_slots,
+                decode_slots=decode_slots if should_decode else [],
                 should_prefill=len(prefill_requests) > 0,
                 should_decode=should_decode,
             )
@@ -257,6 +310,10 @@ class FIFOScheduler:
                 # Clean up tracking
                 del self.request_to_slot[request_id]
 
+                # Clean up decode tracking
+                self.pending_decode_slots.discard(slot)
+                self.decode_wait_counts.pop(slot, None)
+
                 self.completed_requests += 1
 
     def force_batch(self):
@@ -272,12 +329,21 @@ class FIFOScheduler:
             pending_count = len(self.pending_batch)
             queue_size = self.prefill_queue.qsize()
 
+            # Add decode wait stats
+            max_decode_wait = max(self.decode_wait_counts.values()) if self.decode_wait_counts else 0
+            avg_decode_wait = (
+                sum(self.decode_wait_counts.values()) / len(self.decode_wait_counts) if self.decode_wait_counts else 0
+            )
+
             return {
                 "total_requests": self.total_requests,
                 "completed_requests": self.completed_requests,
                 "active_requests": active_count,
                 "pending_batch_size": pending_count,
                 "queue_size": queue_size,
+                "pending_decode_slots": len(self.pending_decode_slots),
+                "max_decode_wait": max_decode_wait,
+                "avg_decode_wait": avg_decode_wait,
                 "utilization": active_count / self.max_batch_size if self.max_batch_size > 0 else 0,
                 "scheduler_type": "simple_fifo",
             }
