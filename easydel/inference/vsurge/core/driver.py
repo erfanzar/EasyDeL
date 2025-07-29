@@ -352,7 +352,9 @@ class vDriver:
                                         request.accumulated_text[idx] = accum + res
                                 else:
                                     if request.accumulated_text is None:
-                                        request.accumulated_text = res_base.text
+                                        request.accumulated_text = (
+                                            res_base.text if isinstance(res_base.text, list) else [res_base.text]
+                                        )
                                     else:
                                         request.accumulated_text = request.accumulated_text + res_base.text
                             if request.sampling_params.stop is not None:
