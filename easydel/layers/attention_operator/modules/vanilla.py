@@ -132,6 +132,10 @@ class VanillaAttn(AttentionImpl):
 
             aw = jnp.einsum("bskhd,bmkd->bkhsm", q * sm_scale, k, optimize=True)
 
+        soft_cap = self.metadata.soft_cap
+        if soft_cap is not None:
+            aw = soft_cap * jnp.tanh(aw / soft_cap)
+
         if bias is not None:
             if bias.shape[1] == (kh * num_reps):
                 bias = bias.reshape(b, kh, num_reps, qs, ks)

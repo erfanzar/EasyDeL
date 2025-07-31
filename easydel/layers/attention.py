@@ -181,6 +181,7 @@ class FlexibleAttentionModule(nn.Module):
         base_config: EasyDeLBaseConfig,
         softmax_scale: float,
         dropout_prob: float = 0.0,
+        soft_cap: float | None = None,
         *,
         rngs: nn.Rngs | None = None,
     ):
@@ -193,6 +194,8 @@ class FlexibleAttentionModule(nn.Module):
             softmax_scale (float): The scaling factor to apply before the softmax function.
             dropout_prob (float, optional): The dropout probability for attention weights.
                                              Defaults to 0.0.
+            soft_cap (float | None, optional): Optional soft cap for attention weights.
+                                               Defaults to None.
         """
         if rngs is None:
             rngs = nn.Rngs(42)
@@ -210,6 +213,7 @@ class FlexibleAttentionModule(nn.Module):
             config=base_config,
             softmax_scale=softmax_scale,
             dropout_prob=dropout_prob,
+            soft_cap=soft_cap,
         )
         self.config = base_config
         self.metadata = metadata

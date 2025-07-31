@@ -171,7 +171,7 @@ class AttentionMetadata:
         config: EasyDeLBaseConfig,
         softmax_scale: float,
         dropout_prob: float = 0.0,
-        soft_cap: int | None = None,
+        soft_cap: float | None = None,
     ) -> AttentionMetadata:
         """
         Factory method to create AttentionMetadata from an EasyDeLBaseConfig.
