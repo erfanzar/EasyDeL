@@ -62,6 +62,7 @@ class AttentionOutput:
     """
 
     attention_weights: Array | None = None
+    attention_logits: Array | None = None
     attention_outputs: Array | None = None
 
 

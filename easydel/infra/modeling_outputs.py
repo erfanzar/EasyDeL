@@ -146,6 +146,7 @@ class ModelOutput(tp.OrderedDict):
 class AttentionLayerOutput(ModelOutput):
     attention_output: chex.Array
     attention_weight: chex.Array | None = None
+    attention_logits: chex.Array | None = None
     cache_view: TransformerCacheView | None = None
 
 
@@ -154,6 +155,7 @@ class EncoderLayerOutput(ModelOutput):
     hidden_states: chex.Array
     residual_states: chex.Array | None = None
     attention_weight: chex.Array | None = None
+    attention_logits: chex.Array | None = None
 
 
 @auto_pytree
@@ -162,6 +164,7 @@ class DecoderLayerOutput(ModelOutput):
     residual_states: chex.Array | None = None
     cross_attention: chex.Array | None = None
     attention_weight: chex.Array | None = None
+    attention_logits: chex.Array | None = None
     router_logits: chex.Array | None = None
     gate_loss: chex.Array | None = None
     cache_view: TransformerCacheView | None = None
@@ -191,6 +194,7 @@ class BaseModelOutput(ModelOutput):
     last_hidden_state: chex.Array = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     past_key_values: dict[str, chex.Array] | None = None
     loss: chex.Array | None = None
 
@@ -284,6 +288,7 @@ class BaseModelOutputWithPast(ModelOutput):
     past_key_values: dict[str, chex.Array] | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -316,6 +321,7 @@ class BaseModelOutputWithPooling(ModelOutput):
     pooler_output: chex.Array = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -365,7 +371,9 @@ class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
     hidden_states: tuple[chex.Array] | None = None
     past_key_values: TransformerCache | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     cross_attentions: tuple[chex.Array] | None = None
+    cross_attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -412,7 +420,9 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     cross_attentions: tuple[chex.Array] | None = None
+    cross_attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -471,10 +481,13 @@ class Seq2SeqModelOutput(ModelOutput):
     past_key_values: TransformerCache | None = None
     decoder_hidden_states: tuple[chex.Array] | None = None
     decoder_attentions: tuple[chex.Array] | None = None
+    decoder_attention_logits: tuple[chex.Array] | None = None
     cross_attentions: tuple[chex.Array] | None = None
+    cross_attention_logits: tuple[chex.Array] | None = None
     encoder_last_hidden_state: chex.Array | None = None
     encoder_hidden_states: tuple[chex.Array] | None = None
     encoder_attentions: tuple[chex.Array] | None = None
+    encoder_attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -516,7 +529,9 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     cross_attentions: tuple[chex.Array] | None = None
+    cross_attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -544,6 +559,7 @@ class MaskedLMOutput(ModelOutput):
     logits: chex.Array = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     past_key_values: TransformerCache | None = None
     loss: chex.Array | None = None
 
@@ -602,10 +618,13 @@ class Seq2SeqLMOutput(ModelOutput):
     past_key_values: TransformerCache | None = None
     decoder_hidden_states: tuple[chex.Array] | None = None
     decoder_attentions: tuple[chex.Array] | None = None
+    decoder_attention_logits: tuple[chex.Array] | None = None
     cross_attentions: tuple[chex.Array] | None = None
+    cross_attention_logits: tuple[chex.Array] | None = None
     encoder_last_hidden_state: chex.Array | None = None
     encoder_hidden_states: tuple[chex.Array] | None = None
     encoder_attentions: tuple[chex.Array] | None = None
+    encoder_attention_logits: tuple[chex.Array] | None = None
     loss: chex.Array | None = None
 
 
@@ -900,6 +919,7 @@ class MoeModelOutput(ModelOutput):
     hidden_states: tuple[chex.Array] | None = None
     past_key_values: TransformerCache | None = None
     attentions: tuple[chex.Array] | None = None
+    attention_logits: tuple[chex.Array] | None = None
     router_logits: tuple[chex.Array] | None = None
     all_router_losses: tuple[chex.Array] | None = None
     logits: chex.Array = None
