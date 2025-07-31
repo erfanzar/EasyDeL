@@ -38,7 +38,7 @@ except ImportError:
 
 
 class SMPMemoryMonitor:
-    def __init__(self, check_interval: int = 60, quiet: bool = False):
+    def __init__(self, check_interval: float = 60.0, quiet: bool = False):
         """
         Initialize the memory monitor.
 
