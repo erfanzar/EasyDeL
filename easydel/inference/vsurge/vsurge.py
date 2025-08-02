@@ -574,7 +574,7 @@ class vSurge:
         sampling_params: SamplingParams | tp.Sequence[SamplingParams] | None = None,
         stream: bool = False,
         bytecode_decode: bool | _Empty = NOT_GIVEN,
-    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
+    ) -> tp.Generator[ReturnSample] | list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
         """Generates text completions for given prompts.
 
         This is the main public method for text generation. It handles single or

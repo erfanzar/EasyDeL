@@ -13,15 +13,17 @@
 # limitations under the License.
 from __future__ import annotations
 
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from ...sampling_params import SamplingParams
-from ..request_type import EngineRequest
+if TYPE_CHECKING:
+    from ...sampling_params import SamplingParams
+    from ..request import EngineRequest
 
 
-@auto_pytree
-class ScheduledNewRequestData:
-    req_id: str | int
+@dataclass
+class NewRequestData:
+    req_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams | None
     page_ids: tuple[list[int], ...]
@@ -32,7 +34,7 @@ class ScheduledNewRequestData:
         cls,
         request: EngineRequest,
         page_ids: tuple[list[int], ...],
-    ) -> ScheduledNewRequestData:
+    ) -> NewRequestData:
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -43,9 +45,20 @@ class ScheduledNewRequestData:
 
     def __repr__(self):
         return (
-            f"ScheduledNewRequestData("
+            f"NewRequestData("
             f"req_id={self.req_id},"
             f"prompt_token_ids={self.prompt_token_ids},"
+            f"sampling_params={self.sampling_params},"
+            f"page_ids={self.page_ids},"
+            f"num_computed_tokens={self.num_computed_tokens}"
+            ")"
+        )
+
+    def anon_repr(self):
+        return (
+            f"NewRequestData("
+            f"req_id={self.req_id},"
+            f"prompt_token_ids_len={len(self.prompt_token_ids)},"
             f"sampling_params={self.sampling_params},"
             f"page_ids={self.page_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
@@ -53,8 +66,8 @@ class ScheduledNewRequestData:
         )
 
 
-@auto_pytree
-class ScheduledCacheRequestData:
+@dataclass
+class CachedRequestData:
     req_ids: list[str]
     resumed_from_preemption: list[bool]
     new_token_ids: list[list[int]]
@@ -66,7 +79,7 @@ class ScheduledCacheRequestData:
         return len(self.req_ids)
 
     @classmethod
-    def make_empty(cls) -> ScheduledCacheRequestData:
+    def make_empty(cls) -> CachedRequestData:
         return cls(
             req_ids=[],
             resumed_from_preemption=[],
@@ -76,11 +89,12 @@ class ScheduledCacheRequestData:
         )
 
 
-@auto_pytree
+@dataclass
 class SchedulerOutput:
-    scheduled_new_reqs: list[ScheduledNewRequestData]
-    scheduled_cached_reqs: ScheduledCacheRequestData
+    scheduled_new_reqs: list[NewRequestData]
+    scheduled_cached_reqs: CachedRequestData
     num_scheduled_tokens: dict[str, int]
     total_num_scheduled_tokens: int
+    scheduled_spec_decode_tokens: dict[str, list[int]]
     num_common_prefix_pages: list[int]
     finished_req_ids: set[str]
