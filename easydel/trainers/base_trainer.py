@@ -327,7 +327,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self.arguments.performance_mode:
             import easydel
 
-            interval = 1.0 if self.arguments.track_memory is True else self.arguments.track_memory
+            interval = (
+                self.arguments.track_memory
+                if isinstance(self.arguments.track_memory, (int, float))
+                else 1.0
+            )
             self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
