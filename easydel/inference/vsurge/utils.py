@@ -16,23 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import os
-import pickle
 import signal
 import threading
-import time
 import traceback
 import typing as tp
 import uuid
 from asyncio import futures
 from bisect import bisect_left
-from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
 
 import jax
-import msgspec
 import numpy as np
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
@@ -45,10 +39,7 @@ from ..sampling_params import JitableSamplingParams, SamplingParams
 if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
 
-    from .request_type import FinishReason
 
-
-_K = tp.TypeVar("_K", bound=Hashable)
 _V = tp.TypeVar("_V")
 
 
@@ -655,137 +646,6 @@ def calculate_pefill_lengths(max_prefill_length: int, num_pages: int = 128):
     )
 
 
-@dataclass
-class PrefixCacheStats:
-    """Stores prefix cache hit statistics."""
-
-    reset: bool = False
-    requests: int = 0
-    queries: int = 0
-    hits: int = 0
-
-
-@dataclass
-class SpecDecodingStats:
-    """Per-step iteration decoding stats from scheduler.
-
-    Each scheduler step, statistics on spec decoding performance are
-    aggregated across requests by the scheduler and returned to the
-    frontend in EngineCoreOutputs->SchedulerStats.
-    """
-
-    num_spec_tokens: int
-    num_drafts: int = 0
-    num_draft_tokens: int = 0
-    num_accepted_tokens: int = 0
-    num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
-
-    @classmethod
-    def new(cls, num_spec_tokens: int) -> SpecDecodingStats:
-        return cls(num_spec_tokens=num_spec_tokens, num_accepted_tokens_per_pos=[0] * num_spec_tokens)
-
-    def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
-        self.num_drafts += 1
-        self.num_draft_tokens += num_draft_tokens
-        self.num_accepted_tokens += num_accepted_tokens
-        assert num_accepted_tokens <= self.num_spec_tokens
-        for i in range(num_accepted_tokens):
-            self.num_accepted_tokens_per_pos[i] += 1
-
-
-@dataclass
-class SchedulerStats:
-    """Stats associated with the scheduler."""
-
-    num_running_reqs: int = 0
-    num_waiting_reqs: int = 0
-    kv_cache_usage: float = 0.0
-    prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
-    spec_decoding_stats: SpecDecodingStats | None = None
-
-
-def is_list_of(
-    value: object,
-    typ: type[_V] | tuple[type[_V], ...],
-    *,
-    check: tp.Literal["first", "all"] = "first",
-) -> list[_V]:
-    if not isinstance(value, list):
-        return False
-
-    if check == "first":
-        return len(value) == 0 or isinstance(value[0], typ)
-    elif check == "all":
-        return all(isinstance(v, typ) for v in value)
-
-    tp.assert_never(check)
-
-
-class ConstantList(tp.Generic[_V], Sequence):
-    def __init__(self, x: list[_V]) -> None:
-        self._x = x
-
-    def append(self, item):
-        raise Exception("Cannot append to a constant list")
-
-    def extend(self, item):
-        raise Exception("Cannot extend a constant list")
-
-    def insert(self, item):
-        raise Exception("Cannot insert into a constant list")
-
-    def pop(self, item):
-        raise Exception("Cannot pop from a constant list")
-
-    def remove(self, item):
-        raise Exception("Cannot remove from a constant list")
-
-    def clear(self):
-        raise Exception("Cannot clear a constant list")
-
-    def index(self, item: _V, start: int = 0, stop: int | None = None) -> int:
-        return self._x.index(item, start, stop if stop is not None else len(self._x))
-
-    @tp.overload
-    def __getitem__(self, item: int) -> _V: ...
-
-    @tp.overload
-    def __getitem__(self, s: slice, /) -> list[_V]: ...
-
-    def __getitem__(self, item: int | slice) -> _V | list[_V]:
-        return self._x[item]
-
-    @tp.overload
-    def __setitem__(self, item: int, value: _V): ...
-
-    @tp.overload
-    def __setitem__(self, s: slice, value: _V, /): ...
-
-    def __setitem__(self, item: int | slice, value: _V | list[_V]):
-        raise Exception("Cannot set item in a constant list")
-
-    def __delitem__(self, item):
-        raise Exception("Cannot delete item from a constant list")
-
-    def __iter__(self):
-        return iter(self._x)
-
-    def __contains__(self, item):
-        return item in self._x
-
-    def __len__(self):
-        return len(self._x)
-
-    def __repr__(self):
-        return f"ConstantList({self._x})"
-
-
-class UtilityOutput(msgspec.Struct, array_like=True, gc=False):
-    call_id: int
-    failure_message: str | None = None
-    result: tp.Any = None
-
-
 class MetricsRecorder:
     """
     Records and provides access to various operational metrics.
@@ -1076,139 +936,3 @@ class SmartBytecodeDecoder:
 
         logger.warning("Complete decode failure, using fallback")
         return self.fallback_char, [], True
-
-
-class LogprobsLists(tp.NamedTuple):
-    logprob_token_ids: list[list[int]]  # [num_reqs, max_num_logprobs + 1]
-    logprobs: list[list[float]]  # [num_reqs, max_num_logprobs + 1]
-    sampled_token_ranks: list[int]  # [num_reqs]
-
-    def slice(self, start: int, end: int):
-        return LogprobsLists(
-            self.logprob_token_ids[start:end],
-            self.logprobs[start:end],
-            self.sampled_token_ranks[start:end],
-        )
-
-
-class LogprobsTensors(tp.NamedTuple):
-    logprob_token_ids: jax.Array  # [num_reqs, max_num_logprobs + 1]
-    logprobs: jax.Array  # [num_reqs, max_num_logprobs + 1]
-    selected_token_ranks: jax.Array  # [num_reqs]
-
-    def tolists(self):
-        return LogprobsLists(
-            self.logprob_token_ids.tolist(),
-            self.logprobs.tolist(),
-            self.selected_token_ranks.tolist(),
-        )
-
-    @staticmethod
-    def empty_cpu(num_positions: int, num_tokens_per_position: int) -> LogprobsTensors:
-        """Create empty LogprobsTensors on CPU."""
-
-        logprob_token_ids = jnp.empty((num_positions, num_tokens_per_position), dtype=jnp.int32)
-        return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids,
-            logprobs=jnp.empty_like(logprob_token_ids, dtype=jnp.float32),
-            selected_token_ranks=jnp.empty(num_positions, dtype=jnp.int32),
-        )
-
-
-@auto_pytree
-class ModelRunnerOutput:
-    req_ids: list[str]
-    req_id_to_index: dict[str, int]
-    sampled_token_ids: list[list[int]]
-    spec_token_ids: list[list[int]] | None
-    logprobs: LogprobsLists | None
-    prompt_logprobs_dict: dict[str, LogprobsTensors | None]
-    pooler_output: list[jax.Array | None]
-    finished_sending: set[str] | None = None
-    finished_recving: set[str] | None = None
-    num_nans_in_logits: dict[str, int] | None = None
-
-
-def swap_dict_values(obj: dict[_K, _V], key1: _K, key2: _K) -> None:
-    """
-    Helper function to swap values for two keys
-    """
-    v1 = obj.get(key1)
-    v2 = obj.get(key2)
-    if v1 is not None:
-        obj[key2] = v1
-    else:
-        obj.pop(key2, None)
-    if v2 is not None:
-        obj[key1] = v2
-    else:
-        obj.pop(key1, None)
-
-
-class EngineCoreOutput(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
-    request_id: str
-    new_token_ids: list[int]
-    new_logprobs: LogprobsLists | None = None
-    new_prompt_logprobs_tensors: LogprobsTensors | None = None
-    finish_reason: FinishReason | None = None
-    stop_reason: int | str | None = None
-    kv_transfer_params: dict[str, tp.Any] | None = None
-    num_cached_tokens: int = 0
-
-    @property
-    def finished(self) -> bool:
-        return self.finish_reason is not None
-
-
-class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
-    engine_index: int = 0
-
-    outputs: list[EngineCoreOutput] = []
-    scheduler_stats: SchedulerStats | None = None
-    timestamp: float = 0.0
-    utility_output: UtilityOutput | None = None
-    finished_requests: set[str] | None = None
-    wave_complete: int | None = None
-    start_wave: int | None = None
-
-    def __post_init__(self):
-        if self.timestamp == 0.0:
-            self.timestamp = time.monotonic()
-
-
-def sha256(input) -> int:  # noqa
-    """Hash any picklable Python object using SHA-256.
-
-    The input is serialized using pickle before hashing, which allows
-    arbitrary Python objects to be used. Note that this function does
-    not use a hash seed—if you need one, prepend it explicitly to the input.
-
-    Args:
-        input: Any picklable Python object.
-
-    Returns:
-        An integer representing the SHA-256 hash of the serialized input.
-    """
-    input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
-    return int.from_bytes(hashlib.sha256(input_bytes).digest(), byteorder="big")
-
-
-class PageHash(NamedTuple):
-    """Hash value of a page (int), the token IDs in the page, and extra keys.
-    We keep a tuple of token IDs and extra keys to reduce the likelihood of
-    hash collisions when the hash value is the same. By using SHA256 however,
-    hash collisions are practically impossible.
-    """
-
-    hash_value: int
-    token_ids: tuple[int, ...]
-    extra_keys: Any | None = None
-
-
-class PageHashWithGroupId(NamedTuple):
-    page_hash: PageHash
-
-    group_id: int
-
-    def get_hash_value(self) -> int:
-        return self.page_hash.hash_value

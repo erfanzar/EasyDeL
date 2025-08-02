@@ -11,47 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 from dataclasses import field
 from typing import Any, cast
 
-import jax
 import numpy as np
 from eformer.pytree import auto_pytree
 
 from easydel.utils.helpers import get_logger
 
-from ..sampling_params import SamplingParams, SamplingType
-from .page_table import MultiGroupPageTable
-from .utils import LogprobsTensors, swap_dict_values
+from ...sampling_params import SamplingType
+from ..outputs import LogprobsTensors, swap_dict_values
+from ..page_table import MultiGroupPageTable
 
 logger = get_logger(__name__)
-
-
-@auto_pytree
-class CachedRequestState:
-    """Represents the state of a single request, compatible with JAX."""
-
-    req_id: str
-    prompt_token_ids: list[int]
-    sampling_params: SamplingParams
-    generator: jax.random.PRNGKey
-    page_ids: tuple[list[int], ...]
-    num_computed_tokens: int
-    output_token_ids: list[int]
-    num_prompt_tokens: int = -1
-
-    def __post_init__(self):
-        self.num_prompt_tokens = len(self.prompt_token_ids)
-
-    @property
-    def num_tokens(self) -> int:
-        return self.num_prompt_tokens + len(self.output_token_ids)
-
-    def get_token_id(self, idx: int) -> int:
-        if idx < self.num_prompt_tokens:
-            return self.prompt_token_ids[idx]
-        else:
-            return self.output_token_ids[idx - self.num_prompt_tokens]
 
 
 class SequenceBuffer:
@@ -68,19 +42,16 @@ class SequenceBuffer:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.vocab_size = vocab_size
 
-        # Request management
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
         self.req_output_token_ids: list[list[int] | None] = []
 
-        # Token data - use more efficient dtypes where possible
         self.token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_computed_tokens = np.zeros(max_num_reqs, dtype=np.int32)
 
-        # Page table
         self.page_table = MultiGroupPageTable(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
@@ -88,13 +59,8 @@ class SequenceBuffer:
             page_sizes=page_sizes,
         )
 
-        # Sampling parameters - initialize arrays once
         self._init_sampling_arrays()
-
-        # Request sets for efficient filtering
         self._init_request_sets()
-
-        # Sparse storage for less common parameters
         self._init_sparse_storage()
 
     def _init_sampling_arrays(self):
@@ -141,7 +107,6 @@ class SequenceBuffer:
 
         req_id = request.req_id
 
-        # Update request tracking
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
@@ -151,23 +116,18 @@ class SequenceBuffer:
 
         self.req_id_to_index[req_id] = req_index
 
-        # Copy tokens efficiently
         self._copy_tokens(request, req_index)
 
-        # Update token counts
         self.num_tokens[req_index] = request.num_tokens
         self.num_tokens_no_spec[req_index] = request.num_tokens
         self.num_computed_tokens[req_index] = request.num_computed_tokens
 
-        # Add page table row
         self.page_table.add_row(request.page_ids, req_index)
 
-        # Process sampling parameters
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
         self._process_sampling_params(sampling_params, req_id, req_index)
 
-        # Handle optional parameters
         self._process_optional_params(request, sampling_params, req_id, req_index)
 
     def _copy_tokens(self, request: Any, req_index: int) -> None:
@@ -175,7 +135,6 @@ class SequenceBuffer:
         num_prompt_tokens = len(request.prompt_token_ids)
         self.num_prompt_tokens[req_index] = num_prompt_tokens
 
-        # Use numpy's efficient copying
         self.token_ids[req_index, :num_prompt_tokens] = request.prompt_token_ids
 
         if request.output_token_ids:
@@ -185,7 +144,7 @@ class SequenceBuffer:
 
     def _process_sampling_params(self, sampling_params: Any, req_id: str, req_index: int) -> None:
         """Process core sampling parameters."""
-        # Temperature and sampling type
+
         if sampling_params.sampling_type == SamplingType.GREEDY:
             self.temperature[req_index] = -1.0
             self.greedy_reqs.add(req_id)
@@ -193,12 +152,10 @@ class SequenceBuffer:
             self.temperature[req_index] = sampling_params.temperature
             self.random_reqs.add(req_id)
 
-        # Top-p sampling
         self.top_p[req_index] = sampling_params.top_p
         if sampling_params.top_p < 1:
             self.top_p_reqs.add(req_id)
 
-        # Top-k sampling
         top_k = sampling_params.top_k
         if 0 < top_k < self.vocab_size:
             self.top_k_reqs.add(req_id)
@@ -206,12 +163,10 @@ class SequenceBuffer:
         else:
             self.top_k[req_index] = self.vocab_size
 
-        # Min-p sampling
         self.min_p[req_index] = sampling_params.min_p
         if sampling_params.min_p > 1e-5:
             self.min_p_reqs.add(req_id)
 
-        # Penalties
         if sampling_params.frequency_penalty != 0.0:
             self.frequency_penalties[req_index] = sampling_params.frequency_penalty
             self.frequency_penalties_reqs.add(req_id)
@@ -253,7 +208,6 @@ class SequenceBuffer:
         if self.allowed_token_ids_mask is None:
             self.allowed_token_ids_mask = np.zeros((self.max_num_reqs, self.vocab_size), dtype=bool)
 
-        # Use numpy operations for efficiency
         self.allowed_token_ids_mask[req_index] = True
         self.allowed_token_ids_mask[req_index, allowed_token_ids] = False
 
@@ -263,11 +217,9 @@ class SequenceBuffer:
         if req_index is None:
             return None
 
-        # Clear request data
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
 
-        # Remove from all tracking sets
         for req_set in [
             self.greedy_reqs,
             self.random_reqs,
@@ -281,7 +233,6 @@ class SequenceBuffer:
         ]:
             req_set.discard(req_id)
 
-        # Clear sparse storage
         self.min_tokens.pop(req_index, None)
         self.generator_seeds.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
@@ -297,7 +248,7 @@ class SequenceBuffer:
 
     def swap_states(self, i1: int, i2: int) -> None:
         """Swap states between two indices."""
-        # Swap request IDs
+
         old_id_i1, old_id_i2 = self._req_ids[i1], self._req_ids[i2]
         self._req_ids[i1], self._req_ids[i2] = old_id_i2, old_id_i1
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] = (
@@ -309,21 +260,18 @@ class SequenceBuffer:
         self.req_id_to_index[old_id_i1] = i2
         self.req_id_to_index[old_id_i2] = i1
 
-        # Swap numpy arrays efficiently
         self._swap_array_values(i1, i2)
 
-        # Swap dictionary values
         swap_dict_values(self.generator_seeds, i1, i2)
         swap_dict_values(self.min_tokens, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
 
-        # Swap other data
         self.logit_bias[i1], self.logit_bias[i2] = self.logit_bias[i2], self.logit_bias[i1]
         self.page_table.swap_row(i1, i2)
 
     def _swap_array_values(self, i1: int, i2: int) -> None:
         """Efficiently swap array values between two indices."""
-        # List of scalar arrays to swap
+
         scalar_arrays = [
             self.num_tokens,
             self.num_tokens_no_spec,
@@ -341,10 +289,8 @@ class SequenceBuffer:
         for array in scalar_arrays:
             array[[i1, i2]] = array[[i2, i1]]
 
-        # Swap token_ids rows
         self.token_ids[[i1, i2]] = self.token_ids[[i2, i1]]
 
-        # Swap allowed token masks if they exist
         if self.allowed_token_ids_mask is not None:
             self.allowed_token_ids_mask[[i1, i2]] = self.allowed_token_ids_mask[[i2, i1]]
 
@@ -356,22 +302,18 @@ class SequenceBuffer:
             self.req_output_token_ids.clear()
             return
 
-        # Process empty indices in descending order
         last_req_index = num_reqs + len(empty_req_indices) - 1
 
         for empty_index in reversed(empty_req_indices):
-            # Find the last non-empty index
             while last_req_index in empty_req_indices and last_req_index > empty_index:
                 last_req_index -= 1
 
             if empty_index >= last_req_index:
                 continue
 
-            # Move the request
             self._move_request(last_req_index, empty_index)
             last_req_index -= 1
 
-        # Trim lists to the batch size
         del self._req_ids[self.num_reqs :]
         del self.req_output_token_ids[self.num_reqs :]
 
@@ -380,18 +322,15 @@ class SequenceBuffer:
         req_id = self._req_ids[from_idx]
         assert req_id is not None
 
-        # Move request tracking
         self._req_ids[to_idx] = req_id
         self._req_ids[from_idx] = None
         self.req_output_token_ids[to_idx] = self.req_output_token_ids[from_idx]
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
 
-        # Move token data efficiently
         num_tokens = self.num_tokens[from_idx].item()
         self.token_ids[to_idx, :num_tokens] = self.token_ids[from_idx, :num_tokens]
 
-        # Move scalar arrays
         scalar_arrays = [
             self.num_tokens,
             self.num_tokens_no_spec,
@@ -409,15 +348,13 @@ class SequenceBuffer:
         for array in scalar_arrays:
             array[to_idx] = array[from_idx]
 
-        # Move page table
         self.page_table.move_row(from_idx, to_idx)
 
-        # Move sparse data
         self._move_sparse_data(from_idx, to_idx)
 
     def _move_sparse_data(self, from_idx: int, to_idx: int) -> None:
         """Move sparse/optional data from one index to another."""
-        # Move dictionary entries
+
         if from_idx in self.generator_seeds:
             self.generator_seeds[to_idx] = self.generator_seeds.pop(from_idx)
 
@@ -427,11 +364,9 @@ class SequenceBuffer:
         if from_idx in self.bad_words_token_ids:
             self.bad_words_token_ids[to_idx] = self.bad_words_token_ids.pop(from_idx)
 
-        # Move logit bias
         self.logit_bias[to_idx] = self.logit_bias[from_idx]
         self.logit_bias[from_idx] = None
 
-        # Move allowed token mask
         if self.allowed_token_ids_mask is not None:
             self.allowed_token_ids_mask[to_idx] = self.allowed_token_ids_mask[from_idx]
             self.allowed_token_ids_mask[from_idx] = False
@@ -444,14 +379,12 @@ class SequenceBuffer:
         max_prompt_len = np.max(self.num_prompt_tokens[: self.num_reqs]).item()
         prompt_token_ids = np.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=np.int64)
 
-        # Vectorized copy of prompt tokens
         for i in range(self.num_reqs):
             num_prompt = self.num_prompt_tokens[i].item()
             prompt_token_ids[i, :num_prompt] = self.token_ids[i, :num_prompt]
 
         return prompt_token_ids
 
-    # Properties remain the same but with minor optimizations
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
@@ -517,7 +450,6 @@ class SequenceBuffer:
             "top_k": self.top_k[req_index],
         }
 
-        # Only include non-default values
         if req_id in self.min_p_reqs:
             params["min_p"] = self.min_p[req_index]
         if req_id in self.frequency_penalties_reqs:
@@ -535,14 +467,12 @@ class SequenceBuffer:
         self.req_id_to_index.clear()
         self.req_output_token_ids.clear()
 
-        # Reset numpy arrays
         self.token_ids.fill(0)
         self.num_tokens.fill(0)
         self.num_tokens_no_spec.fill(0)
         self.num_prompt_tokens.fill(0)
         self.num_computed_tokens.fill(0)
 
-        # Reset sampling parameters to defaults
         self.temperature.fill(-1.0)
         self.top_p.fill(1.0)
         self.top_k.fill(self.vocab_size)
@@ -551,7 +481,6 @@ class SequenceBuffer:
         self.presence_penalties.fill(0.0)
         self.repetition_penalties.fill(1.0)
 
-        # Clear sets
         for req_set in [
             self.greedy_reqs,
             self.random_reqs,
@@ -565,7 +494,6 @@ class SequenceBuffer:
         ]:
             req_set.clear()
 
-        # Clear sparse storage
         self.min_tokens.clear()
         self.generator_seeds.clear()
         self.num_logprobs.clear()

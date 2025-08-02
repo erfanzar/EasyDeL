@@ -26,14 +26,15 @@ from jax import numpy as jnp
 from easydel.layers.caching import PagesCache, PagesMetadata
 from easydel.utils import capture_time, ejit, get_logger
 
+from ...vsurge.core.functions import vmaped_sample_top_p_efficient
+from ..outputs import LogprobsTensors, ModelRunnerOutput
 from ..scheduler import SchedulerOutput
-from ..sequence_buffer import CachedRequestState, ModelRunnerSamplingMetadata, SequenceBuffer
-from ..utils import LogprobsTensors, ModelRunnerOutput
-from .functions import vmaped_sample_top_p_efficient
+from .sequence_buffer import ModelRunnerSamplingMetadata, SequenceBuffer
+from .states import CachedRequestState
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
-logger = get_logger("vSurge-ModelRunner")
+logger = get_logger("eSurge")
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
@@ -63,7 +64,7 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     return min(res, upper_limit)
 
 
-class vSurgeExecutionManager:
+class eSurgeRunner:
     """Handles model execution with efficient batching and KV cache management."""
 
     def __init__(
@@ -156,7 +157,7 @@ class vSurgeExecutionManager:
         )
         self.max_num_tokens = self.num_tokens_paddings[-1]
 
-        # Request tracking
+        # EngineRequest tracking
         self.requests = {}
         self.sequence_buffer = SequenceBuffer(
             self.max_num_reqs,
@@ -552,7 +553,6 @@ class vSurgeExecutionManager:
                 spec_token_ids=None,
                 logprobs=None,
                 prompt_logprobs_dict={},
-                pooler_output=[],
                 finished_sending=None,
                 finished_recving=None,
                 num_nans_in_logits=None,
@@ -647,7 +647,6 @@ class vSurgeExecutionManager:
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
             finished_sending=None,
             finished_recving=None,
         )

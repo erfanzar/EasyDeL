@@ -15,41 +15,46 @@
 from __future__ import annotations
 
 import itertools
+import typing
 from collections import defaultdict
 from collections.abc import Iterable
-from typing import Any
 
-from easydel.layers.caching.page.cache import PagesCacheMetaData
-from easydel.utils.helpers import get_logger
+from ..config import Config
+from ..core.interface import CacheGroupsConfig
+from ..core.manager import CacheManager
+from ..engine_types import EngineCoreOutput, EngineCoreOutputs
+from ..outputs import ModelRunnerOutput
+from ..request import EngineRequest, EngineRequestStatus
+from .interface import SchedulerInterface
+from .output import CachedRequestData, NewRequestData, SchedulerOutput
+from .request_queue import SchedulingPolicy, create_request_queue
+from .utils import check_stop
 
-from ..cache_manager import KVCacheManager
-from ..request_type import EngineRequest, EngineRequestStatus
-from ..utils import EngineCoreOutput, EngineCoreOutputs, ModelRunnerOutput
-from ._utils import check_stop
-from .output import ScheduledCacheRequestData, ScheduledNewRequestData, SchedulerOutput
-from .queue_types import SchedulingPolicy, create_request_queue
-from .scheduler_config import SchedulerConfig
-from .scheduler_interface import SchedulerInterface
-
-logger = get_logger(__name__)
+if typing.TYPE_CHECKING:
+    from ..runners.model_runner import eSurgeRunner
 
 
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
-        metadata: PagesCacheMetaData,
-        scheduler_config: SchedulerConfig,
-        enable_caching: bool = True,
-        num_kv_cache_groups: int = 1,
+        config: Config,
+        kv_cache_config: CacheGroupsConfig,
         include_finished_set: bool = False,
     ) -> None:
-        self.scheduler_config = scheduler_config
+        self.config = config
+        self.scheduler_config = config.scheduler_config
+        self.cache_config = config.cache_config
+        self.kv_cache_config = kv_cache_config
 
         self.finished_req_ids_dict: dict[int, set[str]] | None = defaultdict(set) if include_finished_set else None
 
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        num_pages = self.cache_config.num_pages
+        assert num_pages is not None and num_pages > 0
+
+        self.page_size = self.cache_config.page_size
 
         self.requests: dict[str, EngineRequest] = {}
 
@@ -62,14 +67,64 @@ class Scheduler(SchedulerInterface):
 
         self.waiting = create_request_queue(self.policy)
         self.running: list[EngineRequest] = []
+
         self.finished_req_ids: set[str] = set()
+
         self.finished_recving_kv_req_ids: set[str] = set()
-        self.num_kv_cache_groups = num_kv_cache_groups
-        self.kv_cache_manager = KVCacheManager(
-            metadata=metadata,
-            enable_caching=enable_caching,
-            use_eagle=False,
-            num_kv_cache_groups=num_kv_cache_groups,
+
+        self.use_eagle = False
+        self.num_spec_tokens = self.num_lookahead_tokens = 0
+
+        self.kv_cache_manager = CacheManager(
+            num_pages=num_pages,
+            kv_cache_groups=kv_cache_config.kv_cache_groups,
+            max_model_len=self.max_model_len,
+            enable_caching=self.cache_config.enable_prefix_caching,
+            use_eagle=self.use_eagle,
+        )
+
+    @classmethod
+    def from_runner(
+        cls,
+        runner: eSurgeRunner,
+        max_num_batched_tokens: int | None = None,
+        enable_prefix_caching: bool = True,
+    ) -> Scheduler:
+        """Create a Scheduler instance from an eSurgeRunner."""
+        from ..config import CacheConfig, SchedulerConfig
+        from ..core.interface import CacheGroupSpec, FullAttentionSpec
+
+        metadata = runner.metadata
+
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = runner.max_model_len
+        return Scheduler(
+            config=Config(
+                scheduler_config=SchedulerConfig(
+                    max_num_seqs=runner.max_num_seqs,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    max_model_len=runner.max_model_len,
+                ),
+                cache_config=CacheConfig(
+                    num_pages=metadata.num_pages,
+                    page_size=metadata.page_size,
+                    enable_prefix_caching=enable_prefix_caching,
+                ),
+            ),
+            kv_cache_config=CacheGroupsConfig(
+                num_pages=metadata.num_pages,
+                kv_cache_groups=[
+                    CacheGroupSpec(
+                        FullAttentionSpec(
+                            page_size=metadata.page_size,
+                            num_kv_heads=metadata.num_kv_heads,
+                            head_size=metadata.k_headdim,
+                            dtype=runner.kv_pages.views[-1].kv_pages.dtype,
+                            use_mla=False,
+                        )
+                    )
+                ],
+            ),
         )
 
     def schedule(self) -> SchedulerOutput:
@@ -77,20 +132,22 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[EngineRequest] = []
         scheduled_running_reqs: list[EngineRequest] = []
         preempted_reqs: list[EngineRequest] = []
+
         req_to_new_page_ids: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+
+        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             num_new_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
-
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-
             num_new_tokens = min(num_new_tokens, token_budget)
+
             num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
 
             if num_new_tokens == 0:
@@ -98,10 +155,15 @@ class Scheduler(SchedulerInterface):
                 continue
 
             while True:
-                new_pages = self.kv_cache_manager.allocate_slots(request, num_new_tokens)
+                new_pages = self.kv_cache_manager.allocate_slots(
+                    request, num_new_tokens, num_lookahead_tokens=self.num_lookahead_tokens
+                )
                 if new_pages is None:
                     if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(self.running, key=lambda r: (r.priority, r.arrival_time))
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: (r.priority, r.arrival_time),
+                        )
                         self.running.remove(preempted_req)
                     else:
                         preempted_req = self.running.pop()
@@ -109,6 +171,7 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = EngineRequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
+
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -127,6 +190,12 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
 
+            if request.spec_token_ids:
+                num_scheduled_spec_tokens = num_new_tokens + request.num_computed_tokens - request.num_tokens
+                if num_scheduled_spec_tokens > 0:
+                    del request.spec_token_ids[num_scheduled_spec_tokens:]
+                    scheduled_spec_decode_tokens[request.request_id] = request.spec_token_ids
+
         skipped_waiting_requests = create_request_queue(self.policy)
 
         if not preempted_reqs:
@@ -137,19 +206,16 @@ class Scheduler(SchedulerInterface):
                 request = self.waiting.peek_request()
 
                 if request.status == EngineRequestStatus.WAITING_FOR_REMOTE_KVS:
-                    is_ready = self._update_waiting_for_remote_kv(request)
-                    if is_ready:
+                    request.status = EngineRequestStatus.WAITING
+
+                if request.status == EngineRequestStatus.WAITING_FOR_FSM:
+                    structured_output_req = request.structured_output_request
+                    if structured_output_req and structured_output_req.grammar:
                         request.status = EngineRequestStatus.WAITING
                     else:
-                        logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request.request_id)
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
-
-                if request.status == EngineRequestStatus.WAITING_FOR_FSM:
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
-                    continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -186,7 +252,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens + num_external_computed_tokens,
                     num_new_local_computed_tokens,
                     new_computed_pages,
-                    num_lookahead_tokens=0,
+                    num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_pages=load_kv_async,
                 )
                 if new_pages is None:
@@ -226,18 +292,18 @@ class Scheduler(SchedulerInterface):
 
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
 
-        num_common_prefix_pages = [0] * self.num_kv_cache_groups
+        num_common_prefix_pages = [0] * len(self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
             num_common_prefix_pages = self.kv_cache_manager.get_num_common_prefix_pages(any_request, len(self.running))
-
         new_reqs_data = [
-            ScheduledNewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
+            NewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
             num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
             req_to_new_page_ids,
         )
         scheduler_output = SchedulerOutput(
@@ -245,6 +311,7 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_common_prefix_pages=num_common_prefix_pages,
             finished_req_ids=self.finished_req_ids,
         )
@@ -257,6 +324,7 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+
         self.finished_req_ids = set()
 
     def _make_cached_request_data(
@@ -264,8 +332,9 @@ class Scheduler(SchedulerInterface):
         running_reqs: list[EngineRequest],
         resumed_reqs: list[EngineRequest],
         num_scheduled_tokens: dict[str, int],
+        spec_decode_tokens: dict[str, list[int]],
         req_to_new_page_ids: dict[str, tuple[list[int], ...]],
-    ) -> ScheduledCacheRequestData:
+    ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
         new_page_ids: list[tuple[list[int], ...]] = []
@@ -274,13 +343,16 @@ class Scheduler(SchedulerInterface):
         for req in itertools.chain(running_reqs, resumed_reqs):
             req_id = req.request_id
             req_ids.append(req_id)
+            num_tokens = num_scheduled_tokens[req_id] - len(spec_decode_tokens.get(req_id, ()))
+            token_ids = req.all_token_ids[req.num_computed_tokens : req.num_computed_tokens + num_tokens]
+            new_token_ids.append(token_ids)
+
             new_page_ids.append(req_to_new_page_ids[req_id])
             num_computed_tokens.append(req.num_computed_tokens)
-
         resumed_from_preemption = [False] * len(running_reqs)
         resumed_from_preemption += [True] * len(resumed_reqs)
 
-        return ScheduledCacheRequestData(
+        return CachedRequestData(
             req_ids=req_ids,
             resumed_from_preemption=resumed_from_preemption,
             new_token_ids=new_token_ids,
@@ -294,7 +366,6 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
-        logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -311,52 +382,41 @@ class Scheduler(SchedulerInterface):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
-
             stopped = False
-            new_logprobs = None
             new_token_ids = generated_token_ids
-            kv_transfer_params = None
             status_before_stop = request.status
 
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
-
             if stopped:
-                kv_transfer_params = self._free_request(request)
+                self._free_request(request)
                 if status_before_stop == EngineRequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
 
-            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
-                new_logprobs = logprobs.slice(req_index, req_index + 1)
-
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or kv_transfer_params:
+            if new_token_ids:
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
-                        new_logprobs=new_logprobs,
-                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         finish_reason=request.get_finished_reason(),
+                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         stop_reason=request.stop_reason,
-                        kv_transfer_params=kv_transfer_params,
+                        events=request.take_events(),
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
-            else:
-                assert not prompt_logprobs_tensors
+            assert not prompt_logprobs_tensors
 
         if stopped_running_reqs:
             self.running = [req for req in self.running if req not in stopped_running_reqs]
         if stopped_preempted_reqs:
             self.waiting.remove_requests(stopped_preempted_reqs)
-
-        self._update_from_kv_xfer_finished(model_runner_output)
 
         engine_core_outputs = {client_index: EngineCoreOutputs(outputs=outs) for client_index, outs in outputs.items()}
 
@@ -434,14 +494,15 @@ class Scheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request)
 
-    def _free_request(self, request: EngineRequest) -> dict[str, Any] | None:
+    def _free_request(self, request: EngineRequest):
         assert request.is_finished()
+
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+
         self._free_pages(request)
-        return None
 
     def _free_pages(self, request: EngineRequest):
         assert request.is_finished()
@@ -459,20 +520,3 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.reset_prefix_cache()
 
     def shutdown(self) -> None: ...
-
-    def _update_from_kv_xfer_finished(self, model_runner_output: ModelRunnerOutput):
-        """
-        KV Connector: update the scheduler state based on the output.
-
-        The Worker side connectors add finished_recving and
-        finished_sending reqs to the output.
-        * if finished_sending: free the pages
-
-            scheduler the request during the next step.
-        """
-        for req_id in model_runner_output.finished_recving or ():
-            logger.debug("Finished recving KV transfer for request %s", req_id)
-            self.finished_recving_kv_req_ids.add(req_id)
-        for req_id in model_runner_output.finished_sending or ():
-            logger.debug("Finished sending KV transfer for request %s", req_id)
-            self._free_pages(self.requests[req_id])

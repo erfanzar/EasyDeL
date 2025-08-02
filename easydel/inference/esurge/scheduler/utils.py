@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import annotations
 
-from ..request_type import EngineRequest, EngineRequestStatus
+from ..request import EngineRequest, EngineRequestStatus
 
 
 def check_stop(request: EngineRequest, max_model_len: int) -> bool:
