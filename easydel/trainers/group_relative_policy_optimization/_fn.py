@@ -87,7 +87,7 @@ def grpo_step(
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
     )
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(arr=batch, sharding={key: partition_spec for key in batch.keys()})
 
     def loss_fn(tree, minibatch):
         module = flax.nnx.merge(state.graphdef, tree, state.graphother)
