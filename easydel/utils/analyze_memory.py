@@ -151,14 +151,13 @@ class SMPMemoryMonitor:
         """
         results = self.check_all_devices()
 
-        headers = ("Device", "Status", "Memory Used", "Utilization", "Peak Usage", "Active Allocations")
+        headers = ("Device", "Status", "Memory Used", "Peak Usage", "Active Allocations")
         rows = [
             (
                 r["device_id"],
                 r["status"],
-                f"{r['memory_used_gb']} GB / {r['memory_limit_gb']} GB",
-                f"{r['utilization_pct']}%",
-                f"{r['peak_usage_gb']} GB ({r['peak_utilization_pct']}%)",
+                f"{r['memory_used_gb']} GB ({r['utilization_pct']}%)",
+                f"{r['peak_usage_gb']} GB / {r['memory_limit_gb']} GB ({r['peak_utilization_pct']}%)",
                 r["num_allocations"],
             )
             for r in results
@@ -166,16 +165,17 @@ class SMPMemoryMonitor:
 
         column_widths = [max(len(header), max(len(str(row[i])) for row in rows)) for i, header in enumerate(headers)]
         header_row = " | ".join(f"{header:<{width}}" for header, width in zip(headers, column_widths))
-        # print("+" + "-" * (len(header_row) + 2) + "+")
-        # print(f"| {'Current Memory Status':^{len(header_row)}} |")
-        # print("+" + "-" * (len(header_row) + 2) + "+")
-        print(f"+={' Current Memory Status ':=^{len(header_row)}}=+")
-        print(f"| {header_row} |")
-        print("+" + "=" * (len(header_row) + 2) + "+")
+
+        lines = []
+        lines.append(f"+={' Current Memory Status ':=^{len(header_row)}}=+")
+        lines.append(f"| {header_row} |")
+        lines.append("+" + "=" * (len(header_row) + 2) + "+")
         for row in rows:
             row_str = " | ".join(f"{str(item):>{width}}" for item, width in zip(row, column_widths))
-            print(f"| {row_str} |")
-        print("+" + "-" * (len(header_row) + 2) + "+")
+            lines.append(f"| {row_str} |")
+        lines.append("+" + "-" * (len(header_row) + 2) + "+")
+        lines.append("")
+        print("\n".join(lines), end="", flush=True)
 
     def get_device_history(self, device_id: str | None = None) -> list[dict]:
         """
