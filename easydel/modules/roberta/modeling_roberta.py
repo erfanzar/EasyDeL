@@ -21,6 +21,7 @@ from flax import nnx as nn
 from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -893,6 +894,32 @@ class RobertaModel(EasyDeLBaseModule):
             cross_attentions=outputs.cross_attentions,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        RoBERTa is an encoder-only model.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embeddings
+
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
 class RobertaForSequenceClassification(EasyDeLBaseModule):
@@ -957,6 +984,32 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.roberta
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        RoBERTa is an encoder-only model.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.roberta.embeddings
 
 
 class RobertaForMultipleChoice(EasyDeLBaseModule):
@@ -1035,6 +1088,32 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.roberta
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        RoBERTa is an encoder-only model.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has a multiple choice classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a multiple choice classification head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.roberta.embeddings
 
 
 class RobertaForTokenClassification(EasyDeLBaseModule):
@@ -1119,6 +1198,32 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
             attentions=outputs.attentions,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.roberta
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        RoBERTa is an encoder-only model.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has a token classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a token classification head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.roberta.embeddings
+
 
 class RobertaForQuestionAnswering(EasyDeLBaseModule):
     def __init__(
@@ -1195,6 +1300,32 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.roberta
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        RoBERTa is an encoder-only model.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has a question answering head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a question answering head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.roberta.embeddings
 
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
@@ -1279,3 +1410,28 @@ class RobertaForCausalLM(EasyDeLBaseModule):
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        This model is adapted as a decoder, so it has no separate encoder.
+        """
+        raise NotImplementedError("This CausalLM model does not have a separate encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.roberta
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.roberta.embeddings

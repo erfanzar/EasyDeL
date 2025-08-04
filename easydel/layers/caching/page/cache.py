@@ -103,6 +103,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
     num_pages: int = -1
     max_num_pages_per_req: int = -1
     num_slices_per_kv_cache_update_page: int = -1
+    _kvdtype_str: str = field(pytree_node=False, default="bf16")
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
@@ -149,6 +150,8 @@ class PagesCacheMetaData(BaseCacheMetadata):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
+        from easydel.utils import DTYPE_TO_STRING_MAP
+
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -167,7 +170,14 @@ class PagesCacheMetaData(BaseCacheMetadata):
                     kv_cache_dtype=kvdtype,
                 )
             ),
+            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
         )
+
+    @property
+    def kvdtype(self) -> jnp.dtype:
+        from easydel.utils import STRING_TO_DTYPE_MAP
+
+        return STRING_TO_DTYPE_MAP[self._kvdtype_str]
 
     def get_padded_num_slices(self, num_tokens: int, max_num_reqs: int):
         padded_num_slices = 2 * max_num_reqs + num_tokens // self.page_size
@@ -215,7 +225,6 @@ class PagesCacheView(BaseCacheView):
     def init(
         cls,
         mesh: Mesh,
-        dtype: jnp.dtype,
         metadata: PagesCacheMetaData,
         layer_index: int,
         partition_manager: es.PartitionManager,
@@ -248,7 +257,7 @@ class PagesCacheView(BaseCacheView):
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
-            kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=dtype, device=kv_pages_sharding))
+            kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=metadata.kvdtype, device=kv_pages_sharding))
 
         return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages, partition_manager=partition_manager)
 
@@ -338,7 +347,6 @@ class PagesCache(BaseCache):
     def init_cache(
         cls,
         mesh: Mesh,
-        dtype: jnp.dtype,
         metadata: PagesCacheMetaData,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
@@ -362,7 +370,6 @@ class PagesCache(BaseCache):
         views = [
             PagesCacheView.init(
                 mesh=mesh,
-                dtype=dtype,
                 metadata=metadata,
                 quantizer=quantizer,
                 layer_index=i,

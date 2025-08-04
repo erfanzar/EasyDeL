@@ -23,6 +23,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -674,6 +675,32 @@ class Gemma3TextModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3ForCausalLM(EasyDeLBaseModule):
@@ -889,6 +916,31 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.embed_tokens
 
 
 class Gemma3MultiModalProjector(nn.Module):
@@ -1156,6 +1208,33 @@ class Gemma3Model(EasyDeLBaseModule):
         model_kwargs.pop("token_type_ids", None)  # only effect first iter
         return model_kwargs
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Gemma3 is a multi-modal model with a vision tower, but for typical LLM usage,
+        it's considered a decoder-only architecture.
+        """
+        return self.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.language_model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.language_model.embed_tokens
+
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Gemma3Config, model_type="gemma3")
 class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
@@ -1301,3 +1380,28 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         return self.model.update_inputs_for_generation(model_outputs, model_kwargs)
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.model.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.language_model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.language_model.embed_tokens

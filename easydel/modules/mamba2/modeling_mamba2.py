@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -729,6 +730,32 @@ class Mamba2Model(EasyDeLBaseModule):
             hidden_states=all_hidden_states,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embeddings
+
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
 class Mamba2ForCausalLM(EasyDeLBaseModule):
@@ -858,3 +885,28 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
         model_outputs.cache_params.update_seq(1)
         model_kwargs["cache_params"] = model_outputs.cache_params
         return model_kwargs
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.backbone
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.backbone.embeddings

@@ -961,6 +961,35 @@ class DeepseekV2Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For DeepseekV2Model (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("DeepseekV2Model is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For DeepseekV2Model, this is the model itself.
+        """
+        return self
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        DeepseekV2Model does not include the lm_head.
+        """
+        raise NotImplementedError("DeepseekV2Model does not include the language model head. See DeepseekV2ForCausalLM.")
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Assuming the embedding layer is named `embed_tokens` based on common conventions
+        # and the presence of `self.embed_tokens(input_ids.astype("i4"))` in typical __call__ methods.
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, DeepseekV2Config, model_type="deepseek_v2")
 class DeepseekV2ForCausalLM(EasyDeLBaseModule):
@@ -1086,3 +1115,31 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For DeepseekV2ForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("DeepseekV2ForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For DeepseekV2ForCausalLM, this is the underlying DeepseekV2Model.
+        """
+        # Assuming the base model is stored in `self.model`
+        return self.model
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (DeepseekV2Model)
+        return self.model.get_embedding()  # Leverages DeepseekV2Model's get_embedding
