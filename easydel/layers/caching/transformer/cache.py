@@ -509,12 +509,12 @@ class TransformerCache(BaseCache):
 
             new_val = lax.dynamic_update_slice(
                 _maybe_materialize(view.value),
-                _maybe_materialize(oview.value),
+                _maybe_materialize(oview.value.astype(view.value.dtype)),
                 (slot, 0, 0, 0),
             )
             new_key = lax.dynamic_update_slice(
                 _maybe_materialize(view.key),
-                _maybe_materialize(oview.key),
+                _maybe_materialize(oview.key.astype(view.key.dtype)),
                 (slot, 0, 0, 0),
             )
 
