@@ -857,13 +857,18 @@ class BaseTrainer(BaseTrainerProtocol):
             self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
             self._save_readme(directory_name)
 
-        state.save_state(
-            save_directory=directory_name,
-            float_dtype=self.model.param_dtype,
-            verbose=self.arguments.verbose,
-            save_optimizer=self.arguments.save_optimizer_state,
-            enable=self.is_enable,
-        )
+        try:
+            state.save_state(
+                save_directory=directory_name,
+                float_dtype=self.model.param_dtype,
+                verbose=self.arguments.verbose,
+                save_optimizer=self.arguments.save_optimizer_state,
+                enable=self.is_enable,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving state to {directory_name}: {e}")
 
         return str(directory_name)
 
