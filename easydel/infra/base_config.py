@@ -268,7 +268,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         quantization_blocksize: int = 64,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
-        attn_dtype: jnp.dtype = jnp.float32,
+        attn_dtype: jnp.dtype = jnp.bfloat16,
         kvdtype: jnp.dtype | None = None,
         attn_softmax_dtype: jnp.dtype = jnp.float32,
         fcm_max_ratio: float = 0.0,
