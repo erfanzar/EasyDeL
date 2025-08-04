@@ -269,7 +269,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
         attn_dtype: jnp.dtype = jnp.float32,
-        kvdtype: jnp.dtype = jnp.bfloat16,
+        kvdtype: jnp.dtype | None = None,
         attn_softmax_dtype: jnp.dtype = jnp.float32,
         fcm_max_ratio: float = 0.0,
         fcm_min_ratio: float = 0.0,
@@ -329,7 +329,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
         )
         self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
-        self.kvdtype = getattr(self, "kvdtype", kvdtype)
+        self.kvdtype = getattr(self, "kvdtype", kvdtype if kvdtype is not None else self.attn_dtype)
         self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
@@ -555,7 +555,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = NOT_GIVEN,
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
         attn_dtype: jnp.dtype = NOT_GIVEN,
-        kvdtype: jnp.dtype = NOT_GIVEN,
+        kvdtype: jnp.dtype | None = NOT_GIVEN,
         attn_softmax_dtype: jnp.dtype = NOT_GIVEN,
         hardware_abstraction: bool = NOT_GIVEN,
         pallas_m_block_size: int = NOT_GIVEN,
@@ -665,7 +665,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "quantization_pattern", ".*", quantization_pattern)
         set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
         set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
-        set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype)
+        set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
         set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)

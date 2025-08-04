@@ -31,11 +31,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -582,6 +578,33 @@ class CohereModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereModel (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("CohereModel is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereModel, this is the model itself.
+        """
+        return self
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        CohereModel does not include the lm_head.
+        """
+        raise NotImplementedError("CohereModel does not include the language model head. See CohereForCausalLM.")
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=CohereConfig, model_type="cohere")
 class CohereForCausalLM(EasyDeLBaseModule):
@@ -701,6 +724,33 @@ class CohereForCausalLM(EasyDeLBaseModule):
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("CohereForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereForCausalLM, this is the underlying CohereModel.
+        """
+        return self.model  # self.model is the CohereModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (CohereModel)
+        return self.model.get_embedding()  # Leverages CohereModel's get_embedding
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=CohereConfig, model_type="cohere")
@@ -826,3 +876,35 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For CohereForSequenceClassification (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError(
+            "CohereForSequenceClassification is a decoder-only model and does not have a separate encoder."
+        )
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For CohereForSequenceClassification, this is the underlying CohereModel.
+        """
+        return self.model  # self.model is the CohereModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        CohereForSequenceClassification uses a classification head instead.
+        """
+        raise NotImplementedError(
+            "CohereForSequenceClassification uses a classification head (self.score), not an lm_head."
+        )
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (CohereModel)
+        return self.model.get_embedding()  # Leverages CohereModel's get_embedding

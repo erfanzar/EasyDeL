@@ -23,10 +23,9 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-
-# import transformers
 from flax import nnx as nn
 from jax import lax
+from typing_extensions import Self
 
 from easydel.inference.logits_process import (
     ForceTokensLogitsProcessor,
@@ -1241,6 +1240,31 @@ class WhisperModel(EasyDeLBaseModule):
             encoder_attentions=encoder_outputs.attentions,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.decoder
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.decoder.embed_tokens
+
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
 class WhisperForConditionalGeneration(EasyDeLBaseModule):
@@ -1570,6 +1594,30 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
             **batch,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.model.encoder
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.decoder
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.proj_out
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.model.decoder.embed_tokens
+
 
 @register_module(TaskType.AUDIO_CLASSIFICATION, config=WhisperConfig, model_type="whisper")
 class WhisperForAudioClassification(EasyDeLBaseModule):
@@ -1655,3 +1703,31 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        This is an encoder-only model for classification.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has an audio classification head, not a language model head.
+        """
+        raise NotImplementedError("This model has an audio classification head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        The encoder uses convolutional layers for feature extraction, not a standard token embedding.
+        Returning the first convolutional layer as the "embedding" layer.
+        """
+        return self.encoder.conv1

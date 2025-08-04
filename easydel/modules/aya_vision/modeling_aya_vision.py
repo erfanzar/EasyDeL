@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -334,7 +335,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             llm_input_ids = input_ids
 
         if inputs_embeds is None:
-            inputs_embeds = self.language_model.embed_tokens(llm_input_ids)
+            inputs_embeds = self.language_model.get_embedding()(llm_input_ids)
 
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
@@ -483,6 +484,32 @@ class AyaVisionModel(EasyDeLBaseModule):
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.language_model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the language model (decoder).
+        """
+        return self.language_model.get_embedding()
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=AyaVisionConfig, model_type="aya_vision")
@@ -720,3 +747,28 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         """
         model_kwargs = self.model.update_inputs_for_generation(model_outputs, model_kwargs)
         return model_kwargs
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.model.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the language model (decoder).
+        """
+        return self.model.get_embedding()

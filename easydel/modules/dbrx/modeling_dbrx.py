@@ -844,6 +844,33 @@ class DbrxModel(EasyDeLBaseModule):
             router_logits=all_router_logits,
         )
 
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For DbrxModel (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("DbrxModel is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For DbrxModel, this is the model itself.
+        """
+        return self
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        DbrxModel does not include the lm_head.
+        """
+        raise NotImplementedError("DbrxModel does not include the language model head. See DbrxForCausalLM.")
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.wte
+
 
 @register_module(TaskType.CAUSAL_LM, config=DbrxConfig, model_type="dbrx")
 class DbrxForCausalLM(EasyDeLBaseModule):
@@ -930,6 +957,34 @@ class DbrxForCausalLM(EasyDeLBaseModule):
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For DbrxForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("DbrxForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For DbrxForCausalLM, this is the underlying DbrxModel.
+        """
+        return self.transformer  # self.transformer is the DbrxModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        # Note: The DBRX code uses `self.score` for the lm_head, not `self.lm_head`
+        return self.score
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (DbrxModel)
+        return self.transformer.get_embedding()  # Leverages DbrxModel's get_embedding
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
@@ -1039,3 +1094,35 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
             attentions=transformer_outputs.attentions,
             aux_loss=aux_loss,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For DbrxForSequenceClassification (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError(
+            "DbrxForSequenceClassification is a decoder-only model and does not have a separate encoder."
+        )
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For DbrxForSequenceClassification, this is the underlying DbrxModel.
+        """
+        return self.transformer  # self.transformer is the DbrxModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        DbrxForSequenceClassification uses a classification head instead.
+        """
+        raise NotImplementedError(
+            "DbrxForSequenceClassification uses a classification head (self.score), not an lm_head."
+        )
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (DbrxModel)
+        return self.transformer.get_embedding()  # Leverages DbrxModel's get_embedding

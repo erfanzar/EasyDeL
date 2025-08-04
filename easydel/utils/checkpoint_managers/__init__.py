@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .path_utils import EasyPath, EasyPathLike
-from .streamer import CheckpointManager
+from .streamer import ALLOWED_DATA_TYPES, DTYPE_TO_STRING_MAP, STRING_TO_DTYPE_MAP, CheckpointManager
 
-__all__ = ("CheckpointManager", "EasyPath", "EasyPathLike")
+__all__ = (
+    "ALLOWED_DATA_TYPES",
+    "DTYPE_TO_STRING_MAP",
+    "STRING_TO_DTYPE_MAP",
+    "CheckpointManager",
+    "EasyPath",
+    "EasyPathLike",
+)

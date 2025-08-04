@@ -142,7 +142,6 @@ class EasyGenerationMixin:
         self,
         hbm_utilization: float,
         page_size: int,
-        dtype: jnp.dtype,
         max_model_length: int,
     ) -> PagesCacheMetaData:
         """
@@ -174,7 +173,7 @@ class EasyGenerationMixin:
         return PagesCacheMetaData.create(
             mesh=self.mesh,
             partition_manager=self.config.partition_manager,
-            kvdtype=dtype,
+            kvdtype=self.config.kvdtype,
             max_model_length=max_model_length,
             num_hidden_layers=num_hidden_layers,
             num_kv_heads=num_key_value_heads,
@@ -236,8 +235,8 @@ class EasyGenerationMixin:
         self,
         metadata: PagesCacheMetaData | None = None,
         page_size: int | None = None,
-        dtype: jnp.dtype | None = jnp.bfloat16,
         hbm_utilization: float | None = None,
+        max_model_length: int | None = None,
     ) -> PagesCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
@@ -257,8 +256,6 @@ class EasyGenerationMixin:
                 metadata object. If provided, other arguments like page_size, batch_size etc.,
                 are ignored for metadata creation.
             page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
-            dtype (tp.Optional[jnp.dtype]): Data type for memory calculation. Required if `metadata` is None.
-                Defaults to jnp.bfloat16.
             hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
 
         Returns:
@@ -270,15 +267,17 @@ class EasyGenerationMixin:
                 (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
         """
         if metadata is None:
-            assert page_size is not None, "if your not passing orginal metadata you should pass `page_size`"
-            assert dtype is not None, "if your not passing orginal metadata you should pass `dtype`"
-            assert hbm_utilization is not None, "if your not passing orginal metadata you should pass `hbm_utilization`"
+            assert page_size is not None, "if your not passing metadata you should pass `page_size`"
+            assert hbm_utilization is not None, "if your not passing metadata you should pass `hbm_utilization`"
+            assert max_model_length is not None, "if your not passing metadata you should pass `max_model_length`"
 
-            metadata = self.create_paged_metadata(hbm_utilization=hbm_utilization, page_size=page_size, dtype=dtype)
-        assert dtype is not None, "`Dtype` should be provided."
+            metadata = self.create_paged_metadata(
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+                max_model_length=max_model_length,
+            )
         return PagesCache.init_cache(
             mesh=self.config.mesh,
-            dtype=dtype,
             metadata=metadata,
             partition_manager=self.config.partition_manager,
             quantizer=self._quant_class(

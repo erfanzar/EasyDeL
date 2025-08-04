@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -594,6 +595,32 @@ class GemmaModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=GemmaConfig, model_type="gemma")
 class GemmaForCausalLM(EasyDeLBaseModule):
@@ -700,6 +727,31 @@ class GemmaForCausalLM(EasyDeLBaseModule):
             past_key_values=outputs.past_key_values,
         )
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.embed_tokens
+
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GemmaConfig, model_type="gemma")
 class GemmaForSequenceClassification(EasyDeLBaseModule):
@@ -793,3 +845,29 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.embed_tokens

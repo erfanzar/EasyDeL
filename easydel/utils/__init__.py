@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from . import analyze_memory, compiling_utils, graph_utils, traversals
-from .checkpoint_managers import CheckpointManager, EasyPath, EasyPathLike
+from .checkpoint_managers import (
+    ALLOWED_DATA_TYPES,
+    DTYPE_TO_STRING_MAP,
+    STRING_TO_DTYPE_MAP,
+    CheckpointManager,
+    EasyPath,
+    EasyPathLike,
+)
 from .cli_helpers import DataClassArgumentParser
 from .compiling_utils import ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
 from .data_managers import (
@@ -28,6 +35,9 @@ from .lazy_import import LazyModule, is_package_available
 from .rngs_utils import GenerateRNG, JaxRNG
 
 __all__ = (
+    "ALLOWED_DATA_TYPES",
+    "DTYPE_TO_STRING_MAP",
+    "STRING_TO_DTYPE_MAP",
     "CheckpointManager",
     "DataClassArgumentParser",
     "DataManager",

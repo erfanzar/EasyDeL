@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -398,6 +399,31 @@ class Mistral3Model(EasyDeLBaseModule):
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.language_model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.language_model.embed_tokens
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Mistral3Config, model_type="mistral3")
 class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
@@ -546,3 +572,28 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
         )
+
+    def get_encoder(self: Self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.model.vision_tower
+
+    def get_decoder(self: Self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.language_model
+
+    def get_lm_head(self: Self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self: Self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.language_model.embed_tokens

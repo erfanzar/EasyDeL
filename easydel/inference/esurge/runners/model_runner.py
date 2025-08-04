@@ -72,7 +72,6 @@ class eSurgeRunner:
         model: EasyDeLBaseModule,
         hbm_utilization: float = 0.5,
         page_size: int = 128,
-        kvdtype: jnp.dtype = jnp.bfloat16,
         max_model_len: int = 2**13,
         max_num_seqs: int = 8,
     ):
@@ -90,13 +89,12 @@ class eSurgeRunner:
         self.metadata = model.create_paged_metadata(
             hbm_utilization=hbm_utilization,
             page_size=page_size,
-            dtype=kvdtype,
             max_model_length=max_model_len,
         )
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = max_num_seqs
         self.max_model_len = max_model_len
-        self.kv_pages = model.init_pages(self.metadata, dtype=kvdtype)
+        self.kv_pages = model.init_pages(self.metadata)
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
         self._setup_variables()
@@ -129,12 +127,10 @@ class eSurgeRunner:
         num = min_token_size
 
         if padding_gap == 0:
-            # Exponential growth
             while num <= max_token_size:
                 paddings.append(num)
                 num *= 2
         else:
-            # Linear growth after initial exponential
             while num <= padding_gap:
                 paddings.append(num)
                 num *= 2
@@ -157,7 +153,6 @@ class eSurgeRunner:
         )
         self.max_num_tokens = self.num_tokens_paddings[-1]
 
-        # EngineRequest tracking
         self.requests = {}
         self.sequence_buffer = SequenceBuffer(
             self.max_num_reqs,
@@ -167,7 +162,6 @@ class eSurgeRunner:
             [self.metadata.page_size],
         )
 
-        # Pre-allocated numpy arrays for efficiency
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.input_ids_np = np.zeros(self.max_num_tokens, dtype=np.int32)
         self.positions_np = np.zeros(self.max_num_tokens, dtype=np.int32)
@@ -345,11 +339,9 @@ class eSurgeRunner:
         Returns:
             True if there were unscheduled requests or new requests added
         """
-        # Remove finished requests
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
-        # Remove finished requests from input batch
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
@@ -428,7 +420,6 @@ class eSurgeRunner:
         num_scheduled_tokens_per_req = []
         end_index = start_index
 
-        # Collect scheduled tokens per request
         for i in range(start_index, num_reqs):
             req_id = self.sequence_buffer.req_ids[i]
             assert req_id is not None
@@ -438,7 +429,6 @@ class eSurgeRunner:
                 use_max_model_len = True
             num_scheduled_tokens_per_req.append(num_tokens)
 
-        # Determine batch size based on model length constraints
         if use_max_model_len:
             if len(num_scheduled_tokens_per_req) > self.num_reqs_max_model_len:
                 num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[: self.num_reqs_max_model_len]
@@ -456,7 +446,6 @@ class eSurgeRunner:
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        # Prepare token indices and positions
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_per_req)
         arange = np.concatenate([self.arange_np[:n] for n in num_scheduled_tokens_per_req])
 
@@ -470,7 +459,6 @@ class eSurgeRunner:
         token_indices = positions_np + req_indices * self.sequence_buffer.token_ids.shape[1]
         input_ids = np.take(self.sequence_buffer.token_ids.flatten(), token_indices)
 
-        # Prepare padded inputs
         padded_total_num_scheduled_tokens = _get_padded_token_len(self.num_tokens_paddings, total_num_scheduled_tokens)
 
         padded_input_ids = np.zeros(padded_total_num_scheduled_tokens, dtype=np.int32)
@@ -481,7 +469,6 @@ class eSurgeRunner:
         padded_position_ids[:total_num_scheduled_tokens] = positions_np
         self.position_ids = padded_position_ids
 
-        # Prepare query metadata
         self.query_start_loc_np[0] = 0
         np.cumsum(
             num_scheduled_tokens_per_req,
@@ -491,7 +478,6 @@ class eSurgeRunner:
 
         self.seq_lens_np[:num_reqs] = self.sequence_buffer.num_computed_tokens[:num_reqs] + num_scheduled_tokens_per_req
 
-        # Prepare page tables and metadata
         if use_max_model_len:
             pages_tables = np.zeros((self.num_reqs_max_model_len, self.metadata.max_num_pages_per_req), dtype=np.int32)
             pages_tables[:num_reqs] = self.sequence_buffer.page_table[0].get_array()[:num_reqs]
@@ -505,7 +491,6 @@ class eSurgeRunner:
             query_start_loc = self.query_start_loc_np[: self.num_reqs_most_model_len + 1].copy()
             seq_lens = self.seq_lens_np[: self.num_reqs_most_model_len].copy()
 
-        # Prepare slot mapping
         slot_mapping_metadata = self._get_slot_mapping_metadata(num_reqs, num_scheduled_tokens_per_req)
         num_kv_update_slices = slot_mapping_metadata.shape[0]
 
@@ -524,7 +509,6 @@ class eSurgeRunner:
             )
         )
 
-        # Create attention metadata
         attn_metadata = PagesMetadata(
             slot_mapping=slot_mapping_metadata,
             pages_tables=pages_tables,
@@ -558,7 +542,6 @@ class eSurgeRunner:
                 num_nans_in_logits=None,
             )
 
-        # Process requests in batches
         start_index = 0
         combined_selected_tokens: list[jax.Array] = []
 
@@ -571,14 +554,12 @@ class eSurgeRunner:
                 end_index,
             ) = self._prepare_inputs(scheduler_output, start_index)
 
-            # Execute model forward pass
             logits = self.execute_forward(
                 input_ids=self.input_ids,
                 position_ids=self.position_ids,
                 cache_metadata=cache_metadata,
             )
 
-            # Sample tokens
             logits = self.select_logits(logits, logits_indices)
             selected_token_ids = self.sample_from_logits_func(
                 logits,
@@ -592,10 +573,8 @@ class eSurgeRunner:
 
             start_index = end_index
 
-        # Combine results from all batches
         selected_token_ids = np.concatenate(combined_selected_tokens, axis=0)
 
-        # Process sampled tokens
         request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices = []
         num_reqs = self.sequence_buffer.num_reqs
@@ -616,7 +595,6 @@ class eSurgeRunner:
         req_ids = cast(list[str], self.sequence_buffer.req_ids[:num_reqs])
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {req_id: None for req_id in req_ids}
 
-        # Update token buffers
         max_gen_len = selected_token_ids.shape[-1]
         if max_gen_len == 1:
             valid_sampled_token_ids = selected_token_ids.tolist()
@@ -629,7 +607,6 @@ class eSurgeRunner:
                 req_state.output_token_ids.append(token_id)
                 self.sequence_buffer.num_tokens[i] += 1
         else:
-            # Handle multi-token generation
             valid_mask = selected_token_ids != -1
             gen_lens = valid_mask.sum(axis=1).tolist()
             valid_sampled_token_ids = [seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)]
