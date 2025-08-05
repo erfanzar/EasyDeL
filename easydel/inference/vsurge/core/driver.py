@@ -665,7 +665,7 @@ class vDriver:
         """Starts the vDriver with process and detokenize threads."""
         if not self.live:
             self.log("[Main] Starting vDriver...")
-            self._detokenize_queue = queue.Queue(maxsize=self.engine.max_concurrent_decodes)
+            self._detokenize_queue = queue.Queue(maxsize=8)
 
             self._detokenize_thread = SafeThread(
                 target=self._detokenize_thread_action,
