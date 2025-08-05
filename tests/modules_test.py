@@ -444,6 +444,35 @@ class EasyModelsTest(unittest.TestCase):
         self.header_config = None
         self.assertTrue(res, f"GPT-NoeX model Failed [ERROR {err}]")
 
+    def test_gpt_oss(self):
+        self.header_config = ed.GptOssConfig(
+            num_hidden_layers=8,
+            num_local_experts=8,
+            vocab_size=201088,
+            hidden_size=128,
+            intermediate_size=256,
+            head_dim=64,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            sliding_window=128,
+            rope_theta=150000.0,
+            tie_word_embeddings=False,
+            hidden_act="silu",
+            initializer_range=0.02,
+            max_position_embeddings=2048,
+            rms_norm_eps=1e-5,
+            rope_scaling=None,
+            attention_dropout=0.0,
+            num_experts_per_tok=2,
+            router_aux_loss_coef=0.9,
+            output_router_logits=False,
+            use_cache=True,
+            layer_types=None,
+        )
+        res, err = self.create_test_for_models("gpt_oss", transformers.GptOssForCausalLM, ed.TaskType.CAUSAL_LM)
+        self.header_config = None
+        self.assertTrue(res, f"GPT-OSS model Failed [ERROR {err}]")
+
     def test_qwen2(self):
         self.header_config = None
         self.rope_scaling = None
@@ -760,7 +789,7 @@ class EasyModelsTest(unittest.TestCase):
         tux = getattr(hf_out, "aux_loss", 0)
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(to) - jnp.mean(jo)
-        ed_loss = ed_out.loss - jux
+        ed_loss = (ed_out.loss - jux) if name not in ["gpt_oss"] else ed_out.loss
         hf_loss = hf_out.loss.cpu().detach().numpy()
         if STRICT_CHECK:
             np.testing.assert_allclose(to, jo, atol=0.125, rtol=0)
@@ -821,36 +850,37 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    test.test_arctic()  # Passed
-    test.test_cohere()  # Passed
-    test.test_cohere2()  # Passed
-    test.test_dbrx()  # Passed
-    test.test_deepseek_v2()  # Passed
-    test.test_deepseek_v3()  # Passed
-    test.test_exaone()  # Passed
-    test.test_falcon()  # Passed
-    test.test_gemma()  # Passed
-    test.test_gemma2()  # Passed
-    test.test_gemma3_text()  # Passed
-    test.test_gemma3()  # Passed
-    test.test_gptj()  # Passed
-    test.test_gpt_noex()  # Passed
-    test.test_gpt2()  # Passed
+    # test.test_arctic()  # Passed
+    # test.test_cohere()  # Passed
+    # test.test_cohere2()  # Passed
+    # test.test_dbrx()  # Passed
+    # test.test_deepseek_v2()  # Passed
+    # test.test_deepseek_v3()  # Passed
+    # test.test_exaone()  # Passed
+    # test.test_falcon()  # Passed
+    # test.test_gemma()  # Passed
+    # test.test_gemma2()  # Passed
+    # test.test_gemma3_text()  # Passed
+    # test.test_gemma3()  # Passed
+    # test.test_gptj()  # Passed
+    # test.test_gpt_noex()  # Passed
+    test.test_gpt_oss()  # Passed
+    # test.test_gpt2()  # Passed
     # test.test_grok1() # Not Tested Yet!
-    test.test_internlm2()  # Passed
-    test.test_llama()  # Passed
-    test.test_llama4()  # Passed
+    # test.test_internlm2()  # Passed
+    # test.test_llama()  # Passed
+    # test.test_llama4()  # Passed
     # test.test_llama4_cond()  # Passed
     # test.test_mamba()  # Passed
     # test.test_mamba2()  # Passed - ReCheck
-    test.test_mistral()  # Passed
-    test.test_mixtral()  # Passed
-    test.test_mpt()  # Passed
-    test.test_olmo()  # Passed
-    test.test_olmo2()  # Passed
+    # test.test_mistral()  # Passed
+    # test.test_mixtral()  # Passed
+    # test.test_mpt()  # Passed
+    # test.test_olmo()  # Passed
+    # test.test_olmo2()  # Passed
     # test.test_openelm()  # Passed
-    test.test_phi()  # Passed
-    test.test_phi3()  # Passed
+    # test.test_phi()  # Passed
+    # test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
     # test.test_qwen2()  # Passed
     # test.test_qwen2_moe()  # Passed

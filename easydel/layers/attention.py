@@ -238,6 +238,7 @@ class FlexibleAttentionModule(nn.Module):
         attention_mask: Array | None = None,
         segment_ids: Array | None = None,
         causal: bool = True,
+        softmax_aux: Array | None = None,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -281,6 +282,7 @@ class FlexibleAttentionModule(nn.Module):
                 causal=causal,
                 deterministic=self.deterministic,
                 dropout_rng=rngs,
+                softmax_aux=softmax_aux,
             )
             if mode == common_types.MODE_DECODE:
                 assert cache_view is not None

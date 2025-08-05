@@ -289,6 +289,12 @@ _import_structure = {
         "GPTNeoXForCausalLM",
         "GPTNeoXModel",
     ],
+    "modules.gpt_oss": [
+        "GptOssConfig",
+        "GptOssForCausalLM",
+        "GptOssForSequenceClassification",
+        "GptOssModel",
+    ],
     "modules.grok_1": [
         "Grok1Config",
         "Grok1ForCausalLM",
@@ -670,6 +676,12 @@ if _tp.TYPE_CHECKING:
         GPTNeoXConfig,
         GPTNeoXForCausalLM,
         GPTNeoXModel,
+    )
+    from .modules.gpt_oss import (
+        GptOssConfig,
+        GptOssForCausalLM,
+        GptOssForSequenceClassification,
+        GptOssModel,
     )
     from .modules.grok_1 import (
         Grok1Config,
