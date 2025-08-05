@@ -316,17 +316,15 @@ class ActiveRequest:
     """Current state of the driver."""
 
     return_channel: AsyncMultifuture[list[ReturnSample]]
-
     sampling_params: SamplingParams
 
     complete: np.ndarray | None = None
-
     prefill_result: tp.Any = None
     prefill_content: str | list[int] | None = None
     prefill_tokens_processed: int | None = None
-    prefill_tokens_remaining: list[int] | None = None  # Remaining token IDs to process
+    prefill_tokens_remaining: list[int] | None = None
     is_prefill_complete: bool = False
-    current_seq_id: int = -1  # For paged attention
+    current_seq_id: int = -1
 
     generate_timestep_added: int | None = None
     is_client_side_tokenization: bool | None = False
@@ -340,38 +338,64 @@ class ActiveRequest:
 
     _token_ids: list[int] | None = None
     _attention_mask: np.ndarray | None = None
-    _text_fragments: list[list[str]] = field(default_factory=list)
-    _cached_text: list[str] = field(default_factory=list)
-    _cache_valid: bool = False
+
+    _accumulated_texts: list[str] = field(default_factory=list)
+    _last_stop_check_length: list[int] = field(default_factory=list)
+    _stop_patterns: list[str] | None = None
+    _max_stop_pattern_length: int = 0
+
+    def __post_init__(self):
+        """Initialize optimized stop pattern checking."""
+        if self.sampling_params.stop:
+            self._stop_patterns = self.sampling_params.stop
+            self._max_stop_pattern_length = max(len(p) for p in self._stop_patterns)
 
     def enqueue_samples(self, generated_samples: list[ReturnSample]):
-        """Adds the generated sample(s) to return channel for current step.
-
-        Args:
-          generated_samples: The generated sample(s) for current step.
-
-        This should be called only from within the Drivers background thread.
-        """
+        """Adds the generated sample(s) to return channel for current step."""
         self.return_channel.add_result(generated_samples)
 
     def add_text_fragments(self, new_fragments: list[str]) -> None:
-        """Add new text fragments and invalidate cache."""
-        if not self._text_fragments:
-            self._text_fragments = [[] for _ in range(len(new_fragments))]
+        """Efficiently append new text fragments."""
+        if not self._accumulated_texts:
+            self._accumulated_texts = [""] * len(new_fragments)
+            self._last_stop_check_length = [0] * len(new_fragments)
 
         for i, fragment in enumerate(new_fragments):
-            if i < len(self._text_fragments):
-                self._text_fragments[i].append(fragment)
-
-        self._cache_valid = False
+            if i < len(self._accumulated_texts) and fragment:
+                self._accumulated_texts[i] += fragment
 
     @property
     def accumulated_text(self) -> list[str]:
-        """Get the full accumulated text with caching."""
-        if not self._cache_valid:
-            self._cached_text = ["".join(fragments) for fragments in self._text_fragments]
-            self._cache_valid = True
-        return self._cached_text
+        """Direct access to accumulated text - no copying needed."""
+        return self._accumulated_texts
+
+    def check_stop_conditions(self, sample_idx: int) -> bool:
+        """Efficiently check stop conditions only on new text."""
+        if not self._stop_patterns or sample_idx >= len(self._accumulated_texts):
+            return False
+
+        current_text = self._accumulated_texts[sample_idx]
+        current_length = len(current_text)
+        if current_length <= self._last_stop_check_length[sample_idx]:
+            return False
+
+        check_start = max(0, self._last_stop_check_length[sample_idx] - self._max_stop_pattern_length)
+        check_text = current_text[check_start:]
+
+        self._last_stop_check_length[sample_idx] = current_length
+        for pattern in self._stop_patterns:
+            if pattern in check_text:
+                return True
+
+        return False
+
+    def get_new_text_since_last_check(self, sample_idx: int) -> str:
+        """Get only the newly added text since last check."""
+        if sample_idx >= len(self._accumulated_texts):
+            return ""
+
+        last_pos = self._last_stop_check_length.get(sample_idx, 0) if self._last_stop_check_length else 0
+        return self._accumulated_texts[sample_idx][last_pos:]
 
 
 class SafeThread(threading.Thread):
