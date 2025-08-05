@@ -61,7 +61,6 @@ class vDriver:
 
     _engine: vEngine
     scheduler: Scheduler
-    _detokenize_backlog: queue.Queue[tp.Any]
     _process_thread: SafeThread
     _detokenize_thread: SafeThread
     _metrics_thread: SafeThread | None
@@ -646,7 +645,6 @@ class vDriver:
         """Background thread action for periodically updating and logging metrics."""
         while self.live:
             try:
-                self.metrics_recorder.update_queue_size("detokenize_backlog", self._detokenize_backlog.qsize())
                 self.metrics_recorder.update_queue_size("free_decode_slots", self.scheduler.get_free_slot_count())
                 self.metrics_recorder.set_active_requests_count(self.scheduler.get_active_request_count())
 
@@ -695,7 +693,6 @@ class vDriver:
         if self.live:
             self.log("[Main] Stopping vDriver...")
             self.live = False
-            self._detokenize_backlog.close()
             current_threads_to_join = list(self._all_threads)
             for t in current_threads_to_join:
                 if t.is_alive():
