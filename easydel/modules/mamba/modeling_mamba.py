@@ -56,6 +56,7 @@ class MambaCausalLMOutput(BaseModelOutput):
     logits: chex.Array = None
     cache: MambaCache | None = None
     hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: chex.Array | None = None
 
 
 _T = tp.TypeVar("_T")
@@ -557,6 +558,32 @@ class MambaModel(EasyDeLBaseModule):
             ),
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embeddings
+
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
 class MambaForCausalLM(EasyDeLBaseModule):
@@ -599,6 +626,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
         inputs_embeds: chex.Array | None = None,
         cache: MambaCache | None = None,
         position_ids: chex.Array | None = None,
+        apply_lm_head: bool = True,
         attention_mask: chex.Array | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
@@ -611,15 +639,16 @@ class MambaForCausalLM(EasyDeLBaseModule):
             cache=cache,
             output_hidden_states=output_hidden_states,
         )
-        hidden_states = mamba_outputs.last_hidden_state
 
-        self.lm_head.kernel.value = self.backbone.embeddings.embedding.value.T
-        logits = self.lm_head(hidden_states).astype(jnp.float32)
+        logits = None
+        if apply_lm_head:
+            logits = self.apply_lm_head(mamba_outputs.last_hidden_state)
 
         return MambaCausalLMOutput(
             logits=logits,
             cache=mamba_outputs.cache,
             hidden_states=mamba_outputs.hidden_states,
+            last_hidden_state=mamba_outputs.last_hidden_state,
         )
 
     def update_inputs_for_generation(
@@ -667,3 +696,28 @@ class MambaForCausalLM(EasyDeLBaseModule):
                 head_dim=self.config.head_dim,
             ),
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.backbone.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.backbone.get_embedding()

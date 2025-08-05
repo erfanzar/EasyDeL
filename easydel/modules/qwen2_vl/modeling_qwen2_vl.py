@@ -1024,6 +1024,33 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         return self.merger(hidden_states)
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        This vision model acts as the encoder.
+        """
+        return self
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        This is an encoder-only model and does not have a decoder.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This vision model does not have a language model head.
+        """
+        raise NotImplementedError("This vision model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module. In this case, it's the patch embedding layer.
+        """
+        return self.patch_embed
+
 
 @register_module(TaskType.BASE_MODULE, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VLModel(EasyDeLBaseModule):
@@ -1081,6 +1108,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -1159,6 +1187,32 @@ class Qwen2VLModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
@@ -1206,15 +1260,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def get_decoder(self):
-        return self.model
-
     def __call__(
         self,
         input_ids: chex.Array = None,
@@ -1223,6 +1268,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1306,7 +1352,9 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        logits = self.lm_head(hidden_states)
+        logits = None
+        if apply_lm_head:
+            logits = self.apply_lm_head(outputs.last_hidden_state)
 
         return Qwen2VLCausalLMOutputWithPast(
             logits=logits,
@@ -1487,3 +1535,28 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         model_kwargs.pop("token_type_ids", None)  # only effect first iter
         return model_kwargs
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.visual
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.embed_tokens

@@ -716,6 +716,38 @@ class ArcticModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For ArcticModel (decoder-only), this is not applicable.
+        """
+        # As per instructions, raise NotImplementedError for non-encoder models
+        # Or you could return `self` if you consider the whole model the "encoder" context,
+        # but raising NotImplementedError is more standard for a decoder-only base.
+        raise NotImplementedError("ArcticModel is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For ArcticModel, this is the model itself.
+        """
+        # The ArcticModel *is* the decoder stack.
+        return self
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        ArcticModel does not include the lm_head.
+        """
+        # The lm_head is part of ArcticForCausalLM, not the base ArcticModel.
+        raise NotImplementedError("ArcticModel does not include the language model head. See ArcticForCausalLM.")
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=ArcticConfig, model_type="arctic")
 class ArcticForCausalLM(EasyDeLBaseModule):
@@ -777,6 +809,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -814,14 +847,9 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 
         hidden_states = outputs.last_hidden_state
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
 
@@ -829,10 +857,38 @@ class ArcticForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             all_router_losses=outputs.all_router_losses,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For ArcticForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("ArcticForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For ArcticForCausalLM, this is the underlying ArcticModel.
+        """
+        return self.model.get_decoder()  # self.model is the ArcticModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (ArcticModel)
+        return self.model.get_embedding()  # Leverages ArcticModel's get_embedding
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ArcticConfig, model_type="arctic")
@@ -962,3 +1018,35 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
             attentions=transformer_outputs.attentions,
             aux_loss=aux_loss,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For ArcticForSequenceClassification (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError(
+            "ArcticForSequenceClassification is a decoder-only model and does not have a separate encoder."
+        )
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For ArcticForSequenceClassification, this is the underlying ArcticModel.
+        """
+        return self.model.get_decoder()  # self.model is the ArcticModel instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        ArcticForSequenceClassification uses a classification head instead.
+        """
+        raise NotImplementedError(
+            "ArcticForSequenceClassification uses a classification head (self.score), not an lm_head."
+        )
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (ArcticModel)
+        return self.model.get_embedding()  # Leverages ArcticModel's get_embedding

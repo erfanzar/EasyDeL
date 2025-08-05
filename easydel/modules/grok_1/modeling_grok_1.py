@@ -31,11 +31,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import (
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -769,6 +765,32 @@ class Grok1Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=Grok1Config, model_type="grok-1")
 class Grok1ForCausalLM(EasyDeLBaseModule):
@@ -836,6 +858,7 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput | tuple:
         """Forward pass through the Grok1ForCausalLM model.
 
@@ -872,8 +895,9 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             cache_metadata=cache_metadata,
             segment_ids=segment_ids,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
-        logits = logits * self.output_multiplier_scale
+        logits = None
+        if apply_lm_head:
+            logits = self.apply_lm_head(outputs.last_hidden_state)
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(
@@ -888,7 +912,38 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
         )
+
+    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+        lm_logits = super().apply_lm_head(hidden_states)
+        lm_logits = lm_logits * self.output_multiplier_scale
+        return lm_logits
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()

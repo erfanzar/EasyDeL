@@ -23,8 +23,6 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-
-# import transformers
 from flax import nnx as nn
 from jax import lax
 
@@ -1241,6 +1239,31 @@ class WhisperModel(EasyDeLBaseModule):
             encoder_attentions=encoder_outputs.attentions,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.decoder
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.decoder.embed_tokens
+
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
 class WhisperForConditionalGeneration(EasyDeLBaseModule):
@@ -1296,6 +1319,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1318,11 +1342,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-
-        if self.config.tie_word_embeddings:
-            self.proj_out.kernel.value = self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
-
-        lm_logits = self.proj_out(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return Seq2SeqLMOutput(
             logits=lm_logits,
@@ -1570,6 +1592,30 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
             **batch,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.model.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.decoder
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.proj_out
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the decoder.
+        """
+        return self.model.decoder.embed_tokens
+
 
 @register_module(TaskType.AUDIO_CLASSIFICATION, config=WhisperConfig, model_type="whisper")
 class WhisperForAudioClassification(EasyDeLBaseModule):
@@ -1655,3 +1701,31 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        """
+        return self.encoder
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        This is an encoder-only model for classification.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has an audio classification head, not a language model head.
+        """
+        raise NotImplementedError("This model has an audio classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        The encoder uses convolutional layers for feature extraction, not a standard token embedding.
+        Returning the first convolutional layer as the "embedding" layer.
+        """
+        return self.encoder.conv1

@@ -556,8 +556,9 @@ class MaskedLMOutput(ModelOutput):
             heads.
     """
 
-    logits: chex.Array = None
+    logits: chex.Array | None = None
     hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: chex.Array | None = None
     attentions: tuple[chex.Array] | None = None
     attention_logits: tuple[chex.Array] | None = None
     past_key_values: TransformerCache | None = None

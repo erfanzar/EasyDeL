@@ -598,6 +598,9 @@ class AttentionImpl(BaseOperation):
             case EasyDeLBackends.GPU:
                 logger.debug("Calling into GPU exec")
                 return self.forward_gpu(*args, **kwargs)
+            case EasyDeLBackends.TT:
+                logger.debug("Calling into TT exec")
+                return self.forward_tt(*args, **kwargs)
             case EasyDeLBackends.CPU:
                 logger.debug("Calling into CPU exec")
                 return self.forward_native(*args, **kwargs)

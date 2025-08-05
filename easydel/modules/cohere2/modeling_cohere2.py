@@ -31,11 +31,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -589,6 +585,33 @@ class Cohere2Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For Cohere2Model (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("Cohere2Model is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For Cohere2Model, this is the model itself.
+        """
+        return self
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Cohere2Model does not include the lm_head.
+        """
+        raise NotImplementedError("Cohere2Model does not include the language model head. See Cohere2ForCausalLM.")
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=Cohere2Config, model_type="cohere2")
 class Cohere2ForCausalLM(EasyDeLBaseModule):
@@ -641,6 +664,7 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere module.
@@ -680,23 +704,59 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
-
-        lm_logits = lm_logits * self.logit_scale
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+        """
+        Applies the language model head to the hidden states.
+
+        Args:
+            hidden_states (chex.Array): The last hidden states from the model.
+
+        Returns:
+            chex.Array: The logits after applying the language model head.
+        """
+        lm_logits = self.lm_head(hidden_states)
+        if self.logit_scale is not None:
+            lm_logits *= self.logit_scale
+        return lm_logits
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For Cohere2ForCausalLM (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError("Cohere2ForCausalLM is a decoder-only model and does not have a separate encoder.")
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For Cohere2ForCausalLM, this is the underlying Cohere2Model.
+        """
+        return self.model.get_decoder()  # self.model is the Cohere2Model instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (Cohere2Model)
+        return self.model.get_embedding()  # Leverages Cohere2Model's get_embedding
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Cohere2Config, model_type="cohere2")
@@ -792,3 +852,35 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self) -> nn.Module:
+        """
+        Returns the encoder part of the model's graph definition.
+        For Cohere2ForSequenceClassification (decoder-only), this is not applicable.
+        """
+        raise NotImplementedError(
+            "Cohere2ForSequenceClassification is a decoder-only model and does not have a separate encoder."
+        )
+
+    def get_decoder(self) -> nn.Module:
+        """
+        Returns the decoder part of the model's graph definition.
+        For Cohere2ForSequenceClassification, this is the underlying Cohere2Model.
+        """
+        return self.model  # self.model is the Cohere2Model instance
+
+    def get_lm_head(self) -> nn.Module:
+        """
+        Returns the language model head of the module.
+        Cohere2ForSequenceClassification uses a classification head instead.
+        """
+        raise NotImplementedError(
+            "Cohere2ForSequenceClassification uses a classification head (self.score), not an lm_head."
+        )
+
+    def get_embedding(self) -> nn.Module:
+        """
+        Returns the embedding layer of the module.
+        """
+        # Access the embedding layer through the decoder (Cohere2Model)
+        return self.model.get_embedding()  # Leverages Cohere2Model's get_embedding

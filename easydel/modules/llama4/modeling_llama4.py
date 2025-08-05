@@ -36,11 +36,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -759,6 +755,32 @@ class Llama4TextModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4ForCausalLM(EasyDeLBaseModule):
@@ -808,6 +830,7 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
@@ -850,21 +873,42 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Llama4TextConfig, model_type="llama4_text")
@@ -993,6 +1037,32 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
 
 
 class Llama4VisionMLP2(nn.Module):
@@ -1637,6 +1707,33 @@ class Llama4VisionModel(EasyDeLBaseModule):
             attentions=output.attentions,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        This vision model acts as the encoder.
+        """
+        return self
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        This is an encoder-only model and does not have a decoder.
+        """
+        raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This vision model does not have a language model head.
+        """
+        raise NotImplementedError("This vision model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.patch_embedding
+
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Llama4Config, model_type="llama4")
 class Llama4ForConditionalGeneration(EasyDeLBaseModule):
@@ -1735,8 +1832,8 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_index >= self.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_index
+        if input_ids is not None and self.config.image_token_id >= self.vocab_size:
+            special_image_mask = input_ids == self.config.image_token_id
             llm_input_ids = input_ids
             llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
         else:
@@ -1751,7 +1848,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             image_features = self.get_image_features(pixel_values)
             vision_flat = image_features.reshape(-1, image_features.shape[-1])
             projected_vision_flat = self.multi_modal_projector(vision_flat)
-            final_mask = jnp.expand_dims(input_ids == self.config.image_token_index, axis=-1)
+            final_mask = jnp.expand_dims(input_ids == self.config.image_token_id, axis=-1)
             inputs_embeds_flat = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
             final_mask_1d = final_mask[..., 0].reshape(-1)
             num_projected_tokens = projected_vision_flat.shape[0]
@@ -1896,3 +1993,28 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.vision_model
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.language_model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.language_model.get_lm_head()
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.language_model.get_embedding()

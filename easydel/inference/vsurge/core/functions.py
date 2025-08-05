@@ -149,18 +149,13 @@ def continuous_prefill(
     rngs: jax.random.PRNGKey,
 ) -> tuple[GenerationState, ResultTokens]:
     batch_size, sequence_length = tokens.shape
-
     if valids.shape[-1] != max_length:
         valids = jax.lax.dynamic_update_slice(
             jnp.ones((batch_size, max_length), "b1"),
             valids.astype("b1"),
             (0, 0),
         ).astype("b1")
-
-    if attn_metadata is not None and hasattr(attn_metadata, "position_ids"):
-        positions = attn_metadata.position_ids[:, :sequence_length]
-    else:
-        positions = (valids.cumsum(axis=-1) - 1)[:, :sequence_length]
+    positions = (valids.cumsum(axis=-1) - 1)[:, :sequence_length]
 
     @implicit
     def _forward(gdef, gstate, gother, input_ids, attention_mask, position_ids, cache, metadata):
@@ -173,22 +168,30 @@ def continuous_prefill(
             past_key_values = cache
 
         with model.mesh:
-            return model(
+            outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_metadata=metadata,
+                apply_lm_head=False,
             )
+            if getattr(outputs, "last_hidden_state", None) is not None:
+                hidden_states = outputs.last_hidden_state
+            elif getattr(outputs, "hidden_states", None) is not None:
+                hidden_states = outputs.hidden_states[-1]
+            else:
+                raise ValueError(
+                    "The model output does not contain 'last_hidden_state' or 'hidden_states'. "
+                    "Please ensure the model is configured to return these outputs or open an issue."
+                )
+            return outputs.past_key_values, model.apply_lm_head(hidden_states[:, -1])
 
-    outputs = _forward(graphdef, graphstate, graphothers, tokens, valids, positions, cache, attn_metadata)
-    kv_cache = outputs.past_key_values
-    logits = outputs.logits[:, -1]
+    kv_cache, logits = _forward(graphdef, graphstate, graphothers, tokens, valids, positions, cache, attn_metadata)
 
-    # Sample next token
     next_token = dynamic_sample_tokens(
         tokens,
-        jnp.array([sequence_length], "i4"),  # Current length
+        jnp.array([1], "i4"),
         logits,
         sampling_params.top_p,
         sampling_params.temperature,
@@ -198,9 +201,8 @@ def continuous_prefill(
         sampling_params.repetition_penalty,
         rngs,
     ).reshape(logits.shape[0], -1)
-
     validity = jnp.ones_like(next_token, dtype="b1")
-    lengths = jnp.full((batch_size, 1), sequence_length, dtype="i4")
+    lengths = jnp.full((batch_size, 1), 0, dtype="i4")
 
     result = ResultTokens(
         data=jnp.concatenate([next_token, validity, lengths], axis=1),
@@ -209,21 +211,16 @@ def continuous_prefill(
         length_idx=(2, 3),
         samples_per_slot=samples_per_slot,
     )
-
-    # Update valids for the new position
-    new_valids = valids.at[:, sequence_length].set(1) if sequence_length < max_length else valids
-
     generation_state = GenerationState(
         logits=logits,
         cache=kv_cache,
-        index=jnp.array([[sequence_length + 1]]),
+        index=jnp.array((sequence_length,)).reshape(1, 1) + 1,
         tokens=next_token,
-        valids=new_valids,
-        next_position_ids=jnp.array([[sequence_length]]),
-        generated_tokens=jnp.ones((batch_size, 1), dtype=jnp.int32),
+        valids=valids,
+        next_position_ids=positions[:, -1:] + 1,
+        generated_tokens=jnp.zeros((batch_size, 1), dtype=jnp.int32),
         sampling_params=sampling_params,
     )
-
     return generation_state, result
 
 
@@ -311,6 +308,9 @@ def sample_top_p_efficient(
     filtered_top_k_logits = jnp.where(keep_mask_k, top_k_logits, -jnp.inf)
     sampled_k_index = jax.random.categorical(rng, filtered_top_k_logits)
     return jnp.take_along_axis(top_k_indices, jnp.expand_dims(sampled_k_index, axis=-1), axis=-1).squeeze(-1)
+
+
+vmaped_sample_top_p_efficient = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)
 
 
 @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=(0))

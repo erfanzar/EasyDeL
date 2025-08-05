@@ -334,7 +334,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             llm_input_ids = input_ids
 
         if inputs_embeds is None:
-            inputs_embeds = self.language_model.embed_tokens(llm_input_ids)
+            inputs_embeds = self.language_model.get_embedding()(llm_input_ids)
 
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
@@ -484,6 +484,32 @@ class AyaVisionModel(EasyDeLBaseModule):
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.vision_tower
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.language_model
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        return self.language_model.get_lm_head()
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the language model (decoder).
+        """
+        return self.language_model.get_embedding()
+
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=AyaVisionConfig, model_type="aya_vision")
 class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
@@ -547,6 +573,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -602,14 +629,9 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.language_model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return AyaVisionCausalLMOutputWithPast(
             loss=None,
@@ -720,3 +742,28 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         """
         model_kwargs = self.model.update_inputs_for_generation(model_outputs, model_kwargs)
         return model_kwargs
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        The vision tower acts as the encoder in this multi-modal setup.
+        """
+        return self.model.vision_tower
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the language model (decoder).
+        """
+        return self.model.get_embedding()

@@ -16,4 +16,4 @@ from .core import vDriver, vEngine
 from .server import vSurgeApiServer
 from .vsurge import vSurge, vSurgeRequest
 
-__all__ = ("vDriver", "vEngine", "vSurge", "vSurgeApiServer", "vSurgeRequest")
+__all__ = "vDriver", "vEngine", "vSurge", "vSurgeApiServer", "vSurgeRequest"

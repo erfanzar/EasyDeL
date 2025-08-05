@@ -24,11 +24,9 @@ import typing as tp
 import uuid
 from asyncio import futures
 from bisect import bisect_left
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import jax
-import msgspec
 import numpy as np
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
@@ -42,7 +40,7 @@ if tp.TYPE_CHECKING:
     from easydel.infra.utils import ProcessingClassType
 
 
-V = tp.TypeVar("V")
+_V = tp.TypeVar("_V")
 
 
 class SlotData(tp.NamedTuple):
@@ -204,7 +202,7 @@ class ReturnSample:
     text: list[str] | str
     token_ids: list[int]
     time_spent_computing: float = 0.0
-    accumulated_text: list[str] | str = None
+    accumulated_text: list[str] | str | None = None
     tokens_per_second: float | None = dataclasses.field(default=None)
     num_generated_tokens: int | None = dataclasses.field(default=None)
     generation_idx: int | None = dataclasses.field(default=None)
@@ -214,14 +212,14 @@ class _Exception:
     """A class for propagating exceptions through a queue.
 
     By wrapping them with a custom private class we ensure that any type
-    (including Exception) can be used as a V.
+    (including Exception) can be used as a _V.
     """
 
     def __init__(self, exception: Exception) -> None:
         self.exception = exception
 
 
-class AsyncMultifuture(tp.Generic[V]):
+class AsyncMultifuture(tp.Generic[_V]):
     """AsyncMultifuture is like concurrent.futures.Future but supports returning
 
     multiple results. It provides an unidirectional stream with buffering and
@@ -235,7 +233,7 @@ class AsyncMultifuture(tp.Generic[V]):
         self._cancelled = threading.Event()
         self._done = threading.Event()
         self._loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue[V | _Exception]()
+        self._queue = asyncio.Queue[_V | _Exception]()
 
     def cancel(self, unused: tp.Any = None) -> None:
         """Cancels the asyncmultifuture."""
@@ -267,7 +265,7 @@ class AsyncMultifuture(tp.Generic[V]):
         self._loop.call_soon_threadsafe(self._queue.put_nowait, _Exception(exception))
         self._loop.call_soon_threadsafe(self._done.set)
 
-    def add_result(self, result: V) -> None:
+    def add_result(self, result: _V) -> None:
         """Adds the result to the asyncmultifuture.
 
         Caller must call .close() once all results are added.
@@ -284,7 +282,7 @@ class AsyncMultifuture(tp.Generic[V]):
     def __aiter__(self) -> AsyncMultifuture:
         return self
 
-    async def __anext__(self) -> V:
+    async def __anext__(self) -> _V:
         """Returns the next value."""
         value = await self._queue.get()
         if isinstance(value, _Exception):
@@ -646,170 +644,6 @@ def calculate_pefill_lengths(max_prefill_length: int, num_pages: int = 128):
         {i * num_pages for i in range(1, (max_prefill_length // num_pages) + 1) if (i * num_pages) in allowed_calls}
         | {max_prefill_length}
     )
-
-
-class LogprobsLists(tp.NamedTuple):
-    logprob_token_ids: list[list[int]]
-    logprobs: list[list[float]]
-    sampled_token_ranks: list[int]
-
-    def slice(self, start: int, end: int):
-        return LogprobsLists(
-            self.logprob_token_ids[start:end],
-            self.logprobs[start:end],
-            self.sampled_token_ranks[start:end],
-        )
-
-
-class LogprobsTensors(tp.NamedTuple):
-    logprob_token_ids: jax.Array
-    logprobs: jax.Array
-    selected_token_ranks: jax.Array
-
-    def tolists(self):
-        return LogprobsLists(self.logprob_token_ids.tolist(), self.logprobs.tolist(), self.selected_token_ranks.tolist())
-
-    @staticmethod
-    def empty(num_positions: int, num_tokens_per_position: int) -> LogprobsTensors:
-        logprob_token_ids = jnp.empty((num_positions, num_tokens_per_position), dtype="i4")
-        logprobs = jnp.empty_like(logprob_token_ids, dtype=jnp.float32)
-        selected_token_ranks = jnp.empty(num_positions, dtype="i4")
-        return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids,
-            logprobs=logprobs,
-            selected_token_ranks=selected_token_ranks,
-        )
-
-
-@dataclass
-class PrefixCacheStats:
-    """Stores prefix cache hit statistics."""
-
-    reset: bool = False
-    requests: int = 0
-    queries: int = 0
-    hits: int = 0
-
-
-@dataclass
-class SpecDecodingStats:
-    """Per-step iteration decoding stats from scheduler.
-
-    Each scheduler step, statistics on spec decoding performance are
-    aggregated across requests by the scheduler and returned to the
-    frontend in EngineCoreOutputs->SchedulerStats.
-    """
-
-    num_spec_tokens: int
-    num_drafts: int = 0
-    num_draft_tokens: int = 0
-    num_accepted_tokens: int = 0
-    num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
-
-    @classmethod
-    def new(cls, num_spec_tokens: int) -> SpecDecodingStats:
-        return cls(num_spec_tokens=num_spec_tokens, num_accepted_tokens_per_pos=[0] * num_spec_tokens)
-
-    def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
-        self.num_drafts += 1
-        self.num_draft_tokens += num_draft_tokens
-        self.num_accepted_tokens += num_accepted_tokens
-        assert num_accepted_tokens <= self.num_spec_tokens
-        for i in range(num_accepted_tokens):
-            self.num_accepted_tokens_per_pos[i] += 1
-
-
-@dataclass
-class SchedulerStats:
-    """Stats associated with the scheduler."""
-
-    num_running_reqs: int = 0
-    num_waiting_reqs: int = 0
-    kv_cache_usage: float = 0.0
-    prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
-    spec_decoding_stats: SpecDecodingStats | None = None
-
-
-def is_list_of(
-    value: object,
-    typ: type[V] | tuple[type[V], ...],
-    *,
-    check: tp.Literal["first", "all"] = "first",
-) -> list[V]:
-    if not isinstance(value, list):
-        return False
-
-    if check == "first":
-        return len(value) == 0 or isinstance(value[0], typ)
-    elif check == "all":
-        return all(isinstance(v, typ) for v in value)
-
-    tp.assert_never(check)
-
-
-class ConstantList(tp.Generic[V], Sequence):
-    def __init__(self, x: list[V]) -> None:
-        self._x = x
-
-    def append(self, item):
-        raise Exception("Cannot append to a constant list")
-
-    def extend(self, item):
-        raise Exception("Cannot extend a constant list")
-
-    def insert(self, item):
-        raise Exception("Cannot insert into a constant list")
-
-    def pop(self, item):
-        raise Exception("Cannot pop from a constant list")
-
-    def remove(self, item):
-        raise Exception("Cannot remove from a constant list")
-
-    def clear(self):
-        raise Exception("Cannot clear a constant list")
-
-    def index(self, item: V, start: int = 0, stop: int | None = None) -> int:
-        return self._x.index(item, start, stop if stop is not None else len(self._x))
-
-    @tp.overload
-    def __getitem__(self, item: int) -> V: ...
-
-    @tp.overload
-    def __getitem__(self, s: slice, /) -> list[V]: ...
-
-    def __getitem__(self, item: int | slice) -> V | list[V]:
-        return self._x[item]
-
-    @tp.overload
-    def __setitem__(self, item: int, value: V): ...
-
-    @tp.overload
-    def __setitem__(self, s: slice, value: V, /): ...
-
-    def __setitem__(self, item: int | slice, value: V | list[V]):
-        raise Exception("Cannot set item in a constant list")
-
-    def __delitem__(self, item):
-        raise Exception("Cannot delete item from a constant list")
-
-    def __iter__(self):
-        return iter(self._x)
-
-    def __contains__(self, item):
-        return item in self._x
-
-    def __len__(self):
-        return len(self._x)
-
-    def __repr__(self):
-        return f"ConstantList({self._x})"
-
-
-class UtilityOutput(msgspec.Struct, array_like=True, gc=False):
-    call_id: int
-    failure_message: str | None = None
-    result: tp.Any = None
 
 
 class MetricsRecorder:

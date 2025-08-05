@@ -32,11 +32,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -714,6 +710,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """Forward pass of the Qwen2 MoE model.
 
@@ -830,6 +827,32 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        raise NotImplementedError("The base model does not have a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.embed_tokens
+
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen2MoeConfig, model_type="qwen2_moe")
 class Qwen2MoeForCausalLM(EasyDeLBaseModule):
@@ -906,6 +929,7 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass of the Qwen2 MoE model for Causal Language Modeling.
 
@@ -950,14 +974,9 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         )
         hidden_states = outputs.last_hidden_state
 
-        if self.config.tie_word_embeddings:
-            logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            logits = self.lm_head(hidden_states)
+        logits = None
+        if apply_lm_head:
+            logits = self.apply_lm_head(hidden_states)
 
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
@@ -973,10 +992,36 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2MoeConfig, model_type="qwen2_moe")
@@ -1053,6 +1098,7 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -1116,3 +1162,29 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        This model has a sequence classification head, not an LM Head.
+        """
+        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()

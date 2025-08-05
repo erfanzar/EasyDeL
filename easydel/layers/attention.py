@@ -534,7 +534,8 @@ class AttentionModule(nn.Module):
         if cache_view is None:
             if causal:
                 target_length = initial_key_length
-                causal_mask = causal_mask or self.config._create_causal_mask(target_length=target_length)
+                if isinstance(causal_mask, bool) or causal_mask is None:
+                    causal_mask = self.config._create_causal_mask(target_length=target_length)
                 causal_mask = causal_mask[:, :, :query_length, :initial_key_length]
                 causal_mask = jnp.broadcast_to(causal_mask, (attention_mask.shape[0], *causal_mask.shape[1:]))
                 if token_type_ids is not None and query_length != 1:
