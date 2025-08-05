@@ -48,7 +48,7 @@ class vSurgeLMEvalAdapter(LM):
         max_length: int = 8192,
         max_new_tokens: int = 2048,
         top_p: float = 0.95,
-        temperature: float = 0.1,
+        temperature: float = 0.0,
     ):
         """Initializes the vSurgeLMEvalAdapter.
 
@@ -102,8 +102,8 @@ class vSurgeLMEvalAdapter(LM):
         if self.setup_complete:
             return
 
-        self.surge.start()
         self.surge.compile()
+        self.surge.start()
         self.setup_complete = True
 
     def stop(self):
@@ -172,7 +172,7 @@ class vSurgeLMEvalAdapter(LM):
         )
         generated_texts = []
         for i, result_list in enumerate(results):
-            text = result_list.accumulated_text[0]
+            text = result_list.text[0][0]
             if stop_sequences and i < len(stop_sequences):
                 for stop in stop_sequences[i]:
                     if stop in text:

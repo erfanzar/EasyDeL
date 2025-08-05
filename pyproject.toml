@@ -75,15 +75,16 @@ torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
 gpu = ["jax[cuda12]==0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]==0.7.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
+lm_eval = ["lm_eval~=0.4.9.1"]
 
 [tool.black]
 line-length = 121
-target-version = ["py310"]
+target-version = ["py311"]
 preview = true
 
 [tool.ruff]
 line-length = 121
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
