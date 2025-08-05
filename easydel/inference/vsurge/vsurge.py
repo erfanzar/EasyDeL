@@ -207,7 +207,6 @@ class vSurge:
         page_size: int = 128,
         hbm_utilization: float = 0.8,
         interleaved_mode: bool = False,
-        detokenizing_blocks: int = 8,
         slot_clear_steps: int = 0,
         vsurge_name: str | None = None,
         verbose: bool = True,
@@ -244,8 +243,6 @@ class vSurge:
                 the decoding workspace.
             interleaved_mode (bool): If True, enables interleaved decoding and prefill
                 scheduling. Defaults to False.
-            detokenizing_blocks (int): Number of detokenization blocks used during
-                output post-processing. Defaults to 8.
             slot_clear_steps (int): Number of steps after which stale memory slots
                 are cleared. Defaults to 0.
             vsurge_name (tp.Optional[str]): Optional name identifier for the created
@@ -301,7 +298,6 @@ class vSurge:
                     seed=seed,
                 ),
                 interleaved_mode=interleaved_mode,
-                detokenizing_blocks=detokenizing_blocks,
                 slot_clear_steps=slot_clear_steps,
                 verbose=verbose,
             ),

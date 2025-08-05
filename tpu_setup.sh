@@ -221,7 +221,7 @@ log_info "Starting package installations in virtual environment..."
 
 log_info "Uninstalling existing easydel..."
 eopod run "~/.local/bin/uv pip uninstall  --python ${VENV_PATH}/bin/python easydel" 2>/dev/null || true
-install_package "git+https://github.com/erfanzar/easydel.git[tpu,torch]" || exit 1
+install_package "git+https://github.com/erfanzar/easydel.git[tpu,torch,lm_eval]" || exit 1
 
 log_info "Configuring Ray..."
 if ! "$ENV_EOPOD_PATH" auto-config-ray --self-job --python-path "$VENV_PATH/bin/python"; then
