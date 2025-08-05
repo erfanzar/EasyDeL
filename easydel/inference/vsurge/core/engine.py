@@ -424,9 +424,9 @@ class vEngine:
         true_length: int,
         sampling_params: JitableSamplingParams,
         rngs: jax.random.PRNGKey,
-        cache: TransformerCache | PagesCache | None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None,
-        slot: int,
+        cache: TransformerCache | PagesCache | None = None,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        slot: int = 0,
     ) -> tuple[GenerationState, ResultTokens]:
         """Performs the prefill step for initializing the generation process.
 
@@ -473,9 +473,9 @@ class vEngine:
         graphstate: nn.GraphState,
         graphothers: nn.GraphState,
         state: GenerationState,
-        cache_metadata: TransformerMetadata | PagesMetadata | None,
         rngs: jax.random.PRNGKey,
-        slot: int,
+        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        slot: int = 0,
     ) -> tuple[GenerationState, ResultTokens]:
         """Performs a single decode step in the autoregressive generation loop.
 
