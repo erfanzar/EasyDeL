@@ -496,7 +496,6 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
     if not is_flatten(tree):
         tree = flatten_dict(tree)
     tree = string_key_to_int(tree)
-
     for keys in list(params.keys()):
         tree_values = tree.get(keys, None)
         if tree_values is not None:
