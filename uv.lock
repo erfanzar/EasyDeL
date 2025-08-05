@@ -553,7 +553,7 @@ requires-dist = [
     { name = "eformer", specifier = "==0.0.47" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "fastapi", specifier = ">=0.115.2" },
-    { name = "flax", specifier = "==0.10.7" },
+    { name = "flax", specifier = "==0.11.0" },
     { name = "gcsfs" },
     { name = "grain", specifier = "~=0.2.11" },
     { name = "jax", specifier = "==0.7.0" },
@@ -681,7 +681,7 @@ wheels = [
 
 [[package]]
 name = "flax"
-version = "0.10.7"
+version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
@@ -695,9 +695,9 @@ dependencies = [
     { name = "treescope" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/76/4ea55a60a47e98fcff591238ee26ed4624cb4fdc4893aa3ebf78d0d021f4/flax-0.10.7.tar.gz", hash = "sha256:2930d6671e23076f6db3b96afacf45c5060898f5c189ecab6dda7e05d26c2085", size = 5136099, upload-time = "2025-07-02T06:10:07.819Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/44/1db7010083a43a4655325731729b413f085373315ce53f90e2ae92665043/flax-0.11.0.tar.gz", hash = "sha256:4b03b7938b5e1f8c5843f59af41116e9184f98e10ce61a8d33b5dd7d2ba91edd", size = 5072990, upload-time = "2025-07-29T21:05:16.449Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/f6/560d338687d40182c8429cf35c64cc022e0d57ba3e52191c4a78ed239b4e/flax-0.10.7-py3-none-any.whl", hash = "sha256:4033223a9a9969ba0b252e085e9714d0a1e9124ac300aaf48e92c40769c420f6", size = 456944, upload-time = "2025-07-02T06:10:05.807Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/70/476765f56b64d0533e3d2c4ee2772f1c12a14fe505dd985bf3ee2c6e55b8/flax-0.11.0-py3-none-any.whl", hash = "sha256:9dd67b7296e70c311a8cfd9a5fcd7bdaac9ccbc732ac70cc5c40b3534532d30a", size = 455936, upload-time = "2025-07-29T21:05:14.21Z" },
 ]
 
 [[package]]
