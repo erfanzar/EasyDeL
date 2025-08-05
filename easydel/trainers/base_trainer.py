@@ -327,7 +327,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self.arguments.performance_mode:
             import easydel
 
-            interval = 1.0 if self.arguments.track_memory is True else self.arguments.track_memory
+            interval = (
+                self.arguments.track_memory
+                if isinstance(self.arguments.track_memory, (int, float))
+                else 1.0
+            )
             self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
@@ -853,13 +857,18 @@ class BaseTrainer(BaseTrainerProtocol):
             self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
             self._save_readme(directory_name)
 
-        state.save_state(
-            save_directory=directory_name,
-            float_dtype=self.model.param_dtype,
-            verbose=self.arguments.verbose,
-            save_optimizer=self.arguments.save_optimizer_state,
-            enable=self.is_enable,
-        )
+        try:
+            state.save_state(
+                save_directory=directory_name,
+                float_dtype=self.model.param_dtype,
+                verbose=self.arguments.verbose,
+                save_optimizer=self.arguments.save_optimizer_state,
+                enable=self.is_enable,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving state to {directory_name}: {e}")
 
         return str(directory_name)
 

@@ -328,7 +328,7 @@ def orpo_step(
     )
 
     # Apply sharding constraints to the batch.
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(arr=batch, sharding={key: partition_spec for key in batch.keys()})
 
     def calculate_loss(tree: nn.GraphState, batch: dict):
         """
