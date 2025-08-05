@@ -23,7 +23,6 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
-from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -675,27 +674,27 @@ class Gemma3TextModel(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
         return self
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         Base Models don't have a Language Model Head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -764,6 +763,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """
         Forward pass through the Gemma3 model.
@@ -805,14 +805,9 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
         if self.config.final_logit_softcapping is not None:
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
@@ -820,9 +815,36 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
         return CausalLMOutput(
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
+        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
+        return self.model.get_decoder()
+
+    def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
+        return self.lm_head
+
+    def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
+        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma3TextConfig, model_type="gemma3_text")
@@ -884,6 +906,7 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
@@ -917,30 +940,30 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
             attentions=transformer_outputs.attentions,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
         return self.model
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         """
         return self.lm_head
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
-        return self.model.embed_tokens
+        return self.model.get_embedding()
 
 
 class Gemma3MultiModalProjector(nn.Module):
@@ -1088,14 +1111,12 @@ class Gemma3Model(EasyDeLBaseModule):
         else:
             llm_input_ids = input_ids
         if inputs_embeds is None:
-            inputs_embeds = self.language_model.embed_tokens(llm_input_ids) * (
-                self.config.get_text_config().hidden_size ** 0.5
-            )
+            inputs_embeds = self.get_embedding()(llm_input_ids) * (self.config.get_text_config().hidden_size ** 0.5)
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
             if input_ids is None:
-                special_image_mask = inputs_embeds == self.language_model.embed_tokens(
+                special_image_mask = inputs_embeds == self.get_embedding()(
                     jnp.array(self.config.image_token_id, dtype="i4")
                 )
             else:
@@ -1208,7 +1229,7 @@ class Gemma3Model(EasyDeLBaseModule):
         model_kwargs.pop("token_type_ids", None)  # only effect first iter
         return model_kwargs
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         Gemma3 is a multi-modal model with a vision tower, but for typical LLM usage,
@@ -1216,24 +1237,24 @@ class Gemma3Model(EasyDeLBaseModule):
         """
         return self.vision_tower
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
-        return self.language_model
+        return self.language_model.get_decoder()
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         Base Models don't have a Language Model Head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
-        return self.language_model.embed_tokens
+        return self.language_model.get_embedding()
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Gemma3Config, model_type="gemma3")
@@ -1286,6 +1307,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         token_type_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
@@ -1306,17 +1328,10 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
             **lm_kwargs,
         )
         hidden_states = outputs.last_hidden_state
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.language_model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
-        if self.config.get_text_config().final_logit_softcapping is not None:
-            cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
-            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return Gemma3CausalLMOutputWithPast(
             loss=None,
@@ -1327,6 +1342,13 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states if pixel_values is not None else None,
         )
+
+    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+        lm_logits = super().apply_lm_head(hidden_states)
+        if self.config.get_text_config().final_logit_softcapping is not None:
+            cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
+            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+        return lm_logits
 
     def init_cache(self, batch_size, max_length, starts=None, shardings=None, pad_token_id=None):
         return self.model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
@@ -1381,27 +1403,27 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         return self.model.update_inputs_for_generation(model_outputs, model_kwargs)
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         The vision tower acts as the encoder in this multi-modal setup.
         """
         return self.model.vision_tower
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
-        return self.model.language_model
+        return self.model.get_decoder()
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         """
         return self.lm_head
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
-        return self.model.language_model.embed_tokens
+        return self.model.get_embedding()

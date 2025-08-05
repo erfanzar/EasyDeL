@@ -664,6 +664,7 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere module.
@@ -703,23 +704,32 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
-
-        lm_logits = lm_logits * self.logit_scale
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
+
+    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+        """
+        Applies the language model head to the hidden states.
+
+        Args:
+            hidden_states (chex.Array): The last hidden states from the model.
+
+        Returns:
+            chex.Array: The logits after applying the language model head.
+        """
+        lm_logits = self.lm_head(hidden_states)
+        if self.logit_scale is not None:
+            lm_logits *= self.logit_scale
+        return lm_logits
 
     def get_encoder(self) -> nn.Module:
         """
@@ -733,7 +743,7 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
         Returns the decoder part of the model's graph definition.
         For Cohere2ForCausalLM, this is the underlying Cohere2Model.
         """
-        return self.model  # self.model is the Cohere2Model instance
+        return self.model.get_decoder()  # self.model is the Cohere2Model instance
 
     def get_lm_head(self) -> nn.Module:
         """

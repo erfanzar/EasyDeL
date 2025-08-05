@@ -21,7 +21,6 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
-from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -745,27 +744,27 @@ class CLIPTextTransformer(EasyDeLBaseModule):
             attentions=encoder_outputs.attentions,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This model has a projection head, not a language model head.
         """
         raise NotImplementedError("This model has a projection head, not a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -874,27 +873,27 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             attentions=encoder_outputs.attentions,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This vision model does not have a language model head.
         """
         raise NotImplementedError("This vision model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -966,27 +965,27 @@ class CLIPTextModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self.text_model
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         Base Models don't have a Language Model Head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -1077,27 +1076,27 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
             attentions=text_outputs.attentions,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self.text_model
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This model has a projection head, not a language model head.
         """
         raise NotImplementedError("This model has a projection head, not a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -1165,27 +1164,27 @@ class CLIPVisionModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self.vision_model
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This vision model does not have a language model head.
         """
         raise NotImplementedError("This vision model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -1269,27 +1268,27 @@ class CLIPForImageClassification(EasyDeLBaseModule):
             attentions=outputs.attentions,
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         """
         return self.vision_model
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model for classification.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This model has an image classification head, not a language model head.
         """
         raise NotImplementedError("This model has an image classification head, not a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -1433,28 +1432,28 @@ class CLIPModel(EasyDeLBaseModule):
         outputs = outputs.replace(loss=loss.loss)
         return outputs, loss
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         The vision tower acts as the encoder in this multi-modal setup.
         """
         return self.vision_model
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         The text model acts as the "decoder" or text processor in this multi-modal setup.
         """
         return self.text_model
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This model does not have a traditional language model head, but projection heads.
         """
         raise NotImplementedError("This model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the text model.
         """

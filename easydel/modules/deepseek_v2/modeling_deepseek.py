@@ -1058,6 +1058,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """
         Forward pass of the causal language model.
@@ -1100,18 +1101,14 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
         )
@@ -1129,7 +1126,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
         For DeepseekV2ForCausalLM, this is the underlying DeepseekV2Model.
         """
         # Assuming the base model is stored in `self.model`
-        return self.model
+        return self.model.get_decoder()
 
     def get_lm_head(self) -> nn.Module:
         """
