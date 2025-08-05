@@ -26,12 +26,7 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    BaseModelOutput,
-    CausalLMOutput,
-    DecoderLayerOutput,
-)
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import (
     ACT2FN,
     ModuleCaches,

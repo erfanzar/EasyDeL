@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .gidd_configuration import GiddConfig
-from .modeling_gidd_flax import GiddForDiffusionLM, GiddModel
+from .modeling_gidd import GiddForDiffusionLM, GiddModel
 
 __all__ = ("GiddConfig", "GiddForDiffusionLM", "GiddModel")
