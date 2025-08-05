@@ -149,18 +149,13 @@ def continuous_prefill(
     rngs: jax.random.PRNGKey,
 ) -> tuple[GenerationState, ResultTokens]:
     batch_size, sequence_length = tokens.shape
-
     if valids.shape[-1] != max_length:
         valids = jax.lax.dynamic_update_slice(
             jnp.ones((batch_size, max_length), "b1"),
             valids.astype("b1"),
             (0, 0),
         ).astype("b1")
-
-    if attn_metadata is not None and hasattr(attn_metadata, "position_ids"):
-        positions = attn_metadata.position_ids[:, :sequence_length]
-    else:
-        positions = (valids.cumsum(axis=-1) - 1)[:, :sequence_length]
+    positions = (valids.cumsum(axis=-1) - 1)[:, :sequence_length]
 
     @implicit
     def _forward(gdef, gstate, gother, input_ids, attention_mask, position_ids, cache, metadata):
@@ -184,11 +179,9 @@ def continuous_prefill(
     outputs = _forward(graphdef, graphstate, graphothers, tokens, valids, positions, cache, attn_metadata)
     kv_cache = outputs.past_key_values
     logits = outputs.logits[:, -1]
-
-    # Sample next token
     next_token = dynamic_sample_tokens(
         tokens,
-        jnp.array([sequence_length], "i4"),  # Current length
+        jnp.array([1], "i4"),
         logits,
         sampling_params.top_p,
         sampling_params.temperature,
@@ -198,9 +191,8 @@ def continuous_prefill(
         sampling_params.repetition_penalty,
         rngs,
     ).reshape(logits.shape[0], -1)
-
     validity = jnp.ones_like(next_token, dtype="b1")
-    lengths = jnp.full((batch_size, 1), sequence_length, dtype="i4")
+    lengths = jnp.full((batch_size, 1), 0, dtype="i4")
 
     result = ResultTokens(
         data=jnp.concatenate([next_token, validity, lengths], axis=1),
@@ -209,21 +201,16 @@ def continuous_prefill(
         length_idx=(2, 3),
         samples_per_slot=samples_per_slot,
     )
-
-    # Update valids for the new position
-    new_valids = valids.at[:, sequence_length].set(1) if sequence_length < max_length else valids
-
     generation_state = GenerationState(
         logits=logits,
         cache=kv_cache,
-        index=jnp.array([[sequence_length + 1]]),
+        index=jnp.array((sequence_length,)).reshape(1, 1) + 1,
         tokens=next_token,
-        valids=new_valids,
-        next_position_ids=jnp.array([[sequence_length]]),
-        generated_tokens=jnp.ones((batch_size, 1), dtype=jnp.int32),
+        valids=valids,
+        next_position_ids=positions[:, -1:] + 1,
+        generated_tokens=jnp.zeros((batch_size, 1), dtype=jnp.int32),
         sampling_params=sampling_params,
     )
-
     return generation_state, result
 
 
