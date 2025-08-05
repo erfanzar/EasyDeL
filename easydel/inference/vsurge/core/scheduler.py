@@ -86,7 +86,9 @@ class Scheduler:
                 pass
 
         return SchedulerAction(
-            prefill_requests=prefill_requests, decode_slots=decode_slots, active_requests=active_requests
+            prefill_requests=prefill_requests,
+            decode_slots=decode_slots,
+            active_requests=active_requests,
         )
 
     def insert_prefill_result(self, request: ActiveRequest, slot: int):
