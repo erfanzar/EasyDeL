@@ -200,6 +200,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
@@ -265,6 +266,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """
         Forward pass for Mixture-of-Experts (MoE) Models.
@@ -301,6 +303,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """
         Forward pass for Mixture-of-Experts (MoE) Causal Language Models.

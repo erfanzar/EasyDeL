@@ -168,17 +168,27 @@ def continuous_prefill(
             past_key_values = cache
 
         with model.mesh:
-            return model(
+            outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_metadata=metadata,
+                apply_lm_head=False,
             )
+            if getattr(outputs, "last_hidden_state", None) is not None:
+                hidden_states = outputs.last_hidden_state
+            elif getattr(outputs, "hidden_states", None) is not None:
+                hidden_states = outputs.hidden_states[-1]
+            else:
+                raise ValueError(
+                    "The model output does not contain 'last_hidden_state' or 'hidden_states'. "
+                    "Please ensure the model is configured to return these outputs or open an issue."
+                )
+            return outputs.past_key_values, model.apply_lm_head(hidden_states[:, -1])
 
-    outputs = _forward(graphdef, graphstate, graphothers, tokens, valids, positions, cache, attn_metadata)
-    kv_cache = outputs.past_key_values
-    logits = outputs.logits[:, -1]
+    kv_cache, logits = _forward(graphdef, graphstate, graphothers, tokens, valids, positions, cache, attn_metadata)
+
     next_token = dynamic_sample_tokens(
         tokens,
         jnp.array([1], "i4"),

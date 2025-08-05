@@ -255,21 +255,13 @@ class vDriver:
         decode_state = engine.init_decode_state()
         self.log("[Process] Processing thread started.")
 
-        # Pre-allocate some variables to reduce memory allocation overhead
         last_slot_clear_step = 0
 
         while self.live:
             action: SchedulerAction = self.scheduler.schedule()
-            self.log(
-                f"[Process] Scheduler action - Prefill: {len(action.prefill_requests)}, "
-                f"Decode: {len(action.decode_slots)}"
-            )
-
-            # Process prefill requests
             for request in action.prefill_requests:
                 decode_state = self._process_single_prefill_request(request, engine, processor, decode_state)
 
-            # Process decode slots
             if action.decode_slots:
                 generate_timestep, decode_state = self._process_decode_slots(
                     action.decode_slots,
@@ -277,8 +269,6 @@ class vDriver:
                     decode_state,
                     generate_timestep,
                 )
-
-            # Periodic slot resource cleanup
             if self._slot_clear_steps and (generate_timestep - last_slot_clear_step) >= self._slot_clear_steps:
                 decode_state = self._perform_slot_cleanup(engine, decode_state, generate_timestep)
                 last_slot_clear_step = generate_timestep

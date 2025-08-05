@@ -168,6 +168,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
         attn_temperature_tuning=4,
         floor_scale=8192,
         attn_scale=0.1,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -214,7 +215,6 @@ class Llama4TextConfig(EasyDeLBaseConfig):
             int((layer_idx + 1) % no_rope_layer_interval != 0) for layer_idx in range(self.num_hidden_layers)
         ]
 
-        # no_rope_layers == [] is invalid as we cannot have 0 layers
         self.no_rope_layers = no_rope_layers if no_rope_layers else default_no_rope_layers
 
         self.interleave_moe_layer_step = interleave_moe_layer_step
@@ -224,6 +224,9 @@ class Llama4TextConfig(EasyDeLBaseConfig):
             else list(range(interleave_moe_layer_step - 1, num_hidden_layers, interleave_moe_layer_step))
         )
         self.attention_chunk_size = attention_chunk_size
+        if layer_types is None:
+            layer_types = ["chunked_attention" if no_rope else "full_attention" for no_rope in self.no_rope_layers]
+        self.layer_types = layer_types
 
     get_partition_rules = _get_partition_rules
 
@@ -232,6 +235,11 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 class Llama4Config(EasyDeLBaseConfig):
     model_type = "llama4"
     sub_configs: typing.ClassVar = {"text_config": Llama4TextConfig, "vision_config": Llama4VisionConfig}
+    attribute_map: typing.ClassVar = {
+        "image_token_id": "image_token_index",
+        "boi_token_id": "boi_token_index",
+        "eoi_token_id": "eoi_token_index",
+    }
 
     def __init__(
         self,

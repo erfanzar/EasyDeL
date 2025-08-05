@@ -809,6 +809,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -846,14 +847,9 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 
         hidden_states = outputs.last_hidden_state
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
 
@@ -861,6 +857,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=lm_logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             all_router_losses=outputs.all_router_losses,
             past_key_values=outputs.past_key_values,
@@ -878,7 +875,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
         Returns the decoder part of the model's graph definition.
         For ArcticForCausalLM, this is the underlying ArcticModel.
         """
-        return self.model  # self.model is the ArcticModel instance
+        return self.model.get_decoder()  # self.model is the ArcticModel instance
 
     def get_lm_head(self) -> nn.Module:
         """
@@ -1036,7 +1033,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
         Returns the decoder part of the model's graph definition.
         For ArcticForSequenceClassification, this is the underlying ArcticModel.
         """
-        return self.model  # self.model is the ArcticModel instance
+        return self.model.get_decoder()  # self.model is the ArcticModel instance
 
     def get_lm_head(self) -> nn.Module:
         """

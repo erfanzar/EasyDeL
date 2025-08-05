@@ -922,6 +922,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput | tuple:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -938,7 +939,9 @@ class DbrxForCausalLM(EasyDeLBaseModule):
             cache_metadata=cache_metadata,
             segment_ids=segment_ids,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        logits = None
+        if apply_lm_head:
+            logits = self.apply_lm_head(outputs.last_hidden_state)
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(
@@ -953,6 +956,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
@@ -970,14 +974,13 @@ class DbrxForCausalLM(EasyDeLBaseModule):
         Returns the decoder part of the model's graph definition.
         For DbrxForCausalLM, this is the underlying DbrxModel.
         """
-        return self.transformer  # self.transformer is the DbrxModel instance
+        return self.transformer.get_decoder()
 
     def get_lm_head(self) -> nn.Module:
         """
         Returns the language model head of the module.
         """
-        # Note: The DBRX code uses `self.score` for the lm_head, not `self.lm_head`
-        return self.score
+        return self.lm_head
 
     def get_embedding(self) -> nn.Module:
         """

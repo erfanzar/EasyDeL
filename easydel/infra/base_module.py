@@ -48,6 +48,8 @@ from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
+    from easydel.layers.linear import ParallelLinear
+
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
 
 
@@ -916,7 +918,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         return ()
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self: Self) -> nn.Module | EasyDeLBaseModule:
         """
         Returns the encoder part of the model's graph definition.
 
@@ -925,7 +927,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         raise NotImplementedError()
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self: Self) -> nn.Module | EasyDeLBaseModule:
         """
         Returns the decoder part of the model's graph definition.
 
@@ -934,7 +936,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         raise NotImplementedError()
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self: Self) -> ParallelLinear:
         """
         Returns the language model head of the module.
 
@@ -943,7 +945,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         raise NotImplementedError()
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self: Self) -> nn.Module | nn.Embed:
         """
         Returns the embedding layer of the module.
 
@@ -1433,3 +1435,25 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
                 loss_output.loss = loss_output.loss + outputs.aux_loss
         outputs = outputs.replace(loss=loss_output.loss)
         return outputs, loss_output
+
+    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+        """
+        Apply the language model head to transform hidden states into logits.
+
+        Args:
+            hidden_states: Input hidden states from the transformer model.
+                Shape should be [..., hidden_size].
+
+        Returns:
+            Output logits over the vocabulary. Shape will be [..., vocab_size].
+        """
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        return self.get_lm_head()(hidden_states, w=w)

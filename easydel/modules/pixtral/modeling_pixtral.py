@@ -21,7 +21,6 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
-from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -819,28 +818,28 @@ class PixtralVisionModel(EasyDeLBaseModule):
             position_embeddings=self.frequencies[position_ids],
         )
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         This vision model acts as the encoder.
         """
         return self
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         This is an encoder-only model and does not have a decoder.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         This vision model does not have a language model head.
         """
         raise NotImplementedError("This vision model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module. In this case, it's the patch convolution layer.
         """

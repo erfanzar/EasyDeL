@@ -22,7 +22,6 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
-from typing_extensions import Self
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -404,27 +403,27 @@ class LlavaModel(EasyDeLBaseModule):
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         The vision tower acts as the encoder in this multi-modal setup.
         """
         return self.vision_tower
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
         return self.language_model.get_decoder()
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         Base Models don't have a Language Model Head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
@@ -493,6 +492,7 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -548,14 +548,9 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            lm_logits = jax.lax.dot_general(
-                hidden_states,
-                self.model.language_model.embed_tokens.embedding.value.T,
-                (((hidden_states.ndim - 1), (0,)), ((), ())),
-            )
-        else:
-            lm_logits = self.lm_head(hidden_states)
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = self.apply_lm_head(hidden_states)
 
         return LlavaCausalLMOutputWithPast(
             loss=None,
@@ -667,27 +662,27 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
         model_kwargs = self.model.update_inputs_for_generation(model_outputs, model_kwargs)
         return model_kwargs
 
-    def get_encoder(self: Self) -> nn.Module:
+    def get_encoder(self):
         """
         Returns the encoder part of the model's graph definition.
         The vision tower acts as the encoder in this multi-modal setup.
         """
         return self.model.vision_tower
 
-    def get_decoder(self: Self) -> nn.Module:
+    def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
         """
         return self.model.get_decoder()
 
-    def get_lm_head(self: Self) -> nn.Module:
+    def get_lm_head(self):
         """
         Returns the language model head of the module.
         """
         return self.lm_head
 
-    def get_embedding(self: Self) -> nn.Module:
+    def get_embedding(self):
         """
         Returns the embedding layer of the module.
         """
-        return self.model.language_model.get_embedding()
+        return self.model.get_embedding()
