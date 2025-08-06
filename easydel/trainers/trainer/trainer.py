@@ -331,7 +331,8 @@ class Trainer(BaseTrainer):
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
             current_step = int(jax.device_get(state.step))
             try:
-                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                with capture_time() as dataloading_time:
+                    batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 if self._should_skip_step(current_step):
                     pbar.update(1)
                     continue
@@ -372,6 +373,7 @@ class Trainer(BaseTrainer):
                     seq_length=self.arguments.max_sequence_length,
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
+                    dataloading_time=dataloading_time(),
                     mode="train",
                 )
                 state, metrics = self.on_step_end(
@@ -436,7 +438,8 @@ class Trainer(BaseTrainer):
 
         for current_step in range(1, self.max_evaluation_steps + 1):
             try:
-                batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                with capture_time() as dataloading_time:
+                    batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
                 step_metrics.start_step()
                 with self.evalu_tracker.trace_compilation():
                     with capture_time() as execution_time:
@@ -458,6 +461,7 @@ class Trainer(BaseTrainer):
                     seq_length=self.arguments.max_sequence_length,
                     mean_loss=mean_loss,
                     mean_accuracy=mean_accuracy,
+                    dataloading_time=dataloading_time(),
                     mode="eval",
                 )
                 self.log_metrics(
