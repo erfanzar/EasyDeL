@@ -268,10 +268,7 @@ class DbrxConfig(EasyDeLBaseConfig):
         if tie_word_embeddings:
             raise ValueError("tie_word_embeddings is not supported for Dbrx models.")
 
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):
         """

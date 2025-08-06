@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from functools import partial
 
 import chex
@@ -44,13 +43,13 @@ from easydel.layers.caching import (
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 
-from .llama_configuration import LlamaConfig
+from .glm_configuration import GlmConfig
 
 
-class LlamaMLP(nn.Module):
+class GlmMLP(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -65,16 +64,14 @@ class LlamaMLP(nn.Module):
             ParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=self.config.mlp_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
+        self.gate_up_proj = linear_class(config.hidden_size, 2 * config.intermediate_size)
         self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
-        self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
-        self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -83,10 +80,9 @@ class LlamaMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
-        hidden_states = self.dropout(hidden_states)
+        gate_up_states = self.gate_up_proj(hidden_states)
+        gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
+        hidden_states = self.down_proj(up_states * self.act_fn(gate))
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -95,10 +91,11 @@ class LlamaMLP(nn.Module):
         return hidden_states
 
 
-class LlamaAttention(AttentionModule):
+class GlmAttention(AttentionModule):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -106,18 +103,16 @@ class LlamaAttention(AttentionModule):
         rngs: nn.Rngs,
     ):
         super().__init__(config=config)
+        self.layer_idx = layer_idx
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-
         self.hidden_size = config.hidden_size
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", head_dim)
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = head_dim
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
 
         linear_class = partial(
             ParallelLinear,
@@ -141,8 +136,6 @@ class LlamaAttention(AttentionModule):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=self.config.attention_dropout,
         )
-
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def __call__(
         self,
@@ -219,9 +212,8 @@ class LlamaAttention(AttentionModule):
             segment_ids=segment_ids,
             causal=True,
         )
-        attn_output = self.resid_dropout(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
-        )
+        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -229,10 +221,11 @@ class LlamaAttention(AttentionModule):
         )
 
 
-class LlamaDecoderLayer(nn.Module):
+class GlmDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -243,22 +236,23 @@ class LlamaDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = LlamaAttention
-        mlp_block = LlamaMLP
+        self.layer_idx = layer_idx
+
+        attn_block = GlmAttention
+        mlp_block = GlmMLP
         attn_block, mlp_block = auto_remat(
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
         )
-
         self.self_attn = attn_block(
             config=config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-
         self.mlp = mlp_block(
             config=config,
             dtype=dtype,
@@ -295,38 +289,46 @@ class LlamaDecoderLayer(nn.Module):
         fcm_mask: chex.Array | None = None,
         frequencies: chex.Array | None = None,
     ):
-        attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
-            attention_mask,
-            position_ids,
-            causal_mask,
-            mode,
-            cache_view,
-            cache_metadata,
-            segment_ids,
-            output_attentions,
-            fcm_mask,
-            frequencies,
-        )
-        hidden_states = hidden_states + attn_outputs.attention_output
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        # Self Attention
+        attn_outputs = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            causal_mask=causal_mask,
+            mode=mode,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            segment_ids=segment_ids,
+            output_attentions=output_attentions,
+            fcm_mask=fcm_mask,
+            frequencies=frequencies,
+        )
+
+        hidden_states = residual + attn_outputs.attention_output
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.config.use_scan_mlp:
             feed_forward_hidden_states = block_wise_ffn(
                 self.mlp,
-                feed_forward_input,
+                hidden_states,
                 self.config.scan_mlp_chunk_size,
             )
         else:
-            feed_forward_hidden_states = self.mlp(feed_forward_input)
+            feed_forward_hidden_states = self.mlp(hidden_states)
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+        hidden_states = residual + feed_forward_hidden_states
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
@@ -334,23 +336,13 @@ class LlamaDecoderLayer(nn.Module):
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=LlamaConfig, model_type="llama")
-class LlamaModel(EasyDeLBaseModule):
-    """Llama model implementation.
-
-    This implements the Llama language model architecture, utilizing transformer blocks
-    with RMSNorm, rotary position embeddings, and a specific attention mechanism.
-
-    Attributes:
-            config (LlamaConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision: Precision setting for JAX operations.
-    """
+@register_module(TaskType.BASE_MODULE, config=GlmConfig, model_type="glm")
+class GlmModel(EasyDeLBaseModule):
+    """GLM model implementation."""
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -364,7 +356,8 @@ class LlamaModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
@@ -373,16 +366,16 @@ class LlamaModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
         self.layers = [
-            LlamaDecoderLayer(
+            GlmDecoderLayer(
                 config=config,
+                layer_idx=layer_idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
                 rngs=rngs,
             )
-            for _ in range(self.config.num_hidden_layers)
+            for layer_idx in range(self.config.num_hidden_layers)
         ]
         self.norm = RMSNorm(
             self.config.hidden_size,
@@ -405,56 +398,44 @@ class LlamaModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the Llama model.
-
-        Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing
-                precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-            Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
-        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
 
+        batch_size, sequence_length, _ = inputs_embeds.shape
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
+
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
-        hidden_states = self.dropout(inputs_embeds)
+        hidden_states = inputs_embeds
+
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
                 if sequence_length == 1 and past_key_values is not None
                 else common_types.MODE_TRAIN
             )
+
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.layers))
 
@@ -463,6 +444,7 @@ class LlamaModel(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -479,6 +461,7 @@ class LlamaModel(EasyDeLBaseModule):
                 segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
+
             hidden_states = layer_outputs.hidden_states
 
             if output_attentions:
@@ -499,49 +482,25 @@ class LlamaModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
-        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
         return self.embed_tokens
 
 
-@register_module(TaskType.CAUSAL_LM, config=LlamaConfig, model_type="llama")
-class LlamaForCausalLM(EasyDeLBaseModule):
-    """Llama model with a language modeling head for causal language modeling tasks.
-
-    This model is a transformer-based language model with causal attention masks
-    applied to perform autoregressive language generation.
-
-    Attributes:
-            config (LlamaConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations (default is jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default is jnp.float32).
-            precision (tp.Optional[tp.Union[str, jax.lax.Precision]]): Precision setting for JAX operations.
-    """
+@register_module(TaskType.CAUSAL_LM, config=GlmConfig, model_type="glm")
+class GlmForCausalLM(EasyDeLBaseModule):
+    """GLM model with a language modeling head for causal language modeling tasks."""
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -555,14 +514,14 @@ class LlamaForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.model = LlamaModel(
+        self.model = GlmModel(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-
+        self.vocab_size = config.vocab_size
         self.lm_head = ParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -589,24 +548,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass through the Llama model for causal language modeling.
-
-        Args:
-                input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-                inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-                position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-                segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-                past_key_values (TransformerCache | PagesCache, optional): Cache containing
-                    precomputed key/value states.
-                cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-                output_attentions (bool, optional): Whether to return attention weights.
-                output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-                Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
-        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -621,7 +562,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
         )
 
         hidden_states = outputs.last_hidden_state
-
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -641,48 +581,25 @@ class LlamaForCausalLM(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
         return self.model.get_embedding()
 
 
-@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=LlamaConfig, model_type="llama")
-class LlamaForSequenceClassification(EasyDeLBaseModule):
-    """Llama model for sequence classification tasks.
-
-    This class extends the base Llama model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
-
-    Attributes:
-            config (LlamaConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision: Precision setting for JAX operations.
-    """
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GlmConfig, model_type="glm")
+class GlmForSequenceClassification(EasyDeLBaseModule):
+    """GLM model for sequence classification tasks."""
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GlmConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -696,7 +613,7 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.model = LlamaModel(
+        self.model = GlmModel(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -731,27 +648,6 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
-        """Forward pass through the Llama model for sequence classification.
-
-        This method processes input sequences through the Llama model and applies
-        a classification head to the output.
-
-        Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing
-                precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-            Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
-        """
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -767,6 +663,7 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 
         hidden_states = transformer_outputs.last_hidden_state
         logits = self.score(hidden_states)
+
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
@@ -774,6 +671,7 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 
         if self.config.pad_token_id is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+
         if self.config.pad_token_id is None:
             sequence_lengths = -1
         else:
@@ -793,27 +691,13 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
-        """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
         return self.model.get_embedding()
