@@ -274,6 +274,24 @@ _import_structure = {
         "GiddModel",
         "GiddForDiffusionLM",
     ],
+    "modules.glm": [
+        "GlmConfig",
+        "GlmForCausalLM",
+        "GlmForSequenceClassification",
+        "GlmModel",
+    ],
+    "modules.glm4": [
+        "Glm4Config",
+        "Glm4ForCausalLM",
+        "Glm4ForSequenceClassification",
+        "Glm4Model",
+    ],
+    "modules.glm4_moe": [
+        "Glm4MoeConfig",
+        "Glm4MoeForCausalLM",
+        "Glm4MoeForSequenceClassification",
+        "Glm4MoeModel",
+    ],
     "modules.gpt2": [
         "GPT2Config",
         "GPT2LMHeadModel",
@@ -661,6 +679,24 @@ if _tp.TYPE_CHECKING:
         GiddConfig,
         GiddForDiffusionLM,
         GiddModel,
+    )
+    from .modules.glm import (
+        GlmConfig,
+        GlmForCausalLM,
+        GlmForSequenceClassification,
+        GlmModel,
+    )
+    from .modules.glm4 import (
+        Glm4Config,
+        Glm4ForCausalLM,
+        Glm4ForSequenceClassification,
+        Glm4Model,
+    )
+    from .modules.glm4_moe import (
+        Glm4MoeConfig,
+        Glm4MoeForCausalLM,
+        Glm4MoeForSequenceClassification,
+        Glm4MoeModel,
     )
     from .modules.gpt2 import (
         GPT2Config,

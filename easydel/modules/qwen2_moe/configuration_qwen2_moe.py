@@ -201,10 +201,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):
         """
