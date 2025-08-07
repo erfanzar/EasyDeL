@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -43,6 +43,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeMetrics, MoeRoutingStrategy
 from easydel.layers.norms import RMSNorm
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
@@ -226,24 +227,8 @@ class MixtralAttention(AttentionModule):
         )
 
 
-class MixtralBLockSparseTop2MLP(nn.Module):
-    """Mixtral Block Sparse Top-2 MLP module.
-
-    This module implements the specific MLP structure used within the sparse Mixture of Experts
-    layer in the Mixtral model. It consists of three linear projections (gate, up, down)
-    and a SiLU activation function.
-
-    Attributes:
-        config (MixtralConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        w1 (ParallelLinear): Gate projection layer.
-        w3 (ParallelLinear): Up projection layer.
-        w2 (ParallelLinear): Down projection layer.
-        act_fn (callable): Activation function (SiLU).
-    """
+class MixtralMoEMlp(nn.Module):
+    """Mixtral MoE MLP using the new MoELinear layers."""
 
     def __init__(
         self,
@@ -254,81 +239,50 @@ class MixtralBLockSparseTop2MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the MixtralBLockSparseTop2MLP module.
-
-        Args:
-            config (MixtralConfig): The configuration object for the Mixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__()
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.rngs = rngs
-        linear = functools.partial(
-            ParallelLinear,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
+        self.w1 = MoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
             kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            use_bias=False,
+            use_gmm=config.use_pallas_group_matmul,
         )
-        self.w1 = linear(
-            self.config.hidden_size,
-            self.config.intermediate_size,
+        self.w2 = MoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
             rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_gmm=config.use_pallas_group_matmul,
         )
-        self.w3 = linear(
-            self.config.hidden_size,
-            self.config.intermediate_size,
+        self.w3 = MoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
             rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_gmm=config.use_pallas_group_matmul,
         )
-        self.w2 = linear(
-            self.config.intermediate_size,
-            self.config.hidden_size,
-            rngs=rngs,
-        )
-        self.act_fn = ACT2FN[self.config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array):
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        w1 = self.act_fn(self.w1(hidden_states))
-        w3 = self.w3(hidden_states)
-        hidden_states = self.w2(w1 * w3)
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        return hidden_states
+    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        hidden_states = self.act_fn(self.w1(x, group_sizes))
+        hidden_states = hidden_states * self.w3(x, group_sizes)
+        outputs = self.w2(hidden_states, group_sizes)
+        return outputs
 
 
-class MixtralSparseMoeBlock(nn.Module):
-    """Mixtral Sparse Mixture of Experts (MoE) block.
-
-    This module implements the sparse MoE layer used in Mixtral. It routes each token
-    to the top-2 experts based on learned gating weights.
-
-    Attributes:
-        config (MixtralConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        gate (ParallelLinear): Linear layer for computing router logits.
-        experts (tp.List[MixtralBLockSparseTop2MLP]): List of expert MLP modules.
-    """
+class MixtralSparseMoeBlock(BaseMoeModule):
+    """Mixtral Sparse MoE block using BaseMoeModule."""
 
     def __init__(
         self,
@@ -339,21 +293,22 @@ class MixtralSparseMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the MixtralSparseMoeBlock.
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=getattr(config, "router_aux_loss_coef", None),
+            rzl_coef=getattr(config, "router_z_loss_coef", None),
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
 
-        Args:
-            config (MixtralConfig): The configuration object for the Mixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
-        super().__init__()
-        self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.rngs = rngs
+
+        # Router/gate
         self.gate = ParallelLinear(
             config.hidden_size,
             config.num_local_experts,
@@ -365,74 +320,28 @@ class MixtralSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(),
         )
 
-        self.experts = [
-            MixtralBLockSparseTop2MLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_local_experts)
-        ]
-
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+        # Expert MLPs
+        self.experts = MixtralMoEMlp(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
         )
 
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
-        routing_weights, selected_experts = jax.lax.top_k(
-            router_logits,
-            k=self.config.num_experts_per_tok,
-        )
-        routing_weights = jax.nn.softmax(
-            routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
-            axis=-1,
-        )
-        final_hidden_state = jnp.zeros_like(hidden_states)
-
-        for index in range(self.config.num_local_experts):
-            expert_layer_output = (
-                block_wise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
-                )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
-            )
-            expert_layer_output_exp = (
-                jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
-        return (
-            final_hidden_state,
-            router_logits,
+    def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, MoeMetrics]:
+        """Forward pass of the MoE block."""
+        return self._moe_call(
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            hidden_state=hidden_state,
+            output_metrics=True,
+            validate_inputs=True,
         )
 
 
 class MixtralDecoderLayer(nn.Module):
-    """Mixtral Transformer Decoder Layer.
-
-    This module represents a single decoder layer in the Mixtral model,
-    combining self-attention and a sparse MoE block with residual connections
-    and layer normalization.
-
-    Attributes:
-        config (MixtralConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        input_layernorm (RMSNorm): Layer normalization before the attention layer.
-        self_attn (MixtralAttention): The self-attention module.
-        post_attention_layernorm (RMSNorm): Layer normalization after the attention layer and before the MoE block.
-        block_sparse_moe (MixtralSparseMoeBlock): The sparse Mixture of Experts block.
-    """
+    """Mixtral Transformer Decoder Layer with updated MoE integration."""
 
     def __init__(
         self,
@@ -443,28 +352,17 @@ class MixtralDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the MixtralDecoderLayer.
-
-        Args:
-            config (MixtralConfig): The configuration object for the Mixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__()
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+
         attn_block = MixtralAttention
         mlp_block = MixtralSparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-        )
+        attn_block, mlp_block = auto_remat(attn_block, mlp_block, policy=config.gradient_checkpointing)
+
         self.self_attn = attn_block(
             config=config,
             dtype=dtype,
@@ -472,6 +370,7 @@ class MixtralDecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
+
         self.block_sparse_moe = mlp_block(
             config=config,
             dtype=dtype,
@@ -479,6 +378,7 @@ class MixtralDecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
+
         self.input_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -486,6 +386,7 @@ class MixtralDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
         self.post_attention_layernorm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -509,28 +410,7 @@ class MixtralDecoderLayer(nn.Module):
         fcm_mask: chex.Array | None = None,
         frequencies: chex.Array | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the MixtralDecoderLayer module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-                Shape: (batch_size, 1, query_length, key_length).
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            output_router_logits (bool): Whether to return router logits from the MoE layer. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            DecoderLayerOutput: A tuple containing:
-                - hidden_states (chex.Array): The output hidden states.
-                - attention_weights (chex.Array, optional): Attention weights if `output_attentions` is True.
-                - router_logits (chex.Array, optional): Router logits if `output_router_logits` is True.
-        """
+        """Forward pass of the MixtralDecoderLayer module."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -557,13 +437,15 @@ class MixtralDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+
+        hidden_states, moe_metrics = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
+        router_logits = moe_metrics.router_probs if output_router_logits else None
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
-            router_logits=router_logits if output_router_logits else None,
+            router_logits=router_logits,
             cache_view=attn_outputs.cache_view,
         )
 

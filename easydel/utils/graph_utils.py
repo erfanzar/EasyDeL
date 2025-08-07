@@ -20,10 +20,7 @@ T = tp.TypeVar("T", bound=nn.Module)
 ModulePath = tuple[str, ...]
 
 
-def iter_module_search(
-    model: nn.Module,
-    instance: type[T] | None = None,
-) -> tp.Iterator[tuple[ModulePath, T]]:
+def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> tp.Iterator[tuple[ModulePath, T]]:
     """
     Iterates through a model and yields paths and modules of a specific type.
 

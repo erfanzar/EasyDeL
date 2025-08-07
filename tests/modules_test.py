@@ -705,8 +705,50 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"PHIMOE model Failed [ERROR {err}]")
 
     def test_deepseek_v2(self):
-        self.header_config = None
         hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
+        self.header_config = ed.DeepseekV2Config(
+            vocab_size=conf.vocab_size,
+            hidden_size=conf.hidden_size,
+            intermediate_size=conf.intermediate_size,
+            moe_intermediate_size=conf.moe_intermediate_size,
+            num_hidden_layers=conf.num_hidden_layers,
+            num_attention_heads=conf.num_attention_heads,
+            num_key_value_heads=conf.num_key_value_heads,
+            n_shared_experts=conf.n_shared_experts,
+            n_routed_experts=conf.n_routed_experts,
+            ep_size=conf.ep_size,
+            routed_scaling_factor=conf.routed_scaling_factor,
+            kv_lora_rank=conf.kv_lora_rank,
+            q_lora_rank=conf.q_lora_rank,
+            qk_rope_head_dim=conf.qk_rope_head_dim,
+            v_head_dim=conf.v_head_dim,
+            qk_nope_head_dim=conf.qk_nope_head_dim,
+            topk_method=conf.topk_method,
+            n_group=conf.n_group,
+            topk_group=conf.topk_group,
+            num_experts_per_tok=conf.num_experts_per_tok,
+            moe_layer_freq=conf.moe_layer_freq,
+            first_k_dense_replace=conf.first_k_dense_replace,
+            norm_topk_prob=conf.norm_topk_prob,
+            scoring_func=conf.scoring_func,
+            aux_loss_alpha=conf.aux_loss_alpha,
+            seq_aux=conf.seq_aux,
+            hidden_act=conf.hidden_act,
+            max_position_embeddings=conf.max_position_embeddings,
+            initializer_range=conf.initializer_range,
+            rms_norm_eps=conf.rms_norm_eps,
+            use_cache=conf.use_cache,
+            pad_token_id=conf.pad_token_id,
+            bos_token_id=conf.bos_token_id,
+            eos_token_id=conf.eos_token_id,
+            pretraining_tp=conf.pretraining_tp,
+            tie_word_embeddings=conf.tie_word_embeddings,
+            rope_theta=conf.rope_theta,
+            attention_bias=conf.attention_bias,
+            attention_dropout=conf.attention_dropout,
+            gradient_checkpointing=EasyDeLGradientCheckPointers.NONE,
+            rope_scaling=conf.rope_scaling,
+        )
         res, err = self.create_test_for_models("deepseek_v2", hf_model, ed.TaskType.CAUSAL_LM)
 
         self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
@@ -833,7 +875,7 @@ class EasyModelsTest(unittest.TestCase):
         self.header_config = None
         self.rope_scaling = None
         res, err = self.create_test_for_models("qwen3_moe", transformers.Qwen3MoeForCausalLM, ed.TaskType.CAUSAL_LM)
-        self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
+        self.assertTrue(res, f"Qwen3Moe model Failed [ERROR {err}]")
 
     def test_qwen2_vl(self):
         self.header_config = ed.AutoEasyDeLConfig.from_pretrained(
@@ -920,10 +962,7 @@ class EasyModelsTest(unittest.TestCase):
         return torch.from_numpy(np_input_ids).to(torch.long), jnp.asarray(np_input_ids, dtype="i4")
 
     def get_hf_model_from_hub(self, repo_id, factory=transformers.AutoModelForCausalLM):
-        conf = transformers.AutoConfig.from_pretrained(
-            repo_id,
-            trust_remote_code=True,
-        )
+        conf = transformers.AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
         for k, v in self.__dict__.items():
             if isinstance(v, bool | str | float | type(None) | int):
                 setattr(conf, k, v)
@@ -938,21 +977,21 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    # test.test_arctic()  # Passed
+    # test.test_arctic()  # Passed - Passes MoE CONOV
     # test.test_cohere()  # Passed
     # test.test_cohere2()  # Passed
     # test.test_dbrx()  # Passed
-    # test.test_deepseek_v2()  # Passed
-    # test.test_deepseek_v3()  # Passed
+    # test.test_deepseek_v2()  # Passed - Passes MoE CONOV
+    # test.test_deepseek_v3()  # Passed - Passes MoE CONOV
     # test.test_exaone()  # Passed
     # test.test_falcon()  # Passed
     # test.test_gemma()  # Passed
     # test.test_gemma2()  # Passed
     # test.test_gemma3_text()  # Passed
     # test.test_gemma3()  # Passed
-    test.test_glm()  # Passed
-    test.test_glm4()  # Passed
-    test.test_glm4_moe()  # Passed
+    # test.test_glm()  # Passed
+    # test.test_glm4()  # Passed
+    # test.test_glm4_moe()  # Passed - Passes MoE CONOV
     # test.test_gptj()  # Passed
     # test.test_gpt_noex()  # Passed
     # test.test_gpt_oss()  # Passed
@@ -965,7 +1004,7 @@ if __name__ == "__main__":
     # test.test_mamba()  # Passed
     # test.test_mamba2()  # Passed - ReCheck
     # test.test_mistral()  # Passed
-    # test.test_mixtral()  # Passed
+    # test.test_mixtral()  # Passed - Passes MoE CONOV
     # test.test_mpt()  # Passed
     # test.test_olmo()  # Passed
     # test.test_olmo2()  # Passed
@@ -977,6 +1016,6 @@ if __name__ == "__main__":
     # test.test_qwen2_moe()  # Passed
     # test.test_qwen2_vl()  # Passed
     # test.test_qwen3()  # Passed
-    # test.test_qwen3_moe()  # Passed
+    test.test_qwen3_moe()  # Passed - Failed MoE CONOV
     # test.test_stablelm()  # Passed
     # -----------------------------------------------

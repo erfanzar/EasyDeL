@@ -28,7 +28,6 @@ def main():
         "USER:code fibo in rust\nASSIST:",
     ]
     model_id = "meta-llama/Llama-3.2-1B-Instruct"
-
     max_decode_length = 2048
     max_prefill_length = 2048
     max_concurrent_decodes = 16
@@ -41,7 +40,7 @@ def main():
         model_id,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
-        precision=lax.Precision.HIGH,
+        precision=lax.Precision.DEFAULT,
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
@@ -53,7 +52,7 @@ def main():
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-        quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
     )
 
     surge = ed.vSurge.from_model(
