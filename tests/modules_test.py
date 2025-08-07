@@ -999,7 +999,7 @@ if __name__ == "__main__":
     # test.test_grok1() # Not Tested Yet!
     # test.test_internlm2()  # Passed
     # test.test_llama()  # Passed
-    # test.test_llama4()  # Passed
+    test.test_llama4()  # Passed
     # test.test_llama4_cond()  # Passed
     # test.test_mamba()  # Passed
     # test.test_mamba2()  # Passed - ReCheck
@@ -1013,9 +1013,9 @@ if __name__ == "__main__":
     # test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
     # test.test_qwen2()  # Passed
-    # test.test_qwen2_moe()  # Passed
+    # test.test_qwen2_moe()  # Passed - Passes MoE CONOV
     # test.test_qwen2_vl()  # Passed
     # test.test_qwen3()  # Passed
-    test.test_qwen3_moe()  # Passed - Failed MoE CONOV
+    # test.test_qwen3_moe()  # Passed - Passes MoE CONOV
     # test.test_stablelm()  # Passed
     # -----------------------------------------------

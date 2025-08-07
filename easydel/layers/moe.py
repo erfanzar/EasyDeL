@@ -486,8 +486,10 @@ class BaseMoeModule(nn.Module, ABC):
         hidden_state_flat = hidden_state.reshape(-1, hidden_size)
         router_logits = gate_layer(hidden_state_flat).astype(jnp.promote_types(self.dtype, jnp.float32))
         router_probs = jax.nn.softmax(router_logits, axis=-1)
+
         if reform_router_probs_fn is not None:
             router_probs = reform_router_probs_fn(router_probs)
+
         if validate_inputs:
             self._validate_routing_inputs(hidden_state, router_logits)
 
