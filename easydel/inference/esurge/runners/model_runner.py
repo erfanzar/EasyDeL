@@ -194,34 +194,29 @@ class eSurgeRunner:
             cache: PagesCache,
             cache_metadata: PagesMetadata,
         ):
-            model = nn.merge(graphdef, graphstate, graphother)
+            model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
             with model.mesh:
                 output = model(
                     input_ids=jnp.expand_dims(input_ids, 0),
                     position_ids=jnp.expand_dims(position_ids, 0),
                     past_key_values=cache,
                     cache_metadata=cache_metadata,
+                    apply_lm_head=False,
                 )
-            return output.logits.squeeze(0), output.past_key_values
-
-        def _execute_forward(input_ids: jax.Array, position_ids: jax.Array, cache_metadata: PagesMetadata) -> jax.Array:
-            logits, self.kv_pages = _execute_forward_fn(
-                self.graphdef,
-                self.graphstate,
-                self.graphother,
-                input_ids,
-                position_ids,
-                self.kv_pages,
-                cache_metadata,
-            )
-            return logits
+            return output.last_hidden_state.squeeze(0), output.past_key_values
 
         @ejit(
-            in_shardings=(self._empty_sharding, self._empty_sharding),
+            static_argnums=(0,),
+            in_shardings=(
+                es.extract_shardings(self.graphstate, self.mesh),
+                es.extract_shardings(self.graphother, self.mesh),
+                self._empty_sharding,
+                self._empty_sharding,
+            ),
             out_shardings=(self._empty_sharding),
         )
-        def _select_logits(hidden_states, indices_do_sample):
-            return hidden_states[indices_do_sample]
+        def _apply_logits_and_select_fn(graphdef, graphstate, graphother, hidden_states, indices_do_sample):
+            return nn.merge(graphdef, graphstate, graphother).apply_lm_head(hidden_states[indices_do_sample])
 
         @ejit(
             in_shardings=(self._empty_sharding, self._empty_sharding),
@@ -236,9 +231,34 @@ class eSurgeRunner:
                 64,
             ).reshape(-1, 1)
 
+        def _apply_logits_and_select(hidden_states, indices_do_sample):
+            return _apply_logits_and_select_fn(
+                self.graphdef,
+                self.graphstate,
+                self.graphother,
+                hidden_states,
+                indices_do_sample,
+            )
+
+        def _execute_forward(
+            input_ids: jax.Array,
+            position_ids: jax.Array,
+            cache_metadata: PagesMetadata,
+        ) -> jax.Array:
+            states, self.kv_pages = _execute_forward_fn(
+                self.graphdef,
+                self.graphstate,
+                self.graphother,
+                input_ids,
+                position_ids,
+                self.kv_pages,
+                cache_metadata,
+            )
+            return states
+
         self.sample_from_logits_func = _sample_from_logits_func
         self.execute_forward = _execute_forward
-        self.select_logits = _select_logits
+        self.apply_logits_and_select = _apply_logits_and_select
 
     def _step_compile(self, num_tokens: int, num_reqs: int, num_pages: int) -> bool:
         """Compile a single step configuration."""
@@ -554,13 +574,12 @@ class eSurgeRunner:
                 end_index,
             ) = self._prepare_inputs(scheduler_output, start_index)
 
-            logits = self.execute_forward(
+            hidden_states = self.execute_forward(
                 input_ids=self.input_ids,
                 position_ids=self.position_ids,
                 cache_metadata=cache_metadata,
             )
-
-            logits = self.select_logits(logits, logits_indices)
+            logits = self.apply_logits_and_select(hidden_states, logits_indices)
             selected_token_ids = self.sample_from_logits_func(
                 logits,
                 ModelRunnerSamplingMetadata.from_sequence_buffer(

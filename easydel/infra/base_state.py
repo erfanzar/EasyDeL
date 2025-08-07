@@ -17,6 +17,7 @@ import contextlib
 import os
 import pickle
 import typing as tp
+from typing import Self
 
 import jax
 import optax
@@ -26,7 +27,6 @@ from flax import nnx as nn
 from flax import struct
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from typing_extensions import Self
 
 from easydel.infra.factory import TaskType
 from easydel.utils.checkpoint_managers import CheckpointManager

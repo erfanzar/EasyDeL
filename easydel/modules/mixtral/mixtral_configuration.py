@@ -203,6 +203,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.router_jitter_noise = router_jitter_noise
         self.layer_types = layer_types
+        self.head_dim = hidden_size // num_attention_heads
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"

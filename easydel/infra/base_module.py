@@ -16,7 +16,11 @@ from __future__ import annotations
 import re
 import typing as tp
 import warnings
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cached_property, partial
+from re import Pattern
+from typing import Self
 
 import chex
 import flax
@@ -29,7 +33,6 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from typing_extensions import Self
 
 from easydel.utils import traversals
 from easydel.utils.helpers import get_logger
@@ -58,6 +61,16 @@ logger = get_logger(__name__)
 BaseConf = EasyDeLBaseConfig
 
 
+@dataclass
+class ParameterTransformRule:
+    """Rule for transforming MoE parameter names and tensors."""
+
+    pattern: str | Pattern
+    replacement: str
+    tensor_transform: Callable | None = None
+    consolidate_experts: bool = False
+
+
 class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin):
     """
     Base class for EasyDeL modules, providing common functionalities for model initialization,
@@ -66,9 +79,10 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
     config_class: type[BaseConf]
     base_model_prefix: str
+    config: BaseConf | None = None
     _model_task: str | None = None
     _model_type: str | None = None
-    config: BaseConf | None = None
+    _parameter_transform_rules: tp.ClassVar[list[ParameterTransformRule]] = []
 
     def __init__(
         self,
@@ -632,14 +646,8 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         mesh = self._get_mesh(mesh)
         partition_rules = self._get_partition_rules(partition_rules)
-        partition_specs = match_partition_rules(
-            rules=partition_rules,
-            tree=self.graphtree_params_shape,
-        )
-        shard_fns, _ = make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )
+        partition_specs = match_partition_rules(rules=partition_rules, tree=self.graphtree_params_shape)
+        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
         if overlay_fns is not None:
             shard_fns.update(overlay_fns)
         self = self._apply_sharding_fns(shard_fns)
@@ -877,18 +885,15 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             torch.nn.Module: The equivalent Hugging Face PyTorch model with loaded weights.
         """
-        from easydel.utils.parameters_transformation import module_to_huggingface_model
+        from easydel.utils.parameters_transformation import ModelConverter
 
-        hf_autoloader = self.get_torch_loader()
-        model_class = hf_autoloader._model_mapping[type(self.config)]
-        hf_model = module_to_huggingface_model(
+        return ModelConverter.easydel_to_huggingface(
             module=self,
-            base_huggingface_module=model_class,
+            base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],
             config=self.config,
             dtype=self.param_dtype,
             **kwargs,
         )
-        return hf_model
 
     def prepare_inputs_for_call(self, **kwargs):
         """
@@ -1072,27 +1077,25 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         return self
 
     @property
-    def transform_fn(self: Self):
-        """
-        Returns a partial function for transforming PyTorch state dicts to EasyDeL parameters.
-
-        This function identifies embedding and LayerNorm layers within the module and creates
-        a transformation function (`torch_dict_to_easydel_params`) pre-configured with these
-        layer names, the target parameter dtype, and the module's sharding functions.
-
-        Returns:
-            tp.Callable: A partial function ready to convert a PyTorch state dict.
-        """
+    def transform_fn(self):
+        """Transform function with rules."""
+        from easydel.layers.moe import BaseMoeModule, MoELinear
         from easydel.utils import graph_utils
-        from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
+        from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, MoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
 
         return partial(
-            torch_dict_to_easydel_params,
+            StateDictConverter.huggingface_to_easydel,
             embedding_layer_names=embedding_path,
             layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
             dtype=self.param_dtype,
             shard_fns=self._shard_fns,
         )
@@ -1342,13 +1345,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             tp.Callable: A partial function for converting a PyTorch state dict without applying sharding.
         """
         from easydel.utils import graph_utils
-        from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
+        from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
 
         return partial(
-            torch_dict_to_easydel_params,
+            StateDictConverter.huggingface_to_easydel,
             embedding_layer_names=embedding_path,
             layernorm_names=layernorm_path,
             dtype=self.param_dtype,

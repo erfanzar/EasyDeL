@@ -147,6 +147,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     shard_attention_computation: bool
     use_sharded_kv_caching: bool
     use_sharding_constraint: bool
+    use_pallas_group_matmul: bool
     backend: EasyDeLBackends | None
     platform: EasyDeLPlatforms | None
     easy_method: tp.Literal["train", "serve", "convert"]
@@ -195,6 +196,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shard_attention_computation (bool): Whether to shard attention computation. Default is True.
         use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
         use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
+        use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
         backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
         platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
         easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
@@ -250,6 +252,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shard_attention_computation: bool = True,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
+        use_pallas_group_matmul: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -311,6 +314,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
         self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
         self.use_sharding_constraint = getattr(self, "use_sharding_constraint", use_sharding_constraint)
+        self.use_pallas_group_matmul = getattr(self, "use_pallas_group_matmul", use_pallas_group_matmul)
         self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
         self.kv_cache_sharding_sequence_axis_name = getattr(
             self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
@@ -495,6 +499,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_ring_attention",
             "scan_attention_layers",
             "use_sharding_constraint",
+            "use_pallas_group_matmul",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
             "sequence_axis_name",
@@ -542,6 +547,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
+        use_pallas_group_matmul: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
         sequence_axis_name: str = NOT_GIVEN,
@@ -595,6 +601,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
             use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays.
                 Defaults to False.
+            use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
             use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
             scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
             sequence_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
@@ -639,6 +646,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
         set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
+        set_attrs_smartly(self, "use_pallas_group_matmul", True, use_pallas_group_matmul)
+
         set_attrs_smartly(self, "backend", None, backend)
         set_attrs_smartly(self, "platform", "jax", platform)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
