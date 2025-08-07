@@ -97,10 +97,10 @@ class Qwen3MoeMLPStack(nn.Module):
 
     def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array) -> chex.Array:
         """Forward pass through MoE MLP."""
-        hidden_states = self.act_fn(self.gate_proj(hidden_states, group_sizes))
-        hidden_states = hidden_states * self.up_proj(hidden_states, group_sizes)
-        outputs = self.down_proj(hidden_states, group_sizes)
-        return outputs
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+            group_sizes,
+        )
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -224,9 +224,9 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
             n_routed_experts=config.num_local_experts,
             num_experts_per_tok=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            lbl_coef=getattr(config, "router_aux_loss_coef", None),
-            rzl_coef=getattr(config, "router_z_loss_coef", None),
-            routing_strategy=MoeRoutingStrategy.TOP_K_NDIV if config.norm_topk_prob else MoeRoutingStrategy.TOP_K,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
             load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
         )
         self.config = config
@@ -271,105 +271,6 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
             validate_inputs=True,
         )
         return out, router_logits
-
-
-class Qwen3MoeBlock(nn.Module):
-    """Mixture of Experts (MoE) block for Qwen3 MoE.
-
-    This block routes input hidden states to a selected subset of experts
-    and combines their outputs.
-
-    Attributes:
-        config (Qwen3MoeConfig): Configuration object for the model.
-        gate (ParallelLinear): Linear layer for the gating network.
-        experts (nn.List[Qwen3MoeMLP]): List of expert MLP modules.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3MoeConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: nn.Rngs,
-    ):
-        """Initializes the Qwen3MoeBlock module.
-
-        Args:
-            config (Qwen3MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
-        """
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.gate = ParallelLinear(
-            config.hidden_size,
-            config.num_experts,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-        )
-
-        self.experts = [
-            Qwen3MoeMLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                intermediate_size=config.moe_intermediate_size,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_experts)
-        ]
-
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
-        """Forward pass of the Sparse MoE block.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
-
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
-        """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        router_logits = self.gate(hidden_states)
-        routing_weights = jax.nn.softmax(router_logits.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
-
-        routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights,
-            k=self.config.num_experts_per_tok,
-        )
-
-        if self.config.norm_topk_prob:
-            routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
-        final_hidden_state = jnp.zeros_like(hidden_states)
-
-        for index in range(self.config.num_experts):
-            expert_layer_output = self.experts[index](hidden_states)
-            expert_layer_output_exp = (
-                jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
-        return (final_hidden_state, router_logits)
 
 
 class Qwen3MoeAttention(AttentionModule):
@@ -659,7 +560,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.precision = precision
         attn_block = Qwen3MoeAttention
         mlp_block = Qwen3MoeMLP
-        moe_block = Qwen3MoeBlock
+        moe_block = Qwen3MoeSparseBlock
         attn_block, mlp_block, moe_block = auto_remat(
             attn_block,
             mlp_block,
