@@ -337,13 +337,8 @@ class Trainer(BaseTrainer):
                     continue
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
-            except (
-                KeyboardInterrupt,
-                EasyDeLTimerError,
-                EasyDeLBreakRequest,
-                StopIteration,
-            ) as exect:
-                return state, exect
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
+                return state, exect, train_iter
 
             # Execute training step
             with self.train_tracker.trace_compilation():

@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -291,8 +291,8 @@ class DeepseekV3Config(EasyDeLBaseConfig):
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
-            (r"mlp/experts/\d+/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
+            (r"mlp/experts/\d+/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"mlp/experts/\d+/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
             (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
             (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),

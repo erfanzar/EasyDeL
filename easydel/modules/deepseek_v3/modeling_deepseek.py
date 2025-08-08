@@ -43,6 +43,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
 from easydel.layers.norms import RMSNorm
 
 from .deepseek_configuration import DeepseekV3Config
@@ -260,8 +261,7 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, hidden_states):
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, h)
+        squ, _ = hidden_states.shape
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
             self.kernel.value.astype(jnp.float32),
@@ -275,7 +275,7 @@ class MoEGate(nn.Module):
 
         if self.topk_method == "noaux_tc":
             scores_for_choice = scores + self.e_score_correction_bias
-            group_scores = scores_for_choice.reshape(bsz * seq_len, self.n_group, -1)
+            group_scores = scores_for_choice.reshape(squ, self.n_group, -1)
             top2_scores = jax.lax.top_k(group_scores, k=2)[0]
             group_scores = jnp.sum(top2_scores, axis=-1)
 
@@ -285,12 +285,14 @@ class MoEGate(nn.Module):
             indices = jnp.arange(group_mask.shape[0])[:, None]
             group_mask = group_mask.at[indices, group_idx].set(1.0)
 
-            score_mask = jnp.repeat(group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=2).reshape(
-                bsz * seq_len, -1
-            )
+            score_mask = jnp.repeat(
+                group_mask[:, :, None],
+                self.n_routed_experts // self.n_group,
+                axis=2,
+            ).reshape(squ, -1)
 
             masked_scores = jnp.where(score_mask > 0, scores_for_choice, 0.0)
-            topk_weight, topk_idx = jax.lax.top_k(masked_scores, k=self.top_k)
+            topk_weight, _ = jax.lax.top_k(masked_scores, k=self.top_k)
         else:
             raise NotImplementedError(f"insupportable TopK function for MoE gating: {self.topk_method}")
 
@@ -298,90 +300,125 @@ class MoEGate(nn.Module):
             denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
             topk_weight = topk_weight / denominator
 
-        topk_weight = topk_weight * self.routed_scaling_factor
-        return topk_idx, topk_weight
+        return topk_weight * self.routed_scaling_factor
 
 
-class DeepseekV3MoE(nn.Module):
+class DeepseekV3MLPMoE(nn.Module):
     def __init__(
         self,
         config: DeepseekV3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: str | jax.lax.Precision | None = None,
+        hidden_size: int | None = None,
+        intermediate_size: int | None = None,
         *,
         rngs: nn.Rngs,
     ):
         self.config = config
+        self.precision = precision
+        linear = functools.partial(
+            MoELinear,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+        )
+        imz = intermediate_size or config.intermediate_size
+        hs = hidden_size or config.hidden_size
+        self.gate_proj = linear(config.n_routed_experts, hs, imz, rngs=rngs)
+        self.up_proj = linear(config.n_routed_experts, hs, imz, rngs=rngs)
+        self.down_proj = linear(config.n_routed_experts, imz, hs, rngs=rngs)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array):
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
+        return apply_logical_sharding(
+            self.down_proj(
+                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+                group_sizes,
+            ),
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
+
+class DeepseekV3MoE(BaseMoeModule):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | jax.lax.Precision | None = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__(
+            config=config,
+            n_routed_experts=config.n_routed_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=getattr(config, "router_aux_loss_coef", None),
+            rzl_coef=getattr(config, "router_z_loss_coef", None),
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.num_experts_per_tok = self.config.num_experts_per_tok
+        self.rngs = rngs
+        self.num_experts_per_tok = config.num_experts_per_tok
         self.experts_per_rank = config.n_routed_experts
-        self.deterministic = False
-        self.experts = [
-            DeepseekV3MLP(
-                config=self.config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                intermediate_size=config.moe_intermediate_size,
-                rngs=rngs,
-            )
-            for i in range(config.n_routed_experts)
-        ]
-
+        self.experts = DeepseekV3MLPMoE(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            intermediate_size=self.config.moe_intermediate_size,
+            rngs=rngs,
+        )
         self.gate = MoEGate(
-            config=self.config,
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
         if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV3MLP(
-                config=self.config,
+                config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
-                intermediate_size=self.config.moe_intermediate_size * self.config.n_shared_experts,
+                intermediate_size=intermediate_size,
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states: chex.Array):
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         identity = hidden_states
-        orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if self.deterministic:
-            y = self.moe_infer(hidden_states, topk_idx, topk_weight).reshape(*orig_shape)
+        y, router_logits = self._moe_call(
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            hidden_state=hidden_states,
+            output_metrics=False,
+            validate_inputs=False,
+        )
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
-        return y
-
-    def moe_infer(
-        self,
-        x: jnp.ndarray,
-        topk_ids: jnp.ndarray,
-        topk_weight: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """
-        Args:
-                x: Input tensor of shape [batch_size, hidden_dim]
-                topk_ids: Tensor of expert assignments [batch_size, top_k]
-                topk_weight: Tensor of expert weights [batch_size, top_k]
-        Returns:
-                Output tensor of shape [batch_size, hidden_dim]
-        """
-        final_hidden_state = jnp.zeros_like(x)
-        for expert_idx, expert in enumerate(self.experts):
-            expert_mask = jnp.sum(
-                jnp.multiply(topk_ids == expert_idx, topk_weight),
-                axis=-1,
-                keepdims=True,
-            )
-            final_hidden_state = final_hidden_state + (expert_mask * expert(x))
-        return final_hidden_state
+        return y, router_logits
 
 
 class DeepseekV3Attention(AttentionModule):
@@ -743,6 +780,9 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         feed_forward_hidden_states = self.mlp(hidden_states)
+        router_logits = None
+        if isinstance(feed_forward_hidden_states, tuple):
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
         hidden_states = residual + feed_forward_hidden_states
         hidden_states = apply_logical_sharding(
             hidden_states,

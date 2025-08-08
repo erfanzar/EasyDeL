@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -218,24 +218,30 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
         """
         pmag = self.partition_manager
         return (
-            # Column-wise Sharding (split output dimensions)
-            (r".*attn/.*(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            # QKV Projections
-            (r".*mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            # MLP Up-Projections
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
-            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
-            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
-            # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/kernel", pmag.resolve(RowWise)),  # Attention Output
-            (r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
-            (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
-            # Replicated Parameters
-            (r".*bias", pmag.resolve(Replicated)),  # All biases
-            (r".*layernorm/scale", pmag.resolve(Replicated)),  # LayerNorm scales
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),  # RMSNorm scales
-            (r".*norm/scale", pmag.resolve(Replicated)),  # Final LayerNorm scale
+            # Embedding
+            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+            # Attention Layers
+            (r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),
+            (r"self_attn/k_proj/kernel", pmag.resolve(ColumnWise)),
+            (r"self_attn/v_proj/kernel", pmag.resolve(ColumnWise)),
+            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),  # If bias is used
+            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
+            # Standard MLP (used in early layers or non-MoE layers)
+            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
+            (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            # --- Shared Experts ---
+            (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
+            # Normalization Layers
+            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
+            # Language Model Head
+            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
+            (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
 

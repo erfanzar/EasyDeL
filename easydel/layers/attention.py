@@ -499,7 +499,6 @@ class AttentionModule(nn.Module):
         """Handles concatenation of current KV states to the cache."""
         if cache_view is None:
             return key, value, attention_mask, None, None
-
         key, value, attention_mask, cache_view, masking_details = cache_view.concatenate_to_cache(
             query=query,
             key=key,

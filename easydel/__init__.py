@@ -507,8 +507,8 @@ _import_structure = {
         "pack_sequences",
     ],
     "utils.parameters_transformation": [
-        "module_to_huggingface_model",
-        "module_to_torch",
+        "easydel_to_huggingface_model",
+        "easydel_to_torch",
         "torch_dict_to_easydel_params",
     ],
 }
@@ -925,8 +925,8 @@ if _tp.TYPE_CHECKING:
         traversals,
     )
     from .utils.parameters_transformation import (
-        module_to_huggingface_model,
-        module_to_torch,
+        easydel_to_huggingface_model,
+        easydel_to_torch,
         torch_dict_to_easydel_params,
     )
 else:
@@ -939,7 +939,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.47"]
+    _targeted_versions = ["0.0.48"]
 
     from eformer import __version__ as _eform_version
 
