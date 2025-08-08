@@ -406,7 +406,7 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         """
         super().__init__(
             config=config,
-            n_routed_experts=config.num_local_experts,
+            n_routed_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             lbl_coef=None,

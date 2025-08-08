@@ -813,6 +813,14 @@ class MoELinear(nn.Module):
             if self.out_first:
                 weight = jnp.transpose(self.kernel.value, (0, 2, 1))
             fn = self._grouped_matmul
+        if weight.dtype in [
+            jnp.float8_e4m3b11fnuz,
+            jnp.float8_e4m3fn,
+            jnp.float8_e4m3fnuz,
+            jnp.float8_e5m2,
+            jnp.float8_e5m2fnuz,
+        ]:
+            weight = weight.astype("f4")
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
         output = fn(inputs, weight, group_sizes)
 

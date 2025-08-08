@@ -221,7 +221,7 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
         """
         super().__init__(
             config=config,
-            n_routed_experts=config.num_local_experts,
+            n_routed_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             lbl_coef=None,
@@ -760,7 +760,6 @@ class Qwen3MoeModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """Forward pass of the Qwen3MoeModel.
 
