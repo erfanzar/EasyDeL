@@ -182,7 +182,7 @@ class DeepseekV2MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         imz = intermediate_size or config.intermediate_size
         hs = hidden_size or config.hidden_size

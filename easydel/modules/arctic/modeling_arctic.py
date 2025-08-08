@@ -221,7 +221,7 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.w1 = linear_class(config.num_local_experts, self.hidden_dim, self.ffn_dim, rngs=rngs)
         self.w3 = linear_class(config.num_local_experts, self.hidden_dim, self.ffn_dim, rngs=rngs)

@@ -118,7 +118,7 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.down_proj = MoELinear(
             num_experts=config.n_routed_experts,
@@ -127,7 +127,7 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.up_proj = MoELinear(
             num_experts=config.n_routed_experts,
@@ -136,7 +136,7 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
