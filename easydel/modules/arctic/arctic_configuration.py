@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -206,8 +206,8 @@ class ArcticConfig(EasyDeLBaseConfig):
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/.*/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/.*/w2/kernel", pmag.resolve(RowWise)),
+            (r"block_sparse_moe/experts/.*/(w1|w3)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"block_sparse_moe/experts/.*/w2/kernel", pmag.resolve(ExpertRowWiseAlt)),
             (r"block_sparse_moe/mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/mlp/w2/kernel", pmag.resolve(RowWise)),
             (r"residual_mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
