@@ -848,6 +848,7 @@ class GptOssForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
