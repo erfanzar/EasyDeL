@@ -1,9 +1,10 @@
+import os
+
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["JAX_PLATFORMS"] = "cpu"
 import copy
 import gc
-
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
-# os.environ["CUDA_VISIBLE_DEVICES"] = ""
-# os.environ["JAX_PLATFORMS"] = "cpu"
 import unittest
 
 import jax
@@ -975,7 +976,7 @@ class EasyModelsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     # unittest.main()
-    # print(jax.devices())
+    print(jax.devices())
     test = EasyModelsTest()
     test.setUp()
 

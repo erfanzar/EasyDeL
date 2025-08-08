@@ -27,8 +27,13 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P
 
+BATCH = common_types.BATCH
+QUERY_LENGTH = common_types.QUERY_LENGTH
+EMPTY = common_types.EMPTY
+MODE_TRAIN = common_types.MODE_TRAIN
+EMBED = common_types.EMBED
+EXPERT = common_types.EXPERT
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
@@ -164,6 +169,7 @@ class BaseMoeModule(nn.Module, ABC):
         super().__init__()
         self.config = config
         self.mesh = config.mesh
+        self.partition_manager = config.partition_manager
         self.n_routed_experts = n_routed_experts or config.n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok or config.num_experts_per_tok
         self.hidden_size = hidden_size or config.hidden_size
@@ -197,30 +203,24 @@ class BaseMoeModule(nn.Module, ABC):
         return self._route_sharded(router_probs, routing_strategy or self.routing_strategy)
 
     def _route_sharded(self, router_probs: jax.Array, strategy: MoeRoutingStrategy) -> tuple[jax.Array, jax.Array]:
-        """Performs sharded routing of tokens to experts.
+        """Performs sharded routing of tokens to experts with improved partitioning.
 
-        This method uses `jax.sharding.shard_map` to apply the local routing
-        logic across devices according to the specified sharding configuration.
-
-        Args:
-            router_probs: An array of router probabilities with shape
-                `(batch_size * seq_len, num_experts)`.
-            strategy: The routing strategy to apply.
-
-        Returns:
-            A tuple containing:
-                - selected_weights: The sharded weights for the selected experts.
-                - selected_experts: The sharded indices of the selected experts.
+        Router probs shape: (batch * seq_len, num_experts)
+        Partitioned as: ((dp, fsdp), sp) for batch dimension
         """
+        pmag = self.partition_manager
+
         if router_probs.ndim == 2:
-            in_specs = P("dp", None)
-            out_specs = (P("dp", None), P("dp", None))
+            pspec = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=router_probs.shape)
+            in_specs = pspec
+            out_specs = (pspec, pspec)
         elif router_probs.ndim == 3:
-            in_specs = P("dp", "fsdp", None)
-            out_specs = (P("dp", "fsdp", None), P("dp", "fsdp", None))
+            pspec = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMPTY], mode=MODE_TRAIN, shape=router_probs.shape)
+            in_specs = pspec
+            out_specs = (pspec, pspec)
         else:
-            in_specs = P(None)
-            out_specs = (P(None), P(None))
+            in_specs = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
+            out_specs = (in_specs, in_specs)
 
         @partial(shard_map, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
         def sharded_route(router_probs_):
@@ -296,27 +296,31 @@ class BaseMoeModule(nn.Module, ABC):
         hidden_states_flat: jax.Array,
         topk_idx_flat: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Performs a sharded permutation of tokens.
+        """Performs a sharded permutation of tokens with improved partitioning.
 
-        This method uses `jax.sharding.shard_map` to apply the local permutation
-        logic across devices.
-
-        Args:
-            hidden_states_flat: A sharded, flattened array of input tokens.
-            topk_idx_flat: A sharded, flattened array of expert indices.
-
-        Returns:
-            A tuple containing the sharded permuted hidden states, group sizes,
-            and sorting indices.
+        Hidden states: (batch * seq_len, hidden_size)
+        Partitioned as: ((dp, fsdp), sp) for batch/seq, tp for hidden dimension
         """
-        x_in_specs = P("dp", None) if hidden_states_flat.ndim == 2 else P("dp", "fsdp", None)
-        idx_in_specs = P("dp") if topk_idx_flat.ndim == 1 else P("dp", "fsdp")
+        pmag = self.partition_manager
+        if hidden_states_flat.ndim == 2:
+            x_in_specs = pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
+        else:
+            x_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
+
+        if topk_idx_flat.ndim == 1:
+            idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+        else:
+            idx_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(x_in_specs, idx_in_specs),
-            out_specs=(P("dp", None), P("ep"), P("dp")),
+            out_specs=(
+                pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape),
+                pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN),
+                pmag.resolve(axes=[BATCH], mode=MODE_TRAIN),
+            ),
             check_rep=False,
         )
         def permute_sharded(x_flat_: jax.Array, topk_idx_flat_: jax.Array):
@@ -372,27 +376,27 @@ class BaseMoeModule(nn.Module, ABC):
         sort_idx: jax.Array,
         original_shape: tuple[int, ...],
     ) -> jax.Array:
-        """Performs a sharded un-permutation of tokens.
+        """Performs a sharded un-permutation of tokens with auto-sharding."""
+        pmag = self.partition_manager
 
-        This method uses `jax.sharding.shard_map` to apply the local
-        un-permutation logic across devices.
+        if out_repeat_sort.ndim == 2:
+            out_in_specs = pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
+        else:
+            out_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMBED], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
 
-        Args:
-            out_repeat_sort: A sharded array of expert outputs in sorted order.
-            sort_idx: The sharded sorting indices.
-            original_shape: The original shape of the hidden states.
+        if sort_idx.ndim == 1:
+            idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=sort_idx.shape)
+        else:
+            idx_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH], mode=MODE_TRAIN, shape=sort_idx.shape)
 
-        Returns:
-            The sharded, un-permuted expert outputs.
-        """
-        out_in_specs = P("dp", None) if out_repeat_sort.ndim == 2 else P("dp", "fsdp", None)
-        idx_in_specs = P("dp") if sort_idx.ndim == 1 else P("dp", "fsdp")
+        batch_size, seq_len, hidden_size = original_shape
+        output_shape = (batch_size * seq_len, self.num_experts_per_tok, hidden_size)
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(out_in_specs, idx_in_specs),
-            out_specs=P("dp", None, None),
+            out_specs=pmag.resolve(axes=[BATCH, EMPTY, EMBED], mode=MODE_TRAIN, shape=output_shape),
             check_rep=False,
         )
         def unpermute_sharded(out_repeat_sort_: jax.Array, sort_idx_: jax.Array):
@@ -524,28 +528,51 @@ class BaseMoeModule(nn.Module, ABC):
         metrics.routing_entropy = jnp.mean(-jnp.sum(router_probs * jnp.log(router_probs + 1e-8), axis=-1))
         return metrics
 
-    def _apply_expert_sharding(self, hidden_states: jax.Array, axis_name: str = "ep") -> jax.Array:
-        """Applies expert parallel sharding to a tensor.
+    def _apply_expert_sharding(self, tensor: jax.Array, tensor_type: str = "weight") -> jax.Array:
+        """Applies expert parallel sharding to a tensor with auto-sharding."""
+        pmag = self.partition_manager
 
-        This utility function shards a tensor, typically expert weights or biases,
-        across the expert parallel (`ep`) axis of the device mesh.
+        if tensor_type == "weight_col":
+            if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+            elif tensor.ndim == 2:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+            else:
+                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
-        Args:
-            hidden_states: The tensor to be sharded. It is expected to have the
-                number of experts as its first dimension.
-            axis_name: The name of the mesh axis to shard over. Defaults to "ep".
+        elif tensor_type == "weight_row":
+            if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+            elif tensor.ndim == 2:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+            else:
+                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
-        Returns:
-            The sharded tensor.
-        """
-        if hidden_states.ndim == 3 and hidden_states.shape[0] == self.n_routed_experts:
-            sharding = P(axis_name, "tp", None)
-        elif hidden_states.ndim == 2 and hidden_states.shape[0] == self.n_routed_experts:
-            sharding = P(axis_name, None)
+        elif tensor_type == "bias":
+            if tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+            else:
+                sharding_spec = pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=tensor.shape)
+
         else:
-            sharding = P(None)
+            if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+            elif tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
+                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+            else:
+                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
-        return jax.device_put(hidden_states, jax.sharding.NamedSharding(self.mesh, sharding))
+        return jax.device_put(tensor, jax.sharding.NamedSharding(self.mesh, sharding_spec))
+
+    def _get_gate_layer_sharding(self, weight_shape: tuple) -> jax.sharding.PartitionSpec:
+        """Returns the partition spec for the gate/router layer weights."""
+        pmag = self.partition_manager
+        return pmag.resolve(axes=[EMBED, EXPERT], mode=MODE_TRAIN, shape=weight_shape)
+
+    def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> jax.sharding.PartitionSpec:
+        """Returns the partition spec for the gate/router layer bias."""
+        pmag = self.partition_manager
+        return pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=bias_shape)
 
     def _validate_routing_inputs(self, hidden_states: jax.Array, router_logits: jax.Array) -> None:
         """Validates the shapes of inputs for routing operations.
