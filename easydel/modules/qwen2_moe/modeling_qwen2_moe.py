@@ -74,7 +74,7 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.down_proj = MoELinear(
             num_experts=config.num_experts,
@@ -83,7 +83,7 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.up_proj = MoELinear(
             num_experts=config.num_experts,
@@ -92,7 +92,7 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.act_fn = nn.silu
 
@@ -412,7 +412,7 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             lbl_coef=None,
             rzl_coef=None,
             routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
-            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+            load_balancing_strategy=MoeLoadBalancingStrategy.NONE,
         )
         self.config = config
         self.dtype = dtype
@@ -455,6 +455,25 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
+    def _moe_call(
+        self,
+        hidden_state_flat: jax.Array,
+        batch_size: int,
+        seq_len: int,
+        hidden_size: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Forward pass of the MoE block."""
+
+        router_logits = self.gate(hidden_state_flat).astype(jnp.float32)
+        routing_weights = jax.nn.softmax(router_logits, axis=-1)
+        selected_weights, selected_experts = self._route(routing_weights)
+        x_repeat_sort, group_sizes, sort_idx = self._permute(hidden_state_flat, selected_experts.reshape(-1))
+        out_repeat_sort = self.experts(x_repeat_sort, group_sizes)
+        out_repeat_unflat = self._unpermute(out_repeat_sort, sort_idx, (batch_size, seq_len, hidden_size))
+        output = jnp.sum(out_repeat_unflat * selected_weights[:, :, None], axis=1)
+
+        return output, router_logits
+
     def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the Sparse MoE block.
 
@@ -466,19 +485,26 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - final_hidden_states (chex.Array): The output hidden states after MoE processing.
                 - router_logits (chex.Array): The logits output by the gating network.
         """
-        out, router_logits = self._moe_call(
-            gate_layer=self.gate,
-            expert_layer=self.experts,
-            hidden_state=hidden_states,
-            output_metrics=False,
-            validate_inputs=True,
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
         )
+        batch_size, seq_len, hidden_size = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+
+        out, router_logits = self._moe_call(
+            hidden_state_flat=hidden_states,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+        )
+
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = jax.nn.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-        final_hidden_state = out + shared_expert_output.reshape(*out.shape)
+        out = out + shared_expert_output
 
-        return final_hidden_state, router_logits
+        return out.reshape(batch_size, seq_len, hidden_size), router_logits
 
 
 class Qwen2MoeDecoderLayer(nn.Module):

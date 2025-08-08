@@ -251,7 +251,7 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.w2 = MoELinear(
             num_experts=config.num_local_experts,
@@ -260,7 +260,7 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.w3 = MoELinear(
             num_experts=config.num_local_experts,
@@ -269,7 +269,7 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_gmm=config.use_pallas_group_matmul,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 

@@ -1344,16 +1344,23 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             tp.Callable: A partial function for converting a PyTorch state dict without applying sharding.
         """
+        from easydel.layers.moe import BaseMoeModule, MoELinear
         from easydel.utils import graph_utils
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, MoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
 
         return partial(
             StateDictConverter.huggingface_to_easydel,
             embedding_layer_names=embedding_path,
             layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
             dtype=self.param_dtype,
         )
 

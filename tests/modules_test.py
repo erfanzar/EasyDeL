@@ -39,6 +39,7 @@ class EasyModelsTest(unittest.TestCase):
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range: float = 0.02
         self.use_cache: bool = True
+        self.use_pallas_group_matmul: bool = False
         self.bos_token_id: int = 0
         self.eos_token_id: int = 1
         self.resid_pdrop: float = 0.0
@@ -124,6 +125,7 @@ class EasyModelsTest(unittest.TestCase):
                 platform=self.platform,
                 use_scan_mlp=self.use_scan_mlp,
                 scan_mlp=self.use_scan_mlp,
+                use_pallas_group_matmul=self.use_pallas_group_matmul,
                 # sliding_window=self.sliding_window,
                 # use_sliding_window=self.use_sliding_window,
             )
@@ -977,12 +979,12 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    # test.test_arctic()  # Passed - Passes MoE CONOV
+    test.test_arctic()  # Passed - Passes MoE CONOV
     # test.test_cohere()  # Passed
     # test.test_cohere2()  # Passed
     # test.test_dbrx()  # Passed
-    # test.test_deepseek_v2()  # Passed - Passes MoE CONOV
-    # test.test_deepseek_v3()  # Passed - Passes MoE CONOV
+    test.test_deepseek_v2()  # Passed - Passes MoE CONOV
+    test.test_deepseek_v3()  # Passed - Passes MoE CONOV
     # test.test_exaone()  # Passed
     # test.test_falcon()  # Passed
     # test.test_gemma()  # Passed
@@ -991,7 +993,7 @@ if __name__ == "__main__":
     # test.test_gemma3()  # Passed
     # test.test_glm()  # Passed
     # test.test_glm4()  # Passed
-    # test.test_glm4_moe()  # Passed - Passes MoE CONOV
+    test.test_glm4_moe()  # Passed - Passes MoE CONOV
     # test.test_gptj()  # Passed
     # test.test_gpt_noex()  # Passed
     # test.test_gpt_oss()  # Passed
@@ -999,12 +1001,12 @@ if __name__ == "__main__":
     # test.test_grok1() # Not Tested Yet!
     # test.test_internlm2()  # Passed
     # test.test_llama()  # Passed
-    test.test_llama4()  # Passed
+    # test.test_llama4()  # Passed
     # test.test_llama4_cond()  # Passed
     # test.test_mamba()  # Passed
     # test.test_mamba2()  # Passed - ReCheck
     # test.test_mistral()  # Passed
-    # test.test_mixtral()  # Passed - Passes MoE CONOV
+    test.test_mixtral()  # Passed - Passes MoE CONOV
     # test.test_mpt()  # Passed
     # test.test_olmo()  # Passed
     # test.test_olmo2()  # Passed
@@ -1013,9 +1015,9 @@ if __name__ == "__main__":
     # test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
     # test.test_qwen2()  # Passed
-    # test.test_qwen2_moe()  # Passed - Passes MoE CONOV
+    test.test_qwen2_moe()  # Passed - Passes MoE CONOV
     # test.test_qwen2_vl()  # Passed
     # test.test_qwen3()  # Passed
-    # test.test_qwen3_moe()  # Passed - Passes MoE CONOV
+    test.test_qwen3_moe()  # Passed - Passes MoE CONOV
     # test.test_stablelm()  # Passed
     # -----------------------------------------------
