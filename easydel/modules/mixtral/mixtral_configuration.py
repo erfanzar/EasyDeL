@@ -131,6 +131,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         attention_bias: bool = False,
         initialization_of_moe: bool = False,
         router_jitter_noise=0.0,
+        head_dim: int | None = None,
         layer_types: list[str] | None = None,
         **kwargs,
     ):
@@ -203,7 +204,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.router_jitter_noise = router_jitter_noise
         self.layer_types = layer_types
-        self.head_dim = hidden_size // num_attention_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"

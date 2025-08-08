@@ -665,19 +665,10 @@ class EasyBridgeMixin(PushToHubMixin):
         try:
             import torch
 
-            if torch.cuda.is_available():
-
-                def _clear():
-                    gc.collect()
+            def _clear():
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-            else:
-
-                class torch:
-                    bfloat16 = None
-
-                def _clear():
-                    gc.collect()
+                gc.collect()
 
         except ModuleNotFoundError as er:
             raise ModuleNotFoundError(
@@ -695,10 +686,10 @@ class EasyBridgeMixin(PushToHubMixin):
         config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
-        hf_model = cls.get_torch_loader().from_pretrained(
-            pretrained_model_name_or_path,
-            **kwargs,
-        )
+        if "torch_dtype" not in kwargs.keys():
+            kwargs["torch_dtype"] = torch.float16
+
+        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, **kwargs)
         generation_config = getattr(hf_model, "generation_config", None)
         config_class = config_class.from_pretrained(pretrained_model_name_or_path)
         state_dict = hf_model.state_dict()

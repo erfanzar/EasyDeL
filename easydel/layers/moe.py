@@ -23,6 +23,7 @@ import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
@@ -807,12 +808,13 @@ class MoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
+        fn = self._ragged_dot
         if self.use_pallas_group_matmul:
             if self.out_first:
                 weight = jnp.transpose(self.kernel.value, (0, 2, 1))
-            output = self._grouped_matmul(inputs, weight, group_sizes)
-        else:
-            output = self._ragged_dot(inputs, weight, group_sizes)
+            fn = self._grouped_matmul
+        inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
+        output = fn(inputs, weight, group_sizes)
 
         if self.bias is not None:
             bias_expanded = self._expand_bias_ragged(group_sizes)

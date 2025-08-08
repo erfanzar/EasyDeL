@@ -288,114 +288,6 @@ class StateDictConverter:
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict, set()
 
-        import torch
-
-        excepted_expert_name = moe_path[0].split(".")[-2]
-        expert_prefix = f".{excepted_expert_name}."
-
-        moe_names_set = set(moe_names)
-        moe_stacked_paths = {
-            f"{block_path}.{excepted_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
-        }
-
-        new_state_dict = {}
-        moe_groups = {path: {} for path in moe_stacked_paths}
-        consolidated_moe_keys = set()
-
-        for key, value in state_dict.items():
-            is_moe_expert = False
-
-            if expert_prefix not in key:
-                new_state_dict[key] = value
-                continue
-
-            for block_path in moe_block_path:
-                block_expert_prefix = block_path + expert_prefix
-                if key.startswith(block_expert_prefix):
-                    remainder = key[len(block_expert_prefix) :]
-
-                    dot_idx = remainder.find(".")
-                    if dot_idx <= 0:
-                        continue
-
-                    expert_part = remainder[:dot_idx]
-                    if not expert_part.isdigit():
-                        continue
-
-                    expert_idx = int(expert_part)
-                    moe_name_part = remainder[dot_idx + 1 :]
-                    moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
-
-                    if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
-                        moe_groups[target_path][expert_idx] = value
-                        is_moe_expert = True
-                        break
-
-            if not is_moe_expert:
-                new_state_dict[key] = value
-        for target_path, expert_dict in moe_groups.items():
-            if not expert_dict:
-                continue
-
-            expert_indices = sorted(expert_dict.keys())
-            num_experts = len(expert_indices)
-            first_tensor = expert_dict[expert_indices[0]]
-            new_key = f"{target_path}.weight"
-
-            try:
-                if isinstance(first_tensor, torch.Tensor):
-                    if first_tensor.device.type != "meta":
-                        meta_sample = torch.empty_like(first_tensor, device="meta")
-                    else:
-                        meta_sample = first_tensor
-                    stacked_shape = (num_experts, *meta_sample.shape)
-                    stacked_tensor = torch.empty(
-                        stacked_shape,
-                        dtype=first_tensor.dtype,
-                        device=first_tensor.device,
-                    )
-
-                    for i, idx in enumerate(expert_indices):
-                        stacked_tensor[i] = expert_dict[idx]
-
-                else:
-                    import numpy as np
-
-                    expert_tensors = [expert_dict[idx] for idx in expert_indices]
-                    stacked_tensor = np.stack(expert_tensors, axis=0)
-
-                if tensor_transform is not None:
-                    stacked_tensor = tensor_transform(stacked_tensor)
-
-                new_state_dict[new_key] = stacked_tensor
-                consolidated_moe_keys.add(new_key)
-            except Exception as e:
-                logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
-                for idx, tensor in expert_dict.items():
-                    fallback_key = (
-                        f"{target_path.replace(f'.{excepted_expert_name}.', f'.{excepted_expert_name}.{idx}.')}.weight"
-                    )
-                    new_state_dict[fallback_key] = tensor
-
-        return new_state_dict, consolidated_moe_keys
-
-    @staticmethod
-    def apply_moe_transformations_low_memory(
-        state_dict: dict[str, tp.Any],
-        moe_block_names: list[str] | None = None,
-        moe_names: list[str] | None = None,
-        moe_block_path: list[str] | None = None,
-        moe_path: list[str] | None = None,
-        tensor_transform: tp.Callable | None = None,
-    ) -> tuple[dict[str, tp.Any], set[str]]:
-        """
-        Memory-optimized MoE transformation that aggressively frees memory.
-        Modifies state_dict in-place to minimize memory usage.
-        """
-        if not all([moe_block_names, moe_names, moe_block_path]):
-            return state_dict, set()
-
         import gc
 
         import torch
@@ -403,61 +295,66 @@ class StateDictConverter:
         excepted_expert_name = moe_path[0].split(".")[-2]
         expert_prefix = f".{excepted_expert_name}."
         moe_names_set = set(moe_names)
-        moe_stacked_paths = {
-            f"{block_path}.{excepted_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
-        }
-
         consolidated_moe_keys = set()
-        moe_groups = {path: {} for path in moe_stacked_paths}
 
+        moe_groups = {}
         for key in list(state_dict.keys()):
             if expert_prefix not in key:
                 continue
 
             for block_path in moe_block_path:
                 block_expert_prefix = block_path + expert_prefix
-                if key.startswith(block_expert_prefix):
-                    remainder = key[len(block_expert_prefix) :]
-                    dot_idx = remainder.find(".")
+                if not key.startswith(block_expert_prefix):
+                    continue
 
-                    if dot_idx <= 0:
-                        continue
+                remainder = key[len(block_expert_prefix) :]
+                dot_idx = remainder.find(".")
+                if dot_idx <= 0:
+                    continue
 
-                    expert_part = remainder[:dot_idx]
-                    if not expert_part.isdigit():
-                        continue
+                expert_part = remainder[:dot_idx]
+                if not expert_part.isdigit():
+                    continue
 
-                    expert_idx = int(expert_part)
-                    moe_name_part = remainder[dot_idx + 1 :]
-                    moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
+                expert_idx = int(expert_part)
+                moe_name_part = remainder[dot_idx + 1 :]
+                moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
 
-                    if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
-                        moe_groups[target_path][expert_idx] = state_dict.pop(key)
-                        break
+                if moe_name in moe_names_set:
+                    target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                    if target_path not in moe_groups:
+                        moe_groups[target_path] = []
+                    moe_groups[target_path].append((expert_idx, key))
+                    break
 
-        for target_path, expert_dict in moe_groups.items():
-            if not expert_dict:
+        for target_path, expert_keys in tqdm(moe_groups.items(), desc="Applying MoE Transformations"):
+            if not expert_keys:
                 continue
 
-            expert_indices = sorted(expert_dict.keys())
-            num_experts = len(expert_indices)
+            expert_keys.sort(key=lambda x: x[0])
+            num_experts = len(expert_keys)
             new_key = f"{target_path}.weight"
 
             try:
-                first_tensor = expert_dict[expert_indices[0]]
+                first_key = expert_keys[0][1]
+                first_tensor = state_dict[first_key]
 
                 if isinstance(first_tensor, torch.Tensor):
-                    stacked_shape = (num_experts, *first_tensor.shape)
-                    if first_tensor.device.type != "meta":
-                        stacked_tensor = torch.empty(stacked_shape, dtype=first_tensor.dtype, device=first_tensor.device)
-                    else:
-                        stacked_tensor = torch.empty(stacked_shape, dtype=first_tensor.dtype, device="meta")
+                    dtype = first_tensor.dtype
+                    shape = first_tensor.shape
+                    stacked_tensor = torch.empty((num_experts, *shape), dtype=dtype, device="cpu", pin_memory=False)
 
-                    for i, idx in enumerate(expert_indices):
-                        if stacked_tensor.device.type != "meta":
-                            stacked_tensor[i] = expert_dict[idx]
-                        del expert_dict[idx]
+                    for i, (_, key) in enumerate(expert_keys):
+                        expert = state_dict.pop(key)
+
+                        if expert.device.type == "cuda":
+                            stacked_tensor[i] = expert.cpu()
+                            torch.cuda.empty_cache()
+                        else:
+                            stacked_tensor[i] = expert
+
+                        del expert
+                        gc.collect()
 
                     if tensor_transform is not None:
                         stacked_tensor = tensor_transform(stacked_tensor)
@@ -466,32 +363,29 @@ class StateDictConverter:
                     consolidated_moe_keys.add(new_key)
 
                 else:
-                    import numpy as np
-
-                    expert_tensors = [expert_dict[idx] for idx in expert_indices]
-                    stacked_tensor = np.stack(expert_tensors, axis=0)
-                    for idx in expert_indices:
-                        del expert_dict[idx]
+                    first_array = state_dict[first_key]
+                    shape = first_array.shape
+                    dtype = first_array.dtype
+                    stacked_array = np.empty((num_experts, *shape), dtype=dtype)
+                    for i, (_, key) in enumerate(expert_keys):
+                        expert = state_dict.pop(key)
+                        stacked_array[i] = expert
+                        del expert
+                        gc.collect()
 
                     if tensor_transform is not None:
-                        stacked_tensor = tensor_transform(stacked_tensor)
+                        stacked_array = tensor_transform(stacked_array)
 
-                    state_dict[new_key] = stacked_tensor
+                    state_dict[new_key] = stacked_array
                     consolidated_moe_keys.add(new_key)
 
             except Exception as e:
                 logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
-                for idx, tensor in expert_dict.items():
-                    fallback_key = (
-                        f"{target_path.replace(f'.{excepted_expert_name}.', f'.{excepted_expert_name}.{idx}.')}.weight"
-                    )
-                    state_dict[fallback_key] = tensor
 
-            expert_dict.clear()
+            gc.collect()
 
         moe_groups.clear()
         gc.collect()
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -515,29 +409,19 @@ class StateDictConverter:
         remove_state_dict: bool = False,
         lm_head_name: str | None = None,
         uses_tie_word_embedding: bool = False,
-        low_memory_mode: bool = True,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Convert PyTorch state dict to EasyDeL format with MoE transformations."""
         consolidated_moe_keys = set()
 
         if moe_block_names is not None and moe_names is not None:
-            if low_memory_mode:
-                state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations_low_memory(
-                    state_dict=state_dict,
-                    moe_names=moe_names,
-                    moe_path=moe_path,
-                    moe_block_names=moe_block_names,
-                    moe_block_path=moe_block_path,
-                )
-            else:
-                state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
-                    state_dict=state_dict,
-                    moe_names=moe_names,
-                    moe_path=moe_path,
-                    moe_block_names=moe_block_names,
-                    moe_block_path=moe_block_path,
-                )
+            state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
+                state_dict=state_dict,
+                moe_names=moe_names,
+                moe_path=moe_path,
+                moe_block_names=moe_block_names,
+                moe_block_path=moe_block_path,
+            )
 
         return StateDictConverter._base_huggingface_to_easydel(
             state_dict,

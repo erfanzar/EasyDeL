@@ -101,7 +101,7 @@ class MixtralAttention(AttentionModule):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -827,6 +827,7 @@ class MixtralForCausalLM(EasyDeLBaseModule):
             aux_loss=aux_loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             past_key_values=outputs.past_key_values,
