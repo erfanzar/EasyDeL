@@ -635,7 +635,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
         ...  "gpt2",
-        ...  sharding_axis_dims=(1, 8, 1, 1),
+        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
         ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,
@@ -713,7 +713,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
         ...  "openai/whisper-large-v3-turbo",
-        ...  sharding_axis_dims=(1, 8, 1, 1),
+        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
         ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,

@@ -16,7 +16,6 @@
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
-from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
 
@@ -81,6 +80,13 @@ class Xerxes2Config(EasyDeLBaseConfig):
         vocab_size: int = 256128,
         hidden_size: int = 4096,
         intermediate_size: int = 16384,
+        moe_intermediate_size: int = 8192,
+        decoder_sparse_step: int = 1,
+        num_experts_per_tok: int = 8,
+        num_experts: int = 128,
+        norm_topk_prob: int = False,
+        output_router_logits: int = False,
+        router_aux_loss_coef: int = 0.001,
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
         max_position_embeddings: int = 16384,
@@ -92,7 +98,6 @@ class Xerxes2Config(EasyDeLBaseConfig):
         bos_token_id: int = 2,
         tie_word_embeddings: bool = False,
         rope_theta: float = 10000.0,
-        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
         q_lora_dim: int | None = 1536,
@@ -100,15 +105,23 @@ class Xerxes2Config(EasyDeLBaseConfig):
         qk_rope_head_dim: int = 64,
         qk_nope_head_dim: int = 128,
         vhead_dim: int = 128,
+        mlp_only_layers: list[int] | None = None,
+        hidden_act: str | None = None,
         **kwargs,
     ):
-        self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.scan_layers = scan_layers
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.moe_intermediate_size = moe_intermediate_size
+        self.decoder_sparse_step = decoder_sparse_step
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.norm_topk_prob = norm_topk_prob
+        self.output_router_logits = output_router_logits
+        self.router_aux_loss_coef = router_aux_loss_coef
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.initializer_range = initializer_range
@@ -120,6 +133,8 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
         self.vhead_dim = vhead_dim
+        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+        self.hidden_act = hidden_act if hidden_act is not None else "silu"
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

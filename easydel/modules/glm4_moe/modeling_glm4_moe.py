@@ -42,6 +42,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
 from easydel.layers.norms import RMSNorm
 
 from .glm4_moe_configuration import Glm4MoeConfig
@@ -91,6 +92,60 @@ class Glm4MoeMLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
         return hidden_states, None
+
+
+class Glm4MoeMLPStack(nn.Module):
+    """Glm4Moe MoE MLP using the new MoELinear layers."""
+
+    def __init__(
+        self,
+        config: Glm4MoeConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_proj = MoELinear(
+            num_experts=config.n_routed_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=False,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+        )
+        self.down_proj = MoELinear(
+            num_experts=config.n_routed_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+        )
+        self.up_proj = MoELinear(
+            num_experts=config.n_routed_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        hidden_states = self.act_fn(self.gate_proj(x, group_sizes))
+        hidden_states = hidden_states * self.up_proj(x, group_sizes)
+        outputs = self.down_proj(hidden_states, group_sizes)
+        return outputs
 
 
 class Glm4MoeTopKRouter(nn.Module):
@@ -159,10 +214,10 @@ class Glm4MoeTopKRouter(nn.Module):
             denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
             topk_weights = topk_weights / denominator
         topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_indices, topk_weights
+        return topk_weights
 
 
-class Glm4MoeMoE(nn.Module):
+class Glm4MoeMoE(BaseMoeModule):
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -172,21 +227,28 @@ class Glm4MoeMoE(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        super().__init__(
+            config=config,
+            n_routed_experts=config.n_routed_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=getattr(config, "router_aux_loss_coef", None),
+            rzl_coef=getattr(config, "router_z_loss_coef", None),
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.experts = [
-            Glm4MoeMLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(self.config.n_routed_experts)
-        ]
+        self.experts = Glm4MoeMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
 
         self.gate = Glm4MoeTopKRouter(
             config=config,
@@ -210,24 +272,16 @@ class Glm4MoeMoE(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        residual = hidden_states
-        orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.gate(hidden_states)
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        final_hidden_states = jnp.zeros_like(hidden_states)
-        for expert_idx in range(self.config.n_routed_experts):
-            expert = self.experts[expert_idx]
-
-            expert_output, _ = expert(hidden_states)
-            expert_mask = (topk_indices == expert_idx).astype(topk_weights.dtype)
-            expert_weights = jnp.sum(expert_mask * topk_weights, axis=-1)[:, None]
-            final_hidden_states += expert_output * expert_weights
-
-        final_hidden_states = final_hidden_states.reshape(*orig_shape)
-        shared_output, _ = self.shared_experts(residual)
+        final_hidden_states, router_logits = self._moe_call(
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            hidden_state=hidden_states,
+            output_metrics=False,
+            validate_inputs=True,
+        )
+        shared_output, _ = self.shared_experts(hidden_states)
         final_hidden_states = final_hidden_states + shared_output
-
-        return final_hidden_states, topk_indices
+        return final_hidden_states, router_logits
 
 
 class Glm4MoeAttention(AttentionModule):
@@ -729,7 +783,7 @@ class Glm4MoeForCausalLM(EasyDeLBaseModule):
         if apply_lm_head:
             lm_logits = self.apply_lm_head(hidden_states)
 
-        aux_loss = None
+        aux_loss = 0
         if output_router_logits and outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(
                 gate_logits=outputs.router_logits,
