@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -234,13 +234,10 @@ class MixtralConfig(EasyDeLBaseConfig):
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
-            (r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(RowWise)),
+            (r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(ExpertRowWiseAlt)),
             (r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r".*/(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r"score/kernel", pmag.resolve(RowWise)),
             (r".*bias", pmag.resolve(Replicated)),
