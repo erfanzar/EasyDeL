@@ -183,9 +183,9 @@ class Grok1Config(EasyDeLBaseConfig):
             (r"attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"gate/kernel", pmag.resolve(ColumnWise)),
             (r"gate/bias", pmag.resolve(Replicated)),
-            (r"experts/\d+/(linear|linear_v)/kernel", pmag.resolve(ColumnWise)),
-            (r"experts/\d+/linear_1/kernel", pmag.resolve(RowWise)),
-            (r"experts/\d+/.*linear.*/bias", pmag.resolve(Replicated)),
+            (r"experts/(linear|linear_v)/kernel", pmag.resolve(ColumnWise)),
+            (r"experts/linear_1/kernel", pmag.resolve(RowWise)),
+            (r"experts/.*linear.*/bias", pmag.resolve(Replicated)),
             (
                 r".*(pre_attn_norm|post_attn_norm|pre_moe_norm|post_moe_norm|norm)/kernel",
                 pmag.resolve(Replicated),
