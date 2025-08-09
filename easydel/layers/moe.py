@@ -29,11 +29,8 @@ from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
 
 BATCH = common_types.BATCH
-QUERY_LENGTH = common_types.QUERY_LENGTH
 EMPTY = common_types.EMPTY
 MODE_TRAIN = common_types.MODE_TRAIN
-EMBED = common_types.EMBED
-EXPERT = common_types.EXPERT
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
@@ -47,7 +44,7 @@ class MoeRoutingStrategy(enum.Enum):
         TOP_K_NDIV: Top-k routing without dividing the weights by their sum.
         SWITCH: Switch Transformer-style routing, where each token is routed to
             only the top-1 expert.
-        EXPERT_CHOICE: Expert Choice routing, where each expert selects the top-k
+        EMPTY_CHOICE: Expert Choice routing, where each expert selects the top-k
             tokens with the highest scores for that expert.
         HASH: A simple hashing-based routing for debugging or baseline comparison.
     """
@@ -55,7 +52,7 @@ class MoeRoutingStrategy(enum.Enum):
     TOP_K = "top_k"
     TOP_K_NDIV = "top_k_ndiv"
     SWITCH = "switch"
-    EXPERT_CHOICE = "expert_choice"
+    EMPTY_CHOICE = "expert_choice"
     HASH = "hash"
 
 
@@ -67,14 +64,14 @@ class MoeLoadBalancingStrategy(enum.Enum):
             loads and mean router probabilities.
         SWITCH_TRANSFORMER: The load balancing loss used in the Switch
             Transformer paper.
-        EXPERT_CHOICE: A load balancing loss variant suitable for Expert Choice
+        EMPTY_CHOICE: A load balancing loss variant suitable for Expert Choice
             routing, often based on the variance of expert loads.
         NONE: No load balancing loss is applied.
     """
 
     STANDARD = "standard"
     SWITCH_TRANSFORMER = "switch_transformer"
-    EXPERT_CHOICE = "expert_choice"
+    EMPTY_CHOICE = "expert_choice"
     NONE = "none"
 
 
@@ -215,7 +212,7 @@ class BaseMoeModule(nn.Module, ABC):
             in_specs = pspec
             out_specs = (pspec, pspec)
         elif router_probs.ndim == 3:
-            pspec = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMPTY], mode=MODE_TRAIN, shape=router_probs.shape)
+            pspec = pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=router_probs.shape)
             in_specs = pspec
             out_specs = (pspec, pspec)
         else:
@@ -250,7 +247,7 @@ class BaseMoeModule(nn.Module, ABC):
         elif strategy == MoeRoutingStrategy.SWITCH:
             selected_experts = jnp.argmax(router_probs, axis=-1, keepdims=True)
             selected_weights = jnp.take_along_axis(router_probs, selected_experts, axis=-1)
-        elif strategy == MoeRoutingStrategy.EXPERT_CHOICE:
+        elif strategy == MoeRoutingStrategy.EMPTY_CHOICE:
             k = router_probs.shape[0] // self.n_routed_experts
             selected_weights, selected_experts = jax.lax.top_k(router_probs.T, k=k)
             selected_weights = selected_weights.T
@@ -303,22 +300,22 @@ class BaseMoeModule(nn.Module, ABC):
         """
         pmag = self.partition_manager
         if hidden_states_flat.ndim == 2:
-            x_in_specs = pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
+            x_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
         else:
-            x_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
+            x_in_specs = pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
 
         if topk_idx_flat.ndim == 1:
             idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
         else:
-            idx_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+            idx_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(x_in_specs, idx_in_specs),
             out_specs=(
-                pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=hidden_states_flat.shape),
-                pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN),
+                pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape),
+                pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN),
                 pmag.resolve(axes=[BATCH], mode=MODE_TRAIN),
             ),
             check_rep=False,
@@ -380,14 +377,14 @@ class BaseMoeModule(nn.Module, ABC):
         pmag = self.partition_manager
 
         if out_repeat_sort.ndim == 2:
-            out_in_specs = pmag.resolve(axes=[BATCH, EMBED], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
+            out_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
         else:
-            out_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH, EMBED], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
+            out_in_specs = pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
 
         if sort_idx.ndim == 1:
             idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=sort_idx.shape)
         else:
-            idx_in_specs = pmag.resolve(axes=[BATCH, QUERY_LENGTH], mode=MODE_TRAIN, shape=sort_idx.shape)
+            idx_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=sort_idx.shape)
 
         batch_size, seq_len, hidden_size = original_shape
         output_shape = (batch_size * seq_len, self.num_experts_per_tok, hidden_size)
@@ -396,7 +393,7 @@ class BaseMoeModule(nn.Module, ABC):
             shard_map,
             mesh=self.mesh,
             in_specs=(out_in_specs, idx_in_specs),
-            out_specs=pmag.resolve(axes=[BATCH, EMPTY, EMBED], mode=MODE_TRAIN, shape=output_shape),
+            out_specs=pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=output_shape),
             check_rep=False,
         )
         def unpermute_sharded(out_repeat_sort_: jax.Array, sort_idx_: jax.Array):
@@ -467,7 +464,7 @@ class BaseMoeModule(nn.Module, ABC):
             router_fraction = jnp.mean(router_probs, axis=0)
             return self.lbl_coef * self.n_routed_experts * jnp.sum(expert_fraction * router_fraction)
 
-        elif strategy == MoeLoadBalancingStrategy.EXPERT_CHOICE:
+        elif strategy == MoeLoadBalancingStrategy.EMPTY_CHOICE:
             return self.lbl_coef * jnp.var(expert_loads)
 
         else:
@@ -534,31 +531,31 @@ class BaseMoeModule(nn.Module, ABC):
 
         if tensor_type == "weight_col":
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             elif tensor.ndim == 2:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             else:
                 sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
         elif tensor_type == "weight_row":
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             elif tensor.ndim == 2:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             else:
                 sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
         elif tensor_type == "bias":
             if tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMBED], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             else:
-                sharding_spec = pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
 
         else:
             if tensor.ndim == 3 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             elif tensor.ndim == 2 and tensor.shape[0] == self.n_routed_experts:
-                sharding_spec = pmag.resolve(axes=[EXPERT, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
+                sharding_spec = pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=tensor.shape)
             else:
                 sharding_spec = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
 
@@ -567,12 +564,12 @@ class BaseMoeModule(nn.Module, ABC):
     def _get_gate_layer_sharding(self, weight_shape: tuple) -> jax.sharding.PartitionSpec:
         """Returns the partition spec for the gate/router layer weights."""
         pmag = self.partition_manager
-        return pmag.resolve(axes=[EMBED, EXPERT], mode=MODE_TRAIN, shape=weight_shape)
+        return pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=weight_shape)
 
     def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> jax.sharding.PartitionSpec:
         """Returns the partition spec for the gate/router layer bias."""
         pmag = self.partition_manager
-        return pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=bias_shape)
+        return pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=bias_shape)
 
     def _validate_routing_inputs(self, hidden_states: jax.Array, router_logits: jax.Array) -> None:
         """Validates the shapes of inputs for routing operations.

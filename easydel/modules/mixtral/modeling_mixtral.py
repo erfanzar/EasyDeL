@@ -43,7 +43,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
-from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeMetrics, MoeRoutingStrategy
+from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
 from easydel.layers.norms import RMSNorm
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
@@ -329,13 +329,13 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, MoeMetrics]:
+    def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
         return self._moe_call(
             gate_layer=self.gate,
             expert_layer=self.experts,
             hidden_state=hidden_state,
-            output_metrics=True,
+            output_metrics=False,
             validate_inputs=True,
         )
 
@@ -438,9 +438,8 @@ class MixtralDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states, moe_metrics = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
-        router_logits = moe_metrics.router_probs if output_router_logits else None
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,
