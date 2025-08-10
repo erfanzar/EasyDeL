@@ -27,10 +27,12 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
 MODE_TRAIN = common_types.MODE_TRAIN
+
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
@@ -561,12 +563,12 @@ class BaseMoeModule(nn.Module, ABC):
 
         return jax.device_put(tensor, jax.sharding.NamedSharding(self.mesh, sharding_spec))
 
-    def _get_gate_layer_sharding(self, weight_shape: tuple) -> jax.sharding.PartitionSpec:
+    def _get_gate_layer_sharding(self, weight_shape: tuple) -> PartitionSpec:
         """Returns the partition spec for the gate/router layer weights."""
         pmag = self.partition_manager
         return pmag.resolve(axes=[EMPTY, EMPTY], mode=MODE_TRAIN, shape=weight_shape)
 
-    def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> jax.sharding.PartitionSpec:
+    def _get_gate_layer_bias_sharding(self, bias_shape: tuple) -> PartitionSpec:
         """Returns the partition spec for the gate/router layer bias."""
         pmag = self.partition_manager
         return pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=bias_shape)
