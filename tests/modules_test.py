@@ -980,12 +980,12 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    test.test_arctic()  # Passed - Passes MoE CONOV
+    # test.test_arctic()  # Passed - Passes MoE CONOV
     # test.test_cohere()  # Passed
     # test.test_cohere2()  # Passed
     # test.test_dbrx()  # Passed
-    test.test_deepseek_v2()  # Passed - Passes MoE CONOV
-    test.test_deepseek_v3()  # Passed - Passes MoE CONOV
+    # test.test_deepseek_v2()  # Passed - Passes MoE CONOV
+    # test.test_deepseek_v3()  # Passed - Passes MoE CONOV
     # test.test_exaone()  # Passed
     # test.test_falcon()  # Passed
     # test.test_gemma()  # Passed
@@ -994,7 +994,7 @@ if __name__ == "__main__":
     # test.test_gemma3()  # Passed
     # test.test_glm()  # Passed
     # test.test_glm4()  # Passed
-    test.test_glm4_moe()  # Passed - Passes MoE CONOV
+    # test.test_glm4_moe()  # Passed - Passes MoE CONOV
     # test.test_gptj()  # Passed
     # test.test_gpt_noex()  # Passed
     # test.test_gpt_oss()  # Passed
@@ -1016,9 +1016,9 @@ if __name__ == "__main__":
     # test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
     # test.test_qwen2()  # Passed
-    test.test_qwen2_moe()  # Passed - Passes MoE CONOV
+    # test.test_qwen2_moe()  # Passed - Passes MoE CONOV
     # test.test_qwen2_vl()  # Passed
     # test.test_qwen3()  # Passed
-    test.test_qwen3_moe()  # Passed - Passes MoE CONOV
+    # test.test_qwen3_moe()  # Passed - Passes MoE CONOV
     # test.test_stablelm()  # Passed
     # -----------------------------------------------
