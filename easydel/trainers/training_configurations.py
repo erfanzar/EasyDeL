@@ -381,6 +381,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The Weights & Biases run name."},
     )
+    wandb_tags: list[str] | None = field(
+        default=None,
+        metadata={"help": "The Weights & Biases run tags."},
+    )
     warmup_steps: int = field(
         default=0,
         metadata={"help": "The number of warmup steps for the learning rate scheduler."},
@@ -664,7 +668,7 @@ class TrainingArguments:
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,
-                tags=["EasyDeL", "Jax", "Train", "LLM", "VLM"],
+                tags=self.wandb_tags or ["EasyDeL", "Jax", "Train", "LLM", "VLM"],
                 entity=self.wandb_entity,
             )
         return None
