@@ -708,10 +708,12 @@ class TrainingArguments:
 
         metrics = {}
         for key in history[0]:
-            vals = [h[key] for h in history if key in h]
+            vals = [h[key] for h in history if h.get(key) is not None]
+            if len(vals) == 0:
+                continue
             if all(isinstance(v, str) for v in vals):
                 metrics[key] = vals[-1]  # Take the last string value
-            elif all(isinstance(v, float) for v in vals):
+            elif all(isinstance(v, (int, float)) for v in vals):
                 metrics[key] = agg_fn(vals)
             elif all(isinstance(v, (list, tuple)) for v in vals):
                 # If all values are lists/tuples, aggregate them element-wise
