@@ -1364,12 +1364,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def log_metrics(
         self,
-        metrics: MetricsType,
+        history: list[MetricsType],
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
-    ):
+    ) -> list[MetricsType]:
         """Log metrics and update progress bar."""
+
+        metrics = self.arguments.aggregate_metrics(history)
 
         if step % self.arguments.log_steps == 0:
             if step == 0:
@@ -1389,5 +1391,9 @@ class BaseTrainer(BaseTrainerProtocol):
             pbar.set_postfix(**display_metrics)
             update_size = 0 if step == 0 else self.arguments.log_steps
             pbar.update(update_size)
+
         if step % self.arguments.report_steps == 0:
             self.arguments.log_metrics(metrics=metrics, step=step)
+            return []
+        else:
+            return history

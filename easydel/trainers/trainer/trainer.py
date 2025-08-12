@@ -327,6 +327,8 @@ class Trainer(BaseTrainer):
 
             def data_collator(x):
                 return x
+            
+        metrics_history = []
 
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
             current_step = int(jax.device_get(state.step))
@@ -381,8 +383,9 @@ class Trainer(BaseTrainer):
                     metrics=metrics,
                     step=current_step,
                 )
-                self.log_metrics(
-                    metrics=train_metrics,
+                metrics_history.append(train_metrics)
+                metrics_history = self.log_metrics(
+                    history=metrics_history,
                     pbar=pbar,
                     step=current_step,
                     mode="train",
