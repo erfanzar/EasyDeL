@@ -826,7 +826,9 @@ class ParallelMoELinear(nn.Module):
         self.num_experts = num_experts
         self.in_features = in_features
         self.out_features = out_features
-        self.use_pallas_group_matmul = use_pallas_group_matmul
+        # self.use_pallas_group_matmul = use_pallas_group_matmul
+        # NOTE: hard set this to False before fixing the shard-map issues.
+        self.use_pallas_group_matmul = False
         self.out_first = out_first
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -851,24 +853,6 @@ class ParallelMoELinear(nn.Module):
         return self.partition_manager is not None and self._direction is not None
 
     @property
-    def alt_sharding_input(self) -> DynamicShardingAxes | None:
-        alt_sharding = self.alt_sharding
-        if alt_sharding is not None:
-            if self.direction == "column":
-
-                class _Sharding(DynamicShardingAxes):
-                    axes: typing.ClassVar = [alt_sharding.axes[2], alt_sharding.axes[1]]
-                    mode: typing.ClassVar = alt_sharding.mode
-            else:
-
-                class _Sharding(DynamicShardingAxes):
-                    axes: typing.ClassVar = [alt_sharding.axes[1], alt_sharding.axes[2]]
-                    mode: typing.ClassVar = alt_sharding.mode
-
-            return _Sharding
-        return None
-
-    @property
     def alt_sharding(self) -> ExpertRowWiseAlt | ExpertColumnWiseAlt | None:
         if self.direction is None:
             return None
@@ -879,6 +863,12 @@ class ParallelMoELinear(nn.Module):
         else:
             direction = self.direction
             raise NotImplementedError(f"ALT-Sharding Rule for {direction=} is not implemented!.")
+
+    @property
+    def alt_sharding_axis(self) -> list[str] | None:
+        if self.alt_sharding is None:
+            return None
+        return self.alt_sharding.axes
 
     def __call__(self, inputs: jax.Array, group_sizes: jax.Array) -> jax.Array:
         """Applies the batched linear transformation.
@@ -899,15 +889,20 @@ class ParallelMoELinear(nn.Module):
             if self.out_first:
                 weight = jnp.transpose(self.kernel.value, (0, 2, 1))
             fn = self._grouped_matmul
-        if self.can_use_shard_map:
-            pmag = self.partition_manager
-            specs = (
-                pmag.resolve(dynamic_axes=self.alt_sharding_input, shape=inputs.shape),
-                pmag.resolve(dynamic_axes=self.alt_sharding, shape=weight.shape),
-                pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=group_sizes.shape),
+        if self.can_use_shard_map and self.use_pallas_group_matmul:
+            resolve = self.partition_manager.resolve
+            weights_axes = self.alt_sharding_axis
+            fn = shard_map(
+                fn,
+                mesh=get_incontext_mesh(),
+                in_specs=(
+                    resolve(axes=[weights_axes[2], weights_axes[1]], mode=MODE_TRAIN, shape=inputs.shape),
+                    resolve(axes=weights_axes, mode=MODE_TRAIN, shape=weight.shape),
+                    resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=group_sizes.shape),
+                ),
+                out_specs=resolve(axes=[weights_axes[1], weights_axes[2]], mode=MODE_TRAIN, shape=inputs.shape[::-1]),
+                check_rep=False,
             )
-
-            fn = shard_map(fn, mesh=get_incontext_mesh(), in_specs=specs, out_specs=specs[0], check_rep=False)
         if weight.dtype in [
             jnp.float8_e4m3b11fnuz,
             jnp.float8_e4m3fn,
