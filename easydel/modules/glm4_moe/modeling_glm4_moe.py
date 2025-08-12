@@ -42,7 +42,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
-from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
 from .glm4_moe_configuration import Glm4MoeConfig
@@ -95,7 +101,7 @@ class Glm4MoeMLP(nn.Module):
 
 
 class Glm4MoeMLPStack(nn.Module):
-    """Glm4Moe MoE MLP using the new MoELinear layers."""
+    """Glm4Moe MoE MLP using the new ParallelMoELinear layers."""
 
     def __init__(
         self,
@@ -111,7 +117,7 @@ class Glm4MoeMLPStack(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate_proj = MoELinear(
+        self.gate_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
@@ -119,8 +125,9 @@ class Glm4MoeMLPStack(nn.Module):
             kernel_init=nn.initializers.normal(),
             use_bias=False,
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
-        self.down_proj = MoELinear(
+        self.down_proj = RowParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
@@ -128,8 +135,9 @@ class Glm4MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
-        self.up_proj = MoELinear(
+        self.up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
@@ -137,6 +145,7 @@ class Glm4MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 

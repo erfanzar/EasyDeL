@@ -44,7 +44,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
-from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
 from .deepseek_configuration import DeepseekV2Config
@@ -176,19 +182,45 @@ class DeepseekV2MLPMoE(nn.Module):
         rngs: nn.Rngs,
     ):
         self.config = config
-        linear = functools.partial(
-            MoELinear,
+
+        imz = intermediate_size or config.intermediate_size
+        hs = hidden_size or config.hidden_size
+        self.gate_proj = ColumnParallelMoELinear(
+            config.n_routed_experts,
+            hs,
+            imz,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
         )
-        imz = intermediate_size or config.intermediate_size
-        hs = hidden_size or config.hidden_size
-        self.gate_proj = linear(config.n_routed_experts, hs, imz, rngs=rngs)
-        self.up_proj = linear(config.n_routed_experts, hs, imz, rngs=rngs)
-        self.down_proj = linear(config.n_routed_experts, imz, hs, rngs=rngs)
+        self.up_proj = ColumnParallelMoELinear(
+            config.n_routed_experts,
+            hs,
+            imz,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
+        self.down_proj = RowParallelMoELinear(
+            config.n_routed_experts,
+            imz,
+            hs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array):

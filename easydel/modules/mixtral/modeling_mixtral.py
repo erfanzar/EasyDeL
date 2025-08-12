@@ -43,7 +43,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
-from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
@@ -228,7 +234,7 @@ class MixtralAttention(AttentionModule):
 
 
 class MixtralMoEMlp(nn.Module):
-    """Mixtral MoE MLP using the new MoELinear layers."""
+    """Mixtral MoE MLP using the new ParallelMoELinear layers."""
 
     def __init__(
         self,
@@ -244,7 +250,7 @@ class MixtralMoEMlp(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.w1 = MoELinear(
+        self.w1 = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
@@ -252,8 +258,9 @@ class MixtralMoEMlp(nn.Module):
             kernel_init=nn.initializers.normal(),
             use_bias=False,
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
-        self.w2 = MoELinear(
+        self.w2 = RowParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
@@ -261,8 +268,9 @@ class MixtralMoEMlp(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
-        self.w3 = MoELinear(
+        self.w3 = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
@@ -270,6 +278,7 @@ class MixtralMoEMlp(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 

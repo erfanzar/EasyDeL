@@ -1079,13 +1079,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
     @property
     def transform_fn(self):
         """Transform function with rules."""
-        from easydel.layers.moe import BaseMoeModule, MoELinear
+        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
         from easydel.utils import graph_utils
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, MoELinear)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
 
         return partial(
@@ -1344,13 +1344,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             tp.Callable: A partial function for converting a PyTorch state dict without applying sharding.
         """
-        from easydel.layers.moe import BaseMoeModule, MoELinear
+        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
         from easydel.utils import graph_utils
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, MoELinear)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
 
         return partial(
