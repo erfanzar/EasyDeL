@@ -42,7 +42,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
-from easydel.layers.moe import BaseMoeModule, MoELinear, MoeLoadBalancingStrategy, MoeRoutingStrategy
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
 from .arctic_configuration import ArcticConfig
@@ -215,17 +221,43 @@ class ArcticMLPMoE(nn.Module):
         self.is_residual_mlp = is_residual_mlp
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
-        linear_class = partial(
-            MoELinear,
+
+        self.w1 = ColumnParallelMoELinear(
+            config.num_local_experts,
+            self.hidden_dim,
+            self.ffn_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
         )
-        self.w1 = linear_class(config.num_local_experts, self.hidden_dim, self.ffn_dim, rngs=rngs)
-        self.w3 = linear_class(config.num_local_experts, self.hidden_dim, self.ffn_dim, rngs=rngs)
-        self.w2 = linear_class(config.num_local_experts, self.ffn_dim, self.hidden_dim, rngs=rngs)
+        self.w3 = ColumnParallelMoELinear(
+            config.num_local_experts,
+            self.hidden_dim,
+            self.ffn_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
+        self.w2 = RowParallelMoELinear(
+            config.num_local_experts,
+            self.ffn_dim,
+            self.hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array):

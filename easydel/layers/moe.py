@@ -21,7 +21,7 @@ from functools import partial
 
 import jax
 from eformer import common_types
-from eformer.escale import apply_logical_sharding
+from eformer.escale import PartitionManager, apply_logical_sharding, get_incontext_mesh
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
@@ -31,8 +31,15 @@ from jax.sharding import PartitionSpec
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
+EMBED = common_types.EMBED
+EXPERT = common_types.EXPERT
 MODE_TRAIN = common_types.MODE_TRAIN
-
+FSDP = common_types.FSDP
+TP = common_types.TP
+SP = common_types.SP
+ExpertColumnWiseAlt = common_types.ExpertColumnWiseAlt
+ExpertRowWiseAlt = common_types.ExpertRowWiseAlt
+DynamicShardingAxes = common_types.DynamicShardingAxes
 if typing.TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
 
@@ -672,7 +679,7 @@ class BaseMoeModule(nn.Module, ABC):
 
         Args:
             gate_layer: The module that acts as the router (e.g., a Linear layer).
-            expert_layer: The module containing the expert logic (e.g., `MoELinear`).
+            expert_layer: The module containing the expert logic (e.g., `ParallelMoELinear`).
             hidden_state: The input tensor of shape
                 `(batch_size, seq_len, hidden_size)`.
             output_metrics: If True, returns a `MoeMetrics` object along with the
@@ -752,25 +759,34 @@ class BaseMoeModule(nn.Module, ABC):
         pass
 
 
-class MoELinear(nn.Module):
-    """A batched Linear layer for Mixture of Experts (MoE).
+class ParallelMoELinear(nn.Module):
+    """A batched linear transformation layer for Mixture of Experts (MoE) models.
 
-    This module performs a linear transformation on inputs that have been grouped
-    by expert. It supports both standard ragged matrix multiplication and
-    optimized Grouped Matrix Multiplication (GMM) on TPUs.
+    This layer applies separate linear transformations for each expert in a MoE setup.
+    The inputs are assumed to be sorted and grouped by expert, with `group_sizes`
+    specifying how many tokens belong to each expert. It supports:
+    - **Ragged Matrix Multiplication** via `jax.lax.ragged_dot_general`.
+    - **Grouped Matrix Multiplication (GMM)** via a Pallas kernel for TPUs.
+
+    Can optionally integrate with a `PartitionManager` to shard parameters and
+    use `shard_map` for distributed execution.
 
     Attributes:
-        num_experts: The number of experts in the layer.
-        in_features: The number of input features.
-        out_features: The number of output features.
-        use_pallas_group_matmul: A boolean indicating whether to use the optimized GMM kernel.
-        out_first: If True, the weight matrix has shape `(E, O, I)`. Otherwise,
-            `(E, I, O)`.
-        dtype: The data type for computations.
-        param_dtype: The data type for parameters (weights and biases).
-        kernel: The weight parameter for the linear transformation.
-        bias: The bias parameter for the linear transformation.
+        num_experts (int): Number of experts.
+        in_features (int): Input feature dimension.
+        out_features (int): Output feature dimension.
+        use_pallas_group_matmul (bool): Whether to use the optimized GMM kernel (TPU-optimized).
+        out_first (bool): If True, kernel shape is `(num_experts, out_features, in_features)`;
+            otherwise `(num_experts, in_features, out_features)`.
+        dtype (jax.numpy.dtype | None): Data type for computation.
+        param_dtype (jax.numpy.dtype): Data type for parameters.
+        kernel (nn.Param): Weight matrix parameter for the transformation.
+        bias (nn.Param | None): Optional bias parameter.
+        partition_manager (PartitionManager | None): Handles sharding of parameters.
+        _direction (Literal["row", "column"] | None): Sharding direction for ALT sharding.
     """
+
+    _direction: typing.Literal["row", "column"] | None = None
 
     def __init__(
         self,
@@ -785,25 +801,27 @@ class MoELinear(nn.Module):
         use_pallas_group_matmul: bool = False,
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.float32,
+        partition_manager: PartitionManager | None = None,
+        direction: typing.Literal["row", "column"] | None = None,
         rngs: nn.Rngs,
     ):
-        """Initializes the MoELinear layer.
+        """Initializes a `ParallelMoELinear` layer.
 
         Args:
-            num_experts: The number of experts.
-            in_features: The dimension of the input features.
-            out_features: The dimension of the output features.
+            num_experts: Number of experts in the layer.
+            in_features: Size of the input feature dimension.
+            out_features: Size of the output feature dimension.
             use_bias: Whether to include a bias term. Defaults to True.
-            out_first: If True, the weight kernel is initialized with the output
-                dimension first `(num_experts, out_features, in_features)`.
-                Defaults to False.
-            kernel_init: The initializer for the weight kernel.
-            bias_init: The initializer for the bias.
-            use_pallas_group_matmul: Whether to use the optimized Grouped Matrix Multiplication
-                (GMM) kernel, typically for TPUs. Defaults to False.
-            dtype: The data type for the computation.
-            param_dtype: The data type for the parameters (weights and bias).
-            rngs: The random number generators for parameter initialization.
+            out_first: If True, kernel shape is `(num_experts, out_features, in_features)`,
+                otherwise `(num_experts, in_features, out_features)`.
+            kernel_init: Initializer for the kernel weights.
+            bias_init: Initializer for the bias.
+            use_pallas_group_matmul: Whether to use the TPU-optimized grouped matrix multiplication kernel.
+            dtype: Data type for computation. Defaults to None (inherits from inputs).
+            param_dtype: Data type for parameters (weights, biases).
+            partition_manager: Partition manager for parameter sharding and mapping.
+            direction: ALT-sharding direction, either `"row"`, `"column"`, or None.
+            rngs: Random number generators for parameter initialization.
         """
         self.num_experts = num_experts
         self.in_features = in_features
@@ -812,6 +830,10 @@ class MoELinear(nn.Module):
         self.out_first = out_first
         self.dtype = dtype
         self.param_dtype = param_dtype
+        self.partition_manager = partition_manager
+        if direction is not None:
+            assert direction in ["row", "column"]
+            self._direction = direction
         kshape = (num_experts, out_features, in_features) if out_first else (num_experts, in_features, out_features)
         self.kernel = nn.Param(kernel_init(rngs.param(), kshape, param_dtype))
         if use_bias:
@@ -819,6 +841,44 @@ class MoELinear(nn.Module):
             self.bias = nn.Param(bias_init(rngs.param(), bshape, self.param_dtype))
         else:
             self.bias = None
+
+    @property
+    def direction(self) -> typing.Literal["row", "column"] | None:
+        return self._direction
+
+    @property
+    def can_use_shard_map(self) -> PartitionManager | None:
+        return self.partition_manager is not None and self._direction is not None
+
+    @property
+    def alt_sharding_input(self) -> DynamicShardingAxes | None:
+        alt_sharding = self.alt_sharding
+        if alt_sharding is not None:
+            if self.direction == "column":
+
+                class _Sharding(DynamicShardingAxes):
+                    axes: typing.ClassVar = [alt_sharding.axes[2], alt_sharding.axes[1]]
+                    mode: typing.ClassVar = alt_sharding.mode
+            else:
+
+                class _Sharding(DynamicShardingAxes):
+                    axes: typing.ClassVar = [alt_sharding.axes[1], alt_sharding.axes[2]]
+                    mode: typing.ClassVar = alt_sharding.mode
+
+            return _Sharding
+        return None
+
+    @property
+    def alt_sharding(self) -> ExpertRowWiseAlt | ExpertColumnWiseAlt | None:
+        if self.direction is None:
+            return None
+        elif self.direction == "row":
+            return ExpertRowWiseAlt
+        elif self.direction == "column":
+            return ExpertColumnWiseAlt
+        else:
+            direction = self.direction
+            raise NotImplementedError(f"ALT-Sharding Rule for {direction=} is not implemented!.")
 
     def __call__(self, inputs: jax.Array, group_sizes: jax.Array) -> jax.Array:
         """Applies the batched linear transformation.
@@ -834,11 +894,20 @@ class MoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
-        fn = self._ragged_dot
+        fn = partial(self._ragged_dot, out_first=self.out_first)
         if self.use_pallas_group_matmul:
             if self.out_first:
                 weight = jnp.transpose(self.kernel.value, (0, 2, 1))
             fn = self._grouped_matmul
+        if self.can_use_shard_map:
+            pmag = self.partition_manager
+            specs = (
+                pmag.resolve(dynamic_axes=self.alt_sharding_input, shape=inputs.shape),
+                pmag.resolve(dynamic_axes=self.alt_sharding, shape=weight.shape),
+                pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=group_sizes.shape),
+            )
+
+            fn = shard_map(fn, mesh=get_incontext_mesh(), in_specs=specs, out_specs=specs[0], check_rep=False)
         if weight.dtype in [
             jnp.float8_e4m3b11fnuz,
             jnp.float8_e4m3fn,
@@ -847,6 +916,7 @@ class MoELinear(nn.Module):
             jnp.float8_e5m2fnuz,
         ]:
             weight = weight.astype("f4")
+
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
         output = fn(inputs, weight, group_sizes)
 
@@ -856,7 +926,8 @@ class MoELinear(nn.Module):
 
         return output
 
-    def _ragged_dot(self, inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    @staticmethod
+    def _ragged_dot(inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array, *, out_first: bool) -> jax.Array:
         """Performs ragged dot product using `jax.lax.ragged_dot_general`.
 
         This is suitable for inputs where each expert processes a different number
@@ -875,13 +946,14 @@ class MoELinear(nn.Module):
             rhs=weight,
             group_sizes=group_sizes,
             ragged_dot_dimension_numbers=jax.lax.RaggedDotDimensionNumbers(
-                dot_dimension_numbers=(((1,), (2,)) if self.out_first else ((1,), (1,)), ((), ())),
+                dot_dimension_numbers=(((1,), (2,)) if out_first else ((1,), (1,)), ((), ())),
                 lhs_ragged_dimensions=(0,),
                 rhs_group_dimensions=(0,),
             ),
         )
 
-    def _grouped_matmul(self, inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    @staticmethod
+    def _grouped_matmul(inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array) -> jax.Array:
         """Performs grouped matrix multiplication using the Pallas kernel.
 
         This is a highly optimized operation for TPUs. It may pad the input to
@@ -925,3 +997,11 @@ class MoELinear(nn.Module):
             The expanded bias array.
         """
         return self.bias.value[jnp.repeat(jnp.arange(self.num_experts), group_sizes)]
+
+
+class RowParallelMoELinear(ParallelMoELinear):
+    _direction: typing.Literal["row", "column"] | None = "row"
+
+
+class ColumnParallelMoELinear(ParallelMoELinear):
+    _direction: typing.Literal["row", "column"] | None = "column"
