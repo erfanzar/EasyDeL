@@ -826,9 +826,7 @@ class ParallelMoELinear(nn.Module):
         self.num_experts = num_experts
         self.in_features = in_features
         self.out_features = out_features
-        # self.use_pallas_group_matmul = use_pallas_group_matmul
-        # NOTE: hard set this to False before fixing the shard-map issues.
-        self.use_pallas_group_matmul = False
+        self.use_pallas_group_matmul = use_pallas_group_matmul and (jax.default_backend() == "tpu")
         self.out_first = out_first
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -884,35 +882,59 @@ class ParallelMoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
-        fn = partial(self._ragged_dot, out_first=self.out_first)
-        if self.use_pallas_group_matmul:
-            if self.out_first:
-                weight = jnp.transpose(self.kernel.value, (0, 2, 1))
-            fn = self._grouped_matmul
-        if self.can_use_shard_map and self.use_pallas_group_matmul:
-            resolve = self.partition_manager.resolve
-            weights_axes = self.alt_sharding_axis
-            fn = shard_map(
-                fn,
-                mesh=get_incontext_mesh(),
-                in_specs=(
-                    resolve(axes=[weights_axes[2], weights_axes[1]], mode=MODE_TRAIN, shape=inputs.shape),
-                    resolve(axes=weights_axes, mode=MODE_TRAIN, shape=weight.shape),
-                    resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=group_sizes.shape),
-                ),
-                out_specs=resolve(axes=[weights_axes[1], weights_axes[2]], mode=MODE_TRAIN, shape=inputs.shape[::-1]),
-                check_rep=False,
-            )
-        if weight.dtype in [
+
+        core = (
+            partial(self._ragged_dot, out_first=self.out_first)
+            if not self.use_pallas_group_matmul
+            else self._grouped_matmul
+        )
+        if self.use_pallas_group_matmul and self.out_first:
+            weight = jnp.transpose(weight, (0, 2, 1))
+
+        if weight.dtype in (
             jnp.float8_e4m3b11fnuz,
             jnp.float8_e4m3fn,
             jnp.float8_e4m3fnuz,
             jnp.float8_e5m2,
             jnp.float8_e5m2fnuz,
-        ]:
+        ):
             weight = weight.astype("f4")
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
+
+        fn = core
+
+        if self.can_use_shard_map and self.use_pallas_group_matmul:  # ragged decode works better without shardings
+            resolve = self.partition_manager.resolve
+            mesh = get_incontext_mesh()
+            weight_axes = self.alt_sharding_axis
+            in_axis_name = weight_axes[2] if self.out_first else weight_axes[1]
+            out_axis_name = weight_axes[1] if self.out_first else weight_axes[2]
+
+            need_tp_psum = (self.direction == "row") and (in_axis_name is not None)
+            axis_name = self.partition_manager.resolve(axes=[in_axis_name], mode=MODE_TRAIN)[0]
+
+            def mapped_fn(x: jax.Array, w: jax.Array, gs: jax.Array) -> jax.Array:
+                y = core(x, w, gs)  # [sum(gs), out_features]
+                if need_tp_psum:
+                    y = jax.lax.psum(y, axis_name=axis_name)
+                return y
+
+            inputs_axes = [None, in_axis_name]
+            group_sizes_axes = [weight_axes[0]]
+            out_axes = [None, out_axis_name]
+            fn = shard_map(
+                mapped_fn,
+                mesh=mesh,
+                in_specs=(
+                    resolve(axes=inputs_axes, mode=MODE_TRAIN, shape=inputs.shape),
+                    resolve(axes=weight_axes, mode=MODE_TRAIN, shape=weight.shape),
+                    resolve(axes=group_sizes_axes, mode=MODE_TRAIN, shape=group_sizes.shape),
+                ),
+                out_specs=resolve(axes=out_axes, mode=MODE_TRAIN, shape=(inputs.shape[0], self.out_features)),
+                check_rep=False,
+            )
+
         output = fn(inputs, weight, group_sizes)
 
         if self.bias is not None:

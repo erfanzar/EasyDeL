@@ -709,13 +709,13 @@ class MetricsRecorder:
                              to prevent unbounded memory growth.
     """
 
-    def __init__(self, metrics_log_interval_sec: float = 10.0):
+    def __init__(self, metrics_log_interval_sec: float = 60.0):
         """
         Initializes the MetricsRecorder.
 
         Args:
             metrics_log_interval_sec (float): The interval in seconds at which
-                a monitoring thread might log these metrics. Defaults to 10.0.
+                a monitoring thread might log these metrics. Defaults to 60.0.
         """
         self.metrics = {
             "queue_sizes": {},
