@@ -52,14 +52,9 @@ def main():
         inference_name="LLaMA",
     )
 
-    inference.precompile(
-        ed.vInferencePreCompileConfig(
-            batch_size=1,
-            prefill_length=[1024],
-        )
-    )
+    inference.precompile(ed.vInferencePreCompileConfig(batch_size=1, prefill_length=[1024]))
     print(inference.inference_name)
-    ed.vInferenceApiServer(inference).fire(port=11557)
+    ed.vInferenceApiServer(inference).run(port=11557)
 
 
 if __name__ == "__main__":
