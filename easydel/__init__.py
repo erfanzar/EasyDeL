@@ -507,9 +507,9 @@ _import_structure = {
         "pack_sequences",
     ],
     "utils.parameters_transformation": [
-        "easydel_to_huggingface_model",
-        "easydel_to_torch",
-        "torch_dict_to_easydel_params",
+        "ModelConverter",
+        "StateDictConverter",
+        "TensorConverter",
     ],
 }
 
@@ -925,9 +925,9 @@ if _tp.TYPE_CHECKING:
         traversals,
     )
     from .utils.parameters_transformation import (
-        easydel_to_huggingface_model,
-        easydel_to_torch,
-        torch_dict_to_easydel_params,
+        ModelConverter,
+        StateDictConverter,
+        TensorConverter,
     )
 else:
     _logger = _get_logger("EasyDeL")

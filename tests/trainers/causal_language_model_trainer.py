@@ -37,6 +37,8 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
         attn_dtype=jnp.float32,
         attn_softmax_dtype=jnp.float32,
         attn_mechanism=ed.AttentionMechanisms.VANILLA,
+        num_experts=2,
+        num_experts_per_tok=1,
     )
 
     model = ed.Xerxes2ForCausalLM(config=config, dtype=dtype, param_dtype=dtype, rngs=ed.Rngs(0))
