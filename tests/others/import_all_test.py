@@ -1,14 +1,7 @@
-import os
-import sys
+import importlib
+import unittest
 
-dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(dirname)
-sys.path.append(os.path.join(dirname, ".."))
-
-import importlib  # noqa
-import unittest  # noqa
-
-from easydel import _import_structure  # noqa
+from easydel import _import_structure
 
 
 class ImportTests(unittest.TestCase):

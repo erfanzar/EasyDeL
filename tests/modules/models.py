@@ -26,7 +26,7 @@ STRICT_CHECK = False
 
 class EasyModelsTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.batch_size: int = 4
+        self.batch_size: int = 2
         self.vocab_size: int = 32000
         self.hidden_size: int = 64
         self.intermediate_size: int = 128
@@ -66,13 +66,13 @@ class EasyModelsTest(unittest.TestCase):
 
         self.blocksize_k: int = 128
         self.blocksize_q: int = 128
-        self.sequence_length = 1024
+        self.sequence_length = 128
 
-        self.sliding_window = 512
+        self.sliding_window = 64
         self.use_sliding_window = True
 
         self.scan_mlp_chunk_size = self.sequence_length // 2
-        self.sharding_axis_dims = (1, 1, 1, 1, -1)
+        self.sharding_axis_dims = (1, 1, 1, -1, 1)
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.use_parallel_residual = True
         self.qk_layernorm = True
@@ -981,44 +981,45 @@ if __name__ == "__main__":
     test.setUp()
 
     test.test_arctic()  # Passed - Passes MoE CONOV
-    # test.test_cohere()  # Passed
-    # test.test_cohere2()  # Passed
-    # test.test_dbrx()  # Passed
+    test.test_cohere()  # Passed
+    test.test_cohere2()  # Passed
+    test.test_dbrx()  # Passed
     test.test_deepseek_v2()  # Passed - Passes MoE CONOV
     test.test_deepseek_v3()  # Passed - Passes MoE CONOV
-    # test.test_exaone()  # Passed
-    # test.test_falcon()  # Passed
-    # test.test_gemma()  # Passed
-    # test.test_gemma2()  # Passed
-    # test.test_gemma3_text()  # Passed
-    # test.test_gemma3()  # Passed
-    # test.test_glm()  # Passed
-    # test.test_glm4()  # Passed
+    test.test_exaone()  # Passed
+    test.test_falcon()  # Passed
+    test.test_gemma()  # Passed
+    test.test_gemma2()  # Passed
+    test.test_gemma3_text()  # Passed
+    test.test_gemma3()  # Passed
+    test.test_glm()  # Passed
+    test.test_glm4()  # Passed
     test.test_glm4_moe()  # Passed - Passes MoE CONOV
-    # test.test_gptj()  # Passed
-    # test.test_gpt_noex()  # Passed
-    # test.test_gpt_oss()  # Passed
-    # test.test_gpt2()  # Passed
-    # test.test_grok1() # Not Tested Yet!
-    # test.test_internlm2()  # Passed
-    # test.test_llama()  # Passed
-    # test.test_llama4()  # Passed
+    test.test_gptj()  # Passed
+    test.test_gpt_noex()  # Passed
+    test.test_gpt_oss()  # Passed
+    test.test_gpt2()  # Passed
+    test.test_internlm2()  # Passed
+    test.test_llama()  # Passed
+    test.test_llama4()  # Passed
     # test.test_llama4_cond()  # Passed
-    # test.test_mamba()  # Passed
-    # test.test_mamba2()  # Passed - ReCheck
-    # test.test_mistral()  # Passed
+    test.test_mamba()  # Passed
+    test.test_mamba2()  # Passed - ReCheck
+    test.test_mistral()  # Passed
     test.test_mixtral()  # Passed - Passes MoE CONOV
-    # test.test_mpt()  # Passed
-    # test.test_olmo()  # Passed
-    # test.test_olmo2()  # Passed
-    # test.test_openelm()  # Passed
-    # test.test_phi()  # Passed
-    # test.test_phi3()  # Passed
+    test.test_mpt()  # Passed
+    test.test_olmo()  # Passed
+    test.test_olmo2()  # Passed
+    test.test_phi()  # Passed
+    test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-    # test.test_qwen2()  # Passed
+    test.test_qwen2()  # Passed
     test.test_qwen2_moe()  # Passed - Passes MoE CONOV
     # test.test_qwen2_vl()  # Passed
-    # test.test_qwen3()  # Passed
+    test.test_qwen3()  # Passed
     test.test_qwen3_moe()  # Passed - Passes MoE CONOV
+
+    # You may not belive this but these model have issues on HF side ;\
+    # test.test_openelm()  # Passed
     # test.test_stablelm()  # Passed
     # -----------------------------------------------

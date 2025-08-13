@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import typing as tp
 import warnings
@@ -51,6 +52,7 @@ TF_WEIGHTS_NAME = "model.ckpt"
 FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
 SAFE_WEIGHTS_NAME = "model.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+ED_SAFE_WEIGHTS_INDEX_NAME = "easydel-model.parameters.safetensors.index.json"
 CONFIG_NAME = "config.json"
 FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
 IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
@@ -58,6 +60,8 @@ PROCESSOR_NAME = "processor_config.json"
 CHAT_TEMPLATE_NAME = "chat_template.json"
 GENERATION_CONFIG_NAME = "generation_config.json"
 MODEL_CARD_NAME = "modelcard.json"
+
+CANDIDATE_FILENAMES = [SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, ED_SAFE_WEIGHTS_INDEX_NAME]
 
 
 class EasyBridgeMixin(PushToHubMixin):
@@ -111,6 +115,7 @@ class EasyBridgeMixin(PushToHubMixin):
         verbose: bool = True,
         mismatch_allowed: bool = True,
         enable: bool | None = None,
+        shard_size_gb: float | None = None,
     ):
         """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -149,6 +154,7 @@ class EasyBridgeMixin(PushToHubMixin):
             float_dtype=float_dtype,
             verbose=verbose,
             enable=enable,
+            shard_size_gb=shard_size_gb,
         )
 
         logger.info(f"Model weights saved in {output_model_file}")
@@ -163,6 +169,7 @@ class EasyBridgeMixin(PushToHubMixin):
         verbose: bool = True,
         mismatch_allowed: bool = True,
         enable: bool | None = None,
+        shard_size_gb: float | None = 5.00,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -199,6 +206,7 @@ class EasyBridgeMixin(PushToHubMixin):
             verbose=verbose,
             mismatch_allowed=mismatch_allowed,
             enable=enable,
+            shard_size_gb=shard_size_gb,
         )
         readme_path = easy_directory / "README.md"
         if not readme_path.exists() and enable:
@@ -292,12 +300,6 @@ class EasyBridgeMixin(PushToHubMixin):
         Returns:
             bool: True if the model can generate, False otherwise.
         """
-        # Detects whether `prepare_inputs_for_generation` has been overwritten, which is a requirement for generation.
-        # Alternatively, the model can also have a custom `generate` function.
-        # if "GenerationMixin" in str(
-        # 	cls.prepare_inputs_for_generation
-        # ) and "GenerationMixin" in str(cls.generate):
-        # 	return False
         return True
 
     @classmethod
@@ -361,7 +363,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 callback=callback,
                 dtype=param_dtype,
             )
-
             params = state.get("params", None)
             if params is not None:
                 state = params
@@ -531,49 +532,86 @@ class EasyBridgeMixin(PushToHubMixin):
 
             is_local = EasyPath(pretrained_model_name_or_path).is_dir()
 
-            if is_local:
-                archive_file = EasyPath(pretrained_model_name_or_path) / subfolder / FLAX_WEIGHTS_NAME
-                if not archive_file.is_file():
-                    raise FileNotFoundError(
-                        f"No file named '{FLAX_WEIGHTS_NAME}' found in directory '{pretrained_model_name_or_path}'."
-                    )
-            elif EasyPath(EasyPath(subfolder) / pretrained_model_name_or_path / FLAX_WEIGHTS_NAME).is_file():
-                archive_file = EasyPath(subfolder) / pretrained_model_name_or_path / FLAX_WEIGHTS_NAME
-                is_local = True
-            elif _is_remote_url(pretrained_model_name_or_path):
-                filename = pretrained_model_name_or_path
-                resolved_archive_file = _download_url(pretrained_model_name_or_path)
-            else:
-                filename = FLAX_WEIGHTS_NAME
-                try:
-                    resolved_archive_file = api.hf_hub_download(
-                        repo_id=pretrained_model_name_or_path,
-                        filename=filename,
-                        subfolder=subfolder,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        force_download=force_download,
-                        proxies=proxies,
-                        token=token,
-                        local_files_only=local_files_only,
-                    )
+            def _pick_first_existing(dir_path: EasyPath) -> tuple[EasyPath | None, str | None]:  # type:ignore
+                for cand in CANDIDATE_FILENAMES:
+                    p = dir_path / cand
+                    if p.is_file():
+                        return p, cand
+                return None, None
 
-                    if resolved_archive_file is None:
-                        raise FileNotFoundError("No model parameters found!")
-                except FileNotFoundError:
-                    raise
-                except Exception:
-                    raise OSError(
-                        f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it"
-                        " from 'https://huggingface.co/models', make sure you don't have a local directory with the"
-                        f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
-                        f" directory containing a file named {FLAX_WEIGHTS_NAME}."
-                    ) from None
+            if is_local:
+                # Local directory: look for index -> safetensors -> msgpack
+                root = EasyPath(pretrained_model_name_or_path) / subfolder
+                archive_file, picked_name = _pick_first_existing(root)
+                if not archive_file:
+                    raise FileNotFoundError(
+                        f"No model weights found in '{root}'. Tried: {', '.join(CANDIDATE_FILENAMES)}"
+                    )
+                is_local = True
+            else:
+                # Sometimes the path is nested under subfolder
+                alt_root = EasyPath(subfolder) / pretrained_model_name_or_path
+                if alt_root.is_dir():
+                    archive_file, picked_name = _pick_first_existing(alt_root)
+                    if archive_file:
+                        is_local = True
+
+                if not is_local:
+                    if _is_remote_url(pretrained_model_name_or_path):
+                        filename = pretrained_model_name_or_path
+                        resolved_archive_file = _download_url(pretrained_model_name_or_path)
+                    else:
+                        filename = None
+                        for cand in CANDIDATE_FILENAMES:
+                            try:
+                                resolved_archive_file = api.hf_hub_download(
+                                    repo_id=pretrained_model_name_or_path,
+                                    filename=cand,
+                                    subfolder=subfolder,
+                                    revision=revision,
+                                    cache_dir=cache_dir,
+                                    force_download=force_download,
+                                    proxies=proxies,
+                                    token=token,
+                                    local_files_only=local_files_only,
+                                )
+                                filename = cand
+                                break
+                            except FileNotFoundError:
+                                continue
+
+                        if resolved_archive_file is None:
+                            raise OSError(
+                                f"Can't load the model for '{pretrained_model_name_or_path}'. "
+                                f"Tried to download one of: {', '.join(CANDIDATE_FILENAMES)}. "
+                                f"If you're loading from https://huggingface.co/models, make sure the repo exists and "
+                                f"contains one of the expected files, or provide a local directory."
+                            )
+
+                        if filename == SAFE_WEIGHTS_INDEX_NAME:
+                            try:
+                                with open(resolved_archive_file, "r", encoding="utf-8") as f:
+                                    index_data = json.load(f)
+                                shard_names = sorted(set(index_data.get("weight_map", {}).values()))
+                                for shard_name in shard_names:
+                                    api.hf_hub_download(
+                                        repo_id=pretrained_model_name_or_path,
+                                        filename=shard_name,
+                                        subfolder=subfolder,
+                                        revision=revision,
+                                        cache_dir=cache_dir,
+                                        force_download=force_download,
+                                        proxies=proxies,
+                                        token=token,
+                                        local_files_only=local_files_only,
+                                    )
+                            except Exception as e:
+                                raise RuntimeError(f"Downloaded sharded index but failed to fetch shards: {e}") from e
+
             if is_local:
                 logger.debug(f"loading weights file {archive_file}")
-
                 resolved_archive_file = str(archive_file)
-
+                filename = os.path.basename(str(archive_file))
             else:
                 logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
         cls = get_modules_by_type(config.model_type, cls._model_task)[1]
