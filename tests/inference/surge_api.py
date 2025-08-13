@@ -75,7 +75,7 @@ def main():
         surge,
         enable_function_calling=True,
         default_function_format=FunctionCallFormat.OPENAI,
-    ).fire()
+    ).run(port=8888)
 
 
 if __name__ == "__main__":

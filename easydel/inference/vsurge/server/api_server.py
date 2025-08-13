@@ -18,21 +18,18 @@ from __future__ import annotations
 import asyncio
 import time
 import typing as tp
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from http import HTTPStatus
 
-import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
 from easydel.utils.helpers import get_logger
 
+from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
 from ...openai_api_modules import (
     ChatCompletionRequest,
     ChatCompletionRequestWithTools,
@@ -110,255 +107,111 @@ def create_error_response(status_code: HTTPStatus, message: str, request_id: str
     return JSONResponse(content=error_response.model_dump(), status_code=status_code.value)
 
 
-class vSurgeApiServer:
-    """
-    Enhanced FastAPI server for serving vSurge instances with function calling.
+class vSurgeAdapter(InferenceEngineAdapter):
+    """Adapter for vSurge inference engine."""
 
-    Features:
-    - OpenAI API compatibility
-    - Function/Tool calling support
-    - Multiple function call formats (OpenAI, Hermes, Gorilla, JSON)
-    - Streaming function calls
-    - Parallel tool calls
+    def __init__(self, vsurge_instance: vSurge):
+        self.vsurge = vsurge_instance
+
+    async def generate(
+        self,
+        prompts: str | list[str],
+        sampling_params: SamplingParams,
+        stream: bool = False,
+    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
+        """Generate using vSurge."""
+        return await self.vsurge.generate(prompts=prompts, sampling_params=sampling_params, stream=stream)
+
+    def count_tokens(self, content: str) -> int:
+        """Count tokens using vSurge tokenizer."""
+        return self.vsurge.count_tokens(content)
+
+    def get_model_info(self) -> dict[str, tp.Any]:
+        """Get vSurge model information."""
+        return {"name": self.vsurge.vsurge_name, "type": "vsurge", "architecture": type(self.vsurge).__name__}
+
+    @property
+    def model_name(self) -> str:
+        return self.vsurge.vsurge_name
+
+    @property
+    def processor(self) -> tp.Any:
+        return self.vsurge.processor
+
+
+class vSurgeApiServer(BaseInferenceApiServer):
+    """
+    vSurge-specific API server implementation.
+
+    This is now a clean implementation that follows the base interface.
     """
 
     def __init__(
         self,
         vsurge_map: dict[str, vSurge] | vSurge,
-        max_workers: int | None = None,
         oai_like_processor: bool = True,
-        enable_cors: bool = True,
-        cors_origins: list[str] | None = None,
-        max_request_size: int = 10 * 1024 * 1024,
-        request_timeout: float = 300.0,
-        enable_function_calling: bool = True,
-        default_function_format: FunctionCallFormat = FunctionCallFormat.OPENAI,
+        **kwargs,
     ) -> None:
-        """
-        Initialize the vSurge API Server with function calling support.
-
-        Args:
-            vsurge_map: Dictionary of model names to vSurge instances
-            max_workers: Maximum number of worker threads
-            oai_like_processor: Use OpenAI-like conversation format
-            enable_cors: Enable CORS middleware
-            cors_origins: Allowed CORS origins
-            max_request_size: Maximum request size in bytes
-            request_timeout: Request timeout in seconds
-            enable_function_calling: Enable function calling support
-            default_function_format: Default format for function calls
-        """
+        # Convert single instance to map
         if isinstance(vsurge_map, vSurge):
             vsurge_map = {vsurge_map.vsurge_name: vsurge_map}
 
-        self.vsurge_map: dict[str, vSurge] = {}
-        self._validate_and_register_models(vsurge_map)
-        self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vsurge-worker")
-        self.oai_like_processor = oai_like_processor
-        self.max_request_size = max_request_size
-        self.request_timeout = request_timeout
-        self.status = ServerStatus.STARTING
-        self.metrics = ServerMetrics()
-        self._active_requests: set[str] = set()
-        self._request_lock = asyncio.Lock()
-        self.enable_function_calling = enable_function_calling
-        self.default_function_format = default_function_format
+        # Store both for backward compatibility
+        self.vsurge_map = vsurge_map  # Keep original map
+        self.adapters: dict[str, vSurgeAdapter] = {}
 
-        self.app = FastAPI(
-            title="EasyDeL vSurge API Server",
-            description="High-performance inference server with OpenAI API compatibility",
-            version="2.0.0",
-            lifespan=self._lifespan,
-        )
-        if enable_function_calling:
-            self._add_function_calling_endpoints()
-
-        if enable_cors:
-            self._setup_cors(cors_origins)
-        self._setup_middleware()
-        self._register_endpoints()
-
-        logger.info(f"vSurge API Server initialized with {len(self.vsurge_map)} models")
-
-    @asynccontextmanager
-    async def _lifespan(self, app: FastAPI):
-        """Manage server lifecycle."""
-        logger.info("Starting vSurge API Server...")
-        self.status = ServerStatus.READY
-        yield
-        logger.info("Shutting down vSurge API Server...")
-        self.status = ServerStatus.SHUTTING_DOWN
-        await self._graceful_shutdown()
-
-    def _validate_and_register_models(self, vsurge_map: dict[str, vSurge]) -> None:
-        """Validate and register vSurge models."""
         for name, vsurge in vsurge_map.items():
             if not isinstance(vsurge, vSurge):
-                raise TypeError(f"Value for key '{name}' must be an instance of vSurge, got {type(vsurge).__name__}")
-            self.vsurge_map[name] = vsurge
-            logger.info(f"Registered model: {name}")
+                raise TypeError(f"Value for key '{name}' must be an instance of vSurge")
+            self.adapters[name] = vSurgeAdapter(vsurge)
 
-    def _setup_cors(self, origins: list[str] | None) -> None:
-        """Setup CORS middleware."""
-        self.app.add_middleware(
-            CORSMiddleware,
-            allow_origins=origins or ["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+        self.oai_like_processor = oai_like_processor
+
+        super().__init__(
+            server_name="EasyDeL vSurge API Server",
+            server_description="High-performance vSurge inference server",
+            **kwargs,
         )
 
-    def _setup_middleware(self) -> None:
-        """Setup request middleware."""
+    async def on_startup(self) -> None:
+        """Custom startup logic for vSurge."""
+        logger.info(f"Loaded {len(self.adapters)} vSurge models")
+        for name in self.adapters:
+            logger.info(f"  - {name}")
 
-        @self.app.middleware("http")
-        async def add_request_id(request: Request, call_next):
-            """Add unique request ID to each request."""
-            request_id = f"req_{int(time.time() * 1000000)}"
-            request.state.request_id = request_id
+    def _get_adapter(self, model_name: str) -> vSurgeAdapter:
+        """Get adapter by model name."""
+        adapter = self.adapters.get(model_name)
+        if adapter is None:
+            available = list(self.adapters.keys())
+            raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available: {available}")
+        return adapter
 
-            async with self._request_lock:
-                self._active_requests.add(request_id)
+    def _count_tokens(self, content: str, model_name: str | None = None) -> int:
+        """Count tokens for the given content."""
+        if model_name:
+            adapter = self._get_adapter(model_name)
+            return adapter.count_tokens(content)
+        adapter = next(iter(self.adapters.values()))
+        return adapter.count_tokens(content)
 
-            try:
-                response = await call_next(request)
-                response.headers["X-Request-ID"] = request_id
-                return response
-            finally:
-                async with self._request_lock:
-                    self._active_requests.discard(request_id)
+    def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
+        """Create sampling parameters from request."""
+        max_tokens = int(request.max_tokens or 128)
+        temperature = max(0.0, min(float(request.temperature or 1.0), 2.0))
 
-        @self.app.middleware("http")
-        async def track_metrics(request: Request, call_next):
-            """Track request metrics."""
-            self.metrics.total_requests += 1
-
-            try:
-                response = await call_next(request)
-                if response.status_code < 400:
-                    self.metrics.successful_requests += 1
-                else:
-                    self.metrics.failed_requests += 1
-                return response
-            except Exception:
-                self.metrics.failed_requests += 1
-                raise
-            finally:
-                self.metrics.uptime_seconds = time.time() - self.metrics.start_time
-
-    def _add_function_calling_endpoints(self) -> None:
-        """Add function calling specific endpoints."""
-        additional_endpoints = [
-            EndpointConfig(
-                path="/v1/tools",
-                handler=self.list_tools,
-                methods=["GET"],
-                tags=["Tools"],
-                summary="List available tools/functions",
-            ),
-            EndpointConfig(
-                path="/v1/tools/execute",
-                handler=self.execute_tool,
-                methods=["POST"],
-                tags=["Tools"],
-                summary="Execute a tool/function call",
-            ),
-        ]
-
-        for endpoint in additional_endpoints:
-            self.app.add_api_route(
-                path=endpoint.path,
-                endpoint=endpoint.handler,
-                methods=endpoint.methods,
-                summary=endpoint.summary,
-                tags=endpoint.tags,
-            )
-
-    @property
-    def _endpoints(self) -> list[EndpointConfig]:
-        """Define all API endpoints."""
-        return [
-            EndpointConfig(
-                path="/v1/chat/completions",
-                handler=self.chat_completions,
-                methods=["POST"],
-                tags=["Chat"],
-                summary="Create a chat completion",
-            ),
-            EndpointConfig(
-                path="/v1/completions",
-                handler=self.completions,
-                methods=["POST"],
-                tags=["Completions"],
-                summary="Create a completion",
-            ),
-            EndpointConfig(
-                path="/health",
-                handler=self.health_check,
-                methods=["GET"],
-                tags=["Health"],
-                summary="Comprehensive health check",
-            ),
-            EndpointConfig(
-                path="/v1/models",
-                handler=self.list_models,
-                methods=["GET"],
-                tags=["Models"],
-                summary="List available models",
-            ),
-            EndpointConfig(
-                path="/v1/models/{model_id}",
-                handler=self.get_model,
-                methods=["GET"],
-                tags=["Models"],
-                summary="Get model details",
-            ),
-            EndpointConfig(
-                path="/metrics",
-                handler=self.get_metrics,
-                methods=["GET"],
-                tags=["Monitoring"],
-                summary="Get server metrics",
-            ),
-        ]
-
-    def _register_endpoints(self) -> None:
-        """Register all API endpoints."""
-        for endpoint in self._endpoints:
-            self.app.add_api_route(
-                path=endpoint.path,
-                endpoint=endpoint.handler,
-                methods=endpoint.methods,
-                summary=endpoint.summary,
-                tags=endpoint.tags,
-                response_model=endpoint.response_model,
-            )
-
-    async def _graceful_shutdown(self) -> None:
-        """Perform graceful shutdown."""
-        max_wait = 30
-        start = time.time()
-
-        while self._active_requests and (time.time() - start) < max_wait:
-            logger.info(f"Waiting for {len(self._active_requests)} active requests...")
-            await asyncio.sleep(1)
-
-        if self._active_requests:
-            logger.warning(f"Force closing {len(self._active_requests)} active requests")
-
-        self.thread_pool.shutdown(wait=True)
-        logger.info("Thread pool shut down")
-
-    def _get_vsurge(self, model_name: str) -> vSurge:
-        """Get vSurge instance by model name."""
-        vsurge = self.vsurge_map.get(model_name)
-        if vsurge is None:
-            available = list(self.vsurge_map.keys())
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{model_name}' not found. Available models: {available}",
-            )
-        return vsurge
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            presence_penalty=float(request.presence_penalty or 0.0),
+            frequency_penalty=float(request.frequency_penalty or 0.0),
+            repetition_penalty=float(getattr(request, "repetition_penalty", 1.0)),
+            top_k=int(getattr(request, "top_k", 50)),
+            top_p=float(request.top_p or 1.0),
+            min_p=float(getattr(request, "min_p", 0.0)),
+            n=int(request.n or 1),
+            stop=request.stop,
+        )
 
     def _prepare_vsurge_input(
         self,
@@ -781,7 +634,7 @@ class vSurgeApiServer:
             if not request.messages:
                 raise HTTPException(400, "Messages cannot be empty")
 
-            vsurge = self._get_vsurge(request.model)
+            vsurge = self._get_adapter(request.model).vsurge
 
             is_function_request = (
                 self.enable_function_calling
@@ -822,7 +675,7 @@ class vSurgeApiServer:
         request_id = getattr(request, "request_id", None)
 
         try:
-            vsurge = self._get_vsurge(request.model)
+            vsurge = self._get_adapter(request.model).vsurge
 
             prompt = request.prompt
             if isinstance(prompt, list):
@@ -1141,41 +994,20 @@ class vSurgeApiServer:
     async def health_check(self) -> JSONResponse:
         """Comprehensive health check."""
         model_health_info = {}
-        for name, vsurge_instance in self.vsurge_map.items():
-            driver_metrics = {}
+        for name, adapter in self.adapters.items():
+            vsurge = adapter.vsurge
             device_memory_stats = None
-            if hasattr(vsurge_instance, "driver") and hasattr(vsurge_instance.driver, "get_device_memory_stats"):
+
+            if hasattr(vsurge, "driver") and hasattr(vsurge.driver, "get_device_memory_stats"):
                 try:
-                    if asyncio.iscoroutinefunction(vsurge_instance.driver.get_device_memory_stats):
-                        device_memory_stats = await vsurge_instance.driver.get_device_memory_stats()
-                    else:
-                        device_memory_stats = vsurge_instance.driver.get_device_memory_stats()
+                    device_memory_stats = await vsurge.driver.get_device_memory_stats()
                 except Exception as e:
                     logger.warning(f"Could not get device memory stats for model {name}: {e}")
 
-            if hasattr(vsurge_instance, "driver") and hasattr(vsurge_instance.driver, "get_metrics"):
-                try:
-                    # Call get_metrics if it's not a coroutine
-                    if asyncio.iscoroutinefunction(vsurge_instance.driver.get_metrics):
-                        raw_driver_metrics = await vsurge_instance.driver.get_metrics(aggregated=True)
-                    else:
-                        raw_driver_metrics = vsurge_instance.driver.get_metrics(aggregated=True)
-
-                    # Select a few key driver metrics to include
-                    driver_metrics = {
-                        "queue_sizes": raw_driver_metrics.get("queue_sizes"),
-                        "active_driver_requests": raw_driver_metrics.get("active_requests_count"),
-                        "ttft_ms_avg": raw_driver_metrics.get("ttft_ms_avg"),
-                        "prefill_op_ms_avg": raw_driver_metrics.get("prefill_op_ms_avg"),
-                        "decode_op_ms_avg": raw_driver_metrics.get("decode_op_ms_avg"),
-                    }
-                except Exception as e:
-                    logger.warning(f"Could not get driver metrics for model {name}: {e}")
-
             model_health_info[name] = {
                 "loaded": True,
-                "type": type(vsurge_instance).__name__,
-                "driver_metrics": driver_metrics or "N/A",
+                "type": adapter.get_model_info()["type"],
+                "architecture": adapter.get_model_info()["architecture"],
                 "device_memory_stats": device_memory_stats or "N/A",
             }
 
@@ -1184,92 +1016,57 @@ class vSurgeApiServer:
             "timestamp": time.time(),
             "uptime_seconds": self.metrics.uptime_seconds,
             "models": model_health_info,
-            "active_api_requests": len(self._active_requests),
-            "thread_pool": {
-                "max_workers": self.thread_pool._max_workers,
-                "active_threads": len(self.thread_pool._threads),
-            },
+            "active_requests": len(self._active_requests),
         }
 
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
 
     async def get_metrics(self) -> JSONResponse:
-        """Get server performance metrics, including vDriver metrics if available."""
-
+        """Get server performance metrics."""
         all_driver_metrics = {}
-        all_device_memory_stats = {}
 
-        for model_name, vsurge_instance in self.vsurge_map.items():
-            if hasattr(vsurge_instance, "driver"):
-                driver = vsurge_instance.driver
-                if hasattr(driver, "get_metrics"):
-                    try:
-                        if asyncio.iscoroutinefunction(driver.get_metrics):
-                            all_driver_metrics[model_name] = await driver.get_metrics(aggregated=True)
-                        else:
-                            all_driver_metrics[model_name] = driver.get_metrics(aggregated=True)
-                    except Exception as e:
-                        logger.warning(f"Failed to get driver metrics for {model_name}: {e}")
-                        all_driver_metrics[model_name] = {"error": str(e)}
-
-                if hasattr(driver, "get_device_memory_stats"):
-                    try:
-                        if asyncio.iscoroutinefunction(driver.get_device_memory_stats):
-                            all_device_memory_stats[model_name] = await driver.get_device_memory_stats()
-                        else:
-                            all_device_memory_stats[model_name] = driver.get_device_memory_stats()
-                    except Exception as e:
-                        logger.warning(f"Failed to get device memory stats for {model_name}: {e}")
-                        all_device_memory_stats[model_name] = {"error": str(e)}
-            else:
-                all_driver_metrics[model_name] = "Driver not found or metrics unavailable"
-                all_device_memory_stats[model_name] = "Driver not found or memory stats unavailable"
+        for model_name, adapter in self.adapters.items():
+            vsurge = adapter.vsurge
+            if hasattr(vsurge, "driver") and hasattr(vsurge.driver, "get_metrics"):
+                try:
+                    all_driver_metrics[model_name] = vsurge.driver.get_metrics(aggregated=True)
+                except Exception as e:
+                    logger.warning(f"Failed to get driver metrics for {model_name}: {e}")
 
         return JSONResponse(
             {
-                "api_server_uptime_seconds": self.metrics.uptime_seconds,
-                "total_api_requests": self.metrics.total_requests,
-                "successful_api_requests": self.metrics.successful_requests,
-                "failed_api_requests": self.metrics.failed_requests,
-                "total_tokens_generated_via_api": self.metrics.total_tokens_generated,
-                "average_tokens_per_second_via_api": round(self.metrics.average_tokens_per_second, 2),
-                "active_api_requests": len(self._active_requests),
-                "models_loaded_count": len(self.vsurge_map),
-                "api_server_status": self.status.value,
-                "vsurge_driver_metrics": all_driver_metrics,
-                "device_memory_stats_per_model": all_device_memory_stats,
+                "uptime_seconds": self.metrics.uptime_seconds,
+                "total_requests": self.metrics.total_requests,
+                "successful_requests": self.metrics.successful_requests,
+                "failed_requests": self.metrics.failed_requests,
+                "total_tokens_generated": self.metrics.total_tokens_generated,
+                "average_tokens_per_second": round(self.metrics.average_tokens_per_second, 2),
+                "active_requests": len(self._active_requests),
+                "models_loaded": len(self.adapters),
+                "status": self.status.value,
+                "driver_metrics": all_driver_metrics,
             }
         )
 
     async def list_models(self) -> JSONResponse:
-        """List available models with function calling information."""
+        """List available models."""
         models_data = []
-
-        for model_id, vsurge in self.vsurge_map.items():
-            model_info = {
-                "id": model_id,
-                "object": "model",
-                "created": int(self.metrics.start_time),
-                "owned_by": "easydel",
-                "permission": [],
-                "root": model_id,
-                "parent": None,
-                "metadata": {
-                    "architecture": type(vsurge).__name__,
-                    "supports_chat": hasattr(vsurge.processor, "apply_chat_template"),
-                    "supports_function_calling": self.enable_function_calling,
-                    "function_call_formats": [
-                        FunctionCallFormat.OPENAI.value,
-                        FunctionCallFormat.HERMES.value,
-                        FunctionCallFormat.GORILLA.value,
-                        FunctionCallFormat.JSON_SCHEMA.value,
-                    ]
-                    if self.enable_function_calling
-                    else [],
-                },
-            }
-            models_data.append(model_info)
+        for model_id, adapter in self.adapters.items():
+            model_info = adapter.get_model_info()
+            models_data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(self.metrics.start_time),
+                    "owned_by": "easydel",
+                    "metadata": {
+                        **model_info,
+                        "supports_chat": hasattr(adapter.processor, "apply_chat_template"),
+                        "supports_function_calling": self.enable_function_calling,
+                    },
+                }
+            )
 
         return JSONResponse(
             {
@@ -1280,8 +1077,9 @@ class vSurgeApiServer:
         )
 
     async def get_model(self, model_id: str) -> JSONResponse:
-        """Get detailed information about a specific model."""
-        vsurge = self._get_vsurge(model_id)
+        """Get model details."""
+        adapter = self._get_adapter(model_id)
+        model_info = adapter.get_model_info()
 
         return JSONResponse(
             {
@@ -1289,64 +1087,10 @@ class vSurgeApiServer:
                 "object": "model",
                 "created": int(self.metrics.start_time),
                 "owned_by": "easydel",
-                "permission": [],
-                "root": model_id,
-                "parent": None,
                 "metadata": {
-                    "architecture": type(vsurge).__name__,
-                    "supports_chat": hasattr(vsurge.processor, "apply_chat_template"),
+                    **model_info,
+                    "supports_chat": hasattr(adapter.processor, "apply_chat_template"),
+                    "supports_function_calling": self.enable_function_calling,
                 },
             }
         )
-
-    def run(
-        self,
-        host: str = "0.0.0.0",
-        port: int = 11556,
-        workers: int = 1,
-        log_level: str = "info",
-        ssl_keyfile: str | None = None,
-        ssl_certfile: str | None = None,
-        reload: bool = False,
-    ) -> None:
-        """
-        Start the server with enhanced configuration.
-
-        Args:
-            host: Host address to bind to
-            port: Port to listen on
-            workers: Number of worker processes
-            log_level: Logging level
-            ssl_keyfile: Path to SSL key file
-            ssl_certfile: Path to SSL certificate file
-            reload: Enable auto-reload for development
-        """
-        uvicorn_config = {
-            "app": self.app,
-            "host": host,
-            "port": port,
-            "workers": workers if not reload else 1,
-            "log_level": log_level,
-            "timeout_keep_alive": TIMEOUT_KEEP_ALIVE,
-            "reload": reload,
-            "server_header": False,
-            "date_header": True,
-        }
-
-        if ssl_keyfile and ssl_certfile:
-            uvicorn_config.update({"ssl_keyfile": ssl_keyfile, "ssl_certfile": ssl_certfile})
-            logger.info(f"Starting HTTPS server on https://{host}:{port}")
-        else:
-            logger.info(f"Starting HTTP server on http://{host}:{port}")
-
-        try:
-            import uvloop
-
-            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-            logger.info("Using uvloop for enhanced performance")
-        except ImportError:
-            logger.info("uvloop not available, using default event loop")
-
-        uvicorn.run(**uvicorn_config)
-
-    fire = run
