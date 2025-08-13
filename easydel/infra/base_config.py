@@ -252,7 +252,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shard_attention_computation: bool = True,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
-        use_pallas_group_matmul: bool = False,
+        use_pallas_group_matmul: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -646,7 +646,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
         set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
-        set_attrs_smartly(self, "use_pallas_group_matmul", False, use_pallas_group_matmul)
+        set_attrs_smartly(self, "use_pallas_group_matmul", True, use_pallas_group_matmul)
 
         set_attrs_smartly(self, "backend", None, backend)
         set_attrs_smartly(self, "platform", "jax", platform)
