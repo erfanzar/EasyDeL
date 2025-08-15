@@ -1,236 +1,211 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+# Ensure ~/.local/bin in PATH for current session
 case ":$PATH:" in
-  *":$HOME/.local/bin:"*)
-    :
-    ;;
-  *)
-    log_info "Adding $HOME/.local/bin to PATH for the current session."
-    export PATH="$HOME/.local/bin:$PATH"
-    ;;
+  *":$HOME/.local/bin:"*) ;;
+  *) log_info "Adding $HOME/.local/bin to PATH for the current session."; export PATH="$HOME/.local/bin:$PATH";;
 esac
 
+# Persist PATH
 log_info "Checking shell configuration for persistent PATH..."
-python -c "
-import os
-import sys
-BLUE = '\033[0;34m'
-GREEN = '\033[0;32m'
-NC = '\033[0m'
+python - << 'PY'
+import os, sys
+BLUE = '\033[0;34m'; GREEN = '\033[0;32m'; NC = '\033[0m'
+def info(m): print(f'{BLUE}[INFO]{NC} (Python) {m}', file=sys.stderr)
+def ok(m):   print(f'{GREEN}[SUCCESS]{NC} (Python) {m}', file=sys.stderr)
 
-def log_py_info(msg):
-    print(f'{BLUE}[INFO]{NC} (Python) {msg}', file=sys.stderr)
-
-def log_py_success(msg):
-    print(f'{GREEN}[SUCCESS]{NC} (Python) {msg}', file=sys.stderr)
-
-line_to_add = 'export PATH=\"\$HOME/.local/bin:\$PATH\"'
-home_dir = os.path.expanduser('~')
-shell_config_files = [os.path.join(home_dir, '.zshrc'), os.path.join(home_dir, '.bashrc')]
-
-config_file_to_modify = None
-for f in shell_config_files:
-    if os.path.exists(f):
-        config_file_to_modify = f
-        break
-
-if not config_file_to_modify:
-    config_file_to_modify = os.path.join(home_dir, '.bashrc')
-    log_py_info(f'No .zshrc or .bashrc found. Will create {config_file_to_modify}.')
-
-log_py_info(f'Checking shell configuration file: {config_file_to_modify}')
-
+line = 'export PATH="$HOME/.local/bin:$PATH"'
+home = os.path.expanduser('~')
+cands = [os.path.join(home, '.zshrc'), os.path.join(home, '.bashrc')]
+target = next((c for c in cands if os.path.exists(c)), os.path.join(home, '.bashrc'))
+info(f'Checking shell configuration file: {target}')
 try:
     content = ''
-    if os.path.exists(config_file_to_modify):
-        with open(config_file_to_modify, 'r') as f:
-            content = f.read()
-
-    if line_to_add in content:
-        log_py_info('PATH configuration already exists. No changes needed.')
+    if os.path.exists(target):
+        with open(target) as f: content = f.read()
+    if line in content:
+        info('PATH configuration already exists. No changes needed.')
     else:
-        log_py_info('Adding PATH configuration to shell config file.')
-        with open(config_file_to_modify, 'a') as f:
-            f.write(f'\n# Added by script to include local binaries\n{line_to_add}\n')
-        log_py_success(f'Successfully updated {config_file_to_modify}. Please run \"source {config_file_to_modify}\" or restart your terminal for it to take effect in other sessions.')
+        with open(target, 'a') as f:
+            f.write('\n# Added by script to include local binaries\n' + line + '\n')
+        ok(f'Successfully updated {target}. Run "source {target}" or restart your terminal for it to take effect.')
 except Exception as e:
-    RED = '\033[0;31m'
-    print(f'{RED}[ERROR]{NC} (Python) Failed to modify shell config: {e}', file=sys.stderr)
-"
+    print(f'\033[0;31m[ERROR]\033[0m (Python) Failed to modify shell config: {e}', file=sys.stderr)
+PY
 
-
+# Detect zone (GCE)
 log_info "Detecting current zone..."
-ZONE=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4)
-log_info "Current zone: $ZONE"
+ZONE=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4 || true)
+: "${ZONE:=}" || true
+log_info "Current zone: ${ZONE:-unknown}"
 
-if ! command -v gcloud &>/dev/null; then
-    log_error "gcloud CLI not found. Please install Google Cloud SDK."
-    exit 1
+# gcloud checks
+if ! command -v gcloud >/dev/null 2>&1; then
+  log_error "gcloud CLI not found. Please install Google Cloud SDK."
+  exit 1
 fi
-
 if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1 >/dev/null; then
-    log_error "No active gcloud authentication found. Please run 'gcloud auth login'"
-    exit 1
+  log_error "No active gcloud authentication found. Please run 'gcloud auth login'"
+  exit 1
 fi
 
-log_info "Searching for available TPUs in zone $ZONE..."
-READY_TPUS=($(gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="value(name)" 2>/dev/null))
+# TPU selection
+log_info "Searching for available TPUs in zone ${ZONE}..."
+mapfile -t READY_TPUS < <(gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="value(name)" 2>/dev/null || true)
 
-case ${#READY_TPUS[@]} in
-0)
-    log_warning "No READY TPUs found in zone $ZONE"
-
-    echo ""
-    log_info "All TPUs in zone $ZONE:"
-    gcloud compute tpus tpu-vm list --zone="$ZONE" --format="table(name,state,health,acceleratorType)" 2>/dev/null || {
-        log_error "Failed to list TPUs. Check your permissions."
-        exit 1
-    }
-
-    echo ""
-    read -p "Enter your TPU name: " TPU_NAME < /dev/tty
-
-    if [ -z "$TPU_NAME" ]; then
-        log_error "TPU name cannot be empty"
-        exit 1
+if (( ${#READY_TPUS[@]} == 0 )); then
+  log_warning "No READY TPUs found in zone $ZONE"
+  echo ""
+  log_info "All TPUs in zone $ZONE:"
+  gcloud compute tpus tpu-vm list --zone="$ZONE" --format="table(name,state,health,acceleratorType)" || {
+    log_error "Failed to list TPUs. Check your permissions."
+    exit 1
+  }
+  echo ""
+  read -p "Enter your TPU name: " TPU_NAME < /dev/tty
+  if [ -z "${TPU_NAME:-}" ]; then
+    log_error "TPU name cannot be empty"
+    exit 1
+  fi
+elif (( ${#READY_TPUS[@]} == 1 )); then
+  TPU_NAME="${READY_TPUS[0]}"
+  log_success "Found one READY TPU: $TPU_NAME - using it automatically"
+else
+  log_info "Multiple READY TPUs found:"
+  echo ""
+  gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="table(name,acceleratorType,health)"
+  echo ""
+  echo "Available READY TPUs:"
+  for i in "${!READY_TPUS[@]}"; do
+    echo "$((i + 1)). ${READY_TPUS[i]}"
+  done
+  echo ""
+  while true; do
+    read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input < /dev/tty
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#READY_TPUS[@]} )); then
+      TPU_NAME="${READY_TPUS[$((input - 1))]}"
+      break
+    elif [[ " ${READY_TPUS[*]} " == *" ${input} "* ]]; then
+      TPU_NAME="$input"
+      break
+    else
+      log_error "Invalid selection. Please enter a number (1-${#READY_TPUS[@]}) or a valid TPU name."
     fi
-    ;;
-1)
-    TPU_NAME="${READY_TPUS[0]}"
-    log_success "Found one READY TPU: $TPU_NAME - using it automatically"
-    ;;
-*)
-    log_info "Multiple READY TPUs found:"
-    echo ""
-    gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="table(name,acceleratorType,health)"
-    echo ""
-
-    echo "Available READY TPUs:"
-    for i in "${!READY_TPUS[@]}"; do
-        echo "$((i + 1)). ${READY_TPUS[i]}"
-    done
-    echo ""
-
-    while true; do
-        read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input < /dev/tty
-
-        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#READY_TPUS[@]} ]; then
-            TPU_NAME="${READY_TPUS[$((input - 1))]}"
-            break
-        elif [[ " ${READY_TPUS[@]} " =~ " ${input} " ]]; then
-            TPU_NAME="$input"
-            break
-        else
-            log_error "Invalid selection. Please enter a number (1-${#READY_TPUS[@]}) or valid TPU name."
-        fi
-    done
-    ;;
-esac
+  done
+fi
 
 log_success "Selected TPU: $TPU_NAME"
 
-# Get TPU accelerator type
+# TPU type
 log_info "Getting TPU accelerator type..."
 TPU_TYPE=$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" --format="value(acceleratorType)" 2>/dev/null | awk -F'/' '{print $NF}')
-
-if [ -z "$TPU_TYPE" ]; then
-    log_warning "Could not determine TPU type, defaulting to v4-8"
-    TPU_TYPE="v4-8"
+if [ -z "${TPU_TYPE:-}" ]; then
+  log_warning "Could not determine TPU type, defaulting to v4-8"
+  TPU_TYPE="v4-8"
 else
-    log_success "Detected TPU type: $TPU_TYPE"
+  log_success "Detected TPU type: $TPU_TYPE"
 fi
 
-log_info "Installing eopod..."
-if ! pip install eopod --quiet -U; then
-    log_error "Failed to install eopod"
-    exit 1
-fi
+# ---------- Bootstrapping ----------
+UV="${HOME}/.local/bin/uv"
+LOCAL_VENV_PATH="$HOME/orchestrator-venv"
+REMOTE_VENV_PATH="$HOME/easy-venv"
 
-EOPOD_PATH="$HOME/.local/bin/eopod"
-if [ ! -f "$EOPOD_PATH" ]; then
-    log_error "eopod not found at $EOPOD_PATH after installation"
-    log_error "This might be a PATH issue. The script tried to fix it, but you may need to 'source ~/.bashrc' or 'source ~/.zshrc' and re-run."
-    exit 1
+log_info "Installing uv locally on orchestrator..."
+if ! python3 -m pip install --user -U uv --quiet; then
+  log_error "Failed to install uv locally"
+  exit 1
 fi
+log_success "uv installed locally"
+
+log_info "Creating local orchestrator virtual environment at $LOCAL_VENV_PATH..."
+if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.11.6; then
+  log_error "Failed to create local orchestrator virtual environment"
+  exit 1
+fi
+log_success "Local orchestrator virtual environment created"
+
+log_info "Installing eopod in local orchestrator environment..."
+if ! "$UV" pip install --python "$LOCAL_VENV_PATH/bin/python" -U eopod --quiet; then
+  log_error "Failed to install eopod in local environment"
+  exit 1
+fi
+LOCAL_EOPOD_PATH="$LOCAL_VENV_PATH/bin/eopod"
+log_success "eopod installed in local environment"
+
 log_info "Configuring eopod with TPU: $TPU_NAME"
-if ! "$EOPOD_PATH" configure --tpu-name "$TPU_NAME"; then
-    log_error "Failed to configure eopod with TPU"
-    exit 1
+if ! "$LOCAL_EOPOD_PATH" configure --tpu-name "$TPU_NAME"; then
+  log_error "Failed to configure eopod with TPU"
+  exit 1
 fi
-
 log_success "eopod configured successfully"
 log_warning "IMPORTANT: Press Enter during first execution to accept terms (terms may not be displayed)"
 echo ""
 
-# read -p "Press Enter to continue with package installations..." < /dev/tty
-
-VENV_PATH="$HOME/easy-venv"
-ENV_EOPOD_PATH="$VENV_PATH/bin/eopod"
-export RAY_EXECUTABLE_PATH="$VENV_PATH/bin/ray"
-log_info "Setting up virtual environment with uv at $VENV_PATH..."
-log_info "Installing uv..."
-if ! eopod run "pip install uv --quiet -U"; then
-    log_error "Failed to install uv"
-    exit 1
+log_info "Installing uv on TPU hosts..."
+if ! "$LOCAL_EOPOD_PATH" run "pip install uv --quiet -U"; then
+  log_error "Failed to install uv on TPU hosts"
+  exit 1
 fi
+log_success "uv installed on TPU hosts"
 
-log_info "Creating virtual environment..."
-if ! eopod run "~/.local/bin/uv venv $VENV_PATH --clear --python 3.11.6"; then
-    log_error "Failed to create virtual environment"
-    exit 1
+log_info "Creating virtual environment on TPU hosts at $REMOTE_VENV_PATH..."
+if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv venv $REMOTE_VENV_PATH --clear --python 3.11.6"; then
+  log_error "Failed to create virtual environment on TPU hosts"
+  exit 1
 fi
+log_success "Virtual environment created on TPU hosts"
 
-install_package() {
-    local package="$1"
-    local extra_args="$2"
+log_info "Installing eopod on TPU hosts..."
+if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python -U eopod --quiet"; then
+  log_error "Failed to install eopod on TPU hosts"
+  exit 1
+fi
+log_success "eopod installed on TPU hosts"
 
-    log_info "Installing $package in virtual environment..."
-    if ! eopod run "~/.local/bin/uv pip install --python ${VENV_PATH}/bin/python $package $extra_args --quiet"; then
-        log_error "Failed to install $package"
-        return 1
-    fi
-    log_success "Successfully installed $package"
+# Helper to install packages remotely into the TPU venv
+install_package_on_tpu() {
+  local spec="$1"
+  log_info "Installing ${spec} on TPU hosts..."
+  if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip install --python ${REMOTE_VENV_PATH}/bin/python ${spec} --quiet"; then
+    log_error "Failed to install ${spec} on TPU hosts"
+    return 1
+  fi
+  log_success "Successfully installed ${spec} on TPU hosts"
 }
 
 echo ""
-log_info "Starting package installations in virtual environment..."
+log_info "Starting package installations on TPU hosts..."
 
-~/.local/bin/uv pip install --python "${VENV_PATH}/bin/python" eopod --quiet
+log_info "Uninstalling existing easydel on TPU hosts (if any)..."
+"$LOCAL_EOPOD_PATH" run "~/.local/bin/uv pip uninstall --python ${REMOTE_VENV_PATH}/bin/python easydel" || true
 
-log_info "Uninstalling existing easydel..."
-eopod run "~/.local/bin/uv pip uninstall  --python ${VENV_PATH}/bin/python easydel" 2>/dev/null || true
-install_package "git+https://github.com/erfanzar/easydel.git[tpu,torch,lm_eval]" || exit 1
+# Use PEP 508 direct URL so extras are preserved:
+# 'easydel[extras] @ git+https://...'
+install_package_on_tpu "'easydel[tpu,torch,lm_eval] @ git+https://github.com/erfanzar/easydel.git'"
 
+# Configure Ray (use the actual eopod binary we installed locally, not uv run)
 log_info "Configuring Ray..."
-if ! "$ENV_EOPOD_PATH" auto-config-ray --self-job --python-path "$VENV_PATH/bin/python"; then
-    log_error "Failed to configure Ray"
-    exit 1
+export RAY_EXECUTABLE_PATH="${REMOTE_VENV_PATH}/bin/ray"
+if ! "$LOCAL_EOPOD_PATH" auto-config-ray --self-job --python-path "${REMOTE_VENV_PATH}/bin/python"; then
+  log_error "Failed to configure Ray"
+  exit 1
 fi
-
 log_success "Ray configured successfully"
 
+# ---------- Summary ----------
 echo ""
 log_success "🎉 TPU setup completed successfully!"
 log_info "TPU Name: $TPU_NAME"
@@ -238,15 +213,10 @@ log_info "TPU Type: $TPU_TYPE"
 log_info "Zone: $ZONE"
 echo ""
 log_info "Final TPU status:"
-gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)"
-echo ""
-echo ""
-log_info "Virtual Environment: $VENV_PATH"
-log_info "All packages installed and configured in virtual environment."
-log_info "Running health check."
-log_info "(maybe health check fail but the setup is fine ;/ if ur on large pods like v4-2048 ... )."
+gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)" || true
 
-"${VENV_PATH}/bin/python" -c "
+
+"${REMOTE_VENV_PATH}/bin/python" -c "
 from eformer.executor.ray import TpuAcceleratorConfig, execute
 import ray
 
@@ -268,4 +238,14 @@ if __name__ == '__main__':
     health_check()
 "
 
-log_success "🎉 looks like the runtime is as healthy as it can be."
+log_success "🎉 Runtime health check completed!"
+echo ""
+
+log_info "Local Orchestrator Environment: $LOCAL_VENV_PATH"
+log_info "TPU Hosts Environment: $REMOTE_VENV_PATH"
+
+echo ""
+
+log_info "Next time:"
+log_info "  Local orchestrator: source ${LOCAL_VENV_PATH}/bin/activate"
+log_info "  Run on TPU: ${LOCAL_VENV_PATH}/bin/eopod run \"${REMOTE_VENV_PATH}/bin/python your_script.py\""
