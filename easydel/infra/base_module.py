@@ -614,11 +614,8 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
         def _map(path, val: nn.VariableState):
             if val.value is not None and path in _shard_keys:
-                try:
-                    val.value = sharding_fns[path](val.value)
-                except TypeError:
-                    path = map(str, path)
-                    warnings.warn(f"couldn't shard/gather {'.'.join(path)}", stacklevel=1)
+                fn = sharding_fns[path]
+                val.value = fn(val.value)
             return val
 
         state.update(state.map(_map))
