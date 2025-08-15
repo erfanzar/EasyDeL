@@ -26,7 +26,7 @@ from jax import numpy as jnp
 from easydel.layers.caching import PagesCache, PagesMetadata
 from easydel.utils import capture_time, ejit, get_logger
 
-from ...vsurge.core.functions import vmaped_sample_top_p_efficient
+from ...vsurge.core.functions import sample_top_p_efficient
 from ..outputs import LogprobsTensors, ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from .sequence_buffer import ModelRunnerSamplingMetadata, SequenceBuffer
@@ -96,7 +96,7 @@ class eSurgeRunner:
         self.max_model_len = max_model_len
         self.kv_pages = model.init_pages(self.metadata)
         self.graphdef, self.graphstate, self.graphother = model.split_module()
-
+        self.rng_key = jax.random.PRNGKey(0)
         self._setup_variables()
         self._setup_model()
 
@@ -165,7 +165,11 @@ class eSurgeRunner:
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.input_ids_np = np.zeros(self.max_num_tokens, dtype=np.int32)
         self.positions_np = np.zeros(self.max_num_tokens, dtype=np.int32)
-        self.page_table_np = np.zeros((self.max_num_reqs, self.metadata.max_num_pages_per_req), dtype=np.int32)
+        self.page_table_np = np.full(
+            (self.max_num_reqs, self.metadata.max_num_pages_per_req),
+            fill_value=-1,
+            dtype=np.int32,
+        )
         self.query_start_loc_np = np.zeros(self.max_num_tokens + 1, dtype=np.int32)
         self.seq_lens_np = np.zeros(self.max_num_tokens, dtype=np.int32)
 
@@ -219,17 +223,25 @@ class eSurgeRunner:
             return nn.merge(graphdef, graphstate, graphother).apply_lm_head(hidden_states[indices_do_sample])
 
         @ejit(
-            in_shardings=(self._empty_sharding, self._empty_sharding),
-            out_shardings=(self._empty_sharding),
+            in_shardings=(self._empty_sharding, self._empty_sharding, self._empty_sharding),
+            out_shardings=(self._empty_sharding, self._empty_sharding),
         )
-        def _sample_from_logits_func(logits, sampling_params: ModelRunnerSamplingMetadata):
-            return vmaped_sample_top_p_efficient(
+        def _sample_from_logits_func(logits, sampling_params: ModelRunnerSamplingMetadata, rng_key):
+            batch_size = logits.shape[0]
+            keys = jax.random.split(rng_key, batch_size + 1)
+            new_rng = keys[0]
+            sample_keys = keys[1:]
+
+            batched_sample = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)
+
+            samples = batched_sample(
                 logits,
-                sampling_params.top_p,
-                sampling_params.temperature,
-                jax.random.PRNGKey(0),
+                sampling_params.top_p[:batch_size],
+                sampling_params.temperature[:batch_size],
+                sample_keys,
                 64,
-            ).reshape(-1, 1)
+            )
+            return samples.reshape(-1, 1), new_rng
 
         def _apply_logits_and_select(hidden_states, indices_do_sample):
             return _apply_logits_and_select_fn(
@@ -268,8 +280,8 @@ class eSurgeRunner:
 
         padded_num_slices = self.metadata.get_padded_num_slices(num_tokens, self.max_num_reqs)
         num_kv_update_slices = jnp.array([padded_num_slices], dtype=jnp.int32)
-        slot_mapping = jnp.zeros((3, padded_num_slices), dtype=jnp.int32)
-        pages_tables = jnp.zeros((num_reqs, num_pages), dtype=jnp.int32)
+        slot_mapping = jnp.full((3, padded_num_slices), fill_value=-1, dtype=jnp.int32)
+        pages_tables = jnp.full((num_reqs, num_pages), fill_value=-1, dtype=jnp.int32)
 
         query_lens = [1] * num_reqs
         query_start_loc = jnp.cumsum(jnp.array([0, *query_lens], dtype=jnp.int32), axis=0, dtype=jnp.int32)
@@ -321,6 +333,7 @@ class eSurgeRunner:
         global_page_start_idx = no_repeat_req_indices * self.metadata.max_num_pages_per_req + local_page_start_idx
 
         page_lens = local_page_end_idx - local_page_start_idx + 1
+
         global_page_start_idx = np.repeat(global_page_start_idx, page_lens)
         slice_arange = np.concatenate([self.arange_np[:n] for n in page_lens])
         global_page_indices = global_page_start_idx + slice_arange
@@ -373,6 +386,7 @@ class eSurgeRunner:
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
 
         for req_id in unscheduled_req_ids:
+            logger.debug(f"Removing unscheduled request {req_id} from sequence buffer")
             req_index = self.sequence_buffer.remove_request(req_id)
             assert req_index is not None
             removed_req_indices.append(req_index)
@@ -395,7 +409,11 @@ class eSurgeRunner:
 
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests[req_id]
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                logger.warning(f"Cached request {req_id} not found in requests dict")
+                continue
+
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_page_ids = req_data.new_page_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
@@ -470,18 +488,15 @@ class eSurgeRunner:
         arange = np.concatenate([self.arange_np[:n] for n in num_scheduled_tokens_per_req])
 
         positions_np = self.positions_np[:total_num_scheduled_tokens].copy()
-        np.add(
-            self.sequence_buffer.num_computed_tokens[req_indices],
-            arange,
-            out=positions_np,
-        )
+        np.add(self.sequence_buffer.num_computed_tokens[req_indices], arange, out=positions_np)
 
         token_indices = positions_np + req_indices * self.sequence_buffer.token_ids.shape[1]
         input_ids = np.take(self.sequence_buffer.token_ids.flatten(), token_indices)
 
         padded_total_num_scheduled_tokens = _get_padded_token_len(self.num_tokens_paddings, total_num_scheduled_tokens)
 
-        padded_input_ids = np.zeros(padded_total_num_scheduled_tokens, dtype=np.int32)
+        pad_token_id = -1
+        padded_input_ids = np.full(padded_total_num_scheduled_tokens, pad_token_id, dtype=np.int32)
         padded_input_ids[:total_num_scheduled_tokens] = input_ids
         self.input_ids = padded_input_ids
 
@@ -490,22 +505,27 @@ class eSurgeRunner:
         self.position_ids = padded_position_ids
 
         self.query_start_loc_np[0] = 0
-        np.cumsum(
-            num_scheduled_tokens_per_req,
-            out=self.query_start_loc_np[1 : num_reqs + 1],
-        )
+        np.cumsum(num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1])
         self.query_start_loc_np[num_reqs + 1 :] = 1
 
         self.seq_lens_np[:num_reqs] = self.sequence_buffer.num_computed_tokens[:num_reqs] + num_scheduled_tokens_per_req
-
+        seq_page_table = self.sequence_buffer.page_table[0].get_array()
         if use_max_model_len:
-            pages_tables = np.zeros((self.num_reqs_max_model_len, self.metadata.max_num_pages_per_req), dtype=np.int32)
-            pages_tables[:num_reqs] = self.sequence_buffer.page_table[0].get_array()[:num_reqs]
+            pages_tables = np.full(
+                (self.num_reqs_max_model_len, self.metadata.max_num_pages_per_req),
+                fill_value=-1,
+                dtype=np.int32,
+            )
+            pages_tables[:num_reqs] = seq_page_table[:num_reqs]
             query_start_loc = self.query_start_loc_np[: self.num_reqs_max_model_len + 1].copy()
             seq_lens = self.seq_lens_np[: self.num_reqs_max_model_len].copy()
         else:
-            pages_tables = np.zeros((self.num_reqs_most_model_len, self.num_pages_per_most_len_req), dtype=np.int32)
-            pages_tables[:num_reqs, : self.num_pages_per_most_len_req] = self.sequence_buffer.page_table[0].get_array()[
+            pages_tables = np.full(
+                (self.num_reqs_most_model_len, self.num_pages_per_most_len_req),
+                fill_value=-1,
+                dtype=np.int32,
+            )
+            pages_tables[:num_reqs, : self.num_pages_per_most_len_req] = seq_page_table[
                 :num_reqs, : self.num_pages_per_most_len_req
             ]
             query_start_loc = self.query_start_loc_np[: self.num_reqs_most_model_len + 1].copy()
@@ -525,13 +545,13 @@ class eSurgeRunner:
             np.pad(
                 slot_mapping_metadata,
                 [[0, padded_num_slices - len(slot_mapping_metadata)], [0, 0]],
-                constant_values=0,
+                constant_values=-1,
             )
         )
 
         attn_metadata = PagesMetadata(
-            slot_mapping=slot_mapping_metadata,
             pages_tables=pages_tables,
+            slot_mapping=slot_mapping_metadata,
             context_lens=seq_lens,
             query_start_loc=query_start_loc,
             num_seqs=np.array([num_reqs], dtype=np.int32),
@@ -573,19 +593,19 @@ class eSurgeRunner:
                 num_reqs,
                 end_index,
             ) = self._prepare_inputs(scheduler_output, start_index)
-
             hidden_states = self.execute_forward(
                 input_ids=self.input_ids,
                 position_ids=self.position_ids,
                 cache_metadata=cache_metadata,
             )
             logits = self.apply_logits_and_select(hidden_states, logits_indices)
-            selected_token_ids = self.sample_from_logits_func(
+            selected_token_ids, self.rng_key = self.sample_from_logits_func(
                 logits,
                 ModelRunnerSamplingMetadata.from_sequence_buffer(
                     sequence_buffer=self.sequence_buffer,
                     padded_num_reqs=padded_num_reqs,
                 ),
+                self.rng_key,
             )
             selected_token_ids = jax.device_get(selected_token_ids)[:num_reqs]
             combined_selected_tokens.append(selected_token_ids)
