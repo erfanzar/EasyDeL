@@ -135,6 +135,11 @@ if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.11.6; then
   log_error "Failed to create local orchestrator virtual environment"
   exit 1
 fi
+if ! "$UV" venv "$REMOTE_VENV_PATH" --clear --python 3.11.6; then
+  log_error "Failed to create local orchestrator/remote virtual environment"
+  exit 1
+fi
+
 log_success "Local orchestrator virtual environment created"
 
 log_info "Installing eopod in local orchestrator environment..."
