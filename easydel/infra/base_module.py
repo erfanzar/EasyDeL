@@ -24,6 +24,7 @@ from typing import Self
 
 import chex
 import flax
+import flax.nnx
 import flax.struct
 import jax
 import jax.extend
@@ -846,7 +847,11 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             )
         return self
 
-    def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
+    def to_state(
+        self,
+        state_class: type[EasyDeLState] | None = None,
+        partition_rules: PartitionLike | None = None,
+    ) -> EasyDeLState:
         """
         Converts the current module instance into an `EasyDeLState` object.
 
@@ -860,16 +865,37 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             from easydel.infra.base_state import EasyDeLState
 
             state_class = EasyDeLState
+        _, gstatesh, gothersh = self._shardings.split_module()
+        gstruct, gstate, gother = self.split_module()
+        out_shape = jax.eval_shape(
+            lambda: state_class.create(step=0, graphdef=gstruct, graphstate=gstate, graphother=gother)
+        )
+        partition_rules = self._get_partition_rules(partition_rules)
+        out_shardings = match_partition_rules(partition_rules, out_shape)
 
-        @partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
+        def _to_namedsharding(val):
+            if isinstance(val, PartitionSpec):
+                return NamedSharding(self.mesh, val)
+            return val
+
+        out_shardings = jax.tree_util.tree_map(_to_namedsharding, out_shardings)
+
+        @partial(
+            jax.jit,
+            donate_argnums=(1, 2),
+            static_argnums=(0,),
+            in_shardings=(gstatesh, gothersh),
+            out_shardings=(out_shardings),
+        )
         def _create_state(gstruct, gstate, gother):
             return state_class.create(
                 step=0,
-                model=self.merge_module(gstruct, gstate, gother),
+                graphdef=gstruct,
+                graphstate=gstate,
+                graphother=gother,
             )
 
-        state = _create_state(*self.split_module())
-        state_class = state.model
+        state = _create_state(gstruct, gstate, gother)
         return state
 
     def to_torch(self, **kwargs):
