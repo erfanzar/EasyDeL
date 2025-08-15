@@ -125,6 +125,7 @@ def kv_cache_update_jax(
         Updated KV cache
     """
     num_valid_slices = total_update_slices[0]
+    padded_new_kv = jnp.pad(new_kv_tokens, [(0, page_size), (0, 0), (0, 0)], mode="constant")
 
     def update_single_slice(cache, slice_idx):
         """Update cache with a single slice."""
@@ -132,9 +133,9 @@ def kv_cache_update_jax(
         new_kv_start_pos = slice_indices[1, slice_idx]
         actual_length = slice_indices[2, slice_idx]
         new_slice = jax.lax.dynamic_slice(
-            new_kv_tokens,
+            padded_new_kv,
             (new_kv_start_pos, 0, 0),
-            (page_size, new_kv_tokens.shape[1], new_kv_tokens.shape[2]),
+            (page_size, padded_new_kv.shape[1], padded_new_kv.shape[2]),
         )
         current_cache_slice = jax.lax.dynamic_slice(
             cache,

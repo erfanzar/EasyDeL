@@ -300,7 +300,7 @@ class PagesCacheView(BaseCacheView):
                 ).reshape(pages.shape)
 
         self.kv_pages = _update(
-            jnp.concatenate([key, value], 1),
+            jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size),
             cache_metadata.slot_mapping,
             self.kv_pages,
             cache_metadata.num_kv_update_slices,
