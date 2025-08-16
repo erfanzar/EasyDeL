@@ -162,16 +162,11 @@ class eSurgeRunner:
             [self.metadata.page_size],
         )
 
-        self.arange_np = jnp.arange(self.max_num_tokens, dtype=jnp.int64)
-        self.input_ids_np = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
-        self.positions_np = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
-        self.page_table_np = jnp.full(
-            (self.max_num_reqs, self.metadata.max_num_pages_per_req),
-            fill_value=-1,
-            dtype=jnp.int32,
-        )
-        self.query_start_loc_np = jnp.zeros(self.max_num_tokens + 1, dtype=jnp.int32)
-        self.seq_lens_np = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
+        self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
+        self.input_ids = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
+        self.positions = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
+        self.query_start_loc = jnp.zeros(self.max_num_tokens + 1, dtype=jnp.int32)
+        self.seq_lens = jnp.zeros(self.max_num_tokens, dtype=jnp.int32)
 
     def _setup_model(self):
         """Set up JIT-compiled model execution functions."""
@@ -330,13 +325,13 @@ class eSurgeRunner:
         local_page_start_idx = slices_start // self.metadata.page_size
         local_page_end_idx = (slices_end - 1) // self.metadata.page_size
 
-        no_repeat_req_indices = self.arange_np[:num_reqs]
+        no_repeat_req_indices = self.arange[:num_reqs]
         global_page_start_idx = no_repeat_req_indices * self.metadata.max_num_pages_per_req + local_page_start_idx
 
         page_lens = local_page_end_idx - local_page_start_idx + 1
 
         global_page_start_idx = jnp.repeat(global_page_start_idx, page_lens)
-        slice_arange = jnp.concatenate([self.arange_np[:n] for n in page_lens])
+        slice_arange = jnp.concatenate([self.arange[:n] for n in page_lens])
         global_page_indices = global_page_start_idx + slice_arange
 
         page_table = self.sequence_buffer.page_table[0].get_array()
@@ -491,10 +486,10 @@ class eSurgeRunner:
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        req_indices = jnp.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_per_req)
-        arange = jnp.concatenate([self.arange_np[:n] for n in num_scheduled_tokens_per_req])
+        req_indices = jnp.repeat(self.arange[:num_reqs], num_scheduled_tokens_per_req)
+        arange = jnp.concatenate([self.arange[:n] for n in num_scheduled_tokens_per_req])
 
-        positions_np = self.positions_np[:total_num_scheduled_tokens]
+        positions_np = self.positions[:total_num_scheduled_tokens]
         positions_np = self.sequence_buffer.num_computed_tokens[req_indices] + arange
 
         token_indices = positions_np + req_indices * self.sequence_buffer.token_ids.shape[1]
@@ -511,13 +506,11 @@ class eSurgeRunner:
         padded_position_ids = padded_position_ids.at[:total_num_scheduled_tokens].set(positions_np)
         self.position_ids = padded_position_ids
 
-        self.query_start_loc_np = self.query_start_loc_np.at[0].set(0)
-        self.query_start_loc_np = self.query_start_loc_np.at[1 : num_reqs + 1].set(
-            jnp.cumsum(num_scheduled_tokens_per_req)
-        )
-        self.query_start_loc_np = self.query_start_loc_np.at[num_reqs + 1 :].set(1)
+        self.query_start_loc = self.query_start_loc.at[0].set(0)
+        self.query_start_loc = self.query_start_loc.at[1 : num_reqs + 1].set(jnp.cumsum(num_scheduled_tokens_per_req))
+        self.query_start_loc = self.query_start_loc.at[num_reqs + 1 :].set(1)
 
-        self.seq_lens_np = self.seq_lens_np.at[:num_reqs].set(
+        self.seq_lens = self.seq_lens.at[:num_reqs].set(
             self.sequence_buffer.num_computed_tokens[:num_reqs] + num_scheduled_tokens_per_req
         )
         seq_page_table = self.sequence_buffer.page_table[0].get_array()
@@ -528,8 +521,8 @@ class eSurgeRunner:
                 dtype=jnp.int32,
             )
             pages_tables = pages_tables.at[:num_reqs].set(seq_page_table[:num_reqs])
-            query_start_loc = self.query_start_loc_np[: self.num_reqs_max_model_len + 1]
-            seq_lens = self.seq_lens_np[: self.num_reqs_max_model_len]
+            query_start_loc = self.query_start_loc[: self.num_reqs_max_model_len + 1]
+            seq_lens = self.seq_lens[: self.num_reqs_max_model_len]
         else:
             pages_tables = jnp.full(
                 (self.num_reqs_most_model_len, self.num_pages_per_most_len_req),
@@ -539,8 +532,8 @@ class eSurgeRunner:
             pages_tables = pages_tables.at[:num_reqs, : self.num_pages_per_most_len_req].set(
                 seq_page_table[:num_reqs, : self.num_pages_per_most_len_req]
             )
-            query_start_loc = self.query_start_loc_np[: self.num_reqs_most_model_len + 1]
-            seq_lens = self.seq_lens_np[: self.num_reqs_most_model_len]
+            query_start_loc = self.query_start_loc[: self.num_reqs_most_model_len + 1]
+            seq_lens = self.seq_lens[: self.num_reqs_most_model_len]
 
         slot_mapping_metadata = self._get_slot_mapping_metadata(num_reqs, num_scheduled_tokens_per_req)
         num_kv_update_slices = slot_mapping_metadata.shape[0]
@@ -572,7 +565,7 @@ class eSurgeRunner:
         )
 
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(num_reqs, self.max_num_reqs)
-        logits_indices = self.query_start_loc_np[1 : padded_num_reqs + 1] - 1
+        logits_indices = self.query_start_loc[1 : padded_num_reqs + 1] - 1
 
         return attn_metadata, logits_indices, padded_num_reqs, num_reqs, end_index
 
@@ -608,14 +601,9 @@ class eSurgeRunner:
                 num_reqs,
                 end_index,
             ) = self._prepare_inputs(scheduler_output, start_index)
-            hidden_states = self.execute_forward(
-                input_ids=self.input_ids,
-                position_ids=self.position_ids,
-                cache_metadata=cache_metadata,
-            )
-            logits = self.apply_logits_and_select(hidden_states, logits_indices)
+            hidden_states = self.execute_forward(self.input_ids, self.position_ids, cache_metadata)
             selected_token_ids, self.rng_key = self.sample_from_logits_func(
-                logits,
+                self.apply_logits_and_select(hidden_states, logits_indices),
                 ModelRunnerSamplingMetadata.from_sequence_buffer(
                     sequence_buffer=self.sequence_buffer,
                     padded_num_reqs=padded_num_reqs,

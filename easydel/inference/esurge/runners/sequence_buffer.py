@@ -485,10 +485,10 @@ class SequenceBuffer:
     def _make_prompt_token_ids_tensor(self) -> jax.Array:
         """Create a padded tensor of prompt token IDs."""
         if self.num_reqs == 0:
-            return jnp.empty((0, 0), dtype=jnp.int64)
+            return jnp.empty((0, 0), dtype=jnp.int32)
 
         max_prompt_len = int(jnp.max(self.num_prompt_tokens[: self.num_reqs]))
-        prompt_token_ids = jnp.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=jnp.int64)
+        prompt_token_ids = jnp.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=jnp.int32)
 
         for i in range(self.num_reqs):
             num_prompt = int(self.num_prompt_tokens[i])

@@ -31,7 +31,6 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.inference.sampling_params import SamplingParams
-from easydel.layers.attention import AttentionMechanisms
 from easydel.utils.helpers import get_logger
 
 from .engine_types import EngineCoreOutputs
@@ -134,6 +133,7 @@ class eSurge:
         """
 
         from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
+        from easydel.layers.attention import AttentionMechanisms
 
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
