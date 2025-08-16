@@ -11,6 +11,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""State management for EasyDeL models.
+
+This module provides the EasyDeLState class, which encapsulates all stateful
+components of a model during training or inference, including parameters,
+optimizer state, and training metadata.
+
+Classes:
+    EasyDeLState: Complete state container for models during training/inference
+
+Key Features:
+    - Unified state management for training and inference
+    - Automatic sharding and partitioning support
+    - Checkpoint saving and loading
+    - Gradient application with optimizer integration
+    - State serialization and deserialization
+
+Example:
+    >>> from easydel.infra import EasyDeLState
+    >>> import optax
+    >>>
+    >>> # Create state from a model
+    >>> state = EasyDeLState.create(
+    ...     model=model,
+    ...     tx=optax.adamw(learning_rate=1e-4),
+    ...     init_opt_state=True
+    ... )
+    >>>
+    >>> # Apply gradients
+    >>> state = state.apply_gradients(grads=gradients)
+    >>>
+    >>> # Save checkpoint
+    >>> state.save_state("checkpoint_path")
+    >>>
+    >>> # Load checkpoint
+    >>> state = EasyDeLState.load_state(
+    ...     "checkpoint_path",
+    ...     config=config
+    ... )
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -50,28 +91,40 @@ logger = get_logger(__name__)
 
 
 class EasyDeLState(struct.PyTreeNode):
-    """Represents the state of an EasyDeL model during training or inference.
+    """Complete state container for EasyDeL models.
 
-    This class encapsulates the model's parameters, optimizer state, training step,
-    and potentially other metadata. It provides methods for applying gradients,
-    managing sharding, saving, and loading the state.
+    Encapsulates all stateful components needed for training or inference,
+    including model parameters, optimizer state, and training metadata.
+    Provides methods for gradient updates, checkpointing, and state management.
+
+    This class is designed to work seamlessly with JAX's functional programming
+    paradigm while providing convenient methods for state manipulation.
 
     Attributes:
-        step (int | jax.Array):
-            The current training step count.
-        graphdef (nn.GraphDef):
-            The definition of the model's computation graph (structure).
-        graphstate (nn.GraphState):
-            The state of the model's parameters.
-        graphother (nn.GraphState):
-            The state of non-parameter variables within the model.
-        tx (optax.GradientTransformation):
-            The optimizer transformation (e.g., AdamW, SGD). Marked as a non-pytree node.
-        opt_state (tp.Optional[optax.OptState]):
-            The state of the optimizer (e.g., moments). Marked as a pytree node.
-        apply_fn (tp.Optional[tp.Callable]):
-            A function to apply the model (often `model.__call__`). Typically not
-            directly part of the state but can be associated.
+        step: Current training step count.
+        graphdef: Model's computation graph structure (non-pytree).
+        graphstate: Model parameter state (pytree).
+        graphother: Non-parameter model state (pytree).
+        tx: Optimizer transformation (non-pytree).
+        opt_state: Optimizer state like moments (pytree).
+        apply_fn: Optional model application function (non-pytree).
+
+    Methods:
+        apply_gradients: Update parameters with gradients
+        create: Factory method to create state from model
+        save_state: Save state to checkpoint
+        load_state: Load state from checkpoint
+        shard_state: Apply sharding to state
+        gather_state: Gather sharded state
+
+    Example:
+        >>> state = EasyDeLState.create(
+        ...     model=my_model,
+        ...     tx=optax.adam(1e-3)
+        ... )
+        >>> # Training step
+        >>> grads = compute_gradients(...)
+        >>> state = state.apply_gradients(grads=grads)
     """
 
     step: int | jax.Array = struct.field(pytree_node=True)
@@ -85,17 +138,23 @@ class EasyDeLState(struct.PyTreeNode):
     apply_fn: tp.Callable | None = struct.field(pytree_node=False, default=None)
 
     def apply_gradients(self: Self, *, grads):
-        """Updates the model's parameters and optimizer state based on calculated gradients.
+        """Apply gradients to update parameters and optimizer state.
+
+        Performs a single optimization step using the provided gradients.
 
         Args:
-            grads: A pytree matching the structure of `self.graphstate` containing the gradients.
+            grads: Gradient pytree matching the structure of graphstate.
 
         Returns:
-            EasyDeLState: A new state object with the updated parameters (`graphstate`),
-                optimizer state (`opt_state`), and incremented step count.
+            New EasyDeLState with updated parameters, optimizer state,
+            and incremented step count.
 
         Raises:
-            AssertionError: If `opt_state` or `tx` is not initialized.
+            AssertionError: If opt_state or tx is not initialized.
+
+        Example:
+            >>> grads = jax.grad(loss_fn)(state.graphstate)
+            >>> state = state.apply_gradients(grads=grads)
         """
         assert self.opt_state is not None
         assert self.tx is not None

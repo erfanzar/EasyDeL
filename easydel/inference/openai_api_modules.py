@@ -11,7 +11,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Defines Pydantic models for the vInference API, mimicking OpenAI's structure."""
+"""OpenAI API compatibility models and utilities.
+
+This module provides Pydantic models and utilities for OpenAI API compatibility,
+enabling EasyDeL inference engines to work with OpenAI-compatible clients and tools.
+
+Key Components:
+    - Request/Response models for chat completions and text completions
+    - Function calling support with multiple format parsers
+    - Token usage tracking and metrics
+    - Streaming response models
+
+Classes:
+    ChatMessage: Single message in a conversation
+    DeltaMessage: Incremental message for streaming
+    UsageInfo: Token usage and performance metrics
+    ChatCompletionRequest: Request for chat completions
+    ChatCompletionResponse: Response from chat completions
+    CompletionRequest: Request for text completions
+    CompletionResponse: Response from text completions
+    FunctionCallFormat: Supported function call formats
+    FunctionCallFormatter: Formatter for function call prompts
+    FunctionCallParser: Parser for extracting function calls
+
+Example:
+    >>> from easydel.inference.openai_api_modules import (
+    ...     ChatCompletionRequest,
+    ...     ChatMessage
+    ... )
+    >>> request = ChatCompletionRequest(
+    ...     model="gpt-3.5-turbo",
+    ...     messages=[
+    ...         ChatMessage(role="user", content="Hello!")
+    ...     ],
+    ...     temperature=0.7
+    ... )
+"""
 
 import json
 import re
@@ -25,7 +60,14 @@ from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
-    """Represents a single message in a chat conversation."""
+    """Represents a single message in a chat conversation.
+
+    Attributes:
+        role: Message role (system, user, assistant, function)
+        content: Message content (text or structured)
+        name: Optional name for the message sender
+        function_call: Optional function call made by assistant
+    """
 
     role: str
     content: str | list[tp.Mapping[str, str]]
@@ -34,7 +76,15 @@ class ChatMessage(BaseModel):
 
 
 class DeltaMessage(BaseModel):
-    """Represents a change (delta) in a chat message, used in streaming responses."""
+    """Represents a change (delta) in a chat message.
+
+    Used in streaming responses to send incremental updates.
+
+    Attributes:
+        role: Optional role if starting new message
+        content: Incremental content to append
+        function_call: Optional function call updates
+    """
 
     role: str | None = None
     content: str | list[tp.Mapping[str, str]] | None = None
@@ -42,7 +92,17 @@ class DeltaMessage(BaseModel):
 
 
 class UsageInfo(BaseModel):
-    """Provides information about token usage and processing time for a request."""
+    """Token usage and performance metrics.
+
+    Tracks computational resources used for a request.
+
+    Attributes:
+        prompt_tokens: Number of tokens in the prompt
+        completion_tokens: Number of tokens generated
+        total_tokens: Sum of prompt and completion tokens
+        tokens_per_second: Generation speed
+        processing_time: Total processing time in seconds
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int | None = 0
@@ -52,7 +112,14 @@ class UsageInfo(BaseModel):
 
 
 class FunctionDefinition(BaseModel):
-    """Defines a function that can be called by the model."""
+    """Defines a function that can be called by the model.
+
+    Attributes:
+        name: Function name
+        description: Function description for the model
+        parameters: JSON Schema for function parameters
+        required: List of required parameter names
+    """
 
     name: str
     description: str | None = None
@@ -253,23 +320,58 @@ class ToolCall(BaseModel):
 
 
 class FunctionCallFormat(str, Enum):
-    """Supported function call formats."""
+    """Supported function call formats.
+
+    Different models and frameworks use different formats for function calling.
+
+    Attributes:
+        OPENAI: OpenAI's standard format
+        JSON_SCHEMA: Direct JSON schema format
+        HERMES: Hermes model function calling format
+        GORILLA: Gorilla model function calling format
+        QWEN: Qwen's special token format (✿FUNCTION✿)
+        NOUS: Nous XML-style format (<tool_call>)
+    """
 
     OPENAI = "openai"  # OpenAI's format
     JSON_SCHEMA = "json_schema"  # Direct JSON schema
     HERMES = "hermes"  # Hermes function calling format
     GORILLA = "gorilla"  # Gorilla function calling format
+    QWEN = "qwen"  # Qwen's special token format
+    NOUS = "nous"  # Nous XML-style format
 
 
 @dataclass
 class FunctionCallParser:
-    """Parser for extracting function calls from generated text."""
+    """Parser for extracting function calls from generated text.
+
+    Supports multiple function calling formats and can extract
+    structured function calls from model outputs.
+
+    Attributes:
+        format: Function call format to parse
+        strict: If True, require exact format matching
+
+    Methods:
+        parse: Extract function calls from text
+    """
 
     format: FunctionCallFormat = FunctionCallFormat.OPENAI
     strict: bool = False  # If True, require exact format matching
 
     def parse(self, text: str) -> list[FunctionCall] | None:
-        """Parse function calls from generated text."""
+        """Parse function calls from generated text.
+
+        Args:
+            text: Generated text containing function calls
+
+        Returns:
+            List of parsed FunctionCall objects, or None if no calls found
+
+        Raises:
+            ValueError: If format is unsupported
+            json.JSONDecodeError: If strict mode and JSON is invalid
+        """
         if self.format == FunctionCallFormat.OPENAI:
             return self._parse_openai_format(text)
         elif self.format == FunctionCallFormat.JSON_SCHEMA:
@@ -278,6 +380,10 @@ class FunctionCallParser:
             return self._parse_hermes_format(text)
         elif self.format == FunctionCallFormat.GORILLA:
             return self._parse_gorilla_format(text)
+        elif self.format == FunctionCallFormat.QWEN:
+            return self._parse_qwen_format(text)
+        elif self.format == FunctionCallFormat.NOUS:
+            return self._parse_nous_format(text)
         else:
             raise ValueError(f"Unsupported format: {self.format}")
 
@@ -418,6 +524,59 @@ class FunctionCallParser:
 
         return function_calls if function_calls else None
 
+    def _parse_qwen_format(self, text: str) -> list[FunctionCall] | None:
+        """Parse Qwen-style function calls with special tokens."""
+        function_calls = []
+
+        # Look for Qwen special token patterns
+        # Pattern: ✿FUNCTION✿: function_name\n✿ARGS✿: {...}
+        pattern = r"✿FUNCTION✿:\s*(\w+)\s*\n✿ARGS✿:\s*({.*?})"
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        for name, args_str in matches:
+            try:
+                args_dict = json.loads(args_str)
+                function_calls.append(
+                    FunctionCall(
+                        name=name,
+                        arguments=json.dumps(args_dict),
+                    )
+                )
+            except json.JSONDecodeError:
+                if self.strict:
+                    raise
+                continue
+
+        return function_calls if function_calls else None
+
+    def _parse_nous_format(self, text: str) -> list[FunctionCall] | None:
+        """Parse Nous-style function calls with XML tags."""
+        function_calls = []
+
+        # Pattern: <tool_call>{"name": "func", "arguments": {...}}</tool_call>
+        pattern = r"<tool_call>\s*({.*?})\s*</tool_call>"
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match)
+                if "name" in data:
+                    args = data.get("arguments", {})
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    function_calls.append(
+                        FunctionCall(
+                            name=data["name"],
+                            arguments=args,
+                        )
+                    )
+            except json.JSONDecodeError:
+                if self.strict:
+                    raise
+                continue
+
+        return function_calls if function_calls else None
+
 
 class FunctionCallFormatter:
     """Formats function definitions for inclusion in prompts."""
@@ -431,6 +590,10 @@ class FunctionCallFormatter:
             return FunctionCallFormatter._format_hermes_style(tools)
         elif format == FunctionCallFormat.GORILLA:
             return FunctionCallFormatter._format_gorilla_style(tools)
+        elif format == FunctionCallFormat.QWEN:
+            return FunctionCallFormatter._format_qwen_style(tools)
+        elif format == FunctionCallFormat.NOUS:
+            return FunctionCallFormatter._format_nous_style(tools)
         else:
             return FunctionCallFormatter._format_json_style(tools)
 
@@ -516,6 +679,63 @@ class FunctionCallFormatter:
 
         tools_json = [tool.model_dump() for tool in tools]
         return f"Available tools:\n{json.dumps(tools_json, indent=2)}"
+
+    @staticmethod
+    def _format_qwen_style(tools: list[Tool]) -> str:
+        """Format tools in Qwen style with special tokens."""
+        if not tools:
+            return ""
+
+        formatted = "# Tools\n\n## You have access to the following tools:\n\n"
+
+        for tool in tools:
+            func = tool.function
+            formatted += f"### {func.name}\n"
+            if func.description:
+                formatted += f"- **Description**: {func.description}\n"
+            if func.parameters:
+                formatted += f"- **Parameters**: {json.dumps(func.parameters, indent=2)}\n"
+            formatted += "\n"
+
+        formatted += (
+            "## When you need to call a tool, please insert the following command in your reply:\n\n"
+            "✿FUNCTION✿: The tool to use, should be one of [" + ",".join([tool.function.name for tool in tools]) + "]\n"
+            "✿ARGS✿: The input of the tool\n"
+            "✿RESULT✿: Tool results\n"
+            "✿RETURN✿: Reply based on tool results"
+        )
+
+        return formatted
+
+    @staticmethod
+    def _format_nous_style(tools: list[Tool]) -> str:
+        """Format tools in Nous style with XML tags."""
+        if not tools:
+            return ""
+
+        formatted = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+        formatted += "You are provided with function signatures within <tools></tools> XML tags:\n"
+        formatted += "<tools>\n"
+
+        for tool in tools:
+            func = tool.function
+            tool_def = {
+                "name": func.name,
+                "description": func.description,
+                "parameters": func.parameters,
+            }
+            formatted += f"{json.dumps(tool_def, indent=2)}\n"
+
+        formatted += "</tools>\n\n"
+        formatted += (
+            "For each function call, return a json object with function name and arguments "
+            "within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            '{"name": <function-name>, "arguments": <args-json-object>}\n'
+            "</tool_call>"
+        )
+
+        return formatted
 
 
 # Enhanced request models with function calling support

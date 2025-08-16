@@ -46,7 +46,7 @@ logger = get_logger("vSurge")
 
 @dataclasses.dataclass
 class ProcessState:
-    """Internal state for tracking a single generation within a vSurgeRequest's 'n' sequences.
+    """Internal state for tracking a single generation sequence.
 
     Attributes:
         id (int): Identifier for this generation sequence (0 to n-1).
@@ -85,12 +85,45 @@ class ProcessState:
 
 
 class vSurge:
-    """Orchestrates high-throughput text generation using an underlying vDriver.
+    """High-level interface for high-throughput text generation.
 
-    vSurge manages request queuing, interaction with the driver, and processing
-    of generation results, including tokenization and detokenization. It supports
-    batch and streaming generation, client-side and server-side tokenization,
-    and special handling for bytecode tokenizers.
+    vSurge orchestrates text generation using an underlying vDriver, managing
+    request queuing, result processing, and tokenization/detokenization.
+    It supports both streaming and non-streaming generation with features
+    like bytecode decoding for handling malformed UTF-8 sequences.
+
+    Features:
+        - Batch and streaming generation
+        - Client-side and server-side tokenization
+        - Smart bytecode decoding for robust text handling
+        - Asynchronous request processing
+        - Multiple sampling strategies
+
+    Attributes:
+        driver: Underlying vDriver instance
+        vsurge_name: Name of this vSurge instance
+        bytecode_decode: Default bytecode decoding setting
+        smart_decoder: Smart decoder for malformed characters
+        processor: Tokenizer/processor from the driver
+
+    Example:
+        >>> driver = vDriver.from_pretrained("model-name")
+        >>> surge = vSurge(driver, bytecode_decode=True)
+        >>> surge.start()
+        >>>
+        >>> # Synchronous generation
+        >>> response = surge.generate_once(
+        ...     "Write a story about",
+        ...     max_tokens=100
+        ... )
+        >>> print(response.text)
+        >>>
+        >>> # Asynchronous streaming
+        >>> async for chunk in surge.generate(
+        ...     "Explain quantum computing",
+        ...     stream=True
+        ... ):
+        ...     print(chunk.text, end="")
     """
 
     def __init__(
@@ -99,17 +132,14 @@ class vSurge:
         vsurge_name: str | None = None,
         bytecode_decode: bool = False,
     ):
-        """Initializes the vSurge instance.
+        """Initialize vSurge instance.
 
         Args:
-            driver (vDriver): The underlying vDriver instance for inference.
-            vsurge_name (tp.Optional[str]): Optional name for this vSurge instance.
-                Defaults to the driver's name.
-            bytecode_decode (bool): Default bytecode decoding behavior for this vSurge
-                instance. If True, attempts to decode tokens by accumulating all tokens
-                and decoding them together, which can be beneficial for tokenizers
-                with byte fallbacks. This setting can be overridden per-request in
-                `generate` and `complete` methods. Defaults to False.
+            driver: The underlying vDriver instance for model execution.
+            vsurge_name: Optional name for this instance (defaults to driver name).
+            bytecode_decode: Enable bytecode decoding for handling malformed UTF-8.
+                When True, accumulates tokens before decoding to handle byte
+                fallback tokens properly. Can be overridden per-request.
         """
         self._driver = driver
         self._vsurge_name = vsurge_name or driver.driver_name
@@ -117,36 +147,67 @@ class vSurge:
         self._smart_decoder = SmartBytecodeDecoder(self.processor)
 
     def compile(self):
-        """Compiles the underlying driver for optimized execution."""
+        """Compile the underlying driver for optimized execution.
+
+        Pre-compiles JAX functions for faster inference. Should be called
+        before starting generation for best performance.
+        """
         self.driver.compile()
 
     @property
     def vsurge_name(self) -> str:
-        """str: The name of this vSurge instance."""
+        """Get the name of this vSurge instance.
+
+        Returns:
+            Name identifier for this instance.
+        """
         return self._vsurge_name
 
     @property
     def bytecode_decode(self) -> bool:
-        """bool: The default bytecode decoding setting for this instance."""
+        """Get the default bytecode decoding setting.
+
+        Returns:
+            True if bytecode decoding is enabled by default.
+        """
         return self._bytecode_decode
 
     @property
     def driver(self) -> vDriver:
-        """vDriver: Provides access to the underlying vDriver instance."""
+        """Get the underlying vDriver instance.
+
+        Returns:
+            The vDriver used for model execution.
+        """
         return self._driver
 
     @property
     def smart_decoder(self) -> SmartBytecodeDecoder:
-        """SmartBytecodeDecoder: The smart decoder for handling malformed characters."""
+        """Get the smart bytecode decoder.
+
+        Returns:
+            Decoder for handling malformed UTF-8 sequences.
+        """
         return self._smart_decoder
 
     @property
     def processor(self) -> ProcessingClassType:
-        """ProcessingClassType: The processor/tokenizer from the underlying driver."""
+        """Get the tokenizer/processor.
+
+        Returns:
+            The tokenizer used for text processing.
+        """
         return self.driver.processor
 
     def start(self):
-        """Starts the underlying driver, making it ready for requests."""
+        """Start the underlying driver.
+
+        Initializes the driver and makes it ready to accept generation requests.
+        Must be called before submitting any requests.
+
+        Returns:
+            Result from driver.start() operation.
+        """
         return self.driver.start()
 
     def stop(self):

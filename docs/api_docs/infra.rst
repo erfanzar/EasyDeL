@@ -12,7 +12,6 @@ Infra
    infra_etils
    infra_factory
    infra_loss_utils
-   infra_loss_utils_test
    infra_mixins
    infra_modeling_outputs
    infra_utils

@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Model output classes for EasyDeL.
+
+Defines standardized output structures for various model types and tasks.
+These dataclasses provide consistent interfaces for model outputs while
+maintaining compatibility with JAX pytrees.
+
+Classes:
+    ModelOutput: Base class for all model outputs
+    CausalLMOutput: Output for causal language models
+    MoeCausalLMOutput: Output for MoE causal language models
+    SequenceClassifierOutput: Output for sequence classification
+    ImageClassifierOutput: Output for image classification
+    CLIPOutput: Output for CLIP models
+    CLIPTextModelOutput: Output for CLIP text encoders
+    GreedySearchOutput: Output for greedy generation
+    SampleOutput: Output for sampling generation
+    BeamSearchOutput: Output for beam search generation
+
+Key Features:
+    - Consistent interface across model types
+    - JAX pytree compatibility
+    - Optional fields with None defaults
+    - Dictionary-like access patterns
+    - Automatic validation
+
+Example:
+    >>> from easydel.infra.modeling_outputs import CausalLMOutput
+    >>> output = CausalLMOutput(
+    ...     logits=logits,
+    ...     hidden_states=hidden_states,
+    ...     attentions=attentions
+    ... )
+    >>> # Access as attribute or dictionary
+    >>> logits = output.logits
+    >>> logits = output["logits"]
+"""
 
 from __future__ import annotations
 
@@ -36,10 +72,19 @@ def _is_array(array):
 
 
 class ModelOutput(tp.OrderedDict):
-    """
-    Base class for all model outputs as dataclass. Has a `__getitem__` that allows indexing by integer or slice (like a
-    tuple) or strings (like a dictionary) that will ignore the `None` attributes. Otherwise behaves like a regular
-    python dictionary.
+    """Base class for all model outputs.
+
+    Provides a consistent interface for model outputs that behaves like
+    both a tuple (for positional access) and a dictionary (for named access).
+    Automatically filters out None values and provides validation.
+
+    Subclasses must use the @auto_pytree decorator to ensure JAX compatibility.
+
+    Methods:
+        to_tuple: Convert to tuple, excluding None values
+
+    Note:
+        All fields except the first should have None as default.
     """
 
     def __init__(self, *args, **kwargs):

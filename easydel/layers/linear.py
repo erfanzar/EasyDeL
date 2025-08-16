@@ -12,6 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Linear layers with parallel and distributed computation support.
+
+Provides optimized linear layers with support for model parallelism,
+tensor parallelism, and various sharding strategies for distributed training.
+
+Classes:
+    ParallelLinear: Linear layer with tensor/model parallelism support
+    Linear: Standard linear layer (alias for ParallelLinear)
+
+Functions:
+    get_sharding: Extract sharding specification from an array
+    get_output_partition_spec: Calculate output sharding for matmul
+    get_matmul_output_sharding: Determine output sharding from input specs
+
+Key Features:
+    - Automatic sharding and gathering for distributed training
+    - Support for various matrix multiplication methods
+    - Mixed precision support
+    - Efficient initialization strategies
+    - Integration with JAX's shard_map
+
+Example:
+    >>> from easydel.layers import ParallelLinear
+    >>> # Create a parallel linear layer
+    >>> layer = ParallelLinear(
+    ...     features=768,
+    ...     use_bias=True,
+    ...     gather_output=False,
+    ...     axis_name="model",
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>> output = layer(input_tensor)
+"""
+
 import typing as tp
 
 import jax.numpy as jnp
@@ -44,13 +79,15 @@ default_bias_init = nn.initializers.zeros
 
 
 def get_sharding(arr: Shaped[Array, "..."]) -> Ps | None:
-    """Gets the sharding of an array.
+    """Get the sharding specification of an array.
+
+    Extracts the PartitionSpec from a sharded JAX array.
 
     Args:
-            arr: Array to get sharding from.
+        arr: Array to get sharding from.
 
     Returns:
-            Sharding of the array.
+        PartitionSpec of the array, or None if not sharded.
     """
     sharding = getattr(arr, "sharding", None)
     if sharding is not None:
@@ -64,16 +101,19 @@ def get_output_partition_spec(
     method: MatrixMultiplyMethod,
     axis_name: str,
 ) -> Ps | None:
-    """Calculate output partition spec based on input arrays and matmul method.
+    """Calculate output partition spec for matrix multiplication.
+
+    Determines the appropriate output sharding based on input
+    sharding and the matrix multiplication method used.
 
     Args:
-        lhs: Left-hand side array (inputs)
-        rhs: Right-hand side array (weights)
-        method: Matrix multiplication method
-        axis_name: Axis name for sharding
+        lhs: Left-hand side array (inputs).
+        rhs: Right-hand side array (weights).
+        method: Matrix multiplication method.
+        axis_name: Axis name for sharding.
 
     Returns:
-        Output partition specification
+        Output partition specification for the result.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -90,14 +130,23 @@ def get_output_partition_spec(
 
 
 def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
-    """
-    Determine the output sharding PartitionSpec for a matrix multiplication
-    based on the partition specs of the input matrices.
+    """Determine output sharding for matrix multiplication.
 
-    For matrix multiplication X @ W:
-    - The contracting dimensions get reduced during matmul
-    - The non-contracting dimensions of X and W determine the output sharding
-    - Ensures no duplicate sharding dimensions in the output
+    Calculates the output PartitionSpec based on input partition specs,
+    following matrix multiplication rules where contracting dimensions
+    are reduced and non-contracting dimensions determine output sharding.
+
+    For X @ W:
+    - Contracting dimensions are reduced during matmul
+    - Non-contracting dimensions determine output sharding
+    - Ensures no duplicate sharding dimensions in output
+
+    Args:
+        lhs_pspec: PartitionSpec for left-hand side matrix.
+        rhs_pspec: PartitionSpec for right-hand side matrix.
+
+    Returns:
+        Output PartitionSpec for the multiplication result.
     - Ensures correct output dimensionality with None padding if needed
 
     Args:

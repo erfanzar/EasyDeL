@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Sequence buffer for managing token sequences during generation.
+
+Provides efficient storage and management of token sequences, page tables,
+and generation metadata for batch processing.
+
+Classes:
+    SequenceBuffer: Main buffer for managing sequences
+    DecodeRowInfo: Information about sequences in decode phase
+    ModelRunBatch: Batch data for model execution
+
+Example:
+    >>> buffer = SequenceBuffer(
+    ...     max_num_reqs=32,
+    ...     max_model_len=2048,
+    ...     max_num_batched_tokens=4096,
+    ...     vocab_size=50000,
+    ...     page_sizes=[16, 32]
+    ... )
+    >>> buffer.begin_sequence("req_1", [1, 2, 3])
+    >>> batch = buffer.prepare_batch()
+"""
 
 from dataclasses import field
 from typing import Any, cast
@@ -29,6 +50,30 @@ logger = get_logger(__name__)
 
 
 class SequenceBuffer:
+    """Buffer for managing token sequences during generation.
+
+    Maintains token sequences, page tables, and metadata for efficient
+    batch processing. Handles both prefill and decode phases.
+
+    Attributes:
+        max_num_reqs: Maximum concurrent requests.
+        max_model_len: Maximum sequence length.
+        max_num_batched_tokens: Maximum tokens per batch.
+        vocab_size: Size of vocabulary.
+        token_ids: 2D array of token IDs per request.
+        num_tokens: Number of tokens per request.
+        page_table: Multi-group page table for KV-cache.
+
+    Example:
+        >>> buffer = SequenceBuffer(
+        ...     max_num_reqs=32,
+        ...     max_model_len=2048,
+        ...     max_num_batched_tokens=4096,
+        ...     vocab_size=50000,
+        ...     page_sizes=[16, 32]
+        ... )
+    """
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -37,6 +82,15 @@ class SequenceBuffer:
         vocab_size: int,
         page_sizes: list[int],
     ):
+        """Initialize SequenceBuffer.
+
+        Args:
+            max_num_reqs: Maximum concurrent requests.
+            max_model_len: Maximum sequence length.
+            max_num_batched_tokens: Maximum tokens per batch.
+            vocab_size: Size of vocabulary.
+            page_sizes: List of page sizes for multi-group caching.
+        """
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
