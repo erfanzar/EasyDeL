@@ -18,13 +18,15 @@ from functools import partial
 import jax
 from eformer import common_types as ct
 from jax import Array
-from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
 from easydel.layers.caching import PagesCacheView, PagesMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
+
+USE_SHARDMAP = False
 
 
 @AttentionRegistry.register
@@ -80,33 +82,37 @@ class PagedAttn(AttentionImpl):
         vpages = cache_view.value_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
+        num_seqs = cache_metadata.num_seqs.reshape(-1)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
-        output = shard_map(
-            f=partial(
-                jax_ragged_paged_attention,
-                softmax_scale=self.metadata.softmax_scale,
-                soft_cap=self.metadata.soft_cap,
-            ),
-            in_specs=(
-                qaxes,
-                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kpages.shape),
-                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=vpages.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.pages_tables.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
-            ),
-            out_specs=qaxes,
-            mesh=self.metadata.mesh,
-            check_rep=False,
-        )(
+        fn = partial(
+            jax_ragged_paged_attention,
+            softmax_scale=self.metadata.softmax_scale,
+            soft_cap=self.metadata.soft_cap,
+        )
+        if USE_SHARDMAP:
+            fn = jax.shard_map(
+                fn,
+                in_specs=(
+                    qaxes,
+                    resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kpages.shape),
+                    resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=vpages.shape),
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                ),
+                out_specs=qaxes,
+                mesh=self.metadata.mesh,
+                check_vma=False,
+            )
+        output = fn(
             q,
             kpages,
             vpages,
             cache_metadata.context_lens,
             cache_metadata.pages_tables,
             cache_metadata.query_start_loc,
-            cache_metadata.num_seqs,
+            num_seqs,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=output)
 
@@ -145,37 +151,44 @@ class PagedAttn(AttentionImpl):
             NotImplementedError: Paged Attention currently relies on Pallas for TPUs
                 and does not have a specific implementation.
         """
+        # return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
         kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
+        num_seqs = cache_metadata.num_seqs.reshape(-1)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
-        output = shard_map(
-            f=partial(
+        pages_per_seq = cache_metadata.pages_tables.shape[1]
+        num_kv_pages_per_block = min(8, pages_per_seq)
+
+        if num_kv_pages_per_block <= 0 or num_kv_pages_per_block > pages_per_seq:
+            raise ValueError(f"num_kv_pages_per_block={num_kv_pages_per_block} must be in range (0, {pages_per_seq}].")
+        output = jax.shard_map(
+            partial(
                 pallas_ragged_paged_attention,
                 sm_scale=self.metadata.softmax_scale,
                 soft_cap=self.metadata.soft_cap,
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                vmem_limit_bytes=None,
+                vmem_limit_bytes=16777216,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=64,
             ),
             in_specs=(
                 qaxes,
                 resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.context_lens.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.pages_tables.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.query_start_loc.shape),
-                resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=cache_metadata.num_seqs.shape),
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),
             ),
             out_specs=qaxes,
             mesh=self.metadata.mesh,
-            check_rep=False,
+            check_vma=False,
         )(
             q,
             kv_pages,
             cache_metadata.context_lens,
             cache_metadata.pages_tables,
             cache_metadata.query_start_loc,
-            cache_metadata.num_seqs,
+            num_seqs,
         )
         return AttentionOutput(attention_weights=None, attention_outputs=output)
 
@@ -258,14 +271,16 @@ class PagedAttn(AttentionImpl):
             AttentionOutput: The result of the attention computation with the sequence
                 dimension restored.
         """
-        batch, sequence, head, dim = q.shape
+        if q.ndim == 4:
+            batch, sequence, head, dim = q.shape
         output = super().__call__(
-            q=q.reshape(-1, head, dim),
+            q=q.reshape(-1, *q.shape[-2:]),
             k=k,
             v=v,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             **ignore,
         )
-        output.attention_outputs = output.attention_outputs.reshape(batch, sequence, head, dim)
+        if q.ndim == 4:
+            output.attention_outputs = output.attention_outputs.reshape(batch, sequence, head, dim)
         return output
