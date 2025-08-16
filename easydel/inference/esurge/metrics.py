@@ -25,7 +25,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-import numpy as np
+from jax import numpy as jnp
 
 
 @dataclass
@@ -292,9 +292,9 @@ class MetricsCollector:
             ttfts = [req.time_to_first_token for req in recent_requests if req.time_to_first_token]
             throughputs = [req.tokens_per_second for req in recent_requests if req.tokens_per_second > 0]
 
-            avg_latency = np.mean(latencies) if latencies else 0.0
-            avg_ttft = np.mean(ttfts) if ttfts else 0.0
-            avg_throughput = np.mean(throughputs) if throughputs else 0.0
+            avg_latency = jnp.mean(jnp.array(latencies)) if latencies else 0.0
+            avg_ttft = jnp.mean(jnp.array(ttfts)) if ttfts else 0.0
+            avg_throughput = jnp.mean(jnp.array(throughputs)) if throughputs else 0.0
             requests_per_second = total_completed / window_seconds
 
             return SystemMetrics(

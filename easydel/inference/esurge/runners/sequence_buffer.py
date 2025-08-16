@@ -37,8 +37,9 @@ Example:
 from dataclasses import field
 from typing import Any, cast
 
-import numpy as np
+import jax
 from eformer.pytree import auto_pytree
+from jax import numpy as jnp
 
 from easydel.utils.helpers import get_logger
 
@@ -100,11 +101,11 @@ class SequenceBuffer:
         self.req_id_to_index: dict[str, int] = {}
         self.req_output_token_ids: list[list[int] | None] = []
 
-        self.token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
-        self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
-        self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
-        self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
-        self.num_computed_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+        self.token_ids = jnp.zeros((max_num_reqs, max_model_len), dtype=jnp.int32)
+        self.num_tokens = jnp.zeros(max_num_reqs, dtype=jnp.int32)
+        self.num_tokens_no_spec = jnp.zeros(max_num_reqs, dtype=jnp.int32)
+        self.num_prompt_tokens = jnp.zeros(max_num_reqs, dtype=jnp.int32)
+        self.num_computed_tokens = jnp.zeros(max_num_reqs, dtype=jnp.int32)
 
         self.page_table = MultiGroupPageTable(
             max_num_reqs=max_num_reqs,
@@ -119,13 +120,13 @@ class SequenceBuffer:
 
     def _init_sampling_arrays(self):
         """Initialize sampling parameter arrays with appropriate dtypes."""
-        self.temperature = np.full(self.max_num_reqs, -1.0, dtype=np.float32)
-        self.top_p = np.ones(self.max_num_reqs, dtype=np.float32)
-        self.top_k = np.full(self.max_num_reqs, self.vocab_size, dtype=np.int32)
-        self.min_p = np.zeros(self.max_num_reqs, dtype=np.float32)
-        self.frequency_penalties = np.zeros(self.max_num_reqs, dtype=np.float32)
-        self.presence_penalties = np.zeros(self.max_num_reqs, dtype=np.float32)
-        self.repetition_penalties = np.ones(self.max_num_reqs, dtype=np.float32)
+        self.temperature = jnp.full(self.max_num_reqs, -1.0, dtype=jnp.float32)
+        self.top_p = jnp.ones(self.max_num_reqs, dtype=jnp.float32)
+        self.top_k = jnp.full(self.max_num_reqs, self.vocab_size, dtype=jnp.int32)
+        self.min_p = jnp.zeros(self.max_num_reqs, dtype=jnp.float32)
+        self.frequency_penalties = jnp.zeros(self.max_num_reqs, dtype=jnp.float32)
+        self.presence_penalties = jnp.zeros(self.max_num_reqs, dtype=jnp.float32)
+        self.repetition_penalties = jnp.ones(self.max_num_reqs, dtype=jnp.float32)
 
     def _init_request_sets(self):
         """Initialize request tracking sets."""
@@ -147,7 +148,7 @@ class SequenceBuffer:
         self.num_prompt_logprobs: dict[str, int] = {}
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
         self.logit_bias: list[dict[int, float] | None] = [None] * self.max_num_reqs
-        self.allowed_token_ids_mask: np.ndarray | None = None
+        self.allowed_token_ids_mask: jax.Array | None = None
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
     @property
@@ -172,9 +173,9 @@ class SequenceBuffer:
 
         self._copy_tokens(request, req_index)
 
-        self.num_tokens[req_index] = request.num_tokens
-        self.num_tokens_no_spec[req_index] = request.num_tokens
-        self.num_computed_tokens[req_index] = request.num_computed_tokens
+        self.num_tokens = self.num_tokens.at[req_index].set(request.num_tokens)
+        self.num_tokens_no_spec = self.num_tokens_no_spec.at[req_index].set(request.num_tokens)
+        self.num_computed_tokens = self.num_computed_tokens.at[req_index].set(request.num_computed_tokens)
 
         self.page_table.add_row(request.page_ids, req_index)
 
@@ -187,50 +188,54 @@ class SequenceBuffer:
     def _copy_tokens(self, request: Any, req_index: int) -> None:
         """Efficiently copy prompt and output tokens."""
         num_prompt_tokens = len(request.prompt_token_ids)
-        self.num_prompt_tokens[req_index] = num_prompt_tokens
+        self.num_prompt_tokens = self.num_prompt_tokens.at[req_index].set(num_prompt_tokens)
 
-        self.token_ids[req_index, :num_prompt_tokens] = request.prompt_token_ids
+        self.token_ids = self.token_ids.at[req_index, :num_prompt_tokens].set(
+            jnp.array(request.prompt_token_ids, dtype=jnp.int32)
+        )
 
         if request.output_token_ids:
             start_idx = num_prompt_tokens
             end_idx = start_idx + len(request.output_token_ids)
-            self.token_ids[req_index, start_idx:end_idx] = request.output_token_ids
+            self.token_ids = self.token_ids.at[req_index, start_idx:end_idx].set(
+                jnp.array(request.output_token_ids, dtype=jnp.int32)
+            )
 
     def _process_sampling_params(self, sampling_params: Any, req_id: str, req_index: int) -> None:
         """Process core sampling parameters."""
 
         if sampling_params.sampling_type == SamplingType.GREEDY:
-            self.temperature[req_index] = -1.0
+            self.temperature = self.temperature.at[req_index].set(-1.0)
             self.greedy_reqs.add(req_id)
         else:
-            self.temperature[req_index] = sampling_params.temperature
+            self.temperature = self.temperature.at[req_index].set(sampling_params.temperature)
             self.random_reqs.add(req_id)
 
-        self.top_p[req_index] = sampling_params.top_p
+        self.top_p = self.top_p.at[req_index].set(sampling_params.top_p)
         if sampling_params.top_p < 1:
             self.top_p_reqs.add(req_id)
 
         top_k = sampling_params.top_k
         if 0 < top_k < self.vocab_size:
             self.top_k_reqs.add(req_id)
-            self.top_k[req_index] = top_k
+            self.top_k = self.top_k.at[req_index].set(top_k)
         else:
-            self.top_k[req_index] = self.vocab_size
+            self.top_k = self.top_k.at[req_index].set(self.vocab_size)
 
-        self.min_p[req_index] = sampling_params.min_p
+        self.min_p = self.min_p.at[req_index].set(sampling_params.min_p)
         if sampling_params.min_p > 1e-5:
             self.min_p_reqs.add(req_id)
 
         if sampling_params.frequency_penalty != 0.0:
-            self.frequency_penalties[req_index] = sampling_params.frequency_penalty
+            self.frequency_penalties = self.frequency_penalties.at[req_index].set(sampling_params.frequency_penalty)
             self.frequency_penalties_reqs.add(req_id)
 
         if sampling_params.presence_penalty != 0.0:
-            self.presence_penalties[req_index] = sampling_params.presence_penalty
+            self.presence_penalties = self.presence_penalties.at[req_index].set(sampling_params.presence_penalty)
             self.presence_penalties_reqs.add(req_id)
 
         if sampling_params.repetition_penalty != 1.0:
-            self.repetition_penalties[req_index] = sampling_params.repetition_penalty
+            self.repetition_penalties = self.repetition_penalties.at[req_index].set(sampling_params.repetition_penalty)
             self.repetition_penalties_reqs.add(req_id)
 
     def _process_optional_params(self, request: Any, sampling_params: Any, req_id: str, req_index: int) -> None:
@@ -260,10 +265,10 @@ class SequenceBuffer:
         """Efficiently set allowed token IDs mask."""
         self.has_allowed_token_ids.add(req_id)
         if self.allowed_token_ids_mask is None:
-            self.allowed_token_ids_mask = np.zeros((self.max_num_reqs, self.vocab_size), dtype=bool)
+            self.allowed_token_ids_mask = jnp.zeros((self.max_num_reqs, self.vocab_size), dtype=bool)
 
-        self.allowed_token_ids_mask[req_index] = True
-        self.allowed_token_ids_mask[req_index, allowed_token_ids] = False
+        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index].set(True)
+        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index, allowed_token_ids].set(False)
 
     def remove_request(self, req_id: str) -> int | None:
         """Remove a request. Must be followed by condense()."""
@@ -296,7 +301,7 @@ class SequenceBuffer:
         self.bad_words_token_ids.pop(req_index, None)
 
         if self.allowed_token_ids_mask is not None:
-            self.allowed_token_ids_mask[req_index] = False
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index].set(False)
 
         return req_index
 
@@ -340,13 +345,41 @@ class SequenceBuffer:
             self.min_p,
         ]
 
-        for array in scalar_arrays:
-            array[[i1, i2]] = array[[i2, i1]]
+        for i, array in enumerate(scalar_arrays):
+            temp = array[i1]
+            array = array.at[i1].set(array[i2])
+            array = array.at[i2].set(temp)
+            if i == 0:
+                self.num_tokens = array
+            elif i == 1:
+                self.num_tokens_no_spec = array
+            elif i == 2:
+                self.num_prompt_tokens = array
+            elif i == 3:
+                self.num_computed_tokens = array
+            elif i == 4:
+                self.temperature = array
+            elif i == 5:
+                self.top_p = array
+            elif i == 6:
+                self.top_k = array
+            elif i == 7:
+                self.frequency_penalties = array
+            elif i == 8:
+                self.presence_penalties = array
+            elif i == 9:
+                self.repetition_penalties = array
+            elif i == 10:
+                self.min_p = array
 
-        self.token_ids[[i1, i2]] = self.token_ids[[i2, i1]]
+        temp_row = self.token_ids[i1]
+        self.token_ids = self.token_ids.at[i1].set(self.token_ids[i2])
+        self.token_ids = self.token_ids.at[i2].set(temp_row)
 
         if self.allowed_token_ids_mask is not None:
-            self.allowed_token_ids_mask[[i1, i2]] = self.allowed_token_ids_mask[[i2, i1]]
+            temp_row = self.allowed_token_ids_mask[i1]
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[i1].set(self.allowed_token_ids_mask[i2])
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[i2].set(temp_row)
 
     def condense(self, empty_req_indices: list[int]) -> None:
         """Efficiently condense the buffer by moving requests to fill empty slots."""
@@ -382,8 +415,8 @@ class SequenceBuffer:
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
 
-        num_tokens = self.num_tokens[from_idx].item()
-        self.token_ids[to_idx, :num_tokens] = self.token_ids[from_idx, :num_tokens]
+        num_tokens = int(self.num_tokens[from_idx])
+        self.token_ids = self.token_ids.at[to_idx, :num_tokens].set(self.token_ids[from_idx, :num_tokens])
 
         scalar_arrays = [
             self.num_tokens,
@@ -399,8 +432,30 @@ class SequenceBuffer:
             self.min_p,
         ]
 
-        for array in scalar_arrays:
-            array[to_idx] = array[from_idx]
+        for i, array in enumerate(scalar_arrays):
+            array = array.at[to_idx].set(array[from_idx])
+            if i == 0:
+                self.num_tokens = array
+            elif i == 1:
+                self.num_tokens_no_spec = array
+            elif i == 2:
+                self.num_prompt_tokens = array
+            elif i == 3:
+                self.num_computed_tokens = array
+            elif i == 4:
+                self.temperature = array
+            elif i == 5:
+                self.top_p = array
+            elif i == 6:
+                self.top_k = array
+            elif i == 7:
+                self.frequency_penalties = array
+            elif i == 8:
+                self.presence_penalties = array
+            elif i == 9:
+                self.repetition_penalties = array
+            elif i == 10:
+                self.min_p = array
 
         self.page_table.move_row(from_idx, to_idx)
 
@@ -422,20 +477,22 @@ class SequenceBuffer:
         self.logit_bias[from_idx] = None
 
         if self.allowed_token_ids_mask is not None:
-            self.allowed_token_ids_mask[to_idx] = self.allowed_token_ids_mask[from_idx]
-            self.allowed_token_ids_mask[from_idx] = False
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[to_idx].set(
+                self.allowed_token_ids_mask[from_idx]
+            )
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[from_idx].set(False)
 
-    def _make_prompt_token_ids_tensor(self) -> np.ndarray:
+    def _make_prompt_token_ids_tensor(self) -> jax.Array:
         """Create a padded tensor of prompt token IDs."""
         if self.num_reqs == 0:
-            return np.empty((0, 0), dtype=np.int64)
+            return jnp.empty((0, 0), dtype=jnp.int64)
 
-        max_prompt_len = np.max(self.num_prompt_tokens[: self.num_reqs]).item()
-        prompt_token_ids = np.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=np.int64)
+        max_prompt_len = int(jnp.max(self.num_prompt_tokens[: self.num_reqs]))
+        prompt_token_ids = jnp.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=jnp.int64)
 
         for i in range(self.num_reqs):
-            num_prompt = self.num_prompt_tokens[i].item()
-            prompt_token_ids[i, :num_prompt] = self.token_ids[i, :num_prompt]
+            num_prompt = int(self.num_prompt_tokens[i])
+            prompt_token_ids = prompt_token_ids.at[i, :num_prompt].set(self.token_ids[i, :num_prompt])
 
         return prompt_token_ids
 
@@ -483,14 +540,14 @@ class SequenceBuffer:
     def no_allowed_token_ids(self) -> bool:
         return len(self.has_allowed_token_ids) == 0
 
-    def get_request_indices_with_penalty(self) -> np.ndarray:
+    def get_request_indices_with_penalty(self) -> jax.Array:
         """Get indices of requests that have any penalty applied."""
         penalty_req_ids = self.frequency_penalties_reqs | self.presence_penalties_reqs | self.repetition_penalties_reqs
         if not penalty_req_ids:
-            return np.array([], dtype=np.int32)
+            return jnp.array([], dtype=jnp.int32)
 
         indices = [self.req_id_to_index[req_id] for req_id in penalty_req_ids]
-        return np.array(indices, dtype=np.int32)
+        return jnp.array(indices, dtype=jnp.int32)
 
     def get_active_sampling_params(self, req_index: int) -> dict[str, Any]:
         """Get active sampling parameters for a specific request."""
@@ -521,19 +578,19 @@ class SequenceBuffer:
         self.req_id_to_index.clear()
         self.req_output_token_ids.clear()
 
-        self.token_ids.fill(0)
-        self.num_tokens.fill(0)
-        self.num_tokens_no_spec.fill(0)
-        self.num_prompt_tokens.fill(0)
-        self.num_computed_tokens.fill(0)
+        self.token_ids = jnp.zeros_like(self.token_ids)
+        self.num_tokens = jnp.zeros_like(self.num_tokens)
+        self.num_tokens_no_spec = jnp.zeros_like(self.num_tokens_no_spec)
+        self.num_prompt_tokens = jnp.zeros_like(self.num_prompt_tokens)
+        self.num_computed_tokens = jnp.zeros_like(self.num_computed_tokens)
 
-        self.temperature.fill(-1.0)
-        self.top_p.fill(1.0)
-        self.top_k.fill(self.vocab_size)
-        self.min_p.fill(0.0)
-        self.frequency_penalties.fill(0.0)
-        self.presence_penalties.fill(0.0)
-        self.repetition_penalties.fill(1.0)
+        self.temperature = jnp.full_like(self.temperature, -1.0)
+        self.top_p = jnp.ones_like(self.top_p)
+        self.top_k = jnp.full_like(self.top_k, self.vocab_size)
+        self.min_p = jnp.zeros_like(self.min_p)
+        self.frequency_penalties = jnp.zeros_like(self.frequency_penalties)
+        self.presence_penalties = jnp.zeros_like(self.presence_penalties)
+        self.repetition_penalties = jnp.ones_like(self.repetition_penalties)
 
         for req_set in [
             self.greedy_reqs,
@@ -557,15 +614,15 @@ class SequenceBuffer:
 
         self.logit_bias = [None] * self.max_num_reqs
         if self.allowed_token_ids_mask is not None:
-            self.allowed_token_ids_mask.fill(False)
+            self.allowed_token_ids_mask = jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
 
 
 @auto_pytree
 class ModelRunnerSamplingMetadata:
-    temperature: np.ndarray
-    min_p: np.ndarray
-    top_k: np.ndarray
-    top_p: np.ndarray
+    temperature: jax.Array
+    min_p: jax.Array
+    top_k: jax.Array
+    top_p: jax.Array
 
     all_greedy: bool = True
     logprobs: bool = False
@@ -601,10 +658,10 @@ class ModelRunnerSamplingMetadata:
 
         if sequence_buffer.all_greedy is True and not generate_params_if_all_greedy:
             return cls(
-                temperature=np.zeros((padded_num_reqs,)),
-                min_p=np.zeros((padded_num_reqs,)),
-                top_k=np.zeros((padded_num_reqs,)),
-                top_p=np.zeros((padded_num_reqs,)),
+                temperature=jnp.zeros((padded_num_reqs,)),
+                min_p=jnp.zeros((padded_num_reqs,)),
+                top_k=jnp.zeros((padded_num_reqs,)),
+                top_p=jnp.zeros((padded_num_reqs,)),
                 all_greedy=True,
                 logprobs=False,
             )
@@ -612,8 +669,8 @@ class ModelRunnerSamplingMetadata:
         num_reqs = sequence_buffer.num_reqs
 
         def fill_slice(arr, fill_val):
-            arr = arr.copy()
-            arr[num_reqs:padded_num_reqs] = fill_val
+            arr = arr
+            arr = arr.at[num_reqs:padded_num_reqs].set(fill_val)
             return arr
 
         return cls(

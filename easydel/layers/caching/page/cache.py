@@ -273,10 +273,10 @@ class PagesCacheView(BaseCacheView):
             in_specs=(
                 resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
                 resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
-                resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
                 resolve([EMPTY], mode=MODE_PREFILL),
             ),
-            out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+            out_specs=resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
             mesh=es.get_incontext_mesh(),
             check_vma=False,
         )
@@ -285,28 +285,28 @@ class PagesCacheView(BaseCacheView):
                 return kv_cache_update(
                     kv,
                     slots,
-                    pages.reshape(-1, *pages.shape[2:]),
+                    pages,
                     num_update_slices,
                     page_size=cache_metadata.page_size,
                     slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
-                ).reshape(pages.shape)
+                )
             else:
                 return kv_cache_update_jax(
                     kv,
                     slots,
-                    pages.reshape(-1, *pages.shape[2:]),
+                    pages,
                     num_update_slices,
                     page_size=cache_metadata.page_size,
-                ).reshape(pages.shape)
+                )
 
-        self.kv_pages = _update(
+        kv_pages = _update(
             jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size),
             cache_metadata.slot_mapping,
-            self.kv_pages,
+            self.kv_pages.reshape(-1, *self.kv_pages.shape[2:]),
             cache_metadata.num_kv_update_slices,
-        )
+        ).reshape(self.kv_pages.shape)
 
-        return self
+        return self.replace(kv_pages=kv_pages)
 
     @property
     def key_pages(self) -> jax.Array:
