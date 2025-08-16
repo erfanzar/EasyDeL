@@ -20,6 +20,8 @@ import typing as tp
 import warnings
 from copy import deepcopy
 
+import huggingface_hub
+import huggingface_hub.errors
 import jax
 import jax.extend
 import jax.tree_util
@@ -577,7 +579,7 @@ class EasyBridgeMixin(PushToHubMixin):
                                 )
                                 filename = cand
                                 break
-                            except FileNotFoundError:
+                            except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
                                 continue
 
                         if resolved_archive_file is None:
