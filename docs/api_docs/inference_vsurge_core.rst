@@ -8,3 +8,4 @@ Core
    inference_vsurge_core_driver
    inference_vsurge_core_engine
    inference_vsurge_core_functions
+   inference_vsurge_core_scheduler

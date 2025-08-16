@@ -12,7 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enhanced FastAPI server that proxies requests to OpenAI API with vSurge compatibility."""
+"""Enhanced FastAPI server that proxies requests to OpenAI API.
+
+This module provides a proxy server that forwards requests to OpenAI's API
+while adding vSurge-specific monitoring and compatibility features.
+It enables seamless integration between EasyDeL inference engines and
+OpenAI-compatible clients.
+
+Classes:
+    InferenceApiRouter: Main proxy server class with OpenAI API compatibility
+    ServerStatus: Enum for server operational states
+    ServerMetrics: Performance metrics tracking
+    EndpointConfig: API endpoint configuration
+    ErrorResponse: Standardized error response format
+
+Example:
+    >>> from easydel.inference import InferenceApiRouter
+    >>> # Create a proxy to OpenAI API
+    >>> router = InferenceApiRouter(
+    ...     api_key="your-api-key",
+    ...     base_url="https://api.openai.com/v1"
+    ... )
+    >>> router.run(host="0.0.0.0", port=8084)
+
+    >>> # Or proxy to a local vSurge server
+    >>> router = InferenceApiRouter(
+    ...     base_url="http://localhost:8000/v1",
+    ...     enable_function_calling=True
+    ... )
+    >>> router.run()
+"""
 
 from __future__ import annotations
 
@@ -90,11 +119,22 @@ def create_error_response(status_code: HTTPStatus, message: str, request_id: str
 
 
 class InferenceApiRouter:
-    """
-    Enhanced FastAPI server that acts as a hub for OpenAI API requests with vSurge compatibility.
+    """Enhanced FastAPI server acting as an OpenAI API proxy.
 
-    This server provides endpoints mimicking the OpenAI API structure for chat completions,
-    completions, and vSurge-specific monitoring and function calling endpoints.
+    This server provides a complete OpenAI API-compatible interface that can
+    forward requests to either OpenAI's API or a local vSurge/vInference server.
+    It includes additional monitoring, health check, and function calling endpoints.
+
+    The router automatically detects backend capabilities and provides appropriate
+    fallbacks when features are not available.
+
+    Attributes:
+        client: AsyncOpenAI client for backend communication
+        app: FastAPI application instance
+        status: Current server status
+        metrics: Performance metrics tracker
+        base_url: Backend API base URL
+        enable_function_calling: Whether function calling is enabled
     """
 
     def __init__(
@@ -250,7 +290,17 @@ class InferenceApiRouter:
         self,
         request: CompletionRequest,
     ) -> dict[str, float | int | str | bool | list]:
-        """Build OpenAI parameters from completion request."""
+        """Build OpenAI parameters from completion request.
+
+        Converts a CompletionRequest object into a dictionary of parameters
+        suitable for the OpenAI API.
+
+        Args:
+            request: The completion request to convert
+
+        Returns:
+            Dictionary of OpenAI API parameters
+        """
         return {
             "model": request.model,
             "prompt": request.prompt,
@@ -268,7 +318,17 @@ class InferenceApiRouter:
         self,
         request: ChatCompletionRequest | ChatCompletionRequestWithTools,
     ) -> dict[str, float | int | str | bool | list]:
-        """Build OpenAI parameters from chat completion request."""
+        """Build OpenAI parameters from chat completion request.
+
+        Converts a ChatCompletionRequest object into a dictionary of parameters
+        suitable for the OpenAI API, including function calling parameters if present.
+
+        Args:
+            request: The chat completion request to convert
+
+        Returns:
+            Dictionary of OpenAI API parameters with optional tool/function definitions
+        """
         params = {
             "model": request.model,
             "messages": [msg.model_dump() for msg in request.messages],
@@ -300,7 +360,18 @@ class InferenceApiRouter:
         openai_params: dict,
         request: ChatCompletionRequest | CompletionRequest,
     ) -> tuple[dict, BaseModel | None]:
-        """Process request parameters before sending to OpenAI."""
+        """Process request parameters before sending to OpenAI.
+
+        Hook for subclasses to modify parameters or extract metadata
+        before forwarding to the backend.
+
+        Args:
+            openai_params: Dictionary of OpenAI API parameters
+            request: Original request object
+
+        Returns:
+            Tuple of (processed_params, optional_metadata)
+        """
         return openai_params, None
 
     async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
@@ -346,7 +417,18 @@ class InferenceApiRouter:
     async def _stream_chat_completion(
         self, params: dict, metadata: dict | None, request_id: str | None = None
     ) -> tp.AsyncGenerator[bytes, None]:
-        """Handle streaming chat completion responses."""
+        """Handle streaming chat completion responses.
+
+        Streams Server-Sent Events (SSE) formatted responses from the backend.
+
+        Args:
+            params: OpenAI API parameters
+            metadata: Optional metadata to include in stream
+            request_id: Request identifier for tracking
+
+        Yields:
+            SSE-formatted bytes containing response chunks
+        """
         try:
             stream = await self.client.chat.completions.create(**params)
             if metadata is not None:
@@ -406,7 +488,18 @@ class InferenceApiRouter:
     async def _stream_completion(
         self, params: dict, metadata: dict | None, request_id: str | None = None
     ) -> tp.AsyncGenerator[bytes, None]:
-        """Handle streaming completion responses."""
+        """Handle streaming completion responses.
+
+        Streams Server-Sent Events (SSE) formatted responses from the backend.
+
+        Args:
+            params: OpenAI API parameters
+            metadata: Optional metadata to include in stream
+            request_id: Request identifier for tracking
+
+        Yields:
+            SSE-formatted bytes containing response chunks
+        """
         try:
             stream = await self.client.completions.create(**params)
             if metadata is not None:

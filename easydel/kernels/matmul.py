@@ -12,9 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Optimized matrix multiplication kernels.
 
-# Implementation by @erfanzar,
-# with a few bug fixes and adjustments.
+Provides hardware-specific optimized matrix multiplication implementations
+with automatic platform detection and kernel selection.
+
+Functions:
+    matmul: Platform-optimized matrix multiplication
+    custom_dot_general_kernel: Custom dot_general replacement
+    replace_dot_general_with_matmul: Replace JAX dot operations
+
+Constants:
+    PLATFORM: Current JAX backend platform
+    INTERPRET: Whether running in interpret mode (CPU)
+
+Key Features:
+    - Automatic platform detection (GPU/TPU/CPU)
+    - Triton kernels for GPU
+    - Pallas kernels for TPU
+    - Configurable block sizes
+    - Mixed precision support
+    - Batch matrix multiplication
+
+Example:
+    >>> from easydel.kernels.matmul import matmul
+    >>> # Optimized matmul with auto-selected backend
+    >>> C = matmul(A, B, precision="high")
+    >>>
+    >>> # Custom block sizes for tuning
+    >>> C = matmul(
+    ...     A, B,
+    ...     blocksize_m=128,
+    ...     blocksize_k=128,
+    ...     blocksize_n=128
+    ... )
+
+Note:
+    Implementation by @erfanzar, with bug fixes and adjustments.
+"""
 
 import logging
 import typing as tp
@@ -47,6 +82,27 @@ def matmul(
     precision: PrecisionLike = None,
     **_,
 ):
+    """Hardware-optimized matrix multiplication.
+
+    Automatically selects the best implementation based on platform:
+    - GPU: Uses Triton kernels
+    - TPU: Uses Pallas kernels with bfloat16 promotion
+    - CPU: Falls back to JAX batch_matmul
+
+    Args:
+        A: Left matrix of shape (..., m, k).
+        B: Right matrix of shape (..., k, n).
+        blocksize_m: Block size for M dimension (TPU only).
+        blocksize_k: Block size for K dimension (TPU only).
+        blocksize_n: Block size for N dimension (TPU only).
+        precision: Precision setting for computation.
+
+    Returns:
+        Matrix product of shape (..., m, n).
+
+    Raises:
+        NotImplementedError: If platform is not supported.
+    """
     if PLATFORM == "gpu":
         return triton_matmul(A, B)
     elif PLATFORM == "tpu":
@@ -77,6 +133,26 @@ def custom_dot_general_kernel(
     *args,
     **kwargs,
 ):
+    """Custom dot_general implementation using optimized matmul.
+
+    Replaces JAX's dot_general with hardware-optimized matrix multiplication
+    for improved performance on supported platforms.
+
+    Args:
+        lhs: Left-hand side array.
+        rhs: Right-hand side array.
+        dimension_numbers: Specification of contracting and batch dimensions.
+        precision: Precision for computation.
+        preferred_element_type: Preferred output dtype.
+        *args: Additional positional arguments.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        Result of the generalized dot product.
+
+    Raises:
+        ValueError: If dimension_numbers is not provided.
+    """
     if preferred_element_type is None:
         preferred_element_type = rhs.dtype
 

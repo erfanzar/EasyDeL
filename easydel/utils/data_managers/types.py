@@ -21,8 +21,8 @@ from enum import Enum
 from eformer.pytree import auto_pytree as dataclass
 from eformer.pytree import field
 
-from ..helpers import get_cache_dir
 from ..checkpoint_managers import EasyPath, EasyPathLike
+from ..helpers import get_cache_dir
 
 
 class DatasetType(str, Enum):

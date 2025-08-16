@@ -12,6 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Compilation utilities for JAX function optimization.
+
+Provides enhanced JIT compilation with persistent caching to disk,
+reducing compilation overhead across script runs.
+
+Functions:
+    ejit: Enhanced JIT with persistent caching
+    save_compiled_fn: Save compiled function to disk
+    load_compiled_fn: Load compiled function from disk
+    load_cached_functions: Load multiple cached functions
+    smart_compile: Smart compilation with auto-caching
+    hash_fn: Generate hash for function signature
+
+Constants:
+    RECOMPILE_FORCE: Force recompilation flag
+    ECACHE_COMPILES: Enable compilation caching
+    CACHE_DIR: Cache directory path
+    COMPILE_FUNC_DIR: Compiled functions directory
+    COMPILED_CACHE: In-memory cache of compiled functions
+
+Key Features:
+    - Persistent disk caching of compiled functions
+    - Automatic cache invalidation on changes
+    - Hardware-specific signatures
+    - Two-level caching (memory + disk)
+    - Graceful fallback on errors
+
+Example:
+    >>> from easydel.utils.compiling_utils import ejit
+    >>>
+    >>> @ejit
+    ... def optimized_fn(x, y):
+    ...     return x @ y + x.T @ y.T
+    >>>
+    >>> # First call compiles and caches
+    >>> result = optimized_fn(a, b)
+    >>> # Next run loads from cache
+    >>> result = optimized_fn(a, b)
+"""
+
 from __future__ import annotations
 
 import functools
@@ -46,12 +86,23 @@ COMPILED_CACHE: dict[str, Compiled] = {}
 
 
 def _get_hardware_signature() -> str:
-    """Creates a signature for the current JAX hardware environment."""
+    """Create signature for current JAX hardware environment.
+
+    Returns:
+        String representation of available JAX devices.
+    """
     return str(jax.devices())
 
 
 def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
-    """Generates a hashable signature for a leaf node in a PyTree."""
+    """Generate hashable signature for PyTree leaf.
+
+    Args:
+        leaf: Leaf node from PyTree.
+
+    Returns:
+        Hashable signature including shape, dtype, and sharding.
+    """
     if isinstance(leaf, jax.Array | np.ndarray):
         if hasattr(leaf, "sharding"):
             return (leaf.shape, str(jax.dtypes.canonicalize_dtype(leaf.dtype)), repr(leaf.sharding))
@@ -60,7 +111,18 @@ def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
 
 
 def _get_args_signature(args: tuple, kwargs: dict) -> str:
-    """Creates a signature for arguments based on their tree structure, shapes, and dtypes."""
+    """Create signature for function arguments.
+
+    Generates a unique signature based on the PyTree structure,
+    shapes, and dtypes of arguments.
+
+    Args:
+        args: Positional arguments.
+        kwargs: Keyword arguments.
+
+    Returns:
+        String signature of the arguments.
+    """
     arg_leaves, arg_tree = jax.tree_util.tree_flatten((args, kwargs))
     leaf_signatures = tuple(map(_get_leaf_signature, arg_leaves))
     return str((arg_tree, leaf_signatures))
@@ -75,25 +137,36 @@ def ejit(
     in_shardings: tp.Any = None,
     out_shardings: tp.Any = None,
 ):
-    """
-    An optimized, minimal-overhead, drop-in replacement for `jax.jit` that
-    caches compiled functions to disk for reuse across script runs.
+    """Enhanced JIT compilation with persistent caching.
 
-    This decorator uses a two-level caching system to ensure maximum performance:
-    1.  An in-memory LRU (Least Recently Used) cache acts as a fast "dispatch"
-        cache, mapping argument shapes to the correct compiled executable.
-    2.  A persistent on-disk cache stores the executables, avoiding the need
-        to recompile the same function in a new process.
+    Drop-in replacement for jax.jit that caches compiled functions
+    to disk for reuse across script runs, significantly reducing
+    compilation overhead.
 
-    It is designed to be robust, falling back gracefully to standard `jax.jit`
-    behavior if any part of the caching process fails.
+    Features:
+        - Two-level caching (in-memory LRU + persistent disk cache)
+        - Automatic cache invalidation on signature changes
+        - Graceful fallback to standard jax.jit on errors
+        - Support for all jax.jit parameters
 
     Args:
-        func: The function to be JIT-compiled and cached.
-        ... (all other jax.jit args)
+        func: Function to JIT-compile and cache.
+        static_argnums: Indices of static arguments.
+        static_argnames: Names of static arguments.
+        donate_argnums: Indices of donated arguments.
+        in_shardings: Input sharding specifications.
+        out_shardings: Output sharding specifications.
 
     Returns:
-        A wrapped function that is JIT-compiled and cached with high performance.
+        JIT-compiled function with caching.
+
+    Example:
+        >>> @ejit
+        ... def fast_matmul(a, b):
+        ...     return a @ b
+        >>> # First call compiles and caches
+        >>> result = fast_matmul(x, y)
+        >>> # Subsequent calls use cached version
     """
     if func is None:
         return functools.partial(

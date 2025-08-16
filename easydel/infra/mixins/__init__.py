@@ -12,6 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mixin classes for EasyDeL modules.
+
+Provides reusable functionality through mixin classes that can be combined
+with base modules to add specific capabilities.
+
+Classes:
+    BaseModuleProtocol: Protocol defining the interface for base modules
+    EasyBridgeMixin: Mixin for bridging between EasyDeL and HuggingFace
+    EasyGenerationMixin: Mixin for text generation capabilities
+
+Key Features:
+    - Protocol-based interface definitions
+    - Model conversion and compatibility
+    - Text generation with various strategies
+    - Seamless integration with base modules
+
+Example:
+    >>> from easydel.infra.mixins import EasyGenerationMixin
+    >>> class MyModel(EasyDeLBaseModule, EasyGenerationMixin):
+    ...     # Model implementation
+    ...     pass
+    >>>
+    >>> # Now MyModel has generation capabilities
+    >>> output = model.generate(
+    ...     input_ids=input_ids,
+    ...     max_length=100
+    ... )
+"""
+
 from .bridge import EasyBridgeMixin
 from .generation import EasyGenerationMixin
 from .protocol import BaseModuleProtocol

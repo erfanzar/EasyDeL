@@ -14,4 +14,3 @@ Layers
    layers_ops
    layers_quantization
    layers_rotary_embedding
-   layers_rotary_embedding_test

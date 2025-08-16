@@ -12,6 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Normalization layers for neural networks.
+
+Provides efficient normalization layers optimized for JAX/Flax,
+with support for mixed precision and float8 data types.
+
+Classes:
+    RMSNorm: Root Mean Square normalization layer
+
+Constants:
+    float8s: List of supported float8 data types
+
+Key Features:
+    - Efficient RMS normalization
+    - Support for float8 quantization
+    - Mixed precision computation
+    - Automatic dtype promotion
+
+Example:
+    >>> from easydel.layers.norms import RMSNorm
+    >>> norm = RMSNorm(
+    ...     dim=768,
+    ...     eps=1e-6,
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>> normalized = norm(inputs)
+
+Note:
+    RMSNorm is particularly efficient for large language models
+    as it requires fewer parameters than LayerNorm while providing
+    similar normalization benefits.
+"""
 
 import jax
 from flax import nnx as nn
@@ -28,6 +59,22 @@ float8s = [
 
 
 class RMSNorm(nn.Module):
+    """Root Mean Square normalization layer.
+
+    RMSNorm normalizes inputs by their root mean square value,
+    providing a simpler and more efficient alternative to LayerNorm.
+
+    Attributes:
+        dim: Dimension of the input features.
+        eps: Small constant for numerical stability.
+        dtype: Data type for computations.
+        param_dtype: Data type for parameters.
+        kernel: Learnable scale parameters.
+
+    Methods:
+        __call__: Apply RMS normalization to input.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -37,6 +84,15 @@ class RMSNorm(nn.Module):
         *,
         rngs: nn.Rngs | None = None,
     ) -> None:
+        """Initialize RMSNorm layer.
+
+        Args:
+            dim: Dimension of input features to normalize.
+            eps: Epsilon for numerical stability (default: 1e-6).
+            dtype: Data type for computations (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            rngs: Random number generators for initialization.
+        """
         if rngs is None:
             rngs = nn.Rngs(0)
         self.dim = dim
@@ -52,10 +108,29 @@ class RMSNorm(nn.Module):
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Compute RMS normalization.
+
+        Args:
+            x: Input array to normalize.
+
+        Returns:
+            Normalized array.
+        """
         return x * lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     @jax.named_scope("easydel-rmsnorm")
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply RMS normalization to input.
+
+        Normalizes the input using root mean square normalization
+        and applies learned scale parameters.
+
+        Args:
+            x: Input array of shape (..., dim).
+
+        Returns:
+            Normalized and scaled array of same shape as input.
+        """
         org_dtype = x.dtype
         if self.param_dtype in float8s or self.dtype in float8s:
             x = x.astype(jnp.float32)

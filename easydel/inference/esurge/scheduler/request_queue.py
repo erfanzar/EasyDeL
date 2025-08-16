@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Request queue implementations for scheduling.
+
+Provides different queueing strategies for managing inference requests,
+including FCFS (first-come-first-served) and priority-based scheduling.
+
+Classes:
+    RequestQueue: Abstract base class for request queues
+    FCFSRequestQueue: First-come-first-served queue
+    PriorityRequestQueue: Priority-based request queue
+    SchedulingPolicy: Enum of scheduling policies
+
+Example:
+    >>> queue = FCFSRequestQueue()
+    >>> queue.add_request(request1)
+    >>> queue.add_request(request2)
+    >>> next_request = queue.pop_request()
+
+    >>> priority_queue = PriorityRequestQueue()
+    >>> priority_queue.add_request(high_priority_request)
+    >>> priority_queue.add_request(low_priority_request)
+    >>> next_request = priority_queue.pop_request()  # Gets high priority first
+"""
+
 from __future__ import annotations
 
 import heapq
@@ -24,18 +47,32 @@ from ..request import EngineRequest
 
 
 class SchedulingPolicy(Enum):
-    """Enum for scheduling policies."""
+    """Enum for scheduling policies.
+
+    Attributes:
+        FCFS: First-come-first-served scheduling.
+        PRIORITY: Priority-based scheduling.
+    """
 
     FCFS = "fcfs"
     PRIORITY = "priority"
 
 
 class RequestQueue(ABC):
-    """Abstract base class for request queues."""
+    """Abstract base class for request queues.
+
+    Defines the interface for different request queueing strategies.
+    Implementations must provide methods for adding, removing, and
+    inspecting requests in the queue.
+    """
 
     @abstractmethod
     def add_request(self, request: EngineRequest) -> None:
-        """Add a request to the queue according to the policy."""
+        """Add a request to the queue according to the policy.
+
+        Args:
+            request: The engine request to add.
+        """
         pass
 
     @abstractmethod

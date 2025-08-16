@@ -93,14 +93,21 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         precision: lax.PrecisionLike,
         rngs: nn.Rngs,
     ):
-        """Initializes the EasyDeLBaseModule.
+        """Initialize the EasyDeLBaseModule.
+
+        Sets up the base module with configuration and data types.
+        Subclasses should call this in their __init__ method.
 
         Args:
-            config (EasyDeLBaseConfig): The model configuration.
-            dtype (jnp.dtype): The data type for computation.
-            param_dtype (jnp.dtype): The data type for parameters.
-            precision (jax.lax.PrecisionLike): The numerical precision.
-            rngs (nn.Rngs): The random number generators.
+            config: Model configuration with architecture parameters.
+            dtype: Data type for computations (e.g., float32, bfloat16).
+            param_dtype: Data type for model parameters.
+            precision: Precision setting for JAX operations.
+            rngs: Random number generators for initialization.
+
+        Note:
+            This method should be called by all subclasses to properly
+            initialize the base functionality.
         """
         self.config: BaseConf = config
         self.dtype: jnp.dtype = dtype

@@ -27,6 +27,7 @@ from easydel.layers.caching import PagesCache, PagesMetadata
 from easydel.utils import capture_time, ejit, get_logger
 
 from ...vsurge.core.functions import sample_top_p_efficient
+from ..metrics import get_metrics_collector
 from ..outputs import LogprobsTensors, ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from .sequence_buffer import ModelRunnerSamplingMetadata, SequenceBuffer
@@ -298,8 +299,9 @@ class eSurgeRunner:
             num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
             page_size=self.metadata.page_size,
         )
-
-        self.execute_forward(input_ids, position_ids, cache_metadata)
+        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(actual_num_reqs, self.max_num_reqs)
+        dummy_indices = jnp.arange(padded_num_reqs, dtype=jnp.int32)
+        self.apply_logits_and_select(self.execute_forward(input_ids, position_ids, cache_metadata), dummy_indices)
         return True
 
     def compile(self):
@@ -461,7 +463,9 @@ class eSurgeRunner:
         for i in range(start_index, num_reqs):
             req_id = self.sequence_buffer.req_ids[i]
             assert req_id is not None
-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_tokens == 0:
+                continue
 
             if not use_max_model_len and num_tokens > self.most_model_len:
                 use_max_model_len = True
@@ -567,6 +571,10 @@ class eSurgeRunner:
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests."""
+        import time
+
+        execution_start_time = time.time()
+
         self._update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
@@ -621,14 +629,15 @@ class eSurgeRunner:
         for i, req_id in enumerate(self.sequence_buffer.req_ids[:num_reqs]):
             assert req_id is not None
             req_state = self.requests[req_id]
-            seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
+            scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if scheduled_tokens == 0:
+                continue
+            seq_len = req_state.num_computed_tokens + scheduled_tokens
 
             if seq_len >= req_state.num_tokens:
                 request_seq_lens.append((i, req_state, seq_len))
             else:
-                generator = self.sequence_buffer.generators.get(i)
-                if generator is not None:
-                    generator.set_offset(generator.get_offset() - 4)
+                # Token discarding case - skip this request
                 discard_sampled_tokens_req_indices.append(i)
 
         req_ids = cast(list[str], self.sequence_buffer.req_ids[:num_reqs])
@@ -655,6 +664,16 @@ class eSurgeRunner:
                 target_slice = slice(seq_len - gen_lens[i] + 1, seq_len + 1)
                 self.sequence_buffer.token_ids[i, target_slice] = valid_sampled_token_ids[i]
                 req_state.output_token_ids.extend(valid_sampled_token_ids[i])
+
+        # Log runner metrics
+        execution_time = time.time() - execution_start_time
+        metrics_collector = get_metrics_collector()
+        if metrics_collector:
+            metrics_collector.record_runner_metrics(
+                execution_time=execution_time,
+                batch_size=num_reqs,
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+            )
 
         return ModelRunnerOutput(
             req_ids=req_ids,

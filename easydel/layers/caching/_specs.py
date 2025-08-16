@@ -15,10 +15,10 @@
 import copy
 from dataclasses import dataclass
 from math import prod
+from typing import Self
 
 import jax
 import torch
-from typing_extensions import Self
 
 
 def cdiv(a, b):

@@ -11,6 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Sampling parameters and configurations for text generation.
+
+This module defines the parameters that control text generation behavior,
+including temperature, top-k, top-p, penalties, and other sampling strategies.
+It provides both host-side Python configurations and JAX-compatible versions
+for efficient on-device processing.
+
+Classes:
+    SamplingType: Enum for sampling strategies (greedy vs random)
+    RequestOutputKind: Enum for output formats (cumulative, delta, final)
+    GuidedDecodingParams: Parameters for constrained generation
+    JitableSamplingParams: JAX-compatible sampling parameters
+    SamplingParams: High-level sampling configuration
+    BeamSearchParams: Parameters for beam search decoding
+
+Example:
+    >>> from easydel.inference import SamplingParams
+    >>> params = SamplingParams(
+    ...     temperature=0.8,
+    ...     top_p=0.95,
+    ...     max_tokens=100,
+    ...     stop=["\n", "END"]
+    ... )
+    >>> # Convert to JAX-compatible format
+    >>> jit_params = params.make_jitable()
+"""
+
 from __future__ import annotations
 
 import copy
@@ -46,14 +74,25 @@ logger = get_logger(__name__)
 
 
 class SamplingType(IntEnum):
-    """Defines the sampling strategy."""
+    """Defines the sampling strategy.
+
+    Attributes:
+        GREEDY: Deterministic selection of highest probability token
+        RANDOM: Probabilistic sampling from the distribution
+    """
 
     GREEDY = 0
     RANDOM = 1
 
 
 class RequestOutputKind(Enum):
-    """Defines the kind of output for a request."""
+    """Defines the kind of output for a request.
+
+    Attributes:
+        CUMULATIVE: Return the full generated text so far
+        DELTA: Return only newly generated tokens
+        FINAL_ONLY: Return only the final complete output
+    """
 
     CUMULATIVE = 0
     DELTA = 1
@@ -62,8 +101,27 @@ class RequestOutputKind(Enum):
 
 @auto_pytree
 class GuidedDecodingParams:
-    """
-    Parameters for guided decoding.
+    """Parameters for guided decoding.
+
+    Enables constrained generation to match specific formats or patterns.
+    Only one guided decoding mode can be active at a time.
+
+    Attributes:
+        json: JSON schema or object for structured output
+        regex: Regular expression pattern to match
+        choice: List of allowed string choices
+        grammar: Context-free grammar specification
+        json_object: Force output to be valid JSON object
+        backend: Decoding backend to use
+        backend_was_auto: Whether backend was auto-selected
+        disable_fallback: Disable fallback to unconstrained generation
+        disable_any_whitespace: Disable whitespace in structured output
+        disable_additional_properties: Restrict JSON to defined properties only
+        whitespace_pattern: Custom whitespace pattern
+        structural_tag: Tag for structural elements
+
+    Raises:
+        ValueError: If multiple guided decoding modes are specified
     """
 
     json: str | dict | None = None
@@ -80,7 +138,11 @@ class GuidedDecodingParams:
     structural_tag: str | None = None
 
     def __post_init__(self):
-        """Validates that only one guided decoding mode is specified."""
+        """Validates that only one guided decoding mode is specified.
+
+        Raises:
+            ValueError: If more than one guided decoding mode is active
+        """
         guide_count = sum(
             (
                 self.json is not None,
@@ -286,8 +348,48 @@ class JitableSamplingParams:
 
 @dataclass
 class SamplingParams:
-    """
-    Sampling parameters for text generation, designed for JAX compatibility.
+    """Sampling parameters for text generation.
+
+    Comprehensive configuration for controlling text generation behavior.
+    Supports both OpenAI-compatible parameters and EasyDeL-specific extensions.
+
+    Attributes:
+        n: Number of sequences to generate
+        best_of: Sample n sequences and return the best one
+        presence_penalty: Penalty for tokens based on presence (-2.0 to 2.0)
+        frequency_penalty: Penalty for tokens based on frequency (-2.0 to 2.0)
+        repetition_penalty: Multiplicative penalty for repeated tokens
+        temperature: Controls randomness (0.0 = deterministic, higher = more random)
+        top_p: Nucleus sampling threshold (0.0 to 1.0)
+        min_p: Minimum probability threshold relative to top token
+        top_k: Number of highest probability tokens to consider
+        seed: Random seed for reproducibility
+        stop: List of stop strings
+        stop_token_ids: List of stop token IDs
+        bad_words: List of strings to avoid generating
+        ignore_eos: Whether to ignore end-of-sequence token
+        max_tokens: Maximum number of tokens to generate
+        min_tokens: Minimum number of tokens to generate
+        logprobs: Number of log probabilities to return
+        prompt_logprobs: Number of prompt log probabilities to return
+        detokenize: Whether to convert tokens to text
+        skip_special_tokens: Whether to skip special tokens in output
+        spaces_between_special_tokens: Add spaces between special tokens
+        include_stop_str_in_output: Include stop string in output
+        output_kind: Type of output to return
+        truncate_prompt_tokens: Truncate prompt to this many tokens
+        guided_decoding: Parameters for constrained generation
+        logit_bias: Bias to apply to specific token logits
+        allowed_token_ids: Whitelist of allowed token IDs
+        extra_args: Additional custom arguments
+
+    Example:
+        >>> params = SamplingParams(
+        ...     temperature=0.7,
+        ...     top_p=0.9,
+        ...     max_tokens=100,
+        ...     stop=["\n\n"]
+        ... )
     """
 
     n: int = 1
@@ -485,10 +587,23 @@ class SamplingParams:
 
 @auto_pytree
 class BeamSearchParams:
-    """
-    Beam search parameters for text generation.
+    """Beam search parameters for text generation.
 
+    Configuration for beam search decoding, which maintains multiple
+    candidate sequences and selects the best ones based on cumulative probability.
     This class is immutable (`frozen=True`) for JAX compatibility.
+
+    Attributes:
+        beam_width: Number of beams to maintain
+        max_tokens: Maximum tokens to generate
+        ignore_eos: Whether to ignore end-of-sequence token
+        temperature: Temperature for beam search (0.0 = greedy)
+        length_penalty: Penalty factor for sequence length
+        include_stop_str_in_output: Include stop string in output
+
+    Note:
+        Beam search is typically used when deterministic, high-quality
+        output is desired, at the cost of increased computation.
     """
 
     beam_width: int

@@ -11,6 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Page pool management for KV-cache allocation.
+
+Manages a pool of cache pages that can be allocated, freed, and cached
+for efficient memory management during inference.
+
+Classes:
+    PagePool: Main page pool manager
+
+Example:
+    >>> pool = PagePool(num_pages=1000, enable_caching=True)
+    >>> pages = pool.allocate(num_pages=10)
+    >>> pool.free(pages)
+"""
+
 from collections import defaultdict
 from collections.abc import Iterable
 

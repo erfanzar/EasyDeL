@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Request management for the eSurge engine.
+
+Defines the core request structures and status tracking for managing
+inference requests throughout their lifecycle.
+
+Classes:
+    EngineRequest: Main request object for tracking generation
+    EngineRequestStatus: Enum of request statuses
+
+Example:
+    >>> request = EngineRequest(
+    ...     request_id="req_123",
+    ...     prompt_token_ids=[1, 2, 3],
+    ...     sampling_params=params,
+    ...     eos_token_id=2
+    ... )
+    >>> request.status = EngineRequestStatus.RUNNING
+"""
+
 import enum
 import time
 from typing import Any
@@ -22,6 +41,32 @@ from .utils import ConstantList
 
 
 class EngineRequest:
+    """Request object for tracking generation through the engine.
+
+    Manages the state and metadata of a single inference request,
+    including tokens, sampling parameters, and execution status.
+
+    Attributes:
+        request_id: Unique identifier for the request.
+        prompt_token_ids: Input token IDs.
+        sampling_params: Parameters controlling generation.
+        eos_token_id: End-of-sequence token ID.
+        client_index: Index of the client making request.
+        arrival_time: Timestamp when request arrived.
+        priority: Request priority for scheduling.
+        status: Current request status.
+        events: List of events during processing.
+        stop_reason: Reason for stopping generation.
+
+    Example:
+        >>> request = EngineRequest(
+        ...     request_id="req_123",
+        ...     prompt_token_ids=[1, 2, 3],
+        ...     sampling_params=sampling_params,
+        ...     eos_token_id=2
+        ... )
+    """
+
     def __init__(
         self,
         request_id: str,
@@ -32,6 +77,17 @@ class EngineRequest:
         arrival_time: float | None = None,
         priority: int = 0,
     ) -> None:
+        """Initialize EngineRequest.
+
+        Args:
+            request_id: Unique request identifier.
+            prompt_token_ids: Input token IDs.
+            sampling_params: Generation parameters.
+            eos_token_id: End-of-sequence token.
+            client_index: Client index.
+            arrival_time: Request arrival time.
+            priority: Request priority.
+        """
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority

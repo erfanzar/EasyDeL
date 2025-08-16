@@ -12,6 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""vInference: Streamlined inference engine for text generation.
+
+vInference provides a simplified interface for text generation with
+pre-compiled models, optimized for single and batch inference scenarios.
+It focuses on ease of use while maintaining high performance.
+
+Key Features:
+    - Simple API for text generation
+    - Pre-compilation for optimized inference
+    - Support for streaming and non-streaming generation
+    - Automatic mixed-precision and sharding
+    - Built-in OpenAI API compatibility
+
+Components:
+    vInference: Main inference engine
+    vInferenceConfig: Configuration for generation
+    vInferencePreCompileConfig: Pre-compilation settings
+    vInferenceApiServer: OpenAI-compatible API server
+    PromptOutput: Output structure for generated text
+    SampleState: Internal state for sampling
+
+Example:
+    >>> from easydel.inference.vinference import (
+    ...     vInference,
+    ...     vInferenceConfig
+    ... )
+    >>> # Create configuration
+    >>> config = vInferenceConfig(
+    ...     max_new_tokens=100,
+    ...     temperature=0.7,
+    ...     top_p=0.9
+    ... )
+    >>> # Initialize inference engine
+    >>> engine = vInference(
+    ...     model=model,
+    ...     processor_class=tokenizer,
+    ...     generation_config=config
+    ... )
+    >>> # Generate text
+    >>> output = engine.generate(
+    ...     "Once upon a time",
+    ...     max_new_tokens=50
+    ... )
+    >>> print(output.text)
+
+Note:
+    vInference is optimized for scenarios where you need straightforward
+    text generation without the complexity of continuous batching.
+    For high-throughput scenarios, consider using vSurge instead.
+"""
+
 from .api_server import vInferenceApiServer
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 from .vinference import PromptOutput, vInference

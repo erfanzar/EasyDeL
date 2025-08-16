@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Page table management for KV-cache allocation.
+
+Provides efficient page-based memory management for attention KV-cache.
+Uses NumPy arrays for CPU-based page tracking and slot mapping.
+
+Classes:
+    PageTable: Manages page allocation and slot mapping for sequences
+
+Functions:
+    cdiv: Ceiling division helper
+
+Example:
+    >>> table = PageTable(
+    ...     page_size=16,
+    ...     max_num_reqs=32,
+    ...     max_num_pages_per_req=128,
+    ...     max_num_batched_tokens=2048
+    ... )
+    >>> table.append_row([0, 1, 2], row_idx=0)
+    >>> slots = table.get_slot_mapping([0, 1], [5, 10])
+"""
 
 import numpy as np
 
@@ -21,11 +42,48 @@ logger = get_logger(__name__)
 
 
 def cdiv(a: int, b: int) -> int:
-    """Ceiling division"""
+    """Ceiling division.
+
+    Computes ceil(a/b) using integer arithmetic.
+
+    Args:
+        a: Numerator.
+        b: Denominator.
+
+    Returns:
+        Ceiling of a/b.
+
+    Example:
+        >>> cdiv(5, 2)  # 3
+        >>> cdiv(4, 2)  # 2
+    """
     return (a + b - 1) // b
 
 
 class PageTable:
+    """Manages page allocation and slot mapping for KV-cache.
+
+    Implements a page table structure for efficient memory management
+    of attention caches. Each sequence gets allocated pages which are
+    mapped to physical cache slots.
+
+    Attributes:
+        page_size: Number of tokens per page.
+        max_num_reqs: Maximum number of concurrent requests.
+        max_num_pages_per_req: Maximum pages per request.
+        max_num_batched_tokens: Maximum tokens in a batch.
+        page_table: 2D array mapping request to page IDs.
+        num_pages_per_row: Number of pages allocated per request.
+        slot_mapping: Maps token positions to cache slots.
+
+    Example:
+        >>> table = PageTable(page_size=16, max_num_reqs=32,
+        ...                   max_num_pages_per_req=128,
+        ...                   max_num_batched_tokens=2048)
+        >>> table.set_row([10, 11, 12], row_idx=0)
+        >>> slots = table.get_slot_mapping([0], [48])
+    """
+
     def __init__(
         self,
         page_size: int,
@@ -33,6 +91,14 @@ class PageTable:
         max_num_pages_per_req: int,
         max_num_batched_tokens: int,
     ):
+        """Initialize PageTable.
+
+        Args:
+            page_size: Number of tokens per page.
+            max_num_reqs: Maximum concurrent requests.
+            max_num_pages_per_req: Maximum pages per request.
+            max_num_batched_tokens: Maximum tokens in batch.
+        """
         self.page_size = page_size
         self.max_num_reqs = max_num_reqs
         self.max_num_pages_per_req = max_num_pages_per_req
@@ -43,6 +109,12 @@ class PageTable:
         self.slot_mapping = np.full(self.max_num_batched_tokens, fill_value=-1, dtype=np.int32)
 
     def append_row(self, page_ids: list[int], row_idx: int) -> None:
+        """Append page IDs to a row.
+
+        Args:
+            page_ids: List of page IDs to append.
+            row_idx: Row index to append to.
+        """
         if not page_ids:
             return
         num_pages = len(page_ids)

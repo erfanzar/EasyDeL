@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Base interface for EasyDeL inference API servers."""
+"""Base interface for EasyDeL inference API servers.
+
+This module provides abstract base classes and utilities for building
+standardized inference API servers with OpenAI API compatibility.
+
+Classes:
+    ServerStatus: Enum representing server operational states
+    ServerMetrics: Dataclass for tracking server performance metrics
+    EndpointConfig: Configuration for API endpoints
+    ErrorResponse: Standard error response format
+    BaseInferenceApiServer: Abstract base class for inference servers
+    InferenceEngineAdapter: Abstract adapter for different inference engines
+"""
 
 from __future__ import annotations
 
@@ -52,7 +64,17 @@ logger = get_logger("InferenceApiServer")
 
 
 class ServerStatus(str, Enum):
-    """Server status enumeration."""
+    """Server status enumeration.
+
+    Represents the operational state of an inference server.
+
+    Attributes:
+        STARTING: Server is initializing
+        READY: Server is ready to accept requests
+        BUSY: Server is processing requests at capacity
+        ERROR: Server encountered an error
+        SHUTTING_DOWN: Server is gracefully shutting down
+    """
 
     STARTING = "starting"
     READY = "ready"
@@ -63,7 +85,19 @@ class ServerStatus(str, Enum):
 
 @dataclass
 class ServerMetrics:
-    """Server performance metrics."""
+    """Server performance metrics.
+
+    Tracks key performance indicators for the inference server.
+
+    Attributes:
+        total_requests: Total number of requests received
+        successful_requests: Number of successfully completed requests
+        failed_requests: Number of failed requests
+        total_tokens_generated: Total tokens generated across all requests
+        average_tokens_per_second: Average generation speed
+        uptime_seconds: Time since server started
+        start_time: Unix timestamp when server started
+    """
 
     total_requests: int = 0
     successful_requests: int = 0
@@ -75,7 +109,18 @@ class ServerMetrics:
 
 
 class EndpointConfig(BaseModel):
-    """Configuration for a FastAPI endpoint."""
+    """Configuration for a FastAPI endpoint.
+
+    Defines the structure for registering API endpoints.
+
+    Attributes:
+        path: URL path for the endpoint
+        handler: Callable that handles requests
+        methods: HTTP methods supported (GET, POST, etc.)
+        summary: Brief description of the endpoint
+        tags: Tags for API documentation grouping
+        response_model: Pydantic model for response validation
+    """
 
     path: str
     handler: tp.Callable
@@ -86,7 +131,15 @@ class EndpointConfig(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Standard error response model."""
+    """Standard error response model.
+
+    Provides a consistent error response format across all endpoints.
+
+    Attributes:
+        error: Dictionary containing error message and type
+        request_id: Optional unique identifier for the request
+        timestamp: Unix timestamp when error occurred
+    """
 
     error: dict[str, str]
     request_id: str | None = None
@@ -94,7 +147,16 @@ class ErrorResponse(BaseModel):
 
 
 def create_error_response(status_code: HTTPStatus, message: str, request_id: str | None = None) -> JSONResponse:
-    """Creates a standardized JSON error response."""
+    """Creates a standardized JSON error response.
+
+    Args:
+        status_code: HTTP status code for the error
+        message: Human-readable error message
+        request_id: Optional request identifier for tracking
+
+    Returns:
+        JSONResponse with error details and appropriate status code
+    """
     error_response = ErrorResponse(error={"message": message, "type": status_code.name}, request_id=request_id)
     return JSONResponse(content=error_response.model_dump(), status_code=status_code.value)
 
@@ -176,15 +238,32 @@ class BaseInferenceApiServer(ABC):
         await self.on_shutdown()
 
     async def on_startup(self) -> None:  # noqa: B027
-        """Hook for server startup. Override in subclasses for custom startup logic."""
+        """Hook for server startup.
+
+        Override in subclasses to perform custom initialization tasks
+        such as loading models, establishing connections, or warming up caches.
+        This method is called once when the server starts.
+        """
         pass
 
     async def on_shutdown(self) -> None:  # noqa: B027
-        """Hook for server shutdown. Override in subclasses for custom shutdown logic."""
+        """Hook for server shutdown.
+
+        Override in subclasses to perform cleanup tasks such as
+        saving state, closing connections, or releasing resources.
+        This method is called once when the server shuts down.
+        """
         pass
 
     def _setup_cors(self, origins: list[str] | None) -> None:
-        """Setup CORS middleware."""
+        """Setup CORS middleware.
+
+        Configures Cross-Origin Resource Sharing to allow web browsers
+        to make requests to the API from different domains.
+
+        Args:
+            origins: List of allowed origin URLs. Defaults to ["*"] (all origins)
+        """
         self.app.add_middleware(
             CORSMiddleware,
             allow_origins=origins or ["*"],
@@ -194,7 +273,13 @@ class BaseInferenceApiServer(ABC):
         )
 
     def _setup_middleware(self) -> None:
-        """Setup request middleware."""
+        """Setup request middleware.
+
+        Configures middleware for request tracking, metrics collection,
+        and request ID generation. This method adds two middleware layers:
+        1. Request ID assignment for tracking
+        2. Metrics collection for monitoring
+        """
 
         @self.app.middleware("http")
         async def add_request_id(request: Request, call_next):

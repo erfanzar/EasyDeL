@@ -11,6 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Base configuration classes for EasyDeL models.
+
+This module provides the foundational configuration system for all EasyDeL models,
+extending HuggingFace's PretrainedConfig with EasyDeL-specific features like
+attention mechanisms, quantization, gradient checkpointing, and hardware optimization.
+
+Classes:
+    EasyDeLBaseConfig: Main configuration class with all EasyDeL features
+    EasyDeLBaseConfigDict: Simplified dictionary-based configuration
+
+Key Features:
+    - Multiple attention mechanism support (flash, ring, etc.)
+    - Quantization configuration
+    - Gradient checkpointing policies
+    - Hardware abstraction and optimization
+    - RoPE (Rotary Position Embedding) configuration
+    - Custom kernel support
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseConfig
+    >>> config = EasyDeLBaseConfig(
+    ...     hidden_size=768,
+    ...     num_attention_heads=12,
+    ...     attention_mechanism="flash",
+    ...     gradient_checkpointing_policy="nothing_saveable",
+    ...     use_hardware_abstraction=True
+    ... )
+"""
+
 from __future__ import annotations
 
 import json
@@ -93,8 +123,17 @@ if EKERNEL_OPS:
 
 
 def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
-    """
-    Extracts the commit hash from a resolved filename toward a cache file.
+    """Extract the commit hash from a resolved cache filename.
+
+    Parses the resolved file path to extract the git commit hash
+    if not already provided.
+
+    Args:
+        resolved_file: Path to the resolved cache file.
+        commit_hash: Existing commit hash if available.
+
+    Returns:
+        The commit hash string or None if not found.
     """
     if resolved_file is None or commit_hash is not None:
         return commit_hash
@@ -107,6 +146,16 @@ def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> s
 
 
 def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
+    """Set attributes intelligently with default values.
+
+    Sets an attribute if it doesn't exist, and updates it if a new
+    non-NOT_GIVEN value is provided.
+
+    Args:
+        attr_name: Name of the attribute to set.
+        default: Default value if attribute doesn't exist.
+        new_attr: New value to set (if not NOT_GIVEN).
+    """
     if not hasattr(self, attr_name):
         setattr(self, attr_name, default)
     if new_attr is not NOT_GIVEN:
@@ -115,6 +164,17 @@ def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
 
 @auto_pytree
 class EasyMethod:
+    """Constants for EasyDeL operation modes.
+
+    Defines the different modes in which EasyDeL models can operate.
+
+    Attributes:
+        TRAIN: Training mode for model optimization.
+        SERVE: Serving mode for inference.
+        EVAL: Evaluation mode (alias for serve).
+        CONVERT: Conversion mode for model format changes.
+    """
+
     TRAIN: str = "train"
     SERVE: str = "serve"
     EVAL: str = "serve"
@@ -132,6 +192,15 @@ warnings.filterwarnings("ignore", message="Some donated buffers were not usable:
 
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
+    """TypedDict for EasyDeL configuration parameters.
+
+    Provides type hints for all configuration options that can be
+    passed to EasyDeLBaseConfig. All fields are optional (total=False).
+
+    This is useful for type checking when creating configurations
+    from dictionaries or JSON.
+    """
+
     sharding_axis_dims: tp.Sequence[int]
     sharding_dcn_axis_dims: tp.Sequence[int] | None
     sharding_axis_names: tp.Sequence[str]
@@ -177,8 +246,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
-    """
-    Initialize the configuration for EasyDeL.
+    """Base configuration class for all EasyDeL models.
+
+    Extends HuggingFace's PretrainedConfig with EasyDeL-specific features
+    for distributed training, custom attention mechanisms, quantization,
+    and hardware optimization.
     Args:
         sharding_axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1, 1).
         sharding_axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp",  "ep", "tp", "sp").

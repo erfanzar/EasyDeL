@@ -11,6 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Model runners for the eSurge inference engine.
+
+This module provides the core execution components for running models
+in the eSurge engine, including model runners and sequence buffering.
+
+Classes:
+    eSurgeRunner: Main model runner for executing inference
+    SequenceBuffer: Buffer for managing sequence data during generation
+
+Example:
+    >>> from easydel.inference.esurge.runners import eSurgeRunner
+    >>>
+    >>> runner = eSurgeRunner(
+    ...     model=model,
+    ...     params=params,
+    ...     cache_config=cache_config
+    ... )
+    >>> output = runner.run(batch)
+"""
+
 from .model_runner import eSurgeRunner
 from .sequence_buffer import SequenceBuffer
 
