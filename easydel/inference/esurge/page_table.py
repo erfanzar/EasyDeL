@@ -61,6 +61,10 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+SLOT_MAPPING_PADDING_VAL = 0
+PAGE_TABLE_PADDING_VAL = 0
+
+
 class PageTable:
     """Manages page allocation and slot mapping for KV-cache.
 
@@ -105,9 +109,11 @@ class PageTable:
         self.max_num_pages_per_req = max_num_pages_per_req
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.page_table = jnp.full((max_num_reqs, max_num_pages_per_req), fill_value=-1, dtype=jnp.int32)
+        self.page_table = jnp.full(
+            (max_num_reqs, max_num_pages_per_req), fill_value=PAGE_TABLE_PADDING_VAL, dtype=jnp.int32
+        )
         self.num_pages_per_row = jnp.zeros(max_num_reqs, dtype=jnp.int32)
-        self.slot_mapping = jnp.full(self.max_num_batched_tokens, fill_value=-1, dtype=jnp.int32)
+        self.slot_mapping = jnp.full(self.max_num_batched_tokens, fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32)
 
     def append_row(self, page_ids: list[int], row_idx: int) -> None:
         """Append page IDs to a row.
