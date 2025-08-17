@@ -151,7 +151,6 @@ class PagedAttn(AttentionImpl):
             NotImplementedError: Paged Attention currently relies on Pallas for TPUs
                 and does not have a specific implementation.
         """
-        # return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
         kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
@@ -167,9 +166,7 @@ class PagedAttn(AttentionImpl):
                 pallas_ragged_paged_attention,
                 sm_scale=self.metadata.softmax_scale,
                 soft_cap=self.metadata.soft_cap,
-                vmem_limit_bytes=16777216,
                 num_kv_pages_per_block=num_kv_pages_per_block,
-                num_queries_per_block=64,
             ),
             in_specs=(
                 qaxes,

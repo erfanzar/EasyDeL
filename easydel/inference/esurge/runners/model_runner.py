@@ -249,11 +249,7 @@ class eSurgeRunner:
                 indices_do_sample,
             )
 
-        def _execute_forward(
-            input_ids: jax.Array,
-            position_ids: jax.Array,
-            cache_metadata: PagesMetadata,
-        ) -> jax.Array:
+        def _execute_forward(input_ids: jax.Array, position_ids: jax.Array, cache_metadata: PagesMetadata) -> jax.Array:
             states, self.kv_pages = _execute_forward_fn(
                 self.graphdef,
                 self.graphstate,
@@ -312,6 +308,60 @@ class eSurgeRunner:
                 )
             logger.info(f"  Compilation took: {took():.2f}s")
 
+    def _get_slot_mapping_metadata_optimized(
+        self,
+        num_computed_tokens: jax.Array,
+        num_scheduled_tokens_per_req: jax.Array,
+        arange: jax.Array,
+        page_table_flat: jax.Array,
+        num_reqs: int,
+        page_size: int,
+        max_num_pages_per_req: int,
+    ) -> jax.Array:
+        """Optimized slot mapping computation using JAX operations."""
+        slices_start = num_computed_tokens[:num_reqs]
+        slices_end = slices_start + num_scheduled_tokens_per_req
+
+        local_page_start_idx = slices_start // page_size
+        local_page_end_idx = (slices_end - 1) // page_size
+
+        no_repeat_req_indices = arange[:num_reqs]
+        global_page_start_idx = no_repeat_req_indices * max_num_pages_per_req + local_page_start_idx
+
+        page_lens = local_page_end_idx - local_page_start_idx + 1
+
+        global_page_start_idx = jnp.repeat(global_page_start_idx, page_lens)
+        slice_arange = jnp.concatenate([arange[:n] for n in page_lens])
+        global_page_indices = global_page_start_idx + slice_arange
+
+        page_numbers = page_table_flat[global_page_indices]
+
+        total_page_len = jnp.sum(page_lens)
+        slot_mapping_slices = jnp.repeat(
+            jnp.array([[0, page_size]], dtype=jnp.int32),
+            total_page_len,
+            axis=0,
+        )
+
+        cu_page_lens = jnp.zeros(len(page_lens) + 1, dtype=jnp.int32)
+        cu_page_lens = cu_page_lens.at[1:].set(jnp.cumsum(page_lens))
+
+        # Use a regular loop since we're not in JIT context
+        for req_idx in range(num_reqs):
+            slot_mapping_slices = slot_mapping_slices.at[cu_page_lens[req_idx], 0].set(slices_start[req_idx] % page_size)
+            slot_mapping_slices = slot_mapping_slices.at[cu_page_lens[req_idx + 1] - 1, 1].set(
+                (slices_end[req_idx] - 1) % page_size + 1
+            )
+
+        slice_lens = slot_mapping_slices[:, 1] - slot_mapping_slices[:, 0]
+        cu_slices_lens = jnp.zeros(len(slice_lens) + 1, dtype=jnp.int32)
+        cu_slices_lens = cu_slices_lens.at[1:].set(jnp.cumsum(slice_lens))
+
+        kv_cache_start_indices = slot_mapping_slices[:, 0] + (page_numbers * page_size)
+        new_kv_start_indices = cu_slices_lens[:-1]
+
+        return jnp.stack([kv_cache_start_indices, new_kv_start_indices, slice_lens], axis=1)
+
     def _get_slot_mapping_metadata(self, num_reqs: int, num_scheduled_tokens_per_req: jax.Array) -> jax.Array:
         """Compute metadata for mapping slots to pages in KV cache.
 
@@ -321,50 +371,16 @@ class eSurgeRunner:
             - new_kv_start_index
             - slice_len
         """
-        slices_start = self.sequence_buffer.num_computed_tokens[:num_reqs]
-        slices_end = slices_start + num_scheduled_tokens_per_req
-
-        local_page_start_idx = slices_start // self.metadata.page_size
-        local_page_end_idx = (slices_end - 1) // self.metadata.page_size
-
-        no_repeat_req_indices = self.arange[:num_reqs]
-        global_page_start_idx = no_repeat_req_indices * self.metadata.max_num_pages_per_req + local_page_start_idx
-
-        page_lens = local_page_end_idx - local_page_start_idx + 1
-
-        global_page_start_idx = jnp.repeat(global_page_start_idx, page_lens)
-        slice_arange = jnp.concatenate([self.arange[:n] for n in page_lens])
-        global_page_indices = global_page_start_idx + slice_arange
-
-        page_table = self.sequence_buffer.page_table[0].get_array()
-        page_numbers = page_table.flatten()[global_page_indices]
-
-        total_page_len = jnp.sum(page_lens)
-        slot_mapping_slices = jnp.repeat(
-            jnp.array([[0, self.metadata.page_size]], dtype=jnp.int32),
-            total_page_len,
-            axis=0,
+        page_table_flat = self.sequence_buffer.page_table[0].get_array().flatten()
+        return self._get_slot_mapping_metadata_optimized(
+            self.sequence_buffer.num_computed_tokens,
+            num_scheduled_tokens_per_req,
+            self.arange,
+            page_table_flat,
+            num_reqs,
+            self.metadata.page_size,
+            self.metadata.max_num_pages_per_req,
         )
-
-        cu_page_lens = jnp.zeros(len(page_lens) + 1, dtype=jnp.int32)
-        cu_page_lens = cu_page_lens.at[1:].set(jnp.cumsum(page_lens))
-
-        for req_idx in range(num_reqs):
-            slot_mapping_slices = slot_mapping_slices.at[cu_page_lens[req_idx], 0].set(
-                slices_start[req_idx] % self.metadata.page_size
-            )
-            slot_mapping_slices = slot_mapping_slices.at[cu_page_lens[req_idx + 1] - 1, 1].set(
-                (slices_end[req_idx] - 1) % self.metadata.page_size + 1
-            )
-
-        slice_lens = slot_mapping_slices[:, 1] - slot_mapping_slices[:, 0]
-        cu_slices_lens = jnp.zeros(len(slice_lens) + 1, dtype=jnp.int32)
-        cu_slices_lens = cu_slices_lens.at[1:].set(jnp.cumsum(slice_lens))
-
-        kv_cache_start_indices = slot_mapping_slices[:, 0] + (page_numbers * self.metadata.page_size)
-        new_kv_start_indices = cu_slices_lens[:-1]
-
-        return jnp.stack([kv_cache_start_indices, new_kv_start_indices, slice_lens], axis=1)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
@@ -445,6 +461,33 @@ class eSurgeRunner:
 
         return len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
 
+    def _prepare_inputs_optimized(
+        self,
+        num_scheduled_tokens_per_req: jax.Array,
+        num_computed_tokens: jax.Array,
+        token_ids_flat: jax.Array,
+        arange: jax.Array,
+        token_ids_shape_1: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, int]:
+        """Optimized input preparation without JIT due to dynamic shapes."""
+        num_reqs = len(num_scheduled_tokens_per_req)
+        total_num_scheduled_tokens = int(jnp.sum(num_scheduled_tokens_per_req))
+
+        # Build indices using JAX operations
+        req_indices = jnp.repeat(arange[:num_reqs], num_scheduled_tokens_per_req)
+        arange_concat = jnp.concatenate([arange[:n] for n in num_scheduled_tokens_per_req])
+
+        positions_np = num_computed_tokens[req_indices] + arange_concat
+        token_indices = positions_np + req_indices * token_ids_shape_1
+        input_ids = jnp.take(token_ids_flat, token_indices)
+
+        query_start_loc = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
+        query_start_loc = query_start_loc.at[1:].set(jnp.cumsum(num_scheduled_tokens_per_req))
+
+        seq_lens = num_computed_tokens[:num_reqs] + num_scheduled_tokens_per_req
+
+        return input_ids, positions_np, query_start_loc, seq_lens, total_num_scheduled_tokens
+
     def _prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -485,17 +528,17 @@ class eSurgeRunner:
                 end_index = num_reqs
 
         num_scheduled_tokens_per_req = jnp.array(num_scheduled_tokens_per_req, dtype=jnp.int32)
-        total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        req_indices = jnp.repeat(self.arange[:num_reqs], num_scheduled_tokens_per_req)
-        arange = jnp.concatenate([self.arange[:n] for n in num_scheduled_tokens_per_req])
-
-        positions_np = self.positions[:total_num_scheduled_tokens]
-        positions_np = self.sequence_buffer.num_computed_tokens[req_indices] + arange
-
-        token_indices = positions_np + req_indices * self.sequence_buffer.token_ids.shape[1]
-        input_ids = jnp.take(self.sequence_buffer.token_ids.flatten(), token_indices)
+        (input_ids, positions_np, query_start_loc_partial, seq_lens_partial, total_num_scheduled_tokens) = (
+            self._prepare_inputs_optimized(
+                num_scheduled_tokens_per_req,
+                self.sequence_buffer.num_computed_tokens,
+                self.sequence_buffer.token_ids.flatten(),
+                self.arange,
+                self.sequence_buffer.token_ids.shape[1],
+            )
+        )
 
         padded_total_num_scheduled_tokens = _get_padded_token_len(self.num_tokens_paddings, total_num_scheduled_tokens)
 
@@ -508,12 +551,10 @@ class eSurgeRunner:
         self.position_ids = padded_position_ids
 
         self.query_start_loc = self.query_start_loc.at[0].set(0)
-        self.query_start_loc = self.query_start_loc.at[1 : num_reqs + 1].set(jnp.cumsum(num_scheduled_tokens_per_req))
+        self.query_start_loc = self.query_start_loc.at[1 : num_reqs + 1].set(query_start_loc_partial[1:])
         self.query_start_loc = self.query_start_loc.at[num_reqs + 1 :].set(1)
 
-        self.seq_lens = self.seq_lens.at[:num_reqs].set(
-            self.sequence_buffer.num_computed_tokens[:num_reqs] + num_scheduled_tokens_per_req
-        )
+        self.seq_lens = self.seq_lens.at[:num_reqs].set(seq_lens_partial)
         seq_page_table = self.sequence_buffer.page_table[0].get_array()
         if use_max_model_len:
             pages_tables = jnp.full(
@@ -610,13 +651,40 @@ class eSurgeRunner:
                 ),
                 self.rng_key,
             )
-            selected_token_ids = jax.device_get(selected_token_ids)[:num_reqs]
+            selected_token_ids = selected_token_ids[:num_reqs]
             combined_selected_tokens.append(selected_token_ids)
 
             start_index = end_index
 
         selected_token_ids = jnp.concatenate(combined_selected_tokens, axis=0)
 
+        return self._process_sampled_tokens(
+            selected_token_ids,
+            scheduler_output,
+            execution_start_time,
+        )
+
+    def _update_token_buffers_optimized(
+        self,
+        token_ids: jax.Array,
+        num_tokens: jax.Array,
+        update_indices: jax.Array,
+        new_token_ids: jax.Array,
+        seq_lens: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Optimized token buffer updates using JAX operations."""
+        for idx, token_id, seq_len in zip(update_indices, new_token_ids, seq_lens, strict=False):
+            token_ids = token_ids.at[idx, seq_len].set(token_id)
+            num_tokens = num_tokens.at[idx].add(1)
+        return token_ids, num_tokens
+
+    def _process_sampled_tokens(
+        self,
+        selected_token_ids: jax.Array,
+        scheduler_output: SchedulerOutput,
+        execution_start_time: float,
+    ) -> ModelRunnerOutput:
+        """Process sampled tokens and update buffers."""
         request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices = []
         num_reqs = self.sequence_buffer.num_reqs
@@ -632,7 +700,6 @@ class eSurgeRunner:
             if seq_len >= req_state.num_tokens:
                 request_seq_lens.append((i, req_state, seq_len))
             else:
-                # Token discarding case - skip this request
                 discard_sampled_tokens_req_indices.append(i)
 
         req_ids = cast(list[str], self.sequence_buffer.req_ids[:num_reqs])
