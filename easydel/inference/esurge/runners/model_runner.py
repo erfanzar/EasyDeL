@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import bisect
+import time
 import typing
 from typing import cast
 
@@ -28,6 +29,7 @@ from easydel.utils import capture_time, ejit, get_logger
 from ...vsurge.core.functions import sample_top_p_efficient
 from ..metrics import get_metrics_collector
 from ..outputs import LogprobsTensors, ModelRunnerOutput
+from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..scheduler import SchedulerOutput
 from .sequence_buffer import ModelRunnerSamplingMetadata, SequenceBuffer
 from .states import CachedRequestState
@@ -275,8 +277,8 @@ class eSurgeRunner:
 
         padded_num_slices = self.metadata.get_padded_num_slices(num_tokens, self.max_num_reqs)
         num_kv_update_slices = jnp.array([padded_num_slices], dtype=jnp.int32)
-        slot_mapping = jnp.full((3, padded_num_slices), fill_value=-1, dtype=jnp.int32)
-        pages_tables = jnp.full((num_reqs, num_pages), fill_value=-1, dtype=jnp.int32)
+        slot_mapping = jnp.full((3, padded_num_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32)
+        pages_tables = jnp.full((num_reqs, num_pages), fill_value=PAGE_TABLE_PADDING_VAL, dtype=jnp.int32)
 
         query_lens = [1] * num_reqs
         query_start_loc = jnp.cumsum(jnp.array([0, *query_lens], dtype=jnp.int32), axis=0, dtype=jnp.int32)
@@ -497,8 +499,7 @@ class eSurgeRunner:
 
         padded_total_num_scheduled_tokens = _get_padded_token_len(self.num_tokens_paddings, total_num_scheduled_tokens)
 
-        pad_token_id = -1
-        padded_input_ids = jnp.full(padded_total_num_scheduled_tokens, pad_token_id, dtype=jnp.int32)
+        padded_input_ids = jnp.full(padded_total_num_scheduled_tokens, 0, dtype=jnp.int32)
         padded_input_ids = padded_input_ids.at[:total_num_scheduled_tokens].set(input_ids)
         self.input_ids = padded_input_ids
 
@@ -517,7 +518,7 @@ class eSurgeRunner:
         if use_max_model_len:
             pages_tables = jnp.full(
                 (self.num_reqs_max_model_len, self.metadata.max_num_pages_per_req),
-                fill_value=-1,
+                fill_value=PAGE_TABLE_PADDING_VAL,
                 dtype=jnp.int32,
             )
             pages_tables = pages_tables.at[:num_reqs].set(seq_page_table[:num_reqs])
@@ -526,7 +527,7 @@ class eSurgeRunner:
         else:
             pages_tables = jnp.full(
                 (self.num_reqs_most_model_len, self.num_pages_per_most_len_req),
-                fill_value=-1,
+                fill_value=PAGE_TABLE_PADDING_VAL,
                 dtype=jnp.int32,
             )
             pages_tables = pages_tables.at[:num_reqs, : self.num_pages_per_most_len_req].set(
@@ -549,7 +550,7 @@ class eSurgeRunner:
             jnp.pad(
                 slot_mapping_metadata,
                 [[0, padded_num_slices - len(slot_mapping_metadata)], [0, 0]],
-                constant_values=-1,
+                constant_values=SLOT_MAPPING_PADDING_VAL,
             )
         )
 
@@ -571,7 +572,6 @@ class eSurgeRunner:
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests."""
-        import time
 
         execution_start_time = time.time()
 
