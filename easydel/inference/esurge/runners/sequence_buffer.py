@@ -658,26 +658,20 @@ class ModelRunnerSamplingMetadata:
 
         if sequence_buffer.all_greedy is True and not generate_params_if_all_greedy:
             return cls(
-                temperature=jnp.zeros((padded_num_reqs,)),
-                min_p=jnp.zeros((padded_num_reqs,)),
-                top_k=jnp.zeros((padded_num_reqs,)),
-                top_p=jnp.zeros((padded_num_reqs,)),
-                all_greedy=True,
-                logprobs=False,
+                temperature=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
+                min_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
+                top_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
+                top_k=jnp.zeros((padded_num_reqs,), dtype=jnp.int32),
             )
 
         num_reqs = sequence_buffer.num_reqs
 
         def fill_slice(arr, fill_val):
-            arr = arr
-            arr = arr.at[num_reqs:padded_num_reqs].set(fill_val)
-            return arr
+            return arr.at[num_reqs:padded_num_reqs].set(fill_val)[:padded_num_reqs]
 
         return cls(
-            temperature=fill_slice(sequence_buffer.temperature, -1.0)[:padded_num_reqs],
-            min_p=fill_slice(sequence_buffer.min_p, 0.0)[:padded_num_reqs],
-            top_k=fill_slice(sequence_buffer.top_k, 0)[:padded_num_reqs],
-            top_p=fill_slice(sequence_buffer.top_p, 1.0)[:padded_num_reqs],
-            all_greedy=sequence_buffer.all_greedy,
-            logprobs=False,
+            temperature=fill_slice(sequence_buffer.temperature, -1.0).astype(jnp.float32),
+            min_p=fill_slice(sequence_buffer.min_p, 0.0).astype(jnp.float32),
+            top_p=fill_slice(sequence_buffer.top_p, 1.0).astype(jnp.float32),
+            top_k=fill_slice(sequence_buffer.top_k, 0).astype(jnp.int32),
         )

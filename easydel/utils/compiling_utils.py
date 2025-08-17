@@ -136,6 +136,12 @@ def ejit(
     donate_argnums: int | tp.Sequence[int] | None = None,
     in_shardings: tp.Any = None,
     out_shardings: tp.Any = None,
+    donate_argnames: str | tp.Iterable[str] | None = None,
+    keep_unused: bool = False,
+    backend: str | None = None,
+    inline: bool = False,
+    abstracted_axes: tp.Any | None = None,
+    compiler_options: dict[str, tp.Any] | None = None,
 ):
     """Enhanced JIT compilation with persistent caching.
 
@@ -176,6 +182,12 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
+            abstracted_axes=abstracted_axes,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
         )
 
     if not ECACHE_COMPILES:
@@ -190,6 +202,12 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
+            abstracted_axes=abstracted_axes,
+            backend=backend,
+            compiler_options=compiler_options,
+            donate_argnames=donate_argnames,
+            inline=inline,
+            keep_unused=keep_unused,
         )
         return jitted_function
     jitted_function = jax.jit(
@@ -199,6 +217,12 @@ def ejit(
         donate_argnums=donate_argnums,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
+        abstracted_axes=abstracted_axes,
+        backend=backend,
+        compiler_options=compiler_options,
+        donate_argnames=donate_argnames,
+        inline=inline,
+        keep_unused=keep_unused,
     )
     try:
         func_source = inspect.getsource(func)
