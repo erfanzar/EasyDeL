@@ -483,7 +483,6 @@ class eSurge:
 
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
         """Process engine outputs and update request outputs."""
-        # engine_outputs is a dict mapping client_index to EngineCoreOutputs
         for client_outputs in engine_outputs.values():
             for engine_output in client_outputs.outputs:
                 request_id = engine_output.request_id
@@ -491,27 +490,22 @@ class eSurge:
                 if request_id not in self._request_outputs:
                     continue
 
-                # Get request data
                 request_data = self._active_requests.get(request_id)
                 if not request_data:
                     continue
 
-                # Update generated tokens
                 new_tokens = engine_output.new_token_ids
                 if new_tokens:
                     request_data["generated_tokens"].extend(new_tokens)
 
-                    # Track first token time for TTFT calculation
                     current_time = time.time()
                     if request_data["first_token_time"] is None and len(request_data["generated_tokens"]) > 0:
                         request_data["first_token_time"] = current_time - request_data["start_time"]
 
-                        # Log first token metrics
                         metrics_collector = get_metrics_collector()
                         if metrics_collector:
                             metrics_collector.record_first_token(request_id)
 
-                    # Log generated tokens
                     metrics_collector = get_metrics_collector()
                     if metrics_collector:
                         metrics_collector.add_generated_tokens(request_id, len(new_tokens))
@@ -548,7 +542,6 @@ class eSurge:
                     else:
                         output.tokens_per_second = 0
 
-                # Check if finished (can be finished even without new tokens)
                 if engine_output.finished:
                     output = self._request_outputs[request_id]
                     output.finished = True
@@ -556,11 +549,9 @@ class eSurge:
                         str(engine_output.finish_reason) if engine_output.finish_reason else None
                     )
 
-                    # When finished, set text to empty (no new text) but keep accumulated_text
                     if not new_tokens:
-                        output.outputs[0].text = ""  # No new text on finish
+                        output.outputs[0].text = ""
 
-                    # Calculate final metrics
                     elapsed = time.time() - request_data["start_time"]
                     num_prompt_tokens = len(request_data["prompt_token_ids"])
                     num_generated_tokens = len(request_data["generated_tokens"])
