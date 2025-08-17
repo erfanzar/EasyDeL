@@ -265,7 +265,7 @@ class PagesCacheView(BaseCacheView):
         head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
-        use_kernel = False  # jax.default_backend() == "tpu"
+        use_kernel = jax.default_backend() == "tpu"
         use_shardmap = use_kernel
 
         def _update_fn(kv, slots, pages, num_update_slices):

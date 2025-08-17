@@ -414,7 +414,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         # Standard processing (no function execution)
         choices = []
         for idx, completion in enumerate(output.outputs):
-            response_text = completion.text
+            response_text = output.accumulated_text  # Use the full accumulated text
 
             if is_function_request:
                 format_type = getattr(request, "function_call_format", self.default_function_format)
@@ -474,7 +474,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
             try:
                 total_generated = 0
                 first_token_time = None
-                last_text = ""
 
                 # Initial chunk with role and real prompt token count
                 initial_chunk = ChatCompletionStreamResponse(
@@ -501,9 +500,8 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     if first_token_time is None and output.outputs[0].text:
                         first_token_time = time.time() - start_time
 
-                    # Get new text
-                    current_text = output.outputs[0].text
-                    new_text = current_text[len(last_text) :]
+                    # Use the incremental text directly from the engine
+                    new_text = output.outputs[0].text  # This is already incremental
 
                     if new_text:
                         # Use engine-calculated metrics
@@ -534,7 +532,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                         # Use model_dump_json with exclude_unset=True to avoid validation errors
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
-                        last_text = current_text
                         total_generated = output.num_generated_tokens
 
                     # Check if finished
@@ -646,13 +643,13 @@ class eSurgeApiServer(BaseInferenceApiServer):
         tokens_per_second = output.tokens_per_second
         processing_time = output.processing_time
 
-        # Create response
+        # Create response - use accumulated_text for full text
         choices = []
         for idx, completion in enumerate(output.outputs):
             choices.append(
                 CompletionResponseChoice(
                     index=idx,
-                    text=completion.text,
+                    text=output.accumulated_text,  # Use the full accumulated text
                     finish_reason=completion.finish_reason or "stop",
                 )
             )
@@ -690,13 +687,11 @@ class eSurgeApiServer(BaseInferenceApiServer):
             try:
                 total_generated = 0
                 first_token_time = None
-                last_text = ""
 
                 # Stream tokens
                 async for output in esurge.astream(prompt, sampling_params):
-                    # Get new text
-                    current_text = output.outputs[0].text
-                    new_text = current_text[len(last_text) :]
+                    # Use the incremental text directly from the engine
+                    new_text = output.outputs[0].text  # This is already incremental
 
                     if new_text:
                         # Use engine-calculated metrics
@@ -725,7 +720,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                         )
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
-                        last_text = current_text
                         total_generated = output.num_generated_tokens
 
                     if output.finished:

@@ -324,50 +324,59 @@ class eSurge:
 
     def stream(
         self,
-        prompt: str,
+        prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
     ) -> Iterator[RequestOutput]:
-        """Stream generation results for a single prompt.
+        """Stream generation results for a single prompt or first prompt in list.
 
         Args:
-            prompt: Input prompt
+            prompts: Input prompt(s) - if list, only first is used
             sampling_params: Sampling parameters
             request_id: Optional request ID
 
         Yields:
             RequestOutput objects as generation progresses
         """
+        if isinstance(prompts, list):
+            if len(prompts) == 0:
+                raise ValueError("Empty prompt list provided")
+            prompt = prompts[0]
+        else:
+            prompt = prompts
+
         if request_id is None:
             request_id = self._generate_request_id()
 
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=128)
 
-        # Add request
         self._add_request(request_id, prompt, sampling_params)
 
-        # Stream outputs
         while request_id not in self._request_outputs or not self._request_outputs[request_id].finished:
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs:
                 model_output = self.runner.execute_model(scheduler_output)
                 engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-
-                # Process engine outputs
                 if engine_outputs:
                     self._process_engine_outputs(engine_outputs)
-
                 if request_id in self._request_outputs:
                     yield self._request_outputs[request_id]
 
     async def astream(
         self,
-        prompt: str,
+        prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
     ) -> AsyncIterator[RequestOutput]:
         """Async streaming generation."""
+        if isinstance(prompts, list):
+            if len(prompts) == 0:
+                raise ValueError("Empty prompt list provided")
+            prompt = prompts[0]
+        else:
+            prompt = prompts
+
         if request_id is None:
             request_id = self._generate_request_id()
 
@@ -400,8 +409,10 @@ class eSurge:
         sampling_params: SamplingParams,
     ) -> None:
         """Add a new request to the scheduler."""
-        # Tokenize prompt
-        token_ids = self.tokenizer(prompt, return_tensors=None)["input_ids"]
+        tokenizer_output = self.tokenizer(prompt, return_tensors=None)
+        token_ids = tokenizer_output["input_ids"]
+        if isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
 
         # Get EOS token
         eos_token_id = self.tokenizer.eos_token_id
@@ -414,14 +425,12 @@ class eSurge:
             eos_token_id=eos_token_id,
         )
 
-        # Add to scheduler
         self.scheduler.add_request(engine_request)
-
-        # Track request
         self._active_requests[request_id] = {
             "prompt": prompt,
             "prompt_token_ids": token_ids,
             "generated_tokens": [],
+            "last_decoded_index": 0,  # Track where we last decoded from
             "start_time": time.time(),
             "first_token_time": None,
         }
@@ -455,7 +464,7 @@ class eSurge:
     def _generate_request_id(self) -> str:
         """Generate unique request ID."""
         self._request_counter += 1
-        return f"req-{uuid.uuid4().hex[:8]}-{self._request_counter}"
+        return f"req-{uuid.uuid4().hex}-{self._request_counter}"
 
     def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""
@@ -507,28 +516,30 @@ class eSurge:
                     if metrics_collector:
                         metrics_collector.add_generated_tokens(request_id, len(new_tokens))
 
-                    # Decode new text
-                    generated_text = self.tokenizer.decode(
+                    accumulated_text = self.tokenizer.decode(
                         request_data["generated_tokens"],
                         skip_special_tokens=True,
                     )
 
-                    # Update output
+                    last_index = request_data["last_decoded_index"]
+                    new_text = self.tokenizer.decode(
+                        request_data["generated_tokens"][last_index:],
+                        skip_special_tokens=True,
+                    )
+                    request_data["last_decoded_index"] = len(request_data["generated_tokens"])
+
                     output = self._request_outputs[request_id]
-                    output.outputs[0].text = generated_text
+                    output.outputs[0].text = new_text  # Only the newly generated text
                     output.outputs[0].token_ids = request_data["generated_tokens"].copy()
 
-                    # Update additional fields
-                    output.accumulated_text = generated_text
+                    output.accumulated_text = accumulated_text  # Full generated text
                     output.num_generated_tokens = len(request_data["generated_tokens"])
 
-                    # Calculate processing time and TPS (excluding TTFT)
                     elapsed = current_time - request_data["start_time"]
                     output.processing_time = elapsed
                     output.time_spent_generating = elapsed
                     output.first_token_time = request_data["first_token_time"]
 
-                    # Calculate TPS excluding TTFT
                     if request_data["first_token_time"] is not None and output.num_generated_tokens > 0:
                         generation_time = elapsed - request_data["first_token_time"]
                         output.tokens_per_second = (
@@ -544,6 +555,10 @@ class eSurge:
                     output.outputs[0].finish_reason = (
                         str(engine_output.finish_reason) if engine_output.finish_reason else None
                     )
+
+                    # When finished, set text to empty (no new text) but keep accumulated_text
+                    if not new_tokens:
+                        output.outputs[0].text = ""  # No new text on finish
 
                     # Calculate final metrics
                     elapsed = time.time() - request_data["start_time"]
