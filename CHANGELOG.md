@@ -43,6 +43,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **eSurge ExecutorManager**: Enhanced compilation strategies with AOT/JIT flexibility
+  - Changed `use_aot_forward` parameter default to `True` for better out-of-box performance
+  - Added support for both AOT (Ahead-of-Time) and JIT (Just-In-Time) compilation modes
+  - AOT mode pre-compiles functions for optimal production performance
+  - JIT mode allows dynamic compilation with graph definition as static argument
+  - Improved static argument handling based on compilation mode selection
+
 - **Inference Architecture**: Migrated from JAX to NumPy for CPU operations in page management
   - Page table and cache management now use NumPy for better CPU performance
   - Improved memory efficiency and reduced overhead for cache operations

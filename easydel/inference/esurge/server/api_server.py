@@ -111,23 +111,19 @@ class eSurgeAdapter(InferenceEngineAdapter):
     ) -> list[RequestOutput] | tp.AsyncGenerator[RequestOutput, None]:
         """Generate using eSurge."""
         if stream:
-            # For streaming, we need to return an async generator
             async def stream_generator():
-                # Convert single prompt to list
                 if isinstance(prompts, str):
                     prompt_list = [prompts]
                 else:
                     prompt_list = prompts
 
-                # Stream for each prompt
                 for prompt in prompt_list:
-                    async for output in self.esurge.astream(prompt, sampling_params):
+                    for output in self.esurge.stream(prompt, sampling_params):
                         yield output
 
             return stream_generator()
         else:
-            # Non-streaming generation
-            return await self.esurge.agenerate(prompts, sampling_params)
+            return self.esurge.generate(prompts, sampling_params)
 
     def count_tokens(self, content: str) -> int:
         """Count tokens using eSurge tokenizer."""
@@ -165,13 +161,10 @@ class eSurgeApiServer(BaseInferenceApiServer):
         enable_function_calling: bool = True,
         **kwargs,
     ) -> None:
-        # Convert single instance to map
         if isinstance(esurge_map, eSurge):
-            # Generate a name if not specified
             model_name = esurge_map.esurge_name
             esurge_map = {model_name: esurge_map}
 
-        # Store both for backward compatibility
         self.esurge_map = esurge_map
         self.adapters: dict[str, eSurgeAdapter] = {}
 
@@ -185,7 +178,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
         self.status = ServerStatus.STARTING
         self._active_requests: dict[str, dict] = {}
 
-        # Set Qwen format as default for better Qwen model compatibility
         if "default_function_format" not in kwargs:
             kwargs["default_function_format"] = FunctionCallFormat.QWEN
 
@@ -257,7 +249,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 request.chat_template_kwargs = {}
             add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
 
-            # Apply chat template
             return processor.apply_chat_template(
                 tokenize=False,
                 conversation=conversation,
@@ -343,20 +334,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
             adapter = self._get_adapter(request.model)
             esurge = adapter.esurge
 
-            # Check if this is a function calling request
             is_function_request = (
                 self.enable_function_calling
                 and isinstance(request, ChatCompletionRequestWithTools)
                 and request.get_tools()
             )
 
-            # Prepare input
             if is_function_request:
                 content = await self._prepare_chat_input_with_tools_async(request, esurge)
             else:
                 content = await self._prepare_chat_input_async(request, esurge)
 
-            # Handle streaming vs non-streaming
             if request.stream:
                 return await self._handle_chat_streaming(request, esurge, content, request_id, is_function_request)
             else:
@@ -380,25 +368,21 @@ class eSurgeApiServer(BaseInferenceApiServer):
     ) -> ChatCompletionResponse:
         """Handle non-streaming chat completion."""
 
-        # Count tokens
         prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
 
-        # Generate
         sampling_params = self._create_sampling_params(request)
-        outputs = await esurge.agenerate(content, sampling_params)
+        outputs = esurge.generate(content, sampling_params)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
 
         output = outputs[0]
 
-        # Update metrics using engine-calculated values
         completion_tokens = output.num_generated_tokens
         self.metrics.total_tokens_generated += completion_tokens
         tokens_per_second = output.tokens_per_second
         processing_time = output.processing_time
 
-        # Update average tokens per second
         if self.metrics.average_tokens_per_second == 0:
             self.metrics.average_tokens_per_second = tokens_per_second
         else:
@@ -406,15 +390,12 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
             )
 
-        # Process function calls if needed
         if is_function_request:
-            # Parse function calls but don't execute them - just detect and return
             pass
 
-        # Standard processing (no function execution)
         choices = []
         for idx, completion in enumerate(output.outputs):
-            response_text = output.accumulated_text  # Use the full accumulated text
+            response_text = output.accumulated_text
 
             if is_function_request:
                 format_type = getattr(request, "function_call_format", self.default_function_format)
@@ -475,7 +456,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 total_generated = 0
                 first_token_time = None
 
-                # Initial chunk with role and real prompt token count
                 initial_chunk = ChatCompletionStreamResponse(
                     model=request.model,
                     choices=[
@@ -494,24 +474,18 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     ),
                 )
                 yield f"data: {initial_chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-
-                # Stream tokens
-                async for output in esurge.astream(content, sampling_params):
+                for output in esurge.stream(content, sampling_params):
                     if first_token_time is None and output.outputs[0].text:
                         first_token_time = time.time() - start_time
 
-                    # Use the incremental text directly from the engine
-                    new_text = output.outputs[0].text  # This is already incremental
-
+                    new_text = output.outputs[0].text
                     if new_text:
-                        # Use engine-calculated metrics
                         current_completion_tokens = output.num_generated_tokens
                         current_tps = output.tokens_per_second
                         elapsed_time = output.processing_time
                         if first_token_time is None and output.first_token_time is not None:
                             first_token_time = output.first_token_time
 
-                        # Create proper Pydantic model for streaming chunk with real usage
                         chunk = ChatCompletionStreamResponse(
                             model=request.model,
                             choices=[
@@ -529,17 +503,14 @@ class eSurgeApiServer(BaseInferenceApiServer):
                                 processing_time=elapsed_time,
                             ),
                         )
-                        # Use model_dump_json with exclude_unset=True to avoid validation errors
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
                         total_generated = output.num_generated_tokens
 
-                    # Check if finished
                     if output.finished:
                         break
 
-                # Final chunk with finish reason - use final output metrics
-                final_output = output  # Use the last output from streaming
+                final_output = output
                 generation_time = final_output.processing_time
                 tokens_per_second = final_output.tokens_per_second
                 total_generated = final_output.num_generated_tokens
@@ -553,7 +524,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     first_token_time=final_output.first_token_time,
                 )
 
-                # Final chunk with proper Pydantic model
                 final_chunk = ChatCompletionStreamResponse(
                     model=request.model,
                     choices=[
@@ -569,7 +539,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
                 yield "data: [DONE]\n\n"
 
-                # Update metrics
                 self.metrics.total_tokens_generated += total_generated
                 self.metrics.successful_requests += 1
 
@@ -627,29 +596,25 @@ class eSurgeApiServer(BaseInferenceApiServer):
     ) -> CompletionResponse:
         """Handle non-streaming completion."""
         prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
-
-        # Generate
         sampling_params = self._create_sampling_params(request)
-        outputs = await esurge.agenerate(prompt, sampling_params)
+        outputs = esurge.generate(prompt, sampling_params)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
 
         output = outputs[0]
 
-        # Update metrics using engine-calculated values
         completion_tokens = output.num_generated_tokens
         self.metrics.total_tokens_generated += completion_tokens
         tokens_per_second = output.tokens_per_second
         processing_time = output.processing_time
 
-        # Create response - use accumulated_text for full text
         choices = []
         for idx, completion in enumerate(output.outputs):
             choices.append(
                 CompletionResponseChoice(
                     index=idx,
-                    text=output.accumulated_text,  # Use the full accumulated text
+                    text=output.accumulated_text,
                     finish_reason=completion.finish_reason or "stop",
                 )
             )
@@ -688,13 +653,9 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 total_generated = 0
                 first_token_time = None
 
-                # Stream tokens
-                async for output in esurge.astream(prompt, sampling_params):
-                    # Use the incremental text directly from the engine
-                    new_text = output.outputs[0].text  # This is already incremental
-
+                for output in esurge.stream(prompt, sampling_params):
+                    new_text = output.outputs[0].text
                     if new_text:
-                        # Use engine-calculated metrics
                         current_completion_tokens = output.num_generated_tokens
                         current_tps = output.tokens_per_second
                         elapsed_time = output.processing_time
@@ -725,13 +686,11 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     if output.finished:
                         break
 
-                # Calculate final metrics using last output
-                final_output = output  # Use the last output from streaming
+                final_output = output
                 generation_time = final_output.processing_time
                 tokens_per_second = final_output.tokens_per_second
                 total_generated = final_output.num_generated_tokens
 
-                # Final chunk with usage
                 usage = UsageInfo(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=total_generated,
@@ -756,7 +715,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
                 yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
                 yield "data: [DONE]\n\n"
 
-                # Update metrics
                 self.metrics.total_tokens_generated += total_generated
                 self.metrics.successful_requests += 1
 
@@ -895,21 +853,11 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
             tools_by_model[model_name] = {
                 "tools": model_tools,
-                "formats_supported": [
-                    "openai",
-                    "hermes",
-                    "gorilla",
-                    "json_schema",
-                ],
+                "formats_supported": ["openai", "hermes", "gorilla", "json_schema"],
                 "parallel_calls": True,
             }
 
-        return JSONResponse(
-            {
-                "models": tools_by_model,
-                "default_format": "openai",
-            }
-        )
+        return JSONResponse({"models": tools_by_model, "default_format": "openai"})
 
     async def _generate_function_followup(
         self,
@@ -920,10 +868,8 @@ class eSurgeApiServer(BaseInferenceApiServer):
         start_time: float,
     ) -> ChatCompletionResponse:
         """Generate a follow-up response with function results."""
-        # Build messages with function results
         messages = [msg.model_dump() for msg in request.messages]
 
-        # Add function call results to conversation
         function_results = "Function results:\n"
         for call in executed_calls:
             if "result" in call:
@@ -938,17 +884,14 @@ class eSurgeApiServer(BaseInferenceApiServer):
             }
         )
 
-        # Apply chat template for follow-up
         processor = esurge.tokenizer
         if hasattr(processor, "apply_chat_template"):
             followup_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
-            # Fallback
             followup_prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages) + "\nassistant:"
 
-        # Generate final response
         sampling_params = self._create_sampling_params(request)
-        final_outputs = await esurge.agenerate(followup_prompt, sampling_params)
+        final_outputs = esurge.generate(followup_prompt, sampling_params)
 
         if not final_outputs:
             raise RuntimeError("Follow-up generation failed")
@@ -956,12 +899,10 @@ class eSurgeApiServer(BaseInferenceApiServer):
         final_completion = final_outputs[0].outputs[0]
         final_text = final_completion.text
 
-        # Calculate final metrics
         completion_tokens = len(final_completion.token_ids)
         generation_time = time.time() - start_time
         tokens_per_second = completion_tokens / generation_time if generation_time > 0 else 0
 
-        # Create response with both function calls and final answer
         from ...openai_api_modules import ToolCall
 
         tool_calls = [ToolCall(id=call["id"], type="function", function=call["function"]) for call in executed_calls]
@@ -978,13 +919,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
         return ChatCompletionResponse(
             model=request.model,
-            choices=[
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=message,
-                    finish_reason="stop",
-                )
-            ],
+            choices=[ChatCompletionResponseChoice(index=0, message=message, finish_reason="stop")],
             usage=usage,
         )
 
@@ -1014,11 +949,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         return ChatCompletionResponse(
             model=request.model,
             choices=[
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=message,
-                    finish_reason=completion.finish_reason or "stop",
-                )
+                ChatCompletionResponseChoice(index=0, message=message, finish_reason=completion.finish_reason or "stop")
             ],
             usage=usage,
         )

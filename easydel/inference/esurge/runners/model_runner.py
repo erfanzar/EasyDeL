@@ -93,24 +93,32 @@ class ExecutorManager:
     - Combined forward: Single function for both hidden states and token generation
     - Separate functions: Separate functions for hidden states and token generation
 
+    The manager supports both AOT (Ahead-of-Time) and JIT (Just-In-Time) compilation:
+    - AOT mode (default): Pre-compiles functions using JAX's lower/compile API for
+      optimal performance in production
+    - JIT mode: Compiles functions on first use with graph definition as static
+      argument, more flexible for development
+
     The manager pre-compiles functions for various configurations to avoid
     runtime compilation overhead, enabling seamless switching between different
     batch sizes and sequence lengths.
 
     Attributes:
-        model: The EasyDeL model being managed
-        mesh: JAX sharding mesh for distributed execution
-        kv_pages: KV cache pages for attention
-        use_combined_forward: Whether to use combined or separate functions
-        graphdef, graphstate, graphother: Split model components for JAX
-        _lowerd_history: Cache of compiled functions
+        model: The EasyDeL model being managed.
+        mesh: JAX sharding mesh for distributed execution.
+        kv_pages: KV cache pages for attention.
+        use_combined_forward: Whether to use combined or separate functions.
+        use_aot_forward: Whether to use AOT compilation (default: True).
+        graphdef, graphstate, graphother: Split model components for JAX.
+        _lowerd_history: Cache of compiled functions.
 
     Example:
         >>> executor = ExecutorManager(
         ...     model=my_model,
         ...     mesh=device_mesh,
         ...     kv_pages=cache_pages,
-        ...     use_combined_forward=True
+        ...     use_combined_forward=True,
+        ...     use_aot_forward=True  # Use AOT compilation
         ... )
         >>> executor.compile(token_paddings, ...)
         >>> tokens = executor.execute(inputs, ...)
@@ -122,13 +130,20 @@ class ExecutorManager:
         mesh: jax.sharding.Mesh,
         kv_pages: PagesCache,
         use_combined_forward: bool = False,
-        use_aot_forward: bool = False,
+        use_aot_forward: bool = True,
     ):
         """Initialize the executor manager.
 
         Args:
-            model: The EasyDeL model instance
-            mesh: JAX sharding mesh for distributed execution
+            model: The EasyDeL model instance.
+            mesh: JAX sharding mesh for distributed execution.
+            kv_pages: Pages cache for KV cache management.
+            use_combined_forward: Whether to use combined forward pass for model and token
+                generation in a single function call. Default is False.
+            use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
+                execution. When True (default), functions are pre-compiled for better
+                performance. When False, uses Just-In-Time (JIT) compilation with
+                the graph definition passed as a static argument.
         """
         logger.info(f"Initializing ExecutorManager with use_combined_forward={use_combined_forward}")
         self.model = model
@@ -167,22 +182,29 @@ class ExecutorManager:
         Selects and runs the appropriate pre-compiled function based on
         input shapes. Handles both combined and separate execution modes.
 
+        When AOT compilation is disabled (use_aot_forward=False), the graph
+        definition is passed as a static argument during execution for JIT
+        compilation. When enabled (default), pre-compiled functions are used
+        for better performance.
+
         Args:
-            input_ids_view: Token IDs to process [num_tokens]
-            position_ids_view: Position IDs for tokens [num_tokens]
-            cache_metadata: Paged attention metadata
-            logits_indices: Indices for logit extraction
-            sampling_metadata: Parameters for token sampling
-            padded_num_reqs: Padded number of requests
+            input_ids_view: Token IDs to process [num_tokens].
+            position_ids_view: Position IDs for tokens [num_tokens].
+            cache_metadata: Paged attention metadata.
+            logits_indices: Indices for logit extraction.
+            sampling_metadata: Parameters for token sampling.
+            padded_num_reqs: Padded number of requests.
 
         Returns:
             tuple: (sampled_token_ids, logits or None)
-                - sampled_token_ids: Generated token IDs
-                - logits: Raw logits (only in separate mode)
+                - sampled_token_ids: Generated token IDs.
+                - logits: Raw logits (only in separate mode).
         """
+        static_arguments = (self.graphdef,) if not self.use_aot_forward else ()
         if self.use_combined_forward:
             fn = self.get_compiled_key(input_ids_view.shape[0], padded_num_reqs)
             token_ids, self.kv_pages, self.rng_key = fn(
+                *static_arguments,
                 self.graphstate,
                 self.graphother,
                 input_ids_view,
@@ -197,6 +219,7 @@ class ExecutorManager:
         else:
             hfn, tfn = self.get_compiled_key(input_ids_view.shape[0], padded_num_reqs)
             hidden_states, self.kv_pages = hfn(
+                *static_arguments,
                 self.graphstate,
                 self.graphother,
                 input_ids_view,
@@ -205,6 +228,7 @@ class ExecutorManager:
                 cache_metadata,
             )
             token_ids, self.rng_key = tfn(
+                *static_arguments,
                 self.graphstate,
                 self.graphother,
                 hidden_states,
@@ -423,26 +447,66 @@ class ExecutorManager:
         return _fn
 
     def compile_key(self, num_tokens: int, padded_num_reqs: int, compargs):
-        if self.use_combined_forward:
-            logger.debug(f"Compiling combined forward function for key ({num_tokens}, {padded_num_reqs})")
-            lowered = self._main_fn.lower(*compargs)
-            compiled = lowered.compile()
-            self._lowerd_history[(num_tokens, padded_num_reqs)] = compiled
+        """Compile model execution functions for specific input dimensions.
+
+        Handles both AOT and JIT compilation modes based on use_aot_forward flag.
+        For AOT mode (default), pre-compiles functions using JAX's lower/compile API.
+        For JIT mode, executes functions once to trigger JIT compilation and caches
+        the wrapped functions.
+
+        Args:
+            num_tokens: Number of tokens in the input batch.
+            padded_num_reqs: Padded number of requests for batching.
+            compargs: Compilation arguments for the model functions.
+        """
+        if self.use_aot_forward:
+            if self.use_combined_forward:
+                logger.debug(f"Compiling combined forward function for key ({num_tokens}, {padded_num_reqs})")
+                lowered = self._main_fn.lower(*compargs)
+                compiled = lowered.compile()
+                self._lowerd_history[(num_tokens, padded_num_reqs)] = compiled
+            else:
+                hskey = (num_tokens, padded_num_reqs, "hidden_states")
+                tskey = (num_tokens, padded_num_reqs, "tokens")
+                if hskey not in self._lowerd_history.keys():
+                    logger.debug(f"Compiling hidden states function for key {hskey}")
+                    hidden_states_lowered = self._compute_hidden_states_fn.lower(*compargs[0])
+                    hidden_states_compiled = hidden_states_lowered.compile()
+                    self._lowerd_history[hskey] = hidden_states_compiled
+                if tskey not in self._lowerd_history.keys():
+                    logger.debug(f"Compiling tokens function for key {tskey}")
+                    tokens_lowered = self._compute_tokens_fn.lower(*compargs[1])
+                    tokens_compiled = tokens_lowered.compile()
+                    self._lowerd_history[tskey] = tokens_compiled
         else:
-            hskey = (num_tokens, padded_num_reqs, "hidden_states")
-            tskey = (num_tokens, padded_num_reqs, "tokens")
-            if hskey not in self._lowerd_history.keys():
-                logger.debug(f"Compiling hidden states function for key {hskey}")
-                hidden_states_lowered = self._compute_hidden_states_fn.lower(*compargs[0])
-                hidden_states_compiled = hidden_states_lowered.compile()
-                self._lowerd_history[hskey] = hidden_states_compiled
-            if tskey not in self._lowerd_history.keys():
-                logger.debug(f"Compiling tokens function for key {tskey}")
-                tokens_lowered = self._compute_tokens_fn.lower(*compargs[1])
-                tokens_compiled = tokens_lowered.compile()
-                self._lowerd_history[tskey] = tokens_compiled
+            if self.use_combined_forward:
+                logger.debug(f"Compiling combined forward function for key ({num_tokens}, {padded_num_reqs})")
+                _, self.kv_pages, _ = self._main_fn(*compargs)
+                self._lowerd_history[(num_tokens, padded_num_reqs)] = self._main_fn
+            else:
+                hskey = (num_tokens, padded_num_reqs, "hidden_states")
+                tskey = (num_tokens, padded_num_reqs, "tokens")
+                if hskey not in self._lowerd_history.keys():
+                    logger.debug(f"Compiling hidden states function for key {hskey}")
+                    _, self.kv_pages = self._compute_hidden_states_fn(*compargs[0])
+                    self._lowerd_history[hskey] = self._compute_hidden_states_fn
+                if tskey not in self._lowerd_history.keys():
+                    logger.debug(f"Compiling tokens function for key {tskey}")
+                    _ = self._compute_tokens_fn(*compargs[1])
+                    self._lowerd_history[tskey] = self._compute_tokens_fn
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
+        """Retrieve pre-compiled functions for given input dimensions.
+
+        Args:
+            num_tokens: Number of tokens in the input batch.
+            padded_num_reqs: Padded number of requests for batching.
+
+        Returns:
+            Compiled function(s) for the specified dimensions. Returns a single
+            function for combined forward mode, or a tuple of (hidden_states_fn,
+            tokens_fn) for separate mode.
+        """
         if self.use_combined_forward:
             return self._lowerd_history[(num_tokens, padded_num_reqs)]
         else:
@@ -1363,7 +1427,6 @@ class eSurgeRunner:
             )
             selected_token_ids = selected_token_ids[:num_reqs]
             exec_time = time.time() - exec_start
-            self.log_it(f"Model execution took {exec_time:.3f}s Input preparation took {prepare_time:.3f}s")
             combined_selected_tokens.append(selected_token_ids)
 
             start_index = end_index
@@ -1379,7 +1442,12 @@ class eSurgeRunner:
         )
 
         total_time = time.time() - execution_start_time
-        logger.debug(f"Total model execution completed in {total_time:.3f}s")
+
+        self.log_it(
+            f"Model execution took {exec_time:.3f}s "
+            f"Input preparation took {prepare_time:.3f}s "
+            f"execution completed in {total_time:.3f}s"
+        )
         return result
 
     @staticmethod
