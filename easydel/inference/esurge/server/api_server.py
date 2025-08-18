@@ -162,7 +162,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
             raise NotImplementedError()
         else:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.esurge.generate, prompts, sampling_params)
+            return await loop.run_in_executor(None, self.esurge.generate, prompts, sampling_params, None, False)
 
     def count_tokens(self, content: str) -> int:
         """Count tokens using eSurge tokenizer.
@@ -535,7 +535,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
 
         sampling_params = self._create_sampling_params(request)
-        outputs = esurge.generate(content, sampling_params)
+        outputs = esurge.generate(content, sampling_params, use_tqdm=False)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
@@ -766,7 +766,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         """
         prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
         sampling_params = self._create_sampling_params(request)
-        outputs = esurge.generate(prompt, sampling_params)
+        outputs = esurge.generate(prompt, sampling_params, use_tqdm=False)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
@@ -1102,7 +1102,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
             followup_prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages) + "\nassistant:"
 
         sampling_params = self._create_sampling_params(request)
-        final_outputs = esurge.generate(followup_prompt, sampling_params)
+        final_outputs = esurge.generate(followup_prompt, sampling_params, use_tqdm=False)
 
         if not final_outputs:
             raise RuntimeError("Follow-up generation failed")
