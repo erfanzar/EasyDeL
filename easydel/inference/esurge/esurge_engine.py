@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 import typing
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -112,6 +111,7 @@ class eSurge:
         auto_shard_model: bool = True,
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
+        runner_verbose: bool = False,
         use_combined_forward: bool = False,
         use_aot_forward: bool = True,
         esurge_name: str | None = None,
@@ -162,7 +162,6 @@ class eSurge:
         else:
             self.model = model
 
-        # Load tokenizer
         if tokenizer is None:
             if isinstance(model, str):
                 self.tokenizer = AutoTokenizer.from_pretrained(model)
@@ -172,9 +171,6 @@ class eSurge:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         else:
             self.tokenizer = tokenizer
-
-        # Initialize async lock for thread safety
-        self._async_lock = threading.Lock()
 
         self._monitoring_server = None
         self._dashboard = None
@@ -191,19 +187,17 @@ class eSurge:
             max_num_seqs=max_num_seqs,
             use_combined_forward=use_combined_forward,
             use_aot_forward=use_aot_forward,
+            verbose=runner_verbose,
         )
 
-        # Compile model
         if compile_runner:
             self.runner.compile()
-        # Initialize scheduler
         self.scheduler = Scheduler.from_runner(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
 
-        # Request tracking
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
@@ -260,15 +254,12 @@ class eSurge:
         else:
             request_ids = request_id
 
-        # Default sampling params
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=128)
 
-        # Add requests to scheduler
         for prompt, req_id in zip(prompts, request_ids, strict=False):
             self._add_request(req_id, prompt, sampling_params)
 
-        # Process requests
         outputs = []
         if use_tqdm:
             from tqdm import tqdm
@@ -277,17 +268,14 @@ class eSurge:
 
         completed = set()
         while len(completed) < len(prompts):
-            # Schedule and execute
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs:
                 model_output = self.runner.execute_model(scheduler_output)
                 engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
 
-                # Process engine outputs to update request outputs
                 if engine_outputs:
                     self._process_engine_outputs(engine_outputs)
 
-                # Check for completed requests
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
                         output = self._request_outputs[req_id]
@@ -301,29 +289,6 @@ class eSurge:
             pbar.close()
 
         return outputs
-
-    async def agenerate(
-        self,
-        prompts: str | list[str],
-        sampling_params: SamplingParams | None = None,
-        request_id: str | list[str] | None = None,
-    ) -> list[RequestOutput]:
-        """Async version of generate.
-
-        Note: Uses a lock to serialize JAX operations for thread safety.
-        """
-        loop = asyncio.get_event_loop()
-
-        def _generate_with_lock():
-            with self._async_lock:
-                return self.generate(
-                    prompts,
-                    sampling_params,
-                    request_id,
-                    False,
-                )
-
-        return await loop.run_in_executor(None, _generate_with_lock)
 
     def stream(
         self,
@@ -366,45 +331,6 @@ class eSurge:
                 if request_id in self._request_outputs:
                     yield self._request_outputs[request_id]
 
-    async def astream(
-        self,
-        prompts: str | list[str],
-        sampling_params: SamplingParams | None = None,
-        request_id: str | None = None,
-    ) -> AsyncIterator[RequestOutput]:
-        """Async streaming generation."""
-        if isinstance(prompts, list):
-            if len(prompts) == 0:
-                raise ValueError("Empty prompt list provided")
-            prompt = prompts[0]
-        else:
-            prompt = prompts
-
-        if request_id is None:
-            request_id = self._generate_request_id()
-
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=128)
-
-        # Add request
-        self._add_request(request_id, prompt, sampling_params)
-
-        # Stream outputs
-        while request_id not in self._request_outputs or not self._request_outputs[request_id].finished:
-            scheduler_output = self.scheduler.schedule()
-            if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs:
-                model_output = self.runner.execute_model(scheduler_output)
-                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-
-                # Process engine outputs
-                if engine_outputs:
-                    self._process_engine_outputs(engine_outputs)
-
-                if request_id in self._request_outputs:
-                    yield self._request_outputs[request_id]
-
-            await asyncio.sleep(0.001)  # Small delay for async cooperation
-
     def _add_request(
         self,
         request_id: str,
@@ -417,10 +343,8 @@ class eSurge:
         if isinstance(token_ids[0], list):
             token_ids = token_ids[0]
 
-        # Get EOS token
         eos_token_id = self.tokenizer.eos_token_id
 
-        # Create engine request
         engine_request = EngineRequest(
             request_id=request_id,
             prompt_token_ids=token_ids,
@@ -433,17 +357,15 @@ class eSurge:
             "prompt": prompt,
             "prompt_token_ids": token_ids,
             "generated_tokens": [],
-            "last_decoded_index": 0,  # Track where we last decoded from
+            "last_decoded_index": 0,
             "start_time": time.time(),
             "first_token_time": None,
         }
 
-        # Log metrics
         metrics_collector = get_metrics_collector()
         if metrics_collector:
             metrics_collector.start_request(request_id, len(token_ids))
 
-        # Initialize output with all fields
         self._request_outputs[request_id] = RequestOutput(
             request_id=request_id,
             prompt=prompt,
@@ -526,10 +448,10 @@ class eSurge:
                     request_data["last_decoded_index"] = len(request_data["generated_tokens"])
 
                     output = self._request_outputs[request_id]
-                    output.outputs[0].text = new_text  # Only the newly generated text
+                    output.outputs[0].text = new_text
                     output.outputs[0].token_ids = request_data["generated_tokens"].copy()
 
-                    output.accumulated_text = accumulated_text  # Full generated text
+                    output.accumulated_text = accumulated_text
                     output.num_generated_tokens = len(request_data["generated_tokens"])
 
                     elapsed = current_time - request_data["start_time"]
@@ -559,13 +481,11 @@ class eSurge:
                     num_prompt_tokens = len(request_data["prompt_token_ids"])
                     num_generated_tokens = len(request_data["generated_tokens"])
 
-                    # Update all metric fields
                     output.processing_time = elapsed
                     output.time_spent_generating = elapsed
                     output.num_generated_tokens = num_generated_tokens
                     output.first_token_time = request_data.get("first_token_time")
 
-                    # Calculate final TPS excluding TTFT
                     if output.first_token_time is not None and num_generated_tokens > 0:
                         generation_time = elapsed - output.first_token_time
                         output.tokens_per_second = num_generated_tokens / generation_time if generation_time > 0 else 0
@@ -581,7 +501,6 @@ class eSurge:
                         "tokens_per_second": output.tokens_per_second,
                     }
 
-                    # Complete request metrics logging
                     metrics_collector = get_metrics_collector()
                     if metrics_collector:
                         metrics_collector.complete_request(
@@ -625,7 +544,6 @@ class eSurge:
 
         logger.info("Starting eSurge monitoring services...")
 
-        # Initialize metrics collection if not already done
         if not get_metrics_collector():
             initialize_metrics(
                 log_file=log_file,
@@ -633,11 +551,10 @@ class eSurge:
                 history_size=history_size,
                 enable_detailed_logging=enable_detailed_logging,
             )
-            logger.info("📊 Metrics collection initialized")
+            logger.info(" Metrics collection initialized")
 
         urls = {}
 
-        # Start Prometheus metrics server
         if enable_prometheus:
             try:
                 from .monitoring import start_monitoring_server
@@ -647,13 +564,12 @@ class eSurge:
                     update_interval=1.0,
                 )
                 urls["prometheus"] = f"http://{dashboard_host}:{prometheus_port}/metrics"
-                logger.info(f"📈 Prometheus metrics: {urls['prometheus']}")
+                logger.info(f" Prometheus metrics: {urls['prometheus']}")
             except ImportError:
-                logger.info("⚠️ Prometheus monitoring unavailable (install prometheus-client)")
+                logger.info(" Prometheus monitoring unavailable (install prometheus-client)")
             except Exception as e:
-                logger.info(f"❌ Failed to start Prometheus server: {e}")
+                logger.info(f" Failed to start Prometheus server: {e}")
 
-        # Start web dashboard
         if enable_dashboard:
             try:
                 from .dashboard import create_dashboard
@@ -674,35 +590,34 @@ class eSurge:
                 urls["health"] = f"http://{dashboard_host}:{dashboard_port}/health"
                 urls["api"] = f"http://{dashboard_host}:{dashboard_port}/api/metrics"
 
-                logger.info(f"🌐 Web dashboard: {urls['dashboard']}")
-                logger.info(f"🩺 Health check: {urls['health']}")
+                logger.info(f" Web dashboard: {urls['dashboard']}")
+                logger.info(f" Health check: {urls['health']}")
 
             except ImportError:
-                logger.info("⚠️ Web dashboard unavailable (install fastapi uvicorn)")
+                logger.info(" Web dashboard unavailable (install fastapi uvicorn)")
             except Exception as e:
-                logger.info(f"❌ Failed to start dashboard: {e}")
+                logger.info(f" Failed to start dashboard: {e}")
 
-        # Start console monitor
         if enable_console:
             try:
                 from .monitoring import start_console_monitor
 
-                logger.info("🖥️ Starting console monitor...")
+                logger.info(" Starting console monitor...")
                 start_console_monitor(refresh_rate=1.0)
             except ImportError:
-                logger.info("⚠️ Console monitor unavailable (install rich)")
+                logger.info(" Console monitor unavailable (install rich)")
             except Exception as e:
-                logger.info(f"❌ Failed to start console monitor: {e}")
+                logger.info(f" Failed to start console monitor: {e}")
 
         self._monitoring_initialized = True
 
         if urls:
-            logger.info("\n✅ Monitoring services started successfully!")
-            logger.info("📊 Metrics will be automatically collected during inference")
+            logger.info(" Monitoring services started successfully!")
+            logger.info(" Metrics will be automatically collected during inference")
             if enable_dashboard:
-                logger.info(f"🌐 Open {urls['dashboard']} to view real-time metrics")
+                logger.info(f" Open {urls['dashboard']} to view real-time metrics")
         else:
-            logger.info("⚠️ No monitoring services were started successfully")
+            logger.info(" No monitoring services were started successfully")
         self._dashboard_urls = urls
         return urls
 
@@ -714,27 +629,24 @@ class eSurge:
 
         logger.info("Stopping eSurge monitoring services...")
 
-        # Stop monitoring server
         if self._monitoring_server:
             try:
                 self._monitoring_server.stop()
-                logger.info("📈 Prometheus server stopped")
+                logger.info(" Prometheus server stopped")
             except Exception as e:
-                logger.info(f"⚠️ Error stopping Prometheus server: {e}")
+                logger.info(f" Error stopping Prometheus server: {e}")
             self._monitoring_server = None
 
-        # Stop dashboard
         if self._dashboard_thread and self._dashboard_thread.is_alive():
             try:
-                # Dashboard will stop when the thread daemon exits
-                logger.info("🌐 Dashboard server will stop with process")
+                logger.info(" Dashboard server will stop with process")
             except Exception as e:
-                logger.info(f"⚠️ Error stopping dashboard: {e}")
+                logger.info(f" Error stopping dashboard: {e}")
             self._dashboard_thread = None
             self._dashboard = None
 
         self._monitoring_initialized = False
-        logger.info("✅ Monitoring services stopped")
+        logger.info(" Monitoring services stopped")
 
     def get_metrics_summary(self) -> dict[str, Any]:
         """Get current metrics summary for this eSurge instance."""
