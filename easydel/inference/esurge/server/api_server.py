@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import typing as tp
 import uuid
@@ -60,7 +61,18 @@ logger = get_logger("eSurgeApiServer")
 
 
 class ServerStatus(str, Enum):
-    """Server status enumeration."""
+    """Server status enumeration.
+
+    Represents the current operational state of the API server.
+    Used for health checks and monitoring.
+
+    Values:
+        STARTING: Server is initializing
+        READY: Server is ready to accept requests
+        BUSY: Server is processing at capacity
+        ERROR: Server encountered an error
+        SHUTTING_DOWN: Server is shutting down gracefully
+    """
 
     STARTING = "starting"
     READY = "ready"
@@ -71,7 +83,20 @@ class ServerStatus(str, Enum):
 
 @dataclass
 class ServerMetrics:
-    """Server performance metrics."""
+    """Server performance metrics.
+
+    Tracks aggregate performance statistics for the API server.
+    Updated in real-time as requests are processed.
+
+    Attributes:
+        total_requests: Total number of requests received.
+        successful_requests: Number of successfully completed requests.
+        failed_requests: Number of failed requests.
+        total_tokens_generated: Cumulative tokens generated across all requests.
+        average_tokens_per_second: Rolling average generation throughput.
+        uptime_seconds: Server uptime in seconds.
+        start_time: Server start timestamp.
+    """
 
     total_requests: int = 0
     successful_requests: int = 0
@@ -91,13 +116,27 @@ class ErrorResponse(BaseModel):
 
 
 def create_error_response(status_code: HTTPStatus, message: str, request_id: str | None = None) -> JSONResponse:
-    """Creates a standardized JSON error response."""
+    """Creates a standardized JSON error response.
+
+    Args:
+        status_code: HTTP status code for the error.
+        message: Human-readable error message.
+        request_id: Optional request ID for tracking.
+
+    Returns:
+        JSONResponse with error details in OpenAI API format.
+    """
     error_response = ErrorResponse(error={"message": message, "type": status_code.name}, request_id=request_id)
     return JSONResponse(content=error_response.model_dump(), status_code=status_code.value)
 
 
 class eSurgeAdapter(InferenceEngineAdapter):
-    """Adapter for eSurge inference engine."""
+    """Adapter for eSurge inference engine.
+
+    Bridges the synchronous eSurge engine with the async FastAPI server.
+    Implements the InferenceEngineAdapter interface for compatibility
+    with the base API server infrastructure.
+    """
 
     def __init__(self, esurge_instance: eSurge, model_name: str):
         self.esurge = esurge_instance
@@ -109,28 +148,43 @@ class eSurgeAdapter(InferenceEngineAdapter):
         sampling_params: SamplingParams,
         stream: bool = False,
     ) -> list[RequestOutput] | tp.AsyncGenerator[RequestOutput, None]:
-        """Generate using eSurge."""
+        """Generate text using eSurge engine.
+
+        Args:
+            prompts: Input prompt(s) for generation.
+            sampling_params: Generation parameters.
+            stream: Whether to stream results (not implemented).
+
+        Returns:
+            List of RequestOutput objects for batch generation.
+
+        Raises:
+            NotImplementedError: If stream=True (streaming not supported here).
+        """
         if stream:
-            async def stream_generator():
-                if isinstance(prompts, str):
-                    prompt_list = [prompts]
-                else:
-                    prompt_list = prompts
-
-                for prompt in prompt_list:
-                    for output in self.esurge.stream(prompt, sampling_params):
-                        yield output
-
-            return stream_generator()
+            raise NotImplementedError()
         else:
-            return self.esurge.generate(prompts, sampling_params)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.esurge.generate, prompts, sampling_params)
 
     def count_tokens(self, content: str) -> int:
-        """Count tokens using eSurge tokenizer."""
+        """Count tokens using eSurge tokenizer.
+
+        Args:
+            content: Text to tokenize.
+
+        Returns:
+            Number of tokens in the content.
+        """
         return len(self.esurge.tokenizer(content)["input_ids"])
 
     def get_model_info(self) -> dict[str, tp.Any]:
-        """Get eSurge model information."""
+        """Get eSurge model information.
+
+        Returns:
+            Dictionary containing model metadata: name, type, architecture,
+            max_model_len, and max_num_seqs.
+        """
         return {
             "name": self._model_name,
             "type": "esurge",
@@ -150,8 +204,19 @@ class eSurgeAdapter(InferenceEngineAdapter):
 
 
 class eSurgeApiServer(BaseInferenceApiServer):
-    """
-    eSurge-specific API server implementation with OpenAI compatibility.
+    """eSurge-specific API server implementation with OpenAI compatibility.
+
+    Provides a FastAPI-based REST API server that exposes eSurge engines
+    through OpenAI-compatible endpoints. Supports multiple models, streaming,
+    function calling, and comprehensive monitoring.
+
+    Features:
+    - OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
+    - Multi-model support with dynamic routing
+    - Streaming responses with Server-Sent Events (SSE)
+    - Function/tool calling support
+    - Real-time metrics and health monitoring
+    - Thread-safe request handling
     """
 
     def __init__(
@@ -161,6 +226,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
         enable_function_calling: bool = True,
         **kwargs,
     ) -> None:
+        """Initialize the eSurge API server.
+
+        Args:
+            esurge_map: Single eSurge instance or dict mapping model names to instances.
+            oai_like_processor: Enable OpenAI-like processor compatibility for chat templates.
+            enable_function_calling: Enable function/tool calling support.
+            **kwargs: Additional arguments passed to BaseInferenceApiServer.
+
+        Raises:
+            TypeError: If esurge_map values are not eSurge instances.
+        """
         if isinstance(esurge_map, eSurge):
             model_name = esurge_map.esurge_name
             esurge_map = {model_name: esurge_map}
@@ -189,7 +265,11 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def on_startup(self) -> None:
-        """Custom startup logic for eSurge."""
+        """Custom startup logic for eSurge.
+
+        Called when the FastAPI server starts. Logs loaded models
+        and sets server status to READY.
+        """
         logger.info(f"Loaded {len(self.adapters)} eSurge models")
         for name in self.adapters:
             logger.info(f"  - {name}")
@@ -197,7 +277,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
         logger.info("eSurge API Server is ready")
 
     def _get_adapter(self, model_name: str) -> eSurgeAdapter:
-        """Get adapter by model name."""
+        """Get adapter by model name.
+
+        Args:
+            model_name: Name of the model to retrieve.
+
+        Returns:
+            eSurgeAdapter instance for the specified model.
+
+        Raises:
+            HTTPException: If model not found (404).
+        """
         adapter = self.adapters.get(model_name)
         if adapter is None:
             available = list(self.adapters.keys())
@@ -205,7 +295,15 @@ class eSurgeApiServer(BaseInferenceApiServer):
         return adapter
 
     def _count_tokens(self, content: str, model_name: str | None = None) -> int:
-        """Count tokens for the given content."""
+        """Count tokens for the given content.
+
+        Args:
+            content: Text to tokenize.
+            model_name: Optional model to use for tokenization.
+
+        Returns:
+            Number of tokens in the content.
+        """
         if model_name:
             adapter = self._get_adapter(model_name)
             return adapter.count_tokens(content)
@@ -213,7 +311,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
         return adapter.count_tokens(content)
 
     def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
-        """Create sampling parameters from request."""
+        """Create sampling parameters from request.
+
+        Converts OpenAI API request parameters to eSurge SamplingParams.
+        Applies validation and defaults.
+
+        Args:
+            request: OpenAI API request object.
+
+        Returns:
+            SamplingParams configured for eSurge generation.
+        """
         max_tokens = int(request.max_tokens or 128)
         temperature = max(0.0, min(float(request.temperature or 1.0), 2.0))
 
@@ -235,7 +343,21 @@ class eSurgeApiServer(BaseInferenceApiServer):
         request: ChatCompletionRequest,
         esurge: eSurge,
     ) -> str:
-        """Prepare chat input for model."""
+        """Prepare chat input for model.
+
+        Applies chat template to message history, handling OpenAI format
+        conversion if needed.
+
+        Args:
+            request: Chat completion request with messages.
+            esurge: eSurge instance with tokenizer.
+
+        Returns:
+            Formatted prompt string ready for generation.
+
+        Raises:
+            RuntimeError: If chat template application fails.
+        """
         conversation = request.model_dump(exclude_unset=True)["messages"]
         processor = esurge.tokenizer
 
@@ -260,7 +382,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
             raise RuntimeError(f"Error tokenizing input: {e}") from e
 
     async def _prepare_chat_input_async(self, request: ChatCompletionRequest, esurge: eSurge) -> str:
-        """Prepare chat input asynchronously."""
+        """Prepare chat input asynchronously.
+
+        Async wrapper for _prepare_chat_input using thread pool.
+
+        Args:
+            request: Chat completion request.
+            esurge: eSurge instance.
+
+        Returns:
+            Formatted prompt string.
+        """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             self.thread_pool,
@@ -274,7 +406,21 @@ class eSurgeApiServer(BaseInferenceApiServer):
         request: ChatCompletionRequestWithTools,
         esurge: eSurge,
     ) -> str:
-        """Prepare input with function/tool definitions."""
+        """Prepare input with function/tool definitions.
+
+        Formats chat messages with tool/function definitions included
+        in the system prompt.
+
+        Args:
+            request: Chat request with tools/functions.
+            esurge: eSurge instance.
+
+        Returns:
+            Formatted prompt with tool definitions.
+
+        Raises:
+            RuntimeError: If template application fails.
+        """
         messages = [msg.model_dump() for msg in request.messages]
         processor = esurge.tokenizer
 
@@ -286,7 +432,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
         tools = request.get_tools()
         if tools:
             format_type = request.function_call_format or self.default_function_format
-
             tools_prompt = FunctionCallFormatter.format_tools_for_prompt(tools, format_type)
             if messages and messages[0].get("role") == "system":
                 messages[0]["content"] += f"\n\n{tools_prompt}"
@@ -323,7 +468,22 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
-        """Handle chat completion requests."""
+        """Handle chat completion requests.
+
+        Main endpoint for /v1/chat/completions. Supports both streaming and
+        non-streaming responses, with optional function calling.
+
+        Args:
+            request: Chat completion request (with or without tools).
+
+        Returns:
+            ChatCompletionResponse for non-streaming.
+            StreamingResponse for streaming.
+            JSONResponse with error on failure.
+
+        Raises:
+            HTTPException: For client errors (400, 404).
+        """
         request_id = str(uuid.uuid4())
         self.metrics.total_requests += 1
 
@@ -366,8 +526,24 @@ class eSurgeApiServer(BaseInferenceApiServer):
         request_id: str,
         is_function_request: bool = False,
     ) -> ChatCompletionResponse:
-        """Handle non-streaming chat completion."""
+        """Handle non-streaming chat completion.
 
+        Generates complete response and returns it as a single object.
+        Handles function call parsing if enabled.
+
+        Args:
+            request: Original chat request.
+            esurge: eSurge engine instance.
+            content: Formatted prompt.
+            request_id: Unique request ID.
+            is_function_request: Whether to parse for function calls.
+
+        Returns:
+            Complete chat response with usage statistics.
+
+        Raises:
+            RuntimeError: If generation fails.
+        """
         prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
 
         sampling_params = self._create_sampling_params(request)
@@ -389,9 +565,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
             self.metrics.average_tokens_per_second = (
                 self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
             )
-
-        if is_function_request:
-            pass
 
         choices = []
         for idx, completion in enumerate(output.outputs):
@@ -445,17 +618,58 @@ class eSurgeApiServer(BaseInferenceApiServer):
         request_id: str,
         is_function_request: bool = False,
     ) -> StreamingResponse:
-        """Handle streaming chat completion."""
+        """Handle streaming chat completion with delta chunks.
+
+        Streams incremental text as Server-Sent Events. Uses delta_text
+        field for efficient streaming of only new content.
+
+        Args:
+            request: Original chat request.
+            esurge: eSurge engine instance.
+            content: Formatted prompt.
+            request_id: Unique request ID.
+            is_function_request: Whether to parse for function calls.
+
+        Returns:
+            StreamingResponse with SSE format:
+            - Initial role chunk
+            - Content delta chunks as generated
+            - Final chunk with finish_reason
+            - [DONE] marker
+
+        The streaming format follows OpenAI's SSE specification with
+        'data: {...}' lines for each chunk.
+        """
 
         async def generate_stream():
             start_time = time.time()
             prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
             sampling_params = self._create_sampling_params(request)
 
+            # Bridge sync stream to async via thread + asyncio.Queue
+            loop = asyncio.get_event_loop()
+            q: asyncio.Queue[RequestOutput | None | Exception] = asyncio.Queue()
+
+            def _worker():
+                try:
+                    for out in esurge.stream(content, sampling_params):
+                        asyncio.run_coroutine_threadsafe(q.put(out), loop)
+                except Exception as exc:
+                    asyncio.run_coroutine_threadsafe(q.put(exc), loop)
+                finally:
+                    asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
             try:
                 total_generated = 0
                 first_token_time = None
+                last_delta_seq = -1
+                last_num_generated = 0
+                last_output: RequestOutput | None = None
 
+                # Initial role event
                 initial_chunk = ChatCompletionStreamResponse(
                     model=request.model,
                     choices=[
@@ -474,24 +688,46 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     ),
                 )
                 yield f"data: {initial_chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-                for output in esurge.stream(content, sampling_params):
-                    if first_token_time is None and output.outputs[0].text:
-                        first_token_time = time.time() - start_time
 
-                    new_text = output.outputs[0].text
-                    if new_text:
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+
+                    output: RequestOutput = item
+                    last_output = output
+
+                    # Compute delta:
+                    delta = ""
+                    # Preferred path: new engine fields
+                    if hasattr(output, "delta_text") and hasattr(output, "delta_seq"):
+                        if output.delta_text and output.delta_seq != last_delta_seq:
+                            delta = output.delta_text
+                            last_delta_seq = output.delta_seq
+                    else:
+                        # Fallback: treat outputs[0].text as delta but gate by num_generated_tokens
+                        maybe_delta = output.outputs[0].text
+                        if maybe_delta and output.num_generated_tokens > last_num_generated:
+                            delta = maybe_delta
+                            last_num_generated = output.num_generated_tokens
+
+                    if delta:
+                        if first_token_time is None:
+                            ft = getattr(output, "first_token_time", None)
+                            first_token_time = ft if ft is not None else (time.time() - start_time)
+
                         current_completion_tokens = output.num_generated_tokens
                         current_tps = output.tokens_per_second
                         elapsed_time = output.processing_time
-                        if first_token_time is None and output.first_token_time is not None:
-                            first_token_time = output.first_token_time
 
                         chunk = ChatCompletionStreamResponse(
                             model=request.model,
                             choices=[
                                 ChatCompletionStreamResponseChoice(
                                     index=0,
-                                    delta=DeltaMessage(content=new_text),
+                                    delta=DeltaMessage(content=delta),
                                     finish_reason=None,
                                 )
                             ],
@@ -501,16 +737,20 @@ class eSurgeApiServer(BaseInferenceApiServer):
                                 total_tokens=prompt_tokens + current_completion_tokens,
                                 tokens_per_second=current_tps,
                                 processing_time=elapsed_time,
+                                first_token_time=first_token_time,
                             ),
                         )
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
-                        total_generated = output.num_generated_tokens
+                        total_generated = current_completion_tokens
 
                     if output.finished:
                         break
 
-                final_output = output
+                if last_output is None:
+                    raise RuntimeError("No output received from streaming")
+
+                final_output = last_output
                 generation_time = final_output.processing_time
                 tokens_per_second = final_output.tokens_per_second
                 total_generated = final_output.num_generated_tokens
@@ -521,7 +761,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     total_tokens=prompt_tokens + total_generated,
                     tokens_per_second=tokens_per_second,
                     processing_time=generation_time,
-                    first_token_time=final_output.first_token_time,
+                    first_token_time=final_output.first_token_time or first_token_time,
                 )
 
                 final_chunk = ChatCompletionStreamResponse(
@@ -559,7 +799,21 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def completions(self, request: CompletionRequest) -> tp.Any:
-        """Handle completion requests."""
+        """Handle completion requests.
+
+        Endpoint for /v1/completions. Simpler text completion without
+        chat formatting.
+
+        Args:
+            request: Completion request.
+
+        Returns:
+            CompletionResponse or StreamingResponse.
+            JSONResponse with error on failure.
+
+        Raises:
+            HTTPException: For client errors.
+        """
         request_id = str(uuid.uuid4())
         self.metrics.total_requests += 1
 
@@ -594,7 +848,20 @@ class eSurgeApiServer(BaseInferenceApiServer):
         prompt: str,
         request_id: str,
     ) -> CompletionResponse:
-        """Handle non-streaming completion."""
+        """Handle non-streaming completion.
+
+        Args:
+            request: Original completion request.
+            esurge: eSurge engine instance.
+            prompt: Text prompt.
+            request_id: Unique request ID.
+
+        Returns:
+            Complete response with generated text and usage.
+
+        Raises:
+            RuntimeError: If generation fails.
+        """
         prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
         sampling_params = self._create_sampling_params(request)
         outputs = esurge.generate(prompt, sampling_params)
@@ -643,31 +910,83 @@ class eSurgeApiServer(BaseInferenceApiServer):
         prompt: str,
         request_id: str,
     ) -> StreamingResponse:
-        """Handle streaming completion."""
+        """Handle streaming completion with delta chunks.
+
+        Similar to chat streaming but for raw text completion.
+
+        Args:
+            request: Original completion request.
+            esurge: eSurge engine instance.
+            prompt: Text prompt.
+            request_id: Unique request ID.
+
+        Returns:
+            StreamingResponse with incremental text chunks.
+        """
 
         async def generate_stream():
             sampling_params = self._create_sampling_params(request)
             prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
 
+            loop = asyncio.get_event_loop()
+            q: asyncio.Queue[RequestOutput | None | Exception] = asyncio.Queue()
+
+            def _worker():
+                try:
+                    for out in esurge.stream(prompt, sampling_params):
+                        asyncio.run_coroutine_threadsafe(q.put(out), loop)
+                except Exception as exc:
+                    asyncio.run_coroutine_threadsafe(q.put(exc), loop)
+                finally:
+                    asyncio.run_coroutine_threadsafe(q.put(None), loop)
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+
             try:
                 total_generated = 0
                 first_token_time = None
+                last_delta_seq = -1
+                last_num_generated = 0
+                last_output: RequestOutput | None = None
 
-                for output in esurge.stream(prompt, sampling_params):
-                    new_text = output.outputs[0].text
-                    if new_text:
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+
+                    output: RequestOutput = item
+                    last_output = output
+
+                    # Compute delta
+                    delta = ""
+                    if hasattr(output, "delta_text") and hasattr(output, "delta_seq"):
+                        if output.delta_text and output.delta_seq != last_delta_seq:
+                            delta = output.delta_text
+                            last_delta_seq = output.delta_seq
+                    else:
+                        maybe_delta = output.outputs[0].text
+                        if maybe_delta and output.num_generated_tokens > last_num_generated:
+                            delta = maybe_delta
+                            last_num_generated = output.num_generated_tokens
+
+                    if delta:
+                        if first_token_time is None:
+                            ft = getattr(output, "first_token_time", None)
+                            first_token_time = ft
+
                         current_completion_tokens = output.num_generated_tokens
                         current_tps = output.tokens_per_second
                         elapsed_time = output.processing_time
-                        if first_token_time is None and output.first_token_time is not None:
-                            first_token_time = output.first_token_time
 
                         chunk = CompletionStreamResponse(
                             model=request.model,
                             choices=[
                                 CompletionStreamResponseChoice(
                                     index=0,
-                                    text=new_text,
+                                    text=delta,
                                     finish_reason=None,
                                 )
                             ],
@@ -677,16 +996,20 @@ class eSurgeApiServer(BaseInferenceApiServer):
                                 total_tokens=prompt_tokens + current_completion_tokens,
                                 tokens_per_second=current_tps,
                                 processing_time=elapsed_time,
+                                first_token_time=first_token_time,
                             ),
                         )
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
-                        total_generated = output.num_generated_tokens
+                        total_generated = current_completion_tokens
 
                     if output.finished:
                         break
 
-                final_output = output
+                if last_output is None:
+                    raise RuntimeError("No output received from streaming")
+
+                final_output = last_output
                 generation_time = final_output.processing_time
                 tokens_per_second = final_output.tokens_per_second
                 total_generated = final_output.num_generated_tokens
@@ -697,7 +1020,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     total_tokens=prompt_tokens + total_generated,
                     tokens_per_second=tokens_per_second,
                     processing_time=generation_time,
-                    first_token_time=final_output.first_token_time,
+                    first_token_time=final_output.first_token_time or first_token_time,
                 )
 
                 final_chunk = CompletionStreamResponse(
@@ -735,7 +1058,20 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def health_check(self) -> JSONResponse:
-        """Health check endpoint."""
+        """Health check endpoint.
+
+        Returns server health status and model information.
+
+        Returns:
+            JSONResponse with:
+            - status: Current server status
+            - timestamp: Current time
+            - uptime_seconds: Server uptime
+            - models: Loaded model information
+            - active_requests: Current request count
+
+            Status code 200 if READY, 503 otherwise.
+        """
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         model_health_info = {}
@@ -759,7 +1095,12 @@ class eSurgeApiServer(BaseInferenceApiServer):
         return JSONResponse(health_status, status_code=status_code)
 
     async def get_metrics(self) -> JSONResponse:
-        """Get server performance metrics."""
+        """Get server performance metrics.
+
+        Returns:
+            JSONResponse with comprehensive server metrics including
+            request counts, token statistics, throughput, and status.
+        """
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         return JSONResponse(
@@ -777,7 +1118,13 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def list_models(self) -> JSONResponse:
-        """List available models."""
+        """List available models.
+
+        OpenAI-compatible model listing endpoint.
+
+        Returns:
+            JSONResponse with list of available models and their metadata.
+        """
         models_data = []
         for model_id, adapter in self.adapters.items():
             model_info = adapter.get_model_info()
@@ -804,7 +1151,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def get_model(self, model_id: str) -> JSONResponse:
-        """Get model details."""
+        """Get model details.
+
+        Args:
+            model_id: Model identifier.
+
+        Returns:
+            JSONResponse with model metadata.
+
+        Raises:
+            HTTPException: If model not found.
+        """
         adapter = self._get_adapter(model_id)
         model_info = adapter.get_model_info()
 
@@ -823,7 +1180,14 @@ class eSurgeApiServer(BaseInferenceApiServer):
         )
 
     async def list_tools(self) -> JSONResponse:
-        """List available tools/functions for each model."""
+        """List available tools/functions for each model.
+
+        Returns example tool definitions and supported formats.
+        This is a placeholder that can be extended with actual tools.
+
+        Returns:
+            JSONResponse with tool definitions per model.
+        """
         tools_by_model = {}
 
         for model_name, _ in self.adapters.items():
@@ -957,8 +1321,18 @@ class eSurgeApiServer(BaseInferenceApiServer):
     async def execute_tool(self, request: tp.Any) -> JSONResponse:
         """Execute a tool/function call.
 
-        This is a placeholder implementation that can be extended
+        Placeholder endpoint for tool execution. Implement this method
         to integrate with actual tool execution systems.
+
+        Args:
+            request: Tool execution request.
+
+        Returns:
+            JSONResponse with NOT_IMPLEMENTED status.
+
+        Note:
+            This is a placeholder that should be implemented based on
+            specific tool execution requirements.
         """
         return create_error_response(
             HTTPStatus.NOT_IMPLEMENTED,
