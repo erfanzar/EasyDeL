@@ -23,6 +23,8 @@ import time
 from dataclasses import asdict
 from typing import Any
 
+from easydel.utils.helpers import get_logger
+
 try:
     import uvicorn
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -34,6 +36,8 @@ except ImportError:
     FASTAPI_AVAILABLE = False
 
 from .metrics import get_metrics_collector
+
+logger = get_logger("eSurgeDashboard")
 
 DASHBOARD_HTML_FIXED = """
 <!DOCTYPE html>
@@ -1447,10 +1451,10 @@ class eSurgeWebDashboard:
 
     def run(self, **kwargs) -> None:
         """Run the improved dashboard server."""
-        print(f"🚀 Starting eSurge Dashboard v2.0 at http://{self.host}:{self.port}")
-        print("📊 Enhanced with improved stability and error handling")
-        print(f"🔍 Health check available at: http://{self.host}:{self.port}/health")
-        print(f"📡 API endpoint: http://{self.host}:{self.port}/api/metrics")
+        logger.info(f" Starting eSurge Dashboard v2.0 at http://{self.host}:{self.port}")
+        logger.info(" Enhanced with improved stability and error handling")
+        logger.info(f" Health check available at: http://{self.host}:{self.port}/health")
+        logger.info(f" API endpoint: http://{self.host}:{self.port}/api/metrics")
 
         # Configure logging
         log_level = "debug" if self.debug else "info"

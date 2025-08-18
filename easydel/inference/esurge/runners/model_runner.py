@@ -58,9 +58,9 @@ Example:
 
 from __future__ import annotations
 
-import os
 import time
 import typing
+from functools import partial
 
 import jax
 from eformer import escale as es
@@ -83,8 +83,6 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurge")
-
-MIN_INPUT_SIZE = int(os.getenv("ESURGE_MIN_INPUT_SIZE", "8"))
 
 
 class ExecutorManager:
@@ -133,6 +131,7 @@ class ExecutorManager:
         kv_pages: PagesCache,
         use_combined_forward: bool = False,
         use_aot_forward: bool = True,
+        min_input_pad: int = 8,
     ):
         """Initialize the executor manager.
 
@@ -153,6 +152,7 @@ class ExecutorManager:
         self.kv_pages = kv_pages
         self.use_combined_forward = use_combined_forward
         self.use_aot_forward = use_aot_forward
+        self.min_input_pad = min_input_pad
         logger.debug("Splitting model module for graph-based execution")
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
@@ -252,7 +252,7 @@ class ExecutorManager:
         logger.debug(f"Token paddings: {num_tokens_paddings}")
         logger.debug(f"Max pages per request: {max_pages_per_req}, Max requests: {max_num_reqs}")
 
-        ufn = _get_padded_num_reqs_with_upper_limit
+        ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
         reqs_padds = list(set([ufn(num_reqs, max_num_reqs) for num_reqs in range(max_num_reqs)]))
         total_compilations = len(num_tokens_paddings) * len(reqs_padds)
         compilation_count = 0
@@ -616,7 +616,7 @@ class ExecutorManager:
         return example_args
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
+def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -635,7 +635,7 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
         >>> _get_padded_num_reqs_with_upper_limit(10, 32)  # Returns 16
         >>> _get_padded_num_reqs_with_upper_limit(20, 16)  # Returns 16
     """
-    res = MIN_INPUT_SIZE if x <= MIN_INPUT_SIZE else 1 << (x - 1).bit_length()
+    res = min_input_pad if x <= min_input_pad else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
 
 
@@ -702,7 +702,8 @@ class eSurgeRunner:
         hbm_utilization: float = 0.5,
         page_size: int = 128,
         max_model_len: int = 2**13,
-        max_num_seqs: int = MIN_INPUT_SIZE,
+        min_input_pad: int = 256,
+        max_num_seqs: int = 16,
         use_combined_forward: bool = False,
         use_aot_forward: bool = True,
         verbose: bool = False,
@@ -726,7 +727,9 @@ class eSurgeRunner:
         )
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = max_num_seqs
+
         self.max_model_len = max_model_len
+        self.min_input_pad = min(min_input_pad, max_num_seqs)
 
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
@@ -734,11 +737,12 @@ class eSurgeRunner:
 
         logger.debug("Creating ExecutorManager and initializing pages cache")
         self.executor_manager = ExecutorManager(
-            model,
-            model.mesh,
-            model.init_pages(self.metadata),
-            use_combined_forward,
-            use_aot_forward,
+            model=model,
+            mesh=model.mesh,
+            kv_pages=model.init_pages(self.metadata),
+            use_combined_forward=use_combined_forward,
+            use_aot_forward=use_aot_forward,
+            min_input_pad=self.min_input_pad,
         )
         self.log_it = logger.info if verbose else logger.debug
         logger.debug("Setting up internal variables and buffers")
@@ -926,7 +930,7 @@ class eSurgeRunner:
 
             nr_safe = jnp.maximum(nr, 1)
             next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
-            padded_num_reqs = jnp.where(nr <= MIN_INPUT_SIZE, jnp.int32(MIN_INPUT_SIZE), next_pow2)
+            padded_num_reqs = jnp.where(nr <= self.min_input_pad, jnp.int32(self.min_input_pad), next_pow2)
             padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
 
             tmp_logits = qsl[1:] - 1
@@ -1178,34 +1182,28 @@ class eSurgeRunner:
             - Modifies sequence buffer contents
             - May trigger buffer condensation
         """
-        # Remove finished requests
-        if scheduler_output.finished_req_ids:
-            logger.debug(f"Removing {len(scheduler_output.finished_req_ids)} finished requests")
+        # Remove finished requests from tracking
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
+        # Remove finished requests from sequence buffer
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
-                logger.debug(f"Removed finished request {req_id} at index {req_index}")
 
-        # Remove unscheduled ones currently in buffer
+        # Identify and remove unscheduled requests from buffer
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.sequence_buffer.req_id_to_index.keys()
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-
         for req_id in unscheduled_req_ids:
-            logger.debug(f"Removing unscheduled request {req_id} from sequence buffer")
             req_index = self.sequence_buffer.remove_request(req_id)
             assert req_index is not None
             removed_req_indices.append(req_index)
 
-        # Add new requests
+        # Add new requests to the tracking dictionary
         req_ids_to_add: list[str] = []
-        if scheduler_output.scheduled_new_reqs:
-            logger.debug(f"Adding {len(scheduler_output.scheduled_new_reqs)} new requests")
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.sampling_params is not None, "Pooling not supported in TPU"
             req_id = new_req_data.req_id
@@ -1219,54 +1217,70 @@ class eSurgeRunner:
                 output_token_ids=[],
             )
             req_ids_to_add.append(req_id)
-            logger.debug(f"Added new request {req_id} with {len(new_req_data.prompt_token_ids)} prompt tokens")
 
+        # Process cached requests and prepare batch updates
         req_data = scheduler_output.scheduled_cached_reqs
-        if req_data.req_ids:
-            logger.debug(f"Updating {len(req_data.req_ids)} cached requests")
+        upd_req_indices: list[int] = []  # Indices of requests to update
+        upd_num_computed_vals: list[int] = []  # New num_computed_tokens values
+        batched_page_rows: list[tuple[int, tuple[list[int], ...]]] = []  # Page table updates
+
+        # Update state for each cached request
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests.get(req_id)
             if req_state is None:
-                logger.warning(f"Cached request {req_id} not found in requests dict - skipping")
                 continue
 
-            num_computed_tokens = req_data.num_computed_tokens[i]
-            new_page_ids = req_data.new_page_ids[i]
+            nct = req_data.num_computed_tokens[i]  # New computed token count
+            new_page_ids = req_data.new_page_ids[i]  # New pages allocated for this request
             resumed_from_preemption = req_data.resumed_from_preemption[i]
-            req_state.num_computed_tokens = num_computed_tokens
+            req_state.num_computed_tokens = nct
 
+            # Handle page IDs based on preemption status
             if not resumed_from_preemption:
+                # Extend existing pages with new ones
                 for page_ids, new_ids in zip(req_state.page_ids, new_page_ids, strict=False):
                     page_ids.extend(new_ids)
             else:
+                # Replace pages entirely when resuming from preemption
                 req_state.page_ids = new_page_ids
 
+            # Check if request is already in sequence buffer
             req_index = self.sequence_buffer.req_id_to_index.get(req_id)
             if req_index is None:
+                # Request not in buffer, needs to be added
                 req_ids_to_add.append(req_id)
                 continue
-            self.sequence_buffer.num_computed_tokens = self.sequence_buffer.num_computed_tokens.at[req_index].set(
-                num_computed_tokens
-            )
-            self.sequence_buffer.page_table.append_row(new_page_ids, req_index)
 
-        # Add new or reinsert
+            # Collect updates for batched processing
+            upd_req_indices.append(req_index)
+            upd_num_computed_vals.append(int(nct))
+            batched_page_rows.append((req_index, new_page_ids))
+
+        # Batch update num_computed_tokens for efficiency
+        if upd_req_indices:
+            idx_arr = jnp.array(upd_req_indices, dtype=jnp.int32)
+            val_arr = jnp.array(upd_num_computed_vals, dtype=jnp.int32)
+            self.sequence_buffer.num_computed_tokens = self.sequence_buffer.num_computed_tokens.at[idx_arr].set(val_arr)
+
+        # Batch update page tables using optimized batched operation
+        if batched_page_rows:
+            indices = [ix for ix, _ in batched_page_rows]
+            pages_per_req = [ids for _, ids in batched_page_rows]
+            self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
+
+        # Add new/reinserted requests, reusing removed slots when possible
         removed_req_indices = sorted(removed_req_indices, reverse=True)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             req_index = removed_req_indices.pop() if removed_req_indices else None
             self.sequence_buffer.add_request(req_state, req_index)
-            logger.debug(
-                f"Added request {req_id} to sequence buffer at index {req_index if req_index is not None else 'new'}"
-            )
 
+        # Condense sequence buffer to remove gaps from removed requests
         if removed_req_indices:
-            logger.debug(f"Condensing sequence buffer, removing {len(removed_req_indices)} empty slots")
             self.sequence_buffer.condense(removed_req_indices)
 
+        # Return whether any changes occurred that might affect scheduling
         has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
-        if has_changes:
-            logger.debug(f"State update complete: {len(unscheduled_req_ids)} unscheduled, {len(req_ids_to_add)} added")
         return has_changes
 
     def _prepare_inputs(self, scheduler_output: SchedulerOutput, start_index: int):
