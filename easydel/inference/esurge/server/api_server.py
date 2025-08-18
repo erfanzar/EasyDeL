@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import traceback
 import typing as tp
 import uuid
 from dataclasses import dataclass, field
@@ -112,7 +111,6 @@ class eSurgeAdapter(InferenceEngineAdapter):
     ) -> list[RequestOutput] | tp.AsyncGenerator[RequestOutput, None]:
         """Generate using eSurge."""
         if stream:
-
             async def stream_generator():
                 if isinstance(prompts, str):
                     prompt_list = [prompts]
@@ -125,7 +123,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
 
             return stream_generator()
         else:
-            return self.esurge.generate(prompts, sampling_params, use_tqdm=False)
+            return self.esurge.generate(prompts, sampling_params)
 
     def count_tokens(self, content: str) -> int:
         """Count tokens using eSurge tokenizer."""
@@ -356,7 +354,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
             self.metrics.failed_requests += 1
             raise
         except Exception as e:
-            traceback.print_exc()
             self.metrics.failed_requests += 1
             logger.exception(f"Error in chat completion: {e}")
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
@@ -374,7 +371,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
 
         sampling_params = self._create_sampling_params(request)
-        outputs = esurge.generate(content, sampling_params, use_tqdm=False)
+        outputs = esurge.generate(content, sampling_params)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
@@ -493,7 +490,9 @@ class eSurgeApiServer(BaseInferenceApiServer):
                             model=request.model,
                             choices=[
                                 ChatCompletionStreamResponseChoice(
-                                    index=0, delta=DeltaMessage(content=new_text), finish_reason=None
+                                    index=0,
+                                    delta=DeltaMessage(content=new_text),
+                                    finish_reason=None,
                                 )
                             ],
                             usage=UsageInfo(
@@ -545,7 +544,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
             except Exception as e:
                 self.metrics.failed_requests += 1
-                traceback.print_exc()
                 logger.exception(f"Error during streaming: {e}")
                 error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
                 yield f"data: {error_response.body.decode()}\n\n"
@@ -599,7 +597,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         """Handle non-streaming completion."""
         prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
         sampling_params = self._create_sampling_params(request)
-        outputs = esurge.generate(prompt, sampling_params, use_tqdm=False)
+        outputs = esurge.generate(prompt, sampling_params)
 
         if not outputs:
             raise RuntimeError("Generation failed to produce output")
@@ -666,7 +664,13 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
                         chunk = CompletionStreamResponse(
                             model=request.model,
-                            choices=[CompletionStreamResponseChoice(index=0, text=new_text, finish_reason=None)],
+                            choices=[
+                                CompletionStreamResponseChoice(
+                                    index=0,
+                                    text=new_text,
+                                    finish_reason=None,
+                                )
+                            ],
                             usage=UsageInfo(
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=current_completion_tokens,
@@ -698,7 +702,13 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
                 final_chunk = CompletionStreamResponse(
                     model=request.model,
-                    choices=[CompletionStreamResponseChoice(index=0, text="", finish_reason="stop")],
+                    choices=[
+                        CompletionStreamResponseChoice(
+                            index=0,
+                            text="",
+                            finish_reason="stop",
+                        )
+                    ],
                     usage=usage,
                 )
 
@@ -710,7 +720,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
             except Exception as e:
                 self.metrics.failed_requests += 1
-                traceback.print_exc()
                 logger.exception(f"Error during streaming: {e}")
                 error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
                 yield f"data: {error_response.body.decode()}\n\n"
@@ -882,7 +891,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
             followup_prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages) + "\nassistant:"
 
         sampling_params = self._create_sampling_params(request)
-        final_outputs = esurge.generate(followup_prompt, sampling_params, use_tqdm=False)
+        final_outputs = esurge.generate(followup_prompt, sampling_params)
 
         if not final_outputs:
             raise RuntimeError("Follow-up generation failed")

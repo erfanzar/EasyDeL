@@ -103,6 +103,7 @@ class eSurge:
         tokenizer: str | PreTrainedTokenizerBase | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         max_model_len: int = 8192,
+        min_input_pad: int = 16,
         max_num_seqs: int = 256,
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float = 0.85,
@@ -184,6 +185,7 @@ class eSurge:
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_model_len=max_model_len,
+            min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
             use_combined_forward=use_combined_forward,
             use_aot_forward=use_aot_forward,
@@ -480,7 +482,17 @@ class eSurge:
             return len(self.scheduler.running)
 
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
-        """Process engine outputs and update request outputs with optimized performance."""
+        """Process engine outputs and update request outputs with optimized performance.
+
+        This method processes the raw engine outputs and updates the user-facing request
+        outputs with generated tokens, text, and performance metrics. It handles:
+        - Token decoding with configurable intervals for streaming
+        - Performance metrics calculation (tokens/sec, time to first token)
+        - Request completion and cleanup
+
+        Args:
+            engine_outputs: Dictionary mapping client IDs to their engine outputs
+        """
         metrics_collector = get_metrics_collector()
         current_time = time.time()
 
@@ -507,24 +519,31 @@ class eSurge:
                         generated_tokens.extend(new_tokens)
                         num_generated = len(generated_tokens)
 
+                        # Record time to first token if this is the first token
                         if request_data["first_token_time"] is None and num_generated > 0:
                             request_data["first_token_time"] = current_time - request_data["start_time"]
                             if metrics_collector:
                                 metrics_collector.record_first_token(request_id)
 
+                        # Update metrics with new tokens
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(request_id, len(new_tokens))
 
+                        # Determine if we should decode tokens to text
+                        # (for streaming efficiency, we batch decode at intervals)
                         last_index = request_data["last_decoded_index"]
                         should_decode = False
                         if num_generated - last_index >= self.decode_interval_tokens:
+                            # Decode when we have accumulated enough tokens
                             should_decode = True
                         elif (
                             current_time - request_data.get("last_decode_time", current_time)
                         ) >= self.decode_interval_secs:
+                            # Decode when enough time has passed
                             should_decode = True
 
                         if should_decode:
+                            # Decode only the new tokens since last decode
                             new_text = self.tokenizer.decode(
                                 generated_tokens[last_index:],
                                 skip_special_tokens=True,
@@ -548,6 +567,7 @@ class eSurge:
                         else:
                             output.tokens_per_second = 0
 
+                    # Handle request completion
                     if engine_output.finished:
                         output.finished = True
                         completion = output.outputs[0]
@@ -558,12 +578,12 @@ class eSurge:
                         if not new_tokens:
                             completion.text = ""
 
-                        # Final metrics calculation
+                        # Calculate final metrics for completed request
                         elapsed = current_time - request_data["start_time"]
                         num_prompt_tokens = len(request_data["prompt_token_ids"])
                         num_generated_tokens = len(request_data["generated_tokens"])
 
-                        # Decode full text only on completion
+                        # Decode full text only on completion for final output
                         output.accumulated_text = self.tokenizer.decode(
                             request_data["generated_tokens"],
                             skip_special_tokens=True,
