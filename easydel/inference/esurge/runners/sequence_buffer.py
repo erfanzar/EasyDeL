@@ -314,14 +314,9 @@ class SequenceBuffer:
         if req_id in self.req_id_to_index:
             raise ValueError(f"Request ID {req_id} is already present at index {self.req_id_to_index[req_id]}.")
 
-        # Choose a safe index
         req_index = self._allocate_index(req_index)
-
-        # Compute safe prompt truncation without mutating the request (unless you want to)
         prompt_length = len(request.prompt_token_ids)
-        # Ensure some budget for generation if user asks for more than max length
         safe_num_tokens = self.max_model_len // 2 if request.num_tokens > self.max_model_len else request.num_tokens
-        # Clamp to [0, max_model_len]
         safe_num_tokens = max(0, min(int(safe_num_tokens), self.max_model_len))
 
         if prompt_length > self.max_model_len:
@@ -338,7 +333,6 @@ class SequenceBuffer:
         else:
             truncated_prompt = request.prompt_token_ids
 
-        # Install ID and output-token ref, growing lists if needed
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
@@ -347,9 +341,6 @@ class SequenceBuffer:
             self.req_output_token_ids[req_index] = request.output_token_ids
 
         self.req_id_to_index[req_id] = req_index
-
-        # Copy tokens using the truncated prompt (avoid mutating request)
-        # Option A: do not mutate request; temporarily replace during copy
         original_prompt = request.prompt_token_ids
         try:
             request.prompt_token_ids = truncated_prompt
@@ -472,57 +463,24 @@ class SequenceBuffer:
         self.page_table.swap_row(i1, i2)
 
     def _swap_array_values(self, i1: int, i2: int) -> None:
-        """Efficiently swap array values between two indices."""
+        """Efficiently swap array values between two indices using JIT-compiled swap_rows."""
 
-        scalar_arrays = [
-            self.num_tokens,
-            self.num_tokens_no_spec,
-            self.num_prompt_tokens,
-            self.num_computed_tokens,
-            self.temperature,
-            self.top_p,
-            self.top_k,
-            self.frequency_penalties,
-            self.presence_penalties,
-            self.repetition_penalties,
-            self.min_p,
-        ]
-
-        for i, array in enumerate(scalar_arrays):
-            temp = array[i1]
-            array = array.at[i1].set(array[i2])
-            array = array.at[i2].set(temp)
-            if i == 0:
-                self.num_tokens = array
-            elif i == 1:
-                self.num_tokens_no_spec = array
-            elif i == 2:
-                self.num_prompt_tokens = array
-            elif i == 3:
-                self.num_computed_tokens = array
-            elif i == 4:
-                self.temperature = array
-            elif i == 5:
-                self.top_p = array
-            elif i == 6:
-                self.top_k = array
-            elif i == 7:
-                self.frequency_penalties = array
-            elif i == 8:
-                self.presence_penalties = array
-            elif i == 9:
-                self.repetition_penalties = array
-            elif i == 10:
-                self.min_p = array
-
-        temp_row = self.token_ids[i1]
-        self.token_ids = self.token_ids.at[i1].set(self.token_ids[i2])
-        self.token_ids = self.token_ids.at[i2].set(temp_row)
+        # Use JIT-compiled swap_rows for all arrays
+        self.num_tokens = swap_rows(self.num_tokens, i1, i2)
+        self.num_tokens_no_spec = swap_rows(self.num_tokens_no_spec, i1, i2)
+        self.num_prompt_tokens = swap_rows(self.num_prompt_tokens, i1, i2)
+        self.num_computed_tokens = swap_rows(self.num_computed_tokens, i1, i2)
+        self.temperature = swap_rows(self.temperature, i1, i2)
+        self.top_p = swap_rows(self.top_p, i1, i2)
+        self.top_k = swap_rows(self.top_k, i1, i2)
+        self.frequency_penalties = swap_rows(self.frequency_penalties, i1, i2)
+        self.presence_penalties = swap_rows(self.presence_penalties, i1, i2)
+        self.repetition_penalties = swap_rows(self.repetition_penalties, i1, i2)
+        self.min_p = swap_rows(self.min_p, i1, i2)
+        self.token_ids = swap_rows(self.token_ids, i1, i2)
 
         if self.allowed_token_ids_mask is not None:
-            temp_row = self.allowed_token_ids_mask[i1]
-            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[i1].set(self.allowed_token_ids_mask[i2])
-            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[i2].set(temp_row)
+            self.allowed_token_ids_mask = swap_rows(self.allowed_token_ids_mask, i1, i2)
 
     def condense(self, empty_req_indices: list[int]) -> None:
         """Efficiently condense the buffer by moving requests to fill empty slots."""
@@ -548,7 +506,7 @@ class SequenceBuffer:
         del self.req_output_token_ids[self.num_reqs :]
 
     def _move_request(self, from_idx: int, to_idx: int) -> None:
-        """Move a request from one index to another."""
+        """Move a request from one index to another using JIT-compiled move_row."""
         req_id = self._req_ids[from_idx]
         assert req_id is not None
 
@@ -557,51 +515,19 @@ class SequenceBuffer:
         self.req_output_token_ids[to_idx] = self.req_output_token_ids[from_idx]
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
-
-        num_tokens = int(self.num_tokens[from_idx])
-        self.token_ids = self.token_ids.at[to_idx, :num_tokens].set(self.token_ids[from_idx, :num_tokens])
-
-        scalar_arrays = [
-            self.num_tokens,
-            self.num_tokens_no_spec,
-            self.num_prompt_tokens,
-            self.num_computed_tokens,
-            self.temperature,
-            self.top_p,
-            self.top_k,
-            self.frequency_penalties,
-            self.presence_penalties,
-            self.repetition_penalties,
-            self.min_p,
-        ]
-
-        for i, array in enumerate(scalar_arrays):
-            array = array.at[to_idx].set(array[from_idx])
-            if i == 0:
-                self.num_tokens = array
-            elif i == 1:
-                self.num_tokens_no_spec = array
-            elif i == 2:
-                self.num_prompt_tokens = array
-            elif i == 3:
-                self.num_computed_tokens = array
-            elif i == 4:
-                self.temperature = array
-            elif i == 5:
-                self.top_p = array
-            elif i == 6:
-                self.top_k = array
-            elif i == 7:
-                self.frequency_penalties = array
-            elif i == 8:
-                self.presence_penalties = array
-            elif i == 9:
-                self.repetition_penalties = array
-            elif i == 10:
-                self.min_p = array
-
+        self.token_ids = move_row(self.token_ids, from_idx, to_idx)
+        self.num_tokens = move_row(self.num_tokens, from_idx, to_idx)
+        self.num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)
+        self.num_prompt_tokens = move_row(self.num_prompt_tokens, from_idx, to_idx)
+        self.num_computed_tokens = move_row(self.num_computed_tokens, from_idx, to_idx)
+        self.temperature = move_row(self.temperature, from_idx, to_idx)
+        self.top_p = move_row(self.top_p, from_idx, to_idx)
+        self.top_k = move_row(self.top_k, from_idx, to_idx)
+        self.frequency_penalties = move_row(self.frequency_penalties, from_idx, to_idx)
+        self.presence_penalties = move_row(self.presence_penalties, from_idx, to_idx)
+        self.repetition_penalties = move_row(self.repetition_penalties, from_idx, to_idx)
+        self.min_p = move_row(self.min_p, from_idx, to_idx)
         self.page_table.move_row(from_idx, to_idx)
-
         self._move_sparse_data(from_idx, to_idx)
 
     def _move_sparse_data(self, from_idx: int, to_idx: int) -> None:
@@ -626,18 +552,14 @@ class SequenceBuffer:
             self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[from_idx].set(False)
 
     def _make_prompt_token_ids_tensor(self) -> jax.Array:
-        """Create a padded tensor of prompt token IDs."""
+        """Create a padded tensor of prompt token IDs using JIT-compiled pack_prompts."""
         if self.num_reqs == 0:
             return jnp.empty((0, 0), dtype=jnp.int32)
 
         max_prompt_len = int(jnp.max(self.num_prompt_tokens[: self.num_reqs]))
-        prompt_token_ids = jnp.full((self.num_reqs, max_prompt_len), self.vocab_size, dtype=jnp.int32)
 
-        for i in range(self.num_reqs):
-            num_prompt = int(self.num_prompt_tokens[i])
-            prompt_token_ids = prompt_token_ids.at[i, :num_prompt].set(self.token_ids[i, :num_prompt])
-
-        return prompt_token_ids
+        # Use the JIT-compiled pack_prompts function
+        return pack_prompts(self.token_ids, self.num_prompt_tokens, self.num_reqs, max_prompt_len, self.vocab_size)
 
     @property
     def num_reqs(self) -> int:
@@ -809,6 +731,8 @@ class ModelRunnerSamplingMetadata:
 
         num_reqs = sequence_buffer.num_reqs
 
+        # For now, fall back to the original implementation since num_reqs is dynamic
+        # and JIT has issues with dynamic slicing
         def fill_slice(arr, fill_val):
             return arr.at[num_reqs:padded_num_reqs].set(fill_val)[:padded_num_reqs]
 

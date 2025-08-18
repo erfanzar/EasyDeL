@@ -202,6 +202,16 @@ class eSurge:
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
 
+        self._scheduler_lock = threading.RLock()  # Reentrant lock for nested access
+        self._request_lock = threading.RLock()
+        self._output_lock = threading.RLock()
+        self._counter_lock = threading.Lock()
+
+        self._scheduler_thread: threading.Thread | None = None
+        self._scheduler_running = False
+        self._output_event = threading.Event()
+        self.initiate()
+
     def _calculate_model_size(self, graphstate) -> str:
         """Calculates the model size in billions of parameters."""
         try:
@@ -225,6 +235,59 @@ class eSurge:
     def esurge_name(self) -> str:
         """Returns a standardized name for the esruge and its model."""
         return self._esurge_name or self._get_model_name(self.model)
+
+    def initiate(self) -> None:
+        """Start the background scheduler loop.
+
+        This method starts a background thread that continuously runs the scheduler
+        and processes requests. It enables asynchronous request handling.
+        """
+        with self._scheduler_lock:
+            if self._scheduler_running:
+                logger.info("Scheduler loop is already running")
+                return
+
+            def _scheduler_loop():
+                """Background loop that continuously schedules and executes requests."""
+                logger.info("Starting background scheduler loop")
+                while self._scheduler_running:
+                    try:
+                        scheduler_output = self.scheduler.schedule()
+                        model_output = self.runner.execute_model(scheduler_output)
+                        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+
+                        if engine_outputs:
+                            self._process_engine_outputs(engine_outputs)
+                            self._output_event.set()
+
+                    except Exception as e:
+                        logger.error(f"Error in scheduler loop: {e}")
+                        time.sleep(0.01)
+
+                logger.info("Background scheduler loop stopped")
+
+            self._scheduler_running = True
+            self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+            self._scheduler_thread.start()
+            logger.info("Background scheduler initiated")
+
+    def terminate(self) -> None:
+        """Stop the background scheduler loop."""
+        with self._scheduler_lock:
+            if not self._scheduler_running:
+                logger.info("Scheduler loop is not running")
+                return
+
+            logger.info("Stopping background scheduler loop...")
+            self._scheduler_running = False
+
+            if self._scheduler_thread:
+                self._scheduler_thread.join(timeout=5.0)
+                if self._scheduler_thread.is_alive():
+                    logger.warning("Scheduler thread did not stop gracefully")
+                self._scheduler_thread = None
+
+            logger.info("Background scheduler terminated")
 
     def generate(
         self,
@@ -267,15 +330,15 @@ class eSurge:
             pbar = tqdm(total=len(prompts), desc="Generating")
 
         completed = set()
+
+        if not self._scheduler_running:
+            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+
         while len(completed) < len(prompts):
-            scheduler_output = self.scheduler.schedule()
-            if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs:
-                model_output = self.runner.execute_model(scheduler_output)
-                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+            self._output_event.wait(timeout=0.1)
+            self._output_event.clear()
 
-                if engine_outputs:
-                    self._process_engine_outputs(engine_outputs)
-
+            with self._output_lock:
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
                         output = self._request_outputs[req_id]
@@ -284,7 +347,6 @@ class eSurge:
                             outputs.append(output)
                             if use_tqdm:
                                 pbar.update(1)
-
         if use_tqdm:
             pbar.close()
 
@@ -320,193 +382,209 @@ class eSurge:
             sampling_params = SamplingParams(max_tokens=128)
 
         self._add_request(request_id, prompt, sampling_params)
+        last_output = None
 
-        while request_id not in self._request_outputs or not self._request_outputs[request_id].finished:
-            scheduler_output = self.scheduler.schedule()
-            if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs:
-                model_output = self.runner.execute_model(scheduler_output)
-                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-                if engine_outputs:
-                    self._process_engine_outputs(engine_outputs)
+        if not self._scheduler_running:
+            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+
+        while True:
+            self._output_event.wait(timeout=0.01)
+
+            with self._output_lock:
                 if request_id in self._request_outputs:
-                    yield self._request_outputs[request_id]
+                    current_output = self._request_outputs[request_id]
+                    if current_output != last_output:
+                        last_output = current_output
+                        yield current_output
+                    if current_output.finished:
+                        break
 
-    def _add_request(
-        self,
-        request_id: str,
-        prompt: str,
-        sampling_params: SamplingParams,
-    ) -> None:
+    def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         """Add a new request to the scheduler."""
         tokenizer_output = self.tokenizer(prompt, return_tensors=None)
         token_ids = tokenizer_output["input_ids"]
         if isinstance(token_ids[0], list):
             token_ids = token_ids[0]
 
-        eos_token_id = self.tokenizer.eos_token_id
-
-        engine_request = EngineRequest(
-            request_id=request_id,
-            prompt_token_ids=token_ids,
-            sampling_params=sampling_params,
-            eos_token_id=eos_token_id,
+        self.scheduler.add_request(
+            EngineRequest(
+                request_id=request_id,
+                prompt_token_ids=token_ids,
+                sampling_params=sampling_params,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
         )
 
-        self.scheduler.add_request(engine_request)
-        self._active_requests[request_id] = {
-            "prompt": prompt,
-            "prompt_token_ids": token_ids,
-            "generated_tokens": [],
-            "last_decoded_index": 0,
-            "start_time": time.time(),
-            "first_token_time": None,
-        }
+        with self._request_lock:
+            self._active_requests[request_id] = {
+                "prompt": prompt,
+                "prompt_token_ids": token_ids,
+                "generated_tokens": [],
+                "last_decoded_index": 0,
+                "start_time": time.time(),
+                "first_token_time": None,
+            }
 
         metrics_collector = get_metrics_collector()
         if metrics_collector:
             metrics_collector.start_request(request_id, len(token_ids))
 
-        self._request_outputs[request_id] = RequestOutput(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=token_ids,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="",
-                    token_ids=[],
-                )
-            ],
-            finished=False,
-            accumulated_text="",
-            tokens_per_second=0.0,
-            num_generated_tokens=0,
-            time_spent_generating=0.0,
-            first_token_time=None,
-            processing_time=0.0,
-        )
+        with self._output_lock:
+            self._request_outputs[request_id] = RequestOutput(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_token_ids=token_ids,
+                outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+                finished=False,
+                accumulated_text="",
+                tokens_per_second=0.0,
+                num_generated_tokens=0,
+                time_spent_generating=0.0,
+                first_token_time=None,
+                processing_time=0.0,
+            )
 
     def _generate_request_id(self) -> str:
         """Generate unique request ID."""
-        self._request_counter += 1
-        return f"req-{uuid.uuid4().hex}-{self._request_counter}"
+        with self._counter_lock:
+            self._request_counter += 1
+            return f"req-{uuid.uuid4().hex}-{self._request_counter}"
 
     def abort_request(self, request_id: str) -> None:
         """Abort a specific request."""
-        if request_id in self.scheduler.requests:
-            self.scheduler.requests[request_id].status = EngineRequestStatus.FINISHED_ABORTED
+        with self._scheduler_lock:
+            if request_id in self.scheduler.requests:
+                self.scheduler.requests[request_id].status = EngineRequestStatus.FINISHED_ABORTED
+
+        # Clean up tracking data
+        with self._request_lock:
+            self._active_requests.pop(request_id, None)
+
+        with self._output_lock:
+            if request_id in self._request_outputs:
+                self._request_outputs[request_id].finished = True
 
     @property
     def num_pending_requests(self) -> int:
         """Get number of pending requests."""
-        return len(self.scheduler.waiting)
+        with self._scheduler_lock:
+            return len(self.scheduler.waiting)
 
     @property
     def num_running_requests(self) -> int:
         """Get number of running requests."""
-        return len(self.scheduler.running)
+        with self._scheduler_lock:
+            return len(self.scheduler.running)
 
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
-        """Process engine outputs and update request outputs."""
-        for client_outputs in engine_outputs.values():
-            for engine_output in client_outputs.outputs:
-                request_id = engine_output.request_id
+        """Process engine outputs and update request outputs with optimized performance."""
+        metrics_collector = get_metrics_collector()
+        current_time = time.time()
 
-                if request_id not in self._request_outputs:
-                    continue
+        with self._request_lock:
+            active_requests = self._active_requests
 
-                request_data = self._active_requests.get(request_id)
-                if not request_data:
-                    continue
+        with self._output_lock:
+            for client_outputs in engine_outputs.values():
+                for engine_output in client_outputs.outputs:
+                    request_id = engine_output.request_id
 
-                new_tokens = engine_output.new_token_ids
-                if new_tokens:
-                    request_data["generated_tokens"].extend(new_tokens)
+                    if request_id not in self._request_outputs:
+                        continue
 
-                    current_time = time.time()
-                    if request_data["first_token_time"] is None and len(request_data["generated_tokens"]) > 0:
-                        request_data["first_token_time"] = current_time - request_data["start_time"]
+                    request_data = active_requests.get(request_id)
+                    if not request_data:
+                        continue
 
-                        metrics_collector = get_metrics_collector()
+                    output = self._request_outputs[request_id]
+                    new_tokens = engine_output.new_token_ids
+
+                    if new_tokens:
+                        # Batch token operations
+                        generated_tokens = request_data["generated_tokens"]
+                        generated_tokens.extend(new_tokens)
+                        num_generated = len(generated_tokens)
+
+                        # Track first token time
+                        if request_data["first_token_time"] is None and num_generated > 0:
+                            request_data["first_token_time"] = current_time - request_data["start_time"]
+                            if metrics_collector:
+                                metrics_collector.record_first_token(request_id)
+
                         if metrics_collector:
-                            metrics_collector.record_first_token(request_id)
+                            metrics_collector.add_generated_tokens(request_id, len(new_tokens))
 
-                    metrics_collector = get_metrics_collector()
-                    if metrics_collector:
-                        metrics_collector.add_generated_tokens(request_id, len(new_tokens))
-
-                    accumulated_text = self.tokenizer.decode(
-                        request_data["generated_tokens"],
-                        skip_special_tokens=True,
-                    )
-
-                    last_index = request_data["last_decoded_index"]
-                    new_text = self.tokenizer.decode(
-                        request_data["generated_tokens"][last_index:],
-                        skip_special_tokens=True,
-                    )
-                    request_data["last_decoded_index"] = len(request_data["generated_tokens"])
-
-                    output = self._request_outputs[request_id]
-                    output.outputs[0].text = new_text
-                    output.outputs[0].token_ids = request_data["generated_tokens"].copy()
-
-                    output.accumulated_text = accumulated_text
-                    output.num_generated_tokens = len(request_data["generated_tokens"])
-
-                    elapsed = current_time - request_data["start_time"]
-                    output.processing_time = elapsed
-                    output.time_spent_generating = elapsed
-                    output.first_token_time = request_data["first_token_time"]
-
-                    if request_data["first_token_time"] is not None and output.num_generated_tokens > 0:
-                        generation_time = elapsed - request_data["first_token_time"]
-                        output.tokens_per_second = (
-                            output.num_generated_tokens / generation_time if generation_time > 0 else 0
+                        last_index = request_data["last_decoded_index"]
+                        new_text = self.tokenizer.decode(
+                            generated_tokens[last_index:],
+                            skip_special_tokens=True,
                         )
-                    else:
-                        output.tokens_per_second = 0
+                        request_data["last_decoded_index"] = num_generated
+                        completion = output.outputs[0]
+                        completion.text = new_text
+                        completion.token_ids = generated_tokens.copy()
 
-                if engine_output.finished:
-                    output = self._request_outputs[request_id]
-                    output.finished = True
-                    output.outputs[0].finish_reason = (
-                        str(engine_output.finish_reason) if engine_output.finish_reason else None
-                    )
+                        output.num_generated_tokens = num_generated
+                        elapsed = current_time - request_data["start_time"]
+                        output.processing_time = elapsed
+                        output.time_spent_generating = elapsed
+                        output.first_token_time = request_data["first_token_time"]
 
-                    if not new_tokens:
-                        output.outputs[0].text = ""
+                        # Calculate tokens per second
+                        if request_data["first_token_time"] is not None and num_generated > 0:
+                            generation_time = elapsed - request_data["first_token_time"]
+                            output.tokens_per_second = num_generated / generation_time if generation_time > 0 else 0
+                        else:
+                            output.tokens_per_second = 0
 
-                    elapsed = time.time() - request_data["start_time"]
-                    num_prompt_tokens = len(request_data["prompt_token_ids"])
-                    num_generated_tokens = len(request_data["generated_tokens"])
-
-                    output.processing_time = elapsed
-                    output.time_spent_generating = elapsed
-                    output.num_generated_tokens = num_generated_tokens
-                    output.first_token_time = request_data.get("first_token_time")
-
-                    if output.first_token_time is not None and num_generated_tokens > 0:
-                        generation_time = elapsed - output.first_token_time
-                        output.tokens_per_second = num_generated_tokens / generation_time if generation_time > 0 else 0
-                    else:
-                        output.tokens_per_second = 0
-
-                    output.metrics = {
-                        "prompt_tokens": num_prompt_tokens,
-                        "generated_tokens": num_generated_tokens,
-                        "total_tokens": num_prompt_tokens + num_generated_tokens,
-                        "processing_time": elapsed,
-                        "first_token_time": output.first_token_time,
-                        "tokens_per_second": output.tokens_per_second,
-                    }
-
-                    metrics_collector = get_metrics_collector()
-                    if metrics_collector:
-                        metrics_collector.complete_request(
-                            request_id,
-                            finish_reason=output.outputs[0].finish_reason,
+                    if engine_output.finished:
+                        output.finished = True
+                        completion = output.outputs[0]
+                        completion.finish_reason = (
+                            str(engine_output.finish_reason) if engine_output.finish_reason else None
                         )
+
+                        if not new_tokens:
+                            completion.text = ""
+
+                        # Final metrics calculation
+                        elapsed = current_time - request_data["start_time"]
+                        num_prompt_tokens = len(request_data["prompt_token_ids"])
+                        num_generated_tokens = len(request_data["generated_tokens"])
+
+                        # Decode full text only on completion
+                        output.accumulated_text = self.tokenizer.decode(
+                            request_data["generated_tokens"],
+                            skip_special_tokens=True,
+                        )
+
+                        output.processing_time = elapsed
+                        output.time_spent_generating = elapsed
+                        output.num_generated_tokens = num_generated_tokens
+                        output.first_token_time = request_data.get("first_token_time")
+
+                        if output.first_token_time is not None and num_generated_tokens > 0:
+                            generation_time = elapsed - output.first_token_time
+                            output.tokens_per_second = (
+                                num_generated_tokens / generation_time if generation_time > 0 else 0
+                            )
+                        else:
+                            output.tokens_per_second = 0
+
+                        output.metrics = {
+                            "prompt_tokens": num_prompt_tokens,
+                            "generated_tokens": num_generated_tokens,
+                            "total_tokens": num_prompt_tokens + num_generated_tokens,
+                            "processing_time": elapsed,
+                            "first_token_time": output.first_token_time,
+                            "tokens_per_second": output.tokens_per_second,
+                        }
+
+                        if metrics_collector:
+                            metrics_collector.complete_request(
+                                request_id,
+                                finish_reason=completion.finish_reason,
+                            )
 
     def start_monitoring(
         self,
@@ -674,7 +752,15 @@ class eSurge:
         return self._monitoring_initialized
 
     def __del__(self):
-        """Cleanup monitoring services when eSurge instance is destroyed."""
+        """Cleanup monitoring services and background threads when eSurge instance is destroyed."""
+        # Stop background scheduler if running
+        if self._scheduler_running:
+            try:
+                self.terminate()
+            except Exception:
+                pass
+
+        # Stop monitoring services
         if self._monitoring_initialized:
             try:
                 self.stop_monitoring()
