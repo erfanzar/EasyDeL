@@ -198,6 +198,8 @@ class eSurge:
             enable_prefix_caching=enable_prefix_caching,
         )
 
+        self.decode_interval_tokens = 8
+        self.decode_interval_secs = 0.05
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
@@ -423,6 +425,7 @@ class eSurge:
                 "last_decoded_index": 0,
                 "start_time": time.time(),
                 "first_token_time": None,
+                "last_decode_time": time.time(),  # NEW
             }
 
         metrics_collector = get_metrics_collector()
@@ -500,12 +503,10 @@ class eSurge:
                     new_tokens = engine_output.new_token_ids
 
                     if new_tokens:
-                        # Batch token operations
                         generated_tokens = request_data["generated_tokens"]
                         generated_tokens.extend(new_tokens)
                         num_generated = len(generated_tokens)
 
-                        # Track first token time
                         if request_data["first_token_time"] is None and num_generated > 0:
                             request_data["first_token_time"] = current_time - request_data["start_time"]
                             if metrics_collector:
@@ -515,14 +516,25 @@ class eSurge:
                             metrics_collector.add_generated_tokens(request_id, len(new_tokens))
 
                         last_index = request_data["last_decoded_index"]
-                        new_text = self.tokenizer.decode(
-                            generated_tokens[last_index:],
-                            skip_special_tokens=True,
-                        )
-                        request_data["last_decoded_index"] = num_generated
-                        completion = output.outputs[0]
-                        completion.text = new_text
-                        completion.token_ids = generated_tokens.copy()
+                        should_decode = False
+                        if num_generated - last_index >= self.decode_interval_tokens:
+                            should_decode = True
+                        elif (
+                            current_time - request_data.get("last_decode_time", current_time)
+                        ) >= self.decode_interval_secs:
+                            should_decode = True
+
+                        if should_decode:
+                            new_text = self.tokenizer.decode(
+                                generated_tokens[last_index:],
+                                skip_special_tokens=True,
+                            )
+                            request_data["last_decoded_index"] = num_generated
+                            request_data["last_decode_time"] = current_time
+
+                            completion = output.outputs[0]
+                            completion.text = new_text
+                            completion.token_ids = generated_tokens.copy()
 
                         output.num_generated_tokens = num_generated
                         elapsed = current_time - request_data["start_time"]
@@ -530,7 +542,6 @@ class eSurge:
                         output.time_spent_generating = elapsed
                         output.first_token_time = request_data["first_token_time"]
 
-                        # Calculate tokens per second
                         if request_data["first_token_time"] is not None and num_generated > 0:
                             generation_time = elapsed - request_data["first_token_time"]
                             output.tokens_per_second = num_generated / generation_time if generation_time > 0 else 0
