@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 import typing as tp
 import uuid
@@ -45,8 +44,6 @@ from ...openai_api_modules import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
-    CompletionStreamResponse,
-    CompletionStreamResponseChoice,
     DeltaMessage,
     FunctionCallFormat,
     FunctionCallFormatter,
@@ -338,11 +335,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
             stop=request.stop,
         )
 
-    def _prepare_chat_input(
-        self,
-        request: ChatCompletionRequest,
-        esurge: eSurge,
-    ) -> str:
+    def _prepare_chat_input(self, request: ChatCompletionRequest, esurge: eSurge) -> str:
         """Prepare chat input for model.
 
         Applies chat template to message history, handling OpenAI format
@@ -394,12 +387,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
             Formatted prompt string.
         """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self._prepare_chat_input,
-            request,
-            esurge,
-        )
+        return await loop.run_in_executor(self.thread_pool, self._prepare_chat_input, request, esurge)
 
     def _prepare_chat_input_with_tools(
         self,
@@ -584,14 +572,9 @@ class eSurgeApiServer(BaseInferenceApiServer):
             else:
                 message = ChatMessage(role="assistant", content=response_text)
                 finish_reason = completion.finish_reason or "stop"
-
-            choices.append(
-                ChatCompletionResponseChoice(
-                    index=idx,
-                    message=message,
-                    finish_reason=finish_reason,
-                )
-            )
+            if finish_reason == "finished":
+                finish_reason = "stop"
+            choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
 
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
@@ -642,118 +625,37 @@ class eSurgeApiServer(BaseInferenceApiServer):
         """
 
         async def generate_stream():
-            start_time = time.time()
             prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
             sampling_params = self._create_sampling_params(request)
-
-            # Bridge sync stream to async via thread + asyncio.Queue
-            loop = asyncio.get_event_loop()
-            q: asyncio.Queue[RequestOutput | None | Exception] = asyncio.Queue()
-
-            def _worker():
-                try:
-                    for out in esurge.stream(content, sampling_params):
-                        asyncio.run_coroutine_threadsafe(q.put(out), loop)
-                except Exception as exc:
-                    asyncio.run_coroutine_threadsafe(q.put(exc), loop)
-                finally:
-                    asyncio.run_coroutine_threadsafe(q.put(None), loop)
-
-            t = threading.Thread(target=_worker, daemon=True)
-            t.start()
-
             try:
-                total_generated = 0
-                first_token_time = None
-                last_delta_seq = -1
-                last_num_generated = 0
-                last_output: RequestOutput | None = None
+                for output in esurge.stream(content, sampling_params):
+                    current_completion_tokens = output.num_generated_tokens
+                    current_tps = output.tokens_per_second
+                    elapsed_time = output.processing_time
 
-                # Initial role event
-                initial_chunk = ChatCompletionStreamResponse(
-                    model=request.model,
-                    choices=[
-                        ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta=DeltaMessage(role="assistant"),
-                            finish_reason=None,
-                        )
-                    ],
-                    usage=UsageInfo(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=0,
-                        total_tokens=prompt_tokens,
-                        tokens_per_second=0.0,
-                        processing_time=0.0,
-                    ),
-                )
-                yield f"data: {initial_chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-
-                while True:
-                    item = await q.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-
-                    output: RequestOutput = item
-                    last_output = output
-
-                    # Compute delta:
-                    delta = ""
-                    # Preferred path: new engine fields
-                    if hasattr(output, "delta_text") and hasattr(output, "delta_seq"):
-                        if output.delta_text and output.delta_seq != last_delta_seq:
-                            delta = output.delta_text
-                            last_delta_seq = output.delta_seq
-                    else:
-                        # Fallback: treat outputs[0].text as delta but gate by num_generated_tokens
-                        maybe_delta = output.outputs[0].text
-                        if maybe_delta and output.num_generated_tokens > last_num_generated:
-                            delta = maybe_delta
-                            last_num_generated = output.num_generated_tokens
-
-                    if delta:
-                        if first_token_time is None:
-                            ft = getattr(output, "first_token_time", None)
-                            first_token_time = ft if ft is not None else (time.time() - start_time)
-
-                        current_completion_tokens = output.num_generated_tokens
-                        current_tps = output.tokens_per_second
-                        elapsed_time = output.processing_time
-
-                        chunk = ChatCompletionStreamResponse(
-                            model=request.model,
-                            choices=[
-                                ChatCompletionStreamResponseChoice(
-                                    index=0,
-                                    delta=DeltaMessage(content=delta),
-                                    finish_reason=None,
-                                )
-                            ],
-                            usage=UsageInfo(
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=current_completion_tokens,
-                                total_tokens=prompt_tokens + current_completion_tokens,
-                                tokens_per_second=current_tps,
-                                processing_time=elapsed_time,
-                                first_token_time=first_token_time,
-                            ),
-                        )
-                        yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-
-                        total_generated = current_completion_tokens
-
-                    if output.finished:
-                        break
-
-                if last_output is None:
-                    raise RuntimeError("No output received from streaming")
-
-                final_output = last_output
-                generation_time = final_output.processing_time
-                tokens_per_second = final_output.tokens_per_second
-                total_generated = final_output.num_generated_tokens
+                    chunk = ChatCompletionStreamResponse(
+                        model=request.model,
+                        choices=[
+                            ChatCompletionStreamResponseChoice(
+                                index=0,
+                                delta=DeltaMessage(content=output.delta_text, role="assistant"),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=UsageInfo(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=current_completion_tokens,
+                            total_tokens=prompt_tokens + current_completion_tokens,
+                            tokens_per_second=current_tps,
+                            processing_time=elapsed_time,
+                            first_token_time=output.first_token_time,
+                        ),
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+                    total_generated = current_completion_tokens
+                    generation_time = output.processing_time
+                    tokens_per_second = output.tokens_per_second
+                    total_generated = output.num_generated_tokens
 
                 usage = UsageInfo(
                     prompt_tokens=prompt_tokens,
@@ -761,7 +663,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     total_tokens=prompt_tokens + total_generated,
                     tokens_per_second=tokens_per_second,
                     processing_time=generation_time,
-                    first_token_time=final_output.first_token_time or first_token_time,
+                    first_token_time=output.first_token_time,
                 )
 
                 final_chunk = ChatCompletionStreamResponse(
@@ -769,7 +671,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     choices=[
                         ChatCompletionStreamResponseChoice(
                             index=0,
-                            delta=DeltaMessage(),
+                            delta=DeltaMessage(content="", role="assistant"),
                             finish_reason="stop",
                         )
                     ],
@@ -925,94 +827,39 @@ class eSurgeApiServer(BaseInferenceApiServer):
         """
 
         async def generate_stream():
-            sampling_params = self._create_sampling_params(request)
             prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
-
-            loop = asyncio.get_event_loop()
-            q: asyncio.Queue[RequestOutput | None | Exception] = asyncio.Queue()
-
-            def _worker():
-                try:
-                    for out in esurge.stream(prompt, sampling_params):
-                        asyncio.run_coroutine_threadsafe(q.put(out), loop)
-                except Exception as exc:
-                    asyncio.run_coroutine_threadsafe(q.put(exc), loop)
-                finally:
-                    asyncio.run_coroutine_threadsafe(q.put(None), loop)
-
-            t = threading.Thread(target=_worker, daemon=True)
-            t.start()
-
+            sampling_params = self._create_sampling_params(request)
             try:
-                total_generated = 0
-                first_token_time = None
-                last_delta_seq = -1
-                last_num_generated = 0
-                last_output: RequestOutput | None = None
+                for output in esurge.stream(prompt, sampling_params):
+                    current_completion_tokens = output.num_generated_tokens
+                    current_tps = output.tokens_per_second
+                    elapsed_time = output.processing_time
 
-                while True:
-                    item = await q.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
+                    chunk = ChatCompletionStreamResponse(
+                        model=request.model,
+                        choices=[
+                            ChatCompletionStreamResponseChoice(
+                                index=0,
+                                delta=DeltaMessage(content=output.delta_text, role="assistant"),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=UsageInfo(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=current_completion_tokens,
+                            total_tokens=prompt_tokens + current_completion_tokens,
+                            tokens_per_second=current_tps,
+                            processing_time=elapsed_time,
+                            first_token_time=output.first_token_time,
+                        ),
+                    )
+                    yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
 
-                    output: RequestOutput = item
-                    last_output = output
+                    total_generated = current_completion_tokens
 
-                    # Compute delta
-                    delta = ""
-                    if hasattr(output, "delta_text") and hasattr(output, "delta_seq"):
-                        if output.delta_text and output.delta_seq != last_delta_seq:
-                            delta = output.delta_text
-                            last_delta_seq = output.delta_seq
-                    else:
-                        maybe_delta = output.outputs[0].text
-                        if maybe_delta and output.num_generated_tokens > last_num_generated:
-                            delta = maybe_delta
-                            last_num_generated = output.num_generated_tokens
-
-                    if delta:
-                        if first_token_time is None:
-                            ft = getattr(output, "first_token_time", None)
-                            first_token_time = ft
-
-                        current_completion_tokens = output.num_generated_tokens
-                        current_tps = output.tokens_per_second
-                        elapsed_time = output.processing_time
-
-                        chunk = CompletionStreamResponse(
-                            model=request.model,
-                            choices=[
-                                CompletionStreamResponseChoice(
-                                    index=0,
-                                    text=delta,
-                                    finish_reason=None,
-                                )
-                            ],
-                            usage=UsageInfo(
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=current_completion_tokens,
-                                total_tokens=prompt_tokens + current_completion_tokens,
-                                tokens_per_second=current_tps,
-                                processing_time=elapsed_time,
-                                first_token_time=first_token_time,
-                            ),
-                        )
-                        yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-
-                        total_generated = current_completion_tokens
-
-                    if output.finished:
-                        break
-
-                if last_output is None:
-                    raise RuntimeError("No output received from streaming")
-
-                final_output = last_output
-                generation_time = final_output.processing_time
-                tokens_per_second = final_output.tokens_per_second
-                total_generated = final_output.num_generated_tokens
+                    generation_time = output.processing_time
+                    tokens_per_second = output.tokens_per_second
+                    total_generated = output.num_generated_tokens
 
                 usage = UsageInfo(
                     prompt_tokens=prompt_tokens,
@@ -1020,15 +867,15 @@ class eSurgeApiServer(BaseInferenceApiServer):
                     total_tokens=prompt_tokens + total_generated,
                     tokens_per_second=tokens_per_second,
                     processing_time=generation_time,
-                    first_token_time=final_output.first_token_time or first_token_time,
+                    first_token_time=output.first_token_time,
                 )
 
-                final_chunk = CompletionStreamResponse(
+                final_chunk = ChatCompletionStreamResponse(
                     model=request.model,
                     choices=[
-                        CompletionStreamResponseChoice(
+                        ChatCompletionStreamResponseChoice(
                             index=0,
-                            text="",
+                            delta=DeltaMessage(content="", role="assistant"),
                             finish_reason="stop",
                         )
                     ],
@@ -1312,9 +1159,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
         return ChatCompletionResponse(
             model=request.model,
-            choices=[
-                ChatCompletionResponseChoice(index=0, message=message, finish_reason=completion.finish_reason or "stop")
-            ],
+            choices=[ChatCompletionResponseChoice(index=0, message=message, finish_reason="stop")],
             usage=usage,
         )
 

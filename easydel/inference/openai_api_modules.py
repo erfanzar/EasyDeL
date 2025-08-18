@@ -174,7 +174,7 @@ class ChatCompletionResponseChoice(BaseModel):
 
     index: int
     message: ChatMessage
-    finish_reason: tp.Literal["stop", "length", "function_call"] | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call", "abort"] | None = None
 
 
 class ChatCompletionResponse(BaseModel):
