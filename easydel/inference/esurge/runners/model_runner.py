@@ -1451,6 +1451,7 @@ class eSurgeRunner:
         return result
 
     @staticmethod
+    @jax.jit
     def _update_token_buffers_optimized(
         token_ids: jax.Array,  # [max_reqs, max_len]
         num_tokens: jax.Array,  # [max_reqs]
@@ -1498,55 +1499,51 @@ class eSurgeRunner:
         req_ids = cast(list[str], self.sequence_buffer.req_ids[:num_reqs])
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {req_id: None for req_id in req_ids}
 
-        max_gen_len = int(selected_token_ids.shape[-1])
+        # max_gen_len = int(selected_token_ids.shape[-1])
+        # if max_gen_len == 1:
+        # logger.debug("Using vectorized path for single-token generation")
+        sampled_flat = selected_token_ids.squeeze(-1)
+        update_rows: list[int] = []
+        update_tokens: list[int] = []
+        update_seq_lens: list[int] = []
 
-        if max_gen_len == 1:
-            # Vectorized path (typical decoding)
-            logger.debug("Using vectorized path for single-token generation")
-            sampled_flat = selected_token_ids.squeeze(-1)  # [num_reqs]
-            # Discard indices: just don't update buffer, and clear returned list entry
-            update_rows: list[int] = []
-            update_tokens: list[int] = []
-            update_seq_lens: list[int] = []
+        valid_sampled_token_ids = [[int(sampled_flat[i])] for i in range(num_reqs)]
+        for idx in discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[idx].clear()
 
-            valid_sampled_token_ids = [[int(sampled_flat[i])] for i in range(num_reqs)]
-            for idx in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[idx].clear()
+        for i, req_state, seq_len in request_seq_lens:
+            token_id = int(sampled_flat[i])
+            update_rows.append(i)
+            update_tokens.append(token_id)
+            update_seq_lens.append(seq_len)
+            req_state.output_token_ids.append(token_id)
 
-            for i, req_state, seq_len in request_seq_lens:
-                token_id = int(sampled_flat[i])
-                update_rows.append(i)
-                update_tokens.append(token_id)
-                update_seq_lens.append(seq_len)
-                req_state.output_token_ids.append(token_id)
+        if update_rows:
+            rows = jnp.array(update_rows, dtype=jnp.int32)
+            toks = jnp.array(update_tokens, dtype=jnp.int32)
+            lens = jnp.array(update_seq_lens, dtype=jnp.int32)
+            self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens = self._update_token_buffers_optimized(
+                self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens, rows, toks, lens
+            )
 
-            if update_rows:
-                rows = jnp.array(update_rows, dtype=jnp.int32)
-                toks = jnp.array(update_tokens, dtype=jnp.int32)
-                lens = jnp.array(update_seq_lens, dtype=jnp.int32)
-                self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens = self._update_token_buffers_optimized(
-                    self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens, rows, toks, lens
-                )
+        # else:
+        # logger.debug(f"Using ragged path for multi-token generation (max_gen_len={max_gen_len})")
+        # print(selected_token_ids)
+        # valid_mask = selected_token_ids != -1
+        # gen_lens = valid_mask.sum(axis=1).tolist()
+        # valid_sampled_token_ids = [seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)]
+        # self.sequence_buffer.num_tokens = self.sequence_buffer.num_tokens.at[:num_reqs].add(jnp.array(gen_lens))
 
-        else:
-            # Rare ragged multi-token case (keep original logic)
-            logger.debug(f"Using ragged path for multi-token generation (max_gen_len={max_gen_len})")
-            valid_mask = selected_token_ids != -1
-            gen_lens = valid_mask.sum(axis=1).tolist()
-            valid_sampled_token_ids = [seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)]
-            self.sequence_buffer.num_tokens = self.sequence_buffer.num_tokens.at[:num_reqs].add(jnp.array(gen_lens))
+        # for i, req_state, seq_len in request_seq_lens:
+        #     if i >= len(gen_lens):
+        #         logger.error(f"Index {i} out of bounds for gen_lens (size={len(gen_lens)})")
+        #         continue
+        #     target_slice = slice(seq_len - gen_lens[i] + 1, seq_len + 1)
+        #     self.sequence_buffer.token_ids = self.sequence_buffer.token_ids.at[i, target_slice].set(
+        #         jnp.array(valid_sampled_token_ids[i], dtype=jnp.int32)
+        #     )
+        #     req_state.output_token_ids.extend(valid_sampled_token_ids[i])
 
-            for i, req_state, seq_len in request_seq_lens:
-                if i >= len(gen_lens):
-                    logger.error(f"Index {i} out of bounds for gen_lens (size={len(gen_lens)})")
-                    continue
-                target_slice = slice(seq_len - gen_lens[i] + 1, seq_len + 1)
-                self.sequence_buffer.token_ids = self.sequence_buffer.token_ids.at[i, target_slice].set(
-                    jnp.array(valid_sampled_token_ids[i], dtype=jnp.int32)
-                )
-                req_state.output_token_ids.extend(valid_sampled_token_ids[i])
-
-        # Log runner metrics
         metrics_collector = get_metrics_collector()
         if metrics_collector:
             logger.debug("Recording metrics to metrics collector")

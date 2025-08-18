@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 import typing as tp
 from http import HTTPStatus
 
@@ -396,8 +397,8 @@ class vInferenceApiServer(BaseInferenceApiServer):
         except HTTPException:
             raise
         except Exception as e:
+            traceback.print_exc()
             logger.exception(f"Error in chat completion: {e}")
-
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
 
     async def completions(self, request: CompletionRequest) -> tp.Any:
