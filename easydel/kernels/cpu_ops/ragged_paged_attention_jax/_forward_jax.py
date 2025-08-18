@@ -38,7 +38,7 @@ def _ragged_paged_attention(
     q_heads_per_group = num_q_heads // num_kv_heads
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     qblocks = min(4, total_query_tokens if total_query_tokens > 0 else 4)
-    kvblocks = min(32, max_pages_per_sequence if max_pages_per_sequence > 0 else 32)
+    kvblocks = min(64, max_pages_per_sequence if max_pages_per_sequence > 0 else 64)
     queries = queries * softmax_scale
     padd = (qblocks - total_query_tokens % qblocks) % qblocks + qblocks
     if padd > 0:
@@ -138,12 +138,7 @@ def _ragged_paged_attention(
                     (query_block_global_start, 0, 0, 0),
                 )
 
-            return jax.lax.fori_loop(
-                0,
-                num_query_blocks,
-                _process_query_block,
-                output_accumulator,
-            )
+            return jax.lax.fori_loop(0, num_query_blocks, _process_query_block, output_accumulator)
 
         return jax.lax.cond(
             num_queries_for_seq > 0,
