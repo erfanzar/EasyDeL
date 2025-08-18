@@ -343,15 +343,54 @@ def load_cached_functions(verbose: bool = True) -> None:
 
 
 def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None = None):
-    """Save a compiled function to disk with its serialization metadata."""
+    """Save a compiled JAX function to disk for later reuse.
+
+    Serializes a compiled function along with its input/output tree structures,
+    allowing it to be loaded and executed in future Python sessions.
+
+    Args:
+        path: Directory path where the compiled function will be saved.
+              Will be created if it doesn't exist.
+        fn: Compiled JAX function (output of lowered.compile()).
+        prefix: Optional prefix for the filename. Useful for organizing
+               multiple compiled functions in the same directory.
+
+    Files Created:
+        - {prefix}-compiled.executable: Serialized function and metadata
+
+    Example:
+        >>> # Compile a function
+        >>> jitted = jax.jit(my_function)
+        >>> lowered = jitted.lower(sample_input)
+        >>> compiled = lowered.compile()
+        >>>
+        >>> # Save to disk
+        >>> from pathlib import Path
+        >>> cache_dir = Path("./my_cache")
+        >>> save_compiled_fn(cache_dir, compiled, prefix="model_v1")
+        >>>
+        >>> # File created: ./my_cache/model_v1-compiled.executable
+
+    Raises:
+        Warning: If serialization fails (logged, not raised).
+
+    Notes:
+        - Compiled functions are hardware-specific
+        - Large models may produce large cache files
+        - Uses pickle for serialization (standard security caveats apply)
+    """
+    from pathlib import Path
+
+    path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     prefix = prefix or ""
-    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
     serialized, in_tree, out_tree = serialize(fn)
     try:
-        pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+        with open(filename, "wb") as f:
+            pickle.dump((serialized, in_tree, out_tree), f)
     except Exception as e:
-        warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
+        warnings.warn(f"Could not save compiled function to {filename}: {e}", stacklevel=2)
 
 
 def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):

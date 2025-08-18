@@ -84,7 +84,7 @@ from .data_managers import (
     TextDatasetInform,
     VisualDatasetInform,
 )
-from .helpers import Timer, Timers, capture_time, check_bool_flag, get_cache_dir, get_logger
+from .helpers import ProgressLogger, Timer, Timers, capture_time, check_bool_flag, get_cache_dir, get_logger
 from .lazy_import import LazyModule, is_package_available
 from .rngs_utils import GenerateRNG, JaxRNG
 
@@ -103,6 +103,7 @@ __all__ = (
     "GenerateRNG",
     "JaxRNG",
     "LazyModule",
+    "ProgressLogger",
     "TextDatasetInform",
     "Timer",
     "Timers",
