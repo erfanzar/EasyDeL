@@ -58,9 +58,9 @@ Example:
 
 from __future__ import annotations
 
+import os
 import time
 import typing
-from typing import cast
 
 import jax
 from eformer import escale as es
@@ -83,6 +83,8 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurge")
+
+MIN_INPUT_SIZE = int(os.getenv("ESURGE_MIN_INPUT_SIZE", "8"))
 
 
 class ExecutorManager:
@@ -440,7 +442,7 @@ class ExecutorManager:
                     sampling_params.top_p.astype(logits.dtype),
                     sampling_params.temperature.astype(logits.dtype),
                     keys[1:],
-                    64,
+                    32,
                 )
                 return samples.reshape(-1, 1), output.past_key_values, keys[0]
 
@@ -633,7 +635,7 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
         >>> _get_padded_num_reqs_with_upper_limit(10, 32)  # Returns 16
         >>> _get_padded_num_reqs_with_upper_limit(20, 16)  # Returns 16
     """
-    res = 8 if x <= 8 else 1 << (x - 1).bit_length()
+    res = MIN_INPUT_SIZE if x <= MIN_INPUT_SIZE else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
 
 
@@ -700,7 +702,7 @@ class eSurgeRunner:
         hbm_utilization: float = 0.5,
         page_size: int = 128,
         max_model_len: int = 2**13,
-        max_num_seqs: int = 8,
+        max_num_seqs: int = MIN_INPUT_SIZE,
         use_combined_forward: bool = False,
         use_aot_forward: bool = True,
         verbose: bool = False,
@@ -922,10 +924,9 @@ class eSurgeRunner:
             slot_mapping_buf = slot_mapping_buf.at[1, :].set(sm1)
             slot_mapping_buf = slot_mapping_buf.at[2, :].set(sm2)
 
-            # padded_num_reqs: 8 if <=8 else next pow2, capped
             nr_safe = jnp.maximum(nr, 1)
             next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
-            padded_num_reqs = jnp.where(nr <= 8, jnp.int32(8), next_pow2)
+            padded_num_reqs = jnp.where(nr <= MIN_INPUT_SIZE, jnp.int32(MIN_INPUT_SIZE), next_pow2)
             padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
 
             tmp_logits = qsl[1:] - 1
@@ -1220,7 +1221,6 @@ class eSurgeRunner:
             req_ids_to_add.append(req_id)
             logger.debug(f"Added new request {req_id} with {len(new_req_data.prompt_token_ids)} prompt tokens")
 
-        # Update cached reqs metadata
         req_data = scheduler_output.scheduled_cached_reqs
         if req_data.req_ids:
             logger.debug(f"Updating {len(req_data.req_ids)} cached requests")
@@ -1346,6 +1346,41 @@ class eSurgeRunner:
 
         return attn_metadata, logits_indices, padded_num_reqs, num_reqs, end_index, padded_total
 
+    @staticmethod
+    @ejit(donate_argnums=(0, 1))
+    def _apply_sampled_tokens_and_update(
+        token_ids: jax.Array,  # [max_reqs, max_len]
+        num_tokens: jax.Array,  # [max_reqs]
+        selected_token_ids: jax.Array,  # [max_reqs] or [max_reqs, 1]
+        scheduled_tokens: jax.Array,  # [max_reqs]
+        req_num_tokens: jax.Array,  # [max_reqs]
+        num_computed_tokens: jax.Array,  # [max_reqs]
+        active_mask: jax.Array,  # [max_reqs] bool
+        i_range: jax.Array,  # [max_reqs], reuse self.arange_np
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """
+        Shape-stable, fully jitted updater:
+          - computes valid_mask
+          - writes sampled token at [i, num_computed_tokens[i] + scheduled_tokens[i]]
+          - returns updated token_ids, num_tokens, out_tokens[-1 for invalid], valid_mask
+        """
+        sampled_flat = selected_token_ids.squeeze(-1) if selected_token_ids.ndim > 1 else selected_token_ids
+        seq_lens = num_computed_tokens + scheduled_tokens
+        valid_mask = active_mask & (scheduled_tokens > 0) & (seq_lens >= req_num_tokens)
+
+        # Static at trace time
+        max_len_m1 = token_ids.shape[1] - 1
+        j = jnp.clip(seq_lens, 0, max_len_m1)
+
+        # masked "set" using add(delta) for better fusion
+        current_vals = token_ids[i_range, j]
+        delta = jnp.where(valid_mask, sampled_flat - current_vals, 0)
+        token_ids = token_ids.at[(i_range, j)].add(delta)
+        num_tokens = num_tokens + valid_mask.astype(num_tokens.dtype)
+
+        out_tokens = jnp.where(valid_mask, sampled_flat, -1)
+        return token_ids, num_tokens, out_tokens, valid_mask
+
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests.
 
@@ -1381,7 +1416,9 @@ class eSurgeRunner:
         logger.debug(f"Starting model execution with {scheduler_output.total_num_scheduled_tokens} scheduled tokens")
 
         logger.debug("Updating internal states based on scheduler output")
+        updating_states_start = time.time()
         self._update_states(scheduler_output)
+        updating_states_time = time.time() - updating_states_start
 
         if not scheduler_output.total_num_scheduled_tokens:
             logger.debug("No tokens scheduled, returning empty output")
@@ -1400,6 +1437,8 @@ class eSurgeRunner:
         start_index = 0
         combined_selected_tokens: list[jax.Array] = []
         batch_count = 0
+        total_prepare_time = 0.0
+        total_exec_time = 0.0
 
         logger.debug(f"Processing {self.sequence_buffer.num_reqs} requests in batches")
         while start_index < self.sequence_buffer.num_reqs:
@@ -1415,6 +1454,7 @@ class eSurgeRunner:
                 padded_total,
             ) = self._prepare_inputs(scheduler_output, start_index)
             prepare_time = time.time() - prepare_start
+            total_prepare_time += prepare_time
 
             exec_start = time.time()
             selected_token_ids, logits = self.executor_manager.execute(
@@ -1425,33 +1465,38 @@ class eSurgeRunner:
                 ModelRunnerSamplingMetadata.from_sequence_buffer(self.sequence_buffer, padded_num_reqs),
                 padded_num_reqs,
             )
-            selected_token_ids = selected_token_ids[:num_reqs]
+            # Ensure timing reflects real device work
+            selected_token_ids = jax.block_until_ready(selected_token_ids)[:num_reqs]
             exec_time = time.time() - exec_start
-            combined_selected_tokens.append(selected_token_ids)
+            total_exec_time += exec_time
 
+            combined_selected_tokens.append(selected_token_ids)
             start_index = end_index
 
         selected_token_ids = jnp.concatenate(combined_selected_tokens, axis=0)
         logger.debug(f"Processed {batch_count} batches, generated {selected_token_ids.shape[0]} tokens")
 
         logger.debug("Processing sampled tokens and updating buffers")
+        processing_token_start = time.time()
         result = self._process_sampled_tokens(
             selected_token_ids,
             scheduler_output,
             execution_start_time,
         )
-
+        processing_token_time = time.time() - processing_token_start
         total_time = time.time() - execution_start_time
 
         self.log_it(
-            f"Model execution took {exec_time:.3f}s "
-            f"Input preparation took {prepare_time:.3f}s "
-            f"execution completed in {total_time:.3f}s"
+            f"Model execution in {total_exec_time:.3f}s "
+            f"Input preparation in {total_prepare_time:.3f}s "
+            f"execution completed in {total_time:.3f}s "
+            f"processing token in {processing_token_time:.3f}s "
+            f"updating states in {updating_states_time:.3f}s"
         )
         return result
 
     @staticmethod
-    @jax.jit
+    @ejit
     def _update_token_buffers_optimized(
         token_ids: jax.Array,  # [max_reqs, max_len]
         num_tokens: jax.Array,  # [max_reqs]
@@ -1517,78 +1562,86 @@ class eSurgeRunner:
         scheduler_output: SchedulerOutput,
         execution_start_time: float,
     ) -> ModelRunnerOutput:
-        """Process sampled tokens and update buffers with JIT optimization."""
+        """Process sampled tokens and update buffers with async host copy."""
         num_reqs = self.sequence_buffer.num_reqs
         logger.debug(f"Processing {selected_token_ids.shape[0]} sampled tokens for {num_reqs} requests")
-        scheduled_tokens_arr = jnp.zeros(self.max_num_reqs, dtype=jnp.int32)
-        req_num_tokens_arr = jnp.zeros(self.max_num_reqs, dtype=jnp.int32)
-        active_mask = jnp.zeros(self.max_num_reqs, dtype=bool)
-        for i, req_id in enumerate(self.sequence_buffer.req_ids[:num_reqs]):
-            if req_id is None:
-                continue
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                logger.error(f"Request {req_id} not found in requests dict during token processing")
-                continue
-            scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            scheduled_tokens_arr = scheduled_tokens_arr.at[i].set(scheduled)
-            req_num_tokens_arr = req_num_tokens_arr.at[i].set(req_state.num_tokens if req_state else 0)
-            active_mask = active_mask.at[i].set(True)
-        if selected_token_ids.shape[0] < self.max_num_reqs:
-            pad_width = self.max_num_reqs - selected_token_ids.shape[0]
-            if selected_token_ids.ndim == 1:
-                selected_token_ids = jnp.pad(selected_token_ids, (0, pad_width), constant_values=0)
-            else:
-                selected_token_ids = jnp.pad(selected_token_ids, ((0, pad_width), (0, 0)), constant_values=0)
-        valid_mask, update_indices, update_tokens, update_seq_lens = self._prepare_token_updates(
-            selected_token_ids,
-            self.sequence_buffer.num_computed_tokens,
-            scheduled_tokens_arr,
-            req_num_tokens_arr,
-            active_mask,
+        req_ids_window = list(self.sequence_buffer.req_ids[:num_reqs])
+        scheduled_list = [
+            int(scheduler_output.num_scheduled_tokens.get(rid, 0)) if rid is not None else 0 for rid in req_ids_window
+        ]
+        req_num_tokens_list = [
+            int(getattr(self.requests.get(rid, None), "num_tokens", 0)) if rid is not None else 0
+            for rid in req_ids_window
+        ]
+        active_list = [rid is not None for rid in req_ids_window]
+
+        scheduled_tokens_arr = (
+            jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
+            .at[:num_reqs]
+            .set(jnp.array(scheduled_list, dtype=jnp.int32))
         )
-        valid_indices = update_indices[update_indices >= 0]
-        if valid_indices.shape[0] > 0:
-            valid_tokens = update_tokens[update_indices >= 0]
-            valid_lens = update_seq_lens[update_indices >= 0]
-            self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens = self._update_token_buffers_optimized(
+        req_num_tokens_arr = (
+            jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
+            .at[:num_reqs]
+            .set(jnp.array(req_num_tokens_list, dtype=jnp.int32))
+        )
+        active_mask = jnp.zeros((self.max_num_reqs,), dtype=bool).at[:num_reqs].set(jnp.array(active_list, dtype=bool))
+
+        if selected_token_ids.shape[0] < self.max_num_reqs:
+            pad_w = self.max_num_reqs - selected_token_ids.shape[0]
+            if selected_token_ids.ndim == 1:
+                selected_token_ids = jnp.pad(selected_token_ids, (0, pad_w), constant_values=0)
+            else:
+                selected_token_ids = jnp.pad(selected_token_ids, ((0, pad_w), (0, 0)), constant_values=0)
+
+        self.sequence_buffer.token_ids, self.sequence_buffer.num_tokens, out_tokens, valid_mask = (
+            self._apply_sampled_tokens_and_update(
                 self.sequence_buffer.token_ids,
                 self.sequence_buffer.num_tokens,
-                valid_indices,
-                valid_tokens,
-                valid_lens,
+                selected_token_ids,
+                scheduled_tokens_arr,
+                req_num_tokens_arr,
+                self.sequence_buffer.num_computed_tokens,
+                active_mask,
+                self.arange_np,  # prebuilt in _setup_variables
             )
-        req_ids = cast(list[str], self.sequence_buffer.req_ids[:num_reqs])
-        sampled_flat = selected_token_ids.squeeze(-1)
-        valid_sampled_token_ids = []
+        )
 
-        for i in range(num_reqs):
-            if valid_mask[i]:
-                token_id = int(sampled_flat[i])
-                valid_sampled_token_ids.append([token_id])
+        out_tokens.copy_to_host_async()
+        valid_mask.copy_to_host_async()
 
-                req_id = req_ids[i] if i < len(req_ids) else None
-                if req_id:
-                    req_state = self.requests.get(req_id)
-                    if req_state:
-                        req_state.output_token_ids.append(token_id)
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {
+            rid: None for rid in req_ids_window if rid is not None
+        }
+
+        out_tokens_np, valid_mask_np = jax.device_get((out_tokens[:num_reqs], valid_mask[:num_reqs]))
+        sampled_token_ids: list[list[int]] = []
+        req_ids: list[str] = []
+        for i, rid in enumerate(req_ids_window):
+            if rid is None:
+                continue
+            req_ids.append(rid)
+            if valid_mask_np[i]:
+                tid = int(out_tokens_np[i])
+                sampled_token_ids.append([tid])
+                rs = self.requests.get(rid)
+                if rs:
+                    rs.output_token_ids.append(tid)
             else:
-                valid_sampled_token_ids.append([])
+                sampled_token_ids.append([])
 
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {req_id: None for req_id in req_ids}
         metrics_collector = get_metrics_collector()
         if metrics_collector:
-            logger.debug("Recording metrics to metrics collector")
             metrics_collector.record_runner_metrics(
                 execution_time=time.time() - execution_start_time,
-                batch_size=num_reqs,
+                batch_size=len(req_ids),
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
             )
 
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=self.sequence_buffer.req_id_to_index,
-            sampled_token_ids=valid_sampled_token_ids,
+            sampled_token_ids=sampled_token_ids,
             spec_token_ids=None,
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,
