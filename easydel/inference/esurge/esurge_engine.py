@@ -112,6 +112,8 @@ class eSurge:
         auto_shard_model: bool = True,
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
+        use_combined_forward: bool = False,
+        use_aot_forward: bool = True,
         esurge_name: str | None = None,
         **kwargs,
     ):
@@ -181,13 +183,14 @@ class eSurge:
         self._monitoring_initialized = False
         self._esurge_name = esurge_name
 
-        # Initialize runner
         self.runner = eSurgeRunner(
             model=self.model,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
+            use_combined_forward=use_combined_forward,
+            use_aot_forward=use_aot_forward,
         )
 
         # Compile model

@@ -120,7 +120,7 @@ class Scheduler(SchedulerInterface):
                             page_size=metadata.page_size,
                             num_kv_heads=metadata.num_kv_heads,
                             head_size=metadata.k_headdim,
-                            dtype=runner.kv_pages.views[-1].kv_pages.dtype,
+                            dtype=runner.executor_manager.kv_pages.views[-1].kv_pages.dtype,
                             use_mla=False,
                         )
                     )

@@ -290,6 +290,160 @@ def capture_time():
 logger = get_logger(__name__)
 
 
+class ProgressLogger:
+    """A progress logger that displays updating progress bars and messages.
+
+    This class provides a clean way to show progress for long-running operations
+    with support for progress bars, ETAs, and streaming updates that overwrite
+    the same line in the terminal.
+
+    Attributes:
+        name: Logger name to use for fallback logging
+        use_tty: Whether to use TTY features (auto-detected)
+        start_time: Start time of the progress operation
+        _logger: Underlying logger for fallback
+
+    Example:
+        >>> progress = ProgressLogger("Training")
+        >>> for i in range(100):
+        ...     progress.update(i, 100, f"Processing batch {i}")
+        ...     # Do work
+        >>> progress.complete("Training finished!")
+    """
+
+    def __init__(self, name: str = "Progress", logger_instance: LazyLogger | None = None):
+        """Initialize the progress logger.
+
+        Args:
+            name: Name to display in progress messages
+            logger_instance: Optional logger instance to use for fallback
+        """
+        self.name = name
+        self.use_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+        self.start_time = time.time()
+        self._logger = logger_instance or get_logger(name)
+        self._last_message_length = 0
+
+    def update(
+        self,
+        current: int,
+        total: int,
+        message: str = "",
+        bar_width: int = 20,
+        show_eta: bool = True,
+        extra_info: str = "",
+    ) -> None:
+        """Update the progress display.
+
+        Args:
+            current: Current progress value (0-based)
+            total: Total number of items
+            message: Message to display after the progress bar
+            bar_width: Width of the progress bar in characters
+            show_eta: Whether to show estimated time remaining
+            extra_info: Additional info to append at the end
+        """
+        if total <= 0:
+            return
+
+        # Calculate progress
+        progress = min(current / total, 1.0)
+        progress_pct = progress * 100
+
+        # Create progress bar
+        filled = int(bar_width * progress)
+        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+
+        # Calculate ETA
+        eta_str = ""
+        if show_eta and current > 0:
+            elapsed = time.time() - self.start_time
+            avg_time = elapsed / current
+            remaining = (total - current) * avg_time
+            if remaining > 0:
+                if remaining < 60:
+                    eta_str = f" ETA: {remaining:.1f}s"
+                elif remaining < 3600:
+                    eta_str = f" ETA: {remaining / 60:.1f}m"
+                else:
+                    eta_str = f" ETA: {remaining / 3600:.1f}h"
+
+        # Format the complete message
+        timestamp = time.strftime("%H:%M:%S")
+        full_message = f"({timestamp} {self.name}) [{bar}] {progress_pct:5.1f}% {message}{eta_str}"
+        if extra_info:
+            full_message += f" {extra_info}"
+
+        if self.use_tty:
+            # Clear previous line and write new progress
+            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
+            sys.stdout.write(full_message)
+            sys.stdout.flush()
+            self._last_message_length = len(full_message)
+        else:
+            # Fall back to regular logging
+            self._logger.info(f"{progress_pct:.1f}% - {message}")
+
+    def update_simple(self, message: str) -> None:
+        """Update with a simple message without progress bar.
+
+        Args:
+            message: Message to display
+        """
+        timestamp = time.strftime("%H:%M:%S")
+        full_message = f"({timestamp} {self.name}) {message}"
+
+        if self.use_tty:
+            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
+            sys.stdout.write(full_message)
+            sys.stdout.flush()
+            self._last_message_length = len(full_message)
+        else:
+            self._logger.info(message)
+
+    def complete(self, message: str | None = None, show_time: bool = True) -> None:
+        """Complete the progress and show final message.
+
+        Args:
+            message: Optional completion message
+            show_time: Whether to show total elapsed time
+        """
+        if message is None:
+            message = "Completed"
+
+        total_time = time.time() - self.start_time
+        timestamp = time.strftime("%H:%M:%S")
+
+        if show_time:
+            time_str = ""
+            if total_time < 60:
+                time_str = f" in {total_time:.1f}s"
+            elif total_time < 3600:
+                time_str = f" in {total_time / 60:.1f}m"
+            else:
+                time_str = f" in {total_time / 3600:.1f}h"
+            full_message = f"({timestamp} {self.name}) {message}{time_str}"
+        else:
+            full_message = f"({timestamp} {self.name}) {message}"
+
+        if self.use_tty:
+            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
+            sys.stdout.write(full_message + "\n")
+            sys.stdout.flush()
+        else:
+            self._logger.info(full_message)
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - complete the progress."""
+        if exc_type is None:
+            self.complete()
+        return False
+
+
 class Timer:
     """Simple timer for measuring execution time.
 
