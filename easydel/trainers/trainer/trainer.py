@@ -331,8 +331,8 @@ class Trainer(BaseTrainer):
         metrics_history = []
 
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-            with jax.profiler.StepTraceAnnotation("train", step_num=epoch):
-                current_step = int(jax.device_get(state.step))
+            current_step = int(jax.device_get(state.step))
+            with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
                 try:
                     with capture_time() as dataloading_time:
                         batch, train_iter = self._get_next_batch(train_iter, train_dataset)
