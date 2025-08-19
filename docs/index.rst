@@ -54,6 +54,7 @@ Inference and Serving Solutions
 
 EasyDeL provides powerful, production-ready serving solutions:
 
+- **eSurge Engine**: High-performance inference engine with advanced KV cache management and paged attention
 - **vInference Engine**: Optimized for efficient inference of large language models
 - **vInference API Server**: Provides OpenAI-compatible endpoints for easy integration
 - **vWhisper Inference**: Specialized inference engine for audio transcription and translation
@@ -123,6 +124,8 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    install.md
    contributing
    api_docs/apis
+   esurge
+   esurge_examples
    whisper_api.md
    vinference_api.md
 	 vsurge_example 
