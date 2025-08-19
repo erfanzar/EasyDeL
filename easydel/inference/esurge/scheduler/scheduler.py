@@ -23,6 +23,7 @@ from ..config import Config
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
 from ..engine_types import EngineCoreOutput, EngineCoreOutputs
+from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..request import EngineRequest, EngineRequestStatus
 from .interface import SchedulerInterface
@@ -119,7 +120,7 @@ class Scheduler(SchedulerInterface):
                             page_size=metadata.page_size,
                             num_kv_heads=metadata.num_kv_heads,
                             head_size=metadata.k_headdim,
-                            dtype=runner.kv_pages.views[-1].kv_pages.dtype,
+                            dtype=runner.executor_manager.kv_pages.views[-1].kv_pages.dtype,
                             use_mla=False,
                         )
                     )
@@ -128,6 +129,9 @@ class Scheduler(SchedulerInterface):
         )
 
     def schedule(self) -> SchedulerOutput:
+        import time
+
+        schedule_start_time = time.time()
         scheduled_new_reqs: list[EngineRequest] = []
         scheduled_resumed_reqs: list[EngineRequest] = []
         scheduled_running_reqs: list[EngineRequest] = []
@@ -317,6 +321,34 @@ class Scheduler(SchedulerInterface):
         )
 
         self._update_after_schedule(scheduler_output)
+
+        # Log scheduler metrics
+        schedule_time = time.time() - schedule_start_time
+        metrics_collector = get_metrics_collector()
+        if metrics_collector:
+            metrics_collector.record_scheduler_metrics(
+                num_waiting=len(self.waiting),
+                num_running=len(self.running),
+                num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_preempted=len(preempted_reqs),
+                batch_size=len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs),
+                schedule_time=schedule_time,
+            )
+
+            # Log cache metrics
+            cache_manager = self.kv_cache_manager
+            total_pages = cache_manager.num_pages
+            used_pages = total_pages - cache_manager.page_pool.get_num_free_pages()
+
+            num_cached_pages = len(cache_manager.page_pool.cached_page_hash_to_page)
+            cache_hit_rate = num_cached_pages / max(total_pages, 1)
+
+            metrics_collector.record_cache_metrics(
+                total_pages=total_pages,
+                used_pages=used_pages,
+                cache_hit_rate=cache_hit_rate,
+            )
+
         return scheduler_output
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:

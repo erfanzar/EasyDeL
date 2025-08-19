@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -43,10 +43,71 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm as RMSNorm
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
     Qwen2MoeConfig as Qwen2MoeConfig,
 )
+
+
+class Qwen2MoeMLPStack(nn.Module):
+    """Qwen2Moe MoE MLP using the new ParallelMoELinear layers."""
+
+    def __init__(
+        self,
+        config: Qwen2MoeConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=False,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.act_fn = nn.silu
+
+    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        return self.down_proj(self.act_fn(self.gate_proj(x, group_sizes)) * self.up_proj(x, group_sizes), group_sizes)
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -97,21 +158,9 @@ class Qwen2MoeMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(
-            config.hidden_size,
-            intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = linear_class(
-            intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
-        self.up_proj = linear_class(
-            config.hidden_size,
-            intermediate_size,
-            rngs=rngs,
-        )
+        self.gate_proj = linear_class(config.hidden_size, intermediate_size, rngs=rngs)
+        self.down_proj = linear_class(intermediate_size, config.hidden_size, rngs=rngs)
+        self.up_proj = linear_class(config.hidden_size, intermediate_size, rngs=rngs)
         self.act_fn = nn.silu
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -330,7 +379,7 @@ class Qwen2MoeAttention(AttentionModule):
         )
 
 
-class Qwen2MoeSparseMoeBlock(nn.Module):
+class Qwen2MoeSparseBlock(BaseMoeModule):
     """Sparse Mixture of Experts (MoE) block for Qwen2 MoE.
 
     This block routes input hidden states to a selected subset of experts
@@ -355,7 +404,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeSparseMoeBlock module.
+        """Initializes the Qwen2MoeSparseBlock module.
 
         Args:
             config (Qwen2MoeConfig): The configuration object for the model.
@@ -364,6 +413,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
             rngs (nn.Rngs): Random number generators.
         """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.NONE,
+        )
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -379,17 +438,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(config.initializer_range),
         )
 
-        self.experts = [
-            Qwen2MoeMLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                intermediate_size=config.moe_intermediate_size,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_experts)
-        ]
+        self.experts = Qwen2MoeMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
 
         self.shared_expert = Qwen2MoeMLP(
             config=config,
@@ -409,6 +464,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             rngs=rngs,
         )
 
+    def _moe_call(
+        self,
+        hidden_state_flat: jax.Array,
+        batch_size: int,
+        seq_len: int,
+        hidden_size: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Forward pass of the MoE block."""
+
+        router_logits = self.gate(hidden_state_flat).astype(jnp.float32)
+        routing_weights = jax.nn.softmax(router_logits, axis=-1)
+        selected_weights, selected_experts = self._route(routing_weights)
+        x_repeat_sort, group_sizes, sort_idx = self._permute(hidden_state_flat, selected_experts.reshape(-1))
+        out_repeat_sort = self.experts(x_repeat_sort, group_sizes)
+        out_repeat_unflat = self._unpermute(out_repeat_sort, sort_idx, (batch_size, seq_len, hidden_size))
+        output = jnp.sum(out_repeat_unflat * selected_weights[:, :, None], axis=1)
+
+        return output, router_logits
+
     def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the Sparse MoE block.
 
@@ -425,42 +499,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
-
-        routing_weights = jax.nn.softmax(router_logits.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
-
-        routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights,
-            k=self.config.num_experts_per_tok,
+        out, router_logits = self._moe_call(
+            hidden_state_flat=hidden_states,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
         )
-
-        if self.config.norm_topk_prob:
-            routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
-        final_hidden_state = jnp.zeros_like(hidden_states)
-
-        for index in range(self.config.num_experts):
-            expert_layer_output = (
-                block_wise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
-                )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
-            )
-            expert_layer_output_exp = (
-                jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = jax.nn.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-        final_hidden_state = final_hidden_state + shared_expert_output
+        out = out + shared_expert_output
 
-        return (final_hidden_state, router_logits)
+        return out.reshape(batch_size, seq_len, hidden_size), router_logits
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
@@ -473,7 +526,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         config (Qwen2MoeConfig): Configuration object for the model.
         layer_idx (int): Index of the current layer.
         self_attn (Qwen2MoeAttention): Self-attention module.
-        mlp (Qwen2MoeSparseMoeBlock | Qwen2MoeMLP): MoE block or standard MLP.
+        mlp (Qwen2MoeSparseBlock | Qwen2MoeMLP): MoE block or standard MLP.
         input_layernorm (RMSNorm): Layer normalization applied before self-attention.
         post_attention_layernorm (RMSNorm): Layer normalization applied after self-attention and
             before the MLP/MoE block.
@@ -512,7 +565,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         attn_block = Qwen2MoeAttention
 
         mlp_block = (
-            Qwen2MoeSparseMoeBlock
+            Qwen2MoeSparseBlock
             if (self.layer_idx not in self.config.mlp_only_layers)
             and (self.config.num_experts > 0 and (self.layer_idx + 1) % self.config.decoder_sparse_step == 0)
             else Qwen2MoeMLP

@@ -12,5 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Custom optimized kernels for EasyDeL.
+
+Provides hardware-specific optimized kernels using Pallas (TPU),
+Triton (GPU), and JAX (CPU) implementations. These kernels offer
+significant performance improvements over standard operations.
+
+Submodules:
+    cpu_ops: CPU-optimized operations using JAX
+    gpu_ops: GPU-optimized operations using Triton
+    tpu_ops: TPU-optimized operations using Pallas
+
+Key Operations:
+    flash_attention: Optimized attention computation
+    matmul: Hardware-optimized matrix multiplication
+    ring_attention: Ring-based attention for sequence parallelism
+    rms_norm: Optimized RMS normalization
+    collective_matmul: Distributed matrix multiplication
+
+Platform Support:
+    - TPU: Pallas kernels for v3, v4, v5
+    - GPU: Triton kernels for NVIDIA/AMD
+    - CPU: JAX-based implementations
+
+Example:
+    >>> from easydel.kernels import flash_attention, matmul
+    >>> # Use optimized flash attention
+    >>> output = flash_attention(
+    ...     query, key, value,
+    ...     causal=True,
+    ...     softmax_scale=1.0/sqrt(head_dim)
+    ... )
+    >>> # Use optimized matmul
+    >>> result = matmul(A, B, precision="high")
+
+Note:
+    Kernels automatically select the best implementation
+    based on the detected hardware platform.
+"""
 
 # Custom Pallas/Triton kernels.

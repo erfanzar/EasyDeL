@@ -67,7 +67,17 @@ _EXCEPTION_SENTINEL = object()
 
 
 class PromptOutput(BaseModel):
-    """Structure for holding the output of a processed prompt."""
+    """Output structure for generated text.
+
+    Contains the generated text and associated metadata.
+
+    Attributes:
+        text: Generated text string.
+        generated_tokens: Number of tokens generated.
+        tokens_per_second: Generation speed.
+        error: Error message if generation failed.
+        finish_reason: Reason generation stopped ('stop', 'length', etc.).
+    """
 
     text: str | None = None
     generated_tokens: int | None = None
@@ -81,6 +91,19 @@ class PromptOutput(BaseModel):
 
 
 class vInferenceMetaData(BaseModel):
+    """Metadata for vInference instance.
+
+    Stores configuration and state information.
+
+    Attributes:
+        inference_name: Name identifier for this instance.
+        generation_config: Generation configuration settings.
+        precompiled_configs: Cached pre-compilation configurations.
+        in_compiling_process: Set of configs currently being compiled.
+        input_partition_spec: JAX partitioning specification.
+        uuid4: Unique identifier for this instance.
+    """
+
     inference_name: str
     generation_config: vInferenceConfig
     precompiled_configs: dict[int, vInferencePreCompileConfig]
@@ -91,11 +114,44 @@ class vInferenceMetaData(BaseModel):
 
 
 class vInference:
-    """
-    Class for performing text generation using a pre-trained language graphdef in EasyDeL.
+    """Streamlined inference engine for text generation.
 
-    This class handles the generation process, including initialization, precompilation,
-    and generating text in streaming chunks.
+    vInference provides a simple yet powerful interface for generating text
+    with pre-trained language models. It handles model initialization,
+    pre-compilation for optimal performance, and both streaming and
+    non-streaming generation.
+
+    Features:
+        - Automatic model compilation and optimization
+        - Support for various sampling strategies
+        - Streaming and non-streaming generation
+        - Mixed-precision inference
+        - Distributed inference with JAX sharding
+        - Persistent compilation caching
+
+    Attributes:
+        model: The underlying EasyDeL model
+        processor_class: Tokenizer/processor for text handling
+        generation_config: Configuration for text generation
+        inference_name: Unique name for this instance
+        graphdef: Model graph definition
+        graphstate: Model state
+
+    Example:
+        >>> from easydel.inference.vinference import vInference
+        >>> engine = vInference(
+        ...     model=my_model,
+        ...     processor_class=tokenizer,
+        ...     max_new_tokens=100
+        ... )
+        >>> # Pre-compile for a specific batch size
+        >>> engine.precompile(batch_size=1, sequence_length=512)
+        >>> # Generate text
+        >>> output = engine.generate(
+        ...     "Write a poem about",
+        ...     temperature=0.8
+        ... )
+        >>> print(output.text)
     """
 
     def __init__(
@@ -115,26 +171,27 @@ class vInference:
         report_metrics: bool = True,
         verbose: bool = True,
     ):
-        """Initialize vInference with model components and configuration.
+        """Initialize vInference engine.
 
         Args:
-            model: Pre-trained language model. If provided, graphdef/graphstate/graphother
-                will be extracted automatically.
-            processor_class: Processor class for the model.
-            graphdef: Graph definition (required if model is None).
-            graphstate: Graph state (optional for lazy initialization).
-            graphother: Additional graph state (optional for lazy initialization).
+            model: Pre-trained EasyDeL model (extracts graphdef/state if provided).
+            processor_class: Tokenizer/processor for text handling.
+            graphdef: Model graph definition (required if model is None).
+            graphstate: Model state (optional for lazy initialization).
+            graphother: Additional graph state (optional).
             mesh: JAX mesh for distributed computation.
-            generation_config: Generation configuration settings.
-            seed: Random seed for generation. If None, generates random seed.
-            input_partition_spec: Partitioning specification for input data.
-            max_new_tokens: Maximum number of new tokens to generate.
-            inference_name: Name for this inference instance.
-            partition_axis: Partitioning axis configuration.
+            generation_config: Generation settings (temperature, top_p, etc.).
+            seed: Random seed for reproducible generation.
+            input_partition_spec: Sharding specification for inputs.
+            max_new_tokens: Default maximum tokens to generate.
+            inference_name: Unique identifier for this instance.
+            partition_axis: Axis configuration for model parallelism.
+            report_metrics: Whether to report performance metrics.
+            verbose: Enable verbose logging.
 
-        Raises:
-            AssertionError: If required parameters are missing for lazy initialization.
-            ValueError: If model property is accessed during lazy initialization.
+        Note:
+            Either `model` or `graphdef` must be provided. If using graphdef
+            without graphstate, lazy initialization will be used.
         """
         self.log = logger.info if verbose else logger.debug
         self._init_model_components(model, graphdef, graphstate, graphother, mesh, inference_name, partition_axis)

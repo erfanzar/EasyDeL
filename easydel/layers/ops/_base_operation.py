@@ -78,7 +78,7 @@ class BaseOperation(ABC):
             The result of the operation, potentially optimized for TPU.
         """
         return self.forward_native(*args, **kwargs)
-    
+
     def forward_tt(self, *args, **kwargs) -> tp.Any:
         """
         TT-specific implementation of the operation.

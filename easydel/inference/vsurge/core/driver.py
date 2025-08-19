@@ -29,7 +29,6 @@ from ...sampling_params import JitableSamplingParams
 from ..utils import (
     ActiveRequest,
     MetricsRecorder,
-    ResultTokens,
     ReturnSample,
     SafeThread,
     pad_tokens,
@@ -46,7 +45,7 @@ logger = get_logger("vSurge-vDriver")
 DEFAULT_PREFILL_BACKLOG_MAXSIZE = 0
 DEFAULT_TRANSFER_BACKLOG_MAXSIZE = None
 DEFAULT_DECODE_BACKLOG_MAXSIZE = None
-DEFAULT_METRICS_LOG_INTERVAL_SEC = 10.0
+DEFAULT_METRICS_LOG_INTERVAL_SEC = 120.0
 DEFAULT_DETOKENIZING_BLOCKS = 8
 DEFAULT_SLOT_CLEAR_STEPS = 512
 MIN_SLEEP_DURATION = 0.001  # Minimum sleep time to prevent busy waiting
@@ -62,7 +61,6 @@ class vDriver:
 
     _engine: vEngine
     scheduler: Scheduler
-    _detokenize_backlog: queue.Queue[tp.Any]
     _process_thread: SafeThread
     _detokenize_thread: SafeThread
     _metrics_thread: SafeThread | None
@@ -72,7 +70,6 @@ class vDriver:
         self,
         engine: vEngine,
         interleaved_mode: bool = False,
-        detokenizing_blocks: int = DEFAULT_DETOKENIZING_BLOCKS,
         slot_clear_steps: int = DEFAULT_SLOT_CLEAR_STEPS,
         verbose: bool = True,
         prefill_backlog_maxsize: int = DEFAULT_PREFILL_BACKLOG_MAXSIZE,
@@ -84,7 +81,6 @@ class vDriver:
         self._pause = False
         self._engine = engine
         self._interleaved_mode = interleaved_mode
-        self._detokenizing_blocks = detokenizing_blocks
         self._slot_clear_steps = slot_clear_steps
         self.prefill_backlog_maxsize = prefill_backlog_maxsize
         self.transfer_backlog_maxsize = transfer_backlog_maxsize
@@ -92,7 +88,9 @@ class vDriver:
         self.metrics_recorder = MetricsRecorder(metrics_log_interval_sec)
         self._request_counter = 0
         self.scheduler = Scheduler(self._engine)
-        self._setup_detokenizer()
+
+        # Only create the process thread - no detokenize thread
+        self._process_thread = SafeThread(target=self._process_action_thread, name="process-thread", daemon=True)
         self.log = logger.info if verbose else logger.debug
         self.live = False
         self._metrics_thread = None
@@ -197,6 +195,229 @@ class vDriver:
         duration_ms = (time.perf_counter() - start_time) * 1000
         self.metrics_recorder.record_transfer_op_time(duration_ms)
 
+    def _process_decode_slots(self, decode_slots: list, engine: vEngine, decode_state, generate_timestep: int):
+        """Process decode - just generate and queue for detokenization."""
+        time_before_decode_call = time.perf_counter()
+
+        try:
+            decode_state, sampled_tokens = engine.decode(
+                graphstate=engine.graphstate,
+                graphothers=engine.graphothers,
+                cache_metadata=None,
+                state=decode_state,
+                rngs=engine.prng_key,
+                slot=0,
+            )
+        except Exception as e:
+            self.log(f"[Process] ERROR during decode step {generate_timestep}: {e}", exc_info=True)
+            time.sleep(0.01)
+            return generate_timestep, decode_state
+
+        decode_op_duration_ms = (time.perf_counter() - time_before_decode_call) * 1000
+        self.metrics_recorder.record_decode_op_time(decode_op_duration_ms)
+        sampled_tokens.copy_to_host_async()
+
+        try:
+            self._detokenize_queue.put((generate_timestep, sampled_tokens), block=True)
+        except queue.Full:
+            self.log("[Process] Detokenize queue full - this shouldn't happen")
+
+        generate_timestep += 1
+
+        total_decode_cycle_ms = (time.perf_counter() - time_before_decode_call) * 1000
+        self.log(
+            f"[Process] Decode step {generate_timestep} completed - "
+            f"Active requests: {len(decode_slots)}, "
+            f"Decode op time: {decode_op_duration_ms:.2f}ms, "
+            f"Detokenize op time: {(total_decode_cycle_ms - decode_op_duration_ms):.2f}ms, "
+            f"Total cycle time: {total_decode_cycle_ms:.2f}ms"
+        )
+
+        return generate_timestep, decode_state
+
+    def _insert_request_into_slot(
+        self,
+        request: ActiveRequest,
+        slot: int,
+        engine: vEngine,
+        decode_state,
+    ):
+        """Insert request and register it for detokenization."""
+        self.log(f"[Process] Inserting prefilled request into decode slot {slot}.")
+        insert_start_time = time.perf_counter()
+
+        try:
+            decode_state = engine.insert(
+                prefix=request.prefill_result,
+                decode_state=decode_state,
+                slot=slot,
+            )
+        except Exception as e:
+            self.log(f"[Process] ERROR during insert into slot {slot}: {e}", exc_info=True)
+            del request.prefill_result
+            return decode_state
+
+        insert_duration_ms = (time.perf_counter() - insert_start_time) * 1000
+        self.metrics_recorder.record_insert_op_time(insert_duration_ms)
+        del request.prefill_result
+
+        try:
+            self._detokenize_queue.put((slot, request), block=True)
+        except queue.Full:
+            self.log("[Process] Detokenize queue full when inserting request")
+
+        self.scheduler.insert_prefill_result(request, slot)
+        self.log(
+            f"[Process] Request successfully inserted into slot {slot}. Insert duration: {insert_duration_ms:.2f}ms"
+        )
+        return decode_state
+
+    def _detokenize_thread_action(self):
+        """Dedicated detokenization thread."""
+        engine = self._engine
+        processor = engine.processor
+
+        live_requests = {i: None for i in range(engine.max_concurrent_decodes)}
+
+        self.log("[Detokenize] Detokenization thread started.")
+
+        while self.live:
+            try:
+                data = self._detokenize_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if data is None:
+                break
+
+            if len(data) == 3 and isinstance(data[1], ActiveRequest):
+                first_token, request, _ = data
+                self._process_first_token(first_token, request, processor)
+                continue
+
+            if isinstance(data[1], ActiveRequest):
+                slot, request = data
+                live_requests[slot] = request
+                self.log(f"[Detokenize] Registered request for slot {slot}")
+                continue
+
+            if len(data) == 2:
+                generate_timestep, result_tokens = data
+                result_tokens_np = result_tokens.convert_to_numpy()
+
+                # Process all live slots
+                for slot, request in live_requests.items():
+                    if request is None:
+                        continue
+
+                    try:
+                        self._process_slot_tokens(slot, request, result_tokens_np, processor, engine)
+
+                        # Check if request is complete
+                        if request.complete.all():
+                            if request.return_channel:
+                                request.return_channel.close()
+                            self.log(f"[Detokenize] Request in slot {slot} completed.")
+                            self.metrics_recorder.increment_completed_requests()
+                            self.scheduler.free_slot(slot)
+                            engine.free_resource(slot)
+                            live_requests[slot] = None
+
+                    except Exception as e:
+                        self.log(f"[Detokenize] Error processing slot {slot}: {e}")
+
+        self.log("[Detokenize] Detokenization thread stopped.")
+
+    def _process_slot_tokens(self, slot: int, request: ActiveRequest, result_tokens_np, processor, engine):
+        """Process tokens for a single slot."""
+        if request.decode_start_time is None:
+            request.decode_start_time = time.perf_counter()
+
+        # Use the existing process_result_tokens function
+        results_base, complete, num_valid_tokens_list = process_result_tokens(
+            processor=processor,
+            slot=slot,
+            slot_max_length=request.sampling_params.max_tokens,
+            result_tokens=result_tokens_np,
+            eos_token_id=engine.eos_token_ids,
+            is_client_side_tokenization=request.is_client_side_tokenization,
+            complete=request.complete,
+            ignore_eos=request.sampling_params.ignore_eos,
+        )
+
+        request.complete = complete
+        elapsed_time = time.perf_counter() - request.decode_start_time
+
+        for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
+            if len(res_base.text) > 0:
+                request.add_text_fragments(res_base.text)
+
+            # Check stop conditions
+            if request.sampling_params.stop is not None:
+                for stop_sign in request.sampling_params.stop:
+                    for idx, accum in enumerate(request.accumulated_text):
+                        if stop_sign in accum:
+                            request.complete[idx] = True
+
+            request.total_generated_tokens += num_valid
+            tps = request.total_generated_tokens / elapsed_time if elapsed_time > 1e-6 else 0.0
+
+            if request.return_channel:
+                result = ReturnSample(
+                    text=res_base.text,
+                    token_ids=res_base.token_ids,
+                    time_spent_computing=elapsed_time,
+                    accumulated_text=request.accumulated_text,
+                    tokens_per_second=tps,
+                    num_generated_tokens=request.total_generated_tokens,
+                )
+                request.enqueue_samples([result])
+
+    def _process_first_token(self, first_token, request: ActiveRequest, processor):
+        """Process first token from prefill."""
+        first_token_start = time.perf_counter()
+        first_token_np = first_token.convert_to_numpy()
+
+        if not hasattr(request, "complete") or request.complete is None:
+            request.complete = np.zeros((self._engine.samples_per_slot,), dtype=np.bool_)
+
+        results_base, complete, num_valid_tokens_list = process_result_tokens(
+            processor=processor,
+            slot=0,
+            slot_max_length=request.sampling_params.max_tokens,
+            result_tokens=first_token_np,
+            eos_token_id=self._engine.eos_token_ids,
+            is_client_side_tokenization=request.is_client_side_tokenization,
+            complete=request.complete,
+            ignore_eos=request.sampling_params.ignore_eos,
+        )
+
+        request.complete = complete
+
+        for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
+            if isinstance(res_base.text, list):
+                request.add_text_fragments(res_base.text)
+            else:
+                text_list = [str(res_base.text)] if res_base.text is not None else [""]
+                request.add_text_fragments(text_list)
+
+            request.total_generated_tokens += num_valid
+
+            if request.return_channel:
+                result = ReturnSample(
+                    text=res_base.text,
+                    token_ids=res_base.token_ids,
+                    time_spent_computing=0.0,
+                    accumulated_text=request.accumulated_text,
+                    tokens_per_second=0.0,
+                    num_generated_tokens=request.total_generated_tokens,
+                )
+                request.enqueue_samples([result])
+
+        first_token_duration = (time.perf_counter() - first_token_start) * 1000
+        self.metrics_recorder.record_ttft(first_token_duration)
+        self.log(f"[Detokenize] TTFT: {first_token_duration:.2f}ms for request.")
+
     def _process_prefill_content(
         self,
         request: ActiveRequest,
@@ -228,21 +449,6 @@ class vDriver:
                 right_padding=right_padding,
             )
         return tokens, valids, true_length
-
-    def _setup_detokenizer(self):
-        """Sets up the detokenization thread and its backlog."""
-        # Use a bounded queue to prevent memory issues
-        self._detokenize_backlog = queue.Queue(maxsize=self._detokenizing_blocks if self._detokenizing_blocks > 0 else 0)
-        self._detokenize_thread = SafeThread(
-            target=self._detokenize_action_thread,
-            name="detokenize-thread",
-            daemon=True,
-        )
-        self._process_thread = SafeThread(
-            target=self._process_action_thread,
-            name="process-thread",
-            daemon=True,
-        )
 
     def _process_action_thread(self):
         """
@@ -282,10 +488,8 @@ class vDriver:
         processor: ProcessingClassType,
         decode_state,
     ):
-        """Process a single prefill request."""
+        """Process a single prefill request with inline first token processing."""
         self.log("[Process] Starting prefill for request.")
-
-        # Process prefill content
         padded_tokens, padded_valids, true_length = self._process_prefill_content(
             request,
             processor,
@@ -313,12 +517,15 @@ class vDriver:
             )
         except Exception as e:
             self.log(f"[Process] ERROR during prefill: {e}", exc_info=True)
-            return
+            return decode_state
 
         prefill_duration_ms = (time.perf_counter() - prefill_start_time) * 1000
         self.metrics_recorder.record_prefill_op_time(prefill_duration_ms)
         request.prefill_result = prefill_result
-        self._detokenize_backlog.put((first_token, request, time.perf_counter()), block=True)
+
+        # Process first token inline immediately
+        self._process_first_token_inline(first_token, request, engine, processor)
+
         self.log(f"[Process] Prefill completed, tokens: {num_tokens}, duration: {prefill_duration_ms:.2f}ms")
 
         # Handle non-interleaved mode
@@ -330,7 +537,7 @@ class vDriver:
             except Exception as e:
                 self.log(f"[Process] ERROR during transfer: {e}", exc_info=True)
                 del request.prefill_result
-                return
+                return decode_state
             transfer_duration_ms = (time.perf_counter() - transfer_start_time) * 1000
             self.log(f"[Process] Transfer completed, duration: {transfer_duration_ms:.2f}ms")
 
@@ -340,7 +547,7 @@ class vDriver:
             if free_slot is not None:
                 decode_state = self._insert_request_into_slot(request, free_slot, engine, decode_state)
             else:
-                self.log("[Process] ERROR: Scheduler scheduled a prefill but no free slot found!", level="error")
+                self.log("[Process] ERROR: Scheduler scheduled a prefill but no free slot found!")
                 del request.prefill_result
         return decode_state
 
@@ -352,71 +559,48 @@ class vDriver:
                     return potential_slot
         return None
 
-    def _insert_request_into_slot(
-        self,
-        request: ActiveRequest,
-        slot: int,
-        engine: vEngine,
-        decode_state,
-    ):
-        """Insert a prefilled request into a decode slot."""
-        self.log(f"[Process] Inserting prefilled request into decode slot {slot}.")
-        insert_start_time = time.perf_counter()
-        try:
-            decode_state = engine.insert(
-                prefix=request.prefill_result,
-                decode_state=decode_state,
-                slot=slot,
-            )
-        except Exception as e:
-            self.log(f"[Process] ERROR during insert into slot {slot}: {e}", exc_info=True)
-            del request.prefill_result
-            return
-
-        insert_duration_ms = (time.perf_counter() - insert_start_time) * 1000
-        self.metrics_recorder.record_insert_op_time(insert_duration_ms)
-        del request.prefill_result
-        self.scheduler.insert_prefill_result(request, slot)
-        self._detokenize_backlog.put((slot, request), block=True)
-        self.log(
-            f"[Process] Request successfully inserted into slot {slot}. Insert duration: {insert_duration_ms:.2f}ms"
+    def _process_first_token_inline(self, first_token, request: ActiveRequest, engine: vEngine, processor):
+        """Process first token inline using the new text fragments approach."""
+        first_token_start = time.perf_counter()
+        first_token_np = first_token.convert_to_numpy()
+        if not hasattr(request, "complete") or request.complete is None:
+            request.complete = np.zeros((engine.samples_per_slot,), dtype=np.bool_)
+        results_base, complete, num_valid_tokens_list = process_result_tokens(
+            processor=processor,
+            slot=0,
+            slot_max_length=request.sampling_params.max_tokens,
+            result_tokens=first_token_np,
+            eos_token_id=engine.eos_token_ids,
+            is_client_side_tokenization=request.is_client_side_tokenization,
+            complete=request.complete,
+            ignore_eos=request.sampling_params.ignore_eos,
         )
-        return decode_state
+        request.complete = complete
+        final_results = []
+        for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
+            # Initialize text fragments with first token
+            if isinstance(res_base.text, list):
+                request.add_text_fragments(res_base.text)
+            else:
+                text_list = [str(res_base.text)] if res_base.text is not None else [""]
+                request.add_text_fragments(text_list)
 
-    def _process_decode_slots(self, decode_slots: list, engine: vEngine, decode_state, generate_timestep: int) -> int:
-        """Process all active decode slots."""
-        time_before_decode_call = time.perf_counter()
-        try:
-            decode_state, sampled_tokens = engine.decode(
-                graphstate=engine.graphstate,
-                graphothers=engine.graphothers,
-                cache_metadata=None,
-                state=decode_state,
-                rngs=engine.prng_key,
-                slot=0,
+            request.total_generated_tokens += num_valid
+            final_results.append(
+                ReturnSample(
+                    text=res_base.text,
+                    token_ids=res_base.token_ids,
+                    time_spent_computing=0.0,
+                    accumulated_text=request.accumulated_text,  # Uses the property
+                    tokens_per_second=0.0,
+                    num_generated_tokens=request.total_generated_tokens,
+                )
             )
-        except Exception as e:
-            self.log(f"[Process] ERROR during decode step {generate_timestep}: {e}", exc_info=True)
-            time.sleep(0.01)
-            return generate_timestep, decode_state
-
-        decode_op_duration_ms = (time.perf_counter() - time_before_decode_call) * 1000
-        self.metrics_recorder.record_decode_op_time(decode_op_duration_ms)
-
-        # Asynchronous transfer to host
-        sampled_tokens.copy_to_host_async()
-        self._detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
-        generate_timestep += 1
-
-        total_decode_cycle_ms = (time.perf_counter() - time_before_decode_call) * 1000
-        self.log(
-            f"[Process] Decode step {generate_timestep} completed - "
-            f"Active requests: {len(decode_slots)}, "
-            f"Decode op time: {decode_op_duration_ms:.2f}ms, "
-            f"Total cycle time: {total_decode_cycle_ms:.2f}ms"
-        )
-
-        return generate_timestep, decode_state
+        if request.return_channel:
+            request.enqueue_samples(final_results)
+        first_token_duration = (time.perf_counter() - first_token_start) * 1000
+        self.metrics_recorder.record_ttft(first_token_duration)
+        self.log(f"[Process] TTFT: {first_token_duration:.2f}ms for request.")
 
     def _perform_slot_cleanup(self, engine: vEngine, decode_state, generate_timestep: int):
         """Perform periodic cleanup of unused slot resources."""
@@ -430,176 +614,10 @@ class vDriver:
         self.log(f"[Process] Slot cleanup completed at step {generate_timestep}.")
         return decode_state
 
-    def _detokenize_action_thread(self):
-        """Background thread action for detokenizing results and returning samples."""
-        engine = self._engine
-        processor = engine.processor
-
-        while self.live:
-            try:
-                data: tp.Any = self._detokenize_backlog.get(block=True, timeout=0.1)
-            except queue.Empty:
-                if not self.live:
-                    break
-                continue
-
-            if data is None:
-                break
-
-            # Process different types of data in the backlog
-            try:
-                if isinstance(data[0], ResultTokens):
-                    self._process_first_token(data, engine, processor)
-                elif len(data) == 2 and isinstance(data[1], ResultTokens):
-                    self._process_result_tokens(data, engine, processor)
-                elif len(data) == 2 and isinstance(data[1], ActiveRequest):
-                    slot, active_request = data
-                    self.log(f"[Detokenize] Tracking new active request in slot {slot}.")
-                else:
-                    self.log(
-                        f"[Detokenize] Warning: Unknown data type received in detokenize backlog: "
-                        f"{type(data[0]) if data else 'None'}"
-                    )
-            except Exception as e:
-                self.log(f"[Detokenize] Error processing backlog item: {e}", exc_info=True)
-
-    def _process_first_token(self, data: tuple, engine: vEngine, processor: ProcessingClassType):
-        """Process the first token from a prefill operation."""
-        request_first_token, request, prefill_dequeue_time = data
-        request_first_token = request_first_token.convert_to_numpy()
-
-        if not hasattr(request, "complete") or request.complete is None:
-            request.complete = np.zeros((engine.samples_per_slot,), dtype=np.bool_)
-
-        results_base, complete, num_valid_tokens_list = process_result_tokens(
-            processor=processor,
-            slot=0,
-            slot_max_length=request.sampling_params.max_tokens,
-            result_tokens=request_first_token,
-            eos_token_id=engine.eos_token_ids,
-            is_client_side_tokenization=request.is_client_side_tokenization,
-            complete=request.complete,
-            ignore_eos=request.sampling_params.ignore_eos,
-        )
-        request.complete = complete
-
-        final_results = []
-        for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
-            if isinstance(res_base.text, list):
-                request.accumulated_text = res_base.text[:]
-            else:
-                self.log(
-                    f"[Detokenize] Warning: res_base.text for first token is not "
-                    f"a list: {res_base.text}. Wrapping in list."
-                )
-                request.accumulated_text = [str(res_base.text)] if res_base.text is not None else [""]
-
-            request.total_generated_tokens += num_valid
-            final_results.append(
-                ReturnSample(
-                    text=res_base.text,
-                    token_ids=res_base.token_ids,
-                    time_spent_computing=0.0,
-                    accumulated_text=request.accumulated_text,
-                    tokens_per_second=0.0,
-                    num_generated_tokens=request.total_generated_tokens,
-                )
-            )
-
-        if request.return_channel:
-            request.enqueue_samples(final_results)
-
-        first_token_return_time = (time.perf_counter() - prefill_dequeue_time) * 1000
-        self.metrics_recorder.record_ttft(first_token_return_time)
-        self.log(f"[Detokenize] TTFT: {first_token_return_time:.2f}ms for request.")
-
-    def _process_result_tokens(self, data: tuple, engine: vEngine, processor: ProcessingClassType):
-        """Process result tokens from decode operations."""
-        _, result_tokens = data
-        result_tokens = result_tokens.convert_to_numpy()
-        current_live_requests = self.scheduler._live_requests
-
-        for slot, request_obj in list(current_live_requests.items()):
-            if request_obj is not None:
-                request: ActiveRequest = request_obj
-                if request.decode_start_time is None:
-                    request.decode_start_time = time.perf_counter()
-
-                results_base, complete, num_valid_tokens_list = process_result_tokens(
-                    processor=processor,
-                    slot=slot,
-                    slot_max_length=request.sampling_params.max_tokens,
-                    result_tokens=result_tokens,
-                    eos_token_id=engine.eos_token_ids,
-                    is_client_side_tokenization=request.is_client_side_tokenization,
-                    complete=request.complete,
-                    ignore_eos=request.sampling_params.ignore_eos,
-                )
-                request.complete = complete
-                elapsed_time = time.perf_counter() - request.decode_start_time
-
-                final_step_results = []
-                for res_base, num_valid in zip(results_base, num_valid_tokens_list, strict=False):
-                    expected_samples = len(res_base.text)
-                    if (
-                        not isinstance(request.accumulated_text, list)
-                        or len(request.accumulated_text) != expected_samples
-                    ):
-                        self.log(
-                            f"[Detokenize] Warning: accumulated_text for slot {slot} is invalid "
-                            f"(None, not list, or wrong length). Re-initializing."
-                        )
-                        request.accumulated_text = [""] * expected_samples
-
-                    if len(res_base.text) > 0:
-                        try:
-                            szip = zip(request.accumulated_text, res_base.text, strict=True)
-                            updated_accumulated_text = []
-                            for _, (accum, res) in enumerate(szip):
-                                new_accum = accum + res
-                                updated_accumulated_text.append(new_accum)
-                            request.accumulated_text = updated_accumulated_text
-                        except ValueError as e:
-                            self.log(
-                                f"[Detokenize] Error zipping accumulated_text and res_base.text for slot "
-                                f"{slot}: {e}. Skipping accumulation for this sample."
-                            )
-
-                    if request.sampling_params.stop is not None:
-                        for stop_sign in request.sampling_params.stop:
-                            for idx, accum in enumerate(request.accumulated_text):
-                                if stop_sign in accum:
-                                    request.complete[idx] = True
-
-                    request.total_generated_tokens += num_valid
-                    tps = request.total_generated_tokens / elapsed_time if elapsed_time > 1e-6 else 0.0
-                    final_step_results.append(
-                        ReturnSample(
-                            text=res_base.text,
-                            token_ids=res_base.token_ids,
-                            time_spent_computing=elapsed_time,
-                            accumulated_text=request.accumulated_text,
-                            tokens_per_second=tps,
-                            num_generated_tokens=request.total_generated_tokens,
-                        )
-                    )
-
-                if request.return_channel:
-                    request.enqueue_samples(final_step_results)
-
-                if request.complete.all():
-                    if request.return_channel:
-                        request.return_channel.close()
-                    self.log(f"[Detokenize] Request in slot {slot} completed.")
-                    self.metrics_recorder.increment_completed_requests()
-                    self.scheduler.free_slot(slot)
-                    engine.free_resource(slot)
-
     def _metrics_monitor_thread_action(self):
         """Background thread action for periodically updating and logging metrics."""
         while self.live:
             try:
-                self.metrics_recorder.update_queue_size("detokenize_backlog", self._detokenize_backlog.qsize())
                 self.metrics_recorder.update_queue_size("free_decode_slots", self.scheduler.get_free_slot_count())
                 self.metrics_recorder.set_active_requests_count(self.scheduler.get_active_request_count())
 
@@ -644,13 +662,18 @@ class vDriver:
         self._engine.graphstate = state
 
     def start(self):
-        """Starts the vDriver and all its background worker threads."""
+        """Starts the vDriver with process and detokenize threads."""
         if not self.live:
             self.log("[Main] Starting vDriver...")
-            self._all_threads = [
-                self._process_thread,
-                self._detokenize_thread,
-            ]
+            self._detokenize_queue = queue.Queue(maxsize=8)
+
+            self._detokenize_thread = SafeThread(
+                target=self._detokenize_thread_action,
+                name="detokenize-thread",
+                daemon=True,
+            )
+
+            self._all_threads = [self._process_thread, self._detokenize_thread]
             self.live = True
 
             for t in self._all_threads:
@@ -671,64 +694,30 @@ class vDriver:
             self.log("[Main] vDriver started.")
 
     def stop(self):
-        """Stops the vDriver and all its background worker threads gracefully."""
+        """Stop all threads and clean up queues."""
         if self.live:
             self.log("[Main] Stopping vDriver...")
             self.live = False
 
-            queues_to_signal = [self._detokenize_backlog]
-            for q_safe in queues_to_signal:
-                try:
-                    q_safe.put_nowait(None)
-                except queue.Full:
-                    self.log(f"[Main] Queue {q_safe} full while trying to send sentinel. May delay shutdown.")
+            # Send sentinel to detokenize queue
+            try:
+                self._detokenize_queue.put_nowait(None)
+            except queue.Full:
+                pass
 
+            # Join all threads
             current_threads_to_join = list(self._all_threads)
             for t in current_threads_to_join:
                 if t.is_alive():
                     self.log(f"[Main] Joining thread: {t.name}")
-                    t.join(timeout=1.0)
-
-            self.log("[Main] Draining queues and closing request channels...")
-            for q_final_drain in queues_to_signal:
-                while True:
-                    try:
-                        r = q_final_drain.get_nowait()
-                        if r is None:
-                            continue
-                        request_to_close = None
-                        if isinstance(r, ActiveRequest):
-                            request_to_close = r
-                        elif isinstance(r, tuple) and r:
-                            if isinstance(r[0], ActiveRequest):
-                                request_to_close = r[0]
-                            elif len(r) > 1 and isinstance(r[1], ActiveRequest):
-                                request_to_close = r[1]
-                        if request_to_close and request_to_close.return_channel:
-                            self.log("[Main] Closing return channel for an orphaned request.")
-                            request_to_close.return_channel.close()
-                            request_to_close.return_channel = None
-                    except queue.Empty:
-                        break
-
-            for t_final in current_threads_to_join:
-                if t_final.is_alive():
-                    self.log(f"[Main] Thread {t_final.name} still alive after initial join. Attempting longer join...")
-                    t_final.join(timeout=MAX_THREAD_JOIN_TIMEOUT)
-                    if t_final.is_alive():
-                        self.log(f"[Main] ERROR: Thread {t_final.name} FAILED to terminate.")
+                    t.join(timeout=MAX_THREAD_JOIN_TIMEOUT)
 
             self.log("[Main] vDriver stopped.")
-
-            if self._metrics_thread and self._metrics_thread.is_alive():
-                self.log("[Main] Metrics thread still alive after main stop, forcing join.")
-                self._metrics_thread.join(timeout=1.0)
 
     def resume(self):
         """Resumes the vDriver if it was previously paused."""
         if self._pause:
             self.log("[Main] Resuming vDriver...")
-            self._setup_detokenizer()
             self.start()
             self._pause = False
             self.log("[Main] vDriver resumed.")

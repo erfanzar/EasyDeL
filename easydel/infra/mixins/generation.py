@@ -11,6 +11,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Generation mixin for text generation capabilities.
+
+Provides text generation functionality through the EasyGenerationMixin class,
+which can be combined with EasyDeL models to enable various generation strategies
+including greedy search, sampling, beam search, and more.
+
+Classes:
+    GreedyState: State container for greedy generation
+    SampleState: State container for sampling generation
+    BeamSearchState: State container for beam search
+    EasyGenerationMixin: Mixin class providing generation methods
+
+Key Features:
+    - Multiple generation strategies (greedy, sampling, beam search)
+    - Logits processing and warping
+    - Support for generation constraints
+    - Integration with HuggingFace generation configs
+    - Efficient JAX implementations
+
+Example:
+    >>> from easydel.infra.mixins import EasyGenerationMixin
+    >>> # Model class inherits from EasyGenerationMixin
+    >>> output = model.generate(
+    ...     input_ids=input_ids,
+    ...     max_length=100,
+    ...     temperature=0.8,
+    ...     top_p=0.95,
+    ...     do_sample=True
+    ... )
+"""
+
 from __future__ import annotations
 
 import copy
@@ -60,15 +92,17 @@ logger = get_logger(__name__)
 
 @auto_pytree
 class GreedyState:
-    """
-    State for greedy search generation.
+    """State container for greedy search generation.
+
+    Tracks the current state during greedy decoding, where the most
+    probable token is selected at each step.
 
     Attributes:
-        cur_len (chex.Array): Current length of the generated sequence.
-        sequences (chex.Array): Generated sequences so far.
-        running_token (chex.Array): Current token being processed.
-        is_sent_finished (chex.Array): Boolean array indicating if a sequence is finished.
-        model_kwargs (tp.Dict[str, chex.Array]): Model specific keyword arguments.
+        cur_len: Current length of generated sequences.
+        sequences: Generated token sequences.
+        running_token: Currently processed token.
+        is_sent_finished: Boolean flags for finished sequences.
+        model_kwargs: Additional model-specific arguments.
     """
 
     cur_len: chex.Array
@@ -80,16 +114,18 @@ class GreedyState:
 
 @auto_pytree
 class SampleState:
-    """
-    State for sampling generation.
+    """State container for sampling-based generation.
+
+    Tracks the current state during sampling generation, where tokens
+    are sampled from the probability distribution.
 
     Attributes:
-        cur_len (chex.Array): Current length of the generated sequence.
-        sequences (chex.Array): Generated sequences so far.
-        running_token (chex.Array): Current token being processed.
-        is_sent_finished (chex.Array): Boolean array indicating if a sequence is finished.
-        prng_key (chex.Array): PRNG key for sampling.
-        model_kwargs (tp.Dict[str, chex.Array]): Model specific keyword arguments.
+        cur_len: Current length of generated sequences.
+        sequences: Generated token sequences.
+        running_token: Currently processed token.
+        is_sent_finished: Boolean flags for finished sequences.
+        prng_key: JAX PRNG key for random sampling.
+        model_kwargs: Additional model-specific arguments.
     """
 
     cur_len: chex.Array

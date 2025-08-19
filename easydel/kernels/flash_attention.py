@@ -12,6 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Flash Attention kernel implementations.
+
+Provides optimized Flash Attention implementations for different
+hardware platforms, automatically selecting the best backend.
+
+Classes:
+    Backend: Enum for supported compute backends (GPU, TPU, CPU)
+    Platform: Enum for Flash Attention platforms (Triton, Pallas, JAX)
+    AttentionConfig: Configuration for Flash Attention computation
+
+Functions:
+    get_device_memory_usage: Get memory usage for a JAX device
+    free_gpu_in_process: Find GPU with most available memory
+    flash_attention: Main Flash Attention function
+    flash_attention_2: Flash Attention 2 implementation
+
+Constants:
+    AVAILABLE_FLASH_ATTENTION2_PLATFORMS: Supported platforms
+    AVAILABLE_BACKENDS: Supported backends
+
+Key Features:
+    - Automatic platform detection and selection
+    - Memory-efficient attention computation
+    - Support for causal masks
+    - Variable sequence lengths
+    - Custom block sizes for optimization
+
+Example:
+    >>> from easydel.kernels.flash_attention import flash_attention
+    >>> output = flash_attention(
+    ...     query=q,
+    ...     key=k,
+    ...     value=v,
+    ...     causal=True,
+    ...     blocksize_q=128,
+    ...     blocksize_k=128
+    ... )
+"""
 
 import os
 import typing as tp
@@ -39,13 +77,15 @@ AVAILABLE_BACKENDS = tp.Literal["gpu", "tpu", "cpu"]
 
 
 def get_device_memory_usage(device: jax.Device) -> float:  # type: ignore
-    """
-    Get the memory usage for a specific JAX device using local_devices stats.
+    """Get memory usage for a specific JAX device.
+
+    Queries device memory statistics to determine current memory usage.
 
     Args:
-        device: JAX device to check
+        device: JAX device to check.
+
     Returns:
-        float: Memory usage in bytes
+        Memory usage in bytes, or inf if unavailable.
     """
     try:
         memory_stats = device.memory_stats()
@@ -55,11 +95,13 @@ def get_device_memory_usage(device: jax.Device) -> float:  # type: ignore
 
 
 def free_gpu_in_process() -> int:
-    """
-    Returns the index of the GPU with the most available memory using JAX local_devices.
+    """Find GPU with most available memory.
+
+    Scans all local GPU devices and returns the index of the one
+    with the most free memory for optimal resource allocation.
 
     Returns:
-        int: Index of the GPU with most free memory
+        Index of the GPU with most free memory (0 if no GPUs).
     """
     devices = jax.local_devices()
     gpu_devices = [d for d in devices if d.platform == "gpu"]
@@ -72,7 +114,13 @@ def free_gpu_in_process() -> int:
 
 
 class Backend(str, Enum):
-    """Supported compute backends."""
+    """Supported compute backends for Flash Attention.
+
+    Attributes:
+        GPU: CUDA/ROCm GPU backend.
+        TPU: Google TPU backend.
+        CPU: CPU fallback backend.
+    """
 
     GPU = "gpu"
     TPU = "tpu"
@@ -80,7 +128,13 @@ class Backend(str, Enum):
 
 
 class Platform(str, Enum):
-    """Supported Flash Attention platforms."""
+    """Flash Attention implementation platforms.
+
+    Attributes:
+        TRITON: Triton-based GPU implementation.
+        PALLAS: Pallas-based TPU implementation.
+        JAX: Pure JAX implementation (fallback).
+    """
 
     TRITON = "triton"
     PALLAS = "pallas"
@@ -89,7 +143,15 @@ class Platform(str, Enum):
 
 @auto_pytree
 class AttentionConfig:
-    """Configuration for Flash Attention computation."""
+    """Configuration for Flash Attention computation.
+
+    Attributes:
+        blocksize_q: Block size for query dimension.
+        blocksize_k: Block size for key dimension.
+        softmax_scale: Scale factor for softmax (default: 1/sqrt(head_dim)).
+        backend: Compute backend to use.
+        platform: Implementation platform to use.
+    """
 
     blocksize_q: int = 128
     blocksize_k: int = 128

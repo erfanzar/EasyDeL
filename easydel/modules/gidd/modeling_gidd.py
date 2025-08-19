@@ -242,11 +242,7 @@ class GiddAttention(AttentionModule):
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
         )
-        self.o_proj = linear_class(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-        )
+        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         # Initialize rotary position embeddings
         self.rotary = self.config.get_basic_rope(

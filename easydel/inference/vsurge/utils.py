@@ -15,16 +15,19 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import os
 import signal
 import threading
+import time
 import traceback
 import typing as tp
 import uuid
 from asyncio import futures
 from bisect import bisect_left
 from dataclasses import dataclass, field
+from typing import Any
 
 import jax
 import numpy as np
@@ -313,17 +316,15 @@ class ActiveRequest:
     """Current state of the driver."""
 
     return_channel: AsyncMultifuture[list[ReturnSample]]
-
     sampling_params: SamplingParams
 
     complete: np.ndarray | None = None
-
     prefill_result: tp.Any = None
     prefill_content: str | list[int] | None = None
     prefill_tokens_processed: int | None = None
-    prefill_tokens_remaining: list[int] | None = None  # Remaining token IDs to process
+    prefill_tokens_remaining: list[int] | None = None
     is_prefill_complete: bool = False
-    current_seq_id: int = -1  # For paged attention
+    current_seq_id: int = -1
 
     generate_timestep_added: int | None = None
     is_client_side_tokenization: bool | None = False
@@ -335,20 +336,66 @@ class ActiveRequest:
 
     id: str = field(default_factory=uuid.uuid4)
 
-    accumulated_text: str | list[str] | None = None
-
     _token_ids: list[int] | None = None
     _attention_mask: np.ndarray | None = None
 
+    _accumulated_texts: list[str] = field(default_factory=list)
+    _last_stop_check_length: list[int] = field(default_factory=list)
+    _stop_patterns: list[str] | None = None
+    _max_stop_pattern_length: int = 0
+
+    def __post_init__(self):
+        """Initialize optimized stop pattern checking."""
+        if self.sampling_params.stop:
+            self._stop_patterns = self.sampling_params.stop
+            self._max_stop_pattern_length = max(len(p) for p in self._stop_patterns)
+
     def enqueue_samples(self, generated_samples: list[ReturnSample]):
-        """Adds the generated sample(s) to return channel for current step.
-
-        Args:
-          generated_samples: The generated sample(s) for current step.
-
-        This should be called only from within the Drivers background thread.
-        """
+        """Adds the generated sample(s) to return channel for current step."""
         self.return_channel.add_result(generated_samples)
+
+    def add_text_fragments(self, new_fragments: list[str]) -> None:
+        """Efficiently append new text fragments."""
+        if not self._accumulated_texts:
+            self._accumulated_texts = [""] * len(new_fragments)
+            self._last_stop_check_length = [0] * len(new_fragments)
+
+        for i, fragment in enumerate(new_fragments):
+            if i < len(self._accumulated_texts) and fragment:
+                self._accumulated_texts[i] += fragment
+
+    @property
+    def accumulated_text(self) -> list[str]:
+        """Direct access to accumulated text - no copying needed."""
+        return self._accumulated_texts
+
+    def check_stop_conditions(self, sample_idx: int) -> bool:
+        """Efficiently check stop conditions only on new text."""
+        if not self._stop_patterns or sample_idx >= len(self._accumulated_texts):
+            return False
+
+        current_text = self._accumulated_texts[sample_idx]
+        current_length = len(current_text)
+        if current_length <= self._last_stop_check_length[sample_idx]:
+            return False
+
+        check_start = max(0, self._last_stop_check_length[sample_idx] - self._max_stop_pattern_length)
+        check_text = current_text[check_start:]
+
+        self._last_stop_check_length[sample_idx] = current_length
+        for pattern in self._stop_patterns:
+            if pattern in check_text:
+                return True
+
+        return False
+
+    def get_new_text_since_last_check(self, sample_idx: int) -> str:
+        """Get only the newly added text since last check."""
+        if sample_idx >= len(self._accumulated_texts):
+            return ""
+
+        last_pos = self._last_stop_check_length.get(sample_idx, 0) if self._last_stop_check_length else 0
+        return self._accumulated_texts[sample_idx][last_pos:]
 
 
 class SafeThread(threading.Thread):
@@ -662,13 +709,13 @@ class MetricsRecorder:
                              to prevent unbounded memory growth.
     """
 
-    def __init__(self, metrics_log_interval_sec: float = 10.0):
+    def __init__(self, metrics_log_interval_sec: float = 60.0):
         """
         Initializes the MetricsRecorder.
 
         Args:
             metrics_log_interval_sec (float): The interval in seconds at which
-                a monitoring thread might log these metrics. Defaults to 10.0.
+                a monitoring thread might log these metrics. Defaults to 60.0.
         """
         self.metrics = {
             "queue_sizes": {},
@@ -936,3 +983,200 @@ class SmartBytecodeDecoder:
 
         logger.warning("Complete decode failure, using fallback")
         return self.fallback_char, [], True
+
+
+@dataclass
+class DetokenizeItem:
+    """Wrapper for items in the detokenize queue."""
+
+    data: Any
+    timestamp: float
+    sequence_num: int
+
+
+class ThreadSafeRingBuffer:
+    """Thread-safe ring buffer that blocks when full instead of dropping."""
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self.buffer = collections.deque()
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.sequence_counter = 0
+        self.closed = False
+
+    def put(self, item: Any, timeout: float | None = None) -> bool:
+        """Put an item in the buffer. Blocks if full."""
+        with self.lock:
+            if self.closed:
+                return False
+
+            end_time = None if timeout is None else time.perf_counter() + timeout
+
+            while len(self.buffer) >= self.maxsize:
+                if self.closed:
+                    return False
+
+                remaining = None if timeout is None else end_time - time.perf_counter()
+                if remaining is not None and remaining <= 0:
+                    return False  # Timeout
+
+                if not self.not_full.wait(timeout=remaining):
+                    return False  # Timeout
+
+            # Wrap item with metadata
+            wrapped = DetokenizeItem(data=item, timestamp=time.perf_counter(), sequence_num=self.sequence_counter)
+            self.sequence_counter += 1
+
+            self.buffer.append(wrapped)
+            self.not_empty.notify()
+            return True
+
+    def get(self, timeout: float | None = None) -> Any | None:
+        """Get an item from the buffer. Blocks if empty."""
+        with self.lock:
+            end_time = None if timeout is None else time.perf_counter() + timeout
+
+            while not self.buffer:
+                if self.closed:
+                    return None
+
+                remaining = None if timeout is None else end_time - time.perf_counter()
+                if remaining is not None and remaining <= 0:
+                    return None  # Timeout
+
+                if not self.not_empty.wait(timeout=remaining):
+                    return None  # Timeout
+
+            wrapped = self.buffer.popleft()
+            self.not_full.notify()
+            return wrapped.data
+
+    def get_batch(self, max_items: int = 10, timeout: float | None = None) -> list[Any]:
+        """Get multiple items at once for batch processing."""
+        batch = []
+
+        # First item with timeout
+        first_item = self.get(timeout=timeout)
+        if first_item is None:
+            return batch
+        batch.append(first_item)
+
+        # Rest without blocking
+        with self.lock:
+            while len(batch) < max_items and self.buffer:
+                wrapped = self.buffer.popleft()
+                batch.append(wrapped.data)
+                self.not_full.notify()
+
+        return batch
+
+    def qsize(self) -> int:
+        """Return the approximate size of the buffer."""
+        with self.lock:
+            return len(self.buffer)
+
+    def close(self):
+        """Close the buffer and wake up all waiting threads."""
+        with self.lock:
+            self.closed = True
+            self.not_empty.notify_all()
+            self.not_full.notify_all()
+
+
+@dataclass
+class IncrementalDetokenizerState:
+    """State for incremental detokenization per sample."""
+
+    token_ids: list[int] = field(default_factory=list)
+    output_text: str = ""
+    last_offset: int = 0
+    prefix_offset: int = 0
+    read_offset: int = 0
+    tokens: list[str] = field(default_factory=list)
+
+
+class FastDetokenizer:
+    """Fast incremental detokenizer inspired by vLLM."""
+
+    def __init__(self, processor, skip_special_tokens: bool = True):
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.skip_special_tokens = skip_special_tokens
+
+        # Check if we can use fast tokenizers
+        self.use_fast = False
+        try:
+            from tokenizers.decoders import DecodeStream
+
+            if hasattr(self.tokenizer, "_tokenizer"):
+                self.use_fast = True
+                self.decode_streams: dict[tuple[int, int], DecodeStream] = {}
+        except ImportError:
+            pass
+
+    def decode_incremental(
+        self, new_token_ids: np.ndarray, slot: int, sample_idx: int, state: IncrementalDetokenizerState
+    ) -> str:
+        """Decode only the new tokens incrementally."""
+        if len(new_token_ids) == 0:
+            return ""
+
+        # Add new tokens to state
+        state.token_ids.extend(new_token_ids.tolist())
+
+        if self.use_fast:
+            return self._fast_decode_incremental(new_token_ids, slot, sample_idx, state)
+        else:
+            return self._slow_decode_incremental(new_token_ids, state)
+
+    def _fast_decode_incremental(
+        self,
+        new_token_ids: np.ndarray,
+        slot: int,
+        sample_idx: int,
+        state: IncrementalDetokenizerState,
+    ) -> str:
+        """Use tokenizers library DecodeStream for fast decoding."""
+        key = (slot, sample_idx)
+
+        if key not in self.decode_streams:
+            from tokenizers.decoders import DecodeStream
+
+            self.decode_streams[key] = DecodeStream(skip_special_tokens=self.skip_special_tokens)
+
+        stream = self.decode_streams[key]
+        decoded_text = ""
+
+        for token_id in new_token_ids:
+            try:
+                token = stream.step(self.tokenizer._tokenizer, int(token_id))
+                if token:
+                    decoded_text += token
+            except Exception:
+                # Fallback to regular decode on error
+                return self._slow_decode_incremental(new_token_ids, state)
+
+        state.output_text += decoded_text
+        return decoded_text
+
+    def _slow_decode_incremental(self, new_token_ids: np.ndarray, state: IncrementalDetokenizerState) -> str:
+        """Fallback incremental decoding."""
+        # Decode the entire sequence
+        full_text = self.tokenizer.decode(
+            [*state.token_ids, new_token_ids],
+            skip_special_tokens=self.skip_special_tokens,
+        )
+
+        # Return only the new part
+        new_text = full_text[len(state.output_text) :]
+        state.output_text = full_text
+        return new_text
+
+    def cleanup_slot(self, slot: int):
+        """Clean up resources for a slot."""
+        if self.use_fast:
+            keys_to_remove = [k for k in self.decode_streams if k[0] == slot]
+            for key in keys_to_remove:
+                del self.decode_streams[key]

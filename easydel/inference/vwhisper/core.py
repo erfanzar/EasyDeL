@@ -32,20 +32,48 @@ if tp.TYPE_CHECKING:
 
 
 class vWhisperInference:
-    """
-    Whisper inference pipeline for performing speech-to-text transcription or translation.
+    """Speech-to-text inference engine using Whisper models.
+
+    vWhisperInference provides a high-performance pipeline for transcribing
+    and translating audio using OpenAI's Whisper models, optimized for JAX.
+    It supports long-form audio processing with automatic chunking and
+    can generate timestamps for subtitle creation.
+
+    Features:
+        - Audio transcription in multiple languages
+        - Translation to English
+        - Timestamp generation for subtitles
+        - Long-form audio processing with chunking
+        - Batch processing for efficiency
+        - JAX/XLA acceleration
+
+    Attributes:
+        model: The Whisper model for conditional generation
+        tokenizer: Tokenizer for text processing
+        processor: Audio processor for feature extraction
+        inference_config: Configuration settings
+        dtype: Data type for computations
+        graphdef: Model graph definition
+        graphstate: Model state
 
     Args:
-        model (`WhisperForConditionalGeneration`):
-            The fine-tuned Whisper model to use for inference.
-        tokenizer (`WhisperTokenizer`):
-            Tokenizer for Whisper.
-        processor (`WhisperProcessor`):
-            Processor for Whisper.
-        inference_config (`vWhisperInferenceConfig`, *optional*):
-            Inference configuration.
-        dtype (`jax.typing.DTypeLike`, *optional*, defaults to `jnp.float32`):
-            Data type for computations.
+        model: Fine-tuned Whisper model for inference.
+        tokenizer: Whisper tokenizer.
+        processor: Whisper processor for audio processing.
+        inference_config: Optional configuration settings.
+        dtype: Data type for JAX computations (default: float32).
+
+    Example:
+        >>> engine = vWhisperInference(
+        ...     model=whisper_model,
+        ...     tokenizer=tokenizer,
+        ...     processor=processor
+        ... )
+        >>> result = engine.transcribe(
+        ...     "audio.mp3",
+        ...     language="en"
+        ... )
+        >>> print(result["text"])
     """
 
     def __init__(
@@ -56,6 +84,15 @@ class vWhisperInference:
         inference_config: vWhisperInferenceConfig | None = None,
         dtype: jax.typing.DTypeLike = jnp.float32,
     ):
+        """Initialize vWhisperInference engine.
+
+        Args:
+            model: Whisper model for conditional generation.
+            tokenizer: Tokenizer for text processing.
+            processor: Processor for audio feature extraction.
+            inference_config: Configuration for inference behavior.
+            dtype: JAX data type for computations.
+        """
         if inference_config is None:
             inference_config = vWhisperInferenceConfig()
         self.dtype = dtype
@@ -80,6 +117,19 @@ class vWhisperInference:
         task: str | None = None,
         return_timestamps: bool = False,
     ) -> jax.Array:
+        """Generate text from audio features.
+
+        Internal method for generating sequences from processed audio.
+
+        Args:
+            input_features: Processed audio features.
+            language: Source language code.
+            task: Task type ('transcribe' or 'translate').
+            return_timestamps: Whether to generate timestamps.
+
+        Returns:
+            Generated token sequences.
+        """
         forced_decoder_ids = dict(
             get_decoder_input_ids(
                 model_config=self.model.config,
@@ -106,6 +156,23 @@ class vWhisperInference:
         stride_length_s: float | list[float] | None = None,
         batch_size: int | None = None,
     ):
+        """Process audio input into model-ready features.
+
+        Handles various audio input formats and performs chunking
+        for long-form audio processing.
+
+        Args:
+            audio_input: Audio data (file path, bytes, or array).
+            chunk_length_s: Length of audio chunks in seconds.
+            stride_length_s: Overlap between chunks in seconds.
+            batch_size: Number of chunks to process together.
+
+        Yields:
+            Processed audio features ready for model input.
+
+        Raises:
+            ValueError: If chunk length is less than stride length.
+        """
         audio_array, stride = process_audio_input(
             audio_input=audio_input,
             feature_extractor=self.feature_extractor,
@@ -149,6 +216,16 @@ class vWhisperInference:
         return_timestamps: bool | None = None,
         return_language: str | None = None,
     ):
+        """Process model outputs into final transcription.
+
+        Converts raw model outputs into formatted text with optional
+        timestamps and language information.
+
+        Args:
+            model_outputs: Raw outputs from the model.
+            return_timestamps: Whether to include timestamps.
+            return_language: Language code to include in output.
+        """
         model_outputs = [
             dict(zip(output, t, strict=False)) for output in model_outputs for t in zip(*output.values(), strict=False)
         ]

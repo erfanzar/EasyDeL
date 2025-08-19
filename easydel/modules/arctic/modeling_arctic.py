@@ -31,7 +31,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -42,6 +42,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
 from .arctic_configuration import ArcticConfig
@@ -183,6 +190,89 @@ class ArcticAttention(AttentionModule):
         )
 
 
+class ArcticMLPMoE(nn.Module):
+    """
+    Arctic Multi-Layer Perceptron (MLP) block. This block implements the feed-forward network
+    used in the Arctic model. It can optionally function as a residual MLP.
+
+    Attributes:
+            config (ArcticConfig): Configuration object for the Arctic model.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+            is_residual_mlp (bool): Whether this MLP block is a residual MLP. Defaults to False.
+            rngs (nn.Rngs): Random number generators for the module.
+    """
+
+    def __init__(
+        self,
+        config: ArcticConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        is_residual_mlp: bool = False,
+        *,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.is_residual_mlp = is_residual_mlp
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
+
+        self.w1 = ColumnParallelMoELinear(
+            config.num_local_experts,
+            self.hidden_dim,
+            self.ffn_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
+        self.w3 = ColumnParallelMoELinear(
+            config.num_local_experts,
+            self.hidden_dim,
+            self.ffn_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
+        self.w2 = RowParallelMoELinear(
+            config.num_local_experts,
+            self.ffn_dim,
+            self.hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+            rngs=rngs,
+        )
+        self.act_fn = ACT2FN[self.config.hidden_act]
+
+    def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array):
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        return apply_logical_sharding(
+            self.w2(self.act_fn(self.w1(hidden_states, group_sizes)) * self.w3(hidden_states, group_sizes), group_sizes),
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
+
 class ArcticMLP(nn.Module):
     """
     Arctic Multi-Layer Perceptron (MLP) block. This block implements the feed-forward network
@@ -245,7 +335,7 @@ class ArcticMLP(nn.Module):
         return hidden_states
 
 
-class ArcticMoeBlock(nn.Module):
+class ArcticMoeBlock(BaseMoeModule):
     """
     Arctic Mixture of Experts (MoE) block. This module implements the MoE layer used in the Arctic model,
     routing tokens to different experts based on a gating mechanism.
@@ -269,7 +359,16 @@ class ArcticMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
-        super().__init__()
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=getattr(config, "router_aux_loss_coef", None),
+            rzl_coef=getattr(config, "router_z_loss_coef", None),
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -293,16 +392,13 @@ class ArcticMoeBlock(nn.Module):
                 kernel_init=nn.initializers.normal(),
                 rngs=rngs,
             )
-            self.experts = [
-                ArcticMLP(
-                    config=config,
-                    dtype=dtype,
-                    param_dtype=param_dtype,
-                    precision=precision,
-                    rngs=rngs,
-                )
-                for _ in range(config.num_local_experts)
-            ]
+            self.experts = ArcticMLPMoE(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
         else:
             self.mlp = ArcticMLP(
                 config=config,
@@ -312,55 +408,6 @@ class ArcticMoeBlock(nn.Module):
                 is_residual_mlp=False,
                 rngs=rngs,
             )
-
-    def _call_moe(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
-        """
-        Executes the Mixture of Experts (MoE) logic.
-
-        Args:
-                hidden_states (chex.Array): Input hidden states.
-
-        Returns:
-                tp.Tuple[chex.Array, chex.Array]: Tuple containing the final hidden state and the router logits.
-        """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
-            jnp.promote_types(self.dtype, jnp.float32)
-        )
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = jax.nn.softmax(
-            routing_weights.astype(
-                jnp.promote_types(self.dtype, jnp.float32),
-            ),
-            axis=-1,
-        )
-        final_hidden_state = jnp.zeros_like(hidden_states)
-
-        for index in range(self.config.num_local_experts):
-            expert_layer_output = (
-                block_wise_ffn(
-                    self.experts[index],
-                    hidden_states,
-                    self.config.scan_mlp_chunk_size,
-                )
-                if self.config.use_scan_mlp
-                else self.experts[index](hidden_states)
-            )
-            expert_layer_output_exp = (
-                jnp.sum(
-                    jnp.multiply(selected_experts == index, routing_weights),
-                    axis=-1,
-                )[:, :, None]
-                * expert_layer_output
-            )
-            final_hidden_state += expert_layer_output_exp
-
-        return final_hidden_state, router_logits
 
     def __call__(self, hidden_states: chex.Array):
         """
@@ -377,7 +424,13 @@ class ArcticMoeBlock(nn.Module):
                     hidden state and router logits (or 0.0 if not MoE).
         """
         if self.is_moe_layer:
-            return self._call_moe(hidden_states=hidden_states)
+            return self._moe_call(
+                gate_layer=self.gate,
+                expert_layer=self.experts,
+                hidden_state=hidden_states,
+                output_metrics=False,
+                validate_inputs=True,
+            )
         return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)
 
 

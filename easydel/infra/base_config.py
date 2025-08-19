@@ -11,6 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Base configuration classes for EasyDeL models.
+
+This module provides the foundational configuration system for all EasyDeL models,
+extending HuggingFace's PretrainedConfig with EasyDeL-specific features like
+attention mechanisms, quantization, gradient checkpointing, and hardware optimization.
+
+Classes:
+    EasyDeLBaseConfig: Main configuration class with all EasyDeL features
+    EasyDeLBaseConfigDict: Simplified dictionary-based configuration
+
+Key Features:
+    - Multiple attention mechanism support (flash, ring, etc.)
+    - Quantization configuration
+    - Gradient checkpointing policies
+    - Hardware abstraction and optimization
+    - RoPE (Rotary Position Embedding) configuration
+    - Custom kernel support
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseConfig
+    >>> config = EasyDeLBaseConfig(
+    ...     hidden_size=768,
+    ...     num_attention_heads=12,
+    ...     attention_mechanism="flash",
+    ...     gradient_checkpointing_policy="nothing_saveable",
+    ...     use_hardware_abstraction=True
+    ... )
+"""
+
 from __future__ import annotations
 
 import json
@@ -93,8 +123,17 @@ if EKERNEL_OPS:
 
 
 def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
-    """
-    Extracts the commit hash from a resolved filename toward a cache file.
+    """Extract the commit hash from a resolved cache filename.
+
+    Parses the resolved file path to extract the git commit hash
+    if not already provided.
+
+    Args:
+        resolved_file: Path to the resolved cache file.
+        commit_hash: Existing commit hash if available.
+
+    Returns:
+        The commit hash string or None if not found.
     """
     if resolved_file is None or commit_hash is not None:
         return commit_hash
@@ -107,6 +146,16 @@ def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> s
 
 
 def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
+    """Set attributes intelligently with default values.
+
+    Sets an attribute if it doesn't exist, and updates it if a new
+    non-NOT_GIVEN value is provided.
+
+    Args:
+        attr_name: Name of the attribute to set.
+        default: Default value if attribute doesn't exist.
+        new_attr: New value to set (if not NOT_GIVEN).
+    """
     if not hasattr(self, attr_name):
         setattr(self, attr_name, default)
     if new_attr is not NOT_GIVEN:
@@ -115,6 +164,17 @@ def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
 
 @auto_pytree
 class EasyMethod:
+    """Constants for EasyDeL operation modes.
+
+    Defines the different modes in which EasyDeL models can operate.
+
+    Attributes:
+        TRAIN: Training mode for model optimization.
+        SERVE: Serving mode for inference.
+        EVAL: Evaluation mode (alias for serve).
+        CONVERT: Conversion mode for model format changes.
+    """
+
     TRAIN: str = "train"
     SERVE: str = "serve"
     EVAL: str = "serve"
@@ -132,6 +192,15 @@ warnings.filterwarnings("ignore", message="Some donated buffers were not usable:
 
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
+    """TypedDict for EasyDeL configuration parameters.
+
+    Provides type hints for all configuration options that can be
+    passed to EasyDeLBaseConfig. All fields are optional (total=False).
+
+    This is useful for type checking when creating configurations
+    from dictionaries or JSON.
+    """
+
     sharding_axis_dims: tp.Sequence[int]
     sharding_dcn_axis_dims: tp.Sequence[int] | None
     sharding_axis_names: tp.Sequence[str]
@@ -147,6 +216,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     shard_attention_computation: bool
     use_sharded_kv_caching: bool
     use_sharding_constraint: bool
+    use_pallas_group_matmul: bool
     backend: EasyDeLBackends | None
     platform: EasyDeLPlatforms | None
     easy_method: tp.Literal["train", "serve", "convert"]
@@ -176,8 +246,11 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
-    """
-    Initialize the configuration for EasyDeL.
+    """Base configuration class for all EasyDeL models.
+
+    Extends HuggingFace's PretrainedConfig with EasyDeL-specific features
+    for distributed training, custom attention mechanisms, quantization,
+    and hardware optimization.
     Args:
         sharding_axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1, 1).
         sharding_axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp",  "ep", "tp", "sp").
@@ -195,6 +268,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shard_attention_computation (bool): Whether to shard attention computation. Default is True.
         use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
         use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
+        use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
         backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
         platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
         easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
@@ -250,6 +324,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         shard_attention_computation: bool = True,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
+        use_pallas_group_matmul: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -311,6 +386,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
         self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
         self.use_sharding_constraint = getattr(self, "use_sharding_constraint", use_sharding_constraint)
+        self.use_pallas_group_matmul = getattr(self, "use_pallas_group_matmul", use_pallas_group_matmul)
         self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
         self.kv_cache_sharding_sequence_axis_name = getattr(
             self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
@@ -495,6 +571,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_ring_attention",
             "scan_attention_layers",
             "use_sharding_constraint",
+            "use_pallas_group_matmul",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
             "sequence_axis_name",
@@ -542,6 +619,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
+        use_pallas_group_matmul: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
         sequence_axis_name: str = NOT_GIVEN,
@@ -595,6 +673,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
             use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays.
                 Defaults to False.
+            use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
             use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
             scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
             sequence_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
@@ -639,6 +718,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
         set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
+        set_attrs_smartly(self, "use_pallas_group_matmul", True, use_pallas_group_matmul)
+
         set_attrs_smartly(self, "backend", None, backend)
         set_attrs_smartly(self, "platform", "jax", platform)
         set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)

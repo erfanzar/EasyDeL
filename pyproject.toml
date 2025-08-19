@@ -32,7 +32,7 @@ classifiers = [
 dependencies = [
 	"jax==0.7.0",
 	"jaxlib==0.7.0",
-	"eformer==0.0.47",
+	"eformer==0.0.50",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
 	"flax==0.11.0",
@@ -43,7 +43,7 @@ dependencies = [
 	"fastapi>=0.115.2",
 	"wandb>=0.18.5",
 	"uvloop==0.21.0",
-	"uvicorn>=0.32.0",
+	"uvicorn[standard]>=0.32.0",
 	"jinja2>=3.1.5",
 	"grain~=0.2.11",
 	"datasets>=3.6.0",
@@ -75,15 +75,16 @@ torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
 gpu = ["jax[cuda12]==0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]==0.7.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
+lm_eval = ["lm_eval~=0.4.9.1"]
 
 [tool.black]
 line-length = 121
-target-version = ["py310"]
+target-version = ["py311"]
 preview = true
 
 [tool.ruff]
 line-length = 121
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]

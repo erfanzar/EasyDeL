@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Universal path utilities for local and cloud storage.
+
+Provides a unified API for working with paths across different storage
+backends including local filesystem and Google Cloud Storage (GCS).
+
+Classes:
+    UniversalPath: Abstract base class for path operations
+    LocalPath: Local filesystem path implementation
+    GCSPath: Google Cloud Storage path implementation
+    PathManager: Factory for creating appropriate path objects
+    MLUtilPath: Extended path manager with ML utilities
+
+Key Features:
+    - Unified API for local and cloud storage
+    - Transparent switching between storage backends
+    - Support for JAX array and dictionary I/O
+    - Recursive directory operations
+    - Path manipulation and traversal
+
+Example:
+    >>> from easydel.utils.checkpoint_managers.path_utils import EasyPath
+    >>>
+    >>> # Works with local paths
+    >>> local_path = EasyPath("data/model.pkl")
+    >>> local_path.write_bytes(data)
+    >>>
+    >>> # Works with GCS paths
+    >>> gcs_path = EasyPath("gs://bucket/model.pkl")
+    >>> gcs_path.write_bytes(data)
+    >>>
+    >>> # ML-specific utilities
+    >>> EasyPath.save_jax_array(array, "gs://bucket/weights.npy")
+    >>> loaded = EasyPath.load_jax_array("gs://bucket/weights.npy")
+
+"""
+
 import io
 import json
 import os
@@ -29,18 +65,52 @@ from google.cloud import storage
 
 
 class UniversalPath(ABC):
-    """Abstract base class for universal path operations"""
+    """Abstract base class for universal path operations.
+
+    Defines the interface for path operations that work across
+    different storage backends. All concrete implementations must
+    provide these methods.
+
+    This class follows the pathlib.Path API where possible to provide
+    a familiar interface for Python developers.
+    """
 
     @abstractmethod
     def exists(self) -> bool:
+        """Check if the path exists.
+
+        Returns:
+            True if the path exists, False otherwise.
+        """
         pass
 
     @abstractmethod
     def read_text(self, encoding: str = "utf-8") -> str:
+        """Read text content from the path.
+
+        Args:
+            encoding: Text encoding to use.
+
+        Returns:
+            The text content of the file.
+
+        Raises:
+            FileNotFoundError: If the path doesn't exist.
+            ValueError: If trying to read from a directory.
+        """
         pass
 
     @abstractmethod
     def write_text(self, data: str, encoding: str = "utf-8") -> None:
+        """Write text content to the path.
+
+        Args:
+            data: Text data to write.
+            encoding: Text encoding to use.
+
+        Raises:
+            ValueError: If trying to write to a directory.
+        """
         pass
 
     @abstractmethod
@@ -53,6 +123,15 @@ class UniversalPath(ABC):
 
     @abstractmethod
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
+        """Create directory at this path.
+
+        Args:
+            parents: Create parent directories if needed.
+            exist_ok: Don't raise error if directory exists.
+
+        Raises:
+            FileExistsError: If exist_ok is False and path exists.
+        """
         pass
 
     @abstractmethod
@@ -151,9 +230,29 @@ class UniversalPath(ABC):
 
 
 class LocalPath(UniversalPath):
-    """Local filesystem path wrapper around pathlib.Path"""
+    """Local filesystem path implementation.
+
+    Wraps pathlib.Path to provide the UniversalPath interface for
+    local filesystem operations.
+
+    Attributes:
+        path: The underlying pathlib.Path object.
+
+    Example:
+        >>> path = LocalPath("/data/model.pkl")
+        >>> path.exists()
+        True
+        >>> path.parent
+        LocalPath('/data')
+        >>> (path.parent / "config.json").write_text(config)
+    """
 
     def __init__(self, path: str | Path):
+        """Initialize LocalPath.
+
+        Args:
+            path: Path string or pathlib.Path object.
+        """
         self.path = Path(path)
 
     def exists(self) -> bool:
@@ -273,9 +372,36 @@ class LocalPath(UniversalPath):
 
 
 class GCSPath(UniversalPath):
-    """Google Cloud Storage path wrapper"""
+    """Google Cloud Storage path implementation.
+
+    Provides UniversalPath interface for Google Cloud Storage operations.
+    Handles blob operations, bucket management, and directory emulation.
+
+    Attributes:
+        path: Full GCS path string (gs://bucket/path).
+        client: Google Cloud Storage client.
+        bucket_name: Name of the GCS bucket.
+        blob_name: Path within the bucket.
+
+    Example:
+        >>> path = GCSPath("gs://my-bucket/data/model.pkl")
+        >>> path.exists()
+        True
+        >>> path.write_bytes(model_bytes)
+        >>> for item in path.parent.iterdir():
+        ...     print(item.name)
+    """
 
     def __init__(self, path: str, client: storage.Client | None = None):
+        """Initialize GCSPath.
+
+        Args:
+            path: GCS path starting with gs://.
+            client: Optional GCS client, creates default if None.
+
+        Raises:
+            ValueError: If path doesn't start with gs://.
+        """
         if not path.startswith("gs://"):
             raise ValueError(f"GCS path must start with 'gs://': {path}")
 
@@ -544,13 +670,35 @@ class GCSPath(UniversalPath):
 
 
 class PathManager:
-    """Factory class for creating appropriate path objects"""
+    """Factory for creating appropriate path objects.
+
+    Automatically creates LocalPath or GCSPath based on the path string.
+    Manages GCS client creation and credential handling.
+
+    Attributes:
+        gcs_client: Cached GCS client instance.
+
+    Example:
+        >>> manager = PathManager()
+        >>> local = manager("/data/file.txt")
+        >>> isinstance(local, LocalPath)
+        True
+        >>> gcs = manager("gs://bucket/file.txt")
+        >>> isinstance(gcs, GCSPath)
+        True
+    """
 
     def __init__(
         self,
         gcs_client: storage.Client | None = None,
         gcs_credentials_path: str | None = None,
     ):
+        """Initialize PathManager.
+
+        Args:
+            gcs_client: Optional pre-configured GCS client.
+            gcs_credentials_path: Path to GCS service account credentials.
+        """
         self._gcs_client = gcs_client
         self._gcs_credentials_path = gcs_credentials_path
 
@@ -571,7 +719,14 @@ class PathManager:
         return self._gcs_client
 
     def __call__(self, path: str | Path) -> UniversalPath:
-        """Create appropriate path object based on path string"""
+        """Create appropriate path object based on path string.
+
+        Args:
+            path: Path string or Path object.
+
+        Returns:
+            LocalPath for local paths, GCSPath for gs:// paths.
+        """
         path_str = str(path)
         if path_str.startswith("gs://"):
             return GCSPath(path_str, self.gcs_client)
@@ -580,10 +735,36 @@ class PathManager:
 
 
 class MLUtilPath(PathManager):
-    """Extended path manager with ML-specific utilities"""
+    """Extended path manager with ML-specific utilities.
+
+    Adds JAX array and dictionary I/O operations to the base PathManager.
+    Supports various serialization formats and handles JAX/NumPy conversions.
+
+    Example:
+        >>> path_manager = MLUtilPath()
+        >>> # Save JAX array
+        >>> path_manager.save_jax_array(array, "gs://bucket/weights.npy")
+        >>> # Load JAX array
+        >>> loaded = path_manager.load_jax_array("gs://bucket/weights.npy")
+        >>> # Save dictionary with JAX arrays
+        >>> path_manager.save_dict({"weights": weights}, "config.json")
+    """
 
     def save_jax_array(self, array: jax.Array, path: str | UniversalPath, format: str = "npy") -> None:  # noqa:A002
-        """Save JAX array in various formats"""
+        """Save JAX array in various formats.
+
+        Args:
+            array: JAX array to save.
+            path: Destination path (local or GCS).
+            format: Serialization format ('npy' or 'pickle').
+
+        Raises:
+            ValueError: If format is not supported.
+
+        Example:
+            >>> manager.save_jax_array(weights, "weights.npy")
+            >>> manager.save_jax_array(biases, "gs://bucket/biases.pkl", "pickle")
+        """
         if isinstance(path, str):
             path = self(path)
 
@@ -599,7 +780,23 @@ class MLUtilPath(PathManager):
             raise ValueError(f"Unsupported format: {format}")
 
     def load_jax_array(self, path: str | UniversalPath, format: str = "npy") -> jax.Array:  # noqa:A002
-        """Load JAX array from various formats"""
+        """Load JAX array from various formats.
+
+        Args:
+            path: Source path (local or GCS).
+            format: Serialization format ('npy' or 'pickle').
+
+        Returns:
+            Loaded JAX array.
+
+        Raises:
+            ValueError: If format is not supported.
+            FileNotFoundError: If path doesn't exist.
+
+        Example:
+            >>> weights = manager.load_jax_array("weights.npy")
+            >>> biases = manager.load_jax_array("gs://bucket/biases.pkl", "pickle")
+        """
         if isinstance(path, str):
             path = self(path)
 
@@ -656,7 +853,21 @@ class MLUtilPath(PathManager):
             return obj
 
     def copy_tree(self, src: str | UniversalPath, dst: str | UniversalPath) -> None:
-        """Copy entire directory tree between local and GCS"""
+        """Copy entire directory tree between local and GCS.
+
+        Recursively copies all files and directories from source to destination.
+        Works across different storage backends (local to GCS, GCS to local, etc.).
+
+        Args:
+            src: Source path (directory or file).
+            dst: Destination path.
+
+        Example:
+            >>> # Copy local to GCS
+            >>> manager.copy_tree("data/", "gs://bucket/data/")
+            >>> # Copy GCS to local
+            >>> manager.copy_tree("gs://bucket/model/", "local_model/")
+        """
         if isinstance(src, str):
             src = self(src)
         if isinstance(dst, str):

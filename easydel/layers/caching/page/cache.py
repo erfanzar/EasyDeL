@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import typing as tp
-from functools import partial
 
 import chex as cx
 import jax
@@ -266,47 +265,49 @@ class PagesCacheView(BaseCacheView):
         head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
-        resolve = self.partition_manager.resolve
+        use_kernel = jax.default_backend() == "tpu"
+        use_shardmap = use_kernel
 
-        @partial(
-            jax.shard_map,
-            in_specs=(
-                resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-                resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
-                resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-                resolve([EMPTY], mode=MODE_PREFILL),
-            ),
-            out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-            mesh=es.get_incontext_mesh(),
-            check_vma=False,
-        )
-        def _update(kv, slots, pages, num_update_slices):
-            if jax.default_backend() == "tpu":
-                return kv_cache_update(
+        def _update_fn(kv, slots, pages, num_update_slices):
+            orgshape = pages.shape
+            pages = pages.reshape(-1, *orgshape[2:])
+            if use_kernel:
+                pages = kv_cache_update(
                     kv,
                     slots,
-                    pages.reshape(-1, *pages.shape[2:]),
+                    pages,
                     num_update_slices,
                     page_size=cache_metadata.page_size,
                     slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
-                ).reshape(pages.shape)
+                )
             else:
-                return kv_cache_update_jax(
+                pages = kv_cache_update_jax(
                     kv,
                     slots,
-                    pages.reshape(-1, *pages.shape[2:]),
+                    pages,
                     num_update_slices,
                     page_size=cache_metadata.page_size,
-                ).reshape(pages.shape)
+                )
+            return pages.reshape(*orgshape)
 
-        self.kv_pages = _update(
-            jnp.concatenate([key, value], 1),
-            cache_metadata.slot_mapping,
-            self.kv_pages,
-            cache_metadata.num_kv_update_slices,
-        )
+        if use_shardmap:
+            resolve = self.partition_manager.resolve
+            _update_fn = jax.shard_map(
+                _update_fn,
+                in_specs=(
+                    resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                    resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
+                    resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                    resolve([EMPTY], mode=MODE_PREFILL),
+                ),
+                out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                mesh=es.get_incontext_mesh(),
+                check_vma=False,
+            )
 
-        return self
+        kvs = jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size)
+        kv_pages = _update_fn(kvs, cache_metadata.slot_mapping, self.kv_pages, cache_metadata.num_kv_update_slices)
+        return self.replace(kv_pages=kv_pages)
 
     @property
     def key_pages(self) -> jax.Array:

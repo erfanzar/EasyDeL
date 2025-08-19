@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -96,10 +96,7 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):
         """
@@ -119,16 +116,10 @@ class Qwen3MoeConfig(EasyDeLBaseConfig):
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
             (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"block_sparse_moe/experts/\d+/(gate_proj|up_proj)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
-            (r"block_sparse_moe/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r"block_sparse_moe/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"block_sparse_moe/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            (r"block_sparse_moe/experts/.*bias", pmag.resolve(Replicated)),
+            (r".*/(input_layernorm|post_attention_layernorm)/kernel", pmag.resolve(Replicated)),
             (r"norm/scale", pmag.resolve(Replicated)),
             (r"norm/bias", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),

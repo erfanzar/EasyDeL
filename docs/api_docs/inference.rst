@@ -5,7 +5,11 @@ Inference
    :maxdepth: 2
 
    inference___init__
+   inference_esurge
    inference_evals
+   inference_function_calling
+   inference_function_calling_handler
+   inference_inference_engine_interface
    inference_logits_process
    inference_oai_proxies
    inference_openai_api_modules

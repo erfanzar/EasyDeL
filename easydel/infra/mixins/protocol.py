@@ -106,8 +106,29 @@ def prettify_nnx(
     max_depth: int | None = None,
     module_param=None,
 ) -> str:
-    """
-    Recursively formats the structure of a Flax NNX module, mimicking PyTorch's module printing.
+    """Format the structure of a Flax NNX module for display.
+
+    Recursively creates a human-readable representation of a module's
+    structure, similar to PyTorch's module printing.
+
+    Args:
+        module: The module to format.
+        indent: Current indentation string.
+        depth: Current recursion depth.
+        max_depth: Maximum depth to recurse.
+        module_param: Optional parameter dictionary.
+
+    Returns:
+        Formatted string representation of the module hierarchy.
+
+    Example:
+        >>> print(prettify_nnx(my_model, max_depth=2))
+        MyModel(
+          (encoder): Encoder(
+            (layers): ModuleList(...)
+          )
+          (decoder): Decoder(...)
+        )
     """
     if max_depth is not None and depth > max_depth:
         return ""

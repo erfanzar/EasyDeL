@@ -12,6 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Loss computation utilities for EasyDeL models.
+
+Provides configurable loss functions for various tasks including language modeling,
+sequence classification, and custom objectives. Supports advanced features like
+label smoothing, z-loss regularization, and flexible normalization strategies.
+
+Classes:
+    SpecialLossNormalizingFactor: Enum for dynamic loss normalization
+    LossConfig: Configuration for loss computation behavior
+    LossMetrics: Container for loss metrics and auxiliary information
+    ForCausalLMLoss: Loss function for causal language modeling
+    ForSequenceClassificationLoss: Loss function for sequence classification
+
+Key Features:
+    - Flexible loss normalization strategies
+    - Label smoothing and z-loss regularization
+    - Support for weighted losses
+    - NaN detection and handling
+    - Efficient JAX implementations
+
+Example:
+    >>> from easydel.infra import LossConfig
+    >>> config = LossConfig(
+    ...     label_smoothing=0.1,
+    ...     z_loss=1e-4,
+    ...     loss_normalizing_factor="NUM_REAL_TARGET_TOKENS"
+    ... )
+    >>> loss_fn = ForCausalLMLoss(config)
+    >>> loss, metrics = loss_fn(
+    ...     logits=model_output,
+    ...     labels=targets
+    ... )
+"""
+
 import enum
 import typing as tp
 from dataclasses import fields

@@ -178,9 +178,9 @@ class XerxesConfig(EasyDeLBaseConfig):
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
             (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (r"mlp/experts/\d+/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/experts/\d+/.*bias", pmag.resolve(Replicated)),
+            (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/experts/down_proj/kernel", pmag.resolve(RowWise)),
+            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
             (
                 r".*/(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
                 pmag.resolve(Replicated),

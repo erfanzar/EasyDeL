@@ -68,6 +68,7 @@ class VanillaAttn(AttentionImpl):
         init_bias: tp.Callable[[], Array] | None = None,
         deterministic: bool = True,  # Default to deterministic (no dropout)
         dropout_rng: jax.random.PRNGKey = None,
+        softmax_aux: Array | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -172,7 +173,22 @@ class VanillaAttn(AttentionImpl):
 
             logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
 
-        aw = jax.nn.softmax(logits.astype(softmax_dtype)).astype(dtype)
+        if softmax_aux is not None:
+            if softmax_aux.ndim == 2:
+                sinks = softmax_aux.reshape(1, kh, -1, 1, 1)
+                sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, 1))
+            elif softmax_aux.ndim == 1:
+                sinks = softmax_aux.reshape(1, kh, -1, 1, 1)
+                sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, 1))
+            else:
+                raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
+            combined_logits = jnp.concatenate([logits, sinks], axis=-1)
+            combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
+            probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
+            aw = probs[..., :-1]
+        else:
+            aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)
+
         dp = self.metadata.dropout_prob
         if not deterministic and dp > 0.0 and dropout_rng is not None:
             keep_prob = 1.0 - dp
@@ -219,6 +235,7 @@ class VanillaAttn(AttentionImpl):
         init_bias: tp.Callable[[], Array] | None = None,
         deterministic: bool = True,
         dropout_rng: jax.random.PRNGKey = None,
+        softmax_aux: Array | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -253,6 +270,7 @@ class VanillaAttn(AttentionImpl):
             init_bias=init_bias,
             deterministic=deterministic,
             dropout_rng=dropout_rng,
+            softmax_aux=softmax_aux,
             **ignore,
         )
 

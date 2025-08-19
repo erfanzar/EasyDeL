@@ -19,9 +19,14 @@ Modules
    modules_gemma
    modules_gemma2
    modules_gemma3
+   modules_gidd
+   modules_glm
+   modules_glm4
+   modules_glm4_moe
    modules_gpt2
    modules_gpt_j
    modules_gpt_neox
+   modules_gpt_oss
    modules_grok_1
    modules_internlm2
    modules_llama

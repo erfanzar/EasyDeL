@@ -12,6 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Caching systems for efficient inference.
+
+Provides various caching mechanisms for different model architectures
+to optimize memory usage and computation during inference.
+
+Cache Types:
+    TransformerCache: Standard KV-cache for transformer models
+    PagesCache: Paged cache for efficient memory management
+    MambaCache: Cache for Mamba state-space models
+    Mamba2Cache: Enhanced cache for Mamba2 models
+    LightningCache: Cache for Lightning attention
+
+Cache Specifications:
+    FullAttentionSpec: Specification for full attention caching
+    SlidingWindowSpec: Specification for sliding window attention
+    ChunkedLocalAttentionSpec: Specification for chunked local attention
+    MambaSpec: Specification for Mamba model caching
+    KVCacheSpec: Base specification for KV caches
+
+Key Features:
+    - Memory-efficient caching strategies
+    - Support for various attention patterns
+    - Page-based memory management
+    - Sliding window and local attention support
+    - State-space model caching
+
+Example:
+    >>> from easydel.layers.caching import TransformerCache
+    >>> # Create a transformer cache
+    >>> cache = TransformerCache.init(
+    ...     batch_size=2,
+    ...     max_length=1024,
+    ...     num_heads=16,
+    ...     head_dim=64,
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>> # Update cache with new key-value pairs
+    >>> cache = cache.update(keys, values, positions)
+
+Note:
+    Different cache types are optimized for specific model
+    architectures and attention patterns. Choose the appropriate
+    cache based on your model's requirements.
+"""
+
 from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, MambaSpec, SlidingWindowSpec
 from .lightning import LightningCache, LightningCacheMetaData, LightningCacheView, LightningMetadata
 from .mamba import MambaCache, MambaCacheMetaData, MambaCacheView, MambaMetadata

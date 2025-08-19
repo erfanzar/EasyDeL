@@ -12,6 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Linear layers with parallel and distributed computation support.
+
+Provides optimized linear layers with support for model parallelism,
+tensor parallelism, and various sharding strategies for distributed training.
+
+Classes:
+    ParallelLinear: Linear layer with tensor/model parallelism support
+    Linear: Standard linear layer (alias for ParallelLinear)
+
+Functions:
+    get_sharding: Extract sharding specification from an array
+    get_output_partition_spec: Calculate output sharding for matmul
+    get_matmul_output_sharding: Determine output sharding from input specs
+
+Key Features:
+    - Automatic sharding and gathering for distributed training
+    - Support for various matrix multiplication methods
+    - Mixed precision support
+    - Efficient initialization strategies
+    - Integration with JAX's shard_map
+
+Example:
+    >>> from easydel.layers import ParallelLinear
+    >>> # Create a parallel linear layer
+    >>> layer = ParallelLinear(
+    ...     features=768,
+    ...     use_bias=True,
+    ...     gather_output=False,
+    ...     axis_name="model",
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>> output = layer(input_tensor)
+"""
+
 import typing as tp
 
 import jax.numpy as jnp
@@ -31,7 +66,6 @@ from easydel.kernels.collective_matmul import (
     prepare_matrix_for_all_gather,
     prepare_matrix_for_reduce_scatter,
 )
-from easydel.kernels.tpu_ops.grouped_matmul_pallas import pallas_grouped_matmul_sharded
 
 Dtype = jnp.dtype
 Initializer = nn.initializers.Initializer
@@ -45,13 +79,15 @@ default_bias_init = nn.initializers.zeros
 
 
 def get_sharding(arr: Shaped[Array, "..."]) -> Ps | None:
-    """Gets the sharding of an array.
+    """Get the sharding specification of an array.
+
+    Extracts the PartitionSpec from a sharded JAX array.
 
     Args:
-            arr: Array to get sharding from.
+        arr: Array to get sharding from.
 
     Returns:
-            Sharding of the array.
+        PartitionSpec of the array, or None if not sharded.
     """
     sharding = getattr(arr, "sharding", None)
     if sharding is not None:
@@ -65,16 +101,19 @@ def get_output_partition_spec(
     method: MatrixMultiplyMethod,
     axis_name: str,
 ) -> Ps | None:
-    """Calculate output partition spec based on input arrays and matmul method.
+    """Calculate output partition spec for matrix multiplication.
+
+    Determines the appropriate output sharding based on input
+    sharding and the matrix multiplication method used.
 
     Args:
-        lhs: Left-hand side array (inputs)
-        rhs: Right-hand side array (weights)
-        method: Matrix multiplication method
-        axis_name: Axis name for sharding
+        lhs: Left-hand side array (inputs).
+        rhs: Right-hand side array (weights).
+        method: Matrix multiplication method.
+        axis_name: Axis name for sharding.
 
     Returns:
-        Output partition specification
+        Output partition specification for the result.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -91,14 +130,23 @@ def get_output_partition_spec(
 
 
 def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
-    """
-    Determine the output sharding PartitionSpec for a matrix multiplication
-    based on the partition specs of the input matrices.
+    """Determine output sharding for matrix multiplication.
 
-    For matrix multiplication X @ W:
-    - The contracting dimensions get reduced during matmul
-    - The non-contracting dimensions of X and W determine the output sharding
-    - Ensures no duplicate sharding dimensions in the output
+    Calculates the output PartitionSpec based on input partition specs,
+    following matrix multiplication rules where contracting dimensions
+    are reduced and non-contracting dimensions determine output sharding.
+
+    For X @ W:
+    - Contracting dimensions are reduced during matmul
+    - Non-contracting dimensions determine output sharding
+    - Ensures no duplicate sharding dimensions in output
+
+    Args:
+        lhs_pspec: PartitionSpec for left-hand side matrix.
+        rhs_pspec: PartitionSpec for right-hand side matrix.
+
+    Returns:
+        Output PartitionSpec for the multiplication result.
     - Ensures correct output dimensionality with None padding if needed
 
     Args:
@@ -380,102 +428,8 @@ class ParallelLinear(nn.Module):
 
 
 class RowParallelLinear(ParallelLinear):
-    _direction = "row"
+    _direction: tp.Literal["row", "column"] | None = "row"
 
 
 class ColumnParallelLinear(ParallelLinear):
-    _direction = "column"
-
-
-class MoELinear(nn.Module):
-    def __init__(
-        self,
-        num_experts: int,
-        in_features: int,
-        out_features: int,
-        *,
-        use_bias: bool = True,
-        dtype: Dtype | None = None,
-        param_dtype: Dtype = jnp.float32,
-        precision: PrecisionLike = None,
-        kernel_init: Initializer = default_kernel_init,
-        bias_init: Initializer = default_bias_init,
-        tile_size: tuple[int, int, int] = (512, 1024, 1024),
-        do_hostsync: bool = False,
-        expert_axes: str = "ep",
-        sync_axes: str = "tp",
-        rngs: nn.Rngs | None = None,
-    ):
-        if rngs is None:
-            rngs = nn.Rngs(0)
-        self.num_experts = num_experts
-        self.in_features = in_features
-        self.out_features = out_features
-        self.use_bias = use_bias
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.kernel_init = kernel_init
-        self.bias_init = bias_init
-        self.rngs = rngs
-        self.tile_size = tile_size
-        self.do_hostsync = do_hostsync
-        self.expert_axes = expert_axes
-        self.sync_axes = sync_axes
-        self.tp_merged = len(out_features) if isinstance(out_features, tp.Sequence) else 1
-        out_features_sum = sum(out_features) if self.tp_merged > 1 else out_features
-        kernel_key = rngs.params()
-        kernel_shape = (num_experts, in_features, out_features_sum)
-        self.kernel = nn.Param(kernel_init(kernel_key, kernel_shape, param_dtype))
-
-        if use_bias:
-            bias_key = rngs.params()
-            bias_shape = (out_features,)
-            self.bias = nn.Param(bias_init(bias_key, bias_shape, param_dtype))
-        else:
-            self.bias = None
-
-    def native_forward(
-        self,
-        inputs: Shaped[Array, "num_tokens in_features"],
-        group_sizes: Array,
-    ) -> Shaped[Array, "num_tokens out_features"]:
-        """Applies the linear transformation with optional tensor parallelism.
-
-        Args:
-            inputs: The input array. Shape: (..., in_features).
-                    For ROW parallelism, the input is expected to be sharded
-                    along the feature dimension (`axis_name`).
-
-        Returns:
-            The transformed output array.
-            Shape: (..., out_features).
-            Output is sharded for COLUMN parallelism if `reduce_scatter_output` is True.
-            Otherwise, output is fully replicated.
-        """
-        kernel = self.kernel.value
-        bias = self.bias.value if self.use_bias else None
-
-        if bias is not None:
-            inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
-        else:
-            inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
-
-        y = pallas_grouped_matmul_sharded(
-            lhs=inputs,
-            rhs=kernel,
-            group_sizes=group_sizes,
-            tile_size=self.tile_size,
-            do_hostsync=self.do_hostsync,
-            sync_axes=self.sync_axes,
-        )
-
-        if bias is not None:
-            y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
-
-        return y
-
-    def __call__(
-        self, inputs: Shaped[Array, "num_tokens in_features"], group_sizes: Array
-    ) -> Shaped[Array, "num_tokens out_features"]:
-        return self.native_forward(inputs=inputs, group_sizes=group_sizes)
+    _direction: tp.Literal["row", "column"] | None = "column"

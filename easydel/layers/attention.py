@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Flexible attention module for various attention mechanisms.
+
+Provides a unified interface for different attention implementations,
+automatically selecting the optimal mechanism based on hardware and
+configuration. Supports Flash Attention, Ring Attention, Splash Attention,
+and other optimized implementations.
+
+Classes:
+    AttentionMechanisms: Enum of available attention mechanisms
+    FlexibleAttentionModule: Main attention module with automatic optimization
+
+Functions:
+    tpu_version_check: Check TPU version for optimization
+    get_optimal_config: Determine best attention mechanism for hardware
+    _get_jax_dtype_from_string: Convert string to JAX dtype
+
+Constants:
+    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism ("auto")
+
+Example:
+    >>> from easydel.layers.attention import FlexibleAttentionModule
+    >>> attn = FlexibleAttentionModule(
+    ...     config=config,
+    ...     dtype=jnp.bfloat16,
+    ...     attention_mechanism="flash_attn2"
+    ... )
+    >>> output = attn(
+    ...     query, key, value,
+    ...     attention_mask=mask
+    ... )
+"""
+
 import typing as tp
 import warnings
 from enum import Enum
@@ -42,16 +74,22 @@ logger = get_logger(__name__)
 
 
 def _get_jax_dtype_from_string(dtype_string):
-    """
-    Converts a string representation of a JAX dtype back to the JAX dtype object.
+    """Convert string representation to JAX dtype.
+
+    Parses string representations of JAX dtypes and returns
+    the corresponding dtype object.
 
     Args:
-        dtype_string (str): The string representation of the JAX dtype
-                            (e.g., "<class 'jax.numpy.float32'>").
+        dtype_string: String representation of JAX dtype
+            (e.g., "<class 'jax.numpy.float32'>").
 
     Returns:
-        jnp.dtype or str: The corresponding JAX dtype object (e.g., jnp.float32)
-                          if found, otherwise returns the original string.
+        JAX dtype object if recognized, otherwise the original string.
+
+    Example:
+        >>> dtype = _get_jax_dtype_from_string("<class 'jax.numpy.float32'>")
+        >>> dtype == jnp.float32
+        True
     """
     dtype_mapping = {
         "<class 'jax.numpy.float32'>": jnp.float32,
@@ -66,20 +104,23 @@ def _get_jax_dtype_from_string(dtype_string):
 
 
 class AttentionMechanisms(str, Enum):
-    """
-    Enumeration of available attention mechanisms.
+    """Available attention mechanism implementations.
+
+    Enumeration of different attention computation strategies,
+    each optimized for specific hardware or use cases.
 
     Attributes:
-        AUTO: Automatically selects the best mechanism based on the backend.
-        FLASH_ATTN2: FlashAttention-2 implementation.
-        RING: RingAttention implementation.
+        AUTO: Automatically selects best mechanism for hardware.
+        FLASH_ATTN2: FlashAttention-2 for efficient GPU computation.
+        RING: RingAttention for sequence parallelism.
         VANILLA: Standard dot-product attention.
-        SPLASH: SplashAttention implementation (optimized for TPUs).
-        CUDNN: cuDNN implementation (GPU specific).
-        BLOCKWISE: Blockwise attention computation.
-        SDPA: Scaled Dot Product Attention (potentially uses JAX native SDPA).
-        CUDA_FLASH_ATTN2: CUDA specific FlashAttention-2 implementation.
-        PAGED_ATTENTION: Paged attention for fast inference.
+        SPLASH: SplashAttention optimized for TPUs.
+        CUDNN: cuDNN implementation for NVIDIA GPUs.
+        BLOCKWISE: Blockwise computation for memory efficiency.
+        SDPA: Scaled Dot Product Attention (JAX native).
+        CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
+        PAGED_ATTENTION: Paged attention for efficient inference.
+        REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
     AUTO = "auto"
@@ -96,16 +137,22 @@ class AttentionMechanisms(str, Enum):
 
 
 def tpu_version_check(version: str = "v4"):
-    """
-    Checks if the local JAX device matches the specified TPU version.
+    """Check if running on specified TPU version.
+
+    Verifies if the current JAX device matches the specified
+    TPU version for hardware-specific optimizations.
 
     Args:
-        version (str, optional): The TPU version string to check against (e.g., "v4").
-                                 Defaults to "v4".
+        version: TPU version string to check (e.g., "v4", "v5").
+                Defaults to "v4".
 
     Returns:
-        bool: True if the device kind of the first local device contains the
-              specified version string (case-insensitive), False otherwise.
+        True if running on specified TPU version, False otherwise.
+
+    Example:
+        >>> if tpu_version_check("v5"):
+        ...     # Use TPU v5 optimizations
+        ...     pass
     """
     if version in getattr(jax.local_devices()[0], "device_kind", "").lower():
         return True
@@ -114,13 +161,24 @@ def tpu_version_check(version: str = "v4"):
 
 
 def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
-    """
-    Determines the recommended attention mechanism and dtype for the current JAX backend.
+    """Determine optimal attention configuration for hardware.
+
+    Analyzes the current JAX backend and hardware to recommend
+    the best attention mechanism and data type for performance.
 
     Returns:
-        tp.Tuple[AttentionMechanisms, jnp.dtype]: A tuple containing the recommended
-                                                   AttentionMechanisms enum member and
-                                                   the recommended jnp.dtype.
+        Tuple of (attention_mechanism, dtype) optimized for current hardware:
+        - TPU v3: (FLASH_ATTN2, float32)
+        - TPU v4+: (SPLASH, bfloat16)
+        - GPU: (FLASH_ATTN2, float16)
+        - CPU/other: (VANILLA, bfloat16)
+
+    Example:
+        >>> mechanism, dtype = get_optimal_config()
+        >>> attn = FlexibleAttentionModule(
+        ...     attention_mechanism=mechanism,
+        ...     dtype=dtype
+        ... )
     """
 
     match jax.default_backend():
@@ -139,14 +197,24 @@ DEFAULT_ATTENTION_MECHANISM = "auto"
 
 
 class FlexibleAttentionModule(nn.Module):
-    """
-    Manages different attention mechanisms for efficient computation in EasyDeL models.
+    """Unified interface for various attention mechanisms.
 
-    This class serves as a central hub for handling various attention mechanisms, including
-    optimized implementations like FlashAttention, SplashAttention, RingAttention, and more traditional
-    approaches like vanilla (dot-product) attention. It provides a unified interface to
-    select and execute the appropriate attention mechanism based on the model's configuration and
-    hardware platform.
+    Central hub for managing different attention implementations,
+    automatically selecting and executing the optimal mechanism
+    based on hardware, configuration, and runtime requirements.
+
+    Supports optimized implementations like FlashAttention, SplashAttention,
+    RingAttention, and standard dot-product attention. Provides automatic
+    hardware detection and optimization selection.
+
+    Attributes:
+        config: Model configuration with attention parameters.
+        dtype: Data type for computations.
+        param_dtype: Data type for parameters.
+        precision: Precision setting for operations.
+        attention_mechanism: Selected attention mechanism.
+        mesh: JAX mesh for distributed computation.
+        implementation: Concrete attention implementation.
 
     Key Features:
 
@@ -242,6 +310,7 @@ class FlexibleAttentionModule(nn.Module):
         attention_mask: Array | None = None,
         segment_ids: Array | None = None,
         causal: bool = True,
+        softmax_aux: Array | None = None,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -285,6 +354,7 @@ class FlexibleAttentionModule(nn.Module):
                 causal=causal,
                 deterministic=self.deterministic,
                 dropout_rng=rngs,
+                softmax_aux=softmax_aux,
             )
             if mode == common_types.MODE_DECODE:
                 assert cache_view is not None
@@ -501,7 +571,6 @@ class AttentionModule(nn.Module):
         """Handles concatenation of current KV states to the cache."""
         if cache_view is None:
             return key, value, attention_mask, None, None
-
         key, value, attention_mask, cache_view, masking_details = cache_view.concatenate_to_cache(
             query=query,
             key=key,

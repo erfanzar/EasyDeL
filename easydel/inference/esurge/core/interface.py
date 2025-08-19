@@ -14,9 +14,9 @@
 import copy
 from dataclasses import dataclass
 from math import prod
+from typing import Self
 
 from jax import numpy as jnp
-from typing_extensions import Self
 
 from ..utils import cdiv, get_dtype_size
 

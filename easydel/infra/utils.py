@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions and helpers for EasyDeL infrastructure.
+
+Provides common utilities used throughout the EasyDeL framework, including
+activation functions, dtype handling, module manipulation, and various
+helper functions for model operations.
+
+Constants:
+    ACT2FN: Dictionary mapping activation names to functions
+    ROPE_TYPES: Supported RoPE (Rotary Position Embedding) types
+
+Functions:
+    quick_gelu: Quick GELU activation function
+    canonicalize_dtype: Canonicalize dtype for JAX arrays
+    get_activation: Get activation function by name
+    quantize_linear: Apply quantization to linear layers
+    replace_dot: Replace JAX dot operations
+
+Key Features:
+    - Activation function registry
+    - Data type canonicalization
+    - Module quantization utilities
+    - Sharding constraint helpers
+    - Memory optimization tools
+
+Example:
+    >>> from easydel.infra.utils import ACT2FN, canonicalize_dtype
+    >>> # Get activation function
+    >>> activation = ACT2FN["gelu"]
+    >>> # Canonicalize dtype
+    >>> dtype = canonicalize_dtype(array, dtype=jnp.float32)
+"""
+
 from __future__ import annotations
 
 import functools
@@ -56,6 +88,16 @@ logger = get_logger(__name__)
 
 
 def quick_gelu(x):
+    """Quick GELU activation function.
+
+    A faster approximation of GELU using sigmoid.
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Activated array.
+    """
     return x * jax.nn.sigmoid(1.702 * x)
 
 
@@ -74,6 +116,11 @@ ACT2FN = {
     "softmax": nn.softmax,
     "quick_gelu": quick_gelu,
 }
+"""Registry of activation functions by name.
+
+Maps activation function names to their implementations.
+Supports common activations used in neural networks.
+"""
 
 ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
 
@@ -88,16 +135,14 @@ def canonicalize_dtype(
 ) -> jax.numpy.dtype:
     """Canonicalize an optional dtype to the definitive dtype.
 
-    If the ``dtype`` is None this function will infer the dtype. If it is not
-    None it will be returned unmodified or an exceptions is raised if the dtype
-    is invalid.
-    from the input arguments using ``jnp.result_type``.
+    Infers or validates the dtype for JAX operations. If dtype is None,
+    infers from input arguments. Otherwise validates and returns the
+    specified dtype.
 
     Args:
-      *args: JAX array compatible values. None values
-        are ignored.
-      dtype: tp.Optional dtype override. If specified the arguments are cast to
-        the specified dtype instead and dtype inference is disabled.
+        *args: JAX array compatible values (None values ignored).
+        dtype: Optional dtype override. If specified, arguments are
+            cast to this dtype and inference is disabled.
       inexact: When True, the output dtype must be a subdtype
       of `jnp.inexact`. Inexact dtypes are real or complex floating points. This
       is useful when you want to apply operations that don'position_ids work directly on

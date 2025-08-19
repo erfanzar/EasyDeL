@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -131,6 +131,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         attention_bias: bool = False,
         initialization_of_moe: bool = False,
         router_jitter_noise=0.0,
+        head_dim: int | None = None,
         layer_types: list[str] | None = None,
         **kwargs,
     ):
@@ -203,6 +204,7 @@ class MixtralConfig(EasyDeLBaseConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.router_jitter_noise = router_jitter_noise
         self.layer_types = layer_types
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
@@ -233,13 +235,10 @@ class MixtralConfig(EasyDeLBaseConfig):
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
-            (r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(RowWise)),
-            (r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r"block_sparse_moe/experts/(w1|w3)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"block_sparse_moe/experts/w2/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            (r"block_sparse_moe/experts/.*bias", pmag.resolve(Replicated)),
+            (r".*/(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r"score/kernel", pmag.resolve(RowWise)),
             (r".*bias", pmag.resolve(Replicated)),

@@ -12,6 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Logits processing and warping utilities for text generation.
+
+This module provides a comprehensive set of logits processors and warpers
+for controlling text generation behavior in language models. These utilities
+allow fine-grained control over the probability distributions during sampling.
+
+Key Components:
+    - LogitsProcessor: Base class for modifying logits before sampling
+    - LogitsWarper: Base class for rescaling probability distributions
+    - Various specialized processors for temperature, top-k, top-p, penalties, etc.
+
+Example:
+    >>> from easydel.inference.logits_process import (
+    ...     LogitsProcessorList,
+    ...     TemperatureLogitsWarper,
+    ...     TopKLogitsWarper
+    ... )
+    >>> processors = LogitsProcessorList()
+    >>> processors.append(TemperatureLogitsWarper(temperature=0.7))
+    >>> processors.append(TopKLogitsWarper(top_k=50))
+    >>> # Apply processors to logits during generation
+    >>> processed_scores = processors(input_ids, scores, cur_len)
+"""
 
 import inspect
 

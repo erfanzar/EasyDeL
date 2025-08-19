@@ -18,8 +18,25 @@ from typing import Literal
 
 @dataclass
 class SchedulerConfig:
-    """
-    Configuration for the scheduler.
+    """Configuration for the request scheduler.
+
+    Controls how requests are scheduled and batched for processing.
+
+    Attributes:
+        max_num_seqs: Maximum number of sequences running simultaneously.
+        max_num_batched_tokens: Maximum tokens processed in a single batch.
+        max_model_len: Maximum input length the model can handle.
+        policy: Scheduling policy ('fcfs' for first-come-first-served, 'priority' for priority-based).
+        long_prefill_token_threshold: Token count threshold for identifying long prefill requests.
+        chunked_prefill_enabled: Enable chunked processing of long prefill requests.
+
+    Example:
+        >>> config = SchedulerConfig(
+        ...     max_num_seqs=16,
+        ...     max_num_batched_tokens=2048,
+        ...     max_model_len=8192,
+        ...     policy="priority"
+        ... )
     """
 
     max_num_seqs: int
@@ -43,8 +60,25 @@ class SchedulerConfig:
 
 @dataclass
 class CacheConfig:
-    """
-    Configuration for the KV cache.
+    """Configuration for the KV (key-value) cache.
+
+    Manages memory allocation and caching strategies for attention mechanisms.
+
+    Attributes:
+        num_pages: Number of GPU pages allocated for cache (None for automatic).
+        page_size: Size of each cache page in tokens.
+        enable_prefix_caching: Enable caching of common prefixes across requests.
+
+    Example:
+        >>> config = CacheConfig(
+        ...     num_pages=1000,
+        ...     page_size=16,
+        ...     enable_prefix_caching=True
+        ... )
+
+    Note:
+        Page-based allocation allows efficient memory management and
+        sharing of cache blocks between sequences.
     """
 
     num_pages: int | None
@@ -59,8 +93,27 @@ class CacheConfig:
 
 @dataclass
 class Config:
-    """
-    A unified configuration class.
+    """Unified configuration for the eSurge engine.
+
+    Combines scheduler and cache configurations into a single object.
+
+    Attributes:
+        scheduler_config: Configuration for request scheduling.
+        cache_config: Configuration for KV cache management.
+
+    Example:
+        >>> config = Config(
+        ...     scheduler_config=SchedulerConfig(
+        ...         max_num_seqs=16,
+        ...         max_num_batched_tokens=2048,
+        ...         max_model_len=8192
+        ...     ),
+        ...     cache_config=CacheConfig(
+        ...         num_pages=1000,
+        ...         page_size=16,
+        ...         enable_prefix_caching=True
+        ...     )
+        ... )
     """
 
     scheduler_config: SchedulerConfig

@@ -12,6 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions and classes for the eSurge engine.
+
+Provides helper classes and functions for working with immutable lists,
+array type checking, and other common operations.
+
+Classes:
+    ConstantList: Immutable list wrapper that prevents modifications
+
+Functions:
+    is_list_of_jax_arrays: Type guard for checking JAX array lists
+
+Example:
+    >>> from easydel.inference.esurge.utils import ConstantList
+    >>>
+    >>> # Create immutable list
+    >>> const_list = ConstantList([1, 2, 3])
+    >>> print(const_list[0])  # Works
+    >>> const_list.append(4)  # Raises Exception
+"""
+
 from collections.abc import Sequence
 from typing import Generic, Literal, TypeVar, overload
 
@@ -22,7 +42,28 @@ T = TypeVar("T")
 
 
 class ConstantList(Generic[T], Sequence):
+    """Immutable list wrapper that prevents modifications.
+
+    Provides read-only access to a list while preventing any
+    modification operations. Useful for protecting data structures
+    that should not be changed after creation.
+
+    Args:
+        x: The list to wrap and make immutable.
+
+    Example:
+        >>> const_list = ConstantList([1, 2, 3])
+        >>> print(const_list[0])  # 1
+        >>> print(len(const_list))  # 3
+        >>> const_list.append(4)  # Raises Exception
+    """
+
     def __init__(self, x: list[T]) -> None:
+        """Initialize with a list to make immutable.
+
+        Args:
+            x: List to wrap.
+        """
         self._x = x
 
     def append(self, item):

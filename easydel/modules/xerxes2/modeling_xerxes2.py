@@ -24,8 +24,15 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    BaseModelOutput,
+    DecoderLayerOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -37,6 +44,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
 
@@ -264,16 +278,8 @@ class Xerxes2MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_up_proj = linear_class(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            rngs=rngs,
-        )
-        self.down_proj = linear_class(
-            config.intermediate_size,
-            config.hidden_size,
-            rngs=rngs,
-        )
+        self.gate_up_proj = linear_class(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
+        self.down_proj = linear_class(config.intermediate_size, config.hidden_size, rngs=rngs)
 
     def __call__(self, hidden_states):
         hidden_states = apply_logical_sharding(
@@ -292,10 +298,157 @@ class Xerxes2MLP(nn.Module):
         return hidden_states
 
 
+class Xerxes2MoeMLPStack(nn.Module):
+    """Xerxes2Moe MoE MLP using the new ParallelMoELinear layers."""
+
+    def __init__(
+        self,
+        config: Xerxes2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=False,
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            use_pallas_group_matmul=config.use_pallas_group_matmul,
+            partition_manager=config.partition_manager,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+            group_sizes,
+        )
+
+
+class Xerxes2MoeSparseBlock(BaseMoeModule):
+    """Sparse Mixture of Experts (MoE) block for Xerxes2 MoE.
+
+    This block routes input hidden states to a selected subset of experts
+    and combines their outputs.
+
+    Attributes:
+        config (Xerxes2MoeConfig): Configuration object for the model.
+        gate (ParallelLinear): Linear layer for the gating network.
+        experts (nn.List[Xerxes2MoeMLP]): List of expert MLP modules.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+        rngs (nn.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: Xerxes2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        """Initializes the Xerxes2MoeSparseBlock module.
+
+        Args:
+            config (Xerxes2MoeConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+            rngs (nn.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K if config.norm_topk_prob else MoeRoutingStrategy.TOP_K_NDIV,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate = ParallelLinear(
+            config.hidden_size,
+            config.num_experts,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+        )
+
+        self.experts = Xerxes2MoeMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+        """Forward pass of the Sparse MoE block.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+
+        Returns:
+            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
+                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
+                - router_logits (chex.Array): The logits output by the gating network.
+        """
+        out, router_logits = self._moe_call(
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            hidden_state=hidden_states,
+            output_metrics=False,
+            validate_inputs=True,
+            apply_capacity_constraint=False,
+        )
+        return out, router_logits
+
+
 class Xerxes2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Xerxes2Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -308,9 +461,10 @@ class Xerxes2DecoderLayer(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        attn_block, mlp_block = auto_remat(
+        attn_block, mlp_block, moe_block = auto_remat(
             Xerxes2Attention,
             Xerxes2MLP,
+            Xerxes2MoeSparseBlock,
             policy=config.gradient_checkpointing,
         )
         self.self_attn = attn_block(
@@ -320,13 +474,25 @@ class Xerxes2DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.mlp = mlp_block(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+        self.is_moe = (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         )
+        if self.is_moe:
+            self.mlp = moe_block(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+        else:
+            self.mlp = mlp_block(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
         rms = functools.partial(
             RMSNorm,
             dim=self.config.hidden_size,
@@ -351,6 +517,7 @@ class Xerxes2DecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool = False,
+        output_router_logits: bool = False,
     ):
         """
         Forward pass of the module block.
@@ -386,14 +553,11 @@ class Xerxes2DecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        if self.config.use_scan_mlp:
-            hidden_states = block_wise_ffn(
-                self.mlp,
-                hidden_states,
-                self.config.scan_mlp_chunk_size,
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
+
+        hidden_states = self.mlp(hidden_states)
+        router_logits = None
+        if self.is_moe:
+            hidden_states, router_logits = hidden_states
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(
@@ -405,6 +569,7 @@ class Xerxes2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
+            router_logits=router_logits if output_router_logits else None,
         )
 
 
@@ -426,28 +591,28 @@ class Xerxes2Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.hidden_size = self.config.hidden_size
         self.embed_tokens = nn.Embed(
-            self.config.vocab_size,
-            self.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            config.vocab_size,
+            config.hidden_size,
+            embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
         self.layers = [
             Xerxes2DecoderLayer(
-                self.config,
+                config=config,
+                layer_idx=layer_idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
                 rngs=rngs,
             )
-            for i in range(self.config.num_hidden_layers)
+            for layer_idx in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(
-            dim=self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
         )
@@ -467,20 +632,26 @@ class Xerxes2Model(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
     ) -> BaseModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
+
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = self.embed_tokens(inputs=input_ids.astype("i4"))
+
         batch_size, sequence_length, _ = inputs_embeds.shape
+
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        all_router_logits = () if output_router_logits else None
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -524,6 +695,7 @@ class Xerxes2Model(EasyDeLBaseModule):
                 cache_metadata=cache_metadata,
                 causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
@@ -531,6 +703,8 @@ class Xerxes2Model(EasyDeLBaseModule):
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
+            if output_router_logits:
+                all_router_logits += (layer_outputs.router_logits,)
 
             past_key_values[idx] = layer_outputs.cache_view
 
@@ -539,11 +713,12 @@ class Xerxes2Model(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutput(
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=past_key_values,
+            router_logits=all_router_logits,
         )
 
     def get_encoder(self):
@@ -623,13 +798,15 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:
+        output_router_logits: bool | None = None,
+    ) -> MoeCausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
@@ -648,9 +825,19 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
         lm_logits = None
         if apply_lm_head:
             lm_logits = self.apply_lm_head(hidden_states)
+        aux_loss = None
+        if output_router_logits and outputs.router_logits is not None:
+            aux_loss = auxiliary_load_balancing_loss_func(
+                gate_logits=outputs.router_logits,
+                num_experts=self.config.num_experts,
+                top_k=self.config.num_experts_per_tok,
+                attention_mask=attention_mask,
+            )
+            aux_loss += aux_loss * self.config.router_aux_loss_coef
 
-        return CausalLMOutput(
+        return MoeCausalLMOutput(
             logits=lm_logits,
+            aux_loss=aux_loss,
             hidden_states=outputs.hidden_states,
             last_hidden_state=outputs.last_hidden_state,
             attentions=outputs.attentions,

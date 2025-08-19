@@ -402,6 +402,7 @@ class BaseAutoEasyModel:
         cls,
         pretrained_model_name_or_path,
         FLAX_WEIGHTS_NAME="easydel-model.parameters",
+        MULTI_PART_NAME="easydel-model.parameters.safetensors.index.json",
         cache_dir: str | os.PathLike | None = None,
         force_download: bool = False,
         local_files_only: bool = False,
@@ -423,7 +424,6 @@ class BaseAutoEasyModel:
             bool: True if it's an EasyDeL checkpoint, False otherwise.
         """
         from transformers.utils import cached_file as _cached_file
-        from transformers.utils import download_url as _download_url
         from transformers.utils import is_remote_url as _is_remote_url
 
         proxies = None
@@ -431,7 +431,10 @@ class BaseAutoEasyModel:
         commit_hash = None
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         epath = EasyPath(pretrained_model_name_or_path)
+
         if epath.is_dir():
+            if (epath / subfolder / MULTI_PART_NAME).exists():
+                return True
             if not (epath / subfolder / FLAX_WEIGHTS_NAME).is_file():
                 raise OSError(
                     f"Error no file named {FLAX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
@@ -439,8 +442,7 @@ class BaseAutoEasyModel:
         elif (EasyPath(subfolder) / epath).is_file():
             ...
         elif _is_remote_url(pretrained_model_name_or_path):
-            filename = pretrained_model_name_or_path
-            resolved_archive_file = _download_url(pretrained_model_name_or_path)
+            ...
         else:
             filename = FLAX_WEIGHTS_NAME
             try:
@@ -468,7 +470,13 @@ class BaseAutoEasyModel:
                 )
 
                 if resolved_archive_file is None:
-                    return False
+                    resolved_archive_file = _cached_file(
+                        pretrained_model_name_or_path,
+                        MULTI_PART_NAME,
+                        **cached_file_kwargs,
+                    )
+                    if resolved_archive_file is None:
+                        return False
             except OSError:
                 raise
             except Exception:
@@ -635,7 +643,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
         ...  "gpt2",
-        ...  sharding_axis_dims=(1, 8, 1, 1),
+        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
         ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,
@@ -713,7 +721,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
         >>> # fully sharded data parallelism (FSDP)
         >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
         ...  "openai/whisper-large-v3-turbo",
-        ...  sharding_axis_dims=(1, 8, 1, 1),
+        ...  sharding_axis_dims=(1, 8, 1, 1, 1),
         ...  sharding_axis_names=("dp", "fsdp",  "ep", "tp", "sp"),
         ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
         ...  from_torch=True,

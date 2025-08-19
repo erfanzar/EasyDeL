@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Type definitions and data structures for the eSurge engine.
+
+This module defines the core data types used throughout the eSurge engine,
+including request types, event types, and output structures.
+
+Classes:
+    FinishReason: Enumeration of reasons why generation finished
+    EngineCoreRequest: Core request structure for engine processing
+    EngineCoreEventType: Types of engine events
+    EngineCoreEvent: Timestamped engine event
+    EngineCoreOutput: Output from engine core processing
+    UtilityResult: Wrapper for special serialization handling
+"""
+
 import enum
 import time
 from typing import Any
@@ -23,15 +37,19 @@ from .outputs import LogprobsLists, LogprobsTensors
 
 
 class FinishReason(enum.IntEnum):
-    """
-    Reason a request finished - stop, length, or abort.
+    """Reason why text generation finished.
 
-    Int rather than Str for more compact serialization.
+    Uses integer values for compact serialization.
 
-    stop - a stop string was emitted
-    length - max_tokens was consumed, or max_model_len was reached
-    abort - aborted for another reason
+    Attributes:
+        STOP: A stop string/token was generated.
+        LENGTH: Maximum tokens or model length was reached.
+        ABORT: Generation was aborted for another reason.
 
+    Example:
+        >>> reason = FinishReason.STOP
+        >>> print(reason)  # Output: "stop"
+        >>> reason.value  # Output: 0
     """
 
     STOP = 0
@@ -43,6 +61,22 @@ class FinishReason(enum.IntEnum):
 
 
 class EngineCoreRequest(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
+    """Core request structure for engine processing.
+
+    Efficient msgspec-based structure for request data.
+
+    Attributes:
+        request_id: Unique identifier for the request.
+        prompt_token_ids: List of token IDs in the prompt.
+        sampling_params: Parameters controlling generation behavior.
+        eos_token_id: End-of-sequence token ID.
+        arrival_time: Timestamp when request arrived.
+        data_parallel_rank: Rank for data parallel processing.
+        client_index: Index of the client making the request.
+        current_wave: Current processing wave number.
+        priority: Request priority for scheduling.
+    """
+
     request_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams | None
@@ -55,7 +89,13 @@ class EngineCoreRequest(msgspec.Struct, array_like=True, omit_defaults=True, gc=
 
 
 class EngineCoreEventType(enum.IntEnum):
-    """The type of engine core request event."""
+    """Types of engine core events.
+
+    Attributes:
+        QUEUED: Request was added to the queue.
+        SCHEDULED: Request was scheduled for processing.
+        PREEMPTED: Request was preempted by higher priority work.
+    """
 
     QUEUED = 1
     SCHEDULED = 2
@@ -63,11 +103,19 @@ class EngineCoreEventType(enum.IntEnum):
 
 
 class EngineCoreEvent(msgspec.Struct):
-    """A timestamped engine core event associated with a request.
+    """Timestamped engine core event.
 
-    The timestamp is a monotonic timestamps and is used for by the engine
-    frontend to calculate intervals between engine core events. These
-    timestamps should not be compared with timestamps from other processes.
+    Records events that occur during request processing with monotonic
+    timestamps for accurate interval calculation.
+
+    Attributes:
+        type: Type of the event.
+        timestamp: Monotonic timestamp of when event occurred.
+
+    Note:
+        Timestamps are monotonic and should only be compared within
+        the same process. They are used to calculate intervals between
+        events for performance monitoring.
     """
 
     type: EngineCoreEventType
@@ -75,11 +123,35 @@ class EngineCoreEvent(msgspec.Struct):
 
     @classmethod
     def new_event(cls, event_type: EngineCoreEventType, timestamp: float | None = None) -> "EngineCoreEvent":
+        """Create a new engine event.
+
+        Args:
+            event_type: Type of the event.
+            timestamp: Optional timestamp (uses current time if None).
+
+        Returns:
+            New EngineCoreEvent instance.
+        """
         timestamp = time.monotonic() if timestamp is None else timestamp
         return cls(event_type, timestamp)
 
 
 class EngineCoreOutput(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
+    """Output from engine core processing.
+
+    Contains generated tokens and associated metadata.
+
+    Attributes:
+        request_id: ID of the request this output belongs to.
+        new_token_ids: List of newly generated token IDs.
+        new_logprobs: Log probabilities for generated tokens.
+        new_prompt_logprobs_tensors: Log probabilities for prompt tokens.
+        finish_reason: Reason generation finished (if finished).
+        stop_reason: Specific stop string/token that triggered finish.
+        events: List of events that occurred during processing.
+        num_cached_tokens: Number of tokens retrieved from cache.
+    """
+
     request_id: str
     new_token_ids: list[int]
     new_logprobs: LogprobsLists | None = None
@@ -91,11 +163,23 @@ class EngineCoreOutput(msgspec.Struct, array_like=True, omit_defaults=True, gc=F
 
     @property
     def finished(self) -> bool:
+        """Check if generation has finished.
+
+        Returns:
+            True if finish_reason is set, False otherwise.
+        """
         return self.finish_reason is not None
 
 
 class UtilityResult:
-    """Wrapper for special handling when serializing/deserializing."""
+    """Wrapper for special serialization/deserialization handling.
+
+    Provides a container for results that require custom serialization
+    behavior or special handling during data transfer.
+
+    Attributes:
+        r: The wrapped result object.
+    """
 
     def __init__(self, r: Any = None):
         self.result = r
