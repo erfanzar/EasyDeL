@@ -116,8 +116,7 @@ def main():
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,  # Disables KV cache quantization.
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             # EasyDeL selects the best attention mechanism (e.g., FlashAttention).
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-            # Memory-saving technique for gradients.
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
         # `partition_axis` provides finer control over sharding, e.g., sharding KV heads via tensor parallelism.
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),

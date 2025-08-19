@@ -175,7 +175,7 @@ def main():
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             attn_mechanism=ed.AttentionMechanisms.AUTO, # EasyDeL picks the best attention mechanism.
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE, # Memory-saving technique.
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"), # Advanced sharding for tensor parallelism.
         quantization_method=ed.EasyDeLQuantizationMethods.NONE, # No weight quantization.

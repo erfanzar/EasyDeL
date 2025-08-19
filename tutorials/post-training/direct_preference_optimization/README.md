@@ -176,7 +176,7 @@ def main():
             mask_max_position_embeddings=max_length, # Max length for attention mask.
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Disables quantization for KV cache.
             attn_mechanism=ed.AttentionMechanisms.AUTO, # EasyDeL selects the best attention mechanism (e.g., FlashAttention).
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE, # Memory-saving technique for gradients.
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM # Memory-saving technique for gradients.
         ),
         # partition_axis: Provides finer control over sharding, e.g., sharding KV heads via tensor parallelism.
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),

@@ -134,7 +134,7 @@ class RayDistributedTrainer:
         "precision": lax.Precision.DEFAULT,
         "seed": 654,
         "max_position_embeddings": 2**13,
-        "gradient_checkpointing": EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        "gradient_checkpointing": EasyDeLGradientCheckPointers.NONE,
         "initializer_range": 0.02,
         "partition_axis": PartitionAxis(),
         "attn_mechanism": AttentionMechanisms.AUTO,

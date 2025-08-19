@@ -40,7 +40,7 @@ class RunTimeConfig:
         attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use.
             Defaults to ed.AttentionMechanisms.VANILLA.
         gradient_checkpointing (ed.EasyDeLGradientCheckPointers): The gradient checkpointing strategy.
-            Defaults to ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE.
+            Defaults to ed.EasyDeLGradientCheckPointers.NONE.
         param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
         dtype (jnp.dtype): The data type for general computation. Defaults to jnp.bfloat16.
         attn_dtype (jnp.dtype): The data type for attention computation. Defaults to jnp.bfloat16.
@@ -75,7 +75,7 @@ class RunTimeConfig:
         metadata={"help": "The attention mechanism to use."},
     )
     gradient_checkpointing: ed.EasyDeLGradientCheckPointers = field(
-        default=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        default=ed.EasyDeLGradientCheckPointers.NONE,
         metadata={"help": "The gradient checkpointing strategy."},
     )
     param_dtype: jnp.dtype = field(
