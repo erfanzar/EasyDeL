@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -167,9 +167,18 @@ class Xerxes2Config(EasyDeLBaseConfig):
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"self_attn/(qa_norm|kv_norm)/scale", pmag.resolve(Replicated)),
             (r"self_attn/(qa_norm|kv_norm)/bias", pmag.resolve(Replicated)),
+            # Standard MLP rules
             (r"mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+            # MoE specific rules
+            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/gate/bias", pmag.resolve(Replicated)),
+            (r"mlp/experts/gate_proj/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"mlp/experts/up_proj/kernel", pmag.resolve(ExpertColumnWiseAlt)),
+            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            (r"mlp/experts/.*/bias", pmag.resolve(Replicated)),
+            # Layer norms
             (
                 r".*/(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
                 pmag.resolve(Replicated),
