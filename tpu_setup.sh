@@ -248,11 +248,39 @@ if __name__ == '__main__':
 log_success "🎉 Runtime health check completed!"
 echo ""
 
+# Add eopod alias to shell configuration
+log_info "Adding eopod alias to shell configuration..."
+python - << 'PY'
+import os, sys
+BLUE = '\033[0;34m'; GREEN = '\033[0;32m'; NC = '\033[0m'
+def info(m): print(f'{BLUE}[INFO]{NC} (Python) {m}', file=sys.stderr)
+def ok(m):   print(f'{GREEN}[SUCCESS]{NC} (Python) {m}', file=sys.stderr)
+
+alias_line = f'alias eopod="{os.path.expanduser("~/orchestrator-venv/bin/eopod")}"'
+home = os.path.expanduser('~')
+cands = [os.path.join(home, '.zshrc'), os.path.join(home, '.bashrc')]
+target = next((c for c in cands if os.path.exists(c)), os.path.join(home, '.bashrc'))
+info(f'Adding eopod alias to: {target}')
+try:
+    content = ''
+    if os.path.exists(target):
+        with open(target) as f: content = f.read()
+    if 'alias eopod=' in content:
+        info('eopod alias already exists. No changes needed.')
+    else:
+        with open(target, 'a') as f:
+            f.write('\n# Added by TPU setup script for easy eopod access\n' + alias_line + '\n')
+        ok(f'Successfully added eopod alias. Run "source {target}" or restart your terminal to use it.')
+except Exception as e:
+    print(f'\033[0;31m[ERROR]\033[0m (Python) Failed to add alias: {e}', file=sys.stderr)
+PY
+
 log_info "Local Orchestrator Environment: $LOCAL_VENV_PATH"
 log_info "TPU Hosts Environment: $REMOTE_VENV_PATH"
 
 echo ""
 
 log_info "Next time:"
+log_info "  Use eopod directly: eopod run \"${REMOTE_VENV_PATH}/bin/python your_script.py\""
 log_info "  Local orchestrator: source ${LOCAL_VENV_PATH}/bin/activate"
 log_info "  Run on TPU: ${LOCAL_VENV_PATH}/bin/eopod run \"${REMOTE_VENV_PATH}/bin/python your_script.py\""
