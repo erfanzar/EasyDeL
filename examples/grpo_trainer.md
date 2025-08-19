@@ -64,7 +64,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         attn_softmax_dtype=jnp.bfloat16,
         kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         attn_mechanism=ed.AttentionMechanisms.SDPA,
-        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM
     ),
     quantization_method=ed.EasyDeLQuantizationMethods.NONE,
     precision=jax.lax.Precision.DEFAULT,

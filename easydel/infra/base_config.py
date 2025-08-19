@@ -36,7 +36,7 @@ Example:
     ...     hidden_size=768,
     ...     num_attention_heads=12,
     ...     attention_mechanism="flash",
-    ...     gradient_checkpointing_policy="nothing_saveable",
+    ...     gradient_checkpointing_policy="",
     ...     use_hardware_abstraction=True
     ... )
 """

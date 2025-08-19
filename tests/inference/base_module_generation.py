@@ -30,7 +30,7 @@ def main():
             kvdtype=jnp.bfloat16,
             attn_mechanism=ed.AttentionMechanisms.SDPA,
             decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         precision=jax.lax.Precision.DEFAULT,

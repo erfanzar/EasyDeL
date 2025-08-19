@@ -17,7 +17,7 @@ model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
         mask_max_position_embeddings=1024,
         attn_dtype=jnp.bfloat16,
         attn_softmax_dtype=jnp.float32,
-        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         attn_mechanism=ed.AttentionMechanisms.VANILLA,
     ),

@@ -46,7 +46,7 @@ def main():
             attn_mechanism=ed.AttentionMechanisms.SDPA,
             attn_dtype=jnp.bfloat16,
             kvdtype=jnp.float8_e5m2,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
