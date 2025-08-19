@@ -331,80 +331,81 @@ class Trainer(BaseTrainer):
         metrics_history = []
 
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-            current_step = int(jax.device_get(state.step))
-            try:
-                with capture_time() as dataloading_time:
-                    batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                if self._should_skip_step(current_step):
-                    pbar.update(1)
-                    continue
-                step_metrics.start_step()
-                state = self.on_step_start(state=state, step=current_step)
-            except (
-                KeyboardInterrupt,
-                EasyDeLTimerError,
-                EasyDeLBreakRequest,
-                StopIteration,
-            ) as exect:
-                return state, exect
+            with jax.profiler.StepTraceAnnotation("train", step_num=epoch):
+                current_step = int(jax.device_get(state.step))
+                try:
+                    with capture_time() as dataloading_time:
+                        batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                    if self._should_skip_step(current_step):
+                        pbar.update(1)
+                        continue
+                    step_metrics.start_step()
+                    state = self.on_step_start(state=state, step=current_step)
+                except (
+                    KeyboardInterrupt,
+                    EasyDeLTimerError,
+                    EasyDeLBreakRequest,
+                    StopIteration,
+                ) as exect:
+                    return state, exect
 
-            # Execute training step
-            with self.train_tracker.trace_compilation():
-                with capture_time() as execution_time:
-                    state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
-                    metrics.execution_time = execution_time()
-                    current_step = int(jax.device_get(state.step))
-            # Update and log metrics
-            try:
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    loss=metrics.loss,
-                    accuracy=metrics.accuracy,
-                    step=current_step,
-                )
-                metrics = self.apply_training_hooks(metrics=metrics)
-                train_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=self.scheduler(current_step)
-                    if self.scheduler is not None
-                    else self.arguments.learning_rate,
-                    epoch=epoch,
-                    flops_per_token=self._backward_flops_per_token,
-                    extra_flops_per_token=self._extra_backward_flops_per_token,
-                    batch_size=self.training_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    dataloading_time=dataloading_time(),
-                    mode="train",
-                )
-                state, metrics = self.on_step_end(
-                    state=state,
-                    metrics=metrics,
-                    step=current_step,
-                )
-                metrics_history.append(train_metrics)
-                metrics_history = self.log_metrics(
-                    history=metrics_history,
-                    pbar=pbar,
-                    step=current_step,
-                    mode="train",
-                )
-                self.log_weight_distribution(state=state, step=current_step)
-                # Save checkpoint if needed
-                if self._should_save_checkpoint(current_step):
-                    _ = self._save_state(
-                        state=state,
-                        milestone=True,
-                        save_directory=self.arguments.save_directory,
+                # Execute training step
+                with self.train_tracker.trace_compilation():
+                    with capture_time() as execution_time:
+                        state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
+                        metrics.execution_time = execution_time()
+                        current_step = int(jax.device_get(state.step))
+                # Update and log metrics
+                try:
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        loss=metrics.loss,
+                        accuracy=metrics.accuracy,
+                        step=current_step,
                     )
-                if self._should_run_evaluation(current_step):
-                    for _ in self.eval(model_state=state):
-                        ...
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception, train_iter
-            if run_exception is not None:
-                break
+                    metrics = self.apply_training_hooks(metrics=metrics)
+                    train_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=self.scheduler(current_step)
+                        if self.scheduler is not None
+                        else self.arguments.learning_rate,
+                        epoch=epoch,
+                        flops_per_token=self._backward_flops_per_token,
+                        extra_flops_per_token=self._extra_backward_flops_per_token,
+                        batch_size=self.training_batch_size,
+                        seq_length=self.arguments.max_sequence_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
+                        dataloading_time=dataloading_time(),
+                        mode="train",
+                    )
+                    state, metrics = self.on_step_end(
+                        state=state,
+                        metrics=metrics,
+                        step=current_step,
+                    )
+                    metrics_history.append(train_metrics)
+                    metrics_history = self.log_metrics(
+                        history=metrics_history,
+                        pbar=pbar,
+                        step=current_step,
+                        mode="train",
+                    )
+                    self.log_weight_distribution(state=state, step=current_step)
+                    # Save checkpoint if needed
+                    if self._should_save_checkpoint(current_step):
+                        _ = self._save_state(
+                            state=state,
+                            milestone=True,
+                            save_directory=self.arguments.save_directory,
+                        )
+                    if self._should_run_evaluation(current_step):
+                        for _ in self.eval(model_state=state):
+                            ...
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    return state, run_exception, train_iter
+                if run_exception is not None:
+                    break
         return state, run_exception, train_iter
 
     def _eval_epoch(
@@ -440,42 +441,43 @@ class Trainer(BaseTrainer):
                 return x
 
         for current_step in range(1, self.max_evaluation_steps + 1):
-            try:
-                with capture_time() as dataloading_time:
-                    batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
-                step_metrics.start_step()
-                with self.evalu_tracker.trace_compilation():
-                    with capture_time() as execution_time:
-                        metrics = self._execute_eval_step(state, data_collator(batch))
-                        metrics.execution_time = execution_time()
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    metrics.loss,
-                    metrics.accuracy,
-                    current_step,
-                )
-                eval_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=0.000,
-                    epoch=0,
-                    flops_per_token=self._forward_flops_per_token,
-                    extra_flops_per_token=self._extra_forward_flops_per_token,
-                    batch_size=self.evaluation_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    dataloading_time=dataloading_time(),
-                    mode="eval",
-                )
-                self.log_metrics(
-                    metrics=eval_metrics,
-                    pbar=pbar,
-                    step=current_step,
-                    mode="eval",
-                )
-                yield eval_metrics
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                break
+            with jax.profiler.StepTraceAnnotation("eval", step_num=current_step):
+                try:
+                    with capture_time() as dataloading_time:
+                        batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                    step_metrics.start_step()
+                    with self.evalu_tracker.trace_compilation():
+                        with capture_time() as execution_time:
+                            metrics = self._execute_eval_step(state, data_collator(batch))
+                            metrics.execution_time = execution_time()
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        metrics.loss,
+                        metrics.accuracy,
+                        current_step,
+                    )
+                    eval_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=0.000,
+                        epoch=0,
+                        flops_per_token=self._forward_flops_per_token,
+                        extra_flops_per_token=self._extra_forward_flops_per_token,
+                        batch_size=self.evaluation_batch_size,
+                        seq_length=self.arguments.max_sequence_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
+                        dataloading_time=dataloading_time(),
+                        mode="eval",
+                    )
+                    self.log_metrics(
+                        metrics=eval_metrics,
+                        pbar=pbar,
+                        step=current_step,
+                        mode="eval",
+                    )
+                    yield eval_metrics
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    break
 
     def _execute_eval_step(self, state, batch) -> LossMetrics:
         """
