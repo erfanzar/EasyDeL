@@ -187,7 +187,7 @@ class VanillaAttn(AttentionImpl):
             probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
             aw = probs[..., :-1]
         else:
-            aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)
+            aw = jax.nn.softmax(logits.astype(softmax_dtype), axis=-1).astype(dtype)
 
         dp = self.metadata.dropout_prob
         if not deterministic and dp > 0.0 and dropout_rng is not None:
