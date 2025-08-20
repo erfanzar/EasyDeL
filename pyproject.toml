@@ -76,7 +76,11 @@ gpu = ["jax[cuda12]==0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]==0.7.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
-
+profile = [
+	"xprof>=2.20.6",
+	"tb-nightly>=2.21.0a20250820",
+	"xprof-nightly>=2.21.6a20250820",
+]
 [tool.black]
 line-length = 121
 target-version = ["py311"]
