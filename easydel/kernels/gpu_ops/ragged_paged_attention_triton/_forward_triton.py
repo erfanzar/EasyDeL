@@ -14,9 +14,11 @@
 import triton
 import triton.language as tl
 
+from .._utils import safe_autotune
+
 
 # Autotune only warps/stages; do NOT auto-tune BLOCK_D.
-@triton.autotune(
+@safe_autotune(
     configs=[
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
