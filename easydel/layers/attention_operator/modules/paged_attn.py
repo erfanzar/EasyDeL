@@ -21,12 +21,14 @@ from jax import Array
 from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
+from easydel.kernels.gpu_ops import triton_ragged_paged_attention
 from easydel.kernels.tpu_ops import pallas_ragged_paged_attention
 from easydel.layers.caching import PagesCacheView, PagesMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
 USE_SHARDMAP = False
+DEBUG = False
 
 
 @AttentionRegistry.register
@@ -78,8 +80,7 @@ class PagedAttn(AttentionImpl):
         """
         Native (XLA) forward pass.
         """
-        kpages = cache_view.key_pages
-        vpages = cache_view.value_pages
+        kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         num_seqs = cache_metadata.num_seqs.reshape(-1)
@@ -88,14 +89,14 @@ class PagedAttn(AttentionImpl):
             jax_ragged_paged_attention,
             softmax_scale=self.metadata.softmax_scale,
             soft_cap=self.metadata.soft_cap,
+            compute_dtype=self.metadata.runtime_dtype,
         )
         if USE_SHARDMAP:
             fn = jax.shard_map(
                 fn,
                 in_specs=(
                     qaxes,
-                    resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kpages.shape),
-                    resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=vpages.shape),
+                    resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
                     Ps(),
                     Ps(),
                     Ps(),
@@ -107,8 +108,7 @@ class PagedAttn(AttentionImpl):
             )
         output = fn(
             q,
-            kpages,
-            vpages,
+            kv_pages,
             cache_metadata.context_lens,
             cache_metadata.pages_tables,
             cache_metadata.query_start_loc,
@@ -126,13 +126,37 @@ class PagedAttn(AttentionImpl):
         **ignore,
     ) -> AttentionOutput:
         """
-        Generic GPU forward pass.
-
-        Raises:
-            NotImplementedError: Paged Attention relies on specific kernels (currently
-                Pallas for TPU) and does not have a generic GPU implementation.
+        GPU forward pass.
         """
-        return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
+        if not DEBUG:
+            return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
+        kv_pages = cache_view.kv_pages
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        num_seqs = cache_metadata.num_seqs.reshape(-1)
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
+        output = jax.shard_map(
+            partial(triton_ragged_paged_attention, softmax_scale=self.metadata.softmax_scale),
+            in_specs=(
+                qaxes,
+                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),
+            ),
+            out_specs=qaxes,
+            mesh=self.metadata.mesh,
+            check_vma=False,
+        )(
+            q,
+            kv_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables,
+            cache_metadata.query_start_loc,
+            num_seqs,
+        )
+        return AttentionOutput(attention_weights=None, attention_outputs=output)
 
     @jax.named_scope("easydel-pagedattn-tpu")
     def forward_tpu(
@@ -146,10 +170,6 @@ class PagedAttn(AttentionImpl):
     ) -> AttentionOutput:
         """
         TPU forward pass for Paged Attention.
-
-        Raises:
-            NotImplementedError: Paged Attention currently relies on Pallas for TPUs
-                and does not have a specific implementation.
         """
         kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
