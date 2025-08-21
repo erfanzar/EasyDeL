@@ -228,7 +228,7 @@ from eformer.executor.ray import TpuAcceleratorConfig, execute
 import ray
 
 
-@execute(TpuAcceleratorConfig('$TPU_TYPE'))
+@execute(TpuAcceleratorConfig('$TPU_TYPE', chips_per_host=4))
 @ray.remote
 def health_check():
     import easydel as ed
