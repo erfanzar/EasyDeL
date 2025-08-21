@@ -347,7 +347,7 @@ class Trainer(BaseTrainer):
                         "/tmp/jax-trace",
                         create_perfetto_link=False,
                         create_perfetto_trace=True,
-                        profiler_options=options,
+                        # profiler_options=options,
                     )
                 if current_step == 25:
                     logger.info("Stopping JAX profiler.")
