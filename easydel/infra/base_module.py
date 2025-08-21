@@ -851,31 +851,6 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             )
         return self
 
-    # def to_state(
-    #     self,
-    #     state_class: type[EasyDeLState] | None = None,
-    #     partition_rules: PartitionLike | None = None,
-    # ) -> EasyDeLState:
-    #     """
-    #     Converts the current module instance into an `EasyDeLState` object.
-
-    #     This is useful for saving and managing the model's state, including parameters
-    #     and potentially optimizer state (though optimizer state is typically added later).
-
-    #     Returns:
-    #         EasyDeLState: An EasyDeLState object representing the current model state.
-    #     """
-    #     if state_class is None:
-    #         from easydel.infra.base_state import EasyDeLState
-
-    #         state_class = EasyDeLState
-    #     gstruct, gstate, gother = self.split_module()
-    #     state = state_class.create(
-    #         step=0,
-    #         model=self.merge_module(gstruct, gstate, gother),
-    #     )
-    #     return state
-
     def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
         """
         Converts the current module instance into an `EasyDeLState` object.
@@ -891,7 +866,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
             state_class = EasyDeLState
 
-        # @partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
+        @partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
         def _create_state(gstruct, gstate, gother):
             return state_class.create(
                 step=0,
