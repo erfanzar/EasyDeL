@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import typing as tp
 
 import jax
@@ -332,6 +333,24 @@ class Trainer(BaseTrainer):
 
         for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
             current_step = int(jax.device_get(state.step))
+
+            if os.getenv("EASYDEL_PROFILING") == "1":
+                # skip compilation and let training warm up a bit
+                if current_step == 5:
+                    options = jax.profiler.ProfileOptions()
+                    options.advanced_configuration = {
+                        "tpu_trace_mode" : "TRACE_ONLY_XLA",
+                        "tpu_num_sparse_cores_to_trace" : 2,
+                    }
+                    jax.profiler.start_trace(
+                        "/tmp/jax-trace",
+                        create_perfetto_link=False,
+                        create_perfetto_trace=True,
+                        profiler_options=options,
+                    )
+                if current_step == 25:
+                    jax.profiler.stop_trace()
+
             with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
                 try:
                     with capture_time() as dataloading_time:
