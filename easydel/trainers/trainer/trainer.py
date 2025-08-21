@@ -337,6 +337,7 @@ class Trainer(BaseTrainer):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
                 if current_step == 5:
+                    logger.info("Starting JAX profiler...")
                     options = jax.profiler.ProfileOptions()
                     options.advanced_configuration = {
                         "tpu_trace_mode" : "TRACE_ONLY_XLA",
@@ -349,6 +350,7 @@ class Trainer(BaseTrainer):
                         profiler_options=options,
                     )
                 if current_step == 25:
+                    logger.info("Stopping JAX profiler.")
                     jax.profiler.stop_trace()
 
             with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
