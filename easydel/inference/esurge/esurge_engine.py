@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 import typing
 import uuid
 from collections.abc import Iterator
@@ -166,8 +167,6 @@ class eSurge:
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
-        use_combined_forward: bool = False,
-        use_aot_forward: bool = True,
         esurge_name: str | None = None,
         **kwargs,
     ):
@@ -188,8 +187,6 @@ class eSurge:
             sharding_axis_dims: Sharding configuration for model parallelism.
             compile_runner: JIT compile the runner for better performance.
             runner_verbose: Enable verbose logging in runner.
-            use_combined_forward: Use combined forward pass optimization.
-            use_aot_forward: Use ahead-of-time compilation for forward pass.
             esurge_name: Optional custom name for this engine instance.
             **kwargs: Additional configuration passed to model loading.
 
@@ -202,7 +199,10 @@ class eSurge:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.page_size = page_size
-
+        if kwargs.pop("use_combined_forward", None) is not None:
+            logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
+        if kwargs.pop("use_aot_forward", None) is not None:
+            logger.warning("`use_aot_forward` is deprecated (the fused step will be used now).")
         if isinstance(model, str):
             self.model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
@@ -248,8 +248,6 @@ class eSurge:
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
-            use_combined_forward=use_combined_forward,
-            use_aot_forward=use_aot_forward,
             verbose=runner_verbose,
         )
         if compile_runner:
@@ -333,6 +331,7 @@ class eSurge:
                         if engine_outputs:
                             self._process_engine_outputs(engine_outputs)
                     except Exception as e:
+                        traceback.print_exc()
                         logger.error(f"Error in scheduler loop: {e}")
                         time.sleep(0.01)
                 logger.info("Background scheduler loop stopped")

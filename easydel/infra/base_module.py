@@ -869,13 +869,43 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             from easydel.infra.base_state import EasyDeLState
 
             state_class = EasyDeLState
+
+        _, gstatesh, gothersh = self._shardings.split_module()
         gstruct, gstate, gother = self.split_module()
-        return state_class.create(
-            step=0,
-            graphdef=gstruct,
-            graphstate=gstate,
-            graphother=gother,
+        out_shape = jax.eval_shape(
+            lambda: state_class.create(
+                step=0,
+                graphdef=gstruct,
+                graphstate=gstate,
+                graphother=gother,
+            )
         )
+        partition_rules = self._get_partition_rules(partition_rules)
+        out_shardings = match_partition_rules(partition_rules, out_shape)
+
+        def _to_namedsharding(val):
+            if isinstance(val, PartitionSpec):
+                return NamedSharding(self.mesh, val)
+            return val
+
+        out_shardings = jax.tree_util.tree_map(_to_namedsharding, out_shardings)
+
+        @partial(
+            jax.jit,
+            donate_argnums=(1, 2),
+            static_argnums=(0,),
+            in_shardings=(gstatesh, gothersh),
+            out_shardings=(out_shardings),
+        )
+        def _create_state(gstruct, gstate, gother):
+            return state_class.create(
+                step=0,
+                graphdef=gstruct,
+                graphstate=gstate,
+                graphother=gother,
+            )
+
+        return _create_state(*self.split_module())
 
     def to_torch(self, **kwargs):
         """

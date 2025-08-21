@@ -220,8 +220,6 @@ Loading Custom Models
         max_num_seqs=64,
         hbm_utilization=0.9,
         page_size=128,
-        use_combined_forward=False,
-        use_aot_forward=True,
         esurge_name="custom-model",
     )
 

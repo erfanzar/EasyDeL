@@ -67,7 +67,6 @@ from .logits_process import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
-    hash_fn,
 )
 
 logger = get_logger(__name__)
@@ -342,8 +341,6 @@ class JitableSamplingParams:
 
     def make_jitable(self):
         return self
-
-    __hash__ = hash_fn
 
 
 @dataclass
