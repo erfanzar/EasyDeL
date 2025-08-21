@@ -43,7 +43,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- **eSurge ExecutorManager**: Enhanced compilation strategies with AOT/JIT flexibility
+- **eSurge ExecutionManager**: Enhanced compilation strategies with AOT/JIT flexibility
   - Changed `use_aot_forward` parameter default to `True` for better out-of-box performance
   - Added support for both AOT (Ahead-of-Time) and JIT (Just-In-Time) compilation modes
   - AOT mode pre-compiles functions for optimal production performance
