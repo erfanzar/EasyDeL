@@ -792,7 +792,7 @@ def training_step(
         batch_partition_spec=partition_spec,
     )
 
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(arr=batch, sharding={key: partition_spec for key in batch.keys()})
     _loss_func = get_loss_function(
         loss_type=loss_type,
         beta=beta,
@@ -905,7 +905,7 @@ def evaluation_step(
         batch_partition_spec=partition_spec,
     )
 
-    batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    batch = with_sharding_constraint(arr=batch, sharding={key: partition_spec for key in batch.keys()})
     _loss_func = get_loss_function(
         loss_type=loss_type,
         beta=beta,

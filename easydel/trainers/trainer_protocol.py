@@ -459,7 +459,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def log_metrics(
         self,
-        metrics: dict[str, float],
+        history: list[dict[str, float]],
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
