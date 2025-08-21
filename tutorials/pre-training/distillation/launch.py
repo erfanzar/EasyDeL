@@ -139,7 +139,7 @@ def main():
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
             attn_mechanism=ed.AttentionMechanisms.AUTO,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,
         ),
     )
 
@@ -165,7 +165,7 @@ def main():
             use_sliding_window=False,
             sliding_window=4096,
             sharding_axis_dims=(1, jax.process_count(), 1, -1, 1),
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
             attn_mechanism=ed.AttentionMechanisms.AUTO,

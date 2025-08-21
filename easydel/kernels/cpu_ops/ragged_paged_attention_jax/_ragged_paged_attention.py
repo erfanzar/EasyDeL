@@ -15,18 +15,20 @@
 import jax.numpy as jnp
 
 from ._forward_jax import _ragged_paged_attention
+from ._forward_jax_optimized import _ragged_paged_attention_optimized
 
 
 def ragged_paged_attention(
     queries: jnp.ndarray,
-    key_pages: jnp.ndarray,
-    value_pages: jnp.ndarray,
+    kv_pages: jnp.ndarray,
     context_lens: jnp.ndarray,
     block_tables: jnp.ndarray,
     query_start_loc: jnp.ndarray,
     num_seqs: jnp.ndarray,
     softmax_scale: float | None = None,
     soft_cap: float | None = None,
+    compute_dtype: jnp.dtype = jnp.bfloat16,
+    optimized: bool = False,
 ) -> jnp.ndarray:
     """Performs paged attention for batched, ragged sequences.
 
@@ -43,10 +45,8 @@ def ragged_paged_attention(
     Args:
         queries: The query tensor for all sequences, concatenated together.
             Shape: `[total_query_tokens, num_q_heads, head_size]`.
-        key_pages: The paged Key cache.
-            Shape: `[num_pages, page_size, num_kv_heads, head_size]`.
-        value_pages: The paged Value cache.
-            Shape: `[num_pages, page_size, num_kv_heads, head_size]`.
+        kv_pages: The paged Key/value cache.
+            Shape: `[num_pages, page_size, num_kv_heads_combined, head_size]`.
         context_lens: The total length of each sequence in the KV cache.
             Shape: `[num_seqs]`.
         block_tables: A map from each sequence to its list of
@@ -66,14 +66,15 @@ def ragged_paged_attention(
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
-    return _ragged_paged_attention(
+    fn = _ragged_paged_attention_optimized if optimized else _ragged_paged_attention
+    return fn(
         queries=queries,
-        key_pages=key_pages,
-        value_pages=value_pages,
+        kv_pages=kv_pages,
         context_lens=context_lens,
         block_tables=block_tables,
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
         soft_cap=soft_cap,
+        compute_dtype=compute_dtype,
     )

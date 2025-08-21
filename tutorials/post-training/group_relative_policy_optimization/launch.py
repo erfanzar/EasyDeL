@@ -135,7 +135,7 @@ def main():
             kvdtype=jnp.bfloat16,
             # kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
             attn_mechanism=ed.AttentionMechanisms.AUTO,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
         # quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
         param_dtype=jnp.bfloat16,

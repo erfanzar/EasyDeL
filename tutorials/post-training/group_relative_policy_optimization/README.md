@@ -202,7 +202,7 @@ def main():
             attn_softmax_dtype=jnp.bfloat16, # Softmax dtype in attention
             kvdtype=jnp.bfloat16, # Key/Value cache dtype
             attn_mechanism=ed.AttentionMechanisms.AUTO, # Let EasyDeL choose best attention (e.g., Flash Attention)
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE, # Checkpointing strategy for memory saving
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE, # change this if u go OOM # Checkpointing strategy for memory saving
         ),
         param_dtype=jnp.bfloat16, # Model parameters in bfloat16
         dtype=jnp.bfloat16, # Default dtype for computations
