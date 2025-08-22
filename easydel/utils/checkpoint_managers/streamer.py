@@ -633,9 +633,13 @@ class CheckpointManager:
         verbose: bool = True,
     ) -> None:
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not verbose), start=1):
+            subset = {k: flat_state[k] for k in shard_keys}
+            gathered = jax.experimental.multihost_utils.process_allgather(subset)
+            if jax.process_index() != 0:
+                continue
+
             shard_path = cls._shard_filename(base_prefix, i, total_shards)
-            shard_tensors = {k: flat_state[k] for k in shard_keys}
-            safe_flax.save_file(tensors=shard_tensors, filename=shard_path, metadata=metadata)
+            safe_flax.save_file(tensors=gathered, filename=shard_path, metadata=metadata)
 
     @classmethod
     def _save_sharded_to_gcs(
@@ -653,6 +657,11 @@ class CheckpointManager:
         bucket = gcs_client.bucket(bucket_name)
 
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards to GCS", disable=not verbose), start=1):
+            subset = {k: flat_state[k] for k in shard_keys}
+            gathered = jax.experimental.multihost_utils.process_allgather(subset)
+            if jax.process_index() != 0:
+                continue
+
             shard_name = os.path.basename(cls._shard_filename(base_prefix, i, total_shards))
             shard_blob_name = f"{base_dir}/{shard_name}" if base_dir else shard_name
             shard_blob = bucket.blob(shard_blob_name)
@@ -660,8 +669,7 @@ class CheckpointManager:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors") as temp_file:
                 shard_path = temp_file.name
             try:
-                shard_tensors = {k: flat_state[k] for k in shard_keys}
-                safe_flax.save_file(tensors=shard_tensors, filename=shard_path, metadata=metadata)
+                safe_flax.save_file(tensors=gathered, filename=shard_path, metadata=metadata)
                 shard_blob.upload_from_filename(shard_path)
             finally:
                 if os.path.exists(shard_path):
