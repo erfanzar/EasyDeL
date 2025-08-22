@@ -874,8 +874,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _get_current_step(self, state):
         step = int(jax.device_get(state.step))
-        if self.arguments.step_start_point is not None:
-            step += self.arguments.step_start_point
         return step
 
     def _manage_checkpoint_limit(self, save_directory):
@@ -1208,7 +1206,14 @@ class BaseTrainer(BaseTrainerProtocol):
     def _should_save_checkpoint(self, current_step):
         """Determine if checkpoint should be saved at current step."""
         return (
-            self.arguments.save_steps is not None and current_step > 0 and current_step % self.arguments.save_steps == 0
+            (
+                self.arguments.save_steps is not None
+                and current_step > 0
+                and current_step % self.arguments.save_steps == 0
+            ) and (
+                self.arguments.step_start_point is None
+                or current_step > self.arguments.step_start_point
+            )
         )
 
     def _should_run_evaluation(self, current_step):

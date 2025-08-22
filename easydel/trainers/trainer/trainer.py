@@ -358,6 +358,7 @@ class Trainer(BaseTrainer):
                     with capture_time() as dataloading_time:
                         batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                     if self._should_skip_step(current_step):
+                        self.state = self.state.replace(step=self.state.step + 1)
                         pbar.update(1)
                         continue
                     step_metrics.start_step()
