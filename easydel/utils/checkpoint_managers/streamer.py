@@ -401,7 +401,7 @@ class CheckpointManager:
         state: dict[str, jax.Array] = {}
         mismatch_count = 0
 
-        pbar = tqdm(total=total_keys, desc="Loading shards", disable=not verbose)
+        pbar = tqdm(total=total_keys, desc="Loading shards", disable=not (verbose and jax.process_index() == 0))
         for shard_name, keys in file_to_keys.items():
             shard_path = os.path.join(directory, shard_name)
             with safe_flax.safe_open(shard_path, framework="flax") as manager:
@@ -460,7 +460,7 @@ class CheckpointManager:
         state: dict[str, jax.Array] = {}
         mismatch_count = 0
 
-        pbar = tqdm(total=total_keys, desc="Loading shards (GCS)", disable=not verbose)
+        pbar = tqdm(total=total_keys, desc="Loading shards (GCS)", disable=not (verbose and jax.process_index() == 0))
         for shard_name, keys in file_to_keys.items():
             shard_blob_path = shard_name if not shard_dir else f"{shard_dir}/{shard_name}"
             shard_blob = bucket.blob(shard_blob_path)
@@ -533,7 +533,7 @@ class CheckpointManager:
 
         gather_mismatch_count = 0
         if gather_fns:
-            pbar_gather = tqdm(list(state.keys()), desc="Gathering State", disable=not verbose)
+            pbar_gather = tqdm(list(state.keys()), desc="Gathering State", disable=not (verbose and jax.process_index() == 0))
             if isinstance(gather_fns, bool):
                 for key in pbar_gather:
                     pbar_gather.update(1)
@@ -632,7 +632,7 @@ class CheckpointManager:
         metadata: dict[str, str] | None,
         verbose: bool = True,
     ) -> None:
-        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not verbose), start=1):
+        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not (verbose and jax.process_index() == 0), start=1)):
             subset = {k: flat_state[k] for k in shard_keys}
             gathered = jax.experimental.multihost_utils.process_allgather(subset)
             if jax.process_index() == 0:
@@ -654,7 +654,7 @@ class CheckpointManager:
         base_dir = os.path.dirname(base_blob_name)
         bucket = gcs_client.bucket(bucket_name)
 
-        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards to GCS", disable=not verbose), start=1):
+        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards to GCS", disable=not (verbose and jax.process_index() == 0)), start=1):
             subset = {k: flat_state[k] for k in shard_keys}
             gathered = jax.experimental.multihost_utils.process_allgather(subset)
             if jax.process_index() == 0:
@@ -713,7 +713,7 @@ class CheckpointManager:
                     keys,
                     desc="Loading",
                     total=len(keys),
-                    disable=not verbose,
+                    disable=not (verbose and jax.process_index() == 0),
                 )
             ]
 
@@ -777,7 +777,7 @@ class CheckpointManager:
         if gather_fns:
             gather_fns = flatten_dict(gather_fns)
 
-        pbar = tqdm(flatten_state.items(), disable=not verbose, desc="Saving State to GCS")
+        pbar = tqdm(flatten_state.items(), disable=not (verbose and jax.process_index() == 0), desc="Saving State to GCS")
 
         gather_mismatch_count = 0
         for key, value in pbar:
@@ -825,6 +825,6 @@ class CheckpointManager:
         unpacker = msgpack.Unpacker(buffer, raw=False)
         state = {}
 
-        for key, value_bytes in tqdm(unpacker, desc="Loading from GCS", disable=not verbose):
+        for key, value_bytes in tqdm(unpacker, desc="Loading from GCS", disable=not (verbose and jax.process_index() == 0)):
             state[key] = from_bytes(None, value_bytes)
         return unflatten_dict(state)
