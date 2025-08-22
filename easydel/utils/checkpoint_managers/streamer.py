@@ -610,7 +610,7 @@ class CheckpointManager:
                         json.dumps(index_data, ensure_ascii=False).encode("utf-8"),
                         content_type="application/json",
                     )
-                else:
+                elif base_prefix != "/dev/null":
                     with open(index_path, "w", encoding="utf-8") as f:
                         json.dump(index_data, f, ensure_ascii=False)
 
