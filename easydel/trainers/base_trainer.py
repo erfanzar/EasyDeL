@@ -869,6 +869,8 @@ class BaseTrainer(BaseTrainerProtocol):
             raise
         except Exception as e:
             logger.error(f"Error saving state to {directory_name}: {e}")
+            import traceback
+            traceback.print_exc()
 
         return str(directory_name)
 

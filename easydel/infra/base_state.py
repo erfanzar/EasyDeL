@@ -484,6 +484,8 @@ class EasyDeLState(struct.PyTreeNode):
                 struct_path.write_bytes(buffer_struct)
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
+                import traceback
+                traceback.print_exc()
                 raise
         else:
             logger.info("Current State don't contain any Optimizer.")
