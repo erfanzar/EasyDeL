@@ -1244,7 +1244,8 @@ class BaseTrainer(BaseTrainerProtocol):
         dire = EasyPath(self.arguments.save_directory)
         if self.arguments.do_last_save:
             # don't save checkpoint if `step` is still below `step_start_point`
-            if self._get_current_step(state) < self.arguments.checkpoint_config.step_start_point:
+            step = self._get_current_step(state)
+            if step < self.arguments.step_start_point:
                 logger.info(f"Skipping checkpoint saving for step {step}.")
             else:
                 filename = self._save_state(state=state, milestone=False, save_directory=dire)
