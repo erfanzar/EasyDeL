@@ -660,7 +660,10 @@ class TrainingArguments:
             default_wandb_name = f"{self.model_name.lower()}-{_time}"
 
             wandb_kwargs = self.wandb_kwargs or {}
-            wandb_kwargs.pop("entity")
+            if "entity" in wandb_kwargs:
+                del wandb_kwargs["entity"]
+                logger.warning("WandB entity needs to be specified through the `wandb_entity` argument on TrainingArguments directly.")
+
             return wandb.init(
                 entity=self.wandb_entity,
                 project=wandb_kwargs.pop("project", f"EasyDeL{prefix}-{self.model_name}"),
