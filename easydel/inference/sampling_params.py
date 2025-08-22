@@ -49,7 +49,6 @@ from functools import cached_property
 from typing import Annotated, Any
 
 import jax
-from chex import dataclass
 from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
@@ -157,7 +156,7 @@ class GuidedDecodingParams:
             )
 
 
-@dataclass(frozen=True)
+@auto_pytree(frozen=True)
 class JitableSamplingParams:
     """
     A JAX-native, device-ready version of sampling parameters.
@@ -343,7 +342,7 @@ class JitableSamplingParams:
         return self
 
 
-@dataclass
+@auto_pytree
 class SamplingParams:
     """Sampling parameters for text generation.
 

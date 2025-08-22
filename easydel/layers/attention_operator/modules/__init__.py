@@ -14,7 +14,7 @@
 
 from .decode_attn import AutoRegressiveDecodeAttn
 from .flash import FlashAttn
-from .paged_attn import PagedAttn
+from .ragged_page_attn import RaggedPageAttn
 from .ring import RingAttn
 from .scaled_dot_product import ScaledDotProductAttn
 from .splash import SplashAttn
@@ -23,7 +23,7 @@ from .vanilla import VanillaAttn
 __all__ = (
     "AutoRegressiveDecodeAttn",
     "FlashAttn",
-    "PagedAttn",
+    "RaggedPageAttn",
     "RingAttn",
     "ScaledDotProductAttn",
     "SplashAttn",

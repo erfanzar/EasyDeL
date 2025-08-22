@@ -204,7 +204,7 @@ Loading Custom Models
         config_kwargs=EasyDeLBaseConfigDict(
             freq_max_position_embeddings=16384,
             mask_max_position_embeddings=16384,
-            attn_mechanism=AttentionMechanisms.PAGED_ATTENTION,
+            attn_mechanism=AttentionMechanisms.RAGGED_PAGE_ATTENTION,
             attn_dtype=jnp.bfloat16,
         ),
     )

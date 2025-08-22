@@ -27,7 +27,7 @@ Classes:
 Implementations:
     AutoRegressiveDecodeAttn: Optimized for autoregressive decoding
     FlashAttn: FlashAttention implementation
-    PagedAttn: Paged attention for efficient inference
+    RaggedPageAttn: Paged attention for efficient inference
     RingAttn: Ring attention for sequence parallelism
     ScaledDotProductAttn: Standard scaled dot-product attention
     SplashAttn: Splash attention for TPUs
@@ -50,7 +50,7 @@ from ._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, 
 from .modules import (
     AutoRegressiveDecodeAttn,
     FlashAttn,
-    PagedAttn,
+    RaggedPageAttn,
     RingAttn,
     ScaledDotProductAttn,
     SplashAttn,
@@ -64,7 +64,7 @@ __all__ = (
     "AttentionRegistry",
     "AutoRegressiveDecodeAttn",
     "FlashAttn",
-    "PagedAttn",
+    "RaggedPageAttn",
     "RingAttn",
     "ScaledDotProductAttn",
     "SplashAttn",

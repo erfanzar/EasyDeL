@@ -212,7 +212,7 @@ class eSurge:
                 auto_shard_model=auto_shard_model,
                 sharding_axis_dims=sharding_axis_dims,
                 config_kwargs=EasyDeLBaseConfigDict(
-                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.PAGED_ATTENTION),
+                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.RAGGED_PAGE_ATTENTION),
                     attn_dtype=dtype,
                     kvdtype=dtype,
                     freq_max_position_embeddings=max_model_len,

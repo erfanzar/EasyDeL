@@ -58,11 +58,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .openai_api_modules import (
-    ChatCompletionRequest,
-    ChatCompletionRequestWithTools,
-    CompletionRequest,
-)
+from .openai_api_modules import ChatCompletionRequest, CompletionRequest
 
 if tp.TYPE_CHECKING:
     from pydantic import BaseModel
@@ -316,7 +312,7 @@ class InferenceApiRouter:
 
     def build_oai_params_from_chat_request(
         self,
-        request: ChatCompletionRequest | ChatCompletionRequestWithTools,
+        request: ChatCompletionRequest,
     ) -> dict[str, float | int | str | bool | list]:
         """Build OpenAI parameters from chat completion request.
 
@@ -342,16 +338,14 @@ class InferenceApiRouter:
             "n": request.n,
         }
 
-        # Add function calling parameters if present
-        if isinstance(request, ChatCompletionRequestWithTools):
-            if request.tools:
-                params["tools"] = [tool.model_dump() for tool in request.tools]
-            if request.tool_choice:
-                params["tool_choice"] = request.tool_choice
-            if request.functions:
-                params["functions"] = [func.model_dump() for func in request.functions]
-            if request.function_call:
-                params["function_call"] = request.function_call
+        if request.tools:
+            params["tools"] = [tool.model_dump() for tool in request.tools]
+        if request.tool_choice:
+            params["tool_choice"] = request.tool_choice
+        if request.functions:
+            params["functions"] = [func.model_dump() for func in request.functions]
+        if request.function_call:
+            params["function_call"] = request.function_call
 
         return params
 
@@ -374,7 +368,7 @@ class InferenceApiRouter:
         """
         return openai_params, None
 
-    async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
         """
         Handle chat completion requests with function calling support.
         (POST /v1/chat/completions)
