@@ -377,13 +377,9 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The Weights & Biases entity."},
     )
-    wandb_name: str | None = field(
+    wandb_kwargs: dict[str, str] | None = field(
         default=None,
-        metadata={"help": "The Weights & Biases run name."},
-    )
-    wandb_tags: list[str] | None = field(
-        default=None,
-        metadata={"help": "The Weights & Biases run tags."},
+        metadata={"help": "Additional keyword arguments for Weights & Biases."},
     )
     warmup_steps: int = field(
         default=0,
@@ -653,23 +649,26 @@ class TrainingArguments:
                     stacklevel=1,
                 )
                 return None
-            wandb_name = self.wandb_name
+
             prefix = self.trainer_prefix
             if prefix is None:
                 prefix = ""
             else:
                 prefix = "-" + prefix
-            if wandb_name is None:
-                _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{self.model_name.lower()}-{_time}"
 
+            _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            default_wandb_name = f"{self.model_name.lower()}-{_time}"
+
+            wandb_kwargs = self.wandb_kwargs or {}
+            wandb_kwargs.pop("entity")
             return wandb.init(
-                project=f"EasyDeL{prefix}-{self.model_name}",
-                config=self.to_dict(),
-                save_code=True,
-                name=wandb_name,
-                tags=self.wandb_tags or ["EasyDeL", "Jax", "Train", "LLM", "VLM"],
                 entity=self.wandb_entity,
+                project=wandb_kwargs.pop("project", f"EasyDeL{prefix}-{self.model_name}"),
+                config=wandb_kwargs.pop("config", self.to_dict()),
+                save_code=wandb_kwargs.pop("save_code", True),
+                name=wandb_kwargs.pop("name", default_wandb_name),
+                tags=wandb_kwargs.pop("tags", ["EasyDeL", "Jax", "Train", "LLM", "VLM"]),
+                **wandb_kwargs,
             )
         return None
 
