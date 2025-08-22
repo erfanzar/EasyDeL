@@ -269,8 +269,9 @@ class LocalPath(UniversalPath):
         return self.path.read_bytes()
 
     def write_bytes(self, data: bytes) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_bytes(data)
+        if not str(self.path).startswith("/dev/null"):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_bytes(data)
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> None:
         if not str(self.path).startswith("/dev/null"):
