@@ -819,7 +819,10 @@ class TrainingArguments:
             if log_as == "summary":
                 wandb.summary.update(metrics)
             elif log_as == "config":
-                wandb.config.update(metrics)
+                try:
+                    wandb.config.update(metrics)
+                except Exception as e:
+                    logger.warning(f"Failed to update wandb.config: {e}")
             else:
                 wandb_metrics = {}
                 for key, value in metrics.items():
