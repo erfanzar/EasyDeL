@@ -84,8 +84,6 @@ class vEngine:
         prefill_lengths: int | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
-        page_size: int = 128,
-        hbm_utilization: float = 0.8,
         seed: int = 894,
     ):
         """Initializes the vEngine.
@@ -116,8 +114,6 @@ class vEngine:
         )
 
         self._partition_manager = model.config.partition_manager
-        self._hbm_utilization = hbm_utilization
-        self._page_size = page_size
         self._max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
         self._max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 
@@ -125,8 +121,7 @@ class vEngine:
         self._max_prefill_length = max_prefill_length or self._max_length // 2
         self._max_decodes_length = self._max_length - self._max_prefill_length
         self._max_prefill_lengths = prefill_lengths or calculate_pefill_lengths(
-            max_prefill_length=self._max_prefill_length,
-            page_size=page_size,
+            max_prefill_length=self._max_prefill_length, page_size=128
         )
 
         if extra_eos_token_ids is not None:
@@ -292,16 +287,6 @@ class vEngine:
     def prefill_lengths(self) -> list[int]:
         """Returns the configured list of max prefill length buckets for the engine."""
         return self._max_prefill_lengths
-
-    @property
-    def page_size(self) -> int | None:
-        """Returns the configured page_size for the engine, if specified."""
-        return self._page_size
-
-    @property
-    def hbm_utilization(self) -> int | None:
-        """Returns the configured hbm_utilization for the engine, if specified."""
-        return self._hbm_utilization
 
     @property
     def batch_size(self) -> int | None:

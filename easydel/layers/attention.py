@@ -119,7 +119,7 @@ class AttentionMechanisms(str, Enum):
         BLOCKWISE: Blockwise computation for memory efficiency.
         SDPA: Scaled Dot Product Attention (JAX native).
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
-        PAGED_ATTENTION: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION: Paged attention for efficient inference.
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -132,7 +132,8 @@ class AttentionMechanisms(str, Enum):
     BLOCKWISE = "blockwise"
     SDPA = "sdpa"
     CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
-    PAGED_ATTENTION = "paged_attention"
+    RAGGED_PAGE_ATTENTION = "ragged_page_attention"
+    PAGE_ATTENTION = "ragged_page_attention"
     REGRESSIVE_DECODE = "autoregressive_decodeattn"
 
 
@@ -330,7 +331,7 @@ class FlexibleAttentionModule(nn.Module):
                              attention weights (depending on the backend).
         """
         if isinstance(cache_view, PagesCacheView):
-            assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
+            assert self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
         try:
             rngs = self.rngs()
         except flax.errors.TraceContextError:

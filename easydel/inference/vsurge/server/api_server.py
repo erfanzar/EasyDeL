@@ -32,26 +32,21 @@ from easydel.utils.helpers import get_logger
 from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    ChatCompletionRequestWithTools,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
     ChatCompletionStreamResponseChoice,
     ChatMessage,
-    ChatMessageWithTools,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     CompletionStreamResponse,
     CompletionStreamResponseChoice,
     DeltaMessage,
-    FunctionCallFormat,
-    FunctionCallFormatter,
-    FunctionCallParser,
-    ToolCall,
     UsageInfo,
 )
 from ...sampling_params import SamplingParams
+from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..utils import ReturnSample
 from ..vsurge import vSurge
 
@@ -139,7 +134,7 @@ class vSurgeAdapter(InferenceEngineAdapter):
         return self.vsurge.processor
 
 
-class vSurgeApiServer(BaseInferenceApiServer):
+class vSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
     """
     vSurge-specific API server implementation.
 
@@ -150,6 +145,8 @@ class vSurgeApiServer(BaseInferenceApiServer):
         self,
         vsurge_map: dict[str, vSurge] | vSurge,
         oai_like_processor: bool = True,
+        enable_function_calling: bool = True,
+        tool_parser_name: str = "hermes",
         **kwargs,
     ) -> None:
         # Convert single instance to map
@@ -160,16 +157,28 @@ class vSurgeApiServer(BaseInferenceApiServer):
         self.vsurge_map = vsurge_map  # Keep original map
         self.adapters: dict[str, vSurgeAdapter] = {}
 
+        # Build processor map for tool parser initialization
+        model_processors = {}
         for name, vsurge in vsurge_map.items():
             if not isinstance(vsurge, vSurge):
                 raise TypeError(f"Value for key '{name}' must be an instance of vSurge")
             self.adapters[name] = vSurgeAdapter(vsurge)
+            model_processors[name] = vsurge.processor
+
+        # Initialize tool parsers using mixin
+        self.tool_parsers = self.initialize_tool_parsers(
+            model_processors=model_processors,
+            tool_parser_name=tool_parser_name,
+            enable_function_calling=enable_function_calling,
+        )
 
         self.oai_like_processor = oai_like_processor
+        self.tool_parser_name = tool_parser_name
 
         super().__init__(
             server_name="EasyDeL vSurge API Server",
             server_description="High-performance vSurge inference server",
+            enable_function_calling=enable_function_calling,
             **kwargs,
         )
 
@@ -232,6 +241,7 @@ class vSurgeApiServer(BaseInferenceApiServer):
                 tokenize=False,
                 conversation=conversation,
                 add_generation_prompt=add_generation_prompt,
+                tools=self.extract_tools(request=request),
                 **request.chat_template_kwargs,
             )
         except Exception as e:
@@ -247,66 +257,11 @@ class vSurgeApiServer(BaseInferenceApiServer):
             vsurge,
         )
 
-    def _prepare_vsurge_input_with_tools(
+    async def _handle_completion(
         self,
-        request: ChatCompletionRequestWithTools,
-        vsurge: vSurge,
-    ) -> str:
-        """Prepare input with function/tool definitions."""
-        messages = [msg.model_dump() for msg in request.messages]
-        processor = vsurge.processor
-
-        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
-            from easydel.trainers.prompt_utils import convert_to_openai_format
-
-            messages = convert_to_openai_format(messages)
-
-        tools = request.get_tools()
-        if tools:
-            format_type = request.function_call_format or self.default_function_format
-
-            tools_prompt = FunctionCallFormatter.format_tools_for_prompt(tools, format_type)
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] += f"\n\n{tools_prompt}"
-            else:
-                messages.insert(0, {"role": "system", "content": tools_prompt})
-
-        try:
-            if request.chat_template_kwargs is None:
-                request.chat_template_kwargs = {}
-            add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-
-            return processor.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=False,
-                **request.chat_template_kwargs,
-            )
-        except Exception as e:
-            logger.exception(f"Error applying chat template: {e}")
-            raise RuntimeError(f"Error preparing input: {e}") from e
-
-    async def _prepare_vsurge_input_with_tools_async(
-        self,
-        request: ChatCompletionRequestWithTools,
-        vsurge: vSurge,
-    ) -> str:
-        """Prepare input with tools asynchronously."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self._prepare_vsurge_input_with_tools,
-            request,
-            vsurge,
-        )
-
-    async def _handle_completion_with_tools_async(
-        self,
-        request: ChatCompletionRequest | ChatCompletionRequestWithTools,
+        request: ChatCompletionRequest,
         vsurge: vSurge,
         content: str,
-        request_id: str | None = None,
-        is_function_request: bool = False,
     ) -> ChatCompletionResponse:
         """Generate non-streaming response with function calling support."""
         start_time = time.time()
@@ -338,28 +293,23 @@ class vSurgeApiServer(BaseInferenceApiServer):
                 response_text = result.accumulated_text[idx]
                 if isinstance(response_text, list):
                     response_text = response_text[0]
-                if is_function_request:
-                    format_type = getattr(request, "function_call_format", self.default_function_format)
-                    parser = FunctionCallParser(format=format_type, strict=False)
-                    function_calls = parser.parse(response_text)
 
-                    if function_calls:
-                        message = ChatMessageWithTools.from_function_calls(function_calls, content=None)
-                        finish_reason = "tool_calls"
-                    else:
-                        message = ChatMessage(role="assistant", content=response_text)
-                        finish_reason = self._determine_finish_reason(
-                            result.num_generated_tokens[idx],
-                            sampling_params.max_tokens,
-                            response_text,
-                        )
-                else:
-                    message = ChatMessage(role="assistant", content=response_text)
+                # Use mixin method for tool extraction
+                message, finish_reason_extracted = self.extract_tool_calls_batch(
+                    response_text=response_text,
+                    request=request,
+                    model_name=request.model,
+                )
+
+                # Override finish_reason if not a function call
+                if finish_reason_extracted != "function_call":
                     finish_reason = self._determine_finish_reason(
                         result.num_generated_tokens[idx],
                         sampling_params.max_tokens,
                         response_text,
                     )
+                else:
+                    finish_reason = finish_reason_extracted
 
                 choices.append(
                     ChatCompletionResponseChoice(
@@ -387,14 +337,7 @@ class vSurgeApiServer(BaseInferenceApiServer):
             logger.exception(f"Error generating response: {e}")
             raise
 
-    async def _handle_streaming_with_tools_async(
-        self,
-        request: ChatCompletionRequest | ChatCompletionRequestWithTools,
-        vsurge: vSurge,
-        content: str,
-        request_id: str | None = None,
-        is_function_request: bool = False,
-    ) -> StreamingResponse:
+    async def _handle_streaming(self, request: ChatCompletionRequest, vsurge: vSurge, content: str) -> StreamingResponse:
         """Generate streaming response with function calling support."""
 
         async def generate_stream():
@@ -402,23 +345,14 @@ class vSurgeApiServer(BaseInferenceApiServer):
             prompt_tokens = vsurge.count_tokens(content)
             sampling_params = self._create_sampling_params(request)
 
-            parser = None
-            format_type = None
-            if is_function_request:
-                format_type = getattr(request, "function_call_format", self.default_function_format)
-                parser = FunctionCallParser(format=format_type, strict=False)
+            tool_parser = self.get_tool_parser_for_model(request.model)
+
+            previous_text = ""
 
             try:
                 total_generated = 0
                 first_token_time = None
                 accumulated_texts = {}
-                partial_function_calls = {}
-                function_call_indicators = {
-                    FunctionCallFormat.OPENAI: ['{"name"', "Function call:", "```json"],
-                    FunctionCallFormat.HERMES: ["<tool_call>"],
-                    FunctionCallFormat.GORILLA: ["<<<"],
-                    FunctionCallFormat.JSON_SCHEMA: ["{", '"function"'],
-                }
 
                 async for response_state in await vsurge.generate(
                     prompts=content,
@@ -447,48 +381,42 @@ class vSurgeApiServer(BaseInferenceApiServer):
                             accumulated_texts[idx] = ""
                         accumulated_texts[idx] += response_state.text[idx]
 
-                        if is_function_request and parser:
-                            indicators = function_call_indicators.get(format_type, [])
-                            might_be_function = any(ind in accumulated_texts[idx] for ind in indicators)
+                        if tool_parser and idx == 0:  # Only process tool calls for first choice
+                            current_text = accumulated_texts[idx]
+                            delta_text = response_state.text[idx]
 
-                            if might_be_function:
-                                try:
-                                    function_calls = parser.parse(accumulated_texts[idx])
-                                    if function_calls:
-                                        if idx not in partial_function_calls:
-                                            partial_function_calls[idx] = []
+                            # Note: vSurge doesn't provide token_ids in the same way as eSurge
+                            delta_message = self.extract_tool_calls_streaming(
+                                model_name=request.model,
+                                previous_text=previous_text,
+                                current_text=current_text,
+                                delta_text=delta_text,
+                                request=request,
+                            )
 
-                                        new_calls = function_calls[len(partial_function_calls[idx]) :]
-                                        if new_calls:
-                                            tool_calls = []
-                                            for fc in new_calls:
-                                                tool_call = ToolCall(
-                                                    id=f"call_{idx}_{len(partial_function_calls[idx])}_{fc.name}",
-                                                    type="function",
-                                                    function=fc,
-                                                )
-                                                tool_calls.append(tool_call)
-                                                partial_function_calls[idx].append(fc)
+                            previous_text = current_text
 
-                                            choices.append(
-                                                ChatCompletionStreamResponseChoice(
-                                                    index=idx,
-                                                    delta=DeltaMessage(tool_calls=tool_calls),
-                                                    finish_reason=None,
-                                                )
-                                            )
-                                            continue
-                                except Exception:
-                                    pass
+                            if delta_message:
+                                if not delta_message.role:
+                                    delta_message.role = (
+                                        "assistant" if response_state.num_generated_tokens[idx] == 1 else None
+                                    )
+                            else:
+                                delta_message = DeltaMessage(
+                                    role="assistant" if response_state.num_generated_tokens[idx] == 1 else None,
+                                    content=response_state.text[idx],
+                                )
+                        else:
+                            delta_message = DeltaMessage(
+                                role="assistant" if response_state.num_generated_tokens[idx] == 1 else None,
+                                content=response_state.text[idx],
+                            )
 
-                        if response_state.text[idx]:
+                        if response_state.text[idx] or delta_message.tool_calls:
                             choices.append(
                                 ChatCompletionStreamResponseChoice(
                                     index=idx,
-                                    delta=DeltaMessage(
-                                        role="assistant" if response_state.num_generated_tokens[idx] == 1 else None,
-                                        content=response_state.text[idx],
-                                    ),
+                                    delta=delta_message,
                                     finish_reason=None,
                                 )
                             )
@@ -503,9 +431,7 @@ class vSurgeApiServer(BaseInferenceApiServer):
 
                     final_choices = []
                     for idx in accumulated_texts:
-                        if is_function_request and idx in partial_function_calls and partial_function_calls[idx]:
-                            finish_reason = "tool_calls"
-                        elif sum(response_state.num_generated_tokens) >= sampling_params.max_tokens:
+                        if sum(response_state.num_generated_tokens) >= sampling_params.max_tokens:
                             finish_reason = "length"
                         else:
                             finish_reason = "stop"
@@ -539,74 +465,42 @@ class vSurgeApiServer(BaseInferenceApiServer):
 
             except Exception as e:
                 logger.exception(f"Error during streaming: {e}")
-                error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
                 yield f"data: {error_response.body.decode()}\n\n"
 
         return StreamingResponse(
             generate_stream(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-ID": request_id or "",
-            },
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
     async def list_tools(self) -> JSONResponse:
-        """List available tools/functions for each model."""
-        tools_by_model = {}
+        """List available tools/functions for each model.
 
-        for model_name, vsurge in self.vsurge_map.items():
-            model_tools = getattr(vsurge, "available_tools", [])
-            if not model_tools:
-                model_tools = [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "example_function",
-                            "description": "An example function for demonstration",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "param1": {
-                                        "type": "string",
-                                        "description": "First parameter",
-                                    },
-                                    "param2": {
-                                        "type": "number",
-                                        "description": "Second parameter",
-                                    },
-                                },
-                                "required": ["param1"],
-                            },
-                        },
-                    }
-                ]
-
-            tools_by_model[model_name] = {
-                "tools": model_tools,
-                "formats_supported": [
-                    FunctionCallFormat.OPENAI.value,
-                    FunctionCallFormat.HERMES.value,
-                    FunctionCallFormat.GORILLA.value,
-                    FunctionCallFormat.JSON_SCHEMA.value,
-                ],
-                "parallel_calls": True,
-            }
-
-        return JSONResponse(
-            {
-                "models": tools_by_model,
-                "default_format": self.default_function_format.value,
-            }
-        )
+        Returns example tool definitions and supported formats.
+        This is a placeholder that can be extended with actual tools.
+        """
+        model_names = list(self.adapters.keys())
+        tools_response = self.create_tools_response(model_names)
+        return JSONResponse(tools_response)
 
     async def execute_tool(self, request: tp.Any) -> JSONResponse:
-        """Execute a tool/function call (placeholder for integration)."""
-        return create_error_response(
-            HTTPStatus.NOT_IMPLEMENTED,
-            "Tool execution endpoint is a placeholder. Implement based on your needs.",
-        )
+        """Execute a tool/function call.
+
+        Placeholder endpoint for tool execution. Implement this method
+        to integrate with actual tool execution systems.
+
+        Args:
+            request: Tool execution request.
+
+        Returns:
+            JSONResponse with NOT_IMPLEMENTED status.
+
+        Note:
+            This is a placeholder that should be implemented based on
+            specific tool execution requirements.
+        """
+        return self.create_tool_execution_placeholder()
 
     def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
         """Create sampling parameters from request."""
@@ -626,7 +520,7 @@ class vSurgeApiServer(BaseInferenceApiServer):
             stop=request.stop,
         )
 
-    async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
         """Handle chat completion requests with function calling support."""
         request_id = getattr(request, "request_id", None)
 
@@ -636,33 +530,12 @@ class vSurgeApiServer(BaseInferenceApiServer):
 
             vsurge = self._get_adapter(request.model).vsurge
 
-            is_function_request = (
-                self.enable_function_calling
-                and isinstance(request, ChatCompletionRequestWithTools)
-                and request.get_tools()
-            )
-
-            if is_function_request:
-                content = await self._prepare_vsurge_input_with_tools_async(request, vsurge)
-            else:
-                content = await self._prepare_vsurge_input_async(request, vsurge)
+            content = await self._prepare_vsurge_input_async(request, vsurge)
 
             if request.stream:
-                return await self._handle_streaming_with_tools_async(
-                    request,
-                    vsurge,
-                    content,
-                    request_id,
-                    is_function_request,
-                )
+                return await self._handle_streaming(request, vsurge, content)
             else:
-                return await self._handle_completion_with_tools_async(
-                    request,
-                    vsurge,
-                    content,
-                    request_id,
-                    is_function_request,
-                )
+                return await self._handle_completion(request, vsurge, content)
 
         except HTTPException:
             raise
@@ -672,8 +545,6 @@ class vSurgeApiServer(BaseInferenceApiServer):
 
     async def completions(self, request: CompletionRequest) -> tp.Any:
         """Handle completion requests."""
-        request_id = getattr(request, "request_id", None)
-
         try:
             vsurge = self._get_adapter(request.model).vsurge
 
@@ -685,15 +556,15 @@ class vSurgeApiServer(BaseInferenceApiServer):
                 raise HTTPException(400, "Prompt cannot be empty")
 
             if request.stream:
-                return await self._handle_streaming_response(request, vsurge, prompt, request_id)
+                return await self._handle_streaming_response(request, vsurge, prompt)
             else:
-                return await self._handle_completion_response(request, vsurge, prompt, request_id)
+                return await self._handle_completion_response(request, vsurge, prompt)
 
         except HTTPException:
             raise
         except Exception as e:
             logger.exception(f"Error in completion: {e}")
-            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
     async def _prepare_chat_input(self, request: ChatCompletionRequest, vsurge: vSurge) -> str:
         """Prepare chat input for model."""
@@ -725,7 +596,6 @@ class vSurgeApiServer(BaseInferenceApiServer):
         request: ChatCompletionRequest | CompletionRequest,
         vsurge: vSurge,
         content: str,
-        request_id: str | None = None,
     ) -> ChatCompletionResponse | CompletionResponse:
         """Generate non-streaming response."""
         start_time = time.time()
@@ -775,7 +645,6 @@ class vSurgeApiServer(BaseInferenceApiServer):
         request: ChatCompletionRequest | CompletionRequest,
         vsurge: vSurge,
         content: str,
-        request_id: str | None = None,
     ) -> StreamingResponse:
         """Generate streaming response."""
 
@@ -844,17 +713,13 @@ class vSurgeApiServer(BaseInferenceApiServer):
 
             except Exception as e:
                 logger.exception(f"Error during streaming: {e}")
-                error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
                 yield f"data: {error_response.body.decode()}\n\n"
 
         return StreamingResponse(
             generate_stream(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Request-ID": request_id or "",
-            },
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
     async def _count_tokens_async(self, vsurge: vSurge, content: str) -> int:

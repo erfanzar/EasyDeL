@@ -33,7 +33,7 @@ To initialize and run the API server, you can use the following pattern:
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-            attn_mechanism=ed.AttentionMechanisms.PAGED_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
         ),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         param_dtype=param_dtype,

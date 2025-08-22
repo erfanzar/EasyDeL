@@ -28,11 +28,11 @@ from easydel.layers.caching import PagesCacheView, PagesMetadata
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
 USE_SHARDMAP = False
-DEBUG = False
+DEBUG = True
 
 
 @AttentionRegistry.register
-class PagedAttn(AttentionImpl):
+class RaggedPageAttn(AttentionImpl):
     """
     Attention implementation using the Paged Attention mechanism with TPU Pallas kernels.
 
@@ -55,9 +55,9 @@ class PagedAttn(AttentionImpl):
         Returns the registered name for this attention implementation.
 
         Returns:
-            tp.Union[str, tp.Tuple[str]]: The name "paged_attention".
+            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention".
         """
-        return "paged_attention"
+        return "ragged_page_attention"
 
     def get_impl_metadata(self) -> AttentionMetadata:
         """
@@ -267,7 +267,7 @@ class PagedAttn(AttentionImpl):
         **ignore,
     ) -> AttentionOutput:
         """
-        Makes the PagedAttn instance callable.
+        Makes the RaggedPageAttn instance callable.
 
         Preprocesses the query tensor by removing the sequence dimension (which is
         implicit or handled differently in paged attention kernels) before dispatching

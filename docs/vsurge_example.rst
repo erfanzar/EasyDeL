@@ -34,7 +34,7 @@ Load the pretrained model and tokenizer using EasyDeL's `AutoEasyDeLModelForCaus
         -   `freq_max_position_embeddings` and `mask_max_position_embeddings`: Related to rotary embeddings and attention masks, set to `max_length`.
         -   `kv_cache_quantization_method`: Specifies the quantization method for the KV cache. `ed.EasyDeLQuantizationMethods.NONE` means no quantization.
         -   `gradient_checkpointing`: Controls gradient checkpointing behavior. `ed.EasyDeLGradientCheckPointers.NONE` disables it.
-        -   `attn_mechanism`: Specifies the attention mechanism to use. `ed.AttentionMechanisms.PAGED_ATTENTION` is crucial for efficient KV cache management in vSurge.
+        -   `attn_mechanism`: Specifies the attention mechanism to use. `ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION` is crucial for efficient KV cache management in vSurge.
     -   `quantization_method`: Specifies the quantization method for model weights. `ed.EasyDeLQuantizationMethods.NONE` means no quantization.
     -   `precision`: Controls the precision of computations. `jax.lax.Precision.Precision.DEFAULT` uses the default precision for the chosen dtype.
 
