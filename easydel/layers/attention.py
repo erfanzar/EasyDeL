@@ -133,7 +133,7 @@ class AttentionMechanisms(str, Enum):
     SDPA = "sdpa"
     CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
     RAGGED_PAGE_ATTENTION = "ragged_page_attention"
-    PAGE_ATTENTION = "ragged_page_attention"
+    PAGED_ATTENTION = "ragged_page_attention"
     REGRESSIVE_DECODE = "autoregressive_decodeattn"
 
 
