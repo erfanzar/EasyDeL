@@ -350,7 +350,7 @@ class Trainer(BaseTrainer):
                         # profiler_options=options,
                     )
                 if current_step == 25:
-                    logger.info("Stopping JAX profiler.")
+                    logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
 
             with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
