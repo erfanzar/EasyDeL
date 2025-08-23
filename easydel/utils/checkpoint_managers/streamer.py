@@ -634,7 +634,7 @@ class CheckpointManager:
     ) -> None:
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not (verbose and jax.process_index() == 0)), start=1):
             subset = {k: flat_state[k] for k in shard_keys}
-            gathered = jax.experimental.multihost_utils.process_allgather(subset)
+            gathered = jax.experimental.multihost_utils.process_allgather(subset, tiled=True)
             if jax.process_index() == 0:
                 shard_path = cls._shard_filename(base_prefix, i, total_shards)
                 safe_flax.save_file(tensors=gathered, filename=shard_path, metadata=metadata)
@@ -656,7 +656,7 @@ class CheckpointManager:
 
         for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards to GCS", disable=not (verbose and jax.process_index() == 0)), start=1):
             subset = {k: flat_state[k] for k in shard_keys}
-            gathered = jax.experimental.multihost_utils.process_allgather(subset)
+            gathered = jax.experimental.multihost_utils.process_allgather(subset, tiled=True)
             if jax.process_index() == 0:
                 shard_name = os.path.basename(cls._shard_filename(base_prefix, i, total_shards))
                 shard_blob_name = f"{base_dir}/{shard_name}" if base_dir else shard_name
