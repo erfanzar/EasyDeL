@@ -632,7 +632,7 @@ class CheckpointManager:
         metadata: dict[str, str] | None,
         verbose: bool = True,
     ) -> None:
-        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not (verbose and jax.process_index() == 0), start=1)):
+        for i, shard_keys in enumerate(tqdm(shards, desc="Saving shards", disable=not (verbose and jax.process_index() == 0)), start=1):
             subset = {k: flat_state[k] for k in shard_keys}
             gathered = jax.experimental.multihost_utils.process_allgather(subset)
             if jax.process_index() == 0:
