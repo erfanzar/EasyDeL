@@ -1,25 +1,34 @@
 # Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
 import json
 import re
 from collections.abc import Sequence
+from uuid import uuid4
 
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
+    DeltaFunctionCall,
     DeltaMessage,
+    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
@@ -30,74 +39,155 @@ from ..abstract_tool import ToolParser, ToolParserManager
 @ToolParserManager.register_module("hermes")
 class HermesToolParser(ToolParser):
     """
-    Tool parser for Hermes-style tool calls.
+    Tool call parser for Hermes 2 Pro models.
 
-    Handles extraction of tool calls in the format:
-    <tool_call>
-    {"name": "function_name", "arguments": {...}}
-    </tool_call>
+    Handles tool calls wrapped in <tool_call> XML-style tags with JSON content.
+    Designed for NousResearch Hermes models and similar architectures that use
+    XML-style delimiters for function calling.
+
+    Format:
+        <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
 
     Features:
-    - Simple JSON-based tool call format
-    - Supports streaming with buffer-based parsing
-    - Handles multiple tool calls in sequence
-    - Automatic JSON validation and error recovery
+        - XML-style token boundary detection (<tool_call> and </tool_call>)
+        - Token-level buffering for accurate boundary detection
+        - Supports multiple tool calls in a single response
+        - Handles partial JSON parsing for streaming
+        - Scratch pad support for intermediate reasoning
 
     Attributes:
-        current_tool_call_buffer (str): Buffer for accumulating partial tool calls
-        in_tool_call (bool): Flag indicating if currently parsing a tool call
-        tool_call_pattern (re.Pattern): Regex for extracting complete tool calls
+        current_tool_name_sent: Tracks if function name was sent in stream
+        prev_tool_call_arr: Previous tool calls for streaming comparison
+        current_tool_id: Index of current tool being processed
+        streamed_args_for_tool: Arguments sent so far for each tool
+        tool_call_start_token: Opening delimiter for tool calls
+        tool_call_end_token: Closing delimiter for tool calls
+        buffered_delta_text: Buffer for multi-token delimiter detection
+
+    Used when --enable-auto-tool-choice --tool-call-parser hermes are set.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
-        super().__init__(tokenizer)
-        self.current_tool_call_buffer = ""
-        self.in_tool_call = False
-        self.tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-
-    def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """
-        Extract complete tool calls from Hermes model output.
-
-        Searches for tool calls wrapped in <tool_call> tags and parses
-        the JSON content within. Handles multiple tool calls and returns
-        remaining content after extraction.
+        Initialize the Hermes tool parser.
 
         Args:
-            model_output: Complete model output text
-            request: Original chat request (unused but required by interface)
+            tokenizer: The model tokenizer for encoding/decoding tokens
+
+        Raises:
+            ValueError: If tokenizer is not provided
+        """
+        super().__init__(tokenizer)
+
+        self.current_tool_name_sent: bool = False
+        self.prev_tool_call_arr: list[dict] = []
+        self.current_tool_id: int = -1
+        self.streamed_args_for_tool: list[str] = []
+
+        self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_end_token: str = "</tool_call>"
+
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL)
+        self.scratch_pad_regex = re.compile(r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL)
+
+        if not self.model_tokenizer:
+            raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
+        self.tool_call_start_token_ids = self.model_tokenizer.encode(
+            self.tool_call_start_token, add_special_tokens=False
+        )
+        self.tool_call_end_token_ids = self.model_tokenizer.encode(self.tool_call_end_token, add_special_tokens=False)
+
+        self.tool_call_start_token_array = [
+            self.model_tokenizer.decode([token_id]) for token_id in self.tool_call_start_token_ids
+        ]
+
+        self.tool_call_end_token_array = [
+            self.model_tokenizer.decode([token_id]) for token_id in self.tool_call_end_token_ids
+        ]
+
+        self.buffered_delta_text = ""
+
+    def tool_call_delta_buffer(self, delta_text: str) -> str:
+        """
+        Buffer delta text to handle multi-token delimiters.
+
+        This method accumulates partial tokens that might form tool call
+        delimiters, ensuring accurate boundary detection when delimiters
+        span multiple tokens.
+
+        Args:
+            delta_text: The new text delta from streaming
 
         Returns:
-            ExtractedToolCallInformation with parsed tool calls and content
+            Processed text with complete delimiters or empty string if buffering
         """
-        tool_calls = []
-        content = model_output
-        matches = self.tool_call_pattern.findall(model_output)
+        if delta_text in self.tool_call_start_token_array or delta_text in self.tool_call_end_token_array:
+            if delta_text == self.tool_call_start_token_array[-1] or delta_text == self.tool_call_end_token_array[-1]:
+                buffered_text = self.buffered_delta_text
+                self.buffered_delta_text = ""
+                return buffered_text + delta_text
+            else:
+                self.buffered_delta_text = self.buffered_delta_text + delta_text
+                return ""
+        else:
+            if self.buffered_delta_text:
+                buffered_text = self.buffered_delta_text
+                self.buffered_delta_text = ""
+                return buffered_text + delta_text
+            else:
+                return delta_text
 
-        for match in matches:
+    def extract_tool_calls(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        """
+        Extract tool calls from complete model response.
+
+        Parses XML-style tool call tags and extracts JSON function calls.
+        Supports multiple tool calls and returns remaining content.
+
+        Args:
+            model_output: Complete model output containing tool calls
+            request: Original chat completion request (unused)
+
+        Returns:
+            ExtractedToolCallInformation with:
+                - tools_called: Whether tool calls were found
+                - tool_calls: List of ToolCall objects
+                - content: Text content before tool calls (if any)
+
+        Example:
+            Input: "Let me help. <tool_call>{"name": "search", "arguments": {"q": "weather"}}</tool_call>"
+            Output: tools_called=True, tool_calls=[ToolCall(...)], content="Let me help. "
+        """
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
+
+        else:
             try:
-                tool_data = json.loads(match.strip())
-                tool_call = ToolCall(
-                    id=f"call_{len(tool_calls)}",
-                    type="function",
-                    function=FunctionCall(
-                        name=tool_data.get("name", ""),
-                        arguments=json.dumps(tool_data.get("arguments", {}))
-                        if isinstance(tool_data.get("arguments"), dict)
-                        else tool_data.get("arguments", "{}"),
-                    ),
-                )
-                tool_calls.append(tool_call)
-                content = content.replace(f"<tool_call>{match}</tool_call>", "")
-            except json.JSONDecodeError:
-                print(f"Failed to parse tool call JSON: {match}")
-                continue
+                function_call_tuples = self.tool_call_regex.findall(model_output)
 
-        return ExtractedToolCallInformation(
-            tools_called=len(tool_calls) > 0,
-            tool_calls=tool_calls,
-            content=content.strip() if content.strip() else None,
-        )
+                raw_function_calls = [json.loads(match[0] if match[0] else match[1]) for match in function_call_tuples]
+                tool_calls = [
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=function_call["name"],
+                            arguments=json.dumps(function_call["arguments"], ensure_ascii=False),
+                        ),
+                    )
+                    for function_call in raw_function_calls
+                ]
+
+                content = model_output[: model_output.find(self.tool_call_start_token)]
+                return ExtractedToolCallInformation(
+                    tools_called=True, tool_calls=tool_calls, content=content if content else None
+                )
+
+            except Exception:
+                return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
     def extract_tool_calls_streaming(
         self,
@@ -110,130 +200,191 @@ class HermesToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
         """
-        Extract tool calls from streaming Hermes output.
+        Extract tool calls from streaming model output.
 
-        Maintains state across streaming chunks to detect tool call
-        boundaries and progressively parse JSON content. Emits tool
-        names and arguments as they become available.
+        Handles incremental parsing of tool calls during streaming generation.
+        Maintains state across calls to track partial tool calls and arguments.
+        Uses buffering to handle multi-token delimiters correctly.
 
         Args:
-            previous_text: Text from previous chunks
-            current_text: All text generated so far
-            delta_text: New text in current chunk
-            previous_token_ids: Previous token IDs (unused)
-            current_token_ids: All token IDs (unused)
-            delta_token_ids: New token IDs (unused)
-            request: Original request (unused)
+            previous_text: Text generated before this delta
+            current_text: Text including this delta
+            delta_text: New text in this streaming chunk
+            previous_token_ids: Token IDs before this delta
+            current_token_ids: Token IDs including this delta
+            delta_token_ids: New token IDs in this chunk
+            request: Original chat completion request
 
         Returns:
-            DeltaMessage with incremental tool information or content
+            DeltaMessage with incremental tool call updates or content,
+            or None if more tokens needed for parsing
+
+        State Management:
+            - Tracks tool call boundaries with start/end token counts
+            - Maintains current tool ID for multi-tool responses
+            - Buffers partial arguments until complete
+            - Handles transition between content and tool calls
         """
+        delta_text = self.tool_call_delta_buffer(delta_text)
 
-        if "<tool_call>" in delta_text and not self.in_tool_call:
-            self.in_tool_call = True
-            self.current_tool_call_buffer = ""
-            parts = delta_text.split("<tool_call>", 1)
-            if len(parts) > 1 and parts[1]:
-                self.current_tool_call_buffer = parts[1]
+        if (
+            len(previous_text) >= len(self.buffered_delta_text)
+            and previous_text[-len(self.buffered_delta_text) :] == self.buffered_delta_text
+        ):
+            previous_text = previous_text[: -len(self.buffered_delta_text)]
+            current_text = previous_text + delta_text
+        if self.tool_call_start_token not in current_text:
+            return DeltaMessage(content=delta_text)
 
-            if parts[0]:
-                return DeltaMessage(content=parts[0])
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
-            self.streamed_args_for_tool.append("")
-            return DeltaMessage(
-                tool_calls=[
-                    {
-                        "index": self.current_tool_id,
-                        "id": f"call_{self.current_tool_id}",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                ]
-            )
+        try:
+            prev_tool_start_count = previous_text.count(self.tool_call_start_token)
+            prev_tool_end_count = previous_text.count(self.tool_call_end_token)
+            cur_tool_start_count = current_text.count(self.tool_call_start_token)
+            cur_tool_end_count = current_text.count(self.tool_call_end_token)
+            tool_call_portion = None
+            text_portion = None
 
-        elif "</tool_call>" in delta_text and self.in_tool_call:
-            parts = delta_text.split("</tool_call>", 1)
-            if parts[0]:
-                self.current_tool_call_buffer += parts[0]
+            if (
+                cur_tool_start_count == cur_tool_end_count
+                and prev_tool_end_count == cur_tool_end_count
+                and self.tool_call_end_token not in delta_text
+            ):
+                return DeltaMessage(content=delta_text)
 
-            try:
-                tool_data = json.loads(self.current_tool_call_buffer.strip())
+            if self.tool_call_end_token in delta_text:
+                full_text = current_text + delta_text
+                tool_call_portion = (
+                    full_text.split(self.tool_call_start_token)[-1].split(self.tool_call_end_token)[0].rstrip()
+                )
+                delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
+                text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
 
-                function_name = tool_data.get("name", "")
-                arguments = tool_data.get("arguments", {})
-                arguments_str = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+            flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
-                if not self.current_tool_name_sent:
-                    self.current_tool_name_sent = True
-                    delta_msg = DeltaMessage(
+            if cur_tool_start_count > cur_tool_end_count and cur_tool_start_count > prev_tool_start_count:
+                if len(delta_token_ids) > 1:
+                    tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                else:
+                    tool_call_portion = None
+                    delta = None
+
+                text_portion = None
+
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool.append("")
+
+            elif cur_tool_start_count > cur_tool_end_count and cur_tool_start_count == prev_tool_start_count:
+                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                text_portion = None
+
+            elif cur_tool_start_count == cur_tool_end_count and cur_tool_end_count >= prev_tool_end_count:
+                if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
+                    return None
+                diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                if diff:
+                    diff = diff.encode("utf-8").decode("unicode_escape") if diff is str else diff
+                    if '"}' not in delta_text:
+                        return None
+                    end_loc = delta_text.rindex('"}')
+                    diff = delta_text[:end_loc] + '"}'
+                    self.streamed_args_for_tool[self.current_tool_id] += diff
+                    return DeltaMessage(
                         tool_calls=[
-                            {
-                                "index": self.current_tool_id,
-                                "function": {"name": function_name},
-                            }
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
+                            )
                         ]
                     )
 
-                    self.streamed_args_for_tool[self.current_tool_id] = arguments_str
-                    return delta_msg
+            else:
+                text = delta_text.replace(self.tool_call_start_token, "")
+                text = text.replace(self.tool_call_end_token, "")
+                delta = DeltaMessage(tool_calls=[], content=text)
+                return delta
 
-                return DeltaMessage(
+            try:
+                current_tool_call = (
+                    partial_json_parser.loads(tool_call_portion or "{}", flags) if tool_call_portion else None
+                )
+            except partial_json_parser.core.exceptions.MalformedJSON:
+                return None
+            except json.decoder.JSONDecodeError:
+                return None
+
+            if not self.current_tool_name_sent:
+                if current_tool_call is None:
+                    return None
+                function_name: str | None = current_tool_call.get("name")
+                if function_name:
+                    self.current_tool_name_sent = True
+                    return DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.current_tool_id,
+                                type="function",
+                                id=f"chatcmpl-tool-{uuid4()}",
+                                function=DeltaFunctionCall(name=function_name).model_dump(exclude_none=True),
+                            )
+                        ]
+                    )
+                else:
+                    return None
+
+            if tool_call_portion is None:
+                delta = DeltaMessage(content=delta_text) if text_portion is not None else None
+                return delta
+
+            if len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+
+            prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+            cur_arguments = current_tool_call.get("arguments")
+
+            if not cur_arguments and not prev_arguments:
+                delta = None
+
+            elif not cur_arguments and prev_arguments:
+                delta = None
+
+            elif cur_arguments and not prev_arguments:
+                cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
+                if delta_text not in cur_arguments_json[:-2]:
+                    return None
+                args_delta_start_loc = cur_arguments_json[:-2].rindex(delta_text) + len(delta_text)
+
+                arguments_delta = cur_arguments_json[:args_delta_start_loc]
+                delta = DeltaMessage(
                     tool_calls=[
-                        {
-                            "index": self.current_tool_id,
-                            "function": {"arguments": arguments_str},
-                        }
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
+                        )
                     ]
                 )
+                self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
 
-            except json.JSONDecodeError:
-                pass
-            finally:
-                self.in_tool_call = False
-                self.current_tool_call_buffer = ""
+            elif cur_arguments and prev_arguments:
+                if isinstance(delta_text, str) and len(delta_text.rstrip()) >= 1 and delta_text.rstrip()[-1] == "}":
+                    delta_text = delta_text.rstrip()[:-1]
 
-                if len(parts) > 1 and parts[1]:
-                    return DeltaMessage(content=parts[1])  # noqa: B012
-
-        elif self.in_tool_call:
-            self.current_tool_call_buffer += delta_text
-
-            if not self.current_tool_name_sent and '{"name"' in self.current_tool_call_buffer:
-                try:
-                    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', self.current_tool_call_buffer)
-                    if name_match:
-                        function_name = name_match.group(1)
-                        self.current_tool_name_sent = True
-                        return DeltaMessage(
-                            tool_calls=[{"index": self.current_tool_id, "function": {"name": function_name}}]
+                delta = DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            function=DeltaFunctionCall(arguments=delta_text).model_dump(exclude_none=True),
                         )
-                except Exception:
-                    pass
+                    ]
+                )
+                self.streamed_args_for_tool[self.current_tool_id] += delta_text
 
-            if self.current_tool_name_sent and '"arguments"' in self.current_tool_call_buffer:
-                try:
-                    args_match = re.search(r'"arguments"\s*:\s*({.*}|\[.*\]|"[^"]*")', self.current_tool_call_buffer)
-                    if args_match:
-                        args_str = args_match.group(1)
-                        prev_args = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_str) > len(prev_args):
-                            delta_args = args_str[len(prev_args) :]
-                            self.streamed_args_for_tool[self.current_tool_id] = args_str
-                            return DeltaMessage(
-                                tool_calls=[
-                                    {
-                                        "index": self.current_tool_id,
-                                        "function": {"arguments": delta_args},
-                                    }
-                                ]
-                            )
-                except Exception:
-                    pass
+            if self.current_tool_id == len(self.prev_tool_call_arr) - 1:
+                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+            else:
+                self.prev_tool_call_arr.append(current_tool_call)
 
+            return delta
+
+        except Exception:
             return None
-        else:
-            if delta_text:
-                return DeltaMessage(content=delta_text)
-
-        return None

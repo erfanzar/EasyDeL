@@ -27,8 +27,8 @@ from easydel.layers.caching import PagesCacheView, PagesMetadata
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
-USE_SHARDMAP = False
-DEBUG = True
+USE_SHARDMAP = True
+FORCE_XLA_USE = False
 
 
 @AttentionRegistry.register
@@ -128,7 +128,7 @@ class RaggedPageAttn(AttentionImpl):
         """
         GPU forward pass.
         """
-        if not DEBUG:
+        if FORCE_XLA_USE:
             return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
         kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager

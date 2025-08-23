@@ -196,6 +196,11 @@ class eSurge:
         from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
 
+        if jax.default_backend() != "tpu" and page_size <= 128:
+            logger.warn(
+                "for better performance and to utilize GPUs kernels (or even just on CPUs) "
+                "better it's recommended to use `page_size>=256`."
+            )
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.page_size = page_size
@@ -726,7 +731,7 @@ class eSurge:
 
                             ro.accumulated_text += delta
                             ro.delta_text = delta
-                            ro.delta_seq += 1  # NEW: only when new delta text exists
+                            ro.delta_seq += 1
                             text_changed = True
 
                             comp = ro.outputs[0]

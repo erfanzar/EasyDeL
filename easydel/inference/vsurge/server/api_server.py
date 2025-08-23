@@ -233,6 +233,15 @@ class vSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             from easydel.trainers.prompt_utils import convert_to_openai_format
 
             conversation = convert_to_openai_format(conversation)
+
+        for msg in conversation:
+            if isinstance(msg.get("content"), list):
+                text_parts = []
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                msg["content"] = " ".join(text_parts)
+
         try:
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
@@ -401,6 +410,10 @@ class vSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                                     delta_message.role = (
                                         "assistant" if response_state.num_generated_tokens[idx] == 1 else None
                                     )
+                            elif request.tools:
+                                # Tool parser is active but returned None - it's buffering
+                                # Don't send raw text that might contain tool markup
+                                continue  # Skip this chunk entirely
                             else:
                                 delta_message = DeltaMessage(
                                     role="assistant" if response_state.num_generated_tokens[idx] == 1 else None,
