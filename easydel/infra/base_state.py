@@ -425,7 +425,7 @@ class EasyDeLState(struct.PyTreeNode):
             Exception: If any error occurs during loading or deserialization.
         """
         load_directory = EasyPath(load_directory)
-        optim_path = load_directory / OPTIMIZER_NAME
+        optim_path = load_directory / (OPTIMIZER_NAME + ".safetensors.index.json")
         struct_path = load_directory / OPTIMIZER_STRUCT_NAME
 
         if not (optim_path.exists() and struct_path.exists()):
@@ -689,7 +689,7 @@ class EasyDeLState(struct.PyTreeNode):
         )
 
         state = cls.create(step=jnp.array(0), model=model)
-        optimizer_path = EasyPath(load_directory) / OPTIMIZER_NAME
+        optimizer_path = EasyPath(load_directory) / (OPTIMIZER_NAME + ".safetensors.index.json")
         if optimizer_path.exists():
             cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
             with cmg:
