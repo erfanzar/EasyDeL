@@ -441,29 +441,8 @@ class SequenceBuffer:
         if req_id in self.req_id_to_index:
             raise ValueError(f"Request ID {req_id} is already present at index {self.req_id_to_index[req_id]}.")
 
-        # Possibly extends bookkeeping lists; returns chosen index
-        req_index = self._allocate_index(req_index)  # mutates static lists (allowed)
-        prompt_length = len(request.prompt_token_ids)
+        req_index = self._allocate_index(req_index)
 
-        # Room for output tokens if prompt > max length
-        safe_num_tokens = self.max_model_len // 2 if request.num_tokens > self.max_model_len else request.num_tokens
-        safe_num_tokens = max(0, min(int(safe_num_tokens), self.max_model_len))
-
-        if prompt_length > self.max_model_len:
-            safe_length = self.max_model_len - safe_num_tokens
-            if safe_length <= 0:
-                logger.warning(
-                    f"Request {req_id} has {prompt_length} prompt tokens; "
-                    f"no room left for prompt with max_model_len={self.max_model_len} and "
-                    f"num_tokens={request.num_tokens}. Dropping the prompt."
-                )
-                truncated_prompt = []
-            else:
-                truncated_prompt = request.prompt_token_ids[-safe_length:]
-        else:
-            truncated_prompt = request.prompt_token_ids
-
-        # Update static bookkeeping
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
@@ -473,10 +452,10 @@ class SequenceBuffer:
         self.req_id_to_index[req_id] = req_index
 
         # Copy tokens into arrays (functional)
-        num_prompt_tokens = min(len(truncated_prompt), self.max_model_len)
+        num_prompt_tokens = min(len(request.prompt_token_ids), self.max_model_len)
         new_num_prompt_tokens = self.num_prompt_tokens.at[req_index].set(num_prompt_tokens)
         new_token_ids = self.token_ids.at[req_index, :num_prompt_tokens].set(
-            jnp.array(truncated_prompt[:num_prompt_tokens], dtype=jnp.int32)
+            jnp.array(request.prompt_token_ids[:num_prompt_tokens], dtype=jnp.int32)
         )
 
         if request.output_token_ids:

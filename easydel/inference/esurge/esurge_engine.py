@@ -36,11 +36,19 @@ from .metrics import get_metrics_collector, initialize_metrics
 from .request import EngineRequest, EngineRequestStatus
 from .runners import eSurgeRunner
 from .scheduler import Scheduler
+from .utils import truncate_tokens
 
 if typing.TYPE_CHECKING:
     from easydel import AutoEasyDeLModelForCausalLM
 
 logger = get_logger("eSurgeEngine")
+
+
+def _set_requested_new(sp, n: int):
+    if hasattr(sp, "max_tokens"):
+        sp.max_tokens = int(n)
+    if hasattr(sp, "max_new_tokens"):
+        sp.max_new_tokens = int(n)
 
 
 @dataclass
@@ -168,6 +176,13 @@ class eSurge:
         compile_runner: bool = True,
         runner_verbose: bool = False,
         esurge_name: str | None = None,
+        reserve_tokens: int | None = None,
+        auto_truncate_prompt: bool = True,
+        auto_cap_new_tokens: bool = True,
+        strict_context: bool = False,
+        truncate_mode: typing.Literal["left", "right", "middle"] = "left",
+        prefer_preserve_prompt: bool = True,
+        decode_truncated_prompt: bool = True,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -188,6 +203,13 @@ class eSurge:
             compile_runner: JIT compile the runner for better performance.
             runner_verbose: Enable verbose logging in runner.
             esurge_name: Optional custom name for this engine instance.
+            reserve_tokens: safety margin
+            auto_truncate_prompt: allow truncating prompt if needed
+            auto_cap_new_tokens: cap max_new_tokens to fit budget
+            strict_context: if True, raise errors instead of auto-fixing
+            truncate_mode: "left" | "right" | "middle"
+            prefer_preserve_prompt: cap new tokens before truncating prompt
+            decode_truncated_prompt: if truncated, decode tokens to update
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -201,6 +223,12 @@ class eSurge:
                 "for better performance and to utilize GPUs kernels (or even just on CPUs) "
                 "better it's recommended to use `page_size>=256`."
             )
+        if reserve_tokens is None:
+            reserve_tokens = max_model_len // 10
+
+        if max_model_len <= reserve_tokens:
+            raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
+
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.page_size = page_size
@@ -275,7 +303,13 @@ class eSurge:
 
         # Per-request events to support many concurrent streams
         self._request_events: dict[str, threading.Event] = {}
-
+        self.reserve_tokens = reserve_tokens
+        self.auto_truncate_prompt = auto_truncate_prompt
+        self.auto_cap_new_tokens = auto_cap_new_tokens
+        self.strict_context = strict_context
+        self.truncate_mode = truncate_mode
+        self.prefer_preserve_prompt = prefer_preserve_prompt
+        self.decode_truncated_prompt = decode_truncated_prompt
         # Locks and signals
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
@@ -560,32 +594,140 @@ class eSurge:
             prompt: Text prompt to generate from.
             sampling_params: Generation parameters.
         """
+
+        # ---- Config knobs ----
+        max_model_len = int(self.runner.max_model_len)
+
+        def _get_requested_new(sp):
+            if hasattr(sp, "max_tokens") and sp.max_tokens is not None:
+                return int(sp.max_tokens)
+            if hasattr(sp, "max_new_tokens") and sp.max_new_tokens is not None:
+                return int(sp.max_new_tokens)
+            return 0
+
+        requested_new = _get_requested_new(sampling_params)
+        original_requested_new = requested_new
+
         tokenizer_output = self.tokenizer(prompt, return_tensors=None)
         token_ids = tokenizer_output["input_ids"]
-        if isinstance(token_ids[0], list):
+        if token_ids and isinstance(token_ids[0], list):
             token_ids = token_ids[0]
+        prompt_len = len(token_ids)
 
-        self.scheduler.add_request(
-            EngineRequest(
-                request_id=request_id,
-                prompt_token_ids=token_ids,
-                sampling_params=sampling_params,
-                eos_token_id=self.tokenizer.eos_token_id,
+        max_prompt_budget = max(0, max_model_len - self.reserve_tokens)
+        truncated = False
+        tokens_dropped = 0
+
+        if prompt_len > max_prompt_budget:
+            if not self.auto_truncate_prompt and self.strict_context:
+                raise ValueError(
+                    f"Prompt too long: length={prompt_len} > budget={max_prompt_budget} "
+                    f"(model_max={max_model_len}, reserve={self.reserve_tokens})."
+                )
+            new_tokens, dropped = truncate_tokens(token_ids, max_prompt_budget, self.truncate_mode)
+            token_ids = new_tokens
+            prompt_len = len(token_ids)
+            truncated = dropped > 0
+            tokens_dropped += dropped
+            logger.warn(
+                f"Truncated prompt by {dropped} tokens to fit model budget "
+                f"(mode={self.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
             )
-        )
+
+        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len - self.reserve_tokens)
+
+        if requested_new > allowed_new_if_keep_prompt:
+            do_cap_first = self.prefer_preserve_prompt or not self.auto_truncate_prompt
+
+            if do_cap_first:
+                if self.auto_cap_new_tokens:
+                    logger.warn(
+                        f"Capping max_new_tokens from {requested_new} to {allowed_new_if_keep_prompt} "
+                        f"to preserve prompt (prompt_len={prompt_len}, reserve={self.reserve_tokens}, "
+                        f"model_max={max_model_len})."
+                    )
+                    requested_new = allowed_new_if_keep_prompt
+                    _set_requested_new(sampling_params, requested_new)
+                else:
+                    if self.strict_context:
+                        raise ValueError(
+                            f"Requested max_new_tokens={requested_new} exceeds allowed={allowed_new_if_keep_prompt} "
+                            f"for prompt_len={prompt_len}."
+                        )
+                    logger.warn(
+                        f"auto_cap_new_tokens disabled but strict_context=False; "
+                        f"capping new tokens to {allowed_new_if_keep_prompt}."
+                    )
+                    requested_new = allowed_new_if_keep_prompt
+                    _set_requested_new(sampling_params, requested_new)
+            else:
+                target_prompt_budget = max(0, max_model_len - requested_new - self.reserve_tokens)
+                if target_prompt_budget == 0 and requested_new > 0:
+                    if self.auto_cap_new_tokens:
+                        logger.warn(
+                            f"Requested max_new_tokens={requested_new} leaves no room for prompt; "
+                            f"capping to {allowed_new_if_keep_prompt} to preserve prompt."
+                        )
+                        requested_new = allowed_new_if_keep_prompt
+                        _set_requested_new(sampling_params, requested_new)
+                    else:
+                        if self.strict_context:
+                            raise ValueError("Requested output too large; would require dropping entire prompt.")
+                        requested_new = allowed_new_if_keep_prompt
+                        _set_requested_new(sampling_params, requested_new)
+                else:
+                    if prompt_len > target_prompt_budget:
+                        new_tokens, dropped = truncate_tokens(token_ids, target_prompt_budget, self.truncate_mode)
+                        token_ids = new_tokens
+                        prompt_len = len(token_ids)
+                        truncated = truncated or dropped > 0
+                        tokens_dropped += dropped
+                        logger.info(
+                            f"Truncated prompt by {dropped} tokens (mode={self.truncate_mode}) "
+                            f"to honor requested max_new_tokens={requested_new}. "
+                            f"New prompt_len={prompt_len}, target_prompt_budget={target_prompt_budget}."
+                        )
+
+        allowed_new_final = max(0, max_model_len - prompt_len - self.reserve_tokens)
+        if requested_new > allowed_new_final:
+            if self.strict_context and not self.auto_cap_new_tokens:
+                raise ValueError(
+                    f"After adjustments, requested_new={requested_new} still exceeds allowed={allowed_new_final}."
+                )
+            logger.warn(
+                f"Final cap: max_new_tokens {requested_new} -> {allowed_new_final} "
+                f"(prompt_len={prompt_len}, reserve={self.reserve_tokens}, model_max={max_model_len})."
+            )
+            requested_new = allowed_new_final
+            _set_requested_new(sampling_params, requested_new)
+
+        prompt_for_engine = prompt
+        if truncated and self.decode_truncated_prompt:
+            try:
+                prompt_for_engine = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+            except Exception:
+                prompt_for_engine = prompt
+                logger.warn("Failed to decode truncated prompt; keeping original prompt text.")
 
         start_ts = time.perf_counter()
         ev = threading.Event()
+
         with self._request_lock:
             self._request_events[request_id] = ev
             self._active_requests[request_id] = {
-                "prompt": prompt,
+                "prompt": prompt_for_engine,
                 "prompt_token_ids": token_ids,
                 "generated_tokens": [],
                 "last_decoded_index": 0,
-                "start_time": start_ts,  # perf counter
+                "start_time": start_ts,
                 "first_token_time": None,
-                "last_decode_time": start_ts,  # perf counter
+                "last_decode_time": start_ts,
+                "truncated": truncated,
+                "tokens_dropped": tokens_dropped,
+                "requested_new_tokens_original": original_requested_new,
+                "requested_new_tokens_final": requested_new,
+                "reserve_tokens": self.reserve_tokens,
+                "max_model_len": max_model_len,
             }
 
         metrics_collector = get_metrics_collector()
@@ -595,7 +737,7 @@ class eSurge:
         with self._output_lock:
             self._request_outputs[request_id] = RequestOutput(
                 request_id=request_id,
-                prompt=prompt,
+                prompt=prompt_for_engine,
                 prompt_token_ids=token_ids,
                 outputs=[CompletionOutput(index=0, text="", token_ids=[])],
                 finished=False,
@@ -609,6 +751,21 @@ class eSurge:
                 update_seq=0,
                 delta_seq=0,
             )
+
+        self.scheduler.add_request(
+            EngineRequest(
+                request_id=request_id,
+                prompt_token_ids=token_ids,
+                sampling_params=sampling_params,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        )
+
+        logger.info(
+            f"Queued request {request_id}: prompt_len={prompt_len}, "
+            f"max_tokens={requested_new}, reserve={self.reserve_tokens}, "
+            f"model_max={max_model_len}, dropped={tokens_dropped}"
+        )
 
     def _generate_request_id(self) -> str:
         """Generate a unique request ID.
