@@ -41,6 +41,8 @@ class ToolCallingMixin:
     - self.enable_function_calling: bool
     """
 
+    tool_parsers: dict[str, ToolParser]
+
     def initialize_tool_parsers(
         self,
         model_processors: dict[str, tp.Any],

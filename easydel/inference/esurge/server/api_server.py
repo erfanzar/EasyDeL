@@ -366,6 +366,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
             conversation = convert_to_openai_format(conversation)
 
+        for msg in conversation:
+            if isinstance(msg.get("content"), list):
+                text_parts = []
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                msg["content"] = " ".join(text_parts)
+
         try:
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
@@ -584,7 +592,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                             delta_token_ids=delta_token_ids,
                             request=request,
                         )
-
                         previous_text = current_text
                         previous_token_ids = current_token_ids
 
@@ -592,6 +599,10 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                         if delta_message:
                             if not delta_message.role:
                                 delta_message.role = "assistant"
+                        elif request.tools:
+                            # Tool parser is active but returned None - it's buffering
+                            # Don't send raw text that might contain tool markup
+                            continue  # Skip this chunk entirely
                         else:
                             # No special parsing needed for this chunk
                             delta_message = DeltaMessage(content=output.delta_text, role="assistant")
