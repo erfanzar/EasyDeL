@@ -12,6 +12,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""eSurge Engine - High-Performance Inference Engine for EasyDeL.
+
+This module provides the eSurge engine, a high-performance text generation system
+built on JAX that offers efficient batched inference with advanced features like
+smart bytecode decoding, continuous batching, and comprehensive monitoring.
+
+Key Components:
+    - eSurge: Main engine class for text generation
+    - RequestOutput: Container for generation results and metrics
+    - CompletionOutput: Individual completion within a batch
+    - SmartBytecodeDecoder: Intelligent UTF-8 sequence handler
+
+Features:
+    - **Smart Bytecode Decoding**: Prevents malformed UTF-8 characters (�) during
+      streaming by intelligently buffering incomplete tokens and using progressive
+      backtracking to find clean decode points.
+    - **Continuous Batching**: Background scheduler thread processes requests
+      continuously for optimal throughput.
+    - **Context Management**: Automatic prompt truncation and token reservation
+      with configurable strategies.
+    - **Streaming Support**: Real-time token streaming with delta updates.
+    - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console monitor.
+
+Usage Example:
+    >>> from easydel.inference.esurge import eSurge
+    >>> from easydel.inference.sampling_params import SamplingParams
+    >>>
+    >>> # Initialize engine with smart decoding
+    >>> engine = eSurge(
+    ...     model="model-name",
+    ...     bytecode_decode=True,  # Enable smart UTF-8 handling
+    ...     max_model_len=8192,
+    ...     reserve_tokens=800
+    ... )
+    >>>
+    >>> # Stream generation
+    >>> for output in engine.stream("Tell me about AI"):
+    ...     print(output.delta_text, end="", flush=True)
+    >>>
+    >>> # Batch generation
+    >>> outputs = engine.generate(
+    ...     ["Question 1?", "Question 2?"],
+    ...     SamplingParams(max_tokens=100, temperature=0.7)
+    ... )
+
+Technical Details:
+    The engine uses a multi-threaded architecture with:
+    - Main thread: Handles API calls and request submission
+    - Scheduler thread: Continuously processes queued requests
+    - JAX computation: Executes model forward passes
+
+    Smart bytecode decoding addresses the common issue where byte-level tokenizers
+    (used by many modern LLMs) can split multi-byte UTF-8 characters across token
+    boundaries, causing malformed characters during streaming decode.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -31,6 +87,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from easydel.inference.sampling_params import SamplingParams
 from easydel.utils.helpers import get_logger
 
+from ..decoders import SmartBytecodeDecoder
 from .engine_types import EngineCoreOutputs
 from .metrics import get_metrics_collector, initialize_metrics
 from .request import EngineRequest, EngineRequestStatus
@@ -152,11 +209,41 @@ class eSurge:
     - Efficient batched inference with paged attention
     - Continuous batching with background scheduling
     - Streaming generation with delta text tracking
+    - Smart bytecode decoding for handling malformed UTF-8 sequences
     - Comprehensive monitoring and metrics
     - Thread-safe request handling
+    - Dynamic context management with automatic prompt truncation
 
     The engine runs a background scheduler thread that continuously processes
-    requests from the queue, enabling high throughput and low latency.
+    requests from the queue, enabling high throughput and low latency. It includes
+    advanced features like smart decoding to handle tokenizers that split multi-byte
+    UTF-8 characters across token boundaries, preventing malformed characters (�)
+    during streaming.
+
+    Key Features:
+        - **Smart Bytecode Decoding**: Automatically handles incomplete UTF-8 sequences
+          by buffering partial tokens and using progressive backtracking to find clean
+          decode points.
+        - **Context Management**: Automatically manages context length with configurable
+          truncation strategies and token reservation.
+        - **Streaming Support**: Efficient incremental decoding with configurable
+          intervals for optimal performance.
+        - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console
+          monitoring capabilities.
+
+    Example:
+        >>> # Initialize with smart decoding enabled
+        >>> engine = eSurge(
+        ...     model="model-name",
+        ...     bytecode_decode=True,  # Enable smart UTF-8 handling
+        ...     max_model_len=8192,
+        ...     reserve_tokens=800  # Reserve tokens for generation
+        ... )
+        >>> engine.initiate()
+        >>>
+        >>> # Generate with streaming
+        >>> for output in engine.stream("Tell me a story"):
+        ...     print(output.delta_text, end="", flush=True)
     """
 
     def __init__(
@@ -183,6 +270,7 @@ class eSurge:
         truncate_mode: typing.Literal["left", "right", "middle"] = "left",
         prefer_preserve_prompt: bool = True,
         decode_truncated_prompt: bool = True,
+        bytecode_decode: bool = True,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -196,24 +284,44 @@ class eSurge:
             max_num_seqs: Maximum number of concurrent sequences.
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
-            page_size: Page size for paged attention KV cache.
-            enable_prefix_caching: Enable caching of common prefixes.
+            page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
+            enable_prefix_caching: Enable caching of common prefixes for efficiency.
             auto_shard_model: Automatically shard model across devices.
             sharding_axis_dims: Sharding configuration for model parallelism.
-            compile_runner: JIT compile the runner for better performance.
+            compile_runner: JIT pre-compile the runner for better performance.
             runner_verbose: Enable verbose logging in runner.
             esurge_name: Optional custom name for this engine instance.
-            reserve_tokens: safety margin
-            auto_truncate_prompt: allow truncating prompt if needed
-            auto_cap_new_tokens: cap max_new_tokens to fit budget
-            strict_context: if True, raise errors instead of auto-fixing
-            truncate_mode: "left" | "right" | "middle"
-            prefer_preserve_prompt: cap new tokens before truncating prompt
-            decode_truncated_prompt: if truncated, decode tokens to update
+            reserve_tokens: Safety margin tokens reserved from max_model_len to prevent
+                OOM or Scheduler errors. Defaults to max_model_len // 10.
+            auto_truncate_prompt: Allow automatic prompt truncation when it exceeds
+                the available context budget.
+            auto_cap_new_tokens: Automatically cap max_new_tokens to fit within
+                the model's context window.
+            strict_context: If True, raise errors on context violations instead of
+                auto-fixing. Use for strict validation.
+            truncate_mode: Strategy for prompt truncation:
+                - "left": Remove tokens from the beginning
+                - "right": Remove tokens from the end
+                - "middle": Remove tokens from the middle
+            prefer_preserve_prompt: When True, prioritize preserving the prompt by
+                capping new tokens first before truncating the prompt.
+            decode_truncated_prompt: Re-decode truncated prompt to update the text
+                representation when truncation occurs.
+            bytecode_decode: Enable smart bytecode decoding for handling malformed
+                UTF-8 sequences. This prevents "�" characters during streaming when
+                tokens split multi-byte UTF-8 characters. Uses intelligent buffering
+                and progressive backtracking to find clean decode points.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
-            ValueError: If tokenizer not provided and cannot be inferred.
+            ValueError: If tokenizer not provided and cannot be inferred, or if
+                configuration parameters are invalid.
+
+        Note:
+            The bytecode_decode feature is particularly important for models using
+            byte-level tokenizers (like many modern LLMs) where token boundaries
+            may not align with UTF-8 character boundaries. When enabled, it ensures
+            smooth streaming without malformed characters.
         """
         from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
@@ -273,6 +381,8 @@ class eSurge:
         self._dashboard_urls = None
         self._monitoring_initialized = False
         self._esurge_name = esurge_name
+        self._bytecode_decode = bytecode_decode
+        self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
 
         self.runner = eSurgeRunner(
             model=self.model,
@@ -342,6 +452,35 @@ class eSurge:
     def esurge_name(self) -> str:
         return self._esurge_name or self._get_model_name(self.model)
 
+    @property
+    def bytecode_decode(self) -> bool:
+        """Get the bytecode decoding setting.
+
+        Returns:
+            True if smart bytecode decoding is enabled for handling malformed
+            UTF-8 sequences during token streaming.
+
+        Example:
+            >>> if engine.bytecode_decode:
+            ...     print("Smart UTF-8 handling is enabled")
+        """
+        return self._bytecode_decode
+
+    @property
+    def smart_decoder(self) -> SmartBytecodeDecoder | None:
+        """Get the smart bytecode decoder instance.
+
+        Returns:
+            SmartBytecodeDecoder instance if bytecode_decode is enabled, else None.
+            The decoder handles buffering of incomplete tokens and progressive
+            backtracking to find clean UTF-8 decode points.
+
+        Example:
+            >>> if engine.smart_decoder:
+            ...     print("Decoder is active and handling UTF-8 sequences")
+        """
+        return self._smart_decoder
+
     def initiate(self) -> None:
         """Start the background scheduler thread.
 
@@ -406,28 +545,56 @@ class eSurge:
         sampling_params: SamplingParams | None = None,
         request_id: str | list[str] | None = None,
         use_tqdm: bool = True,
+        bytecode_decode: bool | None = None,
     ) -> list[RequestOutput]:
         """Generate completions for one or more prompts (blocking).
 
         Synchronous batch generation that waits for all completions to finish
-        before returning. Suitable for batch processing scenarios.
+        before returning. Suitable for batch processing scenarios where you need
+        all results at once.
 
         Args:
-            prompts: Single prompt string or list of prompts.
-            sampling_params: Generation parameters (temperature, max_tokens, etc.).
-                Defaults to SamplingParams(max_tokens=128) if None.
+            prompts: Single prompt string or list of prompts to generate from.
+            sampling_params: Generation parameters controlling temperature, top_p,
+                max_tokens, etc. Defaults to SamplingParams(max_tokens=128) if None.
             request_id: Optional request ID(s) for tracking. Auto-generated if None.
-            use_tqdm: Show progress bar for batch generation.
+                Can be a single string (for single prompt) or list of strings.
+            use_tqdm: Show progress bar for batch generation. Useful for tracking
+                progress with multiple prompts.
+            bytecode_decode: Override the instance's bytecode_decode setting for this
+                specific call. When True, enables smart UTF-8 handling for this request.
+                When None, uses the instance's default setting.
 
         Returns:
-            List of RequestOutput objects containing generated text and metrics.
+            List of RequestOutput objects containing:
+                - Generated text in the `text` field
+                - Token IDs in the `token_ids` field
+                - Performance metrics (tokens/sec, latency, etc.)
+                - Finish reason ('stop', 'length', 'eos_token')
 
         Raises:
-            RuntimeError: If background scheduler is not running.
+            RuntimeError: If background scheduler is not running. Call initiate() first.
+            ValueError: If prompts and request_ids have mismatched lengths.
 
         Example:
-            >>> outputs = engine.generate("What is AI?", SamplingParams(max_tokens=100))
+            >>> # Single prompt generation
+            >>> outputs = engine.generate(
+            ...     "What is AI?",
+            ...     SamplingParams(max_tokens=100, temperature=0.7)
+            ... )
             >>> print(outputs[0].get_text())
+            >>>
+            >>> # Batch generation with progress bar
+            >>> prompts = ["Question 1?", "Question 2?", "Question 3?"]
+            >>> outputs = engine.generate(prompts, use_tqdm=True)
+            >>> for i, output in enumerate(outputs):
+            ...     print(f"Prompt {i}: {output.get_text()[:50]}...")
+            >>>
+            >>> # Override bytecode decoding for specific request
+            >>> outputs = engine.generate(
+            ...     "Generate UTF-8 text",
+            ...     bytecode_decode=True  # Enable smart decoding
+            ... )
         """
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -442,69 +609,111 @@ class eSurge:
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=128)
 
-        for prompt, req_id in zip(prompts, request_ids, strict=False):
-            self._add_request(req_id, prompt, sampling_params)
+        # Override bytecode_decode if specified
+        original_bytecode_decode = self._bytecode_decode
+        if bytecode_decode is not None:
+            self._bytecode_decode = bytecode_decode
+            if bytecode_decode and self._smart_decoder is None:
+                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
 
-        outputs = []
-        pbar = None
-        if use_tqdm:
-            from tqdm import tqdm
+        try:
+            for prompt, req_id in zip(prompts, request_ids, strict=False):
+                self._add_request(req_id, prompt, sampling_params)
 
-            pbar = tqdm(total=len(prompts), desc="Generating")
+            outputs = []
+            pbar = None
+            if use_tqdm:
+                from tqdm import tqdm
 
-        completed = set()
+                pbar = tqdm(total=len(prompts), desc="Generating")
 
-        if not self._scheduler_running:
-            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+            completed = set()
 
-        while len(completed) < len(prompts):
-            self._output_event.wait(timeout=0.1)
-            self._output_event.clear()
-            with self._output_lock:
-                for req_id in request_ids:
-                    if req_id not in completed and req_id in self._request_outputs:
-                        output = self._request_outputs[req_id]
-                        if output.finished:
-                            completed.add(req_id)
-                            outputs.append(output)
-                            if pbar:
-                                pbar.update(1)
+            if not self._scheduler_running:
+                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
-        if pbar:
-            pbar.close()
-        return outputs
+            while len(completed) < len(prompts):
+                self._output_event.wait(timeout=0.1)
+                self._output_event.clear()
+                with self._output_lock:
+                    for req_id in request_ids:
+                        if req_id not in completed and req_id in self._request_outputs:
+                            output = self._request_outputs[req_id]
+                            if output.finished:
+                                completed.add(req_id)
+                                outputs.append(output)
+                                if pbar:
+                                    pbar.update(1)
+
+            if pbar:
+                pbar.close()
+            return outputs
+        finally:
+            # Restore original bytecode_decode setting
+            if bytecode_decode is not None:
+                self._bytecode_decode = original_bytecode_decode
+                if not original_bytecode_decode:
+                    self._smart_decoder = None
 
     def stream(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
+        bytecode_decode: bool | None = None,
     ) -> Iterator[RequestOutput]:
         """Stream generation output as tokens are produced.
 
-        Yields RequestOutput objects incrementally as new tokens are generated.
-        The delta_text field contains only newly generated text since the last
-        yield, while accumulated_text contains all text generated so far.
+        Yields RequestOutput objects incrementally as new tokens are generated,
+        enabling real-time streaming of generated text. Perfect for interactive
+        applications and chat interfaces.
 
         Args:
-            prompts: Single prompt string or list with one prompt.
-            sampling_params: Generation parameters. Defaults to max_tokens=128.
+            prompts: Single prompt string or list with one prompt. For multiple
+                prompts, use generate() instead.
+            sampling_params: Generation parameters controlling temperature, top_p,
+                max_tokens, etc. Defaults to SamplingParams(max_tokens=128).
             request_id: Optional request ID for tracking. Auto-generated if None.
+            bytecode_decode: Override the instance's bytecode_decode setting for this
+                specific stream. When True, enables smart UTF-8 handling to prevent
+                malformed characters during streaming. When None, uses instance default.
 
         Yields:
-            RequestOutput objects with incremental updates. Check delta_text
-            for new content and finished flag for completion.
+            RequestOutput objects with incremental updates:
+                - delta_text: Only the newly generated text since last yield
+                - accumulated_text: Full text generated so far
+                - finished: True when generation is complete
+                - tokens_per_second: Current generation throughput
+                - num_generated_tokens: Total tokens generated so far
 
         Raises:
             ValueError: If empty prompt list provided.
             RuntimeError: If scheduler not running or request setup fails.
 
         Example:
+            >>> # Basic streaming
             >>> for output in engine.stream("Tell me a story"):
-            >>>     if output.delta_text:
-            >>>         print(output.delta_text, end="", flush=True)
-            >>>     if output.finished:
-            >>>         break
+            ...     if output.delta_text:
+            ...         print(output.delta_text, end="", flush=True)
+            ...     if output.finished:
+            ...         break
+            >>>
+            >>> # Streaming with smart UTF-8 handling
+            >>> for output in engine.stream("Generate emoji text", bytecode_decode=True):
+            ...     print(output.delta_text, end="", flush=True)
+            >>>
+            >>> # Monitor generation speed
+            >>> for output in engine.stream("Long prompt here..."):
+            ...     if output.delta_text:
+            ...         print(output.delta_text, end="")
+            ...     if output.num_generated_tokens % 10 == 0:
+            ...         print(f"\n[{output.tokens_per_second:.1f} tok/s]", end="")
+
+        Note:
+            The bytecode_decode parameter is particularly useful when streaming
+            text that may contain emojis, special characters, or non-ASCII text,
+            as it prevents the appearance of � characters when tokens split
+            multi-byte UTF-8 sequences.
         """
         if isinstance(prompts, list):
             if len(prompts) == 0:
@@ -519,80 +728,120 @@ class eSurge:
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=128)
 
-        self._add_request(request_id, prompt, sampling_params)
+        # Override bytecode_decode if specified
+        original_bytecode_decode = self._bytecode_decode
+        if bytecode_decode is not None:
+            self._bytecode_decode = bytecode_decode
+            if bytecode_decode and self._smart_decoder is None:
+                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
 
-        if not self._scheduler_running:
-            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        try:
+            self._add_request(request_id, prompt, sampling_params)
 
-        with self._request_lock:
-            req_event = self._request_events.get(request_id)
-        if req_event is None:
-            raise RuntimeError("Request event missing")
+            if not self._scheduler_running:
+                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
-        last_update_seq = -1
+            with self._request_lock:
+                req_event = self._request_events.get(request_id)
+            if req_event is None:
+                raise RuntimeError("Request event missing")
 
-        while True:
-            req_event.wait(timeout=1.0)
-            req_event.clear()
+            last_update_seq = -1
 
-            snapshot = None
-            with self._output_lock:
-                ro = self._request_outputs.get(request_id)
-                if ro is None:
-                    break
+            while True:
+                req_event.wait(timeout=1.0)
+                req_event.clear()
 
-                if ro.update_seq != last_update_seq:
-                    # Snapshot without holding the lock during yield
-                    outputs_copy = []
-                    for comp in ro.outputs:
-                        outputs_copy.append(
-                            CompletionOutput(
-                                index=comp.index,
-                                text=comp.text,
-                                token_ids=list(comp.token_ids),
-                                cumulative_logprob=comp.cumulative_logprob,
-                                logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
-                                finish_reason=comp.finish_reason,
+                snapshot = None
+                with self._output_lock:
+                    ro = self._request_outputs.get(request_id)
+                    if ro is None:
+                        break
+
+                    if ro.update_seq != last_update_seq:
+                        # Snapshot without holding the lock during yield
+                        outputs_copy = []
+                        for comp in ro.outputs:
+                            outputs_copy.append(
+                                CompletionOutput(
+                                    index=comp.index,
+                                    text=comp.text,
+                                    token_ids=list(comp.token_ids),
+                                    cumulative_logprob=comp.cumulative_logprob,
+                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                    finish_reason=comp.finish_reason,
+                                )
                             )
+
+                        snapshot = RequestOutput(
+                            request_id=ro.request_id,
+                            prompt=ro.prompt,
+                            prompt_token_ids=list(ro.prompt_token_ids),
+                            outputs=outputs_copy,
+                            finished=ro.finished,
+                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
+                            accumulated_text=ro.accumulated_text,
+                            delta_text=ro.delta_text,
+                            tokens_per_second=ro.tokens_per_second,
+                            num_generated_tokens=ro.num_generated_tokens,
+                            time_spent_generating=ro.time_spent_generating,
+                            first_token_time=ro.first_token_time,
+                            processing_time=ro.processing_time,
+                            update_seq=ro.update_seq,
                         )
+                        last_update_seq = ro.update_seq
 
-                    snapshot = RequestOutput(
-                        request_id=ro.request_id,
-                        prompt=ro.prompt,
-                        prompt_token_ids=list(ro.prompt_token_ids),
-                        outputs=outputs_copy,
-                        finished=ro.finished,
-                        metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                        accumulated_text=ro.accumulated_text,
-                        delta_text=ro.delta_text,
-                        tokens_per_second=ro.tokens_per_second,
-                        num_generated_tokens=ro.num_generated_tokens,
-                        time_spent_generating=ro.time_spent_generating,
-                        first_token_time=ro.first_token_time,
-                        processing_time=ro.processing_time,
-                        update_seq=ro.update_seq,
-                    )
-                    last_update_seq = ro.update_seq
+                if snapshot is not None:
+                    yield snapshot
+                    if snapshot.finished:
+                        break
 
-            if snapshot is not None:
-                yield snapshot
-                if snapshot.finished:
-                    break
-
-        # Cleanup per-request event (output is preserved for generate or post-hoc access)
-        with self._request_lock:
-            self._request_events.pop(request_id, None)
+            # Cleanup per-request event (output is preserved for generate or post-hoc access)
+            with self._request_lock:
+                self._request_events.pop(request_id, None)
+        finally:
+            # Restore original bytecode_decode setting
+            if bytecode_decode is not None:
+                self._bytecode_decode = original_bytecode_decode
+                if not original_bytecode_decode:
+                    self._smart_decoder = None
 
     def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
-        """Add a new request to the scheduler queue.
+        """Add a new request to the scheduler queue with intelligent context management.
 
-        Internal method that tokenizes the prompt, creates request tracking
-        structures, and adds the request to the scheduler for processing.
+        Internal method that tokenizes the prompt, applies context length management
+        policies, creates request tracking structures, and adds the request to the
+        scheduler for processing. Handles prompt truncation and token reservation
+        to ensure generation fits within model constraints.
 
         Args:
             request_id: Unique identifier for the request.
-            prompt: Text prompt to generate from.
-            sampling_params: Generation parameters.
+            prompt: Text prompt to generate from. May be truncated based on
+                context management settings.
+            sampling_params: Generation parameters including max_tokens/max_new_tokens.
+
+        Context Management:
+            The method implements a sophisticated context management strategy:
+            1. Calculates available token budget (max_model_len - reserve_tokens)
+            2. If prompt exceeds budget:
+               - Truncates based on truncate_mode (left/right/middle)
+               - Or raises error if strict_context=True
+            3. Adjusts max_new_tokens to fit within remaining context
+            4. Prioritizes based on prefer_preserve_prompt setting
+
+        Smart Decoding Setup:
+            When bytecode_decode is enabled, initializes:
+            - buffered_tokens: Empty list for incomplete token buffering
+            - previous_decoded_text: Empty string for tracking decoded state
+
+        Truncation Strategies:
+            - "left": Removes tokens from beginning (keeps recent context)
+            - "right": Removes tokens from end (keeps initial context)
+            - "middle": Removes tokens from middle (keeps both ends)
+
+        Note:
+            This method ensures that prompt_len + max_new_tokens + reserve_tokens
+            never exceeds max_model_len, preventing OOM errors during generation.
         """
 
         # ---- Config knobs ----
@@ -634,7 +883,7 @@ class eSurge:
                 f"(mode={self.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
             )
 
-        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len - self.reserve_tokens)
+        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len)
 
         if requested_new > allowed_new_if_keep_prompt:
             do_cap_first = self.prefer_preserve_prompt or not self.auto_truncate_prompt
@@ -728,6 +977,8 @@ class eSurge:
                 "requested_new_tokens_final": requested_new,
                 "reserve_tokens": self.reserve_tokens,
                 "max_model_len": max_model_len,
+                "buffered_tokens": [],  # For smart bytecode decoding
+                "previous_decoded_text": "",  # Track previously decoded text
             }
 
         metrics_collector = get_metrics_collector()
@@ -830,18 +1081,35 @@ class eSurge:
 
         Core method that processes tokens from the model, performs incremental
         decoding, updates metrics, and signals waiting threads. Uses interval-based
-        decoding to reduce tokenizer overhead during streaming.
+        decoding to reduce tokenizer overhead during streaming. When bytecode_decode
+        is enabled, employs smart decoding to handle malformed UTF-8 sequences.
 
         Args:
-            engine_outputs: Dictionary mapping client IDs to engine outputs.
+            engine_outputs: Dictionary mapping client IDs to engine outputs containing
+                new tokens, completion status, and metadata.
 
-        The method:
-        1. Extracts new tokens from engine outputs
-        2. Performs interval-based decoding (every 4 tokens or 20ms)
-        3. Updates accumulated and delta text
-        4. Tracks performance metrics (TTFT, tokens/sec)
-        5. Handles request completion
-        6. Signals per-request events for streaming
+        Processing Flow:
+            1. Extracts new tokens from engine outputs
+            2. Performs interval-based decoding (every 4 tokens or 20ms)
+            3. If bytecode_decode enabled:
+               - Buffers incomplete tokens that would produce malformed chars
+               - Uses progressive backtracking to find clean decode points
+               - Maintains previous decoded text for accurate diffing
+            4. Updates accumulated and delta text fields
+            5. Tracks performance metrics (TTFT, tokens/sec)
+            6. Handles request completion with final token flush
+            7. Signals per-request events for streaming consumers
+
+        Smart Decoding Logic:
+            When bytecode_decode is active, the method:
+            - Attempts to decode new tokens with any buffered tokens
+            - If malformed characters detected, backtracks to find last clean point
+            - Buffers problematic tokens for next iteration
+            - On completion, flushes all remaining buffered tokens
+
+        Thread Safety:
+            Uses request_lock and output_lock to ensure atomic updates across
+            multiple concurrent requests and streaming consumers.
         """
         metrics_collector = get_metrics_collector()
 
@@ -879,14 +1147,46 @@ class eSurge:
                             or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
                         )
                         if should_decode and num_generated > last_idx:
-                            delta = self.tokenizer.decode(
-                                rd["generated_tokens"][last_idx:],
-                                skip_special_tokens=True,
-                            )
+                            if self._bytecode_decode and self._smart_decoder:
+                                new_tokens = rd["generated_tokens"][last_idx:]
+                                buffered_tokens = rd.get("buffered_tokens", [])
+                                previous_text = rd.get("previous_decoded_text", "")
+
+                                delta, new_buffered_tokens, had_malformed = self._smart_decoder.decode_with_recovery(
+                                    new_tokens,
+                                    previous_text,
+                                    buffered_tokens,
+                                )
+
+                                rd["buffered_tokens"] = new_buffered_tokens
+                                if not had_malformed or not new_buffered_tokens:
+                                    try:
+                                        full_decoded = self.tokenizer.decode(
+                                            rd["generated_tokens"],
+                                            skip_special_tokens=True,
+                                        )
+                                        if not self._smart_decoder.contains_malformed_chars(full_decoded):
+                                            ro.accumulated_text = full_decoded
+                                            rd["previous_decoded_text"] = full_decoded
+                                        else:
+                                            ro.accumulated_text = previous_text + delta
+                                            rd["previous_decoded_text"] = ro.accumulated_text
+                                    except Exception:
+                                        ro.accumulated_text = previous_text + delta
+                                        rd["previous_decoded_text"] = ro.accumulated_text
+                                else:
+                                    ro.accumulated_text = previous_text + delta
+                                    rd["previous_decoded_text"] = ro.accumulated_text
+                            else:
+                                # Standard decoding
+                                delta = self.tokenizer.decode(
+                                    rd["generated_tokens"][last_idx:],
+                                    skip_special_tokens=True,
+                                )
+                                ro.accumulated_text += delta
+
                             rd["last_decoded_index"] = num_generated
                             rd["last_decode_time"] = now
-
-                            ro.accumulated_text += delta
                             ro.delta_text = delta
                             ro.delta_seq += 1
                             text_changed = True
@@ -924,13 +1224,44 @@ class eSurge:
                         num_generated = len(rd["generated_tokens"])
                         last_idx = rd["last_decoded_index"]
                         if num_generated > last_idx:
-                            delta = self.tokenizer.decode(
-                                rd["generated_tokens"][last_idx:],
-                                skip_special_tokens=True,
-                            )
-                            ro.accumulated_text += delta
+                            if self._bytecode_decode and self._smart_decoder:
+                                # Use smart decoder for final flush
+                                new_tokens = rd["generated_tokens"][last_idx:]
+                                buffered_tokens = rd.get("buffered_tokens", [])
+                                previous_text = rd.get("previous_decoded_text", "")
+
+                                # For final flush, decode everything including buffered tokens
+                                all_remaining_tokens = new_tokens + buffered_tokens
+                                if all_remaining_tokens:
+                                    try:
+                                        # Try to decode all tokens for final output
+                                        full_decoded = self.tokenizer.decode(
+                                            rd["generated_tokens"], skip_special_tokens=True
+                                        )
+                                        ro.accumulated_text = full_decoded
+                                        delta = (
+                                            full_decoded[len(previous_text) :]
+                                            if full_decoded.startswith(previous_text)
+                                            else full_decoded
+                                        )
+                                    except Exception:
+                                        # Fallback to incremental decode
+                                        delta, _, _ = self._smart_decoder.decode_with_recovery(
+                                            all_remaining_tokens, previous_text, []
+                                        )
+                                        ro.accumulated_text = previous_text + delta
+                                else:
+                                    delta = ""
+                            else:
+                                # Standard decoding
+                                delta = self.tokenizer.decode(
+                                    rd["generated_tokens"][last_idx:],
+                                    skip_special_tokens=True,
+                                )
+                                ro.accumulated_text += delta
+
                             ro.delta_text = delta
-                            ro.delta_seq += 1  # NEW
+                            ro.delta_seq += 1
                             comp.text = ro.accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
                             rd["last_decoded_index"] = num_generated

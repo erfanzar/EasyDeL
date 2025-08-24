@@ -24,6 +24,7 @@ from eformer.common_types import NOT_GIVEN, _Empty
 
 from easydel.utils.helpers import get_logger
 
+from ..decoders import SmartBytecodeDecoder
 from ..sampling_params import SamplingParams
 from .core import vDriver, vEngine
 from .request_type import vSurgeRequest
@@ -32,7 +33,6 @@ from .utils import (
     ActiveRequestMetadata,
     AsyncMultifuture,
     ReturnSample,
-    SmartBytecodeDecoder,
     calculate_pefill_lengths,
     text_tokens_to_string,
 )
