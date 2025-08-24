@@ -27,7 +27,6 @@ import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import msgpack
 import numpy
-import numpy as np
 from eformer.jaximus import implicit
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 from flax.struct import PyTreeNode
@@ -155,19 +154,17 @@ def _read_process_array(
     return key, tensor, mismatch
 
 
-def _to_host_numpy(x, float_dtype):
+def _to_host(x, float_dtype):
     if isinstance(x, jax.Array):
         if not x.is_fully_addressable:
             x = jax.experimental.multihost_utils.process_allgather(x)
-        try:
-            x = jax.device_get(x)
-        except RuntimeError:
-            pass
-    x = np.asarray(x)
+
+        x = jax.device_get(x)
+
     if float_dtype:
         dtype = STRING_TO_DTYPE_MAP.get(float_dtype, float_dtype) if isinstance(float_dtype, str) else float_dtype
-        if np.issubdtype(x.dtype, np.floating):
-            x = x.astype(np.dtype(dtype), copy=False)
+        if jnp.issubdtype(x.dtype, jnp.floating):
+            x = x.astype(dtype)
     return x
 
 
@@ -572,7 +569,7 @@ class CheckpointManager:
                     pbar_gather.update(1)
 
         state = jax.tree_util.tree_map(
-            lambda x: _to_host_numpy(x, float_dtype),
+            lambda x: _to_host(x, float_dtype),
             state,
             is_leaf=lambda x: isinstance(x, (jax.Array, numpy.generic, float, int)),  # noqa
         )
