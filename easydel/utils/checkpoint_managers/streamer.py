@@ -31,6 +31,7 @@ from eformer.jaximus import implicit
 from flax.serialization import from_bytes, to_bytes, to_state_dict
 from flax.struct import PyTreeNode
 from google.cloud import storage
+from jax.sharding import PartitionSpec
 from safetensors import flax as safe_flax
 from tqdm.autonotebook import tqdm
 
@@ -156,10 +157,7 @@ def _read_process_array(
 
 def _to_host(x, float_dtype):
     if isinstance(x, jax.Array):
-        if not x.is_fully_addressable:
-            x = jax.experimental.multihost_utils.process_allgather(x)
-
-        x = jax.device_get(x)
+        x = jax.device_put(x, PartitionSpec())
 
     if float_dtype:
         dtype = STRING_TO_DTYPE_MAP.get(float_dtype, float_dtype) if isinstance(float_dtype, str) else float_dtype
