@@ -254,7 +254,8 @@ class eSurgeRunner:
             while num < max_token_size:
                 num += padding_gap
                 paddings.append(num)
-
+        if paddings[-1] != max_token_size:
+            paddings.append(max_token_size)
         return paddings
 
     def _setup_variables(self):
