@@ -53,6 +53,7 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
+from eformer import common_types
 from eformer.common_types import NOT_GIVEN
 from eformer.escale import PartitionAxis, PartitionManager
 from eformer.pytree import auto_pytree
@@ -306,6 +307,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
     """
 
     _show_private_attrs: bool = False
+    _hidden_mesh: common_types.Mesh | None = None
 
     def __init__(
         self,
@@ -445,7 +447,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if backend == "":
             backend = None
 
-        return create_mesh(
+        mesh = create_mesh(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
             dcn_mesh_dims=sharding_dcn_axis_dims,
@@ -454,6 +456,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             allow_split_physical_axes=allow_split_physical_axes,
             backend=backend,
         )
+        jax.sharding.use_mesh(mesh)
+        return mesh
 
     @property
     def mesh(self):
@@ -468,6 +472,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Returns:
             A jaxMesh
         """
+        if self._hidden_mesh is not None:
+            return self._hidden_mesh
+
         sharding_axis_dims = (
             [v for k, v in self.sharding_axis_dims.items()]
             if isinstance(self.sharding_axis_dims, dict)
@@ -483,7 +490,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             if isinstance(self.sharding_dcn_axis_dims, dict)
             else self.sharding_dcn_axis_dims
         )
-        return self.create_mesh(
+        mesh = self.create_mesh(
             sharding_axis_dims=tuple(sharding_axis_dims) if sharding_axis_dims is not None else sharding_axis_dims,
             sharding_axis_names=tuple(sharding_axis_names) if sharding_axis_names is not None else sharding_axis_names,
             sharding_dcn_axis_dims=tuple(sharding_dcn_axis_dims)
@@ -501,6 +508,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
             ),
             backend=((self.backend if self.backend is not None else "") if hasattr(self, "backend") else ""),
         )
+
+        return mesh
+
+    def set_model_mesh(self, mesh: common_types.Mesh):
+        self._hidden_mesh = mesh
 
     def jax_mesh(self):
         warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
