@@ -456,7 +456,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             allow_split_physical_axes=allow_split_physical_axes,
             backend=backend,
         )
-        jax.sharding.use_mesh(mesh)
         return mesh
 
     @property

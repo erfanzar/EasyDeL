@@ -432,7 +432,8 @@ class EasyDeLState(struct.PyTreeNode):
             raise FileNotFoundError(f"Optimizer files are missing at {load_directory}")
 
         try:
-            leaves, _ = CheckpointManager.load_checkpoint(path=optim_path)
+            with self.model.mesh:
+                leaves, _ = CheckpointManager.load_checkpoint(path=optim_path)
 
             recreated = [None] * len(leaves)
             for i in range(len(leaves)):
@@ -469,19 +470,21 @@ class EasyDeLState(struct.PyTreeNode):
 
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
-                CheckpointManager.save_checkpoint(
-                    state={
-                        f"param_idx_{idx}": param for idx, param in enumerate(jax.tree_util.tree_leaves(self.opt_state))
-                    },
-                    path=optim_path,
-                    float_dtype=float_dtype,
-                    mismatch_allowed=mismatch_allowed,
-                    verbose=verbose,
-                    enable=enable,
-                )
-                struct_path: EasyPathLike = save_directory / OPTIMIZER_STRUCT_NAME
-                buffer_struct = pickle.dumps((jax.tree_util.tree_structure(self.opt_state), self.step))
-                struct_path.write_bytes(buffer_struct)
+                with self.model.mesh:
+                    CheckpointManager.save_checkpoint(
+                        state={
+                            f"param_idx_{idx}": param
+                            for idx, param in enumerate(jax.tree_util.tree_leaves(self.opt_state))
+                        },
+                        path=optim_path,
+                        float_dtype=float_dtype,
+                        mismatch_allowed=mismatch_allowed,
+                        verbose=verbose,
+                        enable=enable,
+                    )
+                    struct_path: EasyPathLike = save_directory / OPTIMIZER_STRUCT_NAME
+                    buffer_struct = pickle.dumps((jax.tree_util.tree_structure(self.opt_state), self.step))
+                    struct_path.write_bytes(buffer_struct)
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
                 raise
