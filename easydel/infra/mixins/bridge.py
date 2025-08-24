@@ -148,16 +148,17 @@ class EasyBridgeMixin(PushToHubMixin):
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
-        output_model_file = CheckpointManager.save_checkpoint(
-            state=state.to_pure_dict(),
-            path=str(output_model_file),
-            gather_fns=gather_fns,
-            mismatch_allowed=mismatch_allowed,
-            float_dtype=float_dtype,
-            verbose=verbose,
-            enable=enable,
-            shard_size_gb=shard_size_gb,
-        )
+        with self.mesh:
+            output_model_file = CheckpointManager.save_checkpoint(
+                state=state.to_pure_dict(),
+                path=str(output_model_file),
+                gather_fns=gather_fns,
+                mismatch_allowed=mismatch_allowed,
+                float_dtype=float_dtype,
+                verbose=verbose,
+                enable=enable,
+                shard_size_gb=shard_size_gb,
+            )
 
         logger.info(f"Model weights saved in {output_model_file}")
 
@@ -310,6 +311,7 @@ class EasyBridgeMixin(PushToHubMixin):
         resolved_archive_file: str | None,
         model: EasyDeLBaseModule,
         param_dtype: jnp.dtype,
+        mesh: jax.sharding.Mesh,
         mismatch_allowed: bool,
         verbose: bool,
         shard_fns: dict[tp.Callable] | None,
@@ -357,14 +359,15 @@ class EasyBridgeMixin(PushToHubMixin):
                     return quantizer(x, p)
 
         if resolved_archive_file:
-            state, _ = CheckpointManager.load_checkpoint(
-                path=resolved_archive_file,
-                mismatch_allowed=mismatch_allowed,
-                verbose=verbose,
-                shard_fns=passed_shard_fns,
-                callback=callback,
-                dtype=param_dtype,
-            )
+            with mesh:
+                state, _ = CheckpointManager.load_checkpoint(
+                    path=resolved_archive_file,
+                    mismatch_allowed=mismatch_allowed,
+                    verbose=verbose,
+                    shard_fns=passed_shard_fns,
+                    callback=callback,
+                    dtype=param_dtype,
+                )
             params = state.get("params", None)
             if params is not None:
                 state = params
@@ -629,6 +632,7 @@ class EasyBridgeMixin(PushToHubMixin):
             resolved_archive_file,
             model,
             param_dtype,
+            model.mesh,
             mismatch_allowed,
             verbose,
             shard_fns,
