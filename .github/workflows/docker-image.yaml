@@ -59,9 +59,9 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }} # Push only on push events
           tags: |
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}
-            ghcr.io/erfanzar/easydel:latest
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}
+            ghcr.io/dvruette/easydel:latest
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
@@ -75,9 +75,9 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-gpu
-            ghcr.io/erfanzar/easydel:latest-gpu
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-gpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-gpu
+            ghcr.io/dvruette/easydel:latest-gpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-gpu
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
@@ -91,9 +91,9 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-tpu
-            ghcr.io/erfanzar/easydel:latest-tpu
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-tpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-tpu
+            ghcr.io/dvruette/easydel:latest-tpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-tpu
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
