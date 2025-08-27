@@ -71,4 +71,5 @@ LABEL org.opencontainers.image.version=$VERSION \
 	org.opencontainers.image.description="EasyDeL: An open-source library to make training faster and more optimized in JAX" \
 	org.opencontainers.image.source="https://github.com/dvruette/EasyDeL"
 
-ENTRYPOINT ["/usr/bin/env"]
+ENTRYPOINT []
+CMD ["bash"]
