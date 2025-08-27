@@ -98,3 +98,12 @@ repos:
         language: python
         types: [python]
         pass_filenames: false
+
+      - id: docker-build-push
+        name: Docker Build and Push (Manual)
+        description: Build and optionally push Docker images when DOCKER_BUILD is set
+        entry: bash -c 'if [[ -n "$DOCKER_BUILD" ]]; then ./scripts/docker-build-push.sh $DOCKER_BUILD_ARGS; fi'
+        language: system
+        pass_filenames: false
+        always_run: false
+        stages: [manual]
