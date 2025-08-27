@@ -20,10 +20,15 @@ ENV TZ=UTC
 RUN if [ -f /etc/apt/sources.list.d/cuda.list ] || [ ! -f /usr/bin/python ]; then \
         apt-get update && \
         apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gnupg \
+            lsb-release \
             software-properties-common \
             tzdata && \
         ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
         echo $TZ > /etc/timezone && \
+        mkdir -p /etc/apt/keyrings && \
+        apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys F23C5A6CF475977595C89F51BA6932366A755776 && \
         add-apt-repository -y ppa:deadsnakes/ppa && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
