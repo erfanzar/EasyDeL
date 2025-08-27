@@ -2,30 +2,29 @@
 ARG RAY_IMAGE=rayproject/ray:2.36.0-py311
 FROM ${RAY_IMAGE}
 
-USER root
-WORKDIR /app
+WORKDIR /home/ray
 
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 rsync ca-certificates curl git build-essential && rm -rf /var/lib/apt/lists/*
+RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends libgomp1 rsync ca-certificates curl git build-essential && sudo rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+RUN python3.11 -m pip install uv
 
 COPY pyproject.toml uv.lock* ./
 
 ARG HARDWARE_TYPE=cpu
+RUN --mount=type=cache,target=/root/.cache/uv uv venv /home/ray/.venv && \
+    if [ "$HARDWARE_TYPE" = "gpu" ]; then uv sync --frozen --no-dev --no-install-project --extra gpu; \
+    elif [ "$HARDWARE_TYPE" = "tpu" ]; then uv sync --frozen --no-dev --no-install-project --extra tpu; \
+    else uv sync --frozen --no-dev --no-install-project; fi
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ "$HARDWARE_TYPE" = "gpu" ]; then \
-      uv sync --frozen --no-dev --system --extra gpu; \
-    elif [ "$HARDWARE_TYPE" = "tpu" ]; then \
-      uv sync --frozen --no-dev --system --extra tpu; \
-    else \
-      uv sync --frozen --no-dev --system; \
-    fi
+ENV PATH="/home/ray/.venv/bin:$PATH" \
+    VIRTUAL_ENV="/home/ray/.venv" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 COPY . .
 
-RUN uv pip install -e . --no-deps --system
-RUN uv pip install --system -U google-api-python-client google-auth-httplib2 google-auth-oauthlib
+RUN uv pip install -e . --no-deps
+RUN uv pip install -U google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 RUN python -c "import easydel; print('EasyDeL imported successfully')" && \
     if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
@@ -42,9 +41,6 @@ ENV VERSION=$VERSION \
 LABEL org.opencontainers.image.version=$VERSION \
       org.opencontainers.image.description="EasyDeL on Ray base image" \
       org.opencontainers.image.source="https://github.com/dvruette/EasyDeL"
-
-RUN chown -R ray:ray /app || true
-USER ray
 
 ENTRYPOINT []
 CMD ["bash"]
