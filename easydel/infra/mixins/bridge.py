@@ -121,7 +121,6 @@ class EasyBridgeMixin(PushToHubMixin):
         save_directory: ePathLike,
         gather_fns: dict[tp.Callable] | None = None,
         float_dtype=None,
-        enable: bool | None = None,
     ):
         """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -129,29 +128,23 @@ class EasyBridgeMixin(PushToHubMixin):
           save_directory (ePath): The directory where the model files will be saved.
           gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
           float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
-          verbose (bool, optional): Whether to print verbose messages. Defaults to True.
-          mismatch_allowed (bool, optional): If True allows mismatch in parameters. Defaults to True.
-          enable (bool): if True, allows file to be saved (used for multi-host saving models).
         """
-        if enable is None:
-            enable = jax.process_index() == 0
-        if enable:
-            save_directory.mkdir(parents=True, exist_ok=True)
+        save_directory.mkdir(parents=True, exist_ok=True)
 
-            config_to_save = deepcopy(self.config)
-            config_to_save.__dict__.pop("attn_dtype", None)
-            config_to_save.__dict__.pop("attn_softmax_dtype", None)
-            config_to_save.architectures = [self.__class__.__name__]
-            config_to_save.save_pretrained(str(save_directory))
+        config_to_save = deepcopy(self.config)
+        config_to_save.__dict__.pop("attn_dtype", None)
+        config_to_save.__dict__.pop("attn_softmax_dtype", None)
+        config_to_save.architectures = [self.__class__.__name__]
+        config_to_save.save_pretrained(str(save_directory))
 
-            if self.can_generate() and hasattr(self, "generation_config"):
-                if self.generation_config is not None:
-                    self.generation_config.save_pretrained(str(save_directory))
+        if self.can_generate() and hasattr(self, "generation_config"):
+            if self.generation_config is not None:
+                self.generation_config.save_pretrained(str(save_directory))
 
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
-        output_model_file = AsyncCheckpointManager(max_workers=1, enable=enable).save(
+        output_model_file = AsyncCheckpointManager(max_workers=1).save(
             tree=state.to_pure_dict(),
             path=str(save_directory),
             mesh=self.mesh,
@@ -167,11 +160,7 @@ class EasyBridgeMixin(PushToHubMixin):
         push_to_hub: bool = False,
         token: str | bool | None = None,
         gather_fns: dict[tp.Callable] | None = None,
-        float_dtype=None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
-        enable: bool | None = None,
-        shard_size_gb: float | None = 5.00,
+        float_dtype: jnp.dtype | None = None,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -182,14 +171,9 @@ class EasyBridgeMixin(PushToHubMixin):
             token (str or bool, optional): The Hugging Face Hub token.
             gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
             float_dtype (dtype, optional): Data type for saving weights.
-            verbose (bool, optional): Whether to print verbose messages. Defaults to True.
-            mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
-            enable (bool): if True, allows file to be saved (used for multi-host saving models).
             **kwargs: Additional keyword arguments for Hugging Face Hub.
         """
 
-        if enable is None:
-            enable = jax.process_index() == 0
         easy_directory = ePath(save_directory)
         if easy_directory.is_file():
             logger.error(f"Provided path ({easy_directory}) should be a directory, not a file")
@@ -205,13 +189,11 @@ class EasyBridgeMixin(PushToHubMixin):
             save_directory=easy_directory,
             gather_fns=gather_fns,
             float_dtype=float_dtype,
-            enable=enable,
         )
         readme_path = easy_directory / "README.md"
-        if not readme_path.exists() and enable:
-            readme_path.write_text(self._model_card(repo_id, repo_id))
+        readme_path.write_text(self._model_card(repo_id, repo_id))
 
-        if push_to_hub and enable:
+        if push_to_hub and jax.process_index() == 0:
             self._upload_modified_files(
                 str(easy_directory),
                 repo_id,
