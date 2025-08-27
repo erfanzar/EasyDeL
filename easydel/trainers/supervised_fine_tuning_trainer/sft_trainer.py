@@ -16,10 +16,11 @@ from __future__ import annotations
 import typing as tp
 import warnings
 
+from eformer.loggings import get_logger
+
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
 from ..utils import DataCollatorForCompletionOnlyLM, create_constant_length_dataset, get_formatting_func_from_dataset

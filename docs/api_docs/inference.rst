@@ -5,6 +5,7 @@ Inference
    :maxdepth: 2
 
    inference___init__
+   inference_decoders
    inference_esurge
    inference_evals
    inference_inference_engine_interface

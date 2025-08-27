@@ -26,15 +26,15 @@ import jax
 import jax.extend
 import jax.tree_util
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
+from eformer.paths import ePath, ePathLike
+from eformer.serialization import AsyncCheckpointManager
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.utils import EasyPath, EasyPathLike
-from easydel.utils.checkpoint_managers import CheckpointManager
-from easydel.utils.helpers import get_logger
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
@@ -55,6 +55,7 @@ FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
 SAFE_WEIGHTS_NAME = "model.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 ED_SAFE_WEIGHTS_INDEX_NAME = "easydel-model.parameters.safetensors.index.json"
+TENSORSTORE_INDEX_NAME = "tensorstore_index.json"
 CONFIG_NAME = "config.json"
 FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
 IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
@@ -63,7 +64,13 @@ CHAT_TEMPLATE_NAME = "chat_template.json"
 GENERATION_CONFIG_NAME = "generation_config.json"
 MODEL_CARD_NAME = "modelcard.json"
 
-CANDIDATE_FILENAMES = [SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, ED_SAFE_WEIGHTS_INDEX_NAME, FLAX_WEIGHTS_NAME]
+CANDIDATE_FILENAMES = [
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    ED_SAFE_WEIGHTS_INDEX_NAME,
+    FLAX_WEIGHTS_NAME,
+    TENSORSTORE_INDEX_NAME,
+]
 
 
 class EasyBridgeMixin(PushToHubMixin):
@@ -111,18 +118,15 @@ class EasyBridgeMixin(PushToHubMixin):
 
     def _save_model_files(
         self,
-        save_directory: EasyPathLike,
+        save_directory: ePathLike,
         gather_fns: dict[tp.Callable] | None = None,
         float_dtype=None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
         enable: bool | None = None,
-        shard_size_gb: float | None = None,
     ):
         """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
         Args:
-          save_directory (EasyPath): The directory where the model files will be saved.
+          save_directory (ePath): The directory where the model files will be saved.
           gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
           float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
           verbose (bool, optional): Whether to print verbose messages. Defaults to True.
@@ -144,21 +148,16 @@ class EasyBridgeMixin(PushToHubMixin):
                 if self.generation_config is not None:
                     self.generation_config.save_pretrained(str(save_directory))
 
-        output_model_file = save_directory / FLAX_WEIGHTS_NAME
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
-        with self.mesh:
-            output_model_file = CheckpointManager.save_checkpoint(
-                state=state.to_pure_dict(),
-                path=str(output_model_file),
-                gather_fns=gather_fns,
-                mismatch_allowed=mismatch_allowed,
-                float_dtype=float_dtype,
-                verbose=verbose,
-                enable=enable,
-                shard_size_gb=shard_size_gb,
-            )
+        output_model_file = AsyncCheckpointManager(max_workers=1, enable=enable).save(
+            tree=state.to_pure_dict(),
+            path=str(save_directory),
+            mesh=self.mesh,
+            float_dtype=float_dtype,
+            prefix="model",
+        )
 
         logger.info(f"Model weights saved in {output_model_file}")
 
@@ -191,7 +190,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         if enable is None:
             enable = jax.process_index() == 0
-        easy_directory = EasyPath(save_directory)
+        easy_directory = ePath(save_directory)
         if easy_directory.is_file():
             logger.error(f"Provided path ({easy_directory}) should be a directory, not a file")
             return
@@ -206,10 +205,7 @@ class EasyBridgeMixin(PushToHubMixin):
             save_directory=easy_directory,
             gather_fns=gather_fns,
             float_dtype=float_dtype,
-            verbose=verbose,
-            mismatch_allowed=mismatch_allowed,
             enable=enable,
-            shard_size_gb=shard_size_gb,
         )
         readme_path = easy_directory / "README.md"
         if not readme_path.exists() and enable:
@@ -259,7 +255,7 @@ class EasyBridgeMixin(PushToHubMixin):
         Returns:
             str: The URL of the created repository.
         """
-        working_dir = EasyPath(repo_id.split("/")[-1])
+        working_dir = ePath(repo_id.split("/")[-1])
 
         repo_id = self._create_repo(
             repo_id,
@@ -312,8 +308,6 @@ class EasyBridgeMixin(PushToHubMixin):
         model: EasyDeLBaseModule,
         param_dtype: jnp.dtype,
         mesh: jax.sharding.Mesh,
-        mismatch_allowed: bool,
-        verbose: bool,
         shard_fns: dict[tp.Callable] | None,
         quantization_method: EasyDeLQuantizationMethods | None,
         quantization_platform: EasyDeLQuantizationMethods | None,
@@ -334,8 +328,6 @@ class EasyBridgeMixin(PushToHubMixin):
         Returns:
             an easydel, with loaded parameter.
         """
-        callback = None
-        passed_shard_fns = None
         if quantize_tensors:
             from easydel.layers.quantization.quantizers import EasyQuantizer
 
@@ -345,7 +337,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 quantization_pattern=quantization_pattern,
                 block_size=quantization_block_size,
             )
-            passed_shard_fns = shard_fns
             if quantize_tensors:
 
                 def callback(x, p):
@@ -358,16 +349,20 @@ class EasyBridgeMixin(PushToHubMixin):
                             x = callable_fn(x)
                     return quantizer(x, p)
 
+        extraargs = {}
         if resolved_archive_file:
-            with mesh:
-                state, _ = CheckpointManager.load_checkpoint(
-                    path=resolved_archive_file,
-                    mismatch_allowed=mismatch_allowed,
-                    verbose=verbose,
-                    shard_fns=passed_shard_fns,
-                    callback=callback,
-                    dtype=param_dtype,
-                )
+            if str(resolved_archive_file).endswith(TENSORSTORE_INDEX_NAME):
+                resolved_archive_file = str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
+            else:
+                extraargs["callback"] = callback
+            state, _ = AsyncCheckpointManager(max_workers=1).load(
+                path=ePath(resolved_archive_file),
+                mesh=mesh,
+                dtype=param_dtype,
+                partition_rules=model.config.get_partition_rules(),
+                prefix="model",
+                **extraargs,
+            )
             params = state.get("params", None)
             if params is not None:
                 state = params
@@ -535,9 +530,9 @@ class EasyBridgeMixin(PushToHubMixin):
         if pretrained_model_name_or_path:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
-            is_local = EasyPath(pretrained_model_name_or_path).is_dir()
+            is_local = ePath(pretrained_model_name_or_path).is_dir()
 
-            def _pick_first_existing(dir_path: EasyPath) -> tuple[EasyPath | None, str | None]:  # type:ignore
+            def _pick_first_existing(dir_path: ePath) -> tuple[ePath | None, str | None]:  # type:ignore
                 for cand in CANDIDATE_FILENAMES:
                     p = dir_path / cand
                     if p.is_file():
@@ -546,7 +541,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
             if is_local:
                 # Local directory: look for index -> safetensors -> msgpack
-                root = EasyPath(pretrained_model_name_or_path) / subfolder
+                root = ePath(pretrained_model_name_or_path) / subfolder
                 archive_file, picked_name = _pick_first_existing(root)
                 if not archive_file:
                     raise FileNotFoundError(
@@ -555,7 +550,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 is_local = True
             else:
                 # Sometimes the path is nested under subfolder
-                alt_root = EasyPath(subfolder) / pretrained_model_name_or_path
+                alt_root = ePath(subfolder) / pretrained_model_name_or_path
                 if alt_root.is_dir():
                     archive_file, picked_name = _pick_first_existing(alt_root)
                     if archive_file:
@@ -633,8 +628,6 @@ class EasyBridgeMixin(PushToHubMixin):
             model,
             param_dtype,
             model.mesh,
-            mismatch_allowed,
-            verbose,
             shard_fns,
             quantization_method,
             quantization_platform,

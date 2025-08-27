@@ -28,7 +28,6 @@ from easydel.layers.caching import PagesCacheView, PagesMetadata
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
 USE_SHARDMAP = True
-FORCE_XLA_USE = False
 
 
 @AttentionRegistry.register
@@ -128,15 +127,17 @@ class RaggedPageAttn(AttentionImpl):
         """
         GPU forward pass.
         """
-        if FORCE_XLA_USE:
-            return self.forward_native(q, k, v, cache_view, cache_metadata, **ignore)
         kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         num_seqs = cache_metadata.num_seqs.reshape(-1)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
         output = jax.shard_map(
-            partial(triton_ragged_paged_attention, softmax_scale=self.metadata.softmax_scale),
+            partial(
+                triton_ragged_paged_attention,
+                softmax_scale=self.metadata.softmax_scale,
+                kv_pages_per_block=32,
+            ),
             in_specs=(
                 qaxes,
                 resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),

@@ -21,6 +21,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
+from jaxtyping import Array, Float
 
 from easydel.utils.compiling_utils import ejit
 
@@ -145,7 +146,7 @@ def _yarn_get_mscale(scale: float = 1) -> float:
 
 
 @jax.named_scope("easydel-rotary-rotate-neox")
-def _rotate_neox(x: jnp.ndarray) -> jnp.ndarray:
+def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:
     """
     Applies the Neox-style rotation to the input array.
 
@@ -164,7 +165,7 @@ def _rotate_neox(x: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.named_scope("easydel-rotary-rotate-gptj")
-def _rotate_gptj(x: jnp.ndarray) -> jnp.ndarray:
+def _rotate_gptj(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:
     """
     Applies the GPT-J-style rotation to the input array.
 

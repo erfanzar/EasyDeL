@@ -29,7 +29,9 @@ import jax.experimental
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
+from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
+from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
 from jax.sharding import PartitionSpec
 
@@ -42,9 +44,7 @@ from easydel.infra.etils import (
     EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
-from easydel.utils import EasyPath, EasyPathLike
 from easydel.utils.compiling_utils import hash_fn
-from easydel.utils.helpers import get_logger
 
 from .metrics import MetricsHistogram, compute_weight_stats
 from .utils import JaxDistributedConfig
@@ -527,19 +527,19 @@ class TrainingArguments:
         }.get(unit.lower())
         return int(value) * unit_to_seconds
 
-    def get_path(self) -> EasyPathLike:
+    def get_path(self) -> ePathLike:
         """
         Returns the path to the checkpoint directory.
 
         Returns:
-            EasyPathLike: The path to the checkpoint directory.
+            ePathLike: The path to the checkpoint directory.
         """
         if self.process_zero_is_admin:
             if self.is_process_zero:
-                return EasyPath(self.save_directory) / self.model_name
+                return ePath(self.save_directory) / self.model_name
             else:
-                return EasyPath("/dev/null")
-        return EasyPath(self.save_directory) / self.model_name
+                return ePath("/dev/null")
+        return ePath(self.save_directory) / self.model_name
 
     def ensure_checkpoint_path(self):
         """
@@ -596,16 +596,12 @@ class TrainingArguments:
         Returns the checkpoint manager, responsible for saving model checkpoints.
 
         Returns:
-            CheckpointManager: The checkpoint manager.
+            AsyncCheckpointManager: The checkpoint manager.
         """
 
-        from easydel.utils.checkpoint_managers import CheckpointManager
+        from eformer.serialization import AsyncCheckpointManager
 
-        return CheckpointManager(
-            checkpoint_dir=self.get_path(),
-            save_optimizer_state=self.save_optimizer_state,
-            verbose=self.verbose,
-        )
+        return AsyncCheckpointManager(max_workers=1)
 
     @functools.cached_property
     def _tensorboard(self):
@@ -854,7 +850,7 @@ class TrainingArguments:
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
-        return json.loads(EasyPath(json_file).read_text())
+        return json.loads(ePath(json_file).read_text())
 
     def to_json_string(self) -> str:
         """
@@ -893,7 +889,7 @@ class TrainingArguments:
             assert cls is not None, "We couldn't clearify the trainer config class from provided json."
         return cls(**config_dict)
 
-    def save_arguments(self, json_file_path: str | os.PathLike | EasyPathLike):
+    def save_arguments(self, json_file_path: str | os.PathLike | ePathLike):
         """
         Save this instance to a JSON file.
 
@@ -901,20 +897,20 @@ class TrainingArguments:
             json_file_path (`str` or `os.PathLike`):
                 Path to the JSON file in which this configuration instance's parameters will be saved.
         """
-        EasyPath(json_file_path).write_text(self.to_json_string())
+        ePath(json_file_path).write_text(self.to_json_string())
 
-    def _get_save_directory(self, create: bool = True) -> EasyPathLike:
+    def _get_save_directory(self, create: bool = True) -> ePathLike:
         if self.process_zero_is_admin and not self.is_process_zero:
             return None
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()
 
-    def _get_save_directory_milestone(self, step, create: bool = True) -> EasyPathLike:
+    def _get_save_directory_milestone(self, step, create: bool = True) -> ePathLike:
         directory_name = f"run-{step}"
         savedir = self._get_save_directory(create=create)
         if savedir is None:
-            return EasyPath("/dev/null")
+            return ePath("/dev/null")
         save_directory = savedir / directory_name
         if create:
             save_directory.mkdir(exist_ok=True, parents=True)

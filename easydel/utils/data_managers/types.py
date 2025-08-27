@@ -18,10 +18,9 @@ import os
 import typing as tp
 from enum import Enum
 
-from eformer.pytree import auto_pytree as dataclass
-from eformer.pytree import field
+from eformer.paths import ePath, ePathLike
+from eformer.pytree import auto_pytree, field
 
-from ..checkpoint_managers import EasyPath, EasyPathLike
 from ..helpers import get_cache_dir
 
 
@@ -61,7 +60,7 @@ class DatasetType(str, Enum):
         return None
 
 
-@dataclass
+@auto_pytree
 class BaseDatasetInform:
     """Base class for dataset information."""
 
@@ -92,7 +91,7 @@ class BaseDatasetInform:
             return self.path
 
 
-@dataclass
+@auto_pytree
 class TextDatasetInform(BaseDatasetInform):
     """Dataset information specific to text datasets."""
 
@@ -101,7 +100,7 @@ class TextDatasetInform(BaseDatasetInform):
     preprocessing_fn: tp.Callable | None = None
 
 
-@dataclass
+@auto_pytree
 class VisualDatasetInform(BaseDatasetInform):
     """Dataset information specific to visual datasets."""
 
@@ -111,12 +110,12 @@ class VisualDatasetInform(BaseDatasetInform):
     preprocessing_fn: tp.Callable | None = None
 
 
-@dataclass
+@auto_pytree
 class DatasetMixture:
     """Configuration for a mixture of datasets."""
 
     informs: list[VisualDatasetInform | TextDatasetInform]
-    cache_dir: str | EasyPathLike = field(default_factory=get_cache_dir)
+    cache_dir: str | ePathLike = field(default_factory=get_cache_dir)
     streaming: bool = True
     text_target_field: str = "text"
     image_target_field: str = "image"
@@ -126,7 +125,7 @@ class DatasetMixture:
 
     def __post_init__(self):
         if isinstance(self.cache_dir, str):
-            self.cache_dir = EasyPath(self.cache_dir)
+            self.cache_dir = ePath(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod

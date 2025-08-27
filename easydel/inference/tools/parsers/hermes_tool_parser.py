@@ -39,7 +39,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 @ToolParserManager.register_module("hermes")
 class HermesToolParser(ToolParser):
     """
-    Tool call parser for Hermes 2 Pro models.
+    Tool call parser for Hermes models.
 
     Handles tool calls wrapped in <tool_call> XML-style tags with JSON content.
     Designed for NousResearch Hermes models and similar architectures that use
@@ -63,8 +63,6 @@ class HermesToolParser(ToolParser):
         tool_call_start_token: Opening delimiter for tool calls
         tool_call_end_token: Closing delimiter for tool calls
         buffered_delta_text: Buffer for multi-token delimiter detection
-
-    Used when --enable-auto-tool-choice --tool-call-parser hermes are set.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):

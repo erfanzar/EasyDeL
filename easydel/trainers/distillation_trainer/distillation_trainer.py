@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import typing as tp
 
+from eformer.loggings import get_logger
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput

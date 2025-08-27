@@ -17,9 +17,8 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import uuid4
 
+from eformer.loggings import get_logger
 from transformers import PreTrainedTokenizerBase
-
-from easydel.utils import get_logger
 
 from ...openai_api_modules import (
     ChatCompletionRequest,

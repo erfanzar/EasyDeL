@@ -21,9 +21,8 @@ import typing as tp
 
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from jax import numpy as jnp
-
-from easydel.utils.helpers import get_logger
 
 from ...sampling_params import JitableSamplingParams
 from ..utils import (

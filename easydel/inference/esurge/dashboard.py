@@ -23,7 +23,7 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from easydel.utils.helpers import get_logger
+from eformer.loggings import get_logger
 
 try:
     import uvicorn

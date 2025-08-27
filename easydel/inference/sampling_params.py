@@ -50,12 +50,11 @@ from typing import Annotated, Any
 
 import jax
 from eformer.escale import with_sharding_constraint
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
-
-from easydel.utils import get_logger
 
 from .logits_process import (
     FrequencyPenaltyLogitsProcessor,

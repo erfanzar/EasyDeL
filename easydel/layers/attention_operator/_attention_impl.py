@@ -23,6 +23,7 @@ import jax
 from eformer import common_types
 from eformer import escale as es
 from eformer.escale import PartitionAxis, PartitionManager
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
@@ -30,7 +31,6 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
-from easydel.utils.helpers import get_logger
 
 from ..ops import BaseOperation
 

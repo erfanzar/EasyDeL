@@ -15,12 +15,12 @@ import typing as tp
 
 import flax
 from eformer.escale import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
+from eformer.loggings import get_logger
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)

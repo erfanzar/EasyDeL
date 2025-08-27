@@ -19,6 +19,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
@@ -35,7 +36,6 @@ from easydel.layers.caching import (
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
-from easydel.utils.helpers import get_logger
 
 from .mistral3_configuration import Mistral3Config
 

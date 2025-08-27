@@ -22,12 +22,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from http import HTTPStatus
 
+from eformer.loggings import get_logger
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
-
-from easydel.utils.helpers import get_logger
 
 from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
 from ...openai_api_modules import (

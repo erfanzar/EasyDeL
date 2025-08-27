@@ -21,11 +21,11 @@ import sys as _sys
 import typing as _tp
 from logging import getLogger as _getlogger
 
+from eformer.loggings import get_logger as _get_logger
 from packaging.version import Version as _version
 
 from .utils import LazyModule as _LazyModule
 from .utils import check_bool_flag as _check_bool_flag
-from .utils import get_logger as _get_logger
 from .utils import is_package_available as _is_package_available
 
 if _check_bool_flag("EASYDEL_AUTO", True):
@@ -46,7 +46,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
-        "--xla_gpu_triton_gemm_any=True  "
+        "--xla_gpu_triton_gemm_any=true  "
         "--xla_gpu_enable_while_loop_double_buffering=true  "
         "--xla_gpu_enable_pipelined_all_gather=true  "
         "--xla_gpu_enable_pipelined_reduce_scatter=true  "
@@ -59,13 +59,13 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_all_reduce_combine_threshold_bytes=33554432 "
         "--xla_gpu_multi_streamed_windowed_einsum=true  "
         "--xla_gpu_enable_latency_hiding_scheduler=true  "
-        "--xla_gpu_enable_command_buffer=  "
         "--xla_gpu_enable_cublaslt=true "
         "--xla_gpu_enable_cudnn_fmha=true "
         "--xla_gpu_force_compilation_parallelism=4 "
         "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
-        "--xla_gpu_graph_level=2 "
+        "--xla_gpu_graph_level=3 "
+        "--xla_gpu_enable_command_buffer=  "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
         _os.getenv("LIBTPU_INIT_ARGS", "") + " "
@@ -103,8 +103,8 @@ _import_structure = {
         "DatasetLoadError",
         "DatasetMixture",
         "DatasetType",
-        "EasyPath",
-        "EasyPathLike",
+        "ePath",
+        "ePathLike",
         "TextDatasetInform",
         "VisualDatasetInform",
     ],
@@ -933,11 +933,11 @@ if _tp.TYPE_CHECKING:
         DatasetLoadError,
         DatasetMixture,
         DatasetType,
-        EasyPath,
-        EasyPathLike,
         TextDatasetInform,
         VisualDatasetInform,
         ejit,
+        ePath,
+        ePathLike,
         traversals,
     )
     from .utils.parameters_transformation import (
@@ -955,7 +955,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.50", "0.0.51"]
+    _targeted_versions = ["0.0.51"]
 
     from eformer import __version__ as _eform_version
 

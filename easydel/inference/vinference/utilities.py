@@ -18,14 +18,15 @@ import typing as tp
 import jax
 import jax.random
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax import random
+from jax import random as jrandom
 from jax.sharding import PartitionSpec
 
 from easydel.utils.compiling_utils import get_safe_hash_int
-from easydel.utils.helpers import get_logger
 
 from ..logits_process import hash_fn
 from ..sampling_params import JitableSamplingParams, SamplingParams
@@ -502,3 +503,34 @@ class vInferenceConfig:
             self.sampling_params = SamplingParams(max_tokens=self.max_new_tokens)
 
     __hash__ = hash_fn
+
+
+class GenerateRNG:
+    """An infinite generator of JAX PRNGKeys, useful for iterating over seeds."""
+
+    def __init__(self, seed: int = 0):
+        """Initializes the generator with a starting seed.
+
+        Args:
+            seed: The seed to use for the initial PRNGKey.
+        """
+        self.seed = seed
+        self._rng = jrandom.PRNGKey(seed)
+
+    def __next__(self) -> jrandom.PRNGKey:
+        """Generates and returns the next PRNGKey in the sequence.
+
+        Returns:
+            The next PRNGKey derived from the internal state.
+        """
+        self._rng, key = jrandom.split(self._rng)
+        return key
+
+    @property
+    def rng(self) -> jrandom.PRNGKey:
+        """Provides access to the next PRNGKey without advancing the generator.
+
+        Returns:
+            The next PRNGKey in the sequence.
+        """
+        return next(self)

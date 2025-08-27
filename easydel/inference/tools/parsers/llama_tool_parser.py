@@ -20,10 +20,9 @@ from collections.abc import Sequence
 from uuid import uuid4
 
 import partial_json_parser
+from eformer.loggings import get_logger
 from partial_json_parser.core.options import Allow
 from transformers import PreTrainedTokenizerBase
-
-from easydel.utils import get_logger
 
 from ...openai_api_modules import (
     ChatCompletionRequest,

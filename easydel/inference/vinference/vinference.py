@@ -47,11 +47,10 @@ from transformers import ProcessorMixin
 from easydel.utils.compiling_utils import load_compiled_fn, save_compiled_fn, smart_compile
 from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
-from easydel.utils.rngs_utils import GenerateRNG
 
 from ..sampling_params import JitableSamplingParams, SamplingParams
 from .functions import expand_inputs_for_generation, get_compiled_funcs, interval_func, prefill_func, put_compiled_funcs
-from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
+from .utilities import GenerateRNG, SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule

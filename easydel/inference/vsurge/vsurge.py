@@ -21,8 +21,7 @@ import typing as tp
 
 import jax
 from eformer.common_types import NOT_GIVEN, _Empty
-
-from easydel.utils.helpers import get_logger
+from eformer.loggings import get_logger
 
 from ..decoders import SmartBytecodeDecoder
 from ..sampling_params import SamplingParams

@@ -21,9 +21,9 @@ import typing as tp
 from abc import ABC, abstractmethod
 
 import jax
+from eformer.loggings import get_logger
 
 from easydel.infra.etils import EasyDeLBackends
-from easydel.utils.helpers import get_logger
 
 logger = get_logger("EasyDeL-BaseOperation")
 

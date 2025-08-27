@@ -20,11 +20,10 @@ from random import choices
 from string import ascii_letters, digits
 
 import partial_json_parser
+from eformer.loggings import get_logger
 from partial_json_parser.core.options import Allow
 from pydantic import Field
 from transformers import AutoTokenizer as AnyTokenizer
-
-from easydel.utils import get_logger
 
 try:
     from mistral_common.tokens.tokenizers.mistral import MistralTokenizer

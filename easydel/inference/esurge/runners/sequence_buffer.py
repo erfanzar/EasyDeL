@@ -40,12 +40,12 @@ from dataclasses import replace
 from typing import Any, cast
 
 import jax
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 
 from easydel.inference.esurge.request import EngineRequest
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 
 from ...sampling_params import SamplingParams, SamplingType
 from ..outputs import LogprobsTensors, swap_dict_values

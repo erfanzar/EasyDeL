@@ -14,11 +14,11 @@
 
 
 from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

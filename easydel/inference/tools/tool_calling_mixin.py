@@ -16,9 +16,8 @@ from __future__ import annotations
 import typing as tp
 from http import HTTPStatus
 
+from eformer.loggings import get_logger
 from fastapi.responses import JSONResponse
-
-from easydel.utils.helpers import get_logger
 
 from ..openai_api_modules import ChatCompletionRequest, ChatMessage, DeltaMessage
 from . import ToolParser, ToolParserManager

@@ -14,11 +14,11 @@
 import os
 from dataclasses import dataclass, field
 
+from eformer.loggings import get_logger
+from eformer.paths import ePath
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from easydel import __version__
-from easydel.utils.checkpoint_managers.path_utils import EasyPath
-from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
@@ -416,7 +416,7 @@ class ReadmeGenerator:
             content = template.render(model=model_info).replace("\n\n\n", "\n").strip() + "\n"
 
             if output_path:
-                output_path = EasyPath(output_path)
+                output_path = ePath(output_path)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text(content)
                 logger.info(f"README saved to {output_path}")

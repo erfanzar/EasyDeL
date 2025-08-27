@@ -39,12 +39,11 @@ from enum import Enum
 from http import HTTPStatus
 
 import uvicorn
+from eformer.loggings import get_logger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-
-from easydel.utils.helpers import get_logger
 
 from .openai_api_modules import (
     ChatCompletionRequest,

@@ -17,9 +17,8 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
+from eformer.loggings import get_logger
 from transformers import AutoTokenizer as AnyTokenizer
-
-from easydel.utils import get_logger
 
 from ...openai_api_modules import (
     ChatCompletionRequest,

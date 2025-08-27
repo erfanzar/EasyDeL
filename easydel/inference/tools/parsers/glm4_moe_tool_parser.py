@@ -20,9 +20,8 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
+from eformer.loggings import get_logger
 from transformers import AutoTokenizer as AnyTokenizer
-
-from easydel.utils import get_logger
 
 from ...openai_api_modules import (
     ChatCompletionRequest,
