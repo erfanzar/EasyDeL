@@ -43,50 +43,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image (CPU)
+      - name: Build and push Ray Docker image (CPU)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }} # Push only on push events
+          file: ./Dockerfile.ray
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}
-            ghcr.io/dvruette/easydel:latest
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-ray-cpu
+            ghcr.io/dvruette/easydel:latest-ray-cpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-ray-cpu
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=cpu
+            RAY_IMAGE=rayproject/ray:2.36.0-py311
 
-      - name: Build and push Docker image (GPU)
+      - name: Build and push Ray Docker image (GPU)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.ray
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-gpu
-            ghcr.io/dvruette/easydel:latest-gpu
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-gpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-ray-gpu
+            ghcr.io/dvruette/easydel:latest-ray-gpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-ray-gpu
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=gpu
+            RAY_IMAGE=rayproject/ray:2.36.0-py311-gpu
 
-      - name: Build and push Docker image (TPU)
+      - name: Build and push Ray Docker image (TPU)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.ray
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-tpu
-            ghcr.io/dvruette/easydel:latest-tpu
-            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-tpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.version }}-ray-tpu
+            ghcr.io/dvruette/easydel:latest-ray-tpu
+            ghcr.io/dvruette/easydel:${{ steps.meta.outputs.date }}-ray-tpu
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=tpu
+            RAY_IMAGE=rayproject/ray:2.36.0-py311
