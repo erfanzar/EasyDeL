@@ -23,12 +23,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental.shard_map import shard_map
 
-from .._attention_impl import (
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionOutput,
-    AttentionRegistry,
-)
+from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
 
 @AttentionRegistry.register

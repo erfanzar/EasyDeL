@@ -74,11 +74,7 @@ from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import (
-    AVAILABLE_SPARSE_MODULE_TYPES,
-    EasyDeLGradientCheckPointers,
-    EasyDeLQuantizationMethods,
-)
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
 
 warnings.filterwarnings(
     "ignore",
@@ -374,11 +370,7 @@ def apply_lora_to_layers(
     Returns:
         The modified model with LoRA applied to the specified layers.
     """
-    from easydel.utils.traversals import (
-        get_module_from_path,
-        iter_module_search,
-        set_module_from_path,
-    )
+    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
     if not (lora_rank > 0):
         raise ValueError("lora_rank should be a positive value and higher than `0`.")
@@ -471,11 +463,7 @@ def unwrap_lora_to_layers(
     """
     UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model.
     """
-    from easydel.utils.traversals import (
-        get_module_from_path,
-        iter_module_search,
-        set_module_from_path,
-    )
+    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
     with tqdm(
         total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),

@@ -23,18 +23,8 @@ import triton.language as tl
 from eformer.callib import triton_call
 from triton import Config
 
-from .._utils import (
-    dtype_index,
-    get_sharding,
-    get_strides,
-    safe_autotune,
-)
-from ._utils import (
-    attention_pack_with_static_shape,
-    attention_unpack_with_static_shape,
-    calc_bias_strides,
-    padded_load,
-)
+from .._utils import dtype_index, get_sharding, get_strides, safe_autotune
+from ._utils import attention_pack_with_static_shape, attention_unpack_with_static_shape, calc_bias_strides, padded_load
 
 BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
 LN2: tl.constexpr = 1.44269504089
@@ -487,12 +477,12 @@ def _fwd_attention_kernel_call(
     _, KSeq, nheads_kv, _ = k.shape
     expected_kv_shape = (batch, KSeq, nheads_kv, head_dim)
 
-    assert k.shape == expected_kv_shape, (
-        f"key shape is {k.shape = } and we excepted it to be like {expected_kv_shape = }"
-    )
-    assert v.shape == expected_kv_shape, (
-        f"value shape is {v.shape = } and we excepted it to be like {expected_kv_shape = }"
-    )
+    assert (
+        k.shape == expected_kv_shape
+    ), f"key shape is {k.shape = } and we excepted it to be like {expected_kv_shape = }"
+    assert (
+        v.shape == expected_kv_shape
+    ), f"value shape is {v.shape = } and we excepted it to be like {expected_kv_shape = }"
 
     assert nheads_q % nheads_kv == 0, f"{nheads_q = } is not divisible by {nheads_kv =}"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"

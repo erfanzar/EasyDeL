@@ -17,24 +17,24 @@ dpo_config = DPOConfig(
     # Model and training basics
     model_name="DPOTrainer",  # Name of the model
     learning_rate=1e-6,       # Learning rate for optimization
-    
+
     # Beta parameter controls how strongly to optimize preferences
     beta=0.1,                 # Temperature parameter for deviation from reference model
-    
+
     # Loss function options
     loss_type="sigmoid",      # Loss type (sigmoid, hinge, ipo, etc.)
     label_smoothing=0.0,      # Smoothing factor for labels
-    
+
     # Sequence length parameters
     max_length=512,           # Maximum total sequence length
     max_prompt_length=256,    # Maximum length for prompts
     max_completion_length=256,# Maximum length for completions
-    
+
     # Reference model control
     reference_free=False,     # Whether to use reference-free variant
     sync_ref_model=False,     # Periodically sync reference model
     ref_model_sync_steps=64,  # Steps between reference model syncs
-    
+
     # Training optimization
     disable_dropout=True,     # Disable dropout during training
     total_batch_size=16,      # Total batch size

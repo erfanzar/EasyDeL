@@ -17,23 +17,23 @@ orpo_config = ORPOConfig(
     # Model and training basics
     model_name="ORPOTrainer",    # Name of the model
     learning_rate=1e-6,          # Learning rate for optimization
-    
+
     # Sequence parameters
     max_length=1024,             # Maximum total sequence length
     max_prompt_length=512,       # Maximum length for prompts
     max_completion_length=512,   # Maximum length for completions
-    
+
     # ORPO specific parameters
     beta=0.1,                    # Controls deviation from reference policy
-    
+
     # Training parameters
     disable_dropout=True,        # Disable dropout during training
     generate_during_eval=False,  # Whether to generate during evaluation
-    
+
     # Tokenizer settings
     label_pad_token_id=-100,     # Padding token for labels
     padding_value=None,          # Optional custom padding value
-    
+
     # Dataset processing
     dataset_num_proc=None,       # Number of processes for dataset processing
 )
@@ -57,7 +57,7 @@ if tokenizer.pad_token_id is None:
 
 # Load dataset with preference pairs
 dataset = load_dataset(
-    "trl-lib/ultrafeedback_binarized", 
+    "trl-lib/ultrafeedback_binarized",
     split="train[:5%]"  # Using a small subset for demonstration
 )
 
@@ -162,7 +162,7 @@ You can provide a separate evaluation dataset to monitor performance during trai
 ```python
 # Load evaluation dataset
 eval_dataset = load_dataset(
-    "trl-lib/ultrafeedback_binarized", 
+    "trl-lib/ultrafeedback_binarized",
     split="test[:10%]"
 )
 

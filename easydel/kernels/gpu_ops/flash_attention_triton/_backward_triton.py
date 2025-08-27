@@ -23,18 +23,8 @@ from eformer.callib import triton_call
 from jax import numpy as jnp
 from triton import Config
 
-from .._utils import (
-    dtype_index,
-    get_sharding,
-    get_strides,
-    safe_autotune,
-)
-from ._utils import (
-    attention_pack_with_static_shape,
-    attention_unpack_with_static_shape,
-    calc_bias_strides,
-    padded_load,
-)
+from .._utils import dtype_index, get_sharding, get_strides, safe_autotune
+from ._utils import attention_pack_with_static_shape, attention_unpack_with_static_shape, calc_bias_strides, padded_load
 
 BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
 LN2: tl.constexpr = 1.44269504089

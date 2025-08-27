@@ -234,9 +234,9 @@ class FullAttentionManager(SingleTypeCacheManager):
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
     ) -> tuple[list[CachePage], ...]:
-        assert isinstance(kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec), (
-            "FullAttentionManager can only be used for full attention and chunked local attention groups"
-        )
+        assert isinstance(
+            kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec
+        ), "FullAttentionManager can only be used for full attention and chunked local attention groups"
         computed_pages: tuple[list[CachePage], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))
         max_num_pages = max_length // kv_cache_spec.page_size
         for _, page_hash in zip(range(max_num_pages), page_hashes, strict=False):
@@ -280,9 +280,9 @@ class SlidingWindowManager(SingleTypeCacheManager):
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
     ) -> tuple[list[CachePage], ...]:
-        assert isinstance(kv_cache_spec, SlidingWindowSpec), (
-            "SlidingWindowManager can only be used for sliding window groups"
-        )
+        assert isinstance(
+            kv_cache_spec, SlidingWindowSpec
+        ), "SlidingWindowManager can only be used for sliding window groups"
 
         sliding_window_contiguous_pages = cdiv(kv_cache_spec.sliding_window - 1, kv_cache_spec.page_size)
         if use_eagle:

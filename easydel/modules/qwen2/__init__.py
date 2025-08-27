@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_qwen import (
-    Qwen2ForCausalLM,
-    Qwen2ForSequenceClassification,
-    Qwen2Model,
-)
+from .modeling_qwen import Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
 from .qwen_configuration import Qwen2Config
 
 __all__ = (

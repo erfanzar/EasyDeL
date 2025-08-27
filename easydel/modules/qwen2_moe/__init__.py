@@ -13,11 +13,7 @@
 # limitations under the License.
 
 from .configuration_qwen2_moe import Qwen2MoeConfig
-from .modeling_qwen2_moe import (
-    Qwen2MoeForCausalLM,
-    Qwen2MoeForSequenceClassification,
-    Qwen2MoeModel,
-)
+from .modeling_qwen2_moe import Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
 
 __all__ = (
     "Qwen2MoeConfig",

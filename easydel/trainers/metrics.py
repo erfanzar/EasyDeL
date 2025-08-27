@@ -22,12 +22,7 @@ from collections import defaultdict
 import jax
 import numpy as np
 from eformer.pytree import auto_pytree
-from rich.progress import (
-    Progress,
-    ProgressColumn,
-    Task,
-    TaskID,
-)
+from rich.progress import Progress, ProgressColumn, Task, TaskID
 from rich.text import Text
 from tqdm.autonotebook import tqdm
 

@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .auto_configuration import (
-    AutoEasyDeLConfig,
-    AutoShardAndGatherFunctions,
-    get_modules_by_type,
-)
+from .auto_configuration import AutoEasyDeLConfig, AutoShardAndGatherFunctions, get_modules_by_type
 from .auto_modeling import (
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,

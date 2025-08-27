@@ -121,7 +121,7 @@ For interactive applications, you can enable streaming to get tokens as they're 
                     "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg"
                 },
                 {
-                    "type": "text", 
+                    "type": "text",
                     "text": "Describe this image in detail."
                 }
             ]
@@ -159,7 +159,7 @@ gemma_inference = ed.vInference(
 ed.vInferenceApiServer(
     {
         "llava": llava_inference,
-        "gemma3": gemma_inference 
+        "gemma3": gemma_inference
     },  # Dictionary mapping model names to inference engines
     max_workers=4
 ).fire(
@@ -348,7 +348,7 @@ async function queryMultimodalModel() {
     // Convert the image to base64
     const imageFile = document.getElementById('imageInput').files[0];
     const base64Image = await convertToBase64(imageFile);
-  
+
     // Prepare the API request
     const response = await fetch('http://localhost:8000/v1/chat/completions', {
         method: 'POST',
@@ -377,7 +377,7 @@ async function queryMultimodalModel() {
             max_tokens: 300
         })
     });
-  
+
     const result = await response.json();
     document.getElementById('result').textContent = result.choices[0].message.content;
 }

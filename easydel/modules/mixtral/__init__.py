@@ -13,11 +13,7 @@
 # limitations under the License.
 
 from .mixtral_configuration import MixtralConfig
-from .modeling_mixtral import (
-    MixtralForCausalLM,
-    MixtralForSequenceClassification,
-    MixtralModel,
-)
+from .modeling_mixtral import MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
 
 __all__ = (
     "MixtralConfig",

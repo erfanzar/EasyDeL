@@ -269,22 +269,22 @@ class HybridCacheCoordinator(CacheCoordinator):
                 if full_attention_type_id is None:
                     full_attention_type_id = g.kv_cache_spec.type_id
                 else:
-                    assert full_attention_type_id == g.kv_cache_spec.type_id, (
-                        "HybridCacheCoordinator assumes exactly one type of full attention groups now."
-                    )
+                    assert (
+                        full_attention_type_id == g.kv_cache_spec.type_id
+                    ), "HybridCacheCoordinator assumes exactly one type of full attention groups now."
                 self.full_attention_group_ids.append(i)
             else:
                 if other_type_id is None:
                     other_type_id = g.kv_cache_spec.type_id
                 else:
-                    assert other_type_id == g.kv_cache_spec.type_id, (
-                        "HybridCacheCoordinator assumes exactly one other type of groups now."
-                    )
+                    assert (
+                        other_type_id == g.kv_cache_spec.type_id
+                    ), "HybridCacheCoordinator assumes exactly one other type of groups now."
                 self.other_group_ids.append(i)
 
-        assert full_attention_type_id is not None, (
-            "HybridCacheCoordinator assumes exactly one type of full attention groups now."
-        )
+        assert (
+            full_attention_type_id is not None
+        ), "HybridCacheCoordinator assumes exactly one type of full attention groups now."
         assert other_type_id is not None, "HybridCacheCoordinator assumes exactly one type of other groups now."
 
         self.full_attention_manager_cls = FullAttentionManager
@@ -298,9 +298,9 @@ class HybridCacheCoordinator(CacheCoordinator):
 
         if self.enable_caching:
             divisible = self.other_page_size % self.full_attention_page_size
-            assert divisible == 0, (
-                "CacheCoordinator assumes the page_size of full attention layers is divisible by other layers now."
-            )
+            assert (
+                divisible == 0
+            ), "CacheCoordinator assumes the page_size of full attention layers is divisible by other layers now."
 
         if max(self.full_attention_group_ids) < min(self.other_group_ids):
             self.full_attn_first = True

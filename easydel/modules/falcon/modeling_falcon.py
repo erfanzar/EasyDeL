@@ -190,9 +190,9 @@ class FalconAttention(AttentionModule):
             key_states = jnp.broadcast_to(key_states, query_states.shape)
             value_states = jnp.broadcast_to(value_states, query_states.shape)
 
-            query_states, key_states, value_states = [
+            query_states, key_states, value_states = (
                 x.reshape((*x.shape[:-2], x.shape[-2] * x.shape[-1])) for x in (query_states, key_states, value_states)
-            ]
+            )
 
             return query_states, key_states, value_states
         if self.config.multi_query:

@@ -319,7 +319,7 @@ Request Management
 
     # Generate with request ID tracking
     request_id = "custom-request-123"
-    
+
     try:
         outputs = engine.generate(
             "Tell me about space exploration",
@@ -360,7 +360,7 @@ Chat Application
                 esurge_name="chatbot",
             )
             self.conversation = []
-            
+
         def format_prompt(self, messages):
             """Format conversation for model."""
             prompt = ""
@@ -369,17 +369,17 @@ Chat Application
                 prompt += f"{role}: {msg['content']}\n"
             prompt += "Assistant: "
             return prompt
-        
+
         def chat(self, user_input):
             """Process user input and return response."""
             self.conversation.append({"role": "user", "content": user_input})
-            
+
             prompt = self.format_prompt(self.conversation)
-            
+
             # Stream response
             response_text = ""
             print("Assistant: ", end="", flush=True)
-            
+
             for output in self.engine.stream(
                 prompt,
                 sampling_params=ed.SamplingParams(
@@ -391,11 +391,11 @@ Chat Application
                 if output.delta_text:
                     print(output.delta_text, end="", flush=True)
                     response_text += output.delta_text
-            
+
             print()  # New line after response
             self.conversation.append({"role": "assistant", "content": response_text})
             return response_text
-        
+
         def reset(self):
             """Reset conversation history."""
             self.conversation = []
@@ -403,19 +403,19 @@ Chat Application
     # Use the chatbot
     if __name__ == "__main__":
         bot = ChatBot()
-        
+
         print("ChatBot initialized. Type 'quit' to exit, 'reset' to clear history.")
-        
+
         while True:
             user_input = input("\nYou: ")
-            
+
             if user_input.lower() == 'quit':
                 break
             elif user_input.lower() == 'reset':
                 bot.reset()
                 print("Conversation reset.")
                 continue
-                
+
             bot.chat(user_input)
 
 Best Practices
@@ -457,7 +457,7 @@ Best Practices
 
        def stream_with_progress(prompt, max_tokens=200):
            pbar = tqdm(total=max_tokens, desc="Generating")
-           
+
            for output in engine.stream(
                prompt,
                sampling_params=ed.SamplingParams(max_tokens=max_tokens)
@@ -465,10 +465,10 @@ Best Practices
                new_tokens = output.num_generated_tokens - pbar.n
                if new_tokens > 0:
                    pbar.update(new_tokens)
-               
+
                if output.finished:
                    break
-           
+
            pbar.close()
            return output.outputs[0].text
 

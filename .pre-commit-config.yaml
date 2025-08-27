@@ -1,0 +1,100 @@
+# Pre-commit hooks for EasyDeL
+# Install with: pip install pre-commit && pre-commit install
+
+repos:
+  # General fixes
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # Python code formatting with ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      # Run the linter
+      - id: ruff
+        args: ["--fix", "--config", "pyproject.toml"]
+      # Run the formatter
+      - id: ruff-format
+        args: ["--config", "pyproject.toml"]
+
+  # Type checking with mypy (optional, can be slow)
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.8.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: [types-all]
+  #       args: ['--ignore-missing-imports']
+
+  # Security checks (commented due to dependency issues)
+  # - repo: https://github.com/PyCQA/bandit
+  #   rev: 1.7.5
+  #   hooks:
+  #     - id: bandit
+  #       args: ['-ll', '--skip', 'B101,B601']
+  #       exclude: ^tests/
+
+  # Dockerfile linting (requires Docker permissions)
+  # - repo: https://github.com/hadolint/hadolint
+  #   rev: v2.12.0
+  #   hooks:
+  #     - id: hadolint-docker
+  #       args: ['--ignore', 'DL3008', '--ignore', 'DL3009']
+
+  # YAML formatting
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        types_or: [yaml, json]
+        exclude: ^docs/
+
+  # Python imports sorting
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black", "--line-length", "121"]
+
+  # Python docstring formatting
+  # - repo: https://github.com/PyCQA/docformatter
+  #   rev: v1.5.1
+  #   hooks:
+  #     - id: docformatter
+  #       args: ['--in-place', '--wrap-summaries=121', '--wrap-descriptions=121']
+
+  # Check for common security issues (commented out due to repo issues)
+  # - repo: https://github.com/pre-commit/mirrors-safety
+  #   rev: v3.0.1
+  #   hooks:
+  #     - id: safety
+  #       args: ['--json', '--ignore=70612']  # Ignore specific vulnerabilities if needed
+
+  # Local hooks
+  - repo: local
+    hooks:
+      - id: no-commit-to-main
+        name: Don't commit to main branch
+        entry: bash -c 'if [[ $(git symbolic-ref --short HEAD) == "main" ]]; then echo "Direct commits to main branch are not allowed."; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: check-easydel-imports
+        name: Check EasyDeL imports
+        entry: python -c "import sys; sys.exit(0)" # Placeholder - can add actual import checks
+        language: python
+        types: [python]
+        pass_filenames: false

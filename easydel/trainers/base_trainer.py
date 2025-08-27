@@ -43,11 +43,7 @@ from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.etils import (
-    EasyDeLBackends,
-    EasyDeLPlatforms,
-    EasyDeLQuantizationMethods,
-)
+from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
@@ -1321,13 +1317,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if hasattr(self, "_hidden_rich_pbar"):
                 progress = self._hidden_rich_pbar
             else:
-                from rich.progress import (
-                    BarColumn,
-                    Progress,
-                    SpinnerColumn,
-                    TextColumn,
-                    TimeRemainingColumn,
-                )
+                from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
                 from .trainer_protocol import MetricsColumn
 

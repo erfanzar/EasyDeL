@@ -24,15 +24,8 @@ from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-)
-from easydel.layers.caching.mamba2 import (
-    Mamba2Cache,
-    Mamba2CacheMetaData,
-    Mamba2CacheView,
-)
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers.caching.mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 
@@ -502,9 +495,9 @@ class Mamba2Mixer(nn.Module):
                 A = A.astype(hidden_states.dtype) * dt
 
                 # Rearrange into blocks/chunks
-                hidden_states, A, B, C = [
+                hidden_states, A, B, C = (
                     reshape_into_chunks(t, pad_size, self.chunk_size) for t in (hidden_states, A, B, C)
-                ]
+                )
 
                 # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
                 A = jnp.transpose(A, axes=(0, 3, 1, 2))
