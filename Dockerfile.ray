@@ -50,6 +50,16 @@ RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cl
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# Add /usr/lib/x86_64-linux-gnu/ to LD_LIBRARY_PATH so that bash prefers the systems
+# libtinfo.so over the conda-provided version. Using the conda-provided libtinfo.so
+# outputs a noisy warning because it doesn't include version information.
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu/
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/ray/.venv/lib
+
+COPY docker/marin/preemptible-fix.patch .
+# apply the patch to fix preemptible GCP in Ray in the installed ray package
+RUN patch -d /home/ray/.venv/lib/python3.11/site-packages/ -p2 < preemptible-fix.patch
+
 ARG VERSION
 ENV VERSION=$VERSION \
     HARDWARE_TYPE=$HARDWARE_TYPE
