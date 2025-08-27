@@ -18,6 +18,7 @@ import typing as tp
 import warnings
 
 import jax
+from eformer.loggings import get_logger
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -26,7 +27,6 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.prompt_utils import maybe_apply_chat_template
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 
 from ..trainer import Trainer
 from ..utils import RewardDataCollatorWithPaddingGrain, RewardDataCollatorWithPaddingTFDS

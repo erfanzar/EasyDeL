@@ -65,9 +65,8 @@ from dataclasses import replace
 
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from jax import numpy as jnp
-
-from easydel.utils import get_logger
 
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput

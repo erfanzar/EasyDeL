@@ -16,6 +16,7 @@ import json
 import typing as tp
 
 import jax
+from eformer.aparser import DataClassArgumentParser
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from lm_eval import evaluator
@@ -126,7 +127,7 @@ def main():
     9. Prints a summary of the evaluation results.
     10. Ensures the vSurge engine is stopped upon completion or error.
     """
-    parser = ed.utils.DataClassArgumentParser(EvaluationConfig)
+    parser = DataClassArgumentParser(EvaluationConfig)
     eval_config = parser.parse_args_into_dataclasses()[0]
     print(eval_config)
     print(f"Creating vSurgeLMEvalAdapter adapter for {eval_config.model}")

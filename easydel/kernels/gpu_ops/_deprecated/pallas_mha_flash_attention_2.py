@@ -19,10 +19,8 @@ from functools import partial
 import chex
 import jax
 import jax.extend
-from flax.nnx import dot_product_attention as _dot_product_attention
 from jax import custom_vjp
 from jax import numpy as jnp
-from jax import random as jrand
 from jax.experimental import pallas as pl
 
 
@@ -527,85 +525,3 @@ def _flash_attn2(
     raise NotImplementedError(
         f"`_flash_attn2` is not implemented for requested platform {jax.extend.backend.get_backend().platform}"
     )
-
-
-def gpu_fwd_test():
-    from easydel.utils import GenerateRNG
-
-    _rng = GenerateRNG()
-    b, h, qs, s, d = 2, 32, 2048, 2048, 128
-    dtype = jnp.float16
-
-    q = jrand.normal(_rng.rng, shape=(b, qs, h, d), dtype=dtype)
-    k = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
-    v = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
-    b = jnp.where(
-        jrand.randint(_rng.rng, shape=(b, 1, qs, s), minval=0, maxval=3) > 1,
-        0,
-        jnp.finfo(dtype).min,
-    )
-
-    excepted_result = _dot_product_attention(
-        query=q,
-        key=k,
-        value=v,
-        bias=b,
-    )
-    result = _flash_attn2(
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        dtype=jnp.float16,
-        qblock=32,
-        kblock=32,
-    )
-    print(f"PRED : {result[-1, -1, -1, :5]}")
-    print(f"ORGN : {excepted_result[-1, -1, -1, :5]}")
-
-    print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
-
-
-def gpu_bwd_test():
-    from easydel.utils import GenerateRNG
-
-    _rng = GenerateRNG()
-    q_key, k_key, v_key = jrand.split(jrand.PRNGKey(8), 3)
-    B, H, S, D = 1, 2, 16, 16
-    blocksize_k = 16
-    blocksize_q = 16
-    q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float32)
-    k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float32)
-    v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float32)
-    b = (
-        jnp.where(
-            jrand.randint(v_key, (B, H, S, S), 0, 4) > 2,
-            jnp.finfo(jnp.float32).min,
-            0,
-        )
-        if False
-        else None
-    )
-    dtype = jnp.float16
-
-    excepted_result = jax.grad(lambda *x: _dot_product_attention(*x).sum())(q, k, v, b)
-    result = jax.grad(
-        lambda *x: _gpu_flash_attn(
-            *x,
-            dtype=dtype,
-            qblock=blocksize_q,
-            kblock=blocksize_k,
-        ).sum()
-    )(q, k, v, b)
-    print(f"PRED BWD : {result[-1, -1, -1, :5]}")
-    print(f"ORGN BWD : {excepted_result[-1, -1, -1, :5]}")
-
-    print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
-
-
-pallas_mha_flash_attention2_gpu = _flash_attn2
-__all__ = ["pallas_mha_flash_attention2_gpu"]
-
-if __name__ == "__main__":
-    gpu_fwd_test()
-    gpu_bwd_test()

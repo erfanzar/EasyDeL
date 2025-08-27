@@ -19,6 +19,7 @@ from functools import partial
 
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -27,7 +28,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 
 from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt

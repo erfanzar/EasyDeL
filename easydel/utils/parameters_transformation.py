@@ -498,22 +498,12 @@ class StateDictConverter:
         model_parameters = flatten_dict(graphtree, sep=".")
 
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
-        from easydel.utils import graph_utils
+        from easydel.utils import traversals
 
-        moe_path = [
-            ".".join(tuple(map(str, pa)))
-            for pa, _ in graph_utils.iter_module_search(
-                module,
-                ParallelMoELinear,
-            )
-        ]
-        moe_block_path = [
-            ".".join(tuple(map(str, pa)))
-            for pa, _ in graph_utils.iter_module_search(
-                module,
-                BaseMoeModule,
-            )
-        ]
+        md = ParallelMoELinear
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
+        md = BaseMoeModule
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(module, md)]
 
         moe_names = list(set([names.split(".")[-1] for names in moe_path])) if moe_path else None
         moe_block_names = list(set([names.split(".")[-1] for names in moe_block_path])) if moe_block_path else None

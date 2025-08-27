@@ -37,11 +37,11 @@ from dataclasses import replace
 
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

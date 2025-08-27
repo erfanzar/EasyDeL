@@ -81,11 +81,11 @@ from functools import cached_property
 from typing import Any
 
 import jax
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.inference.sampling_params import SamplingParams
-from easydel.utils.helpers import get_logger
 
 from ..decoders import SmartBytecodeDecoder
 from .engine_types import EngineCoreOutputs
@@ -383,7 +383,7 @@ class eSurge:
         self._esurge_name = esurge_name
         self._bytecode_decode = bytecode_decode
         self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
-
+        self._scheduler_running = False
         self.runner = eSurgeRunner(
             model=self.model,
             hbm_utilization=hbm_utilization,
@@ -1126,12 +1126,11 @@ class eSurge:
                     text_changed = False
                     new_tokens = engine_output.new_token_ids
                     now = time.perf_counter()
-
+                    elapsed = now - rd["start_time"]
                     if new_tokens:
                         rd["generated_tokens"].extend(new_tokens)
                         num_generated = len(rd["generated_tokens"])
 
-                        # First token time
                         if rd["first_token_time"] is None and num_generated > 0:
                             rd["first_token_time"] = now - rd["start_time"]
                             if metrics_collector:
@@ -1140,7 +1139,6 @@ class eSurge:
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(request_id, len(new_tokens))
 
-                        # Decode delta tokens on cadence
                         last_idx = rd["last_decoded_index"]
                         should_decode = (
                             num_generated - last_idx >= self.decode_interval_tokens
@@ -1148,10 +1146,12 @@ class eSurge:
                         )
                         if should_decode and num_generated > last_idx:
                             if self._bytecode_decode and self._smart_decoder:
+                                # Optimized smart bytecode decoding
                                 new_tokens = rd["generated_tokens"][last_idx:]
                                 buffered_tokens = rd.get("buffered_tokens", [])
                                 previous_text = rd.get("previous_decoded_text", "")
 
+                                # Decode with recovery to handle malformed UTF-8
                                 delta, new_buffered_tokens, had_malformed = self._smart_decoder.decode_with_recovery(
                                     new_tokens,
                                     previous_text,
@@ -1159,29 +1159,26 @@ class eSurge:
                                 )
 
                                 rd["buffered_tokens"] = new_buffered_tokens
-                                if not had_malformed or not new_buffered_tokens:
+                                if had_malformed and new_buffered_tokens:
+                                    new_accumulated_text = previous_text + delta
+                                else:
                                     try:
                                         full_decoded = self.tokenizer.decode(
                                             rd["generated_tokens"],
                                             skip_special_tokens=True,
                                         )
-                                        if not self._smart_decoder.contains_malformed_chars(full_decoded):
-                                            ro.accumulated_text = full_decoded
-                                            rd["previous_decoded_text"] = full_decoded
-                                        else:
-                                            ro.accumulated_text = previous_text + delta
-                                            rd["previous_decoded_text"] = ro.accumulated_text
+                                        new_accumulated_text = (
+                                            full_decoded
+                                            if not self._smart_decoder.contains_malformed_chars(full_decoded)
+                                            else previous_text + delta
+                                        )
                                     except Exception:
-                                        ro.accumulated_text = previous_text + delta
-                                        rd["previous_decoded_text"] = ro.accumulated_text
-                                else:
-                                    ro.accumulated_text = previous_text + delta
-                                    rd["previous_decoded_text"] = ro.accumulated_text
+                                        new_accumulated_text = previous_text + delta
+                                ro.accumulated_text = new_accumulated_text
+                                rd["previous_decoded_text"] = new_accumulated_text
                             else:
-                                # Standard decoding
                                 delta = self.tokenizer.decode(
-                                    rd["generated_tokens"][last_idx:],
-                                    skip_special_tokens=True,
+                                    rd["generated_tokens"][last_idx:], skip_special_tokens=True
                                 )
                                 ro.accumulated_text += delta
 
@@ -1195,10 +1192,8 @@ class eSurge:
                             comp.text = ro.accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
 
-                        # timings, tokens_per_second, etc...
                         ro.num_generated_tokens = len(rd["generated_tokens"])
 
-                        # Timing and throughput
                         elapsed = now - rd["start_time"]
                         ro.processing_time = elapsed
                         ro.time_spent_generating = elapsed
@@ -1212,7 +1207,6 @@ class eSurge:
 
                         ro.num_generated_tokens = num_generated
 
-                    # Completion handling
                     if engine_output.finished:
                         comp = ro.outputs[0]
                         ro.finished = True
@@ -1220,32 +1214,29 @@ class eSurge:
                             str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
                         )
 
-                        # Flush any remaining undecoded tokens
                         num_generated = len(rd["generated_tokens"])
                         last_idx = rd["last_decoded_index"]
                         if num_generated > last_idx:
                             if self._bytecode_decode and self._smart_decoder:
-                                # Use smart decoder for final flush
                                 new_tokens = rd["generated_tokens"][last_idx:]
                                 buffered_tokens = rd.get("buffered_tokens", [])
-                                previous_text = rd.get("previous_decoded_text", "")
 
-                                # For final flush, decode everything including buffered tokens
                                 all_remaining_tokens = new_tokens + buffered_tokens
                                 if all_remaining_tokens:
+                                    previous_text = rd.get("previous_decoded_text", "")
                                     try:
-                                        # Try to decode all tokens for final output
                                         full_decoded = self.tokenizer.decode(
                                             rd["generated_tokens"], skip_special_tokens=True
                                         )
-                                        ro.accumulated_text = full_decoded
-                                        delta = (
-                                            full_decoded[len(previous_text) :]
-                                            if full_decoded.startswith(previous_text)
-                                            else full_decoded
-                                        )
+                                        if full_decoded.startswith(previous_text):
+                                            delta = full_decoded[len(previous_text) :]
+                                            ro.accumulated_text = full_decoded
+                                        else:
+                                            delta, _, _ = self._smart_decoder.decode_with_recovery(
+                                                all_remaining_tokens, previous_text, []
+                                            )
+                                            ro.accumulated_text = previous_text + delta
                                     except Exception:
-                                        # Fallback to incremental decode
                                         delta, _, _ = self._smart_decoder.decode_with_recovery(
                                             all_remaining_tokens, previous_text, []
                                         )
@@ -1253,7 +1244,6 @@ class eSurge:
                                 else:
                                     delta = ""
                             else:
-                                # Standard decoding
                                 delta = self.tokenizer.decode(
                                     rd["generated_tokens"][last_idx:],
                                     skip_special_tokens=True,
@@ -1267,7 +1257,6 @@ class eSurge:
                             rd["last_decoded_index"] = num_generated
                             text_changed = True
 
-                        elapsed = now - rd["start_time"]
                         num_prompt_tokens = (
                             len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else len(ro.prompt_token_ids)
                         )

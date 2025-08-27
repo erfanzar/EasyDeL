@@ -31,11 +31,11 @@ from typing import Any
 
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
 from easydel.layers.caching import PagesCache, TransformerCache
-from easydel.utils.helpers import get_logger
 
 from ..sampling_params import JitableSamplingParams, SamplingParams
 

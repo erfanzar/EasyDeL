@@ -38,10 +38,7 @@ Constants:
     _LOGGING_LEVELS: String to log level mapping
 
 Example:
-    >>> from easydel.utils.helpers import get_logger, Timer
-    >>>
-    >>> logger = get_logger(__name__)
-    >>> logger.info("Starting process...")
+    >>> from easydel.utils.helpers import Timer
     >>>
     >>> with Timer("computation") as timer:
     ...     result = expensive_computation()
@@ -52,18 +49,15 @@ Example:
 from __future__ import annotations
 
 import contextlib
-import datetime
-import logging
 import os
 import sys
 import time
 import typing as tp
 import warnings
 from contextlib import contextmanager
-from functools import wraps
 from pathlib import Path
 
-import jax
+from eformer.loggings import get_logger
 
 if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
@@ -72,186 +66,7 @@ try:
 except ModuleNotFoundError:
     wandb = None
 
-
-COLORS: dict[str, str] = {
-    "PURPLE": "\033[95m",
-    "BLUE": "\033[94m",
-    "CYAN": "\033[96m",
-    "GREEN": "\033[92m",
-    "YELLOW": "\033[93m",
-    "RED": "\033[91m",
-    "ORANGE": "\033[38;5;208m",
-    "BOLD": "\033[1m",
-    "UNDERLINE": "\033[4m",
-    "RESET": "\033[0m",
-    "BLUE_PURPLE": "\033[38;5;99m",
-}
-
-# Mapping log levels to colors
-LEVEL_COLORS: dict[str, str] = {
-    "DEBUG": COLORS["ORANGE"],
-    "INFO": COLORS["BLUE_PURPLE"],
-    "WARNING": COLORS["YELLOW"],
-    "ERROR": COLORS["RED"],
-    "CRITICAL": COLORS["RED"] + COLORS["BOLD"],
-    "FATAL": COLORS["RED"] + COLORS["BOLD"],
-}
-
-_LOGGING_LEVELS: dict[str, int] = {
-    "CRITICAL": 50,
-    "FATAL": 50,
-    "ERROR": 40,
-    "WARNING": 30,
-    "WARN": 30,
-    "INFO": 20,
-    "DEBUG": 10,
-    "NOTSET": 0,
-    "critical": 50,
-    "fatal": 50,
-    "error": 40,
-    "warning": 30,
-    "warn": 30,
-    "info": 20,
-    "debug": 10,
-    "notset": 0,
-}
-
-
-class ColorFormatter(logging.Formatter):
-    """Custom formatter that adds colors to log messages.
-
-    Formats log messages with colored level names and timestamps.
-    Colors are based on the log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-
-    Example:
-        >>> handler = logging.StreamHandler()
-        >>> handler.setFormatter(ColorFormatter())
-        >>> logger.addHandler(handler)
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format log record with colors.
-
-        Args:
-            record: Log record to format.
-
-        Returns:
-            Formatted log message with ANSI color codes.
-        """
-        orig_levelname = record.levelname
-        color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
-        record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
-        current_time = datetime.datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
-        formatted_name = f"{color}({current_time} {record.name}){COLORS['RESET']}"
-        message = f"{formatted_name} {record.getMessage()}"
-        record.levelname = orig_levelname
-        return message
-
-
-class LazyLogger:
-    """Logger that initializes only when first used.
-
-    Defers logger initialization until the first logging call,
-    reducing startup overhead. Automatically adjusts log level
-    for non-primary JAX processes.
-
-    Attributes:
-        _name: Logger name.
-        _level: Logging level.
-        _logger: Underlying logger (initialized on first use).
-
-    Example:
-        >>> logger = LazyLogger(__name__)
-        >>> # Logger not initialized yet
-        >>> logger.info("First message")  # Initializes here
-    """
-
-    def __init__(self, name: str, level: int | None = None):
-        """Initialize LazyLogger.
-
-        Args:
-            name: Logger name.
-            level: Optional logging level, defaults to LOGGING_LEVEL_ED env var.
-        """
-        self._name = name
-        self._level = level or _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
-        self._logger: logging.Logger | None = None
-
-    def _ensure_initialized(self) -> None:
-        if self._logger is not None:
-            return
-
-        try:
-            if jax.process_index() > 0:
-                self._level = logging.WARNING
-        except RuntimeError:
-            pass
-
-        logger = logging.getLogger(self._name)
-        logger.propagate = False
-
-        # Set the logging level
-        logger.setLevel(self._level)
-
-        # Create a console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(self._level)
-
-        # Use our custom color formatter
-        formatter = ColorFormatter()
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-        self._logger = logger
-
-    def __getattr__(self, name: str) -> tp.Callable:
-        if name in _LOGGING_LEVELS or name.upper() in _LOGGING_LEVELS or name in ("exception", "log"):
-
-            @wraps(getattr(logging.Logger, name))
-            def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
-                self._ensure_initialized()
-                return getattr(self._logger, name)(*args, **kwargs)
-
-            return wrapped_log_method
-        raise AttributeError(f"'LazyLogger' object has no attribute '{name}'")
-
-
-def get_logger(
-    name: str,
-    level: int | None = None,
-) -> LazyLogger:
-    """Create a lazy logger that only initializes when first used.
-
-    Args:
-        name: The name of the logger.
-        level: The logging level. Defaults to environment
-            variable LOGGING_LEVEL_ED or "INFO".
-
-    Returns:
-        A lazy logger instance that initializes on first use.
-
-    Example:
-        >>> logger = get_logger(__name__)
-        >>> logger.info("Process started")
-        >>> logger.debug("Debug information")
-    """
-    return LazyLogger(name, level)
-
-
-def set_loggers_level(level: int = logging.WARNING):
-    """Set the logging level of all loggers globally.
-
-    Args:
-        level: The logging level to set. Defaults to logging.WARNING.
-
-    Example:
-        >>> import logging
-        >>> set_loggers_level(logging.DEBUG)  # Enable debug logging
-        >>> set_loggers_level(logging.ERROR)  # Only show errors
-    """
-    logging.root.setLevel(level)
-    for handler in logging.root.handlers:
-        handler.setLevel(level)
+logger = get_logger(__name__)
 
 
 @contextlib.contextmanager
@@ -285,163 +100,6 @@ def capture_time():
     finally:
         end = time.perf_counter_ns()
         is_active = False
-
-
-logger = get_logger(__name__)
-
-
-class ProgressLogger:
-    """A progress logger that displays updating progress bars and messages.
-
-    This class provides a clean way to show progress for long-running operations
-    with support for progress bars, ETAs, and streaming updates that overwrite
-    the same line in the terminal.
-
-    Attributes:
-        name: Logger name to use for fallback logging
-        use_tty: Whether to use TTY features (auto-detected)
-        start_time: Start time of the progress operation
-        _logger: Underlying logger for fallback
-
-    Example:
-        >>> progress = ProgressLogger("Training")
-        >>> for i in range(100):
-        ...     progress.update(i, 100, f"Processing batch {i}")
-        ...     # Do work
-        >>> progress.complete("Training finished!")
-    """
-
-    def __init__(self, name: str = "Progress", logger_instance: LazyLogger | None = None):
-        """Initialize the progress logger.
-
-        Args:
-            name: Name to display in progress messages
-            logger_instance: Optional logger instance to use for fallback
-        """
-        self.name = name
-        self.use_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-        self.start_time = time.time()
-        self._logger = logger_instance or get_logger(name)
-        self._last_message_length = 0
-
-    def update(
-        self,
-        current: int,
-        total: int,
-        message: str = "",
-        bar_width: int = 20,
-        show_eta: bool = True,
-        extra_info: str = "",
-    ) -> None:
-        """Update the progress display.
-
-        Args:
-            current: Current progress value (0-based)
-            total: Total number of items
-            message: Message to display after the progress bar
-            bar_width: Width of the progress bar in characters
-            show_eta: Whether to show estimated time remaining
-            extra_info: Additional info to append at the end
-        """
-        if total <= 0:
-            return
-
-        # Calculate progress
-        progress = min(current / total, 1.0)
-        progress_pct = progress * 100
-
-        # Create progress bar
-        filled = int(bar_width * progress)
-        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
-
-        # Calculate ETA
-        eta_str = ""
-        if show_eta and current > 0:
-            elapsed = time.time() - self.start_time
-            avg_time = elapsed / current
-            remaining = (total - current) * avg_time
-            if remaining > 0:
-                if remaining < 60:
-                    eta_str = f" ETA: {remaining:.1f}s"
-                elif remaining < 3600:
-                    eta_str = f" ETA: {remaining / 60:.1f}m"
-                else:
-                    eta_str = f" ETA: {remaining / 3600:.1f}h"
-
-        # Format the complete message
-        timestamp = time.strftime("%H:%M:%S")
-        full_message = f"({timestamp} {self.name}) [{bar}] {progress_pct:5.1f}% {message}{eta_str}"
-        if extra_info:
-            full_message += f" {extra_info}"
-
-        if self.use_tty:
-            # Clear previous line and write new progress
-            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
-            sys.stdout.write(full_message)
-            sys.stdout.flush()
-            self._last_message_length = len(full_message)
-        else:
-            # Fall back to regular logging
-            self._logger.info(f"{progress_pct:.1f}% - {message}")
-
-    def update_simple(self, message: str) -> None:
-        """Update with a simple message without progress bar.
-
-        Args:
-            message: Message to display
-        """
-        timestamp = time.strftime("%H:%M:%S")
-        full_message = f"({timestamp} {self.name}) {message}"
-
-        if self.use_tty:
-            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
-            sys.stdout.write(full_message)
-            sys.stdout.flush()
-            self._last_message_length = len(full_message)
-        else:
-            self._logger.info(message)
-
-    def complete(self, message: str | None = None, show_time: bool = True) -> None:
-        """Complete the progress and show final message.
-
-        Args:
-            message: Optional completion message
-            show_time: Whether to show total elapsed time
-        """
-        if message is None:
-            message = "Completed"
-
-        total_time = time.time() - self.start_time
-        timestamp = time.strftime("%H:%M:%S")
-
-        if show_time:
-            time_str = ""
-            if total_time < 60:
-                time_str = f" in {total_time:.1f}s"
-            elif total_time < 3600:
-                time_str = f" in {total_time / 60:.1f}m"
-            else:
-                time_str = f" in {total_time / 3600:.1f}h"
-            full_message = f"({timestamp} {self.name}) {message}{time_str}"
-        else:
-            full_message = f"({timestamp} {self.name}) {message}"
-
-        if self.use_tty:
-            sys.stdout.write("\r" + " " * self._last_message_length + "\r")
-            sys.stdout.write(full_message + "\n")
-            sys.stdout.flush()
-        else:
-            self._logger.info(full_message)
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - complete the progress."""
-        if exc_type is None:
-            self.complete()
-        return False
 
 
 class Timer:

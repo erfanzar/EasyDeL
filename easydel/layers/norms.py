@@ -48,6 +48,7 @@ import jax
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jaxtyping import Array, Float
 
 float8s = [
     jnp.float8_e4m3b11fnuz,
@@ -107,7 +108,7 @@ class RMSNorm(nn.Module):
             ),
         )
 
-    def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+    def _norm(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
         """Compute RMS normalization.
 
         Args:
@@ -119,7 +120,7 @@ class RMSNorm(nn.Module):
         return x * lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     @jax.named_scope("easydel-rmsnorm")
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
         """Apply RMS normalization to input.
 
         Normalizes the input using root mean square normalization

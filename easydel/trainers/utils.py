@@ -24,6 +24,7 @@ import jax
 import numpy as np
 from datasets import Dataset, IterableDataset
 from datasets.distributed import split_dataset_by_node
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from grain import python as pygrain
 from jax import numpy as jnp
@@ -31,7 +32,6 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

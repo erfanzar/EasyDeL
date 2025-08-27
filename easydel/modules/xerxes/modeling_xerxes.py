@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from eformer.loggings import get_logger
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -37,7 +38,6 @@ from easydel.layers.caching import (
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.utils.helpers import get_logger
 
 from .xerxes_configuration import XerxesConfig as XerxesConfig
 

@@ -45,12 +45,13 @@ from functools import partial
 
 import jax
 from eformer import escale as es
+from eformer.loggings import ProgressLogger, get_logger
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src import pjit
 
 from easydel.layers.caching import PagesCache, PagesCacheMetaData, PagesMetadata
-from easydel.utils import ProgressLogger, ejit, get_logger
+from easydel.utils import ejit
 
 from ...vsurge.core.functions import sample_top_p_efficient
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL

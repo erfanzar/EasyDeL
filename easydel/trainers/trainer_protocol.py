@@ -22,15 +22,15 @@ import flax.core
 import jax
 import numpy as np
 import optax
+from eformer.paths import ePathLike
 from eformer.pytree import auto_pytree
+from eformer.serialization import AsyncCheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import EasyPathLike
-from easydel.utils.checkpoint_managers.streamer import CheckpointManager
 
 try:
     import wandb  # type:ignore
@@ -38,9 +38,10 @@ except ImportError:
     wandb = None
 
 
+from eformer.loggings import get_logger
+
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.utils import Timers
-from easydel.utils.helpers import get_logger
 
 from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
@@ -73,7 +74,7 @@ class TrainerConfigureModelOutput:
 class TrainerConfigureFunctionOutput:
     sharded_training_step_function: JitWrapped
     mesh: Mesh
-    checkpoint_manager: CheckpointManager
+    checkpoint_manager: AsyncCheckpointManager
     sharded_evaluation_step_function: JitWrapped | None = None
 
 
@@ -333,7 +334,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def save_information(self, output_path: str | EasyPathLike) -> None:
+    def save_information(self, output_path: str | ePathLike) -> None:
         """
         Save the generated information to a markdown file.
         """

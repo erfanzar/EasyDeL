@@ -18,7 +18,6 @@ from math import prod
 from typing import Self
 
 import jax
-import torch
 
 
 def cdiv(a, b):
@@ -81,7 +80,7 @@ class KVCacheSpec:
 class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
-    dtype: torch.dtype
+    dtype: jax.numpy.dtype
     use_mla: bool
 
     @property
@@ -180,7 +179,7 @@ class SlidingWindowSpec(AttentionSpec):
 @dataclass
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
-    dtype: torch.dtype
+    dtype: jax.numpy.dtype
     page_size_padded: int | None = None
 
     def __post_init__(self):

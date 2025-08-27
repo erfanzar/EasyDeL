@@ -24,6 +24,9 @@ from functools import cached_property
 
 import jax
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
+from eformer.mpric import DTYPE_TO_STRING_MAP, STRING_TO_DTYPE_MAP
+from eformer.paths import ePath
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
@@ -39,13 +42,7 @@ from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import TaskType
 from easydel.layers.attention import AttentionMechanisms
 from easydel.modules.auto.auto_configuration import get_modules_by_type
-from easydel.utils.checkpoint_managers.path_utils import EasyPath
-from easydel.utils.helpers import get_logger
 
-from ...utils.checkpoint_managers.streamer import (
-    DTYPE_TO_STRING_MAP,
-    STRING_TO_DTYPE_MAP,
-)
 from ..base_trainer import BaseTrainer
 from ..trainer.trainer import Trainer
 from ..training_configurations import TrainingArguments
@@ -234,7 +231,7 @@ class RayDistributedTrainer:
         state_class: type[EasyDeLState] | None = None,
         trainer_module: type[BaseTrainer | Trainer] | None = None,
     ):
-        config = RayDistributedConfig(**json.loads(EasyPath(path).read_text()))
+        config = RayDistributedConfig(**json.loads(ePath(path).read_text()))
 
         config._loading_postprocess()
 
@@ -260,7 +257,7 @@ class RayDistributedTrainer:
             config_variables=self.config_variables,
         )
         config._saveing_preprocess()
-        EasyPath(path).write_text(config.model_dump_json(indent=2))
+        ePath(path).write_text(config.model_dump_json(indent=2))
 
     def load_processor(self) -> PreTrainedTokenizer:
         """

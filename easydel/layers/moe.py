@@ -28,6 +28,7 @@ from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
+from jaxtyping import Array, Bool, Float, Int
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -107,10 +108,10 @@ class MoeMetrics:
             confidence.
     """
 
-    expert_loads: jax.Array
-    router_probs: jax.Array
-    selected_experts: jax.Array
-    selected_weights: jax.Array
+    expert_loads: Float[Array, "num_experts"]  # type:ignore #noqa
+    router_probs: Float[Array, "batch_seq num_experts"]
+    selected_experts: Int[Array, "batch_seq num_experts_per_tok"]
+    selected_weights: Float[Array, "batch_seq num_experts_per_tok"]
     load_balancing_loss: float | None = None
     router_z_loss: float | None = None
     expert_utilization: float | None = None
@@ -208,7 +209,9 @@ class BaseMoeModule(nn.Module, ABC):
         """
         return self._route_sharded(router_probs, routing_strategy or self.routing_strategy)
 
-    def _route_sharded(self, router_probs: jax.Array, strategy: MoeRoutingStrategy) -> tuple[jax.Array, jax.Array]:
+    def _route_sharded(
+        self, router_probs: Float[Array, "batch_seq num_experts"], strategy: MoeRoutingStrategy
+    ) -> tuple[Int[Array, "batch_seq k"], Float[Array, "batch_seq k"]]:
         """Performs sharded routing of tokens to experts with improved partitioning.
 
         Router probs shape: (batch * seq_len, num_experts)
@@ -234,7 +237,9 @@ class BaseMoeModule(nn.Module, ABC):
 
         return sharded_route(router_probs)
 
-    def _route_local(self, router_probs: jax.Array, strategy: MoeRoutingStrategy) -> tuple[jax.Array, jax.Array]:
+    def _route_local(
+        self, router_probs: Float[Array, "batch_seq num_experts"], strategy: MoeRoutingStrategy
+    ) -> tuple[Int[Array, "batch_seq k"], Float[Array, "batch_seq k"]]:
         """Implements the routing logic on a local device shard.
 
         Args:
@@ -479,7 +484,7 @@ class BaseMoeModule(nn.Module, ABC):
         else:
             raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
-    def _compute_router_z_loss(self, router_logits: jax.Array) -> float | None:
+    def _compute_router_z_loss(self, router_logits: Float[Array, "batch_seq num_experts"]) -> float | None:
         """Computes the router z-loss.
 
         This auxiliary loss encourages the router to produce logits with small
@@ -534,7 +539,7 @@ class BaseMoeModule(nn.Module, ABC):
         metrics.routing_entropy = jnp.mean(-jnp.sum(router_probs * jnp.log(router_probs + 1e-8), axis=-1))
         return metrics
 
-    def _apply_expert_sharding(self, tensor: jax.Array, tensor_type: str = "weight") -> jax.Array:
+    def _apply_expert_sharding(self, tensor: Float[Array, ...], tensor_type: str = "weight") -> Float[Array, ...]:
         """Applies expert parallel sharding to a tensor with auto-sharding."""
         pmag = self.partition_manager
 
@@ -580,7 +585,9 @@ class BaseMoeModule(nn.Module, ABC):
         pmag = self.partition_manager
         return pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN, shape=bias_shape)
 
-    def _validate_routing_inputs(self, hidden_states: jax.Array, router_logits: jax.Array) -> None:
+    def _validate_routing_inputs(
+        self, hidden_states: Float[Array, "batch seq hidden_dim"], router_logits: Float[Array, "batch_seq num_experts"]
+    ) -> None:
         """Validates the shapes of inputs for routing operations.
 
         Args:
@@ -649,7 +656,9 @@ class BaseMoeModule(nn.Module, ABC):
         constrained_weights = jnp.where(weight_sum > 0, constrained_weights / weight_sum, constrained_weights)
         return selected_experts, constrained_weights
 
-    def _create_expert_mask(self, selected_experts: jax.Array, expert_id: int) -> jax.Array:
+    def _create_expert_mask(
+        self, selected_experts: Int[Array, "batch_seq k"], expert_id: int
+    ) -> Bool[Array, "batch_seq k"]:
         """Creates a boolean mask for tokens assigned to a specific expert.
 
         Args:
@@ -740,7 +749,9 @@ class BaseMoeModule(nn.Module, ABC):
         return output, router_logits
 
     @abstractmethod
-    def __call__(self, hidden_states: jax.Array, **kwargs) -> tuple[jax.Array, MoeMetrics]:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq hidden_dim"], **kwargs
+    ) -> tuple[Float[Array, "batch seq hidden_dim"], MoeMetrics]:
         """Performs the forward pass of the MoE module.
 
         Subclasses must implement this method to define the specific logic of their
@@ -868,7 +879,11 @@ class ParallelMoELinear(nn.Module):
             return None
         return self.alt_sharding.axes
 
-    def __call__(self, inputs: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        inputs: Float[Array, "tokens_ragged hidden_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
         """Applies the batched linear transformation.
 
         Args:
@@ -914,7 +929,11 @@ class ParallelMoELinear(nn.Module):
             need_tp_psum = (self.direction == "row") and (in_axis_name is not None)
             axis_name = self.partition_manager.resolve(axes=[in_axis_name], mode=MODE_TRAIN)[0]
 
-            def mapped_fn(x: jax.Array, w: jax.Array, gs: jax.Array) -> jax.Array:
+            def mapped_fn(
+                x: Float[Array, "tokens hidden"],
+                w: Float[Array, "experts in_dim out_dim"],
+                gs: Int[Array, "groups"],  # noqa
+            ) -> Float[Array, "tokens out_dim"]:
                 y = core(x, w, gs)  # [sum(gs), out_features]
                 if need_tp_psum:
                     y = jax.lax.psum(y, axis_name=axis_name)
@@ -944,7 +963,13 @@ class ParallelMoELinear(nn.Module):
         return output
 
     @staticmethod
-    def _ragged_dot(inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array, *, out_first: bool) -> jax.Array:
+    def _ragged_dot(
+        inputs: Float[Array, "tokens_ragged in_dim"],
+        weight: Float[Array, "num_experts in_dim out_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        *,
+        out_first: bool,
+    ) -> Float[Array, "tokens_ragged out_dim"]:
         """Performs ragged dot product using `jax.lax.ragged_dot_general`.
 
         This is suitable for inputs where each expert processes a different number
@@ -970,7 +995,11 @@ class ParallelMoELinear(nn.Module):
         )
 
     @staticmethod
-    def _grouped_matmul(inputs: jax.Array, weight: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    def _grouped_matmul(
+        inputs: Float[Array, "tokens_ragged in_dim"],
+        weight: Float[Array, "num_experts in_dim out_dim"],
+        group_sizes: Int[Array, "num_groups"],  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
         """Performs grouped matrix multiplication using the Pallas kernel.
 
         This is a highly optimized operation for TPUs. It may pad the input to
@@ -1001,7 +1030,7 @@ class ParallelMoELinear(nn.Module):
             output = output[:original_batch_size]
         return output
 
-    def _expand_bias_ragged(self, group_sizes: jax.Array) -> jax.Array:
+    def _expand_bias_ragged(self, group_sizes: Int[Array, "num_groups"]) -> Float[Array, "tokens_ragged out_dim"]:  # noqa
         """Expands the bias to match the ragged batch structure.
 
         This method repeats the bias for each expert according to the number of

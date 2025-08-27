@@ -19,6 +19,7 @@ import flax
 import flax.nnx
 import jax
 from eformer.escale import PartitionAxis
+from eformer.paths import ePath
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
@@ -27,7 +28,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 from easydel.infra.factory import TaskType, registry
-from easydel.utils.checkpoint_managers.path_utils import EasyPath
+
+SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 
 
 class BaseAutoEasyModel:
@@ -430,16 +432,18 @@ class BaseAutoEasyModel:
         subfolder = ""
         commit_hash = None
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
-        epath = EasyPath(pretrained_model_name_or_path)
+        epath = ePath(pretrained_model_name_or_path)
 
         if epath.is_dir():
+            if (epath / subfolder / SAFETENSOR_INDEX_NAME).exists():
+                return True
             if (epath / subfolder / MULTI_PART_NAME).exists():
                 return True
             if not (epath / subfolder / FLAX_WEIGHTS_NAME).is_file():
                 raise OSError(
                     f"Error no file named {FLAX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
                 )
-        elif (EasyPath(subfolder) / epath).is_file():
+        elif (ePath(subfolder) / epath).is_file():
             ...
         elif _is_remote_url(pretrained_model_name_or_path):
             ...

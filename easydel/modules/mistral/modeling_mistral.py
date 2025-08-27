@@ -18,6 +18,7 @@ import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from eformer.loggings import get_logger
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -42,7 +43,6 @@ from easydel.layers.caching import (
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.utils.helpers import get_logger
 
 from .mistral_configuration import MistralConfig
 

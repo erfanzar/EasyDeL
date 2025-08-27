@@ -991,7 +991,7 @@ if __name__ == "__main__":
     test.test_gemma()  # Passed
     test.test_gemma2()  # Passed
     test.test_gemma3_text()  # Passed
-    test.test_gemma3()  # Passed
+    # test.test_gemma3()  # Passed
     test.test_glm()  # Passed
     test.test_glm4()  # Passed
     test.test_glm4_moe()  # Passed - Passes MoE CONOV

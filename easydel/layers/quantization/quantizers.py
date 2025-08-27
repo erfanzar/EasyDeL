@@ -112,11 +112,7 @@ class EasyQuantizer:
         if self.quantization_method == EasyDeLQuantizationMethods.NONE or self.quantization_method is None:
             return model
 
-        from easydel.utils.graph_utils import (
-            get_module_from_path,
-            iter_module_search,
-            set_module_from_path,
-        )
+        from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
         quantizer = METHOD_TO_LINEAR_MAPPING.get(self.quantization_method, None)
         if quantizer is None:

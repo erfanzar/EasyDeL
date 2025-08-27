@@ -15,9 +15,10 @@
 
 import typing
 
+from eformer.loggings import get_logger
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
-from easydel.utils.helpers import get_logger
 
 from ..auto import AutoEasyDeLConfig
 

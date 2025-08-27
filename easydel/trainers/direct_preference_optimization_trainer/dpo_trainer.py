@@ -18,6 +18,7 @@ from collections import defaultdict
 from functools import partial
 
 import jax
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
@@ -26,7 +27,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import TrainerConfigureFunctionOutput

@@ -56,6 +56,7 @@ import jax.tree_util
 from eformer import common_types
 from eformer.common_types import NOT_GIVEN
 from eformer.escale import PartitionAxis, PartitionManager
+from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
 from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from jax import numpy as jnp
@@ -66,7 +67,6 @@ from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
 from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
 from transformers.utils.generic import is_timm_config_dict
 
-from easydel.utils.checkpoint_managers.path_utils import EasyPath, EasyPathLike
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
 
@@ -138,7 +138,7 @@ def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> s
     """
     if resolved_file is None or commit_hash is not None:
         return commit_hash
-    resolved_file = str(EasyPath(resolved_file).as_posix())
+    resolved_file = str(ePath(resolved_file).as_posix())
     search = re.search(r"snapshots/([^/]+)/", resolved_file)
     if search is None:
         return None
@@ -923,7 +923,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         return cls.from_dict(config_dict, **kwargs)
 
-    def save_pretrained(self, save_directory: str | os.PathLike | EasyPathLike, push_to_hub: bool = False, **kwargs):
+    def save_pretrained(self, save_directory: str | os.PathLike | ePathLike, push_to_hub: bool = False, **kwargs):
         """
         Save a configuration object to the directory `save_directory`, so that it can be re-loaded using the
         [`~PretrainedConfig.from_pretrained`] class method.
@@ -939,7 +939,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
         self._set_token_in_kwargs(kwargs)
-        easy_directory = EasyPath(save_directory)
+        easy_directory = ePath(save_directory)
         if easy_directory.is_file():
             raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
 
@@ -977,7 +977,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 token=kwargs.get("token"),
             )
 
-    def to_json_file(self, json_file_path: str | os.PathLike | EasyPathLike, use_diff: bool = True):
+    def to_json_file(self, json_file_path: str | os.PathLike | ePathLike, use_diff: bool = True):
         """
         Save this instance to a JSON file.
 
@@ -988,11 +988,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 If set to `True`, only the difference between the config instance and the default `PretrainedConfig()`
                 is serialized to JSON file.
         """
-        EasyPath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
+        ePath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
 
     @classmethod
-    def _dict_from_json_file(cls, json_file: str | os.PathLike | EasyPathLike):
-        return json.loads(EasyPath(json_file).read_text(encoding="utf-8"))
+    def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
+        return json.loads(ePath(json_file).read_text(encoding="utf-8"))
 
     @classmethod
     def _get_config_dict(
@@ -1026,8 +1026,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
-        is_local = EasyPath(pretrained_model_name_or_path).is_dir()
-        if (EasyPath(subfolder) / pretrained_model_name_or_path).is_file():
+        is_local = ePath(pretrained_model_name_or_path).is_dir()
+        if (ePath(subfolder) / pretrained_model_name_or_path).is_file():
             resolved_config_file = pretrained_model_name_or_path
             is_local = True
         elif is_remote_url(pretrained_model_name_or_path):
@@ -1035,7 +1035,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             resolved_config_file = download_url(pretrained_model_name_or_path)
         else:
             configuration_file = kwargs.pop("_configuration_file", CONFIG_NAME) if gguf_file is None else gguf_file
-            google_cloud_file = EasyPath(pretrained_model_name_or_path) / configuration_file
+            google_cloud_file = ePath(pretrained_model_name_or_path) / configuration_file
             if not google_cloud_file.exists():
                 try:
                     resolved_config_file = cached_file(

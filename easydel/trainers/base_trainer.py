@@ -29,6 +29,8 @@ import jax
 import jax.extend
 import numpy as np
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
+from eformer.paths import ePath, ePathLike
 from flax import nnx as nn
 from flax.core import unfreeze
 from jax import numpy as jnp
@@ -49,8 +51,7 @@ from easydel.infra.etils import (
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import EasyPath, EasyPathLike, Timers, readme_generator
-from easydel.utils.helpers import get_logger
+from easydel.utils import Timers, readme_generator
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -173,7 +174,7 @@ class BaseTrainer(BaseTrainerProtocol):
             **kwargs,
         )
 
-        load_args_path = EasyPath(load_directory) / DEFAULT_ARGS_JSON_NAME
+        load_args_path = ePath(load_directory) / DEFAULT_ARGS_JSON_NAME
         arguments = TrainingArguments.load_arguments(load_args_path)
         if trainer_init_arguments is None:
             trainer_init_arguments = {}
@@ -871,7 +872,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _manage_checkpoint_limit(self, save_directory):
         def _remove_directory_recursive(path):
-            """Recursively remove directory using EasyPath methods"""
+            """Recursively remove directory using ePath methods"""
             if not path.exists():
                 return
 
@@ -887,7 +888,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         def _operate():
             try:
-                save_path = EasyPath(save_directory)
+                save_path = ePath(save_directory)
                 checkpoint_files = []
                 try:
                     checkpoint_files = list(save_path.glob("run-*"))
@@ -927,7 +928,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 _operate()
 
     def _save_readme(self, save_directory):
-        dst = EasyPath(save_directory) / "README.md"
+        dst = ePath(save_directory) / "README.md"
         dst.write_text(self._get_information())
 
     def _format_partition_rules(self) -> str:
@@ -1050,7 +1051,7 @@ class BaseTrainer(BaseTrainerProtocol):
             logger.error(f"Error generating README with Jinja2: {e!s}")
             return f"# Error during README generation for {self.arguments.model_name}"
 
-    def save_information(self, output_path: str | EasyPathLike) -> None:
+    def save_information(self, output_path: str | ePathLike) -> None:
         """
         Save the generated information to a markdown file.
 
@@ -1058,7 +1059,7 @@ class BaseTrainer(BaseTrainerProtocol):
             output_path: Path where the markdown file should be saved
         """
         try:
-            output_path = EasyPath(output_path)
+            output_path = ePath(output_path)
             output_path.mkdir(parents=True, exist_ok=True)
             output_path.write_text(self._get_information())
 
@@ -1077,7 +1078,7 @@ class BaseTrainer(BaseTrainerProtocol):
         torch_save_pretrained_kwargs: dict | None = None,
     ):
         save_directory = save_directory or self.arguments.get_path()
-        save_directory = EasyPath(save_directory)
+        save_directory = ePath(save_directory)
         if to_torch:
             return self._save_to_torch(
                 state=state,
@@ -1227,7 +1228,7 @@ class BaseTrainer(BaseTrainerProtocol):
         checkpoint_path = "SAVING_SKIPPED"
         filename = None
 
-        dire = EasyPath(self.arguments.save_directory)
+        dire = ePath(self.arguments.save_directory)
         if self.arguments.do_last_save:
             filename = self._save_state(state=state, milestone=False, save_directory=dire)
             if self.arguments.save_directory is not None:

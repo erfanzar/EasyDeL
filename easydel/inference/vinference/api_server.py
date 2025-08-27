@@ -22,11 +22,10 @@ import traceback
 import typing as tp
 from http import HTTPStatus
 
+from eformer.loggings import get_logger
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import ProcessorMixin
-
-from easydel.utils.helpers import get_logger
 
 from ..inference_engine_interface import (
     BaseInferenceApiServer,

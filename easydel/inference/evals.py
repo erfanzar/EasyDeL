@@ -15,9 +15,9 @@
 import asyncio
 
 from eformer.common_types import NOT_GIVEN, _Empty
+from eformer.loggings import get_logger
 
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.helpers import get_logger
 
 from .vsurge import vSurge
 

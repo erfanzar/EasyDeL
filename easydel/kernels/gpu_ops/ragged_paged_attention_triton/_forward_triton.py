@@ -14,30 +14,18 @@
 import triton
 import triton.language as tl
 
-from .._utils import safe_autotune
 
-
-# Autotune only warps/stages; do NOT auto-tune BLOCK_D.
-@safe_autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
-    ],
-    key=["D"],
-)
 @triton.jit
 def _ragged_paged_attn_prefetch_kernel_combined(
     Q_ptr,  # float*  [T, KVH, QHG, D]
-    KV_pages_ptr,  # float*  [P, PS, 2*KVH, D] (K/V interleaved)
+    KV_pages_ptr,  # float*  [P, PS, 2*KVH, D]
     block_tables_ptr,  # int32*  [S, PAGES_PER_SEQ_MAX]
     row_seq_ptr,  # int32*  [T_padded]
     row_firstk_ptr,  # int32*  [T_padded]
     row_kvlen_ptr,  # int32*  [T_padded]
     row_valid_ptr,  # bool*   [T_padded]
     Out_ptr,  # float*  [T, KVH, QHG, D] (fp32 buffer)
-    # constexpr meta (D is the full head size)
+    # constexpr meta
     T: tl.constexpr,
     KVH: tl.constexpr,
     QHG: tl.constexpr,
@@ -47,39 +35,42 @@ def _ragged_paged_attn_prefetch_kernel_combined(
     KV_PAGES_PER_BLOCK: tl.constexpr,
     MAX_KV_SUPERBLOCKS: tl.constexpr,
 ):
-    # program ids
     t = tl.program_id(0)
-    h = tl.program_id(1)  # kv head
-    g = tl.program_id(2)  # q head within group
+    h = tl.program_id(1)
+    g = tl.program_id(2)
 
-    # strides for Q/Out: [T, KVH, QHG, D]
+    # strides / constants
     sQ_t = KVH * QHG * D
     sQ_h = QHG * D
     sQ_g = D
     C = 2 * KVH
-    # strides for KV_pages: [P, PS, 2*KVH, D]
     sKV_p = PS * C * D
     sKV_s = C * D
     sKV_h = D
     sKV_d = 1
 
-    # K and V head indices within combined head dim
     head_k = 2 * h
     head_v = 2 * h + 1
 
-    # per-row metadata
+    # base pointers and offsets
+    q_base = t * sQ_t + h * sQ_h + g * sQ_g
+    d_off = tl.arange(0, D)
+
+    # early skip: respect host-side gating (already includes seq cutoff)
+    validrow = tl.load(row_valid_ptr + t, mask=True, other=False)
+    if not validrow:
+        tl.store(Out_ptr + q_base + d_off, tl.zeros([D], dtype=tl.float32), mask=(d_off < D))
+        return
+
+    # per-row metadata (only for active rows)
     seq_idx = tl.load(row_seq_ptr + t, mask=True, other=0)
     first_k = tl.load(row_firstk_ptr + t, mask=True, other=0)
     kv_len = tl.load(row_kvlen_ptr + t, mask=True, other=0)
-    validrow = tl.load(row_valid_ptr + t, mask=True, other=False)
-
-    # early exit for dead rows
-    if not validrow or (kv_len <= 0):
+    if kv_len <= 0:
+        tl.store(Out_ptr + q_base + d_off, tl.zeros([D], dtype=tl.float32), mask=(d_off < D))
         return
 
-    # load q row [D] (full D)
-    q_base = t * sQ_t + h * sQ_h + g * sQ_g
-    d_off = tl.arange(0, D)
+    # load q row
     q_vec = tl.load(Q_ptr + q_base + d_off, mask=(d_off < D), other=0.0).to(tl.float32)
 
     # accumulators
@@ -89,6 +80,12 @@ def _ragged_paged_attn_prefetch_kernel_combined(
 
     ps_off = tl.arange(0, PS)
     num_pages_seq = (kv_len + PS - 1) // PS
+    last_page_needed = tl.minimum(num_pages_seq - 1, first_k // PS)
+    n_pages_eff = last_page_needed + 1
+
+    if n_pages_eff <= 0:
+        tl.store(Out_ptr + q_base + d_off, tl.zeros([D], dtype=tl.float32), mask=(d_off < D))
+        return
 
     for kv_super in range(MAX_KV_SUPERBLOCKS):
         page_idx_base = kv_super * KV_PAGES_PER_BLOCK
@@ -118,7 +115,7 @@ def _ragged_paged_attn_prefetch_kernel_combined(
                 safec = min(page_index_idx, PAGES_PER_SEQ_MAX - 1)
                 pidc = tl.load(block_tables_ptr + seq_idx * PAGES_PER_SEQ_MAX + safec, mask=True, other=0)
 
-                # if no prefetch from superblock, load K now
+                # if no prefetch from superblock, load K now (defensive)
                 if not valid_super:
                     k_ptrs = KV_pages_ptr + (
                         pidc * sKV_p + ps_off[:, None] * sKV_s + head_k * sKV_h + d_off[None, :] * sKV_d
@@ -127,14 +124,13 @@ def _ragged_paged_attn_prefetch_kernel_combined(
                         tl.float32
                     )
 
-                # scores [PS] using full D
+                # scores [PS]
                 scores = tl.sum(k_tile * q_vec[None, :], axis=1)
                 kv_token_indices = kv_token_block_start + p * PS + ps_off
 
                 # mask for this page
                 full_mask = (kv_token_indices <= first_k) & (kv_token_indices < kv_len)
-                mask_count = tl.sum(full_mask.to(tl.int32))
-                has_any = mask_count > 0
+                has_any = tl.sum(full_mask.to(tl.int32)) > 0
 
                 # online softmax update
                 neg_big = tl.full([PS], -1e30, dtype=tl.float32)

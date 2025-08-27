@@ -16,6 +16,7 @@ from dataclasses import field
 
 import jax
 from datasets import load_dataset
+from eformer.aparser import DataClassArgumentParser
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from transformers import AutoConfig, AutoTokenizer
@@ -105,7 +106,7 @@ class RunTimeConfig:
             self.sharding_axis = tuple(map(int, self.sharding_axis.split(",")))
 
 
-parser = ed.utils.DataClassArgumentParser((ed.DPOConfig, RunTimeConfig))
+parser = DataClassArgumentParser((ed.DPOConfig, RunTimeConfig))
 dpo_config, runtime_config = parser.parse_args_into_dataclasses()
 
 runtime_config: RunTimeConfig

@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import typing as tp
 
-from ..checkpoint_managers import EasyPath, EasyPathLike
+from eformer.paths import ePath, ePathLike
+
 from .types import DatasetMixture, TextDatasetInform, VisualDatasetInform
 
 if tp.TYPE_CHECKING:
@@ -180,7 +181,7 @@ class DataManager:
         return interleaved
 
     @classmethod
-    def load_from_config(cls, config_path: str | EasyPathLike) -> tuple[DatasetMixture, tp.Any]:
+    def load_from_config(cls, config_path: str | ePathLike) -> tuple[DatasetMixture, tp.Any]:
         """
         Load dataset configuration from a JSON or YAML file.
 
@@ -194,7 +195,7 @@ class DataManager:
 
         import yaml
 
-        path = EasyPath(config_path)
+        path = ePath(config_path)
 
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
