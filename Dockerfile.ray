@@ -21,6 +21,12 @@ ENV PATH="/home/ray/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+RUN sed -i \
+    -e '/^# >>> conda initialize >>>/,/^# <<< conda initialize <<</d' \
+    -e '/^export \+PATH=\$HOME\/anaconda3\/bin:\$PATH$/d' \
+    /home/ray/.bashrc && \
+    printf 'export VIRTUAL_ENV=/home/ray/.venv\nexport PATH="/home/ray/.venv/bin:$PATH"' >> /home/ray/.bashrc
+
 COPY . .
 
 RUN uv pip install -e . --no-deps
