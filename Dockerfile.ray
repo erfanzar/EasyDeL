@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG RAY_IMAGE=rayproject/ray:2.36.0-py311
+ARG RAY_IMAGE=rayproject/ray:2.45.0-py311
 FROM ${RAY_IMAGE}
 
 WORKDIR /home/ray
@@ -30,17 +30,11 @@ RUN sed -i \
 COPY . .
 
 RUN uv pip install -e . --no-deps
-RUN uv pip install -U \
-    torch \
+RUN uv pip install \
     google-api-python-client \
     google-auth-httplib2 \
     google-auth-oauthlib \
     cryptography
-
-RUN python -c "import easydel; print('EasyDeL imported successfully')" && \
-    if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
-      python -c "import torch; print(f'PyTorch version: {torch.__version__}')"; \
-    fi || true
 
 RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz && \
     tar -xf google-cloud-cli-linux-x86_64.tar.gz && \
@@ -49,12 +43,6 @@ RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cl
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
-
-# Add /usr/lib/x86_64-linux-gnu/ to LD_LIBRARY_PATH so that bash prefers the systems
-# libtinfo.so over the conda-provided version. Using the conda-provided libtinfo.so
-# outputs a noisy warning because it doesn't include version information.
-ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu/
-ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/ray/.venv/lib
 
 COPY ./preemptible-fix.patch .
 # apply the patch to fix preemptible GCP in Ray in the installed ray package
