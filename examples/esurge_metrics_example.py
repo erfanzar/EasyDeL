@@ -3,10 +3,7 @@
 
 import asyncio
 
-from easydel.inference.esurge import (
-    initialize_metrics,
-    log_metrics_summary,
-)
+from easydel.inference.esurge import initialize_metrics, log_metrics_summary
 
 
 async def main():

@@ -731,9 +731,9 @@ class OpenELMModel(EasyDeLBaseModule):
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
-        assert sequence_length <= self.config.max_context_length, (
-            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
-        )
+        assert (
+            sequence_length <= self.config.max_context_length
+        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
         else:

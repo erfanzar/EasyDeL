@@ -56,13 +56,7 @@ Example:
 """
 
 from .manager import DataManager
-from .types import (
-    DatasetLoadError,
-    DatasetMixture,
-    DatasetType,
-    TextDatasetInform,
-    VisualDatasetInform,
-)
+from .types import DatasetLoadError, DatasetMixture, DatasetType, TextDatasetInform, VisualDatasetInform
 
 __all__ = (
     "DataManager",

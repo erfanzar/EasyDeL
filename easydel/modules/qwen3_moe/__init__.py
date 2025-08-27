@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .modeling_qwen3_moe import (
-    Qwen3MoeForCausalLM,
-    Qwen3MoeForSequenceClassification,
-    Qwen3MoeModel,
-)
+from .modeling_qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
 from .qwen3_moe_configuration import Qwen3MoeConfig
 
 __all__ = (

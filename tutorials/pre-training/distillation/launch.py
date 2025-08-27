@@ -74,10 +74,11 @@ def main():
     """
     # Imports are inside the function to ensure they are available in the
     # separate Ray worker process.
-    import easydel as ed  # noqa
     import jax
     from jax import numpy as jnp
     from transformers import AutoTokenizer
+
+    import easydel as ed
 
     # --- Basic Training Parameters ---
     max_length = 4096

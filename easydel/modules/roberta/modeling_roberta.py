@@ -35,11 +35,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCacheView,

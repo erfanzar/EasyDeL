@@ -34,11 +34,7 @@ from ...openai_api_modules import (
     ToolCall,
 )
 from ..abstract_tool import ToolParser, ToolParserManager
-from ..utils import (
-    find_common_prefix,
-    is_complete_json,
-    partial_json_loads,
-)
+from ..utils import find_common_prefix, is_complete_json, partial_json_loads
 
 logger = get_logger(__name__)
 

@@ -676,10 +676,7 @@ class EasyBridgeMixin(PushToHubMixin):
         from transformers import AutoConfig
 
         from easydel.layers.quantization.quantizers import EasyQuantizer
-        from easydel.modules.auto.auto_configuration import (
-            AutoShardAndGatherFunctions,
-            get_modules_by_type,
-        )
+        from easydel.modules.auto.auto_configuration import AutoShardAndGatherFunctions, get_modules_by_type
 
         try:
             import torch

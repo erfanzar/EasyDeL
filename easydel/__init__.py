@@ -569,11 +569,7 @@ if _tp.TYPE_CHECKING:
         auto_pytree,
         escale,
     )
-    from .infra.errors import (
-        EasyDeLRuntimeError,
-        EasyDeLSyntaxRuntimeError,
-        EasyDeLTimerError,
-    )
+    from .infra.errors import EasyDeLRuntimeError, EasyDeLSyntaxRuntimeError, EasyDeLTimerError
     from .infra.etils import (
         EasyDeLBackends,
         EasyDeLGradientCheckPointers,
@@ -582,26 +578,10 @@ if _tp.TYPE_CHECKING:
         EasyDeLQuantizationMethods,
         EasyDeLSchedulers,
     )
-    from .infra.factory import (
-        ConfigType,
-        TaskType,
-        register_config,
-        register_module,
-    )
-    from .layers.attention import (
-        AttentionMechanisms,
-        AttentionModule,
-        FlexibleAttentionModule,
-    )
-    from .layers.attention_operator._attention_impl import (
-        AttentionMetadata,
-        AttentionRegistry,
-    )
-    from .modules.arctic import (
-        ArcticConfig,
-        ArcticForCausalLM,
-        ArcticModel,
-    )
+    from .infra.factory import ConfigType, TaskType, register_config, register_module
+    from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
+    from .layers.attention_operator._attention_impl import AttentionMetadata, AttentionRegistry
+    from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,
         AutoEasyDeLModel,
@@ -623,11 +603,7 @@ if _tp.TYPE_CHECKING:
         AutoStateVisionModel,
         get_modules_by_type,
     )
-    from .modules.aya_vision import (
-        AyaVisionConfig,
-        AyaVisionForConditionalGeneration,
-        AyaVisionModel,
-    )
+    from .modules.aya_vision import AyaVisionConfig, AyaVisionForConditionalGeneration, AyaVisionModel
     from .modules.clip import (
         CLIPConfig,
         CLIPForImageClassification,
@@ -638,18 +614,8 @@ if _tp.TYPE_CHECKING:
         CLIPVisionConfig,
         CLIPVisionModel,
     )
-    from .modules.cohere import (
-        CohereConfig,
-        CohereForCausalLM,
-        CohereForSequenceClassification,
-        CohereModel,
-    )
-    from .modules.cohere2 import (
-        Cohere2Config,
-        Cohere2ForCausalLM,
-        Cohere2ForSequenceClassification,
-        Cohere2Model,
-    )
+    from .modules.cohere import CohereConfig, CohereForCausalLM, CohereForSequenceClassification, CohereModel
+    from .modules.cohere2 import Cohere2Config, Cohere2ForCausalLM, Cohere2ForSequenceClassification, Cohere2Model
     from .modules.dbrx import (
         DbrxAttentionConfig,
         DbrxConfig,
@@ -658,39 +624,12 @@ if _tp.TYPE_CHECKING:
         DbrxForSequenceClassification,
         DbrxModel,
     )
-    from .modules.deepseek_v2 import (
-        DeepseekV2Config,
-        DeepseekV2ForCausalLM,
-        DeepseekV2Model,
-    )
-    from .modules.deepseek_v3 import (
-        DeepseekV3Config,
-        DeepseekV3ForCausalLM,
-        DeepseekV3Model,
-    )
-    from .modules.exaone import (
-        ExaoneConfig,
-        ExaoneForCausalLM,
-        ExaoneForSequenceClassification,
-        ExaoneModel,
-    )
-    from .modules.falcon import (
-        FalconConfig,
-        FalconForCausalLM,
-        FalconModel,
-    )
-    from .modules.gemma import (
-        GemmaConfig,
-        GemmaForCausalLM,
-        GemmaForSequenceClassification,
-        GemmaModel,
-    )
-    from .modules.gemma2 import (
-        Gemma2Config,
-        Gemma2ForCausalLM,
-        Gemma2ForSequenceClassification,
-        Gemma2Model,
-    )
+    from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
+    from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
+    from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
+    from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
+    from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
+    from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
     from .modules.gemma3 import (
         Gemma3Config,
         Gemma3ForCausalLM,
@@ -700,67 +639,22 @@ if _tp.TYPE_CHECKING:
         Gemma3TextConfig,
         Gemma3TextModel,
     )
-    from .modules.gidd import (
-        GiddConfig,
-        GiddForDiffusionLM,
-        GiddModel,
-    )
-    from .modules.glm import (
-        GlmConfig,
-        GlmForCausalLM,
-        GlmForSequenceClassification,
-        GlmModel,
-    )
-    from .modules.glm4 import (
-        Glm4Config,
-        Glm4ForCausalLM,
-        Glm4ForSequenceClassification,
-        Glm4Model,
-    )
-    from .modules.glm4_moe import (
-        Glm4MoeConfig,
-        Glm4MoeForCausalLM,
-        Glm4MoeForSequenceClassification,
-        Glm4MoeModel,
-    )
-    from .modules.gpt2 import (
-        GPT2Config,
-        GPT2LMHeadModel,
-        GPT2Model,
-    )
-    from .modules.gpt_j import (
-        GPTJConfig,
-        GPTJForCausalLM,
-        GPTJModel,
-    )
-    from .modules.gpt_neox import (
-        GPTNeoXConfig,
-        GPTNeoXForCausalLM,
-        GPTNeoXModel,
-    )
-    from .modules.gpt_oss import (
-        GptOssConfig,
-        GptOssForCausalLM,
-        GptOssForSequenceClassification,
-        GptOssModel,
-    )
-    from .modules.grok_1 import (
-        Grok1Config,
-        Grok1ForCausalLM,
-        Grok1Model,
-    )
+    from .modules.gidd import GiddConfig, GiddForDiffusionLM, GiddModel
+    from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
+    from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
+    from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeForSequenceClassification, Glm4MoeModel
+    from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
+    from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
+    from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
+    from .modules.gpt_oss import GptOssConfig, GptOssForCausalLM, GptOssForSequenceClassification, GptOssModel
+    from .modules.grok_1 import Grok1Config, Grok1ForCausalLM, Grok1Model
     from .modules.internlm2 import (
         InternLM2Config,
         InternLM2ForCausalLM,
         InternLM2ForSequenceClassification,
         InternLM2Model,
     )
-    from .modules.llama import (
-        LlamaConfig,
-        LlamaForCausalLM,
-        LlamaForSequenceClassification,
-        LlamaModel,
-    )
+    from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
     from .modules.llama4 import (
         Llama4Config,
         Llama4ForCausalLM,
@@ -771,114 +665,26 @@ if _tp.TYPE_CHECKING:
         Llama4VisionConfig,
         Llama4VisionModel,
     )
-    from .modules.llava import (
-        LlavaConfig,
-        LlavaForConditionalGeneration,
-        LlavaModel,
-    )
-    from .modules.mamba import (
-        MambaConfig,
-        MambaForCausalLM,
-        MambaModel,
-    )
-    from .modules.mamba2 import (
-        Mamba2Config,
-        Mamba2ForCausalLM,
-        Mamba2Model,
-    )
-    from .modules.mistral import (
-        MistralConfig,
-        MistralForCausalLM,
-        MistralForSequenceClassification,
-        MistralModel,
-    )
-    from .modules.mistral3 import (
-        Mistral3Config,
-        Mistral3ForConditionalGeneration,
-        Mistral3Model,
-        Mistral3Tokenizer,
-    )
-    from .modules.mixtral import (
-        MixtralConfig,
-        MixtralForCausalLM,
-        MixtralForSequenceClassification,
-        MixtralModel,
-    )
-    from .modules.mosaic_mpt import (
-        MptAttentionConfig,
-        MptConfig,
-        MptForCausalLM,
-        MptModel,
-    )
-    from .modules.olmo import (
-        OlmoConfig,
-        OlmoForCausalLM,
-        OlmoModel,
-    )
-    from .modules.olmo2 import (
-        Olmo2Config,
-        Olmo2ForCausalLM,
-        Olmo2ForSequenceClassification,
-        Olmo2Model,
-    )
-    from .modules.openelm import (
-        OpenELMConfig,
-        OpenELMForCausalLM,
-        OpenELMModel,
-    )
-    from .modules.opt import (
-        OPTConfig,
-        OPTForCausalLM,
-        OPTModel,
-    )
-    from .modules.phi import (
-        PhiConfig,
-        PhiForCausalLM,
-        PhiModel,
-    )
-    from .modules.phi3 import (
-        Phi3Config,
-        Phi3ForCausalLM,
-        Phi3Model,
-    )
-    from .modules.phimoe import (
-        PhiMoeConfig,
-        PhiMoeForCausalLM,
-        PhiMoeModel,
-    )
-    from .modules.pixtral import (
-        PixtralVisionConfig,
-        PixtralVisionModel,
-    )
-    from .modules.qwen2 import (
-        Qwen2Config,
-        Qwen2ForCausalLM,
-        Qwen2ForSequenceClassification,
-        Qwen2Model,
-    )
-    from .modules.qwen2_moe import (
-        Qwen2MoeConfig,
-        Qwen2MoeForCausalLM,
-        Qwen2MoeForSequenceClassification,
-        Qwen2MoeModel,
-    )
-    from .modules.qwen2_vl import (
-        Qwen2VLConfig,
-        Qwen2VLForConditionalGeneration,
-        Qwen2VLModel,
-    )
-    from .modules.qwen3 import (
-        Qwen3Config,
-        Qwen3ForCausalLM,
-        Qwen3ForSequenceClassification,
-        Qwen3Model,
-    )
-    from .modules.qwen3_moe import (
-        Qwen3MoeConfig,
-        Qwen3MoeForCausalLM,
-        Qwen3MoeForSequenceClassification,
-        Qwen3MoeModel,
-    )
+    from .modules.llava import LlavaConfig, LlavaForConditionalGeneration, LlavaModel
+    from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
+    from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+    from .modules.mistral import MistralConfig, MistralForCausalLM, MistralForSequenceClassification, MistralModel
+    from .modules.mistral3 import Mistral3Config, Mistral3ForConditionalGeneration, Mistral3Model, Mistral3Tokenizer
+    from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
+    from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
+    from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
+    from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2ForSequenceClassification, Olmo2Model
+    from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
+    from .modules.opt import OPTConfig, OPTForCausalLM, OPTModel
+    from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
+    from .modules.phi3 import Phi3Config, Phi3ForCausalLM, Phi3Model
+    from .modules.phimoe import PhiMoeConfig, PhiMoeForCausalLM, PhiMoeModel
+    from .modules.pixtral import PixtralVisionConfig, PixtralVisionModel
+    from .modules.qwen2 import Qwen2Config, Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
+    from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
+    from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
+    from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
     from .modules.roberta import (
         RobertaConfig,
         RobertaForCausalLM,
@@ -896,27 +702,15 @@ if _tp.TYPE_CHECKING:
         SiglipVisionConfig,
         SiglipVisionModel,
     )
-    from .modules.stablelm import (
-        StableLmConfig,
-        StableLmForCausalLM,
-        StableLmModel,
-    )
+    from .modules.stablelm import StableLmConfig, StableLmForCausalLM, StableLmModel
     from .modules.whisper import (
         WhisperConfig,
         WhisperForAudioClassification,
         WhisperForConditionalGeneration,
         WhisperTimeStampLogitsProcessor,
     )
-    from .modules.xerxes import (
-        XerxesConfig,
-        XerxesForCausalLM,
-        XerxesModel,
-    )
-    from .modules.xerxes2 import (
-        Xerxes2Config,
-        Xerxes2ForCausalLM,
-        Xerxes2Model,
-    )
+    from .modules.xerxes import XerxesConfig, XerxesForCausalLM, XerxesModel
+    from .modules.xerxes2 import Xerxes2Config, Xerxes2ForCausalLM, Xerxes2Model
     from .trainers import (
         BaseTrainer,
         DistillationConfig,
@@ -949,11 +743,7 @@ if _tp.TYPE_CHECKING:
         ePathLike,
         traversals,
     )
-    from .utils.parameters_transformation import (
-        ModelConverter,
-        StateDictConverter,
-        TensorConverter,
-    )
+    from .utils.parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
 else:
     _sys.modules[__name__] = _LazyModule(
         __name__,

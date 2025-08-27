@@ -33,11 +33,7 @@ from jax import numpy as jnp
 from pydantic import BaseModel
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from easydel.infra import (
-    EasyDeLBaseConfig,
-    EasyDeLBaseModule,
-    EasyDeLState,
-)
+from easydel.infra import EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import TaskType
 from easydel.layers.attention import AttentionMechanisms
@@ -182,9 +178,9 @@ class RayDistributedTrainer:
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
         if model_task is None or model_type is None:
-            assert model_task is None and model_type is None, (
-                "If one of model_task or model_type is None, both must be None."
-            )
+            assert (
+                model_task is None and model_type is None
+            ), "If one of model_task or model_type is None, both must be None."
             assert model_class is not None, "model_class must be provided if model_task and model_type are not."
             model_type = model_class._model_type
             model_task = model_class._model_task
@@ -197,9 +193,9 @@ class RayDistributedTrainer:
             model_task = model_class._model_task
 
         if model_class is None:
-            assert model_type is not None and model_task is not None, (
-                "model_type and model_task must be provided if model_class is not specified."
-            )
+            assert (
+                model_type is not None and model_task is not None
+            ), "model_type and model_task must be provided if model_class is not specified."
             _, model_class_retrieved = get_modules_by_type(
                 model_type=model_type,
                 task_type=model_task,

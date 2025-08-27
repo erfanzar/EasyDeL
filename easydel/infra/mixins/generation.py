@@ -74,10 +74,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheMetaData,
-)
+from easydel.layers.caching import PagesCache, PagesCacheMetaData
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput

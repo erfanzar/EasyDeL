@@ -38,11 +38,7 @@ from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
 
-from .clip_configuration import (
-    CLIPConfig,
-    CLIPTextConfig,
-    CLIPVisionConfig,
-)
+from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
 
 def contrastive_loss(logits: jax.Array) -> jax.Array:
