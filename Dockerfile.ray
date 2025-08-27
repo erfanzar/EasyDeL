@@ -39,7 +39,7 @@ RUN python -c "import easydel; print('EasyDeL imported successfully')" && \
 
 RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz && \
     tar -xf google-cloud-cli-linux-x86_64.tar.gz && \
-    printf "N\nY\n\n" | ./google-cloud-sdk/install.sh && \
+    printf "N\nY\n\n" | script -qec ./google-cloud-sdk/install.sh && \
     rm google-cloud-cli-linux-x86_64.tar.gz
 
 ENV PYTHONUNBUFFERED=1 \
