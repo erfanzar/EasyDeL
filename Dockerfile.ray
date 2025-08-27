@@ -25,7 +25,7 @@ RUN sed -i \
     -e '/^# >>> conda initialize >>>/,/^# <<< conda initialize <<</d' \
     -e '/^export \+PATH=\$HOME\/anaconda3\/bin:\$PATH$/d' \
     /home/ray/.bashrc && \
-    printf 'export VIRTUAL_ENV=/home/ray/.venv\nexport PATH="/home/ray/.venv/bin:$PATH"' >> /home/ray/.bashrc
+    printf 'export VIRTUAL_ENV=/home/ray/.venv\nexport PATH="/home/ray/.venv/bin:$PATH"\n' >> /home/ray/.bashrc
 
 COPY . .
 
@@ -36,6 +36,11 @@ RUN python -c "import easydel; print('EasyDeL imported successfully')" && \
     if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
       python -c "import torch; print(f'PyTorch version: {torch.__version__}')"; \
     fi || true
+
+RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz && \
+    tar -xf google-cloud-cli-linux-x86_64.tar.gz && \
+    printf "N\nY\n\n" | ./google-cloud-sdk/install.sh && \
+    rm google-cloud-cli-linux-x86_64.tar.gz
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
