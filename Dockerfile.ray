@@ -2,6 +2,7 @@
 ARG RAY_IMAGE=rayproject/ray:2.36.0-py311
 FROM ${RAY_IMAGE}
 
+USER root
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 rsync ca-certificates curl git build-essential && rm -rf /var/lib/apt/lists/*
@@ -41,6 +42,9 @@ ENV VERSION=$VERSION \
 LABEL org.opencontainers.image.version=$VERSION \
       org.opencontainers.image.description="EasyDeL on Ray base image" \
       org.opencontainers.image.source="https://github.com/dvruette/EasyDeL"
+
+RUN chown -R ray:ray /app || true
+USER ray
 
 ENTRYPOINT []
 CMD ["bash"]
