@@ -89,24 +89,35 @@ services:
         - type=registry,ref=ghcr.io/erfanzar/easydel:cache-tpu
     image: easydel:dev-tpu
     container_name: easydel-tpu-dev
+    privileged: true
+    network_mode: host
+    ipc: host
     environment:
       <<: *common-variables
       JAX_PLATFORM_NAME: tpu
       TPU_NAME: ${TPU_NAME}
       TPU_ZONE: ${TPU_ZONE}
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/app/credentials.json}
+      TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS: 60
     volumes:
       - .:/app:rw
       - ~/.cache:/root/.cache:rw
       - easydel-pip-cache:/root/.cache/pip
       - easydel-uv-cache:/root/.cache/uv
       - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/app/credentials.json:ro
+      - /tmp:/tmp
     working_dir: /app
     command: bash
     stdin_open: true
     tty: true
-    networks:
-      - easydel-network
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    shm_size: "32gb"
 
   # Production CPU service
   easydel-cpu:

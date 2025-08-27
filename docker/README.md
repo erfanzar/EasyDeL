@@ -91,15 +91,12 @@ docker run --gpus all --privileged \
 - Using Docker Compose
 
 ```bash
-# Set TPU environment variables
-export TPU_NAME=your-tpu-name  # Optional, will auto-detect if not set
-export TPU_ZONE=us-central1-a  # Optional, will use default if not set
-
 # Start TPU container
 docker compose -f docker-compose.tpu.yml up
 
 # Run in detached mode
-docker compose -f docker-compose.tpu.yml up -d
+sudo docker compose -f docker-compose.tpu.yml up -d
+sudo docker compose -f docker-compose.tpu.yml run --rm easydel-tpu python -c "import jax; print('Devices:', jax.devices())"
 ```
 
 - Using Docker Run

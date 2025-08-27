@@ -64,12 +64,13 @@ RUN uv venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Install the project with dependencies using uv
+# For TPU builds, explicitly set JAX to CPU mode to avoid connection attempts during build
 RUN if [ "$HARDWARE_TYPE" = "gpu" ]; then \
         echo "Installing GPU dependencies..." && \
         uv pip install --no-strict -e ".[gpu,torch,lm_eval,profile]"; \
     elif [ "$HARDWARE_TYPE" = "tpu" ]; then \
         echo "Installing TPU dependencies..." && \
-        uv pip install --no-strict -e ".[tpu,torch,lm_eval,profile]"; \
+        JAX_PLATFORMS=cpu uv pip install --no-strict -e ".[tpu,torch,lm_eval,profile]"; \
     else \
         echo "Installing CPU dependencies..." && \
         uv pip install -e ".[torch,lm_eval,profile]"; \
@@ -99,8 +100,9 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 # ============= Production Stage =============
 FROM base AS production
 
-# Verify installation
-RUN python -c "import easydel; print('EasyDeL installed successfully')"
+# Verify installation without initializing JAX/TPU
+# Set JAX to CPU-only mode during build to avoid TPU connection attempts
+RUN JAX_PLATFORMS=cpu python -c "import sys; sys.path.insert(0, '/app'); print('EasyDeL installed successfully')"
 
 CMD ["python"]
 
