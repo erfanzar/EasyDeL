@@ -28,6 +28,7 @@ from .utils import LazyModule as _LazyModule
 from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
+_logger = _get_logger("EasyDeL")
 if _check_bool_flag("EASYDEL_AUTO", True):
     _sys.setrecursionlimit(10000)
 
@@ -94,7 +95,15 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     if _os.getenv("JAX_TRACEBACK_FILTERING", None) is None:
         _os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
+if _check_bool_flag("AUTO_INIT_JAX", True):
+    import jax
 
+    try:
+        jax.distributed.initialize()
+    except RuntimeError:
+        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
+    except Exception:  # maybe it's a single process
+        ...
 _import_structure = {
     "utils": [
         "ejit",
@@ -946,7 +955,6 @@ if _tp.TYPE_CHECKING:
         TensorConverter,
     )
 else:
-    _logger = _get_logger("EasyDeL")
     _sys.modules[__name__] = _LazyModule(
         __name__,
         globals()["__file__"],
