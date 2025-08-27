@@ -712,17 +712,17 @@ class SequenceGroup:
     def set_last_token_time(self, now: float) -> None:
         """Sets the last token time for Request level timings."""
         # If still in prefill phase, assertion fails.
-        assert not self.is_prefill(), (
-            "seq_group.set_last_token_time() should not be called if the seq_group is in prefill phase."
-        )
+        assert (
+            not self.is_prefill()
+        ), "seq_group.set_last_token_time() should not be called if the seq_group is in prefill phase."
         self.last_token_latency = now - self.metrics.last_token_time
         self.metrics.last_token_time = now
 
     def get_last_token_latency(self) -> float:
         """Returns the latency of the last token."""
-        assert not self.is_prefill(), (
-            "seq_group.get_last_token_latency() should not be called if the seq_group is in prefill phase."
-        )
+        assert (
+            not self.is_prefill()
+        ), "seq_group.get_last_token_latency() should not be called if the seq_group is in prefill phase."
         return self.last_token_latency
 
     def maybe_set_first_token_time(self, time: float) -> None:
@@ -922,9 +922,9 @@ class SequenceGroupMetadata(msgspec.Struct, tag=True, array_like=True, omit_defa
 
     def finish_step(self) -> None:
         assert self.state is not None
-        assert self.state.current_step < self.state.num_steps, (
-            f"current step {self.state.current_step}, num_steps {self.state.num_steps}"
-        )
+        assert (
+            self.state.current_step < self.state.num_steps
+        ), f"current step {self.state.current_step}, num_steps {self.state.num_steps}"
         self.state.current_step += 1
 
 

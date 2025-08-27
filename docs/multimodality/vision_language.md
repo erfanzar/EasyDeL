@@ -160,7 +160,7 @@ with model.mesh:
     outputs = model(**inputs)
     logits_per_image = outputs.logits_per_image
     probs = jax.nn.softmax(logits_per_image, axis=1)
-    
+
     print(f"Prediction probabilities: {probs[0]}")
     # Should show highest probability for "a photo of a cat"
 ```
@@ -180,7 +180,7 @@ from transformers import AutoProcessor
 # Load image
 image = Image.open(
     requests.get(
-        "http://images.cocodataset.org/val2017/000000039769.jpg", 
+        "http://images.cocodataset.org/val2017/000000039769.jpg",
         stream=True
     ).raw
 )
@@ -196,16 +196,16 @@ model = ed.AutoEasyDeLModel.from_pretrained(
 # Prepare inputs
 texts = ["a photo of a cat", "a photo of a dog", "a photo of a bird"]
 inputs = processor(
-    text=texts, 
-    images=image, 
-    padding="max_length", 
+    text=texts,
+    images=image,
+    padding="max_length",
     return_tensors="jax"
 )
 
 # Get predictions
 with model.mesh:
     outputs = model(**inputs)
-    
+
 # Process results
 probs = jax.nn.sigmoid(outputs.logits_per_image)
 for i, text in enumerate(texts):

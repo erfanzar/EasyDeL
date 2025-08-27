@@ -13,11 +13,7 @@
 # limitations under the License.
 
 from .gemma_configuration import GemmaConfig
-from .modeling_gemma import (
-    GemmaForCausalLM,
-    GemmaForSequenceClassification,
-    GemmaModel,
-)
+from .modeling_gemma import GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
 
 __all__ = (
     "GemmaConfig",

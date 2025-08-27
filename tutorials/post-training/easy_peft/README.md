@@ -113,7 +113,7 @@ def main():
     processor.padding_side = "left"
     if processor.pad_token_id is None:
         processor.pad_token_id = processor.eos_token_id
-    
+
     logger.info(f"Loading base model: {MODEL_ID}")
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         MODEL_ID,

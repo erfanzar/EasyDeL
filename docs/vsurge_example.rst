@@ -83,7 +83,7 @@ Instantiate the `vSurge` engine using the `create_odriver` class method. This me
 -   `seed`: A random seed for reproducibility.
 
 .. code-block:: python
- 
+
     max_concurrent_decodes = 64
     max_concurrent_prefill = 1
 

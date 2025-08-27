@@ -465,9 +465,9 @@ class vInferenceConfig:
         """
         if self.partition_rules is not None:
             return self.partition_rules
-        assert self.partition_axis is not None, (
-            "partition axis is required for state sharding if partition_rules is not provided"
-        )
+        assert (
+            self.partition_axis is not None
+        ), "partition axis is required for state sharding if partition_rules is not provided"
         paxis = self.partition_axis
         kvps = PartitionSpec(
             paxis.batch_axis,

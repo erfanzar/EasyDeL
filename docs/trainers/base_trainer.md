@@ -91,7 +91,7 @@ class CustomTrainer(BaseTrainer):
             processed_batch = batch # Placeholder
             return processed_batch
         return collect_fn
-    
+
     def configure_functions(self, *args, **kwargs) -> TrainerConfigureFunctionOutput:
         # Define your custom train and eval steps
         def train_step(state, batch):

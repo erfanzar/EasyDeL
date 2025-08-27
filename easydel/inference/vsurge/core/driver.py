@@ -25,14 +25,7 @@ from eformer.loggings import get_logger
 from jax import numpy as jnp
 
 from ...sampling_params import JitableSamplingParams
-from ..utils import (
-    ActiveRequest,
-    MetricsRecorder,
-    ReturnSample,
-    SafeThread,
-    pad_tokens,
-    process_result_tokens,
-)
+from ..utils import ActiveRequest, MetricsRecorder, ReturnSample, SafeThread, pad_tokens, process_result_tokens
 from .engine import vEngine
 from .scheduler import Scheduler, SchedulerAction
 

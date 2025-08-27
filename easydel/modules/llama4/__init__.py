@@ -13,11 +13,7 @@
 # limitations under the License.
 
 
-from .llama4_configuration import (
-    Llama4Config,
-    Llama4TextConfig,
-    Llama4VisionConfig,
-)
+from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
 from .modeling_llama4 import (
     Llama4ForCausalLM,
     Llama4ForConditionalGeneration,

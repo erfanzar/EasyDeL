@@ -27,12 +27,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput
 from easydel.infra.utils import ACT2FN
-from easydel.layers.caching import (
-    PagesCache,
-    PagesMetadata,
-    TransformerCache,
-    TransformerMetadata,
-)
+from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel

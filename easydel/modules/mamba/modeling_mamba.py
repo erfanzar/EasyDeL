@@ -28,11 +28,7 @@ from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import MambaCache, MambaCacheMetaData, MambaCacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm

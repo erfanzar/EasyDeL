@@ -1,0 +1,21 @@
+services:
+  easydel-tpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HARDWARE_TYPE: tpu
+    image: easydel:tpu
+    container_name: easydel-tpu
+    stdin_open: true
+    tty: true
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+    working_dir: /workspace
+    environment:
+      - JAX_PLATFORMS=${JAX_PLATFORMS:-tpu,cpu}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+    command: bash

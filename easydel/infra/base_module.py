@@ -41,13 +41,7 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
 from .etils import EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
-from .loss_utils import (
-    LOSS_MAPPING,
-    ForCausalLMLoss,
-    ForSequenceClassificationLoss,
-    LossConfig,
-    LossMetrics,
-)
+from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 
 if tp.TYPE_CHECKING:

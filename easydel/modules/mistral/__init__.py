@@ -13,11 +13,7 @@
 # limitations under the License.
 
 from .mistral_configuration import MistralConfig
-from .modeling_mistral import (
-    MistralForCausalLM,
-    MistralForSequenceClassification,
-    MistralModel,
-)
+from .modeling_mistral import MistralForCausalLM, MistralForSequenceClassification, MistralModel
 
 __all__ = (
     "MistralConfig",

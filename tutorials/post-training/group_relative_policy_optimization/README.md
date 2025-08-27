@@ -261,7 +261,7 @@ def main():
         # Each prompt in the original batch has `num_return_sequences` completions generated for it.
         # So we need to duplicate the solutions accordingly.
         solutions = tokenizer.batch_decode(batch["solution_ids"]) * num_return_sequences
-        
+
         completion_contents = [completion[0]["content"] for completion in completions]
         rewards = []
         for content, solution in zip(completion_contents, solutions, strict=False):
@@ -388,7 +388,7 @@ if __name__ == "__main__":
     # Correction: The `eformer.executor.ray.execute` decorator handles launching.
     # So, a direct call to `main()` is what's intended IF the script itself
     # is what `ray job submit` or similar would target.
-    
+
     # Let's stick to the original `main()` as it seems to be the pattern for `eformer.executor`.
     main()
 ```

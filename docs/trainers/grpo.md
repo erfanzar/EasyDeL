@@ -17,23 +17,23 @@ grpo_config = GRPOConfig(
     # Model and training basics
     model_name="GRPOTrainer",    # Name of the model
     learning_rate=1e-6,          # Learning rate for optimization
-    
+
     # Sequence parameters
     max_prompt_length=512,       # Maximum length for prompts
     max_completion_length=256,   # Maximum length for completions
-    
+
     # GRPO specific parameters
     beta=0.04,                   # Controls policy deviation penalty
-    
+
     # Reference model parameters
     sync_ref_model=False,        # Whether to sync the reference model periodically
     ref_model_mixup_alpha=0.9,   # Alpha parameter for reference model mixing
     ref_model_sync_steps=64,     # Steps between reference model syncs
-    
+
     # Dataset processing
     dataset_num_proc=None,       # Processes for dataset processing
     skip_apply_chat_template=False,  # Skip chat template extraction
-    
+
     # Batch and training parameters
     total_batch_size=16,         # Total batch size
     num_train_epochs=3,          # Number of training epochs
@@ -74,11 +74,11 @@ def math_problem_reward_function(completion, reference_answer=None):
         answer_match = re.search(r"The answer is (\d+)", completion)
         if answer_match:
             extracted_answer = int(answer_match.group(1))
-            
+
             # Compare with reference if available
             if reference_answer is not None:
                 return 1.0 if extracted_answer == reference_answer else 0.0
-            
+
             # Some other scoring logic when reference not available
             return min(1.0, max(0.0, 0.5))  # Default score
         return 0.0

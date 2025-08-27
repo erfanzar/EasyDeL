@@ -274,4 +274,4 @@ To optimize Whisper inference performance:
 
 4. **Timestamps**: Use `return_timestamps=True` for audio-text alignment in applications
 
-5. **Translation**: The "translate" task works well for converting non-English speech to English text 
+5. **Translation**: The "translate" task works well for converting non-English speech to English text

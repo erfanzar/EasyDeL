@@ -51,9 +51,7 @@ from easydel.layers.moe import (
     RowParallelMoELinear,
 )
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
-    Qwen2MoeConfig as Qwen2MoeConfig,
-)
+from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig as Qwen2MoeConfig
 
 
 class Qwen2MoeMLPStack(nn.Module):
