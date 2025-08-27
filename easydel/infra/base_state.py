@@ -462,25 +462,16 @@ class EasyDeLState(struct.PyTreeNode):
     def save_optimizer(
         self,
         save_directory: str | os.PathLike | ePathLike,
-        enable: bool | None = None,
         float_dtype: jnp.dtype | None = None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
     ):
         save_directory = ePath(save_directory)
         if self.opt_state is not None:
-            if enable is None:
-                enable = jax.process_index() == 0
-            if enable:
-                save_directory.mkdir(parents=True, exist_ok=True)
-                optim_path = save_directory
-            else:
-                optim_path = ePath("/dev/null")
-
+            save_directory.mkdir(parents=True, exist_ok=True)
+            optim_path = save_directory
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
                 with self.model.mesh:
-                    AsyncCheckpointManager(max_workers=1, enable=enable).save(
+                    AsyncCheckpointManager(max_workers=1).save(
                         tree=self.opt_state,
                         path=optim_path,
                         mesh=self.model.mesh,
@@ -500,10 +491,7 @@ class EasyDeLState(struct.PyTreeNode):
         self,
         save_directory: str | os.PathLike | ePathLike,
         float_dtype: jnp.dtype | None = None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
         save_optimizer: bool = True,
-        enable: bool | None = None,
     ):
         """Saves the entire `EasyDeLState` to a directory.
 
@@ -522,19 +510,10 @@ class EasyDeLState(struct.PyTreeNode):
                 slightly from expected. Defaults to True.
             save_optimizer (bool):
                 If True, saves the optimizer state. Defaults to True.
-            enable (tp.Optional[bool]):
-                If set, controls whether saving happens (True) or is skipped (False). If None, saving typically
-                occurs only on JAX process index 0. Defaults to None.
         """
         save_directory = ePath(save_directory)
         if save_optimizer:
-            self.save_optimizer(
-                save_directory=save_directory,
-                enable=enable,
-                float_dtype=float_dtype,
-                verbose=verbose,
-                mismatch_allowed=mismatch_allowed,
-            )
+            self.save_optimizer(save_directory=save_directory, float_dtype=float_dtype)
         else:
             logger.info("Skipping optimizer saving as requested.")
 
@@ -542,9 +521,6 @@ class EasyDeLState(struct.PyTreeNode):
             save_directory=save_directory,
             gather_fns=self.model._gather_fns,
             float_dtype=float_dtype,
-            mismatch_allowed=mismatch_allowed,
-            verbose=verbose,
-            enable=enable,
         )
 
     @classmethod
