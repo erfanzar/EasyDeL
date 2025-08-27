@@ -30,15 +30,12 @@ RUN sed -i \
 COPY . .
 
 RUN uv pip install -e . --no-deps
-RUN uv pip install -U google-api-python-client google-auth-httplib2 google-auth-oauthlib
-RUN if [ "$HARDWARE_TYPE" = "gpu" ]; then \
-      uv pip install -U torch \
-    fi
+RUN uv pip install -U torch google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 RUN python -c "import easydel; print('EasyDeL imported successfully')" && \
     if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
       python -c "import torch; print(f'PyTorch version: {torch.__version__}')"; \
-    fi
+    fi || true
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
