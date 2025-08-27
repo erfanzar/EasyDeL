@@ -40,11 +40,11 @@ EasyDeL provides unparalleled flexibility in customizing and optimizing your mod
 - **Sharding Strategies**: Easily customize and experiment with different sharding strategies to optimize performance across multiple devices.
 - **Algorithm Customization**: Modify and fine-tune algorithms to suit your specific needs and hardware configurations.
 - **Attention Mechanisms**: Choose from over 10 types of attention mechanisms optimized for GPU/TPU/CPU, including:
-  - Flash Attention 2 (CPU(*XLA*), GPU(*Triton*), TPU(*Pallas*)) 
+  - Flash Attention 2 (CPU(*XLA*), GPU(*Triton*), TPU(*Pallas*))
   - Blockwise Attention (CPU, GPU, TPU | *Pallas*-*Jax*)
   - Ring Attention (CPU, GPU, TPU | *Pallas*-*Jax*)
   - Splash Attention (TPU | *Pallas*)
-  - SDPA (CPU(*XLA*), GPU(*CUDA*), TPU(*XLA*)) 
+  - SDPA (CPU(*XLA*), GPU(*CUDA*), TPU(*XLA*))
 
 This level of customization allows you to squeeze every ounce of performance from your hardware while tailoring the model behavior to your exact requirements.
 
@@ -128,7 +128,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    esurge_examples
    whisper_api.md
    vinference_api.md
-	 vsurge_example 
+	 vsurge_example
    vsurge_api_server_example
    trainers/dpo.md
    trainers/grpo.md
@@ -140,7 +140,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    multimodality/inference.md
    trc-welcome.md
 
- 
+
 
 .. code-block:: bibtex
 

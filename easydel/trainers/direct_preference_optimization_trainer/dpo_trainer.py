@@ -65,9 +65,9 @@ class DPOTrainer(Trainer):
         eval_dataset: Dataset | None = None,
         data_collator: tp.Callable | None = None,
     ):
-        assert arguments is not None, (
-            "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
-        )
+        assert (
+            arguments is not None
+        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
         assert isinstance(arguments, DPOConfig), f"arguments type must be `DPOConfig` but got {type(arguments)}"
 
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."

@@ -75,12 +75,12 @@ def main():
     # Imports are placed inside the `main` function. This ensures that these libraries
     # are imported within the Ray remote worker's process, which is important for
     # dependency management in distributed contexts.
-    import easydel as ed  # The EasyDeL library. #noqa
-
     import jax  # JAX: numerical computation library, backbone of EasyDeL.
     from datasets import load_dataset  # Hugging Face Datasets library.
     from jax import numpy as jnp  # JAX's NumPy-like API.
     from transformers import AutoTokenizer  # Hugging Face Transformers for tokenizer.
+
+    import easydel as ed  # The EasyDeL library.
 
     # Initialize EasyDeL's logger for informative output during training.
     logger = ed.utils.get_logger("SFT-EasyDeL")

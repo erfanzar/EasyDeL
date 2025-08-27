@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_qwen2_vl import (
-    Qwen2VLForConditionalGeneration,
-    Qwen2VLModel,
-)
+from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel
 from .qwen2_vl_configuration import Qwen2VLConfig
 
 __all__ = ("Qwen2VLConfig", "Qwen2VLForConditionalGeneration", "Qwen2VLModel")

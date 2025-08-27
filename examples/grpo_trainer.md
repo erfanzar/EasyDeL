@@ -193,7 +193,7 @@ def tokenize_function(batch, tokenizer, tools):
             {"role": "system", "content": "Solve step by step. Use <think> tags."},
             {"role": "user", "content": question}
         ])
-    
+
     # Tokenize
     return tokenizer(
         prompts,

@@ -6,15 +6,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from easydel.inference.esurge import (
-    initialize_metrics,
-)
+from easydel.inference.esurge import initialize_metrics
 from easydel.inference.esurge.dashboard import create_dashboard
-from easydel.inference.esurge.monitoring import (
-    start_console_monitor,
-    start_monitoring_server,
-    stop_monitoring,
-)
+from easydel.inference.esurge.monitoring import start_console_monitor, start_monitoring_server, stop_monitoring
 
 
 def simulate_inference_workload():

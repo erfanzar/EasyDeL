@@ -58,9 +58,9 @@ class ORPOTrainer(Trainer):
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
     ):
-        assert arguments is not None, (
-            "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
-        )
+        assert (
+            arguments is not None
+        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
         assert isinstance(arguments, ORPOConfig), f"arguments type must be `ORPOConfig` but got {type(arguments)}"
 
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."

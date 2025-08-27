@@ -95,10 +95,11 @@ def main():
     6.  Saves the results to a JSON file and prints a summary.
     """
     # Imports are done inside the remote function as they are needed on the worker.
-    import easydel as ed  # The EasyDeL library. #noqa
     import jax
     from jax import numpy as jnp
     from transformers import AutoTokenizer
+
+    import easydel as ed  # The EasyDeL library.
 
     logger = ed.utils.get_logger("vSurge-EasyDeL")
     logger.info(f"Starting main execution on Ray worker with JAX backend: {jax.default_backend()}")

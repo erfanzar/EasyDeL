@@ -13,11 +13,7 @@
 # limitations under the License.
 
 from .cohere_configuration import CohereConfig
-from .modeling_cohere import (
-    CohereForCausalLM,
-    CohereForSequenceClassification,
-    CohereModel,
-)
+from .modeling_cohere import CohereForCausalLM, CohereForSequenceClassification, CohereModel
 
 __all__ = (
     "CohereConfig",

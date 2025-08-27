@@ -18,10 +18,7 @@ import jax.numpy as jnp
 from flax.nnx import Param
 from flax.nnx.module import Module
 from flax.nnx.nn import initializers
-from flax.typing import (
-    Dtype,
-    PrecisionLike,
-)
+from flax.typing import Dtype, PrecisionLike
 
 Array = jax.Array
 Axis = int

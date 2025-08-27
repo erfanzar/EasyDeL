@@ -18,10 +18,7 @@ from enum import Enum
 
 from eformer.pytree import auto_pytree
 
-from .base_module import (
-    EasyDeLBaseConfig,
-    EasyDeLBaseModule,
-)
+from .base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 
 T = tp.TypeVar("T")
 

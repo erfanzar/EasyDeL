@@ -17,22 +17,22 @@ sft_config = SFTConfig(
     # Model and training basics
     model_name="SFTTrainer",     # Name of the model
     learning_rate=2e-5,          # Learning rate for optimization
-    
+
     # Dataset processing parameters
     dataset_text_field=None,     # Name of the text field in the dataset
     add_special_tokens=False,    # Whether to add special tokens
     packing=False,               # Controls whether sequences are packed
-    
+
     # Packing parameters
     num_of_sequences=1024,       # Number of sequences for packing
     chars_per_token=3.6,         # Characters per token estimate
-    
+
     # Dataset processing
     dataset_num_proc=None,       # Number of processes for dataset processing
     dataset_batch_size=1000,     # Batch size for dataset tokenization
     dataset_kwargs=None,         # Additional dataset creation arguments
     eval_packing=None,           # Whether to pack eval dataset
-    
+
     # Batch and training parameters
     total_batch_size=16,         # Total batch size
     num_train_epochs=3,          # Number of training epochs
