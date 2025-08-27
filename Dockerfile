@@ -40,7 +40,9 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-	libgomp1 && rm -rf /var/lib/apt/lists/*
+	libgomp1 \
+	rsync \
+	&& rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
