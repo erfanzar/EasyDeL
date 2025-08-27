@@ -430,7 +430,7 @@ class EasyDeLState(struct.PyTreeNode):
         )
         struct_path = load_directory / OPTIMIZER_STRUCT_NAME
 
-        if not (optim_path.exists() and struct_path.exists()):
+        if not struct_path.exists():
             raise FileNotFoundError(f"Optimizer files are missing at {load_directory}")
         try:
             leaves, _ = AsyncCheckpointManager(max_workers=1).load(
