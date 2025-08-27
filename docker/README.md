@@ -55,18 +55,22 @@ sudo docker build --build-arg HARDWARE_TYPE=cpu -t easydel:cpu .
 
 ```bash
 # Start GPU container with all necessary mounts
-docker-compose -f docker-compose.gpu.yml up
+docker compose -f docker-compose.gpu.yml up
 
 # Run in detached mode
-docker-compose -f docker-compose.gpu.yml up -d
+docker compose -f docker-compose.gpu.yml up -d
 
 # Execute commands in running container
-docker-compose -f docker-compose.gpu.yml exec easydel-gpu python your_script.py
+docker compose -f docker-compose.gpu.yml exec easydel-gpu python your_script.py
 ```
 
 #### Using Docker Run
 
 ```bash
+# Sanity Check
+
+docker compose -f docker-compose.gpu.yml exec easydel-gpu python -c "import jax; print('Devices:', jax.devices())"
+
 # Basic GPU container
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
@@ -92,10 +96,10 @@ export TPU_NAME=your-tpu-name  # Optional, will auto-detect if not set
 export TPU_ZONE=us-central1-a  # Optional, will use default if not set
 
 # Start TPU container
-docker-compose -f docker-compose.tpu.yml up
+docker compose -f docker-compose.tpu.yml up
 
 # Run in detached mode
-docker-compose -f docker-compose.tpu.yml up -d
+docker compose -f docker-compose.tpu.yml up -d
 ```
 
 - Using Docker Run
@@ -236,14 +240,14 @@ docker build --build-arg HARDWARE_TYPE=gpu -t easydel:gpu-cuda12.8 .
 ### Train a Model on GPU
 
 ```bash
-docker-compose -f docker-compose.gpu.yml run --rm easydel-gpu \
+docker compose -f docker-compose.gpu.yml run --rm easydel-gpu \
     python train.py --config configs/gpu_training.yaml
 ```
 
 ### Run Inference on TPU
 
 ```bash
-docker-compose -f docker-compose.tpu.yml run --rm easydel-tpu \
+docker compose -f docker-compose.tpu.yml run --rm easydel-tpu \
     python inference.py --model-path /workspace/models/my_model
 ```
 
