@@ -16,8 +16,9 @@ ARG HARDWARE_TYPE=cpu
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Install Python 3.11 if using CUDA or TPU base image
-RUN if [ -f /etc/apt/sources.list.d/cuda.list ] || [ ! -f /usr/bin/python ]; then \
+# Install Python 3.11 only for Ubuntu-based GPU/TPU images
+RUN if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
+        set -eux; \
         apt-get update && \
         apt-get install -y --no-install-recommends \
             ca-certificates \
@@ -27,8 +28,6 @@ RUN if [ -f /etc/apt/sources.list.d/cuda.list ] || [ ! -f /usr/bin/python ]; the
             tzdata && \
         ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
         echo $TZ > /etc/timezone && \
-        mkdir -p /etc/apt/keyrings && \
-        apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys F23C5A6CF475977595C89F51BA6932366A755776 && \
         add-apt-repository -y ppa:deadsnakes/ppa && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
@@ -38,7 +37,10 @@ RUN if [ -f /etc/apt/sources.list.d/cuda.list ] || [ ! -f /usr/bin/python ]; the
             python3.11-distutils \
             python3-pip && \
         update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
-        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1; \
+        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+        rm -rf /var/lib/apt/lists/*; \
+    else \
+        echo "CPU base (Debian) already has Python 3.11; skipping Ubuntu-specific install."; \
     fi
 
 # Install system dependencies
