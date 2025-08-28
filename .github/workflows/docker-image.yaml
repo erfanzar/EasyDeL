@@ -68,22 +68,6 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=cpu
 
-      - name: Build and push GPU Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-gpu
-            ghcr.io/erfanzar/easydel:latest-gpu
-            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-gpu
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            HARDWARE_TYPE=gpu
-
       - name: Build and push TPU Docker image
         uses: docker/build-push-action@v6
         with:
@@ -99,3 +83,19 @@ jobs:
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=tpu
+            
+      - name: Build and push GPU Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-gpu
+            ghcr.io/erfanzar/easydel:latest-gpu
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-gpu
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            HARDWARE_TYPE=gpu
