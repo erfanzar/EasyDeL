@@ -152,7 +152,32 @@ COPY --chown=root:root tests* ./tests/
 
 # Run tests by default
 CMD ["python", "-m", "pytest", "-v", "--tb=short"]
+ 
+# Install Ray with GCP support (REQUIRED for Ray clusters)
+RUN pip install 'ray[default,gcp]==2.34.0'
 
-# ============= Final stage selector =============
-# Default to production if not specified
+# Install rsync and openssh (REQUIRED for Ray cluster communication)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        rsync \
+        openssh-client \
+        sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user (REQUIRED - Ray doesn't work well as root)
+RUN useradd -m -s /bin/bash easydel && \
+    echo "easydel ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
+    chown -R easydel:easydel /app
+
+# Fix shell for rsync (REQUIRED to prevent protocol errors)
+ENV HOME=/home/easydel
+RUN mkdir -p $HOME && \
+    touch $HOME/.bashrc && \
+    chown -R easydel:easydel $HOME && \
+    echo 'if [ -z "$PS1" ]; then return; fi' >> $HOME/.bashrc && \
+    touch $HOME/.hushlogin
+
+# Switch to non-root user
+USER easydel
+
 FROM production AS final
