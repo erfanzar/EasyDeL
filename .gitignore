@@ -16,6 +16,7 @@ nohup.out
 sharding_test.py
 exprimental.py
 pallas_env.py
+cluster.yaml
 test_EasyDeLState.py
 memory_log_dir/
 wandb
