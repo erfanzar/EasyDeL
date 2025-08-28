@@ -1,183 +1,99 @@
-# Dockerfile for EasyDeL using uv package manager
-# Use CUDA base image for GPU support, TPU base, or python:slim for CPU
+# syntax=docker/dockerfile:1
 ARG HARDWARE_TYPE=cpu
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04 AS gpu-base
 FROM ubuntu:22.04 AS tpu-base
 FROM python:3.11-slim AS cpu-base
 
-# ============= Base Build Stage =============
-# Select base image based on hardware type
-FROM ${HARDWARE_TYPE}-base AS base
+FROM ${HARDWARE_TYPE}-base AS final
+SHELL ["/bin/bash", "-lc"]
 
-# Re-declare ARG after FROM
 ARG HARDWARE_TYPE=cpu
 
-# Set timezone to avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# Install Python 3.11 only for Ubuntu-based GPU/TPU images
-RUN if [ "$HARDWARE_TYPE" = "gpu" ] || [ "$HARDWARE_TYPE" = "tpu" ]; then \
-        set -eux; \
+RUN set -eux; \
+    if [[ "$HARDWARE_TYPE" != "cpu" ]]; then \
         apt-get update && \
         apt-get install -y --no-install-recommends \
-            ca-certificates \
-            gnupg \
-            lsb-release \
-            software-properties-common \
-            tzdata && \
-        ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
-        echo $TZ > /etc/timezone && \
+            ca-certificates gnupg lsb-release software-properties-common tzdata && \
+        ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
         add-apt-repository -y ppa:deadsnakes/ppa && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
-            python3.11 \
-            python3.11-venv \
-            python3.11-dev \
-            python3.11-distutils \
-            python3-pip && \
+            python3.11 python3.11-venv python3.11-dev python3.11-distutils python3-pip && \
         update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
-        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
-        rm -rf /var/lib/apt/lists/*; \
-    else \
-        echo "CPU base (Debian) already has Python 3.11; skipping Ubuntu-specific install."; \
-    fi
+        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1; \
+    fi; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential git curl wget \
+        libgomp1 rsync openssh-client sudo tmux screen netbase gnupg && \
+    # TPU needs Docker engine inside to manage TPU slices
+    if [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
+        apt-get install -y --no-install-recommends docker.io; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 \
-    git \
-    curl \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-
-# Set working directory
 WORKDIR /app
 
-# Copy project files
+ENV VIRTUAL_ENV=/app/.venv
+RUN uv venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:/usr/local/cuda/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+
 COPY pyproject.toml README.md ./
 COPY easydel ./easydel
 
-# Create and activate virtual environment
-ENV VIRTUAL_ENV=/app/.venv
-RUN uv venv $VIRTUAL_ENV
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-# Install the project with dependencies using uv
-# For TPU builds, explicitly set JAX to CPU mode to avoid connection attempts during build
-RUN if [ "$HARDWARE_TYPE" = "gpu" ]; then \
-        echo "Installing GPU dependencies..." && \
-        uv pip install --no-strict -e ".[gpu,torch,lm_eval,profile]"; \
-    elif [ "$HARDWARE_TYPE" = "tpu" ]; then \
-        echo "Installing TPU dependencies..." && \
+RUN set -eux; \
+    if [[ "$HARDWARE_TYPE" == "gpu" ]]; then \
+        echo "Installing GPU deps"; \
+        JAX_PLATFORMS=cpu uv pip install --no-strict -e ".[gpu,torch,lm_eval,profile]"; \
+    elif [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
+        echo "Installing TPU deps"; \
         JAX_PLATFORMS=cpu uv pip install --no-strict -e ".[tpu,torch,lm_eval,profile]"; \
     else \
-        echo "Installing CPU dependencies..." && \
+        echo "Installing CPU deps"; \
         uv pip install -e ".[torch,lm_eval,profile]"; \
     fi
 
-# Set Python to use unbuffered output
-ENV PYTHONUNBUFFERED=1
+RUN uv pip install --no-strict 'ray[default,gcp]==2.34.0'
 
-# Add NVIDIA libraries to LD_LIBRARY_PATH for GPU version
-RUN if [ -f /etc/apt/sources.list.d/cuda.list ]; then \
-        echo "/usr/local/cuda/lib64" >> /etc/ld.so.conf.d/cuda.conf && \
-        echo "/usr/local/cuda/extras/CUPTI/lib64" >> /etc/ld.so.conf.d/cuda.conf && \
-        ldconfig; \
+RUN set -eux; \
+    if [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
+        git clone https://github.com/dlwh/ray.git /tmp/ray --branch tpu_docker_2.34 --depth 1 && \
+        py_site=$(python - <<'PY'\nimport site; print(next(p for p in site.getsitepackages() if "site-packages" in p)) )\nPY) && \
+        cp /tmp/ray/python/ray/autoscaler/_private/gcp/tpu_command_runner.py \
+           "$py_site/ray/autoscaler/_private/gcp/tpu_command_runner.py" && \
+        rm -rf /tmp/ray && \
+        curl -fsSL https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz -o /tmp/google-cloud-sdk.tar.gz && \
+        mkdir -p /usr/local/gcloud && \
+        tar -C /usr/local/gcloud -xzf /tmp/google-cloud-sdk.tar.gz && \
+        /usr/local/gcloud/google-cloud-sdk/install.sh --quiet && \
+        rm -f /tmp/google-cloud-sdk.tar.gz; \
     fi
 
-# Set environment based on hardware type
-ENV HARDWARE_TYPE=${HARDWARE_TYPE}
-
-# Set CUDA environment for GPU
-ENV PATH=/usr/local/cuda/bin:${PATH}
-# Don't set LD_LIBRARY_PATH as it interferes with JAX's CUDA detection
-# See: https://github.com/jax-ml/jax/issues/29843
-
-# TPU configuration is handled at runtime, not build time
-# TPUs will be configured through environment variables when running the container
-
-# ============= Production Stage =============
-FROM base AS production
-
-# Verify installation without initializing JAX/TPU
-# Set JAX to CPU-only mode during build to avoid TPU connection attempts
-RUN JAX_PLATFORMS=cpu python -c "import sys; sys.path.insert(0, '/app'); print('EasyDeL installed successfully')"
-
-CMD ["python"]
-
-# ============= Development Stage =============
-FROM production AS development
-
-# Install development dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    vim \
-    nano \
-    htop \
-    tmux \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install development Python packages
-RUN uv pip install --no-strict \
-    ipython \
-    ipdb \
-    pytest \
-    pytest-cov \
-    black \
-    ruff \
-    mypy
-
-# Set development environment
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV DEVELOPMENT=1
-
-CMD ["bash"]
-
-# ============= Test Stage =============
-FROM production AS test
-
-# Install test dependencies
-RUN uv pip install --no-strict \
-    pytest \
-    pytest-cov \
-    pytest-xdist \
-    pytest-timeout \
-    hypothesis
-
-# Copy test files if they exist
-COPY --chown=root:root tests* ./tests/
-
-# Run tests by default
-CMD ["python", "-m", "pytest", "-v", "--tb=short"]
- 
-# Install Ray with GCP support (REQUIRED for Ray clusters)
-RUN pip install 'ray[default,gcp]==2.34.0'
-
-# Install rsync and openssh (REQUIRED for Ray cluster communication)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        rsync \
-        openssh-client \
-        sudo && \
-    rm -rf /var/lib/apt/lists/*
-
-# Create non-root user (REQUIRED - Ray doesn't work well as root)
 RUN useradd -m -s /bin/bash easydel && \
     echo "easydel ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
-    chown -R easydel:easydel /app
+    chown -R easydel:easydel /app && \
+    if [[ "$HARDWARE_TYPE" == "tpu" ]]; then usermod -aG docker easydel; fi
 
-# Fix shell for rsync (REQUIRED to prevent protocol errors)
 ENV HOME=/home/easydel
-RUN mkdir -p $HOME && \
-    touch $HOME/.bashrc && \
-    chown -R easydel:easydel $HOME && \
-    echo 'if [ -z "$PS1" ]; then return; fi' >> $HOME/.bashrc && \
-    touch $HOME/.hushlogin
+RUN mkdir -p "$HOME" && \
+    touch "$HOME/.bashrc" && \
+    echo 'if [ -z "$PS1" ]; then return; fi' >> "$HOME/.bashrc" && \
+    touch "$HOME/.hushlogin" && \
+    chown -R easydel:easydel "$HOME"
 
-# Switch to non-root user
+ENV PYTHONPATH=/app:/app/easydel:. \
+    RAY_USAGE_STATS_ENABLED=0 \
+    TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS=60 \
+    TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES=1024 \
+    PATH=$PATH:/usr/local/gcloud/google-cloud-sdk/bin
+
 USER easydel
+WORKDIR /app
 
-FROM production AS final
+CMD ["bash"]
