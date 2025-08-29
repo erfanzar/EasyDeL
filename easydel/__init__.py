@@ -96,8 +96,9 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         _os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 
-if _check_bool_flag("AUTO_INIT_JAX", True):
-    from eformer.executor.ray.cluster_util import DistributedConfig as _DistributedConfig
+if _check_bool_flag("AUTO_INIT_CLUSTER", True):
+    from eformer.executor import DistributedConfig as _DistributedConfig
+    # from eformer.executor import RayClusterConfig as _RayClusterConfig
 
     try:
         _DistributedConfig().initialize()
@@ -755,7 +756,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.51", "0.0.52", "0.0.53", "0.0.54"]
+    _targeted_versions = ["0.0.52", "0.0.53", "0.0.54"]
 
     from eformer import __version__ as _eform_version
 
