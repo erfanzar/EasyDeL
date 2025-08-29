@@ -95,15 +95,17 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     if _os.getenv("JAX_TRACEBACK_FILTERING", None) is None:
         _os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
+
 if _check_bool_flag("AUTO_INIT_JAX", True):
-    import jax
+    from eformer.executor.ray.cluster_util import DistributedConfig as _DistributedConfig
 
     try:
-        jax.distributed.initialize()
+        _DistributedConfig().initialize()
     except RuntimeError:
         _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
     except Exception:  # maybe it's a single process
         ...
+
 _import_structure = {
     "utils": [
         "ejit",
