@@ -853,9 +853,7 @@ class BaseTrainer(BaseTrainerProtocol):
         state.save_state(
             save_directory=directory_name,
             float_dtype=self.model.param_dtype,
-            verbose=self.arguments.verbose,
             save_optimizer=self.arguments.save_optimizer_state,
-            enable=self.is_enable,
         )
 
         return str(directory_name)
