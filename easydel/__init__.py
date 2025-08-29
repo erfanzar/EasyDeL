@@ -23,6 +23,7 @@ from logging import getLogger as _getlogger
 
 from eformer.loggings import get_logger as _get_logger
 from packaging.version import Version as _version
+from ray import is_initialized
 
 from .utils import LazyModule as _LazyModule
 from .utils import check_bool_flag as _check_bool_flag
@@ -768,7 +769,7 @@ else:
 if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     from eformer.executor import DistributedConfig as _DistributedConfig
     from eformer.executor import RayClusterConfig as _RayClusterConfig
-
+    import ray 
     try:
         _DistributedConfig().initialize()
     except RuntimeError:
@@ -776,11 +777,11 @@ if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     except Exception:  # maybe it's a single process
         _logger.warn("Failed to initialize jax-dist")
     del _DistributedConfig
-
-    try:
-        _RayClusterConfig().initialize()
-    except Exception:
-        ...
+    if not ray.is_initialized():
+        try:
+            _RayClusterConfig().initialize()
+        except Exception:
+            ...
     del _RayClusterConfig
 
 del _os
