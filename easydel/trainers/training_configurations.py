@@ -534,24 +534,14 @@ class TrainingArguments:
         Returns:
             ePathLike: The path to the checkpoint directory.
         """
-        if self.process_zero_is_admin:
-            if self.is_process_zero:
-                return ePath(self.save_directory) / self.model_name
-            else:
-                return ePath("/dev/null")
         return ePath(self.save_directory) / self.model_name
 
     def ensure_checkpoint_path(self):
         """
         Creates the checkpoint directory if it doesn't exist.
         """
-        if self.process_zero_is_admin:
-            if self.is_process_zero:
-                path = self.get_path()
-                path.mkdir(parents=True, exist_ok=True)
-        else:
-            path = self.get_path()
-            path.mkdir(parents=True, exist_ok=True)
+        path = self.get_path()
+        path.mkdir(parents=True, exist_ok=True)
 
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         """
@@ -900,8 +890,6 @@ class TrainingArguments:
         ePath(json_file_path).write_text(self.to_json_string())
 
     def _get_save_directory(self, create: bool = True) -> ePathLike:
-        if self.process_zero_is_admin and not self.is_process_zero:
-            return None
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()

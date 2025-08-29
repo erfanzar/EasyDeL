@@ -840,16 +840,11 @@ class BaseTrainer(BaseTrainerProtocol):
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         step = self._get_current_step(state)
         self._manage_checkpoint_limit(self.arguments._get_save_directory())
-
         directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
-
         logger.info(f"saving state {directory_name}.")
-
-        if self.is_enable:
-            directory_name.mkdir(exist_ok=True)
-            self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
-            self._save_readme(directory_name)
-
+        directory_name.mkdir(exist_ok=True)
+        self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
+        self._save_readme(directory_name)
         state.save_state(
             save_directory=directory_name,
             float_dtype=self.model.param_dtype,
@@ -915,11 +910,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.error(f"Error in checkpoint limit management: {e}")
 
         if self.arguments.save_total_limit is not None:
-            if self.arguments.process_zero_is_admin:
-                if self.is_process_zero:
-                    _operate()
-            else:
-                _operate()
+            _operate()
 
     def _save_readme(self, save_directory):
         dst = ePath(save_directory) / "README.md"
