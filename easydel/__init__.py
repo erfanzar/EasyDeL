@@ -760,24 +760,17 @@ else:
 
     if not _is_package_available("torch"):
         _logger.warning("please install `torch` (cpu) if you want to use `AutoEasyDeLModel*.from_torch_pretrained`")
-    del _logger
+
     del _version
     del _eform_version
 
-del _LazyModule
-del _is_package_available
 
-
-_is_worker = _os.environ.get("EASYDEL_WORKER_PROCESS", "0") == "1"
-_already_initialized = _os.environ.get("EASYDEL_CLUSTER_INITIALIZED", "0") == "1"
-
-if _check_bool_flag("AUTO_INIT_CLUSTER", True) and not _is_worker and not _already_initialized:
+if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     from eformer.executor import DistributedConfig as _DistributedConfig
     from eformer.executor import RayClusterConfig as _RayClusterConfig
 
     try:
         _DistributedConfig().initialize()
-        _os.environ["EASYDEL_CLUSTER_INITIALIZED"] = "1"
     except RuntimeError:
         _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
     except Exception:  # maybe it's a single process
@@ -786,14 +779,11 @@ if _check_bool_flag("AUTO_INIT_CLUSTER", True) and not _is_worker and not _alrea
 
     try:
         _RayClusterConfig().initialize()
-    except RuntimeError:
-        _logger.warn(
-            "Failed to initialize Ray cluster if you have initialized that manually you can ignore this warning"
-        )
     except Exception:
-        _logger.warn("Failed to initialize Ray cluster")
+        ...
     del _RayClusterConfig
 
 del _os
-del _is_worker
-del _already_initialized
+del _logger
+del _LazyModule
+del _is_package_available
