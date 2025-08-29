@@ -32,7 +32,7 @@ classifiers = [
 dependencies = [
 	"jax>=0.7.1",
 	"jaxlib>=0.7.1",
-	"ray[default,gcp]==2.34.0",
+	"ray[default]==2.34.0",
 	"eformer>=0.0.51",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
