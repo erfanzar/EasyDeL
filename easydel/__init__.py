@@ -35,6 +35,8 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     # Tell jax xla bridge to stay quiet and only yied warnings or errors.
     _getlogger("jax._src.xla_bridge").setLevel(30)
     _getlogger("jax._src.mesh_utils").setLevel(30)
+    _getlogger("jax._src.distributed").setLevel(30)
+    _getlogger("eray-executor").setLevel(30)
     _getlogger("datasets").setLevel(30)
 
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -98,7 +100,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     from eformer.executor import DistributedConfig as _DistributedConfig
-    # from eformer.executor import RayClusterConfig as _RayClusterConfig
 
     try:
         _DistributedConfig().initialize()
