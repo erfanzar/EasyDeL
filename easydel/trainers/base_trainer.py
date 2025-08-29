@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import pprint
+import re
 import time
 import typing as tp
 from abc import abstractmethod
@@ -596,7 +597,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     CollateMapTransform(collate_fn=collate_fn),
                     grain.Batch(batch_size=batch_size, drop_remainder=True),
                 ],
-                worker_count=1,
+                worker_count=0,
                 worker_buffer_size=1,
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
             )
@@ -840,7 +841,7 @@ class BaseTrainer(BaseTrainerProtocol):
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         step = self._get_current_step(state)
         # TODO:Fix this to enable checkpoint limit management
-        # self._manage_checkpoint_limit(self.arguments._get_save_directory())
+        self._manage_checkpoint_limit(self.arguments._get_save_directory())
         directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
         logger.info(f"saving state {directory_name}.")
         directory_name.mkdir(exist_ok=True)
@@ -879,13 +880,22 @@ class BaseTrainer(BaseTrainerProtocol):
         def _operate():
             try:
                 save_path = ePath(save_directory)
-                checkpoint_files = []
+                checkpoint_dirs = []
                 try:
-                    checkpoint_files = list(save_path.glob("run-*"))
+                    all_run_paths = list(save_path.glob("run-*"))
+                    checkpoint_dirs = [p for p in all_run_paths if p.is_dir()]
+
+                    if not checkpoint_dirs:
+                        return
+
+                    run_pattern = re.compile(r"^run-\d+$")
+                    checkpoint_dirs = [p for p in checkpoint_dirs if run_pattern.match(p.name)]
+
                 except Exception as e:
-                    logger.warning(f"Error listing checkpoint files in {save_path}: {e}")
+                    logger.warning(f"Error listing checkpoint directories in {save_path}: {e}")
                     return
-                if not checkpoint_files:
+
+                if not checkpoint_dirs:
                     return
 
                 def get_mtime(path):
@@ -894,16 +904,21 @@ class BaseTrainer(BaseTrainerProtocol):
                     except Exception:
                         return 0
 
-                checkpoint_files.sort(key=get_mtime)
+                checkpoint_dirs.sort(key=get_mtime)
 
                 if self.arguments.save_total_limit == 0:
-                    _do_dele = checkpoint_files
+                    _do_dele = checkpoint_dirs
                 else:
-                    _do_dele = checkpoint_files[: -self.arguments.save_total_limit]
+                    _do_dele = checkpoint_dirs[: -self.arguments.save_total_limit]
+
                 for old_save_directory in _do_dele:
                     try:
-                        _remove_directory_recursive(old_save_directory)
-                        logger.info(f"Removed old directory: {old_save_directory}")
+                        # Double-check it's a directory and matches pattern before removal
+                        if old_save_directory.is_dir() and old_save_directory.name.startswith("run-"):
+                            _remove_directory_recursive(old_save_directory)
+                            logger.info(f"Removed old checkpoint directory: {old_save_directory}")
+                        else:
+                            logger.warning(f"Skipping non-directory or invalid pattern: {old_save_directory}")
                     except Exception as e:
                         logger.error(f"Failed to remove directory {old_save_directory}: {e}")
 

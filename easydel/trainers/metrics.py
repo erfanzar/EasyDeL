@@ -274,7 +274,7 @@ class TqdmProgressBar(BaseProgressBar):
     def set_postfix(self, **kwargs) -> None:
         for k in list(kwargs.keys()):
             val = kwargs.get(k)
-            if isinstance(val, float):
+            if isinstance(val, float) and k != "learning_rate":
                 kwargs[k] = round(val, 3)
         self.pbar.set_postfix(**kwargs)
 
@@ -299,7 +299,7 @@ class JSONProgressBar(BaseProgressBar):
             val = kwargs.get(k)
             if hasattr(val, "size") and val.size == 1:
                 kwargs[k] = val.item()
-            if isinstance(val, float):
+            if isinstance(val, float) and k != "learning_rate":
                 kwargs[k] = round(val, 3)
         logger.info(kwargs)
 

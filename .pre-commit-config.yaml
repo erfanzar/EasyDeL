@@ -85,16 +85,16 @@ repos:
   # Local hooks
   - repo: local
     hooks:
-      - id: no-commit-to-main
-        name: Don't commit to main branch
-        entry: bash -c 'if [[ $(git symbolic-ref --short HEAD) == "main" ]]; then echo "Direct commits to main branch are not allowed."; exit 1; fi'
-        language: system
-        pass_filenames: false
-        always_run: true
+      # - id: no-commit-to-main
+      #   name: Don't commit to main branch
+      #   entry: bash -c 'if [[ $(git symbolic-ref --short HEAD) == "main" ]]; then echo "Direct commits to main branch are not allowed."; exit 1; fi'
+      #   language: system
+      #   pass_filenames: false
+      #   always_run: true
 
       - id: check-easydel-imports
         name: Check EasyDeL imports
-        entry: python -c "import sys; sys.exit(0)" # Placeholder - can add actual import checks
+        entry: python -c "import easydel as ed;import jax;print(jax.devices())" # Placeholder - can add actual import checks
         language: python
         types: [python]
         pass_filenames: false

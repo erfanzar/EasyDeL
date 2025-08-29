@@ -36,7 +36,9 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("jax._src.xla_bridge").setLevel(30)
     _getlogger("jax._src.mesh_utils").setLevel(30)
     _getlogger("jax._src.distributed").setLevel(30)
+    # these people talk too much
     _getlogger("eray-executor").setLevel(30)
+    _getlogger("absl").setLevel(30)
     _getlogger("datasets").setLevel(30)
 
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -97,16 +99,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     if _os.getenv("JAX_TRACEBACK_FILTERING", None) is None:
         _os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-
-if _check_bool_flag("AUTO_INIT_CLUSTER", True):
-    from eformer.executor import DistributedConfig as _DistributedConfig
-
-    try:
-        _DistributedConfig().initialize()
-    except RuntimeError:
-        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
-    except Exception:  # maybe it's a single process
-        ...
 
 _import_structure = {
     "utils": [
@@ -772,6 +764,36 @@ else:
     del _version
     del _eform_version
 
-del _check_bool_flag
 del _LazyModule
 del _is_package_available
+
+
+_is_worker = _os.environ.get("EASYDEL_WORKER_PROCESS", "0") == "1"
+_already_initialized = _os.environ.get("EASYDEL_CLUSTER_INITIALIZED", "0") == "1"
+
+if _check_bool_flag("AUTO_INIT_CLUSTER", True) and not _is_worker and not _already_initialized:
+    from eformer.executor import DistributedConfig as _DistributedConfig
+    from eformer.executor import RayClusterConfig as _RayClusterConfig
+
+    try:
+        _DistributedConfig().initialize()
+        _os.environ["EASYDEL_CLUSTER_INITIALIZED"] = "1"
+    except RuntimeError:
+        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
+    except Exception:  # maybe it's a single process
+        _logger.warn("Failed to initialize jax-dist")
+    del _DistributedConfig
+
+    try:
+        _RayClusterConfig().initialize()
+    except RuntimeError:
+        _logger.warn(
+            "Failed to initialize Ray cluster if you have initialized that manually you can ignore this warning"
+        )
+    except Exception:
+        _logger.warn("Failed to initialize Ray cluster")
+    del _RayClusterConfig
+
+del _os
+del _is_worker
+del _already_initialized
