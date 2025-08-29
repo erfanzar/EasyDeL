@@ -839,7 +839,8 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         step = self._get_current_step(state)
-        self._manage_checkpoint_limit(self.arguments._get_save_directory())
+        # TODO:Fix this to enable checkpoint limit management
+        # self._manage_checkpoint_limit(self.arguments._get_save_directory())
         directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
         logger.info(f"saving state {directory_name}.")
         directory_name.mkdir(exist_ok=True)
