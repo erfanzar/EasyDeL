@@ -15,9 +15,7 @@ vxp.py
 nohup.out
 sharding_test.py
 exprimental.py
-pallas_env.py
-cluster.yaml
-test_EasyDeLState.py
+autoscale/cluster.yaml 
 memory_log_dir/
 wandb
 io.py

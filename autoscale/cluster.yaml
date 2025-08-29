@@ -1,0 +1,329 @@
+# yaml-language-server: $schema=https://gist.githubusercontent.com/sargunv/c2ca41a08391cd06feaad97aece309e4/raw/empty-json-schema.json
+# ==================================================================================
+# EasyDeL Ray Cluster Configuration for Google Cloud Platform (GCP)
+# ==================================================================================
+#
+# IMPORTANT: This is a template configuration file. You MUST replace the following
+# placeholders with your actual GCP settings before using this configuration:
+#
+# 1. PROJECT_ID (line 38): Replace "IM_UR_PROJECT_ID_HERE" with your GCP project ID
+#    Example: project_id: my-ml-project-123
+#
+# 2. REGION (line 36): Update "us-east5" to your preferred GCP region
+#
+# 3. AVAILABILITY_ZONE (line 37): Update "us-east5-b" to match your region
+#    Format: {region}-{zone_letter}
+#    Example: us-central1-a, europe-west4-b, asia-southeast1-c
+#
+# 4. DOCKER_REGISTRY (line ~56): Update "us-east5-docker.pkg.dev" to match your region
+#    Format: {region}-docker.pkg.dev
+#    Example: us-central1-docker.pkg.dev, europe-west4-docker.pkg.dev
+#
+# Optional Customizations:
+# - Docker image (line ~45): Update if using a custom EasyDeL image
+# - Head node machine type (line ~79): Increase for larger clusters (e.g., n2-standard-8)
+# - Head node disk size (line ~86): Increase if needed (default: 100GB)
+#
+# To deploy this cluster:
+# 1. Configure GCP credentials: gcloud auth application-default login
+# 2. Deploy: ray up autoscale/cluster.yaml
+# 3. Connect to head node: ray attach autoscale/cluster.yaml
+# ==================================================================================
+
+cluster_name: easydel-cluster
+provider:
+  type: gcp
+  region: us-east5 # <- CHANGE THIS to your GCP region
+  availability_zone: us-east5-b # <- CHANGE THIS to match your region
+  project_id: IM_UR_PROJECT_ID_HERE # <- CHANGE THIS to your GCP project ID
+
+max_workers: 1024
+upscaling_speed: 4.0
+
+docker:
+  image: "ghcr.io/erfanzar/easydel:latest-tpu"
+  container_name: "ray_docker"
+  pull_before_run: true
+  worker_run_options:
+    - --privileged
+    - --ulimit memlock=-1:-1
+    - --shm-size=32gb
+    - -e TPU_WORKER_ID
+    - -v "/tmp:/tmp"
+    - -v "/var/run/docker.sock:/var/run/docker.sock"
+
+initialization_commands:
+  - yes | gcloud auth configure-docker us-east5-docker.pkg.dev # <- CHANGE "us-east5" to match your region
+  - "export TPU_WORKER_ID=$(curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number) || true"
+  - which docker || (curl -fsSL https://get.docker.com -o get-docker.sh; sudo sh get-docker.sh; sudo usermod -aG docker $USER; sudo systemctl restart docker -f)
+  - sudo usermod -aG docker $USER
+  - sudo chmod 666 /var/run/docker.sock
+
+head_setup_commands:
+  - mkdir $HOME/.cache/huggingface -p
+  - gcloud secrets versions access latest --secret=HF_TOKEN > $HOME/.cache/huggingface/token || true
+
+worker_setup_commands:
+  - mkdir $HOME/.cache/huggingface -p
+  - gcloud secrets versions access latest --secret=HF_TOKEN > $HOME/.cache/huggingface/token || true
+
+head_node_type: head_default
+
+available_node_types:
+  head_default:
+    min_workers: 0
+    max_workers: 0
+    resources: { "CPU": 32 }
+
+    node_config:
+      machineType: n2-standard-2
+
+      disks:
+        - boot: true
+          autoDelete: true
+          type: PERSISTENT
+          initializeParams:
+            diskSizeGb: 100
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+
+  tpu_slice_v6e_16:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v6e-16
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v6e_32:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v6e-32
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v6e_64:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v6e-64
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v6e_128:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v6e-128
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5e_16:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5litepod-16
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5e_32:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5litepod-32
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5e_64:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5litepod-64
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5e_128:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5litepod-128
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5e_256:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5litepod-256
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5p_8:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5p-8
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5p_16:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5p-16
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v5p_32:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v5p-32
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_8:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-8
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_16:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-16
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_32:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-32
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_64:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-64
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_128:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-128
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_256:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-256
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_512:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-512
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_1024:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-1024
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_2048:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-2048
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
+
+  tpu_slice_v4_4096:
+    min_workers: 0
+    max_workers: 1024
+    resources: { "CPU": 120, "TPU": 4 }
+
+    node_config:
+      acceleratorType: v4-4096
+      runtimeVersion: tpu-ubuntu2204-base
+      schedulingConfig:
+        preemptible: true
