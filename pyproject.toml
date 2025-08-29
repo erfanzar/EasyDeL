@@ -30,8 +30,8 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax>=0.7.1",
-	"jaxlib>=0.7.1",
+	"jax>=0.7.0",
+	"jaxlib>=0.7.0",
 	"ray[default]==2.34.0",
 	"eformer>=0.0.51",
 	"einops~=0.8.0",
@@ -76,8 +76,8 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]>=0.7.1", "torch==2.6.0", "tensorboard>=2.19.0"]
-tpu = ["jax[tpu]>=0.7.1", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]>=0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
+tpu = ["jax[tpu]>=0.7.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
 profile = [
