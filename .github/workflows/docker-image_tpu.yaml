@@ -2,9 +2,9 @@ name: Docker Image CI/CD For TPUs
 
 on:
   push:
-    branches: [main]
+    branches: [main, autoscale]
   pull_request:
-    branches: [main]
+    branches: [main, autoscale]
   workflow_dispatch: # Allow manual triggers
 
 jobs:
