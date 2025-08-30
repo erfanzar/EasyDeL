@@ -143,7 +143,11 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
-            resumed_state = self._try_resume_from_checkpoint(model_state)
+            try:
+                resumed_state = self._try_resume_from_checkpoint(model_state)
+            except Exception:
+                logger.warning("Resuming from checkpoint failed. Starting fresh training.")
+                resumed_state = None
             if resumed_state is not None:
                 model_state = resumed_state
                 self._resumed_from_checkpoint = True
@@ -429,27 +433,42 @@ class BaseTrainer(BaseTrainerProtocol):
             - Checkpoints are expected to be in directories named "run-{step}"
             - The method will try multiple checkpoints if the most recent fails
             - Sets step_start_point in arguments if resuming is successful
+            - ePath handles both local and cloud storage (gs://, s3://) transparently
         """
         try:
             checkpoint_dir = self.arguments._get_save_directory(create=False)
-            if not checkpoint_dir.exists():
-                logger.info("No checkpoint directory found. Starting fresh training.")
-                return None
+            all_paths = list(checkpoint_dir.glob("run-*"))
 
-            run_dirs = sorted(
-                [d for d in checkpoint_dir.glob("run-*") if d.is_dir()],
-                key=lambda x: int(x.name.split("-")[1]) if x.name.split("-")[1].isdigit() else 0,
-                reverse=True,
-            )
-
-            if not run_dirs:
+            if not all_paths:
                 logger.info("No checkpoints found in save directory. Starting fresh training.")
                 return None
 
-            for run_dir in run_dirs:
+            run_dir_names = set()
+            for path in all_paths:
+                parts = str(path).split("/")
+                for i, part in enumerate(parts):
+                    if part.startswith("run-") and part[4:].split("-")[0].isdigit():
+                        run_dir_path = "/".join(parts[: i + 1])
+                        run_dir_names.add(run_dir_path)
+                        break
+
+            if not run_dir_names:
+                logger.info("No valid run directories found. Starting fresh training.")
+                return None
+            sorted_run_dirs = sorted(
+                run_dir_names,
+                key=lambda x: int(x.split("run-")[-1].split("/")[0])
+                if x.split("run-")[-1].split("/")[0].isdigit()
+                else 0,
+                reverse=True,
+            )
+
+            for run_dir_path in sorted_run_dirs:
                 try:
                     model = current_state.model
-                    logger.info(f"Attempting to resume from checkpoint: {run_dir}")
+                    logger.info(f"Attempting to resume from checkpoint: {run_dir_path}")
+                    run_dir = ePath(run_dir_path)
+
                     resumed_state = EasyDeLState.load_state(
                         load_directory=run_dir,
                         dtype=model.dtype,
@@ -466,9 +485,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
                     actual_step = int(jax.device_get(resumed_state.step))
 
-                    logger.info(
-                        f"Successfully resumed from checkpoint at step {actual_step} (checkpoint dir: {run_dir.name})"
-                    )
+                    logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
 
                     if self.arguments.step_start_point is None:
                         self.arguments.step_start_point = actual_step
@@ -477,7 +494,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     return resumed_state
 
                 except Exception as e:
-                    logger.warning(f"Failed to load checkpoint from {run_dir}: {e}")
+                    logger.warning(f"Failed to load checkpoint from {run_dir_path}: {e}")
                     continue
 
             logger.warning("Could not load any checkpoints. Starting fresh training.")
