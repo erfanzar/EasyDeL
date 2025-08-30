@@ -16,7 +16,7 @@ SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
 SAVE_STEPS = 1000
-DO_LAST_SAVE = True
+DO_LAST_SAVE = False
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -117,6 +117,7 @@ def create_training_args(
         log_steps=100,
         progress_bar_type="tqdm",
         use_grain=True,
+        resume_if_possible=True,
     )
     logging.info("Training arguments created.")
     return training_args

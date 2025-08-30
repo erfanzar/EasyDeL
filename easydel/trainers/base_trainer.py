@@ -77,6 +77,31 @@ DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
 
 class BaseTrainer(BaseTrainerProtocol):
+    """
+    Base trainer class implementing core training functionality for EasyDeL models.
+
+    This class provides the foundation for training and evaluation workflows, including:
+    - Checkpoint management and resumption
+    - Dataloader configuration (Grain and TensorFlow datasets)
+    - Model state initialization and sharding
+    - Training and evaluation step compilation
+    - Metrics logging and monitoring
+    - Memory tracking and performance optimization
+
+    The trainer handles distributed training across multiple devices using JAX's
+    sharding capabilities and supports various optimization strategies.
+
+    Attributes:
+        arguments: Training configuration arguments
+        model_state: Current state of the model including parameters and optimizer state
+        dataset_train: Training dataset
+        dataset_eval: Evaluation dataset
+        data_collator: Function to collate batch data
+        finetune: Whether this is a fine-tuning run
+        mesh: Device mesh for distributed computation
+        checkpoint_manager: Manager for saving/loading checkpoints
+    """
+
     def __init__(
         self,
         arguments: TrainingArguments | None = None,
@@ -88,6 +113,23 @@ class BaseTrainer(BaseTrainerProtocol):
         finetune: bool = True,
         **deprecated_kwargs,
     ):
+        """
+        Initialize the BaseTrainer.
+
+        Args:
+            arguments: Training configuration and hyperparameters
+            model_state: Pre-initialized model state (mutually exclusive with model)
+            model: Model class to initialize (mutually exclusive with model_state)
+            dataset_train: Training dataset
+            dataset_eval: Evaluation dataset
+            data_collator: Function to collate batches of data
+            finetune: Whether this is a fine-tuning run (affects initialization)
+            **deprecated_kwargs: Deprecated keyword arguments for backward compatibility
+
+        Raises:
+            ValueError: If both model and model_state are provided, or if neither is provided
+            AssertionError: If arguments is None
+        """
         assert arguments is not None, "training argument must be passed to Trainers."
         if model_state is not None and model is not None:
             raise ValueError("Either model or model_state should be passed, not both.")
@@ -98,6 +140,14 @@ class BaseTrainer(BaseTrainerProtocol):
         if arguments.model_name is None:
             arguments.model_name = getattr(model_state.model, "_model_type", "module")
         self.arguments = arguments
+
+        self._resumed_from_checkpoint = False
+        if self.arguments.resume_if_possible:
+            resumed_state = self._try_resume_from_checkpoint(model_state)
+            if resumed_state is not None:
+                model_state = resumed_state
+                self._resumed_from_checkpoint = True
+
         self.model_state = model_state
         self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
         self.dataset_train = dataset_train
@@ -142,6 +192,46 @@ class BaseTrainer(BaseTrainerProtocol):
         trainer_init_arguments: dict[str, tp.Any] | None = None,
         **kwargs,
     ):
+        """
+        Load a trainer from a saved checkpoint directory.
+
+        This class method reconstructs a trainer instance from a previously saved
+        checkpoint, including the model state and training arguments.
+
+        Args:
+            load_directory: Path to the checkpoint directory
+            dataset_train: Training dataset to use with the loaded trainer
+            dataset_eval: Evaluation dataset to use with the loaded trainer
+            data_collator: Data collation function
+            device: Device to load the model on (default: "cpu")
+            dtype: Data type for computations
+            param_dtype: Data type for model parameters
+            precision: JAX precision level for matrix multiplications
+            sharding_axis_dims: Dimensions for sharding axes (dp, fsdp, ep, tp, sp)
+            sharding_dcn_axis_dims: DCN-specific sharding dimensions
+            sharding_axis_names: Names for the sharding axes
+            partition_axis: Custom partition axis configuration
+            shard_attention_computation: Whether to shard attention computations
+            shard_fns: Custom sharding functions for specific operations
+            backend: Computation backend (CPU, GPU, TPU)
+            platform: Platform-specific configuration
+            config_kwargs: Additional configuration parameters
+            model_task: Task type for the model
+            auto_shard_model: Whether to automatically shard the model
+            partition_rules: Rules for partitioning model parameters
+            quantization_platform: Platform for quantization
+            quantization_method: Method for quantization
+            quantization_block_size: Block size for quantization
+            quantization_pattern: Pattern for selective quantization
+            quantize_tensors: Whether to quantize tensors
+            verbose: Whether to print loading progress
+            base_state: Base state class to use for loading
+            trainer_init_arguments: Additional arguments for trainer initialization
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            BaseTrainer: A new trainer instance loaded from the checkpoint
+        """
         if base_state is None:
             base_state = EasyDeLState
         model_state = base_state.load_state(
@@ -321,6 +411,82 @@ class BaseTrainer(BaseTrainerProtocol):
             (),
         )
 
+    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
+        """
+        Try to resume from the latest checkpoint if available.
+
+        This method searches for existing checkpoints in the save directory and
+        attempts to load the most recent one. It handles multiple checkpoint
+        directories and falls back gracefully if loading fails.
+
+        Args:
+            current_state: The current model state (used as fallback if no checkpoint found)
+
+        Returns:
+            The resumed state if a checkpoint was found and loaded, None otherwise
+
+        Note:
+            - Checkpoints are expected to be in directories named "run-{step}"
+            - The method will try multiple checkpoints if the most recent fails
+            - Sets step_start_point in arguments if resuming is successful
+        """
+        try:
+            checkpoint_dir = self.arguments._get_save_directory(create=False)
+            if not checkpoint_dir.exists():
+                logger.info("No checkpoint directory found. Starting fresh training.")
+                return None
+
+            run_dirs = sorted(
+                [d for d in checkpoint_dir.glob("run-*") if d.is_dir()],
+                key=lambda x: int(x.name.split("-")[1]) if x.name.split("-")[1].isdigit() else 0,
+                reverse=True,
+            )
+
+            if not run_dirs:
+                logger.info("No checkpoints found in save directory. Starting fresh training.")
+                return None
+
+            for run_dir in run_dirs:
+                try:
+                    model = current_state.model
+                    logger.info(f"Attempting to resume from checkpoint: {run_dir}")
+                    resumed_state = EasyDeLState.load_state(
+                        load_directory=run_dir,
+                        dtype=model.dtype,
+                        param_dtype=model.param_dtype,
+                        precision=model.precision,
+                        auto_shard_model=True,
+                        partition_axis=model.config.partition_axis,
+                        sharding_axis_names=model.config.sharding_axis_names,
+                        sharding_axis_dims=model.config.sharding_axis_dims,
+                        sharding_dcn_axis_dims=model.config.sharding_dcn_axis_dims,
+                        model_task=model.model_task,
+                        verbose=True,
+                    )
+
+                    actual_step = int(jax.device_get(resumed_state.step))
+
+                    logger.info(
+                        f"Successfully resumed from checkpoint at step {actual_step} (checkpoint dir: {run_dir.name})"
+                    )
+
+                    if self.arguments.step_start_point is None:
+                        self.arguments.step_start_point = actual_step
+                        logger.info(f"Set step_start_point to {actual_step}")
+
+                    return resumed_state
+
+                except Exception as e:
+                    logger.warning(f"Failed to load checkpoint from {run_dir}: {e}")
+                    continue
+
+            logger.warning("Could not load any checkpoints. Starting fresh training.")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error while trying to resume from checkpoint: {e}")
+            return None
+
     def _initialize_memory_tracking(self):
         if not self.arguments.performance_mode:
             import easydel
@@ -359,10 +525,7 @@ class BaseTrainer(BaseTrainerProtocol):
         return state, metrics
 
     def _preprocess_batch_input(
-        self,
-        state: EasyDeLState,
-        batch: dict[str, jax.Array],
-        is_train: bool,
+        self, state: EasyDeLState, batch: dict[str, jax.Array], is_train: bool
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
         return batch, {}
 
@@ -373,9 +536,18 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         Initializes various utilities used by the trainer.
 
-        This includes setting up Weights & Biases, initializing the training timer,
-        configuring dataloaders, configuring the model and optimizer, sharding the
-        model and reference model states, and configuring the training and evaluation functions.
+        This method orchestrates the initialization of all trainer components in the
+        correct order. It sets up:
+        1. Weights & Biases logging (if enabled)
+        2. Training timer for performance monitoring
+        3. Dataloaders for training and evaluation
+        4. Model, optimizer, and learning rate scheduler
+        5. Model state sharding across devices
+        6. Compiled training and evaluation functions
+
+        The initialization order is important as later steps depend on earlier ones.
+        For example, the optimizer configuration depends on the number of training
+        steps determined during dataloader configuration.
         """
 
         self._initialize_wandb()
@@ -396,9 +568,14 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         Configures the dataloaders for training and evaluation.
 
-        This method retrieves the dataloaders from the `configure_dataloaders` method,
-        sets the maximum training and evaluation steps, and logs the time taken for
-        this configuration.
+        This method sets up data loading pipelines using either Grain or TensorFlow
+        datasets based on the configuration. It handles:
+        - Dataset offloading to specified devices if enabled
+        - Calculation of maximum training and evaluation steps
+        - Proper batch size and epoch configuration
+
+        The configured dataloaders are stored as instance attributes and the
+        time taken for configuration is logged for performance monitoring.
         """
         with self.timer("configure dataloaders"):
             manager = (
@@ -451,14 +628,35 @@ class BaseTrainer(BaseTrainerProtocol):
         self.timer.log("configure functions and sharding them")
 
     def _configure_state(self):
-        """Configures and JIT-compiles the sharded state"""
+        """
+        Configures and shards the model state across devices.
+
+        This method handles:
+        - Optimizer state initialization or reinitialization after checkpoint resumption
+        - Creation of sharding specifications based on partition rules
+        - Distribution of the model state across the device mesh
+
+        The method ensures that the optimizer state is properly initialized whether
+        starting fresh training or resuming from a checkpoint. It uses the model's
+        partition rules to determine how parameters should be distributed across devices.
+        """
         with self.timer("configure sharded state"):
             from eformer.escale import match_partition_rules
 
             with self.model.mesh:
-                if self.arguments.init_tx and self.model_state.opt_state is None:
+                if self._resumed_from_checkpoint and self.model_state.opt_state is not None:
+                    current_step = self.model_state.step
                     self.model_state = self.model_state.init_tx(self.tx)
-                elif self.model_state.tx is None:
+                    self.model_state = self.model_state.replace(step=current_step)
+
+                    logger.info(
+                        f"Reinitialized optimizer state for resumed training at step {jax.device_get(current_step)}"
+                    )
+                elif self.arguments.init_tx and self.model_state.opt_state is None:
+                    self.model_state = self.model_state.init_tx(self.tx)
+                elif self.model_state.opt_state is None and self.model_state.tx is None:
+                    self.model_state = self.model_state.replace(tx=self.tx)
+                elif self.model_state.opt_state is not None and self.model_state.tx is None:
                     self.model_state = self.model_state.replace(tx=self.tx)
 
                 shape = nn.eval_shape(lambda: self.model_state)
@@ -566,6 +764,11 @@ class BaseTrainer(BaseTrainerProtocol):
                 drop_remainder=True,
             )
             from datasets import IterableDataset
+
+            if is_train and hasattr(self, "model_state") and self.model_state is not None:
+                current_step = int(jax.device_get(self.model_state.step))
+                if current_step > 0:
+                    logger.info(f"Note: Grain dataloader will start fresh, but model continues from step {current_step}")
 
             if isinstance(dataset, IterableDataset):
                 data_source = HFDataSource(dataset=dataset, shard_options=shard_options, num_threads=1)
@@ -828,9 +1031,12 @@ class BaseTrainer(BaseTrainerProtocol):
                 model, optimizer, scheduler, and configuration.
         """
 
+        # Always create the optimizer and scheduler according to config
+        # If we resumed from checkpoint, the optimizer state will be reinitialized in _configure_state
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
         if self.pruning_module is not None:
             tx = self.pruning_module.wrap_optax(tx)
+
         return TrainerConfigureModelOutput(
             model=self.model,
             tx=tx,
@@ -839,6 +1045,24 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
+        """
+        Save the current model state to a checkpoint.
+
+        This method handles the complete checkpoint saving process including:
+        - Managing checkpoint limits (removing old checkpoints if needed)
+        - Creating checkpoint directories with proper naming
+        - Saving training arguments alongside the model
+        - Generating README documentation for the checkpoint
+        - Saving the actual model state with optional optimizer state
+
+        Args:
+            state: The model state to save
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            str: Path to the saved checkpoint directory
+        """
         step = self._get_current_step(state)
         # TODO:Fix this to enable checkpoint limit management
         self._manage_checkpoint_limit(self.arguments._get_save_directory())
@@ -862,6 +1086,22 @@ class BaseTrainer(BaseTrainerProtocol):
         return step
 
     def _manage_checkpoint_limit(self, save_directory):
+        """
+        Manage the checkpoint limit by removing old checkpoints.
+
+        This method enforces the save_total_limit by removing the oldest
+        checkpoints when the limit is exceeded. It safely handles directory
+        removal and ensures only valid checkpoint directories are deleted.
+
+        Args:
+            save_directory: Base directory containing checkpoints
+
+        Note:
+            - Only removes directories matching the pattern "run-{number}"
+            - Sorts checkpoints by modification time to identify oldest
+            - Handles errors gracefully to prevent training interruption
+        """
+
         def _remove_directory_recursive(path):
             """Recursively remove directory using ePath methods"""
             if not path.exists():
@@ -954,10 +1194,25 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _get_information(self) -> str:
         """
-        Generate formatted information about the model and training setup using Jinja2.
+        Generate formatted information about the model and training setup.
+
+        This method creates a comprehensive README document containing:
+        - Model architecture and configuration details
+        - Training hyperparameters and settings
+        - Device and platform information
+        - Partition rules for distributed training
+        - Data types and precision settings
+
+        The method attempts to use Jinja2 templates for rich formatting but
+        falls back to a basic format if Jinja2 is not available.
 
         Returns:
-            str: Formatted markdown string containing model and training information.
+            str: Formatted markdown string containing model and training information
+
+        Note:
+            - Requires Jinja2 for full formatting capabilities
+            - Handles missing configuration gracefully
+            - Includes EasyDeL version information
         """
 
         if self.config is None:
@@ -1166,6 +1421,21 @@ class BaseTrainer(BaseTrainerProtocol):
     def _setup_static_metrics(self): ...
 
     def compile_aot(self) -> bool:
+        """
+        Compile training and evaluation functions ahead-of-time.
+
+        This method performs AOT (Ahead-Of-Time) compilation of the training
+        and evaluation step functions using JAX's JIT compilation. This improves
+        performance by compiling the functions once before the training loop.
+
+        Returns:
+            bool: True if any functions were compiled, False otherwise
+
+        Note:
+            - Compilation happens automatically on first call if not done AOT
+            - AOT compilation can reduce first-step latency
+            - Uses actual data batches to determine compilation shapes
+        """
         compiled = False
 
         def compile_function(function, dataloader, state, tag):
@@ -1194,18 +1464,36 @@ class BaseTrainer(BaseTrainerProtocol):
 
         return compiled
 
-    def _should_skip_step(self, current_step):
-        """Determine if current step should be skipped."""
-        return self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step
-
     def _should_save_checkpoint(self, current_step):
-        """Determine if checkpoint should be saved at current step."""
+        """
+        Determine if checkpoint should be saved at current step.
+
+        Args:
+            current_step: The current training step
+
+        Returns:
+            bool: True if a checkpoint should be saved at this step
+
+        Note:
+            Based on save_steps configuration in training arguments
+        """
         return (
             self.arguments.save_steps is not None and current_step > 0 and current_step % self.arguments.save_steps == 0
         )
 
     def _should_run_evaluation(self, current_step):
-        """Determine if evaluation process should be runned current step."""
+        """
+        Determine if evaluation should be run at current step.
+
+        Args:
+            current_step: The current training step
+
+        Returns:
+            bool: True if evaluation should be run at this step
+
+        Note:
+            Based on evaluation_steps configuration in training arguments
+        """
         return (
             self.arguments.evaluation_steps is not None
             and current_step > 0
