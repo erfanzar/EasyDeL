@@ -767,9 +767,10 @@ else:
 
 
 if _check_bool_flag("AUTO_INIT_CLUSTER", True):
+    import ray
     from eformer.executor import DistributedConfig as _DistributedConfig
     from eformer.executor import RayClusterConfig as _RayClusterConfig
-    import ray 
+
     try:
         _DistributedConfig().initialize()
     except RuntimeError:
