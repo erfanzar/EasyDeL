@@ -49,14 +49,12 @@ from functools import cached_property
 from typing import Annotated, Any
 
 import jax
-from chex import dataclass
 from eformer.escale import with_sharding_constraint
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
-
-from easydel.utils import get_logger
 
 from .logits_process import (
     FrequencyPenaltyLogitsProcessor,
@@ -67,7 +65,6 @@ from .logits_process import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
-    hash_fn,
 )
 
 logger = get_logger(__name__)
@@ -158,7 +155,7 @@ class GuidedDecodingParams:
             )
 
 
-@dataclass(frozen=True)
+@auto_pytree(frozen=True)
 class JitableSamplingParams:
     """
     A JAX-native, device-ready version of sampling parameters.
@@ -343,10 +340,8 @@ class JitableSamplingParams:
     def make_jitable(self):
         return self
 
-    __hash__ = hash_fn
 
-
-@dataclass
+@auto_pytree
 class SamplingParams:
     """Sampling parameters for text generation.
 

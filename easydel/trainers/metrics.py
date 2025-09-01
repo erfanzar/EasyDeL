@@ -22,12 +22,7 @@ from collections import defaultdict
 import jax
 import numpy as np
 from eformer.pytree import auto_pytree
-from rich.progress import (
-    Progress,
-    ProgressColumn,
-    Task,
-    TaskID,
-)
+from rich.progress import Progress, ProgressColumn, Task, TaskID
 from rich.text import Text
 from tqdm.autonotebook import tqdm
 
@@ -42,11 +37,10 @@ except ImportError:
     wandb = None
 
 
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 
-from easydel.utils.helpers import get_logger
-
-logger = get_logger(__name__)
+logger = get_logger("TrainerMetrics")
 
 
 class StepMetrics:
@@ -280,6 +274,10 @@ class TqdmProgressBar(BaseProgressBar):
         self.pbar.update(n)
 
     def set_postfix(self, **kwargs) -> None:
+        for k in list(kwargs.keys()):
+            val = kwargs.get(k)
+            if isinstance(val, float) and k != "learning_rate":
+                kwargs[k] = round(val, 3)
         self.pbar.set_postfix(**kwargs)
 
     def reset(self) -> None:
@@ -303,8 +301,9 @@ class JSONProgressBar(BaseProgressBar):
             val = kwargs.get(k)
             if hasattr(val, "size") and val.size == 1:
                 kwargs[k] = val.item()
-
-        print(kwargs)
+            if isinstance(val, float) and k != "learning_rate":
+                kwargs[k] = round(val, 3)
+        logger.info(kwargs)
 
     def reset(self) -> None: ...
 

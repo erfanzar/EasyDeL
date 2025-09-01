@@ -24,28 +24,21 @@ from functools import cached_property
 
 import jax
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
+from eformer.mpric import DTYPE_TO_STRING_MAP, STRING_TO_DTYPE_MAP
+from eformer.paths import ePath
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from pydantic import BaseModel
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from easydel.infra import (
-    EasyDeLBaseConfig,
-    EasyDeLBaseModule,
-    EasyDeLState,
-)
+from easydel.infra import EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import TaskType
 from easydel.layers.attention import AttentionMechanisms
 from easydel.modules.auto.auto_configuration import get_modules_by_type
-from easydel.utils.checkpoint_managers.path_utils import EasyPath
-from easydel.utils.helpers import get_logger
 
-from ...utils.checkpoint_managers.streamer import (
-    DTYPE_TO_STRING_MAP,
-    STRING_TO_DTYPE_MAP,
-)
 from ..base_trainer import BaseTrainer
 from ..trainer.trainer import Trainer
 from ..training_configurations import TrainingArguments
@@ -185,9 +178,9 @@ class RayDistributedTrainer:
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
         if model_task is None or model_type is None:
-            assert model_task is None and model_type is None, (
-                "If one of model_task or model_type is None, both must be None."
-            )
+            assert (
+                model_task is None and model_type is None
+            ), "If one of model_task or model_type is None, both must be None."
             assert model_class is not None, "model_class must be provided if model_task and model_type are not."
             model_type = model_class._model_type
             model_task = model_class._model_task
@@ -200,9 +193,9 @@ class RayDistributedTrainer:
             model_task = model_class._model_task
 
         if model_class is None:
-            assert model_type is not None and model_task is not None, (
-                "model_type and model_task must be provided if model_class is not specified."
-            )
+            assert (
+                model_type is not None and model_task is not None
+            ), "model_type and model_task must be provided if model_class is not specified."
             _, model_class_retrieved = get_modules_by_type(
                 model_type=model_type,
                 task_type=model_task,
@@ -234,7 +227,7 @@ class RayDistributedTrainer:
         state_class: type[EasyDeLState] | None = None,
         trainer_module: type[BaseTrainer | Trainer] | None = None,
     ):
-        config = RayDistributedConfig(**json.loads(EasyPath(path).read_text()))
+        config = RayDistributedConfig(**json.loads(ePath(path).read_text()))
 
         config._loading_postprocess()
 
@@ -260,7 +253,7 @@ class RayDistributedTrainer:
             config_variables=self.config_variables,
         )
         config._saveing_preprocess()
-        EasyPath(path).write_text(config.model_dump_json(indent=2))
+        ePath(path).write_text(config.model_dump_json(indent=2))
 
     def load_processor(self) -> PreTrainedTokenizer:
         """

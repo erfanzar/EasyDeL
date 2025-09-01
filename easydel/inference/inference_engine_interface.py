@@ -39,16 +39,14 @@ from enum import Enum
 from http import HTTPStatus
 
 import uvicorn
+from eformer.loggings import get_logger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from easydel.utils.helpers import get_logger
-
 from .openai_api_modules import (
     ChatCompletionRequest,
-    ChatCompletionRequestWithTools,
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
@@ -419,11 +417,20 @@ class BaseInferenceApiServer(ABC):
         self.thread_pool.shutdown(wait=True)
         logger.info("Thread pool shut down")
 
+    def extract_tools(self, request: ChatCompletionRequest) -> list[dict] | None:
+        resolved_tools = []
+        if request.tools is not None:
+            for tool in request.tools:
+                resolved_tools.append(tool.function.model_dump())
+        if len(resolved_tools) == 0:
+            return None
+        return resolved_tools
+
     # Abstract methods that must be implemented by subclasses
 
     @abstractmethod
     async def chat_completions(
-        self, request: ChatCompletionRequest | ChatCompletionRequestWithTools
+        self, request: ChatCompletionRequest
     ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
         """
         Handle chat completion requests.

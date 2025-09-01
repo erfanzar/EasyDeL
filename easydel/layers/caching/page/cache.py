@@ -149,7 +149,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
-        from easydel.utils import DTYPE_TO_STRING_MAP
+        from eformer.mpric import DTYPE_TO_STRING_MAP
 
         return cls(
             num_hidden_layers=num_hidden_layers,
@@ -174,7 +174,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
 
     @property
     def kvdtype(self) -> jnp.dtype:
-        from easydel.utils import STRING_TO_DTYPE_MAP
+        from eformer.mpric import STRING_TO_DTYPE_MAP
 
         return STRING_TO_DTYPE_MAP[self._kvdtype_str]
 

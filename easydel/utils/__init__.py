@@ -24,7 +24,6 @@ Submodules:
     cli_helpers: Command-line interface helpers
     compiling_utils: JAX compilation caching and optimization
     data_managers: Dataset loading and management
-    graph_utils: Computation graph utilities
     helpers: General helper functions and timing utilities
     lazy_import: Lazy module importing utilities
     parameters_transformation: Parameter transformation tools
@@ -32,17 +31,11 @@ Submodules:
     traversals: PyTree traversal utilities
 
 Key Components:
-    CheckpointManager: Manage model checkpoints
+    AsyncCheckpointManager: Manage model checkpoints
     DataManager: Handle dataset loading and mixing
     Timer/Timers: Performance timing utilities
     ejit: Enhanced JIT compilation with caching
-    GenerateRNG: RNG management for generation
     LazyModule: Lazy module loading
-
-Constants:
-    ALLOWED_DATA_TYPES: Supported checkpoint data types
-    DTYPE_TO_STRING_MAP: Data type to string mapping
-    STRING_TO_DTYPE_MAP: String to data type mapping
 
 Example:
     >>> from easydel.utils import Timer, ejit, get_logger
@@ -65,16 +58,9 @@ Note:
     efficient development and deployment of EasyDeL models.
 """
 
-from . import analyze_memory, compiling_utils, graph_utils, traversals
-from .checkpoint_managers import (
-    ALLOWED_DATA_TYPES,
-    DTYPE_TO_STRING_MAP,
-    STRING_TO_DTYPE_MAP,
-    CheckpointManager,
-    EasyPath,
-    EasyPathLike,
-)
-from .cli_helpers import DataClassArgumentParser
+from eformer.paths import ePath, ePathLike
+
+from . import analyze_memory, compiling_utils, traversals
 from .compiling_utils import ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
 from .data_managers import (
     DataManager,
@@ -84,26 +70,15 @@ from .data_managers import (
     TextDatasetInform,
     VisualDatasetInform,
 )
-from .helpers import ProgressLogger, Timer, Timers, capture_time, check_bool_flag, get_cache_dir, get_logger
+from .helpers import Timer, Timers, capture_time, check_bool_flag, get_cache_dir
 from .lazy_import import LazyModule, is_package_available
-from .rngs_utils import GenerateRNG, JaxRNG
 
 __all__ = (
-    "ALLOWED_DATA_TYPES",
-    "DTYPE_TO_STRING_MAP",
-    "STRING_TO_DTYPE_MAP",
-    "CheckpointManager",
-    "DataClassArgumentParser",
     "DataManager",
     "DatasetLoadError",
     "DatasetMixture",
     "DatasetType",
-    "EasyPath",
-    "EasyPathLike",
-    "GenerateRNG",
-    "JaxRNG",
     "LazyModule",
-    "ProgressLogger",
     "TextDatasetInform",
     "Timer",
     "Timers",
@@ -112,10 +87,10 @@ __all__ = (
     "capture_time",
     "check_bool_flag",
     "compiling_utils",
+    "ePath",
+    "ePathLike",
     "ejit",
     "get_cache_dir",
-    "get_logger",
-    "graph_utils",
     "is_package_available",
     "load_cached_functions",
     "load_compiled_fn",

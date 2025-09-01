@@ -57,14 +57,16 @@ import jax
 from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from eformer.loggings import get_logger
 from jax import NamedSharding, lax
 from jax import numpy as jnp
 from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Complex, Float, Int
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.utils.helpers import get_logger
 
 from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
 from .caching import PagesCacheView, PagesMetadata, TransformerCacheView, TransformerMetadata
@@ -73,7 +75,7 @@ from .quantization.quantizers import EasyQuantizer
 logger = get_logger(__name__)
 
 
-def _get_jax_dtype_from_string(dtype_string):
+def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
     """Convert string representation to JAX dtype.
 
     Parses string representations of JAX dtypes and returns
@@ -119,7 +121,7 @@ class AttentionMechanisms(str, Enum):
         BLOCKWISE: Blockwise computation for memory efficiency.
         SDPA: Scaled Dot Product Attention (JAX native).
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
-        PAGED_ATTENTION: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION: Paged attention for efficient inference.
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -132,11 +134,12 @@ class AttentionMechanisms(str, Enum):
     BLOCKWISE = "blockwise"
     SDPA = "sdpa"
     CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
-    PAGED_ATTENTION = "paged_attention"
+    RAGGED_PAGE_ATTENTION = "ragged_page_attention"
+    PAGED_ATTENTION = "ragged_page_attention"
     REGRESSIVE_DECODE = "autoregressive_decodeattn"
 
 
-def tpu_version_check(version: str = "v4"):
+def tpu_version_check(version: str = "v4") -> bool:
     """Check if running on specified TPU version.
 
     Verifies if the current JAX device matches the specified
@@ -298,19 +301,19 @@ class FlexibleAttentionModule(nn.Module):
     @jax.named_scope("easydel-flexible-attention")
     def forward(
         self,
-        query_states: Array,
-        key_states: Array,
-        value_states: Array,
+        query_states: Float[JArray, "batch seq_q heads dim"],
+        key_states: Float[JArray, "batch seq_k heads dim"],
+        value_states: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
-        bias: Array | None = None,
+        bias: Float[JArray, "batch heads seq_q seq_k"] | None = None,
         sliding_window: int | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         cache_view: TransformerCacheView | PagesCacheView | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
-        attention_mask: Array | None = None,
-        segment_ids: Array | None = None,
+        init_bias: tp.Callable[[], Float[JArray, "batch heads seq_q seq_k"]] | None = None,
+        attention_mask: Bool[JArray, "batch seq_q seq_k"] | None = None,
+        segment_ids: Int[JArray, "batch seq"] | None = None,
         causal: bool = True,
-        softmax_aux: Array | None = None,
+        softmax_aux: Float[JArray, "..."] | None = None,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -334,7 +337,7 @@ class FlexibleAttentionModule(nn.Module):
                              attention weights (depending on the backend).
         """
         if isinstance(cache_view, PagesCacheView):
-            assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
+            assert self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
         try:
             rngs = self.rngs()
         except flax.errors.TraceContextError:
@@ -404,10 +407,10 @@ class AttentionModule(nn.Module):
 
     @staticmethod
     def apply_complex_rotary(
-        xq: jnp.ndarray,
-        xk: jnp.ndarray,
-        freqs_cis: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        xq: Float[JArray, "... seq heads dim"],
+        xk: Float[JArray, "... seq heads dim"],
+        freqs_cis: Complex[JArray, "batch seq 1 dim_2"],
+    ) -> tuple[Float[JArray, "... seq heads dim"], Float[JArray, "... seq heads dim"]]:
         xq_reshaped = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
         xk_reshaped = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
         xq_complex = xq_reshaped[..., 0] + 1j * xq_reshaped[..., 1]
@@ -430,9 +433,9 @@ class AttentionModule(nn.Module):
 
     def apply_qk_shardings(
         self,
-        q: jax.Array,
-        k: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
+        q: Float[JArray, "batch seq heads dim"],
+        k: Float[JArray, "batch seq heads dim"],
+    ) -> tuple[Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]]:
         q = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
@@ -447,10 +450,12 @@ class AttentionModule(nn.Module):
 
     def apply_qkv_shardings(
         self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        q: Float[JArray, "batch seq heads dim"],
+        k: Float[JArray, "batch seq heads dim"],
+        v: Float[JArray, "batch seq heads dim"],
+    ) -> tuple[
+        Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]
+    ]:
         q = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
@@ -470,10 +475,10 @@ class AttentionModule(nn.Module):
 
     @staticmethod
     def build_cache_pos(
-        attention_mask: jax.Array,
+        attention_mask: Bool[JArray, "batch heads seq_q seq_k"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView = None,
-    ) -> jax.Array:
+    ) -> Int[JArray, "batch seq"]:
         """
         Calculates the position indices within the sequence for cache-aware operations.
 
@@ -528,7 +533,7 @@ class AttentionModule(nn.Module):
             ),
         )
 
-    def get_sharding_safely(self, tensor: jax.Array) -> PartitionSpec:
+    def get_sharding_safely(self, tensor: Float[JArray, "..."]) -> PartitionSpec:
         """
         Retrieves the PartitionSpec of a tensor, falling back to the default KV sharding.
 
@@ -558,16 +563,22 @@ class AttentionModule(nn.Module):
 
     def _handle_cache_concat(
         self,
-        query: Array,
-        key: Array,
-        value: Array,
+        query: Float[JArray, "batch seq_q heads dim"],
+        key: Float[JArray, "batch seq_k heads dim"],
+        value: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        attention_mask: Array,
+        attention_mask: Bool[JArray, "batch seq_q seq_k"],
         cache_view: TransformerCacheView | None,
         cache_metadata: TransformerMetadata | None,
-        causal_mask: Array | None,
-        token_type_ids: Array | None,
-    ) -> tuple[Array, Array, Array, TransformerCacheView | None, AttnMaskDetail | None]:
+        causal_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
+        token_type_ids: Int[JArray, "batch seq"] | None,
+    ) -> tuple[
+        Float[JArray, "batch seq_k heads dim"],
+        Float[JArray, "batch seq_v heads dim"],
+        Bool[JArray, "batch seq_q seq_k"],
+        TransformerCacheView | None,
+        AttnMaskDetail | None,
+    ]:
         """Handles concatenation of current KV states to the cache."""
         if cache_view is None:
             return key, value, attention_mask, None, None
@@ -588,15 +599,15 @@ class AttentionModule(nn.Module):
 
     def _merge_masks(
         self,
-        attention_mask: Array,
+        attention_mask: Bool[JArray, "... seq_q seq_k"],
         causal: bool,
-        causal_mask: Array | None,
-        token_type_ids: Array | None,
-        fcm_mask: Array | None,
+        causal_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
+        token_type_ids: Int[JArray, "batch seq"] | None,
+        fcm_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
         query_length: int,
         initial_key_length: int,
         cache_view: TransformerCacheView | None,
-    ) -> Array:
+    ) -> Bool[JArray, "batch heads seq_q seq_k"]:
         """Merges attention, causal, token-type, and FCM masks."""
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -822,7 +833,9 @@ class AttentionModule(nn.Module):
 
         return key, value, attention_mask, init_attention_bias, cache_view, cache_metadata
 
-    def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
+    def shard_attention_prod(
+        self, attn_output: Float[JArray, "batch seq heads dim"]
+    ) -> Float[JArray, "batch seq heads dim"]:
         """
         Applies sharding constraints to the attention output tensor.
 
@@ -842,7 +855,7 @@ class AttentionModule(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-    def _merge_heads(self, hidden_states: jax.Array) -> jax.Array:
+    def _merge_heads(self, hidden_states: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch seq hidden"]:
         """
         Merges the attention heads into a single hidden state tensor.
 
@@ -857,7 +870,9 @@ class AttentionModule(nn.Module):
         return hidden_states.reshape((*hidden_states.shape[:2], -1))
 
     @staticmethod
-    def repeat_key_value(key, value, num_reps: int):
+    def repeat_key_value(
+        key: Float[JArray, "batch seq kv_heads dim"], value: Float[JArray, "batch seq kv_heads dim"], num_reps: int
+    ) -> tuple[Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]]:
         """
         Repeats key and value tensors for Grouped Query Attention (GQA).
 

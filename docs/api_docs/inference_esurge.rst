@@ -8,8 +8,8 @@ Esurge
    inference_esurge_config
    inference_esurge_core
    inference_esurge_dashboard
-   inference_esurge_engine
    inference_esurge_engine_types
+   inference_esurge_esurge_engine
    inference_esurge_function_calling_mixin
    inference_esurge_metrics
    inference_esurge_monitoring

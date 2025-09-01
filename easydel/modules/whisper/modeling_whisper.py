@@ -41,16 +41,9 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-    ACT2FN,
-    get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
+from easydel.layers.caching import TransformerCache, TransformerCacheView, TransformerMetadata
 from easydel.layers.linear import ParallelLinear
 
 from .whisper_configuration import WhisperConfig as WhisperConfig

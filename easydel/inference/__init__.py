@@ -61,22 +61,9 @@ Attributes:
 """
 
 from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner
-from .function_calling import (
-    Function,
-    FunctionCall,
-    FunctionCallingConfig,
-    FunctionCallingManager,
-    FunctionCallingMode,
-)
-from .function_calling_handler import (
-    FunctionCallHandler,
-    FunctionCallResult,
-    FunctionFormatter,
-    OpenAIFunctionFormatter,
-)
 from .oai_proxies import InferenceApiRouter
-from .openai_api_modules import FunctionCallFormat, FunctionCallFormatter
 from .sampling_params import JitableSamplingParams, SamplingParams
+from .tools import ToolParser, ToolParserManager
 from .vinference import vInference, vInferenceApiServer, vInferenceConfig, vInferencePreCompileConfig
 from .vsurge import vDriver, vEngine, vSurge, vSurgeApiServer, vSurgeRequest
 from .vwhisper import vWhisperInference, vWhisperInferenceConfig
@@ -84,20 +71,11 @@ from .vwhisper import vWhisperInference, vWhisperInferenceConfig
 __all__ = (
     "EngineRequest",
     "EngineRequestStatus",
-    "Function",
-    "FunctionCall",
-    "FunctionCallFormat",
-    "FunctionCallFormatter",
-    "FunctionCallHandler",
-    "FunctionCallResult",
-    "FunctionCallingConfig",
-    "FunctionCallingManager",
-    "FunctionCallingMode",
-    "FunctionFormatter",
     "InferenceApiRouter",
     "JitableSamplingParams",
-    "OpenAIFunctionFormatter",
     "SamplingParams",
+    "ToolParser",
+    "ToolParserManager",
     "eSurge",
     "eSurgeApiServer",
     "eSurgeRunner",

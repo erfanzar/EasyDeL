@@ -18,39 +18,35 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 import typing as tp
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from http import HTTPStatus
 
+from eformer.loggings import get_logger
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
-from easydel.utils.helpers import get_logger
-
 from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
 from ...openai_api_modules import (
     ChatCompletionRequest,
-    ChatCompletionRequestWithTools,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
     ChatCompletionStreamResponseChoice,
     ChatMessage,
-    ChatMessageWithTools,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     DeltaMessage,
-    FunctionCallFormat,
-    FunctionCallFormatter,
-    FunctionCallParser,
     UsageInfo,
 )
 from ...sampling_params import SamplingParams
+from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
 
 TIMEOUT_KEEP_ALIVE = 5.0
@@ -200,7 +196,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
         return self.esurge.tokenizer
 
 
-class eSurgeApiServer(BaseInferenceApiServer):
+class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
     """eSurge-specific API server implementation with OpenAI compatibility.
 
     Provides a FastAPI-based REST API server that exposes eSurge engines
@@ -221,6 +217,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         esurge_map: dict[str, eSurge] | eSurge,
         oai_like_processor: bool = True,
         enable_function_calling: bool = True,
+        tool_parser_name: str = "hermes",
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -229,6 +226,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
             esurge_map: Single eSurge instance or dict mapping model names to instances.
             oai_like_processor: Enable OpenAI-like processor compatibility for chat templates.
             enable_function_calling: Enable function/tool calling support.
+            tool_parser_name: Name of the tool parser to use (e.g., "hermes", "qwen", etc.)
             **kwargs: Additional arguments passed to BaseInferenceApiServer.
 
         Raises:
@@ -241,18 +239,26 @@ class eSurgeApiServer(BaseInferenceApiServer):
         self.esurge_map = esurge_map
         self.adapters: dict[str, eSurgeAdapter] = {}
 
+        # Build processor map for tool parser initialization
+        model_processors = {}
         for name, esurge in esurge_map.items():
             if not isinstance(esurge, eSurge):
                 raise TypeError(f"Value for key '{name}' must be an instance of eSurge")
             self.adapters[name] = eSurgeAdapter(esurge, name)
+            model_processors[name] = esurge.tokenizer
+
+        # Initialize tool parsers using mixin
+        self.tool_parsers = self.initialize_tool_parsers(
+            model_processors=model_processors,
+            tool_parser_name=tool_parser_name,
+            enable_function_calling=enable_function_calling,
+        )
 
         self.oai_like_processor = oai_like_processor
         self.metrics = ServerMetrics()
         self.status = ServerStatus.STARTING
         self._active_requests: dict[str, dict] = {}
-
-        if "default_function_format" not in kwargs:
-            kwargs["default_function_format"] = FunctionCallFormat.QWEN
+        self.tool_parser_name = tool_parser_name
 
         super().__init__(
             server_name="EasyDeL eSurge API Server",
@@ -359,15 +365,23 @@ class eSurgeApiServer(BaseInferenceApiServer):
 
             conversation = convert_to_openai_format(conversation)
 
+        for msg in conversation:
+            if isinstance(msg.get("content"), list):
+                text_parts = []
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                msg["content"] = " ".join(text_parts)
+
         try:
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
             add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-
             return processor.apply_chat_template(
                 tokenize=False,
                 conversation=conversation,
                 add_generation_prompt=add_generation_prompt,
+                tools=self.extract_tools(request=request),
                 **request.chat_template_kwargs,
             )
         except Exception as e:
@@ -389,73 +403,7 @@ class eSurgeApiServer(BaseInferenceApiServer):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self.thread_pool, self._prepare_chat_input, request, esurge)
 
-    def _prepare_chat_input_with_tools(
-        self,
-        request: ChatCompletionRequestWithTools,
-        esurge: eSurge,
-    ) -> str:
-        """Prepare input with function/tool definitions.
-
-        Formats chat messages with tool/function definitions included
-        in the system prompt.
-
-        Args:
-            request: Chat request with tools/functions.
-            esurge: eSurge instance.
-
-        Returns:
-            Formatted prompt with tool definitions.
-
-        Raises:
-            RuntimeError: If template application fails.
-        """
-        messages = [msg.model_dump() for msg in request.messages]
-        processor = esurge.tokenizer
-
-        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
-            from easydel.trainers.prompt_utils import convert_to_openai_format
-
-            messages = convert_to_openai_format(messages)
-
-        tools = request.get_tools()
-        if tools:
-            format_type = request.function_call_format or self.default_function_format
-            tools_prompt = FunctionCallFormatter.format_tools_for_prompt(tools, format_type)
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] += f"\n\n{tools_prompt}"
-            else:
-                messages.insert(0, {"role": "system", "content": tools_prompt})
-
-        try:
-            if request.chat_template_kwargs is None:
-                request.chat_template_kwargs = {}
-            add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-
-            return processor.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=add_generation_prompt,
-                tokenize=False,
-                **request.chat_template_kwargs,
-            )
-        except Exception as e:
-            logger.exception(f"Error applying chat template: {e}")
-            raise RuntimeError(f"Error preparing input: {e}") from e
-
-    async def _prepare_chat_input_with_tools_async(
-        self,
-        request: ChatCompletionRequestWithTools,
-        esurge: eSurge,
-    ) -> str:
-        """Prepare input with tools asynchronously."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self._prepare_chat_input_with_tools,
-            request,
-            esurge,
-        )
-
-    async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
         """Handle chat completion requests.
 
         Main endpoint for /v1/chat/completions. Supports both streaming and
@@ -482,26 +430,18 @@ class eSurgeApiServer(BaseInferenceApiServer):
             adapter = self._get_adapter(request.model)
             esurge = adapter.esurge
 
-            is_function_request = (
-                self.enable_function_calling
-                and isinstance(request, ChatCompletionRequestWithTools)
-                and request.get_tools()
-            )
-
-            if is_function_request:
-                content = await self._prepare_chat_input_with_tools_async(request, esurge)
-            else:
-                content = await self._prepare_chat_input_async(request, esurge)
+            content = await self._prepare_chat_input_async(request, esurge)
 
             if request.stream:
-                return await self._handle_chat_streaming(request, esurge, content, request_id, is_function_request)
+                return await self._handle_chat_streaming(request, esurge, content, request_id)
             else:
-                return await self._handle_chat_completion(request, esurge, content, request_id, is_function_request)
+                return await self._handle_chat_completion(request, esurge, content, request_id)
 
         except HTTPException:
             self.metrics.failed_requests += 1
             raise
         except Exception as e:
+            traceback.print_exc()
             self.metrics.failed_requests += 1
             logger.exception(f"Error in chat completion: {e}")
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
@@ -512,7 +452,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
         esurge: eSurge,
         content: str,
         request_id: str,
-        is_function_request: bool = False,
     ) -> ChatCompletionResponse:
         """Handle non-streaming chat completion.
 
@@ -524,7 +463,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
             esurge: eSurge engine instance.
             content: Formatted prompt.
             request_id: Unique request ID.
-            is_function_request: Whether to parse for function calls.
 
         Returns:
             Complete chat response with usage statistics.
@@ -558,20 +496,17 @@ class eSurgeApiServer(BaseInferenceApiServer):
         for idx, completion in enumerate(output.outputs):
             response_text = output.accumulated_text
 
-            if is_function_request:
-                format_type = getattr(request, "function_call_format", self.default_function_format)
-                parser = FunctionCallParser(format=format_type, strict=False)
-                function_calls = parser.parse(response_text)
-
-                if function_calls:
-                    message = ChatMessageWithTools.from_function_calls(function_calls, content=None)
-                    finish_reason = "tool_calls"
-                else:
-                    message = ChatMessage(role="assistant", content=response_text)
-                    finish_reason = completion.finish_reason or "stop"
+            # Use mixin method for tool extraction
+            message, finish_reason_extracted = self.extract_tool_calls_batch(
+                response_text=response_text,
+                request=request,
+                model_name=request.model,
+            )
+            # Override finish_reason if it was set by completion
+            if finish_reason_extracted != "function_call" and completion.finish_reason:
+                finish_reason = completion.finish_reason
             else:
-                message = ChatMessage(role="assistant", content=response_text)
-                finish_reason = completion.finish_reason or "stop"
+                finish_reason = finish_reason_extracted
             if finish_reason == "finished":
                 finish_reason = "stop"
             choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
@@ -599,7 +534,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
         esurge: eSurge,
         content: str,
         request_id: str,
-        is_function_request: bool = False,
     ) -> StreamingResponse:
         """Handle streaming chat completion with delta chunks.
 
@@ -611,7 +545,6 @@ class eSurgeApiServer(BaseInferenceApiServer):
             esurge: eSurge engine instance.
             content: Formatted prompt.
             request_id: Unique request ID.
-            is_function_request: Whether to parse for function calls.
 
         Returns:
             StreamingResponse with SSE format:
@@ -627,18 +560,61 @@ class eSurgeApiServer(BaseInferenceApiServer):
         async def generate_stream():
             prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
             sampling_params = self._create_sampling_params(request)
+
+            tool_parser = self.get_tool_parser_for_model(request.model)
+
+            previous_text = ""
+            previous_token_ids = []
+
             try:
                 for output in esurge.stream(content, sampling_params):
                     current_completion_tokens = output.num_generated_tokens
                     current_tps = output.tokens_per_second
                     elapsed_time = output.processing_time
 
+                    # Get delta message from tool parser if available
+                    if tool_parser:
+                        current_text = output.accumulated_text
+                        delta_text = output.delta_text
+                        current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                        delta_token_ids = (
+                            current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
+                        )
+
+                        delta_message = self.extract_tool_calls_streaming(
+                            model_name=request.model,
+                            previous_text=previous_text,
+                            current_text=current_text,
+                            delta_text=delta_text,
+                            previous_token_ids=previous_token_ids,
+                            current_token_ids=current_token_ids,
+                            delta_token_ids=delta_token_ids,
+                            request=request,
+                        )
+                        previous_text = current_text
+                        previous_token_ids = current_token_ids
+
+                        # If tool parser returns a delta message, use it
+                        if delta_message:
+                            if not delta_message.role:
+                                delta_message.role = "assistant"
+                        elif request.tools:
+                            # Tool parser is active but returned None - it's buffering
+                            # Don't send raw text that might contain tool markup
+                            continue  # Skip this chunk entirely
+                        else:
+                            # No special parsing needed for this chunk
+                            delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+                    else:
+                        # No tool parsing, regular streaming
+                        delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+
                     chunk = ChatCompletionStreamResponse(
                         model=request.model,
                         choices=[
                             ChatCompletionStreamResponseChoice(
                                 index=0,
-                                delta=DeltaMessage(content=output.delta_text, role="assistant"),
+                                delta=delta_message,
                                 finish_reason=None,
                             )
                         ],
@@ -1035,104 +1011,9 @@ class eSurgeApiServer(BaseInferenceApiServer):
         Returns:
             JSONResponse with tool definitions per model.
         """
-        tools_by_model = {}
-
-        for model_name, _ in self.adapters.items():
-            model_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "example_function",
-                        "description": "An example function for demonstration",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "param1": {
-                                    "type": "string",
-                                    "description": "First parameter",
-                                },
-                                "param2": {
-                                    "type": "number",
-                                    "description": "Second parameter",
-                                },
-                            },
-                            "required": ["param1"],
-                        },
-                    },
-                }
-            ]
-
-            tools_by_model[model_name] = {
-                "tools": model_tools,
-                "formats_supported": ["openai", "hermes", "gorilla", "json_schema"],
-                "parallel_calls": True,
-            }
-
-        return JSONResponse({"models": tools_by_model, "default_format": "openai"})
-
-    async def _generate_function_followup(
-        self,
-        request: ChatCompletionRequestWithTools,
-        esurge: eSurge,
-        executed_calls: list,
-        prompt_tokens: int,
-        start_time: float,
-    ) -> ChatCompletionResponse:
-        """Generate a follow-up response with function results."""
-        messages = [msg.model_dump() for msg in request.messages]
-
-        function_results = "Function results:\n"
-        for call in executed_calls:
-            if "result" in call:
-                function_results += f"- {call['function']['name']}: {call['result']}\n"
-            else:
-                function_results += f"- {call['function']['name']}: Error - {call.get('error', 'Unknown error')}\n"
-
-        messages.append(
-            {
-                "role": "user",
-                "content": f"{function_results}\nPlease provide a natural response based on these function results.",
-            }
-        )
-
-        processor = esurge.tokenizer
-        if hasattr(processor, "apply_chat_template"):
-            followup_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        else:
-            followup_prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages) + "\nassistant:"
-
-        sampling_params = self._create_sampling_params(request)
-        final_outputs = esurge.generate(followup_prompt, sampling_params, use_tqdm=False)
-
-        if not final_outputs:
-            raise RuntimeError("Follow-up generation failed")
-
-        final_completion = final_outputs[0].outputs[0]
-        final_text = final_completion.text
-
-        completion_tokens = len(final_completion.token_ids)
-        generation_time = time.time() - start_time
-        tokens_per_second = completion_tokens / generation_time if generation_time > 0 else 0
-
-        from ...openai_api_modules import ToolCall
-
-        tool_calls = [ToolCall(id=call["id"], type="function", function=call["function"]) for call in executed_calls]
-
-        message = ChatMessageWithTools(role="assistant", content=final_text, tool_calls=tool_calls)
-
-        usage = UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            tokens_per_second=tokens_per_second,
-            processing_time=generation_time,
-        )
-
-        return ChatCompletionResponse(
-            model=request.model,
-            choices=[ChatCompletionResponseChoice(index=0, message=message, finish_reason="stop")],
-            usage=usage,
-        )
+        model_names = list(self.adapters.keys())
+        tools_response = self.create_tools_response(model_names)
+        return JSONResponse(tools_response)
 
     async def _create_standard_response(
         self,
@@ -1179,7 +1060,4 @@ class eSurgeApiServer(BaseInferenceApiServer):
             This is a placeholder that should be implemented based on
             specific tool execution requirements.
         """
-        return create_error_response(
-            HTTPStatus.NOT_IMPLEMENTED,
-            "Tool execution endpoint is a placeholder. Implement based on your needs.",
-        )
+        return self.create_tool_execution_placeholder()

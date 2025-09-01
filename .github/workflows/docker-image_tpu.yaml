@@ -1,0 +1,60 @@
+name: Docker Image CI/CD For TPUs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {file: Dockerfile, tag: cpu, tagsuf: "", args: "HARDWARE_TYPE=cpu"}
+          - {file: Dockerfile, tag: gpu, tagsuf: "-gpu", args: "HARDWARE_TYPE=gpu"}
+          - {file: Dockerfile, tag: tpu, tagsuf: "-tpu", args: "HARDWARE_TYPE=tpu"}
+          - {file: Dockerfile.ray, tag: ray-cpu, tagsuf: "-ray-cpu", args: "HARDWARE_TYPE=cpu RAY_IMAGE=rayproject/ray:2.36.0-py311"}
+          - {file: Dockerfile.ray, tag: ray-gpu, tagsuf: "-ray-gpu", args: "HARDWARE_TYPE=gpu RAY_IMAGE=rayproject/ray:2.36.0-py311-gpu"}
+          - {file: Dockerfile.ray, tag: ray-tpu, tagsuf: "-ray-tpu", args: "HARDWARE_TYPE=tpu RAY_IMAGE=rayproject/ray:2.36.0-py311"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install toml
+      - name: Extract version
+        id: meta
+        run: |
+          VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push TPU Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}-tpu
+            ghcr.io/erfanzar/easydel:latest-tpu
+            ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}-tpu
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            HARDWARE_TYPE=tpu

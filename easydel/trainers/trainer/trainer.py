@@ -35,6 +35,38 @@ logger = get_logger(__name__)
 
 
 class Trainer(BaseTrainer):
+    """
+    Main trainer implementation for EasyDeL models.
+
+    This class provides a complete training and evaluation pipeline for JAX-based
+    models with support for distributed training, gradient accumulation, mixed
+    precision, and various optimization strategies.
+
+    The trainer handles:
+    - Distributed training across multiple devices and hosts
+    - Automatic checkpointing and resumption
+    - Gradient accumulation for large effective batch sizes
+    - Learning rate scheduling and optimization
+    - Comprehensive metrics tracking and logging
+    - Memory-efficient data loading with Grain or TensorFlow datasets
+
+    Key Features:
+    - JIT compilation of training and evaluation steps
+    - Automatic mixed precision training
+    - Support for model and data parallelism
+    - Integration with WandB and TensorBoard
+    - Flexible data collation and preprocessing
+
+    Example:
+        >>> trainer = Trainer(
+        ...     arguments=training_args,
+        ...     model=model,
+        ...     dataset_train=train_dataset,
+        ...     dataset_eval=eval_dataset
+        ... )
+        >>> output = trainer.train()
+    """
+
     def create_grain_collect_function(
         self,
         max_sequence_length: int,
@@ -140,19 +172,30 @@ class Trainer(BaseTrainer):
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
-        Configures and JIT-compiles the training and evaluation step functions.
+        Configure and JIT-compile training and evaluation step functions.
 
-        This method prepares the functions that will be used during training and evaluation.
-        It sets up sharding for the model parameters and optimizer state, JIT-compiles the
-        training and evaluation functions with the appropriate static arguments and sharding
-        constraints, and also sets up the checkpoint manager.
+        This method is crucial for performance as it:
+        1. Sets up proper sharding specifications for distributed training
+        2. JIT-compiles the step functions with appropriate static arguments
+        3. Configures input/output sharding for efficient data movement
+        4. Sets up the checkpoint manager for model persistence
+
+        The compilation process traces through the computation graph once
+        and generates optimized XLA code for subsequent executions.
 
         Returns:
-            TrainerConfigureFunctionOutput: An object containing:
-                - sharded_training_step_function: The compiled training step function.
-                - sharded_evaluation_step_function: The compiled evaluation step function.
-                - mesh: The device mesh used for computation.
-                - checkpoint_manager: The checkpointer for saving/loading model state.
+            TrainerConfigureFunctionOutput: Contains:
+                - sharded_training_step_function: JIT-compiled training function
+                  with gradient computation and parameter updates
+                - sharded_evaluation_step_function: JIT-compiled evaluation function
+                  for forward passes only
+                - mesh: Device mesh for distributed computation
+                - checkpoint_manager: AsyncCheckpointManager for saving/loading
+
+        Note:
+            - Static arguments are traced at compile time and cannot change
+            - The donate_argnums=(0,) for training allows in-place updates
+            - Empty sharding specs indicate replication across devices
         """
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
         self._train_shared_fn_static_args = (
@@ -206,19 +249,34 @@ class Trainer(BaseTrainer):
         step_metrics: StepMetrics,
     ):
         """
-        Implements the core training loop.
+        Execute the main training loop across all epochs.
 
-        Iterates over the training epochs and steps, executing training steps and updating metrics.
-        A progress bar is created to track the training process. If the process index is not 0
-        (and logging on all workers is disabled), the progress bar is disabled.
+        This method orchestrates the entire training process, managing:
+        - Epoch iteration with proper resumption handling
+        - Progress tracking and reporting
+        - Batch processing and gradient updates
+        - Checkpoint saving at specified intervals
+        - Early stopping on interruption or time limits
+
+        The method handles resumption differently for Grain (seekable) and
+        TensorFlow (non-seekable) datasets. For Grain, it can resume from
+        the exact position, while for TF datasets it starts fresh but
+        continues from the saved model state.
 
         Args:
-            state (EasyDeLState): The initial model state.
-            metrics_tracker (MetricsTracker): Tracker for accumulating and updating training metrics.
-            step_metrics (StepMetrics): Object to calculate metrics per training step.
+            state: Initial model state with parameters and optimizer state
+            metrics_tracker: Accumulates metrics across training steps
+            step_metrics: Calculates per-step metrics like throughput
 
         Returns:
-            A tuple containing the final training output (e.g., updated state and metrics) and any run exception.
+            tuple: (TrainerOutput, exception) where:
+                - TrainerOutput contains final state and checkpoint info
+                - exception is any error that caused training to stop
+
+        Note:
+            - Progress bar is disabled on non-primary processes by default
+            - Training can be interrupted with Ctrl+C and will save state
+            - Automatic resumption updates the progress bar to show continuation
         """
         disabled = False
         if jax.process_index() != 0 and not self.arguments.log_all_workers:
@@ -228,11 +286,28 @@ class Trainer(BaseTrainer):
             disabled=disabled,
             desc="training process",
         )
+
+        # Handle resumption based on dataset type
+        initial_step = int(jax.device_get(state.step))
+        start_epoch = 0
+
+        if initial_step > 0:
+            pbar.update(initial_step)
+            steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+
+            if self.arguments.use_grain:
+                logger.info(f"Resuming Grain dataset from step {initial_step}")
+                start_epoch = initial_step // steps_per_epoch
+            else:
+                logger.info(
+                    f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
+                )
+
         train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
             with self.mesh:
-                for epoch in range(self.arguments.num_train_epochs):
+                for epoch in range(start_epoch, self.arguments.num_train_epochs):
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
@@ -306,22 +381,40 @@ class Trainer(BaseTrainer):
         epoch: int,
     ):
         """
-        Performs training over one epoch.
+        Execute training for a single epoch.
 
-        Iterates over the training dataset for a fixed number of steps in the epoch.
-        Each step fetches a batch, applies data collation, executes a training step,
-        updates metrics, logs metrics, and optionally saves checkpoints.
+        This method processes batches within an epoch, handling:
+        - Batch fetching and collation
+        - Forward and backward passes
+        - Gradient accumulation if configured
+        - Metrics computation and logging
+        - Checkpoint saving at specified intervals
+        - Optional evaluation during training
+        - Training hooks for customization
+
+        The method includes robust error handling to gracefully handle
+        interruptions and save state before exiting.
 
         Args:
-            state (EasyDeLState): The current model state.
-            train_dataset: The training dataset (or an iterator over it).
-            metrics_tracker (MetricsTracker): Tracker to update and store training metrics.
-            step_metrics (StepMetrics): Object to calculate step-level metrics.
-            pbar (BaseProgressBar): Progress bar instance for displaying training progress.
-            epoch (int): The current epoch index.
+            state: Current model state with parameters and optimizer
+            train_dataset: Training data source (dataset or dataloader)
+            train_iter: Iterator over training batches
+            metrics_tracker: Accumulates loss and accuracy metrics
+            step_metrics: Computes per-step performance metrics
+            pbar: Progress bar for visual feedback
+            epoch: Current epoch number (0-indexed)
 
         Returns:
-            A tuple of (updated state, any exception encountered during the run and train iterator).
+            tuple: (updated_state, exception, iterator) where:
+                - updated_state: Model state after the epoch
+                - exception: Any exception that interrupted training
+                - iterator: Updated batch iterator for next epoch
+
+        Note:
+            - Implements on_step_start and on_step_end hooks
+            - Applies training hooks for loss validation
+            - Saves checkpoints based on save_steps configuration
+            - Runs evaluation based on evaluation_steps configuration
         """
         data_collator = self.data_collator
         if data_collator is None:
@@ -331,7 +424,9 @@ class Trainer(BaseTrainer):
             
         metrics_history = []
 
-        for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+        steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+
+        for _ in range(steps_per_epoch):
             current_step = int(jax.device_get(state.step))
 
             if os.getenv("EASYDEL_PROFILING") == "1":
@@ -352,6 +447,9 @@ class Trainer(BaseTrainer):
                 if current_step == 25:
                     logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
+
+            if current_step >= self.max_training_steps:
+                break
 
             with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
                 try:
@@ -374,6 +472,8 @@ class Trainer(BaseTrainer):
                         current_step = int(jax.device_get(state.step))
                 # Update and log metrics
                 try:
+                    
+
                     mean_loss, mean_accuracy = metrics_tracker.update(
                         loss=metrics.loss,
                         accuracy=metrics.accuracy,
@@ -530,21 +630,36 @@ class Trainer(BaseTrainer):
         batch,
     ) -> tuple[EasyDeLState, LossMetrics, Exception]:
         """
-        Executes a single training step.
+        Execute a single training step with gradient computation and updates.
 
-        This function optionally updates the model's pruning module before and after the gradient step.
-        It then calls the sharded training step function to compute the gradients and update the state.
-        If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
+        This method performs a complete training iteration:
+        1. Pre-forward pruning updates (if configured)
+        2. Batch preprocessing with custom hooks
+        3. Forward pass and loss computation
+        4. Backward pass and gradient computation
+        5. Parameter updates via optimizer
+        6. Post-gradient pruning updates (if configured)
+
+        The method handles various training strategies:
+        - Gradient accumulation (handled in the compiled function)
+        - Mixed precision training (via dtype configuration)
+        - Model pruning (via pruning_module hooks)
+        - Custom preprocessing (via _preprocess_batch_input)
 
         Args:
-            state: The current model state.
-            batch: A processed batch of training data.
+            state: Current model state containing parameters and optimizer state
+            batch: Preprocessed batch of training data as a dictionary
 
         Returns:
-            A tuple containing:
-                - The updated model state.
-                - The computed LossMetrics.
-                - An exception instance if one was raised during execution; otherwise, None.
+            tuple: (updated_state, metrics, exception) where:
+                - updated_state: Model state after parameter updates
+                - metrics: LossMetrics with loss, accuracy, and custom metrics
+                - exception: Any exception caught during execution, None if successful
+
+        Note:
+            - Uses jax.block_until_ready to ensure synchronous execution
+            - Exceptions are caught to allow graceful shutdown with state saving
+            - Custom metrics from preprocessing are merged with training metrics
         """
         if self.pruning_module is not None:
             state = state.replace(
@@ -617,19 +732,43 @@ class Trainer(BaseTrainer):
 
     def train(self) -> TrainerOutput:
         """
-        Executes the complete training process.
+        Execute the complete training pipeline.
 
-        This method sets up initial metrics and logging, runs the training loop, and finalizes training.
-        It calls the training hook at the beginning and returns a TrainerOutput object at the end.
+        This is the main entry point for training. It orchestrates the entire
+        training workflow from initialization to completion:
+
+        1. Calls start_training_hook for custom initialization
+        2. Sets up metrics tracking and logging infrastructure
+        3. Logs initial configuration and model information
+        4. Executes the main training loop across all epochs
+        5. Handles interruptions and saves final checkpoints
+        6. Runs final evaluation if configured
+        7. Cleans up resources and returns results
+
+        The method is designed to be robust to interruptions and will save
+        the model state before exiting on errors or keyboard interrupts.
 
         Returns:
-            TrainerOutput: An object containing the final training state, metrics, and any additional outputs.
+            TrainerOutput: Contains:
+                - state: Final model state after training
+                - mesh: Device mesh used for training
+                - checkpoint_path: Path to the final checkpoint
+                - last_save_file_name: Name of the last saved file
+
+        Example:
+            >>> trainer = Trainer(arguments=args, model=model, ...)
+            >>> output = trainer.train()
+            >>> print(f"Final loss: {output.state.metrics['loss']}")
+
+        Note:
+            - Automatically resumes from checkpoints if configured
+            - Saves checkpoints periodically based on save_steps
+            - Can be interrupted with Ctrl+C without losing progress
         """
         self.start_training_hook()
         state = self.model_state
         metrics_tracker = MetricsTracker()
         step_metrics = StepMetrics(self.arguments)
-        # Setup initial metrics and logging.
         self._setup_initial_metrics(state)
         output, run_exception = self._run_training_loop(
             state=self.model_state,
@@ -640,20 +779,44 @@ class Trainer(BaseTrainer):
 
     def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
         """
-        Evaluates the model using the provided model state.
+        Evaluate the model on the evaluation dataset.
 
-        This method iterates over the evaluation dataset, performs forward passes, calculates evaluation metrics,
-        logs the metrics, and yields the metrics for each evaluation step.
+        This method performs model evaluation without gradient computation,
+        yielding metrics for each evaluation step. It's useful for:
+        - Periodic evaluation during training
+        - Final model evaluation after training
+        - Standalone evaluation of checkpoints
+
+        The evaluation process:
+        1. Switches to evaluation mode (no gradient computation)
+        2. Iterates through the evaluation dataset
+        3. Computes forward passes and metrics
+        4. Yields metrics for monitoring and analysis
+        5. Handles multi-host synchronization
 
         Args:
-            model_state (EasyDeLState): The state of the model (including parameters and configuration)
-                                        to be used for evaluation.
+            model_state: Model state containing parameters for evaluation.
+                        This can be different from the training state,
+                        allowing evaluation of checkpoints or other models.
 
         Yields:
-            Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each evaluation step.
+            dict: Evaluation metrics for each step, including:
+                - loss: Average loss value
+                - accuracy: Average accuracy (if applicable)
+                - throughput: Tokens/samples per second
+                - Additional model-specific metrics
 
         Raises:
-            AssertionError: If the evaluation dataloader is not set.
+            AssertionError: If evaluation dataloader is not configured
+
+        Example:
+            >>> for metrics in trainer.eval(model_state):
+            ...     print(f"Eval loss: {metrics['eval/loss']}")
+
+        Note:
+            - Evaluation is performed without gradient computation
+            - Catches RuntimeError from multi-host synchronization issues
+            - Progress bar shows evaluation progress in real-time
         """
         self.start_evaluation_hook()
         try:

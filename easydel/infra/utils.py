@@ -63,22 +63,18 @@ import jax
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
 from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import (
-    AVAILABLE_SPARSE_MODULE_TYPES,
-    EasyDeLGradientCheckPointers,
-    EasyDeLQuantizationMethods,
-)
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
 
 warnings.filterwarnings(
     "ignore",
@@ -310,11 +306,7 @@ def quantize_linear_layers(
         return model
 
     from easydel.layers.quantization import Linear8bit, LinearNF4
-    from easydel.utils.graph_utils import (
-        get_module_from_path,
-        iter_module_search,
-        set_module_from_path,
-    )
+    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
     quantizer: Linear8bit = {
         EasyDeLQuantizationMethods.NF4: LinearNF4,
@@ -378,11 +370,7 @@ def apply_lora_to_layers(
     Returns:
         The modified model with LoRA applied to the specified layers.
     """
-    from easydel.utils.graph_utils import (
-        get_module_from_path,
-        iter_module_search,
-        set_module_from_path,
-    )
+    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
     if not (lora_rank > 0):
         raise ValueError("lora_rank should be a positive value and higher than `0`.")
@@ -427,7 +415,7 @@ def split_lora_params(model: nn.Module) -> nn.Module:
     Returns:
         LoRA Layer Weights.
     """
-    from easydel.utils.graph_utils import get_module_from_path, iter_module_search
+    from easydel.utils.traversals import get_module_from_path, iter_module_search
 
     od = {}
     with tqdm(
@@ -450,7 +438,7 @@ def merge_lora_params(model: nn.Module, lora_tree: dict) -> nn.Module:
     Returns:
         LoRA Layer Weights.
     """
-    from easydel.utils.graph_utils import get_module_from_path, iter_module_search
+    from easydel.utils.traversals import get_module_from_path, iter_module_search
 
     if not is_flatten(lora_tree):
         lora_tree = flatten_dict(lora_tree)
@@ -475,11 +463,7 @@ def unwrap_lora_to_layers(
     """
     UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model.
     """
-    from easydel.utils.graph_utils import (
-        get_module_from_path,
-        iter_module_search,
-        set_module_from_path,
-    )
+    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
     with tqdm(
         total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),

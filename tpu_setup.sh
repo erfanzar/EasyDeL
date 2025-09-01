@@ -128,7 +128,7 @@ if ! python3 -m pip install --user -U uv --quiet; then
   if ! /usr/bin/python -m pip install --user -U uv --quiet; then
     log_error "Failed to install uv locally"
     exit 1
-  fi 
+  fi
 fi
 log_success "uv installed locally"
 

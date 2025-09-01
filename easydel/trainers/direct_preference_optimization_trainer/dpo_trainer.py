@@ -18,6 +18,7 @@ from collections import defaultdict
 from functools import partial
 
 import jax
+from eformer.loggings import get_logger
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
@@ -26,7 +27,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import TrainerConfigureFunctionOutput
@@ -65,9 +65,9 @@ class DPOTrainer(Trainer):
         eval_dataset: Dataset | None = None,
         data_collator: tp.Callable | None = None,
     ):
-        assert arguments is not None, (
-            "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
-        )
+        assert (
+            arguments is not None
+        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
         assert isinstance(arguments, DPOConfig), f"arguments type must be `DPOConfig` but got {type(arguments)}"
 
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."

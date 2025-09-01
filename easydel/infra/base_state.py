@@ -64,16 +64,16 @@ import jax
 import optax
 from eformer import escale as es
 from eformer.escale import PartitionAxis
+from eformer.loggings import get_logger
+from eformer.paths import ePath, ePathLike
+from eformer.serialization import AsyncCheckpointManager
 from flax import nnx as nn
 from flax import struct
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.infra.factory import TaskType
-from easydel.utils.checkpoint_managers import CheckpointManager
-from easydel.utils.checkpoint_managers.path_utils import EasyPath, EasyPathLike
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
 if tp.TYPE_CHECKING:
@@ -424,25 +424,35 @@ class EasyDeLState(struct.PyTreeNode):
             FileNotFoundError: If the required optimizer files are not found.
             Exception: If any error occurs during loading or deserialization.
         """
-        load_directory = EasyPath(load_directory)
-        optim_path = load_directory / (OPTIMIZER_NAME + ".safetensors.index.json")
+        load_directory = ePath(load_directory)
+        optim_path = (
+            load_directory if AsyncCheckpointManager.is_tensorstore(load_directory) else load_directory / OPTIMIZER_NAME
+        )
         struct_path = load_directory / OPTIMIZER_STRUCT_NAME
 
-        if not (optim_path.exists() and struct_path.exists()):
+        if not struct_path.exists():
             raise FileNotFoundError(f"Optimizer files are missing at {load_directory}")
-
         try:
-            leaves, _ = CheckpointManager.load_checkpoint(path=optim_path)
+            leaves, _ = AsyncCheckpointManager(max_workers=1).load(
+                path=AsyncCheckpointManager.safe_loadpath(optim_path),
+                mesh=self.model.mesh,
+                partition_rules=self.model.config.get_partition_rules(),
+                prefix="tx",
+            )
+            recreated = opt_state = leaves
 
-            recreated = [None] * len(leaves)
-            for i in range(len(leaves)):
-                try:
-                    recreated[i] = leaves[f"param_idx_{i}"]
-                except KeyError:
-                    recreated[i] = leaves[f"param_{i}"]
             treedef, step = pickle.loads(struct_path.read_bytes())
+
+            if not AsyncCheckpointManager.is_tensorstore(optim_path):
+                recreated = [None] * len(leaves)
+                for i in range(len(leaves)):
+                    try:
+                        recreated[i] = leaves[f"param_idx_{i}"]
+                    except KeyError:
+                        recreated[i] = leaves[f"param_{i}"]
+
+                opt_state = jax.tree_util.tree_unflatten(treedef, recreated)
             logger.info(f"Optimizer state loaded from {load_directory}")
-            opt_state = jax.tree_util.tree_unflatten(treedef, recreated)
 
             return self.replace(opt_state=opt_state, step=jnp.asarray(step))
         except Exception as e:
@@ -451,37 +461,26 @@ class EasyDeLState(struct.PyTreeNode):
 
     def save_optimizer(
         self,
-        save_directory: str | os.PathLike | EasyPathLike,
-        enable: bool | None = None,
+        save_directory: str | os.PathLike | ePathLike,
         float_dtype: jnp.dtype | None = None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
     ):
-        save_directory = EasyPath(save_directory)
+        save_directory = ePath(save_directory)
         if self.opt_state is not None:
-            if enable is None:
-                enable = jax.process_index() == 0
-            if enable:
-                save_directory.mkdir(parents=True, exist_ok=True)
-                optim_path = save_directory / OPTIMIZER_NAME
-            else:
-                optim_path = EasyPath("/dev/null")
-
+            save_directory.mkdir(parents=True, exist_ok=True)
+            optim_path = save_directory
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
-                CheckpointManager.save_checkpoint(
-                    state={
-                        f"param_idx_{idx}": param for idx, param in enumerate(jax.tree_util.tree_leaves(self.opt_state))
-                    },
-                    path=optim_path,
-                    float_dtype=float_dtype,
-                    mismatch_allowed=mismatch_allowed,
-                    verbose=verbose,
-                    enable=enable,
-                )
-                struct_path: EasyPathLike = save_directory / OPTIMIZER_STRUCT_NAME
-                buffer_struct = pickle.dumps((jax.tree_util.tree_structure(self.opt_state), self.step))
-                struct_path.write_bytes(buffer_struct)
+                with self.model.mesh:
+                    AsyncCheckpointManager(max_workers=1).save(
+                        tree=self.opt_state,
+                        path=optim_path,
+                        mesh=self.model.mesh,
+                        float_dtype=float_dtype,
+                        prefix="tx",
+                    )
+                    struct_path: ePathLike = save_directory / OPTIMIZER_STRUCT_NAME
+                    buffer_struct = pickle.dumps((jax.tree_util.tree_structure(self.opt_state), self.step))
+                    struct_path.write_bytes(buffer_struct)
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
                 import traceback
@@ -492,12 +491,9 @@ class EasyDeLState(struct.PyTreeNode):
 
     def save_state(
         self,
-        save_directory: str | os.PathLike | EasyPathLike,
+        save_directory: str | os.PathLike | ePathLike,
         float_dtype: jnp.dtype | None = None,
-        verbose: bool = True,
-        mismatch_allowed: bool = True,
         save_optimizer: bool = True,
-        enable: bool | None = None,
     ):
         """Saves the entire `EasyDeLState` to a directory.
 
@@ -516,19 +512,10 @@ class EasyDeLState(struct.PyTreeNode):
                 slightly from expected. Defaults to True.
             save_optimizer (bool):
                 If True, saves the optimizer state. Defaults to True.
-            enable (tp.Optional[bool]):
-                If set, controls whether saving happens (True) or is skipped (False). If None, saving typically
-                occurs only on JAX process index 0. Defaults to None.
         """
-        save_directory = EasyPath(save_directory)
+        save_directory = ePath(save_directory)
         if save_optimizer:
-            self.save_optimizer(
-                save_directory=save_directory,
-                enable=enable,
-                float_dtype=float_dtype,
-                verbose=verbose,
-                mismatch_allowed=mismatch_allowed,
-            )
+            self.save_optimizer(save_directory=save_directory, float_dtype=float_dtype)
         else:
             logger.info("Skipping optimizer saving as requested.")
 
@@ -536,9 +523,6 @@ class EasyDeLState(struct.PyTreeNode):
             save_directory=save_directory,
             gather_fns=self.model._gather_fns,
             float_dtype=float_dtype,
-            mismatch_allowed=mismatch_allowed,
-            verbose=verbose,
-            enable=enable,
         )
 
     @classmethod
@@ -689,7 +673,7 @@ class EasyDeLState(struct.PyTreeNode):
         )
 
         state = cls.create(step=jnp.array(0), model=model)
-        optimizer_path = EasyPath(load_directory) / (OPTIMIZER_NAME + ".safetensors.index.json")
+        optimizer_path = ePath(load_directory) / OPTIMIZER_STRUCT_NAME
         if optimizer_path.exists():
             cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
             with cmg:
@@ -846,6 +830,6 @@ class EasyDeLState(struct.PyTreeNode):
         """
         Returns a string representation of the EasyDeLState, primarily showing the model representation.
         """
-        return "EasyDeLState-" + str(self.model)
+        return ("TxIncluded-" if self.opt_state is not None else "") + "EasyDeLState-" + str(self.model)
 
     __str__ = __repr__

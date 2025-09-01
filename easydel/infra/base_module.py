@@ -30,24 +30,18 @@ import jax
 import jax.extend
 import jax.tree_util
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
+from eformer.loggings import get_logger
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from easydel.utils import traversals
-from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
 from .etils import EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
-from .loss_utils import (
-    LOSS_MAPPING,
-    ForCausalLMLoss,
-    ForSequenceClassificationLoss,
-    LossConfig,
-    LossMetrics,
-)
+from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 
 if tp.TYPE_CHECKING:
@@ -134,7 +128,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             tp.Dict: A dictionary containing the module's parameters.
         """
-        from easydel.utils.graph_utils import iter_module_search
+        from easydel.utils.traversals import iter_module_search
 
         parameters = {}
         for key, value in iter_module_search(self, nn.Param):
@@ -388,7 +382,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             Self: The module instance with parameters converted to the specified dtype.
         """
-        from easydel.utils.graph_utils import iter_module_search
+        from easydel.utils.traversals import iter_module_search
 
         gdef, state, others = nn.split(self, self.graphstate_type, ...)
 
@@ -450,7 +444,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             Self: The module instance with updated runtime dtype.
         """
-        from easydel.utils.graph_utils import iter_module_search
+        from easydel.utils.traversals import iter_module_search
 
         for _path, module in iter_module_search(self):
             if hasattr(module, "dtype"):
@@ -471,7 +465,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             Self: The module instance with updated parameter dtype.
         """
-        from easydel.utils.graph_utils import iter_module_search
+        from easydel.utils.traversals import iter_module_search
 
         gdef, gtree, others = nn.split(self, self.graphstate_type, ...)
 
@@ -873,9 +867,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
                 model=self.merge_module(gstruct, gstate, gother),
             )
 
-        gstruct, gstate, gother = self.split_module()
-        state = _create_state(gstruct, gstate, gother)
-        return state
+        return _create_state(*self.split_module())
 
     def to_torch(self, **kwargs):
         """
@@ -1085,13 +1077,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
     def transform_fn(self):
         """Transform function with rules."""
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
-        from easydel.utils import graph_utils
+        from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 
         return partial(
             StateDictConverter.huggingface_to_easydel,
@@ -1350,13 +1342,13 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
             tp.Callable: A partial function for converting a PyTorch state dict without applying sharding.
         """
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
-        from easydel.utils import graph_utils
+        from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.Embed)]
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in graph_utils.iter_module_search(self, BaseMoeModule)]
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 
         return partial(
             StateDictConverter.huggingface_to_easydel,

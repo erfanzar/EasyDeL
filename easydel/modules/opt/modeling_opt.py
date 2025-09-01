@@ -42,11 +42,7 @@ from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    BaseModelOutput,
-    MaskedLMOutput,
-)
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, MaskedLMOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (

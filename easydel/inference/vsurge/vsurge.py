@@ -21,9 +21,9 @@ import typing as tp
 
 import jax
 from eformer.common_types import NOT_GIVEN, _Empty
+from eformer.loggings import get_logger
 
-from easydel.utils.helpers import get_logger
-
+from ..decoders import SmartBytecodeDecoder
 from ..sampling_params import SamplingParams
 from .core import vDriver, vEngine
 from .request_type import vSurgeRequest
@@ -32,7 +32,6 @@ from .utils import (
     ActiveRequestMetadata,
     AsyncMultifuture,
     ReturnSample,
-    SmartBytecodeDecoder,
     calculate_pefill_lengths,
     text_tokens_to_string,
 )
@@ -265,14 +264,13 @@ class vSurge:
         prefill_lengths: int | list[int] | None = None,
         max_prefill_length: int | None = None,
         max_length: int | None = None,
-        page_size: int = 128,
-        hbm_utilization: float = 0.8,
         interleaved_mode: bool = False,
         slot_clear_steps: int = 0,
         vsurge_name: str | None = None,
         verbose: bool = True,
         bytecode_decode: bool = False,
         seed: int = 894,
+        **kwargs,
     ) -> vSurge:
         """Instantiates vSurge from a model and processor.
 
@@ -353,9 +351,7 @@ class vSurge:
                     max_concurrent_decodes=max_concurrent_decodes,
                     prefill_lengths=actual_prefill_lengths,
                     max_prefill_length=max_prefill_length,
-                    hbm_utilization=hbm_utilization,
                     max_length=max_length,
-                    page_size=page_size,
                     seed=seed,
                 ),
                 interleaved_mode=interleaved_mode,

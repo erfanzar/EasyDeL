@@ -1,0 +1,228 @@
+version: "3.8"
+
+x-common-variables: &common-variables
+  PYTHONUNBUFFERED: 1
+  PYTHONDONTWRITEBYTECODE: 1
+
+x-build-args: &build-args
+  PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
+  GIT_USER_EMAIL: ${GIT_USER_EMAIL}
+  GIT_USER_NAME: ${GIT_USER_NAME}
+
+services:
+  # CPU-only development environment
+  easydel-cpu-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: cpu
+      cache_from:
+        - type=registry,ref=ghcr.io/erfanzar/easydel:cache-cpu
+    image: easydel:dev-cpu
+    container_name: easydel-cpu-dev
+    environment:
+      <<: *common-variables
+    volumes:
+      - .:/app:rw
+      - ~/.cache:/root/.cache:rw
+      - easydel-pip-cache:/root/.cache/pip
+      - easydel-uv-cache:/root/.cache/uv
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
+    networks:
+      - easydel-network
+
+  # GPU-enabled development environment
+  easydel-gpu-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: gpu
+      cache_from:
+        - type=registry,ref=ghcr.io/erfanzar/easydel:cache-gpu
+    image: easydel:dev-gpu
+    container_name: easydel-gpu-dev
+    runtime: nvidia
+    environment:
+      <<: *common-variables
+      JAX_PLATFORM_NAME: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+      XLA_PYTHON_CLIENT_MEM_FRACTION: ${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}
+    volumes:
+      - .:/app:rw
+      - ~/.cache:/root/.cache:rw
+      - easydel-pip-cache:/root/.cache/pip
+      - easydel-uv-cache:/root/.cache/uv
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - easydel-network
+    shm_size: "16gb"
+
+  # TPU-enabled development environment
+  easydel-tpu-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: tpu
+      cache_from:
+        - type=registry,ref=ghcr.io/erfanzar/easydel:cache-tpu
+    image: easydel:dev-tpu
+    container_name: easydel-tpu-dev
+    privileged: true
+    network_mode: host
+    ipc: host
+    environment:
+      <<: *common-variables
+      JAX_PLATFORM_NAME: tpu
+      TPU_NAME: ${TPU_NAME}
+      TPU_ZONE: ${TPU_ZONE}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-/app/credentials.json}
+      TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS: 60
+    volumes:
+      - .:/app:rw
+      - ~/.cache:/root/.cache:rw
+      - easydel-pip-cache:/root/.cache/pip
+      - easydel-uv-cache:/root/.cache/uv
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/app/credentials.json:ro
+      - /tmp:/tmp
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    shm_size: "32gb"
+
+  # Production CPU service
+  easydel-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: cpu
+        VERSION: ${VERSION:-latest}
+    image: easydel:prod-cpu
+    container_name: easydel-cpu
+    environment:
+      <<: *common-variables
+    networks:
+      - easydel-network
+    restart: unless-stopped
+
+  # Production GPU service
+  easydel-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: gpu
+        VERSION: ${VERSION:-latest}
+    image: easydel:prod-gpu
+    container_name: easydel-gpu
+    runtime: nvidia
+    environment:
+      <<: *common-variables
+      JAX_PLATFORM_NAME: cuda
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-all}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - easydel-network
+    restart: unless-stopped
+    shm_size: "16gb"
+
+  # Test runner
+  easydel-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: ${TEST_HARDWARE:-cpu}
+    image: easydel:test
+    container_name: easydel-test
+    environment:
+      <<: *common-variables
+    volumes:
+      - ./test-results:/app/test-results
+    networks:
+      - easydel-network
+
+  # Jupyter notebook server
+  easydel-notebook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        <<: *build-args
+        HARDWARE_TYPE: ${NOTEBOOK_HARDWARE:-cpu}
+    image: easydel:notebook
+    container_name: easydel-notebook
+    environment:
+      <<: *common-variables
+      JUPYTER_ENABLE_LAB: "yes"
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/app:rw
+      - ./notebooks:/app/notebooks:rw
+    working_dir: /app
+    command:
+      [
+        "jupyter",
+        "lab",
+        "--ip=0.0.0.0",
+        "--port=8888",
+        "--no-browser",
+        "--allow-root",
+        "--NotebookApp.token=''",
+      ]
+    networks:
+      - easydel-network
+
+volumes:
+  easydel-pip-cache:
+    driver: local
+  easydel-uv-cache:
+    driver: local
+
+networks:
+  easydel-network:
+    driver: bridge

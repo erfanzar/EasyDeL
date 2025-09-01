@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
@@ -27,18 +28,9 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
-from easydel.layers.caching import (
-    PagesCache,
-    PagesMetadata,
-    TransformerCache,
-    TransformerMetadata,
-)
+from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import ParallelLinear
-from easydel.modules.auto.auto_modeling import (
-    AutoEasyDeLModel,
-    AutoEasyDeLVisionModel,
-)
-from easydel.utils.helpers import get_logger
+from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig
 

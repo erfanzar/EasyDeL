@@ -41,11 +41,11 @@ import inspect
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax.experimental import sparse
 
 from easydel.utils.compiling_utils import hash_fn
-from easydel.utils.helpers import get_logger
 
 
 def add_start_docstrings(*docstr):

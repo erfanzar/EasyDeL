@@ -28,12 +28,7 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.tpu_ops import pallas_ring_attention
 
-from .._attention_impl import (
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionOutput,
-    AttentionRegistry,
-)
+from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 from .vanilla import VanillaAttn
 
 

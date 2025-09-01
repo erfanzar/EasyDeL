@@ -23,6 +23,7 @@ import jax
 from eformer import common_types
 from eformer import escale as es
 from eformer.escale import PartitionAxis, PartitionManager
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
@@ -30,7 +31,6 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
-from easydel.utils.helpers import get_logger
 
 from ..ops import BaseOperation
 
@@ -146,9 +146,9 @@ class AttentionMetadata:
         # fmt:on
         if self.mesh is NOT_GIVEN and self.base_config is None:
             mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-            assert not mesh.empty, (
-                "You should pass 'mesh' to `AttentionMetadata` or at least create that under mesh context manager"
-            )
+            assert (
+                not mesh.empty
+            ), "You should pass 'mesh' to `AttentionMetadata` or at least create that under mesh context manager"
             self.mesh = mesh
         self._safety_check()
         if self.backend is None:

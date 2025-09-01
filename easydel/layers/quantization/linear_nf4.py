@@ -18,12 +18,7 @@ import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib
 from flax.nnx.nn import dtypes, initializers
-from flax.typing import (
-    DotGeneralT,
-    Dtype,
-    Initializer,
-    PrecisionLike,
-)
+from flax.typing import DotGeneralT, Dtype, Initializer, PrecisionLike
 from jax import lax
 
 from easydel.utils.compiling_utils import ejit

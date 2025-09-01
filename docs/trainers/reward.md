@@ -17,18 +17,18 @@ reward_config = RewardConfig(
     # Model and training basics
     model_name="RewardTrainer",     # Name of the model
     learning_rate=1e-6,             # Learning rate for optimization
-    
+
     # Sequence parameters
     max_sequence_length=1024,       # Maximum sequence length
-    
+
     # Reward model parameters
     disable_dropout=True,           # Disable dropout during training
     center_rewards_coefficient=0.1, # Coefficient for centering reward outputs
-    
+
     # Dataset processing
     dataset_num_proc=None,          # Processes for dataset processing
     remove_unused_columns=False,    # Whether to remove unused columns
-    
+
     # Batch and training parameters
     total_batch_size=16,            # Total batch size
     num_train_epochs=3,             # Number of training epochs
@@ -53,7 +53,7 @@ if tokenizer.pad_token_id is None:
 
 # Load dataset with preference pairs
 dataset = load_dataset(
-    "trl-lib/ultrafeedback_binarized", 
+    "trl-lib/ultrafeedback_binarized",
     split="train[:5%]"  # Using a small subset for demonstration
 )
 
@@ -135,11 +135,11 @@ def preprocess_function(examples):
     # Custom preprocessing logic
     chosen_texts = [prompt + chosen for prompt, chosen in zip(examples["prompt"], examples["chosen"])]
     rejected_texts = [prompt + rejected for prompt, rejected in zip(examples["prompt"], examples["rejected"])]
-    
+
     # Tokenize both chosen and rejected
     chosen_inputs = tokenizer(chosen_texts, truncation=True, max_length=1024)
     rejected_inputs = tokenizer(rejected_texts, truncation=True, max_length=1024)
-    
+
     return {
         "input_ids_chosen": chosen_inputs["input_ids"],
         "attention_mask_chosen": chosen_inputs["attention_mask"],
@@ -171,7 +171,7 @@ You can provide a separate evaluation dataset:
 ```python
 # Load evaluation dataset
 eval_dataset = load_dataset(
-    "trl-lib/ultrafeedback_binarized", 
+    "trl-lib/ultrafeedback_binarized",
     split="test[:10%]"
 )
 

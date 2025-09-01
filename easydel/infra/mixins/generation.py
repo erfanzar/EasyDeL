@@ -54,6 +54,7 @@ from functools import cached_property, partial
 import chex
 import jax
 import numpy as np
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import lax
 from jax import numpy as jnp
@@ -73,11 +74,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheMetaData,
-)
-from easydel.utils.helpers import get_logger
+from easydel.layers.caching import PagesCache, PagesCacheMetaData
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput

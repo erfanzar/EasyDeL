@@ -1,0 +1,32 @@
+services:
+  easydel-tpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HARDWARE_TYPE: tpu
+    image: easydel:tpu
+    container_name: easydel-tpu
+    stdin_open: true
+    tty: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - /tmp:/tmp
+    working_dir: /workspace
+    environment:
+      - JAX_PLATFORMS=${JAX_PLATFORMS:-tpu,cpu}
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
+      - TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS=60
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    shm_size: "32gb"
+    command: bash

@@ -23,7 +23,7 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from easydel.utils.helpers import get_logger
+from eformer.loggings import get_logger
 
 try:
     import uvicorn
@@ -58,7 +58,7 @@ DASHBOARD_HTML_FIXED = """
                 this.type = config.type;
                 this.draw();
             }
-            
+
             // Update chart data without recreating
             update(newData) {
                 if (newData && newData.labels) {
@@ -69,57 +69,57 @@ DASHBOARD_HTML_FIXED = """
                 }
                 this.draw();
             }
-            
+
             destroy() {
                 // Simple cleanup
                 if (this.canvas) {
                     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
                 }
             }
-            
+
             draw() {
                 const canvas = this.canvas;
                 const ctx = this.ctx;
-                
+
                 // Validate canvas element
                 if (!canvas || !ctx) {
                     console.error('Canvas or context not available');
                     return;
                 }
-                
+
                 // Check if canvas is properly rendered - but don't retry infinitely
                 if (canvas.offsetWidth === 0 || canvas.offsetHeight === 0) {
                     // Try to get dimensions from parent or use defaults
                     const parent = canvas.parentElement;
                     const parentWidth = parent ? parent.offsetWidth : 400;
                     const parentHeight = parent ? parent.offsetHeight : 250;
-                    
+
                     if (parentWidth === 0 || parentHeight === 0) {
                         // Use fixed dimensions as last resort
                         canvas.style.width = '400px';
                         canvas.style.height = '250px';
                     }
                 }
-                
+
                 // Set canvas size with fallback dimensions
                 const containerWidth = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 400;
                 const containerHeight = canvas.offsetHeight || canvas.parentElement?.offsetHeight || 250;
-                
+
                 canvas.width = containerWidth;
                 canvas.height = containerHeight;
-                
+
                 const width = canvas.width;
                 const height = canvas.height;
                 const padding = 40;
-                
+
                 // Clear canvas
                 ctx.clearRect(0, 0, width, height);
-                
+
                 // Get data
                 const labels = this.data.labels || [];
                 const dataset = this.data.datasets[0] || {};
                 const data = dataset.data || [];
-                
+
                 if (data.length === 0) {
                     // Draw "No Data" message
                     ctx.fillStyle = '#f0f0f0';
@@ -132,20 +132,20 @@ DASHBOARD_HTML_FIXED = """
                     ctx.fillText('Waiting for metrics...', width / 2, height / 2 + 25);
                     return;
                 }
-                
+
                 // Calculate chart area
                 const chartWidth = width - (padding * 2);
                 const chartHeight = height - (padding * 2);
-                
+
                 // Find min/max values
                 const maxValue = Math.max(...data);
                 const minValue = Math.min(...data);
                 const valueRange = maxValue - minValue || 1;
-                
+
                 // Draw background
                 ctx.fillStyle = '#f9f9f9';
                 ctx.fillRect(padding, padding, chartWidth, chartHeight);
-                
+
                 // Draw grid lines
                 ctx.strokeStyle = '#e0e0e0';
                 ctx.lineWidth = 1;
@@ -156,18 +156,18 @@ DASHBOARD_HTML_FIXED = """
                     ctx.lineTo(padding + chartWidth, y);
                     ctx.stroke();
                 }
-                
+
                 // Draw line chart
                 if (data.length > 1) {
                     ctx.strokeStyle = dataset.borderColor || '#667eea';
                     ctx.lineWidth = 2;
                     ctx.beginPath();
-                    
+
                     for (let i = 0; i < data.length; i++) {
                         const x = padding + (chartWidth / (data.length - 1)) * i;
                         const normalizedValue = (data[i] - minValue) / valueRange;
                         const y = padding + chartHeight - (normalizedValue * chartHeight);
-                        
+
                         if (i === 0) {
                             ctx.moveTo(x, y);
                         } else {
@@ -175,7 +175,7 @@ DASHBOARD_HTML_FIXED = """
                         }
                     }
                     ctx.stroke();
-                    
+
                     // Draw fill area if specified
                     if (dataset.fill) {
                         ctx.fillStyle = dataset.backgroundColor || 'rgba(102, 126, 234, 0.1)';
@@ -184,7 +184,7 @@ DASHBOARD_HTML_FIXED = """
                         ctx.closePath();
                         ctx.fill();
                     }
-                    
+
                     // Draw points (show fewer points to reduce clutter)
                     ctx.fillStyle = dataset.borderColor || '#667eea';
                     const pointStep = Math.max(1, Math.floor(data.length / 20)); // Show max 20 points
@@ -192,13 +192,13 @@ DASHBOARD_HTML_FIXED = """
                         const x = padding + (chartWidth / (data.length - 1)) * i;
                         const normalizedValue = (data[i] - minValue) / valueRange;
                         const y = padding + chartHeight - (normalizedValue * chartHeight);
-                        
+
                         ctx.beginPath();
                         ctx.arc(x, y, 2, 0, 2 * Math.PI); // Smaller radius
                         ctx.fill();
                     }
                 }
-                
+
                 // Draw axes
                 ctx.strokeStyle = '#333';
                 ctx.lineWidth = 2;
@@ -207,12 +207,12 @@ DASHBOARD_HTML_FIXED = """
                 ctx.lineTo(padding, padding + chartHeight);
                 ctx.lineTo(padding + chartWidth, padding + chartHeight);
                 ctx.stroke();
-                
+
                 // Draw labels
                 ctx.fillStyle = '#666';
                 ctx.font = '12px Arial';
                 ctx.textAlign = 'center';
-                
+
                 // Y-axis labels
                 for (let i = 0; i <= 5; i++) {
                     const value = minValue + (valueRange / 5) * (5 - i);
@@ -220,7 +220,7 @@ DASHBOARD_HTML_FIXED = """
                     ctx.textAlign = 'right';
                     ctx.fillText(value.toFixed(1), padding - 10, y + 4);
                 }
-                
+
                 // X-axis labels (show only a few labels to avoid crowding)
                 const maxLabels = 6;
                 const labelStep = Math.max(1, Math.floor(labels.length / maxLabels));
@@ -231,7 +231,7 @@ DASHBOARD_HTML_FIXED = """
                     const timeLabel = labels[i].split(':').slice(0, 2).join(':');
                     ctx.fillText(timeLabel, x, height - 10);
                 }
-                
+
                 // Draw title
                 if (dataset.label) {
                     ctx.fillStyle = '#333';
@@ -241,7 +241,7 @@ DASHBOARD_HTML_FIXED = """
                 }
             }
         }
-        
+
         // Create Chart.js-compatible interface
         window.Chart = SimpleChart;
         console.log('Simple Chart implementation loaded');
@@ -252,7 +252,7 @@ DASHBOARD_HTML_FIXED = """
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -260,23 +260,23 @@ DASHBOARD_HTML_FIXED = """
             padding: 20px;
             min-height: 100vh;
         }
-        
+
         .dashboard {
             max-width: 1400px;
             margin: 0 auto;
         }
-        
+
         .header {
             text-align: center;
             margin-bottom: 30px;
             color: white;
         }
-        
+
         .header h1 {
             font-size: 2.5em;
             margin-bottom: 10px;
         }
-        
+
         .status-indicator {
             display: inline-block;
             width: 12px;
@@ -286,25 +286,25 @@ DASHBOARD_HTML_FIXED = """
             margin-right: 8px;
             animation: pulse 2s infinite;
         }
-        
+
         .status-indicator.disconnected {
             background: #f44336;
             animation: none;
         }
-        
+
         @keyframes pulse {
             0% { opacity: 1; }
             50% { opacity: 0.5; }
             100% { opacity: 1; }
         }
-        
+
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
-        
+
         .card {
             background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(10px);
@@ -314,11 +314,11 @@ DASHBOARD_HTML_FIXED = """
             border: 1px solid rgba(255, 255, 255, 0.2);
             transition: transform 0.2s ease;
         }
-        
+
         .card:hover {
             transform: translateY(-2px);
         }
-        
+
         .card h3 {
             color: #5a67d8;
             margin-bottom: 15px;
@@ -326,12 +326,12 @@ DASHBOARD_HTML_FIXED = """
             display: flex;
             align-items: center;
         }
-        
+
         .card h3::before {
             content: "📊";
             margin-right: 8px;
         }
-        
+
         .metric {
             display: flex;
             justify-content: space-between;
@@ -339,66 +339,66 @@ DASHBOARD_HTML_FIXED = """
             padding: 8px 0;
             border-bottom: 1px solid #eee;
         }
-        
+
         .metric:last-child {
             border-bottom: none;
         }
-        
+
         .metric-label {
             font-weight: 500;
             color: #666;
         }
-        
+
         .metric-value {
             font-weight: bold;
             color: #333;
             font-family: 'Courier New', monospace;
         }
-        
+
         .chart-container {
             grid-column: 1 / -1;
             height: 400px;
             position: relative;
         }
-        
+
         .chart-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
             grid-column: 1 / -1;
         }
-        
+
         .chart-grid .card {
             min-height: 300px;
         }
-        
+
         .chart-grid canvas {
             max-height: 250px !important;
             width: 100% !important;
         }
-        
+
         .requests-table {
             grid-column: 1 / -1;
         }
-        
+
         .table-container {
             max-height: 300px;
             overflow-y: auto;
             border-radius: 8px;
         }
-        
+
         table {
             width: 100%;
             border-collapse: collapse;
         }
-        
+
         th, td {
             padding: 10px;
             text-align: left;
             border-bottom: 1px solid #ddd;
             font-size: 0.9em;
         }
-        
+
         th {
             background: #f5f5f5;
             font-weight: 600;
@@ -406,17 +406,17 @@ DASHBOARD_HTML_FIXED = """
             position: sticky;
             top: 0;
         }
-        
+
         .status-success {
             color: #4CAF50;
             font-weight: bold;
         }
-        
+
         .status-error {
             color: #f44336;
             font-weight: bold;
         }
-        
+
         .connection-status {
             position: fixed;
             top: 20px;
@@ -429,25 +429,25 @@ DASHBOARD_HTML_FIXED = """
             z-index: 1000;
             transition: all 0.3s ease;
         }
-        
+
         .connected {
             background: #4CAF50;
         }
-        
+
         .disconnected {
             background: #f44336;
         }
-        
+
         .connecting {
             background: #ff9800;
         }
-        
+
         .loading {
             text-align: center;
             padding: 50px;
             color: white;
         }
-        
+
         .error-message {
             background: rgba(244, 67, 54, 0.9);
             color: white;
@@ -456,7 +456,7 @@ DASHBOARD_HTML_FIXED = """
             margin: 20px 0;
             display: none;
         }
-        
+
         .retry-button {
             background: #4CAF50;
             color: white;
@@ -466,16 +466,16 @@ DASHBOARD_HTML_FIXED = """
             cursor: pointer;
             margin-left: 10px;
         }
-        
+
         .retry-button:hover {
             background: #45a049;
         }
-        
+
         .controls {
             text-align: center;
             margin: 20px 0;
         }
-        
+
         .controls button {
             background: rgba(255, 255, 255, 0.2);
             color: white;
@@ -486,11 +486,11 @@ DASHBOARD_HTML_FIXED = """
             margin: 0 10px;
             transition: all 0.3s ease;
         }
-        
+
         .controls button:hover {
             background: rgba(255, 255, 255, 0.3);
         }
-        
+
         .stats-summary {
             grid-column: 1 / -1;
             background: linear-gradient(45deg, #667eea, #764ba2);
@@ -500,23 +500,23 @@ DASHBOARD_HTML_FIXED = """
             border-radius: 15px;
             margin-bottom: 20px;
         }
-        
+
         .stats-row {
             display: flex;
             justify-content: space-around;
             margin-top: 15px;
         }
-        
+
         .stat-item {
             text-align: center;
         }
-        
+
         .stat-value {
             font-size: 2em;
             font-weight: bold;
             display: block;
         }
-        
+
         .stat-label {
             font-size: 0.9em;
             opacity: 0.9;
@@ -525,25 +525,25 @@ DASHBOARD_HTML_FIXED = """
 </head>
 <body>
     <div class="connection-status" id="connectionStatus">Connecting...</div>
-    
+
     <div class="dashboard">
         <div class="header">
             <h1><span class="status-indicator" id="statusIndicator"></span>eSurge Real-time Dashboard</h1>
             <p>Live monitoring of inference engine performance</p>
         </div>
-        
+
         <div class="controls">
             <button onclick="dashboard.toggleAutoRefresh()">⏸️ Pause</button>
             <button onclick="dashboard.clearData()">🗑️ Clear Data</button>
             <button onclick="dashboard.exportData()">💾 Export</button>
             <button onclick="dashboard.reconnect()">🔄 Reconnect</button>
         </div>
-        
+
         <div class="error-message" id="errorMessage">
             <span id="errorText"></span>
             <button class="retry-button" onclick="dashboard.reconnect()">Retry</button>
         </div>
-        
+
         <div class="grid" id="metricsGrid">
             <div class="loading">
                 <h3>🔄 Connecting to metrics stream...</h3>
@@ -569,28 +569,28 @@ DASHBOARD_HTML_FIXED = """
                 this.reconnectDelay = 1000;
                 this.autoRefresh = true;
                 this.lastDataUpdate = Date.now();
-                
+
                 this.connect();
                 this.startHealthCheck();
             }
-            
+
             connect() {
                 try {
                     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                     const wsUrl = `${protocol}//${window.location.host}/ws`;
-                    
+
                     console.log(`Connecting to: ${wsUrl}`);
                     this.updateConnectionStatus('connecting');
-                    
+
                     this.ws = new WebSocket(wsUrl);
-                    
+
                     this.ws.onopen = () => {
                         console.log('Connected to eSurge metrics stream');
                         this.updateConnectionStatus('connected');
                         this.reconnectAttempts = 0;
                         this.hideError();
                     };
-                    
+
                     this.ws.onmessage = (event) => {
                         try {
                             const data = JSON.parse(event.data);
@@ -603,38 +603,38 @@ DASHBOARD_HTML_FIXED = """
                             this.showError('Error parsing server data');
                         }
                     };
-                    
+
                     this.ws.onclose = (event) => {
                         console.log('Disconnected from metrics stream', event);
                         this.updateConnectionStatus('disconnected');
                         this.scheduleReconnect();
                     };
-                    
+
                     this.ws.onerror = (error) => {
                         console.error('WebSocket error:', error);
                         this.updateConnectionStatus('disconnected');
                         this.showError('Connection error occurred');
                     };
-                    
+
                 } catch (error) {
                     console.error('Error creating WebSocket:', error);
                     this.showError('Failed to create connection');
                     this.scheduleReconnect();
                 }
             }
-            
+
             scheduleReconnect() {
                 if (this.reconnectAttempts < this.maxReconnectAttempts) {
                     this.reconnectAttempts++;
                     const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
-                    
+
                     console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
                     setTimeout(() => this.connect(), delay);
                 } else {
                     this.showError('Max reconnection attempts reached. Click Retry to try again.');
                 }
             }
-            
+
             reconnect() {
                 this.reconnectAttempts = 0;
                 this.hideError();
@@ -643,13 +643,13 @@ DASHBOARD_HTML_FIXED = """
                 }
                 setTimeout(() => this.connect(), 100);
             }
-            
+
             updateConnectionStatus(status) {
                 const statusElement = document.getElementById('connectionStatus');
                 const indicatorElement = document.getElementById('statusIndicator');
-                
+
                 statusElement.className = `connection-status ${status}`;
-                
+
                 switch (status) {
                     case 'connected':
                         statusElement.textContent = '🟢 Connected';
@@ -665,29 +665,29 @@ DASHBOARD_HTML_FIXED = """
                         break;
                 }
             }
-            
+
             showError(message) {
                 const errorDiv = document.getElementById('errorMessage');
                 const errorText = document.getElementById('errorText');
                 errorText.textContent = message;
                 errorDiv.style.display = 'block';
             }
-            
+
             hideError() {
                 const errorDiv = document.getElementById('errorMessage');
                 errorDiv.style.display = 'none';
             }
-            
+
             updateDashboard(data) {
                 try {
                     const grid = document.getElementById('metricsGrid');
-                    
+
                     if (data && data.system) {
                         this.updateMetricsHistory(data);
-                        
+
                         // Check if this is the first render or if we need to rebuild the DOM
                         const isFirstRender = !document.getElementById('throughputChart');
-                        
+
                         if (isFirstRender) {
                             // Initial render - create the full dashboard
                             grid.innerHTML = this.generateDashboardHTML(data);
@@ -705,19 +705,19 @@ DASHBOARD_HTML_FIXED = """
                     this.showError('Error updating dashboard display');
                 }
             }
-            
+
             updateMetricsHistory(data) {
                 const now = new Date().toLocaleTimeString();
                 const throughput = data.system?.average_throughput || 0;
                 const latency = (data.system?.average_latency || 0) * 1000; // Convert to ms
                 const requests = data.system?.requests_per_second || 0;
-                
+
                 this.metricsHistory.timestamps.push(now);
                 this.metricsHistory.throughput.push(throughput);
                 this.metricsHistory.latency.push(latency);
                 this.metricsHistory.requests.push(requests);
-                
-                
+
+
                 // Keep only last N data points
                 if (this.metricsHistory.timestamps.length > this.maxDataPoints) {
                     Object.keys(this.metricsHistory).forEach(key => {
@@ -725,14 +725,14 @@ DASHBOARD_HTML_FIXED = """
                     });
                 }
             }
-            
+
             updateDashboardData(data) {
                 // Update only the dynamic data without rebuilding DOM
                 const system = data.system || {};
                 const scheduler = data.scheduler || {};
                 const runner = data.runner || {};
                 const cache = data.cache || {};
-                
+
                 // Update system metrics
                 this.updateElementText('.stat-value', [
                     (system.requests_per_second || 0).toFixed(1),
@@ -740,7 +740,7 @@ DASHBOARD_HTML_FIXED = """
                     ((system.average_latency || 0) * 1000).toFixed(0) + 'ms',
                     system.total_requests_completed || 0
                 ]);
-                
+
                 // Update individual metric cards
                 this.updateMetricCard('System Performance', {
                     'Requests/sec': (system.requests_per_second || 0).toFixed(2),
@@ -749,7 +749,7 @@ DASHBOARD_HTML_FIXED = """
                     'Throughput': (system.average_throughput || 0).toFixed(1) + ' tok/s',
                     'Success Rate': this.calculateSuccessRate(system) + '%'
                 });
-                
+
                 this.updateMetricCard('Scheduler Status', {
                     'Waiting Requests': scheduler.num_waiting_requests || 0,
                     'Running Requests': scheduler.num_running_requests || 0,
@@ -757,27 +757,27 @@ DASHBOARD_HTML_FIXED = """
                     'Batch Size': scheduler.batch_size || 0,
                     'Schedule Time': ((scheduler.schedule_time || 0) * 1000).toFixed(2) + 'ms'
                 });
-                
+
                 this.updateMetricCard('Model Runner', {
                     'Execution Time': ((runner.execution_time || 0) * 1000).toFixed(2) + 'ms',
                     'Batch Size': runner.batch_size || 0,
                     'Tokens Processed': runner.num_tokens || 0,
                     'Instant Throughput': (runner.tokens_per_second || 0).toFixed(1) + ' tok/s'
                 });
-                
+
                 this.updateMetricCard('Cache Status', {
                     'Total Pages': cache.total_pages || 0,
                     'Used Pages': cache.used_pages || 0,
                     'Utilization': cache.total_pages ? ((cache.used_pages / cache.total_pages) * 100).toFixed(1) + '%' : '0%',
                     'Hit Rate': ((cache.cache_hit_rate || 0) * 100).toFixed(1) + '%'
                 });
-                
+
                 // Update recent requests table if needed
                 if (data.recent_requests) {
                     this.updateRequestsTable(data.recent_requests);
                 }
             }
-            
+
             updateElementText(selector, values) {
                 const elements = document.querySelectorAll(selector);
                 values.forEach((value, index) => {
@@ -786,7 +786,7 @@ DASHBOARD_HTML_FIXED = """
                     }
                 });
             }
-            
+
             updateMetricCard(cardTitle, metrics) {
                 const cards = document.querySelectorAll('.card');
                 for (const card of cards) {
@@ -805,7 +805,7 @@ DASHBOARD_HTML_FIXED = """
                     }
                 }
             }
-            
+
             updateRequestsTable(recentRequests) {
                 const tbody = document.querySelector('.requests-table tbody');
                 if (tbody) {
@@ -824,13 +824,13 @@ DASHBOARD_HTML_FIXED = """
                     `).join('');
                 }
             }
-            
+
             generateDashboardHTML(data) {
                 const system = data.system || {};
                 const scheduler = data.scheduler || {};
                 const runner = data.runner || {};
                 const cache = data.cache || {};
-                
+
                 return `
                     <!-- Summary Stats -->
                     <div class="stats-summary">
@@ -854,7 +854,7 @@ DASHBOARD_HTML_FIXED = """
                             </div>
                         </div>
                     </div>
-                    
+
                     <!-- System Metrics -->
                     <div class="card">
                         <h3>🖥️ System Performance</h3>
@@ -879,7 +879,7 @@ DASHBOARD_HTML_FIXED = """
                             <span class="metric-value">${this.calculateSuccessRate(system)}%</span>
                         </div>
                     </div>
-                    
+
                     <!-- Scheduler Metrics -->
                     <div class="card">
                         <h3>⚡ Scheduler Status</h3>
@@ -904,7 +904,7 @@ DASHBOARD_HTML_FIXED = """
                             <span class="metric-value">${((scheduler.schedule_time || 0) * 1000).toFixed(2)}ms</span>
                         </div>
                     </div>
-                    
+
                     <!-- Runner Metrics -->
                     <div class="card">
                         <h3>🚀 Model Runner</h3>
@@ -925,7 +925,7 @@ DASHBOARD_HTML_FIXED = """
                             <span class="metric-value">${(runner.tokens_per_second || 0).toFixed(1)} tok/s</span>
                         </div>
                     </div>
-                    
+
                     <!-- Cache Metrics -->
                     <div class="card">
                         <h3>💾 Cache Status</h3>
@@ -946,7 +946,7 @@ DASHBOARD_HTML_FIXED = """
                             <span class="metric-value">${((cache.cache_hit_rate || 0) * 100).toFixed(1)}%</span>
                         </div>
                     </div>
-                    
+
                     <!-- Charts -->
                     <div class="chart-grid">
                         <div class="card">
@@ -958,7 +958,7 @@ DASHBOARD_HTML_FIXED = """
                             <canvas id="latencyChart" width="400" height="200"></canvas>
                         </div>
                     </div>
-                    
+
                     <!-- Recent Requests Table -->
                     <div class="card requests-table">
                         <h3>📋 Recent Requests</h3>
@@ -1012,23 +1012,23 @@ DASHBOARD_HTML_FIXED = """
                 if (!canvas) {
                     return;
                 }
-                
+
                 // Get canvas context
                 const ctx = canvas.getContext('2d');
                 if (!ctx) {
                     return;
                 }
-                
+
                 // Validate data before creating/updating chart
                 if (!this.metricsHistory.timestamps.length || !this.metricsHistory.throughput.length) {
                     return;
                 }
-                
+
                 // Check if Chart is available
                 if (typeof Chart === 'undefined') {
                     return;
                 }
-                
+
                 const chartData = {
                     labels: this.metricsHistory.timestamps,
                     datasets: [{
@@ -1043,7 +1043,7 @@ DASHBOARD_HTML_FIXED = """
                         borderWidth: 2
                     }]
                 };
-                
+
                 try {
                     // Update existing chart or create new one
                     if (this.charts.throughput && this.charts.throughput.update) {
@@ -1091,23 +1091,23 @@ DASHBOARD_HTML_FIXED = """
                 if (!canvas) {
                     return;
                 }
-                
+
                 // Get canvas context
                 const ctx = canvas.getContext('2d');
                 if (!ctx) {
                     return;
                 }
-                
+
                 // Validate data before creating/updating chart
                 if (!this.metricsHistory.timestamps.length || !this.metricsHistory.latency.length) {
                     return;
                 }
-                
+
                 // Check if Chart is available
                 if (typeof Chart === 'undefined') {
                     return;
                 }
-                
+
                 const chartData = {
                     labels: this.metricsHistory.timestamps,
                     datasets: [{
@@ -1122,7 +1122,7 @@ DASHBOARD_HTML_FIXED = """
                         borderWidth: 2
                     }]
                 };
-                
+
                 try {
                     // Update existing chart or create new one
                     if (this.charts.latency && this.charts.latency.update) {
@@ -1165,14 +1165,14 @@ DASHBOARD_HTML_FIXED = """
                     console.error('Error updating latency chart:', e);
                 }
             }
-            
+
             toggleAutoRefresh() {
                 this.autoRefresh = !this.autoRefresh;
                 const btn = event.target;
                 btn.textContent = this.autoRefresh ? '⏸️ Pause' : '▶️ Resume';
                 btn.style.background = this.autoRefresh ? 'rgba(255, 255, 255, 0.2)' : 'rgba(255, 152, 0, 0.8)';
             }
-            
+
             clearData() {
                 this.metricsHistory = {
                     throughput: [],
@@ -1198,13 +1198,13 @@ DASHBOARD_HTML_FIXED = """
                     }
                 }
             }
-            
+
             exportData() {
                 const data = {
                     exported_at: new Date().toISOString(),
                     metrics_history: this.metricsHistory
                 };
-                
+
                 const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -1213,11 +1213,11 @@ DASHBOARD_HTML_FIXED = """
                 a.click();
                 URL.revokeObjectURL(url);
             }
-            
+
             startHealthCheck() {
                 setInterval(() => {
                     const timeSinceLastUpdate = Date.now() - this.lastDataUpdate;
-                    
+
                     // If no data for 10 seconds, show warning
                     if (timeSinceLastUpdate > 10000 && this.ws && this.ws.readyState === WebSocket.OPEN) {
                         console.warn('No data received for 10 seconds');
@@ -1226,16 +1226,16 @@ DASHBOARD_HTML_FIXED = """
                 }, 5000);
             }
         }
-        
+
         // Global dashboard instance
         let dashboard;
-        
+
         // Initialize dashboard when page loads
         document.addEventListener('DOMContentLoaded', () => {
             dashboard = new eSurgeDashboard();
             window.dashboard = dashboard; // Make globally accessible
-            
-            
+
+
             // Handle page visibility changes
             document.addEventListener('visibilitychange', () => {
                 if (document.hidden) {
@@ -1246,7 +1246,7 @@ DASHBOARD_HTML_FIXED = """
                 }
             });
         });
-        
+
         // Handle page unload
         window.addEventListener('beforeunload', () => {
             if (dashboard && dashboard.ws) {

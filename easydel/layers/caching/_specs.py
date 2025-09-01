@@ -18,7 +18,6 @@ from math import prod
 from typing import Self
 
 import jax
-import torch
 
 
 def cdiv(a, b):
@@ -71,9 +70,9 @@ class KVCacheSpec:
         """
         Merge a list of KVCacheSpec objects into a single KVCacheSpec object.
         """
-        assert all(spec.type_id == specs[0].type_id for spec in specs[1:]), (
-            "All layers in the same KV cache group must share the same type_id."
-        )
+        assert all(
+            spec.type_id == specs[0].type_id for spec in specs[1:]
+        ), "All layers in the same KV cache group must share the same type_id."
         return copy.deepcopy(specs[0])
 
 
@@ -81,7 +80,7 @@ class KVCacheSpec:
 class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
-    dtype: torch.dtype
+    dtype: jax.numpy.dtype
     use_mla: bool
 
     @property
@@ -132,9 +131,9 @@ class FullAttentionSpec(AttentionSpec):
 
         merged_spec.sliding_window = cls.merge_window_sizes(sliding_window)
         merged_spec.attention_chunk_size = cls.merge_window_sizes(attention_chunk_size)
-        assert (merged_spec.sliding_window is not None) + (merged_spec.attention_chunk_size is not None) <= 1, (
-            "Model with both sliding window layers and chunked local attention layers is not supported."
-        )
+        assert (merged_spec.sliding_window is not None) + (
+            merged_spec.attention_chunk_size is not None
+        ) <= 1, "Model with both sliding window layers and chunked local attention layers is not supported."
         return merged_spec
 
 
@@ -180,7 +179,7 @@ class SlidingWindowSpec(AttentionSpec):
 @dataclass
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
-    dtype: torch.dtype
+    dtype: jax.numpy.dtype
     page_size_padded: int | None = None
 
     def __post_init__(self):

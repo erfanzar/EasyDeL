@@ -29,8 +29,9 @@ import jax.experimental
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
-import torch
+from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
+from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
 from jax.sharding import PartitionSpec
 
@@ -43,9 +44,7 @@ from easydel.infra.etils import (
     EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
-from easydel.utils import EasyPath, EasyPathLike
 from easydel.utils.compiling_utils import hash_fn
-from easydel.utils.helpers import get_logger
 
 from .metrics import MetricsHistogram, compute_weight_stats
 from .utils import JaxDistributedConfig
@@ -81,6 +80,33 @@ AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
 @auto_pytree
 class TrainingArguments:
+    """
+    Comprehensive configuration class for training and evaluation.
+
+    This class encapsulates all training hyperparameters, optimization settings,
+    data loading configuration, logging preferences, and hardware-specific options.
+    It provides a centralized way to manage the complex configuration required for
+    distributed training of large models.
+
+    The configuration covers:
+    - Training hyperparameters (learning rate, batch size, epochs)
+    - Optimization settings (optimizer, scheduler, gradient clipping)
+    - Data loading (dataset configuration, batch collation)
+    - Checkpointing (save frequency, checkpoint limits)
+    - Logging (WandB, TensorBoard, metrics reporting)
+    - Hardware configuration (sharding, precision, device placement)
+    - Performance optimization (compilation, memory tracking)
+
+    Example:
+        >>> args = TrainingArguments(
+        ...     learning_rate=1e-4,
+        ...     num_train_epochs=3,
+        ...     total_batch_size=32,
+        ...     save_steps=1000,
+        ...     use_wandb=True
+        ... )
+    """
+
     auto_shard_states: bool = field(
         default=True,
         metadata={"help": "Whether to automatically shard model states across devices."},
@@ -325,6 +351,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The step to start training from (for resuming)."},
     )
+    resume_if_possible: bool = field(
+        default=False,
+        metadata={"help": "Automatically resume from the latest checkpoint if available."},
+    )
     shuffle_train_dataset: bool = field(
         default=True,
         metadata={"help": "Whether to shuffle the training dataset."},
@@ -428,9 +458,19 @@ class TrainingArguments:
 
     def __post_init__(self):
         """
-        Validates the configuration, sets up distributed training,
-        initializes the optimizer, configures logging.
-        This method is automatically called after the object is initialized.
+        Post-initialization setup and validation.
+
+        This method is automatically called after dataclass initialization.
+        It performs:
+        1. Configuration validation to catch invalid settings early
+        2. Distributed training setup based on backend and platform
+        3. Optimizer and scheduler configuration
+        4. Logging infrastructure initialization
+        5. Variable normalization and default value setting
+
+        Raises:
+            ValueError: If configuration validation fails
+            AssertionError: If required conditions are not met
         """
         self._validate_config()
         self._setup_distributed()
@@ -440,8 +480,16 @@ class TrainingArguments:
 
     def _validate_config(self):
         """
-        Performs validation checks on the provided configuration settings.
-        Raises ValueError if any configuration is invalid.
+        Validate configuration settings for correctness and compatibility.
+
+        This method checks:
+        - Gradient accumulation steps are positive
+        - Backend is supported (CPU, GPU, TPU)
+        - Other configuration constraints are met
+
+        Raises:
+            AssertionError: If gradient_accumulation_steps < 1
+            ValueError: If backend is not recognized
         """
         assert self.gradient_accumulation_steps > 0, "`gradient_accumulation_steps` can't be lower than 1."
 
@@ -450,16 +498,31 @@ class TrainingArguments:
 
     def _setup_distributed(self):
         """
-        Sets up JAX distributed training based on the chosen backend and sharding configuration.
-        Determines the number of available devices and sets up the device mesh.
+        Configure JAX for distributed training.
+
+        This method initializes the JAX distributed configuration which handles:
+        - Multi-host setup for distributed training
+        - Device mesh creation for model parallelism
+        - Communication backend configuration
+        - Process coordination setup
+
+        The actual implementation is delegated to JaxDistributedConfig.
         """
 
         JaxDistributedConfig.initialize(self.jax_distributed_config)
 
     def _setup_optimizer(self):
         """
-        Configures the optimizer and learning rate scheduler based on the provided arguments.
-        Sets up the optimizer_kwargs dictionary.
+        Configure optimizer and learning rate scheduler settings.
+
+        This method prepares the optimizer_kwargs dictionary with all necessary
+        parameters for optimizer creation, including:
+        - Learning rate and schedule parameters
+        - Weight decay and gradient clipping
+        - Optimizer-specific settings from extra_optimizer_kwargs
+        - Data type specifications for optimizer states
+
+        The actual optimizer creation is deferred until training setup.
         """
         extra_optimizer_kwargs = self.extra_optimizer_kwargs if self.extra_optimizer_kwargs is not None else {}
         self.optimizer_kwargs = {
@@ -478,8 +541,15 @@ class TrainingArguments:
 
     def _setup_logging(self):
         """
-        Sets up logging for training using TensorBoard and Weights & Biases.
-        Handles warnings if performance mode is enabled and disables WandB logging accordingly.
+        Configure logging infrastructure for training monitoring.
+
+        This method handles the setup of various logging backends and ensures
+        compatibility with performance mode:
+        - Disables WandB in performance mode to reduce overhead
+        - Disables metrics reporting in performance mode
+        - Configures appropriate logging levels and destinations
+
+        Performance mode prioritizes speed over detailed monitoring.
         """
         if self.use_wandb and self.performance_mode:
             logger.info("WandB logging disabled due to performance mode")
@@ -490,7 +560,15 @@ class TrainingArguments:
 
     def _ensure_variables(self):
         """
-        Checks and sets up variables for start.
+        Ensure all configuration variables are properly initialized.
+
+        This method:
+        - Converts string representations to proper types (e.g., PartitionSpec)
+        - Sets default values for optional parameters
+        - Initializes complex configuration objects (e.g., LossConfig)
+        - Normalizes configuration values for consistency
+
+        This ensures the configuration is ready for use by the trainer.
         """
         if isinstance(self.step_partition_spec, str):
             self.step_partition_spec = eval(self.step_partition_spec)
@@ -507,13 +585,26 @@ class TrainingArguments:
     @staticmethod
     def _time_to_seconds(time_str: str) -> int:
         """
-        Converts a time string in the format "50min" or "23h" to seconds.
+        Convert a human-readable time string to seconds.
+
+        Supports various time formats:
+        - Hours: "23h", "2hour", "3hours"
+        - Minutes: "50min", "30m", "45minutes"
+        - Seconds: "30s", "120sec", "60seconds"
 
         Args:
-            time_str (str): The time string to convert.
+            time_str: The time string to convert
 
         Returns:
-            int: The equivalent time in seconds.
+            int: The equivalent time in seconds
+
+        Raises:
+            ValueError: If the time format is not recognized
+
+        Example:
+            >>> _time_to_seconds("2h30min")  # Would need parsing enhancement
+            >>> _time_to_seconds("90min")
+            5400
         """
         match = re.match(r"(\d+)\s*(h|hour|hours|min|m|minutes|s|sec|seconds)", time_str.lower())
         if not match:
@@ -532,42 +623,45 @@ class TrainingArguments:
         }.get(unit.lower())
         return int(value) * unit_to_seconds
 
-    def get_path(self) -> EasyPathLike:
+    def get_path(self) -> ePathLike:
         """
         Returns the path to the checkpoint directory.
 
         Returns:
-            EasyPathLike: The path to the checkpoint directory.
+            ePathLike: The path to the checkpoint directory.
         """
-        if self.process_zero_is_admin:
-            if self.is_process_zero:
-                return EasyPath(self.save_directory) / self.model_name
-            else:
-                return EasyPath("/dev/null")
-        return EasyPath(self.save_directory) / self.model_name
+        return ePath(self.save_directory) / self.model_name
 
     def ensure_checkpoint_path(self):
         """
         Creates the checkpoint directory if it doesn't exist.
         """
-        if self.process_zero_is_admin:
-            if self.is_process_zero:
-                path = self.get_path()
-                path.mkdir(parents=True, exist_ok=True)
-        else:
-            path = self.get_path()
-            path.mkdir(parents=True, exist_ok=True)
+        path = self.get_path()
+        path.mkdir(parents=True, exist_ok=True)
 
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         """
-        Returns the configured optimizer and learning rate scheduler.
+        Create and return the optimizer and learning rate scheduler.
+
+        This method uses the OptimizerFactory to create the configured optimizer
+        and scheduler based on the training arguments. It handles:
+        - Standard optimizers (AdamW, SGD, etc.)
+        - Learning rate schedules (linear, cosine, constant)
+        - Gradient clipping and weight decay
+        - Custom optimizers and schedulers
 
         Args:
-            steps (tp.Optional[int]): The number of training steps.
-                If not provided, uses the value from `self.optimizer_kwargs`.
+            steps: Optional override for the number of training steps.
+                   If not provided, uses the value from self.optimizer_kwargs.
 
         Returns:
-            tuple: A tuple containing the optimizer and scheduler.
+            tuple: A tuple of (optimizer, scheduler) where:
+                - optimizer: Optax GradientTransformation
+                - scheduler: Learning rate schedule function
+
+        Note:
+            The optimizer is an Optax transformation chain that may include
+            gradient clipping, weight decay, and other transformations.
         """
 
         self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
@@ -601,16 +695,12 @@ class TrainingArguments:
         Returns the checkpoint manager, responsible for saving model checkpoints.
 
         Returns:
-            CheckpointManager: The checkpoint manager.
+            AsyncCheckpointManager: The checkpoint manager.
         """
 
-        from easydel.utils.checkpoint_managers import CheckpointManager
+        from eformer.serialization import AsyncCheckpointManager
 
-        return CheckpointManager(
-            checkpoint_dir=self.get_path(),
-            save_optimizer_state=self.save_optimizer_state,
-            verbose=self.verbose,
-        )
+        return AsyncCheckpointManager(max_workers=1)
 
     @functools.cached_property
     def _tensorboard(self):
@@ -637,10 +727,25 @@ class TrainingArguments:
 
     def get_wandb_init(self):
         """
-        Initializes Weights & Biases for experiment tracking if enabled.
+        Initialize Weights & Biases for experiment tracking.
+
+        This method creates a new WandB run with appropriate configuration:
+        - Project name based on model name and optional prefix
+        - Run name with timestamp if not specified
+        - Configuration dictionary from training arguments
+        - Standard tags for EasyDeL experiments
+
+        The method handles process-level initialization, ensuring only the
+        main process creates the WandB run in distributed settings.
 
         Returns:
-            tp.Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
+            wandb.Run | None: The initialized WandB run object, or None if:
+                - WandB is not installed
+                - use_wandb is False
+                - Not the main process and log_all_workers is False
+
+        Note:
+            WandB initialization is skipped in performance mode to reduce overhead.
         """
         if self.can_log_metrics:
             if not self.use_wandb or wandb is None:
@@ -735,12 +840,30 @@ class TrainingArguments:
         log_as: tp.Literal["summary", "config"] | None = None,
     ):
         """
-        Logs training metrics to Weights & Biases and/or TensorBoard.
+        Log metrics to configured logging backends.
+
+        This method handles logging to multiple backends (WandB, TensorBoard)
+        and supports various metric types including scalars, histograms, and
+        distributions. It automatically filters and formats metrics for each
+        backend's requirements.
 
         Args:
-          metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
-            A dictionary where keys are metric names and values are metric values.
-          step (int): The current training step or iteration.
+            metrics: Dictionary of metric names to values. Values can be:
+                - Scalars (float, int)
+                - Arrays (numpy, JAX arrays)
+                - Histograms (tuple of bin_counts and bin_edges)
+                - Tensors (automatically converted)
+            step: The current training/evaluation step
+            log_as: Special logging mode:
+                - None: Regular step-based logging
+                - "summary": Log as final summary (WandB only)
+                - "config": Log as configuration (WandB only)
+
+        Note:
+            - Metrics are automatically filtered for None values
+            - Array metrics are converted to appropriate formats
+            - Gradient norm metrics are restructured for clarity
+            - Logging only occurs if can_log_metrics is True
         """
 
         if self.can_log_metrics:
@@ -764,11 +887,23 @@ class TrainingArguments:
         return metric_name
 
     def log_weight_distribution(self, state, step: int):
-        """Log weight distribution histograms and statistics.
+        """
+        Log weight distribution histograms and statistics.
+
+        This method computes and logs detailed statistics about model weights,
+        including histograms and summary statistics (mean, std, min, max).
+        It's useful for monitoring training stability and detecting issues
+        like gradient explosion or vanishing.
 
         Args:
-            state: Model state containing parameters
-            step: Current training step
+            state: Model state containing parameters to analyze
+            step: Current training step for logging
+
+        Note:
+            - Only logs at intervals defined by weight_distribution_log_steps
+            - Uses weight_distribution_pattern to filter parameters
+            - Computes statistics across all processes in distributed training
+            - Logs both histograms and scalar statistics for each parameter
         """
         if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
             stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
@@ -917,7 +1052,7 @@ class TrainingArguments:
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
-        return json.loads(EasyPath(json_file).read_text())
+        return json.loads(ePath(json_file).read_text())
 
     def to_json_string(self) -> str:
         """
@@ -933,15 +1068,22 @@ class TrainingArguments:
     @classmethod
     def load_arguments(cls, json_file: str | os.PathLike):
         """
-        Instantiates a [`PretrainedConfig`] from the path to a JSON file of parameters.
+        Load training arguments from a JSON file.
+
+        This class method reconstructs a TrainingArguments instance from a
+        previously saved JSON configuration file. It handles class resolution
+        and proper type conversion.
 
         Args:
-            json_file (`str` or `os.PathLike`):
-                Path to the JSON file containing the parameters.
+            json_file: Path to the JSON file containing saved arguments
 
         Returns:
-            [`PretrainedConfig`]: The configuration object instantiated from that JSON file.
+            TrainingArguments: Reconstructed configuration object with all
+                              settings from the saved file
 
+        Note:
+            The JSON file should contain a 'trainer_config_class' field
+            for proper class resolution when using subclasses.
         """
 
         config_dict = cls._dict_from_json_file(json_file)
@@ -956,28 +1098,34 @@ class TrainingArguments:
             assert cls is not None, "We couldn't clearify the trainer config class from provided json."
         return cls(**config_dict)
 
-    def save_arguments(self, json_file_path: str | os.PathLike | EasyPathLike):
+    def save_arguments(self, json_file_path: str | os.PathLike | ePathLike):
         """
-        Save this instance to a JSON file.
+        Save training arguments to a JSON file.
+
+        This method serializes the current configuration to a JSON file,
+        preserving all settings for later reconstruction. The saved file
+        includes class information for proper deserialization.
 
         Args:
-            json_file_path (`str` or `os.PathLike`):
-                Path to the JSON file in which this configuration instance's parameters will be saved.
-        """
-        EasyPath(json_file_path).write_text(self.to_json_string())
+            json_file_path: Path where the JSON file will be saved.
+                           Parent directories are created if needed.
 
-    def _get_save_directory(self, create: bool = True) -> EasyPathLike:
-        if self.process_zero_is_admin and not self.is_process_zero:
-            return None
+        Note:
+            The saved JSON includes a 'trainer_config_class' field to
+            ensure proper class resolution when loading.
+        """
+        ePath(json_file_path).write_text(self.to_json_string())
+
+    def _get_save_directory(self, create: bool = True) -> ePathLike:
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()
 
-    def _get_save_directory_milestone(self, step, create: bool = True) -> EasyPathLike:
+    def _get_save_directory_milestone(self, step, create: bool = True) -> ePathLike:
         directory_name = f"run-{step}"
         savedir = self._get_save_directory(create=create)
         if savedir is None:
-            return EasyPath("/dev/null")
+            return ePath("/dev/null")
         save_directory = savedir / directory_name
         if create:
             save_directory.mkdir(exist_ok=True, parents=True)

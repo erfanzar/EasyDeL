@@ -1,0 +1,181 @@
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info
+dist
+build
+eggs
+.eggs
+lib
+lib64
+parts
+sdist
+var
+wheels
+*.egg-info
+.installed.cfg
+*.egg
+MANIFEST
+.Python
+develop-eggs
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.hypothesis
+.mypy_cache
+.ruff_cache
+*.cover
+.coverage.*
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+*.swn
+.DS_Store
+*.sublime-*
+.project
+.pydevproject
+.settings
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+notebooks/
+
+# Documentation
+docs/
+*.md
+!README.md
+mkdocs.yml
+.readthedocs.yml
+
+# Tests
+tests/
+test/
+test-results/
+pytest.ini
+.pytest_cache/
+conftest.py
+tox.ini
+
+# CI/CD
+.travis.yml
+.gitlab-ci.yml
+azure-pipelines.yml
+.circleci
+jenkins/
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Cache and logs
+*.log
+logs/
+cache/
+tmp/
+temp/
+*.cache
+
+# Model artifacts and data
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+checkpoint*/
+checkpoints/
+models/
+data/
+datasets/
+wandb/
+runs/
+outputs/
+results/
+
+# Secrets and credentials
+*.key
+*.pem
+*.crt
+*.cert
+.env.*
+credentials.json
+secrets/
+config/local/
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Package managers
+node_modules/
+yarn.lock
+package-lock.json
+poetry.lock
+Pipfile.lock
+
+# Build artifacts
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Media files
+*.mp4
+*.mp3
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.old
+~*
+
+# Custom ignore patterns for EasyDeL
+examples/outputs/
+benchmarks/
+profiling/
+*.prof
+*.pstats

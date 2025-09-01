@@ -15,8 +15,8 @@ NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
-SAVE_STEPS = 100_000
-DO_LAST_SAVE = True
+SAVE_STEPS = 1000
+DO_LAST_SAVE = False
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -102,7 +102,7 @@ def create_training_args(
         learning_rate=learning_rate,
         do_last_save=DO_LAST_SAVE,
         save_steps=SAVE_STEPS,
-        save_total_limit=5,
+        save_total_limit=2,
         save_optimizer_state=True,
         per_epoch_training_steps=NUM_TRAIN_EXAMPLES,
         per_epoch_evaluation_steps=NUM_TRAIN_EXAMPLES,
@@ -115,8 +115,9 @@ def create_training_args(
         warmup_steps=warmup_steps,
         report_steps=10,
         log_steps=100,
-        progress_bar_type="json",
+        progress_bar_type="tqdm",
         use_grain=True,
+        resume_if_possible=True,
     )
     logging.info("Training arguments created.")
     return training_args

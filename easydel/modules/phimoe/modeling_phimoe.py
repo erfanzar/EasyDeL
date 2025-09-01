@@ -26,18 +26,8 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    BaseModelOutput,
-    CausalLMOutput,
-)
-from easydel.infra.utils import (
-    ACT2FN,
-    auto_remat,
-    block_wise_ffn,
-    get_dot_general_by_bits,
-    with_sharding_constraint,
-)
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits, with_sharding_constraint
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     PagesCache,

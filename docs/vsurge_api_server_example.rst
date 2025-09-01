@@ -12,10 +12,10 @@ To initialize and run the API server, you can use the following pattern:
     from transformers import AutoTokenizer
 
     import easydel as ed
-		
+
 
     pretrained_model_name_or_path = "Qwen/Qwen3-8B"
-  
+
     dtype = param_dtype = jnp.bfloat16
     max_length = 8192
     prefill_length = 4096
@@ -33,7 +33,7 @@ To initialize and run the API server, you can use the following pattern:
             mask_max_position_embeddings=max_length,
             kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-            attn_mechanism=ed.AttentionMechanisms.PAGED_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
         ),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         param_dtype=param_dtype,
@@ -41,13 +41,13 @@ To initialize and run the API server, you can use the following pattern:
         partition_axis=partition_axis,
         precision=jax.lax.Precision.DEFAULT,
     )
- 
+
     max_concurrent_decodes = 64
     max_concurrent_prefill = 1
 
     surge = ed.vSurge.from_model(
         model=model,
-        processor=processor, 
+        processor=processor,
         max_concurrent_prefill=max_concurrent_prefill,
         max_concurrent_decodes=max_concurrent_decodes,
         seed=877,

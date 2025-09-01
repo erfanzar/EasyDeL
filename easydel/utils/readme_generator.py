@@ -14,11 +14,11 @@
 import os
 from dataclasses import dataclass, field
 
+from eformer.loggings import get_logger
+from eformer.paths import ePath
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from easydel import __version__
-from easydel.utils.checkpoint_managers.path_utils import EasyPath
-from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
@@ -37,7 +37,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "flash_attn2": "FLASH_ATTN2", "flash_attention2": "FLASH_ATTN2", "flashattn2": "FLASH_ATTN2",
     "splash": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
     "ring": "RING", "ring_attn": "RING", "ring_attention": "RING",
-    "paged": "PAGED", "paged_attn": "PAGED", "paged_attention": "PAGED",
+    "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention": "PAGED",
     "mistral": "MISTRAL"
 } %}
 {%- set attn_enum = attn_enum_map.get(model.attn_mechanism_str.lower(), "VANILLA") %}
@@ -188,7 +188,7 @@ JINJA_TEMPLATE = """
     "ring_attention": "RING",
     "paged": "PAGED",
     "paged_attn": "PAGED",
-    "paged_attention": "PAGED",
+    "ragged_page_attention": "PAGED",
     "mistral": "MISTRAL"
 } %}
 {% set attn_enum = attn_enum_map.get(model.attn_mechanism.lower(), "VANILLA") %}
@@ -416,7 +416,7 @@ class ReadmeGenerator:
             content = template.render(model=model_info).replace("\n\n\n", "\n").strip() + "\n"
 
             if output_path:
-                output_path = EasyPath(output_path)
+                output_path = ePath(output_path)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text(content)
                 logger.info(f"README saved to {output_path}")

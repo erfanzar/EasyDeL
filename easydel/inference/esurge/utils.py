@@ -172,3 +172,20 @@ def round_down(x: int, y: int) -> int:
 def get_dtype_size(dtype: jnp.ndarray) -> int:
     """Get the size of the data type in bytes."""
     return jnp.finfo(dtype).bits // 8 if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo(dtype).bits // 8
+
+
+def truncate_tokens(tokens, target_len: int, mode: str = "left"):
+    n = len(tokens)
+    if n <= target_len:
+        return tokens, 0
+    drop = n - target_len
+    if mode == "left":
+        return tokens[drop:], drop
+    elif mode == "right":
+        return tokens[:target_len], drop
+    elif mode == "middle":
+        keep_left = (target_len + 1) // 2
+        keep_right = target_len - keep_left
+        return tokens[:keep_left] + tokens[n - keep_right :], drop
+    else:
+        raise ValueError(f"Unknown truncate_mode: {mode}")

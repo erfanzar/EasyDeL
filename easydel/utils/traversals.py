@@ -20,13 +20,16 @@ from copy import deepcopy
 
 import jax
 import jax.numpy as jnp
+from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx, struct
+from flax import nnx as nn
 from flax.nnx import traversals
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
-from easydel.utils.helpers import get_logger
+T = tp.TypeVar("T", bound=nn.Module)
+ModulePath = tuple[str, ...]
 
 PyTree = dict
 FnDict = dict[tp.Any, tp.Callable[[tp.Any], tp.Any]]
@@ -707,3 +710,85 @@ def recursive_merge(full_tree, updates):
         return type(full_tree)(result)
     else:
         return updates
+
+
+def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> tp.Iterator[tuple[ModulePath, T]]:
+    """
+    Iterates through a model and yields paths and modules of a specific type.
+
+    Args:
+        model: The root module to search through.
+        instance: The type of module to search for.
+
+    Yields:
+        tp.Tuple containing:
+            - Path to the module as a tuple of strings/integers
+            - The module instance matching the specified type
+
+    Example:
+        >>> for path, module in iter_module_search(model, ParallelLinear):
+        ...   print(f"Found Linear layer at {path}")
+    """
+    if instance is None:
+        for path, module in nn.graph.iter_graph(model):
+            yield path, module
+    else:
+        for path, module in nn.graph.iter_graph(model):
+            if isinstance(module, instance):
+                yield path, module
+
+
+def get_module_from_path(model: nn.Module, path: ModulePath) -> nn.Module | None:
+    """
+    Retrieves a module from a model given its path.
+
+    Args:
+        model: The root module to traverse.
+        path: tp.Tuple of strings/integers representing the path to the module.
+
+    Returns:
+        The module at the specified path, or None if path is empty.
+
+    Example:
+        >>> module = get_module_from_path(model, ("encoder", "layer1", "attention"))
+    """
+    if not path:
+        return None
+
+    current = model
+    for item in path:
+        current = current[item] if isinstance(item, int) else getattr(current, item)
+    return current
+
+
+def set_module_from_path(model: nn.Module, path: ModulePath, new_value: tp.Any) -> None:
+    """
+    Sets a module at a specific path in the model.
+
+    Args:
+        model: The root module to modify.
+        path: tp.Tuple of strings/integers representing the path to the module.
+        new_value: The new value/module to set at the specified path.
+
+    Raises:
+        AttributeError: If the path is invalid.
+        IndexError: If trying to access an invalid index.
+
+    Example:
+        >>> new_layer = ParallelLinear(64, 128)
+        >>> set_module_from_path(model, ("encoder", "layer1"), new_layer)
+    """
+    if not path:
+        return
+
+    current = model
+    # Navigate to the parent of the target location
+    for item in path[:-1]:
+        current = current[item] if isinstance(item, int) else getattr(current, item)
+
+    # Set the new value at the target location
+    last_item = path[-1]
+    if isinstance(last_item, int):
+        current[last_item] = new_value
+    else:
+        setattr(current, last_item, new_value)

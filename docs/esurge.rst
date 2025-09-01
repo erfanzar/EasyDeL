@@ -47,12 +47,6 @@ Request Handling
 Installation
 ------------
 
-eSurge is included with EasyDeL. To install EasyDeL with all inference dependencies:
-
-.. code-block:: bash
-
-    pip install easydel[inference]
-
 For TPU-specific optimizations:
 
 .. code-block:: bash
@@ -90,7 +84,7 @@ Here's a simple example to get started with eSurge:
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
-            attn_mechanism=ed.AttentionMechanisms.PAGED_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
             attn_dtype=jnp.bfloat16,
         ),
     )
@@ -153,7 +147,7 @@ Process multiple prompts efficiently:
             temperature=0.7,
         )
     )
-    
+
     for output in outputs:
         print(f"Request {output.request_id}: {output.outputs[0].text}")
 
@@ -170,21 +164,19 @@ eSurge provides extensive configuration options:
     engine = ed.eSurge(
         model=model,
         tokenizer=tokenizer,
-        
+
         # Model configuration
         max_model_len=16384,          # Maximum sequence length
         max_num_seqs=32,               # Maximum concurrent sequences
-        
+
         # Memory configuration
         hbm_utilization=0.9,           # HBM utilization ratio (0.0-1.0)
         page_size=64,                  # KV cache page size
-        
+
         # Performance options
-        use_combined_forward=False,    # Use combined forward pass
-        use_aot_forward=True,          # Use ahead-of-time compilation
         runner_verbose=False,          # Verbose runner logging
         min_input_pad=32,              # Minimum input padding
-        
+
         # Naming
         esurge_name="my-engine",       # Engine instance name
     )
@@ -204,7 +196,7 @@ For fine-grained control, use configuration objects:
 
     # Advanced configuration is typically handled through engine parameters
     # The engine internally creates the appropriate configuration
-    
+
     engine = ed.eSurge(
         model=model,
         tokenizer=tokenizer,
@@ -350,7 +342,6 @@ For NVIDIA GPUs:
         max_model_len=4096,
         max_num_seqs=32,
         page_size=64,
-        use_combined_forward=True,  # Better for GPU memory patterns
         hbm_utilization=0.85,       # Leave headroom for kernels
     )
 
@@ -405,7 +396,7 @@ Implement custom scheduling logic:
     # Priority scheduling is configured in the scheduler
     # The scheduler automatically handles request prioritization
     # based on the scheduling policy (FCFS or Priority)
-    
+
     # Note: Direct priority setting is handled internally
     # by the scheduler based on arrival time and request characteristics
 
@@ -419,7 +410,7 @@ eSurge supports function calling for tool use:
     # Function calling is available through the API server
     # When using the API server with OpenAI-compatible clients,
     # function calling follows the OpenAI format:
-    
+
     # client.chat.completions.create(
     #     model="default",
     #     messages=[{"role": "user", "content": "What's the weather?"}],
@@ -463,26 +454,26 @@ Best Practices
 --------------
 
 1. **Memory Management**
-   
+
    - Monitor HBM utilization and adjust ``hbm_utilization`` parameter
    - Use prefix caching for repetitive prompts
    - Enable request preemption for long-running services
 
 2. **Performance Optimization**
-   
+
    - Use platform-specific settings (TPU vs GPU)
    - Enable JIT compilation with ``use_aot_forward``
    - Batch similar-length sequences together
 
 3. **Production Deployment**
-   
+
    - Enable monitoring and metrics collection
    - Implement health checks and auto-restart
    - Use load balancing for multiple instances
    - Set up proper logging and alerting
 
 4. **Scaling**
-   
+
    - Horizontal scaling with multiple engine instances
    - Use model parallelism for large models
    - Implement request routing based on load
@@ -518,17 +509,17 @@ Complete example of a chat application:
         """Create an eSurge engine for chat."""
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        
+
         model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
             model_id,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
             auto_shard_model=True,
             config_kwargs=ed.EasyDeLBaseConfigDict(
-                attn_mechanism=ed.AttentionMechanisms.PAGED_ATTENTION,
+                attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
             ),
         )
-        
+
         engine = ed.eSurge(
             model=model,
             tokenizer=tokenizer,
@@ -538,27 +529,27 @@ Complete example of a chat application:
             page_size=64,
             esurge_name="chat-engine",
         )
-        
+
         return engine
 
     def chat_loop(engine):
         """Interactive chat loop."""
         conversation = []
-        
+
         while True:
             user_input = input("\nYou: ")
             if user_input.lower() in ['quit', 'exit']:
                 break
-            
+
             conversation.append({"role": "user", "content": user_input})
-            
+
             # Format conversation for model
             prompt = format_conversation(conversation)
-            
+
             # Generate response
             print("Assistant: ", end="", flush=True)
             response_text = ""
-            
+
             for output in engine.stream(
                 prompt,
                 sampling_params=ed.SamplingParams(
@@ -569,7 +560,7 @@ Complete example of a chat application:
             ):
                 print(output.delta_text, end="", flush=True)
                 response_text += output.delta_text
-            
+
             print()  # New line after response
             conversation.append({"role": "assistant", "content": response_text})
 
@@ -601,11 +592,11 @@ Example of a batch processing service:
 
     class BatchProcessor:
         """Batch text processing service."""
-        
+
         def __init__(self, engine: ed.eSurge):
             self.engine = engine
             self.pending_requests = {}
-        
+
         async def process_batch(
             self,
             texts: List[str],
@@ -617,7 +608,7 @@ Example of a batch processing service:
                     max_new_tokens=100,
                     temperature=0.7,
                 )
-            
+
             # Submit all requests
             request_ids = []
             for text in texts:
@@ -627,22 +618,22 @@ Example of a batch processing service:
                 )
                 request_ids.append(request_id)
                 self.pending_requests[request_id] = None
-            
+
             # Wait for all completions
             results = {}
             while len(results) < len(request_ids):
                 outputs = self.engine.step()
-                
+
                 for output in outputs:
                     if output.finished:
                         results[output.request_id] = output.outputs[0].text
                         self.pending_requests.pop(output.request_id, None)
-                
+
                 await asyncio.sleep(0.01)  # Small delay
-            
+
             # Return in original order
             return [results[rid] for rid in request_ids]
-        
+
         async def process_stream(
             self,
             texts: List[str],
@@ -657,16 +648,16 @@ Example of a batch processing service:
                         temperature=0.7,
                     ),
                 )
-                
+
                 # Stream this request to completion
                 while True:
                     outputs = self.engine.step()
-                    
+
                     for output in outputs:
                         if output.request_id == request_id:
                             if callback:
                                 await callback(output)
-                            
+
                             if output.finished:
                                 break
                     else:
@@ -678,14 +669,14 @@ Example of a batch processing service:
     async def main():
         engine = create_chat_engine()  # From previous example
         processor = BatchProcessor(engine)
-        
+
         # Batch processing
         prompts = [
             "Explain quantum computing in simple terms",
             "What are the benefits of exercise?",
             "How does photosynthesis work?",
         ]
-        
+
         results = await processor.process_batch(prompts)
         for prompt, result in zip(prompts, results):
             print(f"Q: {prompt}\nA: {result}\n")
@@ -705,16 +696,16 @@ If you're migrating from vInference to eSurge:
 
     # Old vInference code
     from easydel.inference import vInference
-    
+
     engine = vInference(
         model=model,
         processor=tokenizer,
         generation_config=config,
     )
-    
+
     # New eSurge code
     from easydel.inference.esurge import eSurge
-    
+
     engine = eSurge(
         model=model,
         tokenizer=tokenizer,

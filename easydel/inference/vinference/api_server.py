@@ -22,11 +22,10 @@ import traceback
 import typing as tp
 from http import HTTPStatus
 
+from eformer.loggings import get_logger
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import ProcessorMixin
-
-from easydel.utils.helpers import get_logger
 
 from ..inference_engine_interface import (
     BaseInferenceApiServer,
@@ -36,22 +35,17 @@ from ..inference_engine_interface import (
 )
 from ..openai_api_modules import (
     ChatCompletionRequest,
-    ChatCompletionRequestWithTools,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionStreamResponse,
     ChatCompletionStreamResponseChoice,
     ChatMessage,
-    ChatMessageWithTools,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     CompletionStreamResponse,
     CompletionStreamResponseChoice,
     DeltaMessage,
-    FunctionCallFormat,
-    FunctionCallFormatter,
-    FunctionCallParser,
     ToolCall,
     UsageInfo,
 )
@@ -259,52 +253,6 @@ class vInferenceApiServer(BaseInferenceApiServer):
             logger.exception(f"Error applying chat template: {e}")
             raise RuntimeError(f"Error tokenizing input: {e}") from e
 
-    def _prepare_tokenized_input_with_tools(
-        self,
-        request: ChatCompletionRequestWithTools,
-        adapter: vInferenceAdapter,
-    ) -> dict:
-        """Prepare tokenized input with function/tool definitions."""
-        messages = [msg.model_dump() for msg in request.messages]
-        processor = adapter.processor
-
-        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
-            from easydel.trainers.prompt_utils import convert_to_openai_format
-
-            messages = convert_to_openai_format(messages)
-
-        tools = request.get_tools()
-        if tools:
-            format_type = request.function_call_format or self.default_function_format
-            tools_prompt = FunctionCallFormatter.format_tools_for_prompt(tools, format_type)
-
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] += f"\n\n{tools_prompt}"
-            else:
-                messages.insert(0, {"role": "system", "content": tools_prompt})
-
-        if request.chat_template_kwargs is None:
-            request.chat_template_kwargs = {}
-        add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-
-        # First, apply chat template to get text
-        text = processor.apply_chat_template(
-            conversation=messages,
-            add_generation_prompt=add_generation_prompt,
-            tokenize=False,  # Don't tokenize yet
-            **request.chat_template_kwargs,
-        )
-
-        # Then tokenize the text
-        tokenized = adapter.tokenizer(
-            text,
-            return_tensors="np",
-            padding=True,
-            return_attention_mask=True,
-        )
-
-        return tokenized
-
     async def _prepare_tokenized_input_async(self, request: ChatCompletionRequest, adapter: vInferenceAdapter) -> dict:
         """Prepare tokenized input asynchronously."""
         loop = asyncio.get_event_loop()
@@ -315,57 +263,7 @@ class vInferenceApiServer(BaseInferenceApiServer):
             adapter,
         )
 
-    def _prepare_tokenized_input_with_tools(
-        self,
-        request: ChatCompletionRequestWithTools,
-        adapter: vInferenceAdapter,
-    ) -> dict:
-        """Prepare tokenized input with function/tool definitions."""
-        messages = [msg.model_dump() for msg in request.messages]
-        processor = adapter.processor
-
-        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
-            from easydel.trainers.prompt_utils import convert_to_openai_format
-
-            messages = convert_to_openai_format(messages)
-
-        tools = request.get_tools()
-        if tools:
-            format_type = request.function_call_format or self.default_function_format
-            tools_prompt = FunctionCallFormatter.format_tools_for_prompt(tools, format_type)
-
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] += f"\n\n{tools_prompt}"
-            else:
-                messages.insert(0, {"role": "system", "content": tools_prompt})
-
-        if request.chat_template_kwargs is None:
-            request.chat_template_kwargs = {}
-        add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-
-        return processor.apply_chat_template(
-            conversation=messages,
-            return_tensors="np",
-            add_generation_prompt=add_generation_prompt,
-            return_dict=True,
-            tokenize=True,
-            padding=True,
-            **request.chat_template_kwargs,
-        )
-
-    async def _prepare_tokenized_input_with_tools_async(
-        self, request: ChatCompletionRequestWithTools, adapter: vInferenceAdapter
-    ) -> dict:
-        """Prepare input with tools asynchronously."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self.thread_pool,
-            self._prepare_tokenized_input_with_tools,
-            request,
-            adapter,
-        )
-
-    async def chat_completions(self, request: ChatCompletionRequest | ChatCompletionRequestWithTools) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
         """Handle chat completion requests with function calling support."""
         request_id = getattr(request, "request_id", None)
 
@@ -376,17 +274,9 @@ class vInferenceApiServer(BaseInferenceApiServer):
             adapter = self._get_adapter(request.model)
 
             # Check if this is a function calling request
-            is_function_request = (
-                self.enable_function_calling
-                and isinstance(request, ChatCompletionRequestWithTools)
-                and request.get_tools()
-            )
+            is_function_request = self.enable_function_calling and request.get_tools()
 
-            # Prepare input with function definitions if needed
-            if is_function_request:
-                ids = await self._prepare_tokenized_input_with_tools_async(request, adapter)
-            else:
-                ids = await self._prepare_tokenized_input_async(request, adapter)
+            ids = await self._prepare_tokenized_input_async(request, adapter)
 
             # Generate response
             if request.stream:
@@ -441,7 +331,7 @@ class vInferenceApiServer(BaseInferenceApiServer):
 
     async def _handle_non_streaming_response(
         self,
-        request: ChatCompletionRequest | ChatCompletionRequestWithTools,
+        request: ChatCompletionRequest,
         adapter: vInferenceAdapter,
         ids: dict,
         request_id: str | None = None,
@@ -486,18 +376,10 @@ class vInferenceApiServer(BaseInferenceApiServer):
             choices = []
             for i, response_text in enumerate(final_responses):
                 if is_function_request:
-                    format_type = getattr(request, "function_call_format", self.default_function_format)
-                    parser = FunctionCallParser(format=format_type, strict=False)
-                    function_calls = parser.parse(response_text)
-
-                    if function_calls:
-                        message = ChatMessageWithTools.from_function_calls(function_calls, content=None)
-                        finish_reason = "tool_calls"
-                    else:
-                        message = ChatMessage(role="assistant", content=response_text)
-                        finish_reason = self._determine_finish_reason(
-                            generated_tokens, sampling_params.max_tokens, response_text
-                        )
+                    message = ChatMessage(role="assistant", content=response_text)
+                    finish_reason = self._determine_finish_reason(
+                        generated_tokens, sampling_params.max_tokens, response_text
+                    )
                 else:
                     message = ChatMessage(role="assistant", content=response_text)
                     finish_reason = self._determine_finish_reason(
@@ -532,7 +414,7 @@ class vInferenceApiServer(BaseInferenceApiServer):
 
     async def _handle_streaming_response(
         self,
-        request: ChatCompletionRequest | ChatCompletionRequestWithTools,
+        request: ChatCompletionRequest,
         adapter: vInferenceAdapter,
         ids: dict,
         request_id: str | None = None,
@@ -546,10 +428,6 @@ class vInferenceApiServer(BaseInferenceApiServer):
             sampling_params = self._create_sampling_params(request)
 
             parser = None
-            if is_function_request:
-                format_type = getattr(request, "function_call_format", self.default_function_format)
-                parser = FunctionCallParser(format=format_type, strict=False)
-
             try:
                 padded_length = None
                 current_position = 0
@@ -1042,72 +920,7 @@ class vInferenceApiServer(BaseInferenceApiServer):
         """List available tools/functions for each model."""
         tools_by_model = {}
 
-        for model_name in self.adapters:
-            # Default example tools for demonstration
-            model_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "description": "Get the current weather for a location",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "location": {
-                                    "type": "string",
-                                    "description": "City and state, e.g. San Francisco, CA",
-                                },
-                                "unit": {
-                                    "type": "string",
-                                    "enum": ["celsius", "fahrenheit"],
-                                    "description": "Temperature unit",
-                                },
-                            },
-                            "required": ["location"],
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_web",
-                        "description": "Search the web for information",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "Search query",
-                                },
-                                "num_results": {
-                                    "type": "integer",
-                                    "description": "Number of results to return",
-                                    "default": 5,
-                                },
-                            },
-                            "required": ["query"],
-                        },
-                    },
-                },
-            ]
-
-            tools_by_model[model_name] = {
-                "tools": model_tools,
-                "formats_supported": [
-                    FunctionCallFormat.OPENAI.value,
-                    FunctionCallFormat.HERMES.value,
-                    FunctionCallFormat.GORILLA.value,
-                    FunctionCallFormat.JSON_SCHEMA.value,
-                ],
-                "parallel_calls": True,
-            }
-
-        return JSONResponse(
-            {
-                "models": tools_by_model,
-                "default_format": self.default_function_format.value,
-            }
-        )
+        return JSONResponse({"models": tools_by_model, "default_format": self.default_function_format.value})
 
     async def execute_tool(self, request: Request) -> JSONResponse:
         """Execute a tool/function call."""

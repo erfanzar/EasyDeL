@@ -22,15 +22,15 @@ import flax.core
 import jax
 import numpy as np
 import optax
+from eformer.paths import ePathLike
 from eformer.pytree import auto_pytree
+from eformer.serialization import AsyncCheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import EasyPathLike
-from easydel.utils.checkpoint_managers.streamer import CheckpointManager
 
 try:
     import wandb  # type:ignore
@@ -38,23 +38,42 @@ except ImportError:
     wandb = None
 
 
+from eformer.loggings import get_logger
+
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.utils import Timers
-from easydel.utils.helpers import get_logger
 
 from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
+
+if tp.TYPE_CHECKING:
+    pass
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset
     from jax._src.pjit import JitWrapped
 else:
     JitWrapped = tp.Any
+    Dataset = tp.Any
+
 logger = get_logger(__name__)
 
 
 @auto_pytree
 class TrainerConfigureDataloaderOutput:
+    """
+    Output configuration for dataloader setup.
+
+    Contains the configured dataloaders and computed maximum steps for
+    training and evaluation phases.
+
+    Attributes:
+        dataloader_train: Iterator over training batches
+        max_training_steps: Total number of training steps
+        dataloader_eval: Optional iterator over evaluation batches
+        max_evaluation_steps: Optional total number of evaluation steps
+    """
+
     dataloader_train: tp.Iterator[np.ndarray]
     max_training_steps: int
     dataloader_eval: tp.Iterator[np.ndarray] | None = None
@@ -63,6 +82,18 @@ class TrainerConfigureDataloaderOutput:
 
 @auto_pytree
 class TrainerConfigureModelOutput:
+    """
+    Output configuration for model setup.
+
+    Contains the configured model, optimizer, scheduler, and model configuration.
+
+    Attributes:
+        model: The initialized EasyDeL model
+        tx: Gradient transformation (optimizer) for training
+        scheduler: Learning rate schedule function
+        config: Optional model configuration object
+    """
+
     model: EasyDeLBaseModule
     tx: GradientTransformation
     scheduler: Schedule
@@ -71,14 +102,38 @@ class TrainerConfigureModelOutput:
 
 @auto_pytree
 class TrainerConfigureFunctionOutput:
+    """
+    Output configuration for training and evaluation functions.
+
+    Contains the compiled step functions and supporting infrastructure.
+
+    Attributes:
+        sharded_training_step_function: JIT-compiled training step function
+        mesh: Device mesh for distributed computation
+        checkpoint_manager: Manager for saving/loading checkpoints
+        sharded_evaluation_step_function: Optional JIT-compiled evaluation function
+    """
+
     sharded_training_step_function: JitWrapped
     mesh: Mesh
-    checkpoint_manager: CheckpointManager
+    checkpoint_manager: AsyncCheckpointManager
     sharded_evaluation_step_function: JitWrapped | None = None
 
 
 @auto_pytree
 class TrainerOutput:
+    """
+    Final output from the training process.
+
+    Contains the final model state and checkpoint information.
+
+    Attributes:
+        state: Final model state after training
+        mesh: Device mesh used during training
+        last_save_file_name: Name of the last saved checkpoint file
+        checkpoint_path: Full path to the last checkpoint
+    """
+
     state: EasyDeLState
     mesh: jax.sharding.Mesh | None
     last_save_file_name: str | None = None
@@ -86,6 +141,23 @@ class TrainerOutput:
 
 
 class BaseTrainerProtocol(metaclass=ABCMeta):
+    """
+    Abstract base protocol defining the interface for all trainer implementations.
+
+    This protocol ensures that all trainer implementations provide the necessary
+    methods and attributes for training and evaluation workflows. It defines the
+    contract that concrete trainer classes must fulfill.
+
+    The protocol covers:
+    - Initialization and configuration methods
+    - Training and evaluation loops
+    - Checkpoint management
+    - Metrics logging and monitoring
+    - Hook methods for customization
+
+    All methods marked with @abstractmethod must be implemented by subclasses.
+    """
+
     # Required attributes for all trainers
     arguments: TrainingArguments
     dataset_train: Dataset | None
@@ -128,23 +200,41 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     _extra_forward_flops_per_token: int | float
     _extra_backward_flops_per_token: int | float
 
-    _train_shared_fn_static_args_: tuple[tp.Any]
+    _train_shared_fn_static_args_: dict[str, tp.Any]
     _train_shared_fn_extra_args_: tuple[tp.Any]
 
-    _eval_shared_fn_static_args_: tuple[tp.Any]
+    _eval_shared_fn_static_args_: dict[str, tp.Any]
     _eval_shared_fn_extra_args_: tuple[tp.Any]
+
+    _resumed_from_checkpoint: bool
+    state_shardings: tp.Any
+    _training_time_start: float | None
+    _evaluation_time_start: float | None
 
     @abstractmethod
     def __init__(
         self,
-        arguments: TrainingArguments,
-        model: EasyDeLBaseModule,
+        arguments: TrainingArguments | None = None,
+        model_state: EasyDeLState | None = None,
+        model: tp.type[EasyDeLBaseModule] | None = None,
         dataset_train: Dataset | None = None,
         dataset_eval: Dataset | None = None,
+        data_collator: tp.Callable | None = None,
         finetune: bool = True,
+        **deprecated_kwargs,
     ):
         """
-        Initializes the trainer.
+        Initialize the trainer with model and training configuration.
+
+        Args:
+            arguments: Training configuration and hyperparameters
+            model_state: Pre-initialized model state (exclusive with model)
+            model: Model class to initialize (exclusive with model_state)
+            dataset_train: Training dataset
+            dataset_eval: Evaluation dataset
+            data_collator: Function to collate batch data
+            finetune: Whether this is a fine-tuning run
+            **deprecated_kwargs: Backward compatibility arguments
         """
         ...
 
@@ -164,10 +254,22 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def evaluation_batch_size(self): ...
 
+    @property
+    @abstractmethod
+    def is_process_zero(self): ...
+
+    @property
+    @abstractmethod
+    def is_enable(self): ...
+
     @abstractmethod
     def _initialize_attributes(self):
         """
-        Initializes attributes with default values.
+        Initialize all trainer attributes with default values.
+
+        This method ensures all required attributes are properly initialized,
+        preventing AttributeError during training. It sets up timers, trackers,
+        compilation managers, and other essential components.
         """
         ...
 
@@ -261,7 +363,14 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
-        Configures and JIT-compiles the training and evaluation step functions.
+        Configure and JIT-compile training and evaluation step functions.
+
+        This method prepares the computational graph for training and evaluation,
+        including setting up sharding specifications, compiling functions with
+        appropriate static arguments, and initializing the checkpoint manager.
+
+        Returns:
+            TrainerConfigureFunctionOutput: Compiled functions and infrastructure
         """
         ...
 
@@ -333,7 +442,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def save_information(self, output_path: str | EasyPathLike) -> None:
+    def save_information(self, output_path: str | ePathLike) -> None:
         """
         Save the generated information to a markdown file.
         """
@@ -346,7 +455,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         save_directory: str | None = None,
         gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None = None,
         to_torch: bool = False,
-        base_hf_auto_class=None,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
     ):
@@ -358,11 +466,10 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def _save_to_torch(
         self,
-        state,
-        save_directory,
-        base_hf_auto_class,
-        easystate_to_huggingface_model_kwargs,
-        torch_save_pretrained_kwargs,
+        state: EasyDeLState,
+        save_directory: str | os.PathLike,
+        easystate_to_huggingface_model_kwargs: dict | None = None,
+        torch_save_pretrained_kwargs: dict | None = None,
     ):
         """
         Saves the model state to a Torch compatible directory.
@@ -398,11 +505,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _should_skip_step(self, current_step):
-        """Determine if current step should be skipped."""
-        ...
-
-    @abstractmethod
     def _should_save_checkpoint(self, current_step):
         """Determine if checkpoint should be saved at current step."""
         ...
@@ -416,8 +518,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _prepare_training_output(
         self,
         state: EasyDeLState,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
         run_exception: Exception | None = None,
     ):
         """Prepare training output after training loop completion."""
@@ -446,6 +546,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def create_progress_bar(
+        self,
         total: int,
         desc: str = "",
         disabled: bool = False,
@@ -476,7 +577,24 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
         gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
     ):
-        """Core training loop implementation."""
+        """
+        Execute the core training loop.
+
+        This method implements the main training iteration, processing batches,
+        computing gradients, updating parameters, and tracking metrics across
+        multiple epochs.
+
+        Args:
+            state: Initial model state
+            metrics_tracker: Tracker for accumulating metrics
+            step_metrics: Calculator for per-step metrics
+            start_time: Training start timestamp
+            shard_fns: Functions for sharding data
+            gather_fns: Functions for gathering sharded data
+
+        Returns:
+            Tuple of final output and any exception encountered
+        """
         ...
 
     @abstractmethod
@@ -531,6 +649,16 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     def _eval_shared_fn_static_args(self) -> dict[str, tp.Any]: ...
 
     @abstractmethod
+    def _configure_grain_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Configure Grain dataloader."""
+        ...
+
+    @abstractmethod
+    def _configure_tfds_dataloader(self) -> TrainerConfigureDataloaderOutput:
+        """Configure TensorFlow dataloader."""
+        ...
+
+    @abstractmethod
     def _execute_eval_step(self, state, batch) -> LossMetrics:
         """Execute a single eval step."""
         ...
@@ -551,13 +679,36 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         model_parameters: flax.core.FrozenDict | None = None,
         state: EasyDeLState | None = None,
     ) -> tp.Any:
-        """Train using the provided model state."""
+        """
+        Execute the complete training process.
+
+        This is the main entry point for training. It orchestrates the entire
+        training workflow including initialization, training loops, evaluation,
+        checkpointing, and finalization.
+
+        Args:
+            model_parameters: Optional model parameters to use
+            state: Optional model state to use instead of self.model_state
+
+        Returns:
+            TrainerOutput or similar object containing final state and metrics
+        """
         ...
 
     @abstractmethod
     def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
         """
-        Evaluates using the provided model state.
+        Evaluate the model on the evaluation dataset.
+
+        This method runs the model in evaluation mode, computing metrics
+        without updating parameters. It yields metrics for each evaluation
+        step, allowing for streaming evaluation and progress monitoring.
+
+        Args:
+            model_state: The model state to evaluate
+
+        Yields:
+            dict: Evaluation metrics for each step
         """
         ...
 
@@ -568,6 +719,12 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def start_evaluation_hook(self):
         """Hook to run before evaluation starts."""
+        ...
+
+    @abstractmethod
+    def _setup_static_metrics(self):
+        """Setup static metrics for logging."""
+        ...
 
     @abstractmethod
     def compile_aot(self) -> bool:
@@ -620,4 +777,61 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def __str__(self):
         """Return a string representation of the trainer."""
+        ...
+
+    @abstractmethod
+    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
+        """
+        Try to resume from the latest checkpoint if available.
+
+        Args:
+            current_state: The current model state (used as fallback if no checkpoint found)
+
+        Returns:
+            The resumed state if a checkpoint was found and loaded, None otherwise
+        """
+        ...
+
+    @abstractmethod
+    def calculate_number_total_flops(self, params, is_training=True):
+        """Calculate total FLOPs for the model."""
+        ...
+
+    @classmethod
+    @abstractmethod
+    def load_trainer_state(
+        cls,
+        load_directory: str | os.PathLike,
+        dataset_train: Dataset | None = None,
+        dataset_eval: Dataset | None = None,
+        data_collator: tp.Callable | None = None,
+        device: tp.Any | None = "cpu",
+        dtype: tp.Any = None,
+        param_dtype: tp.Any = None,
+        precision: tp.Any | None = None,
+        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
+        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: tp.Any | None = None,
+        shard_attention_computation: bool = True,
+        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        backend: tp.Any | None = None,
+        platform: tp.Any | None = None,
+        config_kwargs: tp.Any | None = None,
+        model_task: tp.Any = None,
+        auto_shard_model: bool = True,
+        partition_rules: tuple[tuple[str, tp.Any], ...] | None = None,
+        quantization_platform: tp.Any | None = None,
+        quantization_method: tp.Any | None = None,
+        quantization_block_size: int = 128,
+        quantization_pattern: str | None = None,
+        quantize_tensors: bool = True,
+        verbose: bool = True,
+        base_state: type[EasyDeLState] | None = None,
+        trainer_init_arguments: dict[str, tp.Any] | None = None,
+        **kwargs,
+    ):
+        """
+        Load a trainer state from a saved checkpoint.
+        """
         ...
