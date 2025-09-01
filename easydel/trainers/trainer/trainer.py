@@ -241,6 +241,10 @@ class Trainer(BaseTrainer):
         with self.mesh:
             arr = with_sharding_constraint(arr, PartitionSpec(None))
         return arr
+    
+    def _should_skip_step(self, current_step):
+        """Determine if current step should be skipped."""
+        return self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step
 
     def _run_training_loop(
         self,
