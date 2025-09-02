@@ -280,8 +280,39 @@ class EasyDeLState(struct.PyTreeNode):
 
         from eformer.escale import match_partition_rules
 
+
         def make(graphstate):
-            return tx.init(graphstate)
+            if self.opt_state is None:
+                return tx.init(graphstate)
+            elif isinstance(self.opt_state, dict):
+                # opt_state has been loaded from checkpoint, which does not save EmptyStates
+                # we therefore need to be careful to inject any missing empty states
+                def _normalize_path(path):
+                    # this is necessary since the opt_state dict has DictKeys paths
+                    # and new_state has a mix of GetAttrKey, DictKey, and SequenceKey
+                    def to_str(x):
+                        for attr in ["name", "key", "idx"]:
+                            if hasattr(x, attr):
+                                return str(getattr(x, attr))
+                        return str(x)
+                    return ".".join(to_str(p) for p in path)
+
+                new_state = tx.init(graphstate)
+                flat_new_state, treedef = jax.tree_util.tree_flatten_with_path(new_state)
+                flat_opt_state, _ = jax.tree_util.tree_flatten_with_path(self.opt_state)
+                opt_paths = {_normalize_path(path): val for path, val in flat_opt_state}
+                for path, val in flat_new_state:
+                    path = _normalize_path(path)
+                    if path not in opt_paths:
+                        if val == optax.EmptyState():
+                            opt_paths[path] = val
+                        else:
+                            raise ValueError(f"Missing path in loaded optimizer state: {path}")
+                flat_opt_state = [opt_paths[_normalize_path(path)] for path, _ in flat_new_state]
+                opt_state = jax.tree_util.tree_unflatten(treedef, flat_opt_state)
+                return opt_state
+            else:
+                return self.opt_state
 
         eval_opt_state = jax.eval_shape(lambda: make(self.graphstate))
         partition_specs = match_partition_rules(partition_rules, eval_opt_state)

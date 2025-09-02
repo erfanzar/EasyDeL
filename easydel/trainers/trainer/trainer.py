@@ -15,6 +15,7 @@ import os
 import typing as tp
 
 import jax
+import jax.numpy as jnp
 import jax.experimental
 import jax.lib
 from eformer.escale import with_sharding_constraint
@@ -244,7 +245,10 @@ class Trainer(BaseTrainer):
     
     def _should_skip_step(self, current_step):
         """Determine if current step should be skipped."""
-        return self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step
+        return (
+            (self._skip_first_steps > 0 and current_step < self._skip_first_steps) or
+            (self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step)
+        )
 
     def _run_training_loop(
         self,
@@ -296,15 +300,20 @@ class Trainer(BaseTrainer):
         start_epoch = 0
 
         if initial_step > 0:
-            pbar.update(initial_step)
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
             if self.arguments.use_grain:
                 logger.info(f"Resuming Grain dataset from step {initial_step}")
                 start_epoch = initial_step // steps_per_epoch
+                skipped_steps = start_epoch * steps_per_epoch
+                pbar.update(skipped_steps)
+                self._skip_first_steps = initial_step - skipped_steps
+                state = state.replace(step=jnp.array(skipped_steps, dtype=jnp.int32))
             else:
+                self._skip_first_steps = initial_step
+                state = state.replace(step=jnp.array(0, dtype=jnp.int32))
                 logger.info(
-                    f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
+                    f"Resuming training from step {initial_step} (non-seekable dataset, skipping first {self._skip_first_steps} steps)"
                 )
 
         train_iter = iter(self.dataloader_train)

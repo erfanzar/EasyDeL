@@ -379,6 +379,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self._training_time_start = getattr(self, "_training_time_start", None)
         self._evaluation_time_start = getattr(self, "_evaluation_time_start", None)
 
+        self._skip_first_steps = getattr(self, "_skip_first_steps", 0)
+
         self.sharded_training_step_function = getattr(
             self,
             "sharded_training_step_function",
