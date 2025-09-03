@@ -1,4 +1,19 @@
+import os
+# Disable Ray auto-initialization
+os.environ["RAY_DEDUP_LOGS"] = "0"
+os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+
 import time
+import ray
+
+# Initialize Ray explicitly with minimal settings
+if not ray.is_initialized():
+    ray.init(
+        ignore_reinit_error=True,
+        log_to_driver=False,
+        logging_level="ERROR",
+        include_dashboard=False,
+    )
 
 import jax
 from flax import nnx as nn
@@ -104,6 +119,9 @@ def main():
     tokens = jnp.sum(output.sequences[0][max_model_len - 1024 :] != 128001)
     print(tokens / time_spent)
     print(tokens)
+    
+    # Shutdown Ray cleanly
+    ray.shutdown()
 
 
 if __name__ == "__main__":
