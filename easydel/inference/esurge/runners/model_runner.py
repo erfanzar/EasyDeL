@@ -603,9 +603,6 @@ class eSurgeRunner:
                 active_mask_full=self.active_mask_full_buf,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
-                query_start_loc_buf=self.query_start_loc_buf,
-                seq_lens_buf=self.seq_lens_buf,
-                pages_tables_buf=self.pages_tables_buf,
                 slot_mapping_buf=self.slot_mapping_buf,
                 padded_num_reqs=padded_num_reqs,
             )
