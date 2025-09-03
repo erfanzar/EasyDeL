@@ -700,7 +700,7 @@ class TrainingArguments:
 
         from eformer.serialization import AsyncCheckpointManager
 
-        return AsyncCheckpointManager(max_workers=1)
+        return AsyncCheckpointManager()
 
     @functools.cached_property
     def _tensorboard(self):

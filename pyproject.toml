@@ -102,7 +102,7 @@ ignore = ["F722", "B008", "UP015", "A005"]
 "__init__.py" = ["E402", "F401"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 ignore_missing_imports = true
 exclude = ["easydel/"]
 

@@ -669,12 +669,10 @@ class BaseTrainer(BaseTrainerProtocol):
             with self.model.mesh:
                 if self._resumed_from_checkpoint and self.model_state.opt_state is not None:
                     current_step = self.model_state.step
-                    self.model_state = self.model_state.init_tx(self.tx)
+                    self.model_state = self.model_state.replace(tx=self.tx)
                     self.model_state = self.model_state.replace(step=current_step)
 
-                    logger.info(
-                        f"Reinitialized optimizer state for resumed training at step {jax.device_get(current_step)}"
-                    )
+                    logger.info(f"resumed training at step {jax.device_get(current_step)}")
                 elif self.arguments.init_tx and self.model_state.opt_state is None:
                     self.model_state = self.model_state.init_tx(self.tx)
                 elif self.model_state.opt_state is None and self.model_state.tx is None:
@@ -1087,7 +1085,6 @@ class BaseTrainer(BaseTrainerProtocol):
             str: Path to the saved checkpoint directory
         """
         step = self._get_current_step(state)
-        # TODO:Fix this to enable checkpoint limit management
         self._manage_checkpoint_limit(self.arguments._get_save_directory())
         directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
         logger.info(f"saving state {directory_name}.")

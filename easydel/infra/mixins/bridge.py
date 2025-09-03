@@ -144,7 +144,7 @@ class EasyBridgeMixin(PushToHubMixin):
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
-        output_model_file = AsyncCheckpointManager(max_workers=1).save(
+        output_model_file = AsyncCheckpointManager().save(
             tree=state.to_pure_dict(),
             path=str(save_directory),
             mesh=self.mesh,
@@ -337,7 +337,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 resolved_archive_file = str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
             else:
                 extraargs["callback"] = callback
-            state, _ = AsyncCheckpointManager(max_workers=1).load(
+            state, _ = AsyncCheckpointManager().load(
                 path=ePath(resolved_archive_file),
                 mesh=mesh,
                 dtype=param_dtype,
