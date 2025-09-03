@@ -16,9 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - {file: Dockerfile.ray, tag: ray-cpu, tagsuf: "-ray-cpu", args: "HARDWARE_TYPE=cpu RAY_IMAGE=rayproject/ray:2.36.0-py311"}
-          - {file: Dockerfile.ray, tag: ray-gpu, tagsuf: "-ray-gpu", args: "HARDWARE_TYPE=gpu RAY_IMAGE=rayproject/ray:2.36.0-py311-gpu"}
-          - {file: Dockerfile.ray, tag: ray-tpu, tagsuf: "-ray-tpu", args: "HARDWARE_TYPE=tpu RAY_IMAGE=rayproject/ray:2.36.0-py311"}
+          - {file: Dockerfile.ray, tag: ray-cpu, tagsuf: "-ray-cpu", args: "HARDWARE_TYPE=cpu RAY_IMAGE=rayproject/ray:2.47.1-py311"}
+          - {file: Dockerfile.ray, tag: ray-gpu, tagsuf: "-ray-gpu", args: "HARDWARE_TYPE=gpu RAY_IMAGE=rayproject/ray:2.47.1-py311-gpu"}
+          - {file: Dockerfile.ray, tag: ray-tpu, tagsuf: "-ray-tpu", args: "HARDWARE_TYPE=tpu RAY_IMAGE=rayproject/ray:2.47.1-py311"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
