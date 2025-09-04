@@ -379,6 +379,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self._training_time_start = getattr(self, "_training_time_start", None)
         self._evaluation_time_start = getattr(self, "_evaluation_time_start", None)
 
+        self._skip_first_steps = getattr(self, "_skip_first_steps", 0)
+
         self.sharded_training_step_function = getattr(
             self,
             "sharded_training_step_function",
@@ -508,7 +510,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if not self.arguments.performance_mode:
             import easydel
 
-            interval = 1.0 if self.arguments.track_memory is True else self.arguments.track_memory
+            interval = (
+                self.arguments.track_memory
+                if isinstance(self.arguments.track_memory, (int, float))
+                else 1.0
+            )
             self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
@@ -1095,8 +1101,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _get_current_step(self, state):
         step = int(jax.device_get(state.step))
-        if self.arguments.step_start_point is not None:
-            step += self.arguments.step_start_point
         return step
 
     def _manage_checkpoint_limit(self, save_directory):
@@ -1492,7 +1496,14 @@ class BaseTrainer(BaseTrainerProtocol):
             Based on save_steps configuration in training arguments
         """
         return (
-            self.arguments.save_steps is not None and current_step > 0 and current_step % self.arguments.save_steps == 0
+            (
+                self.arguments.save_steps is not None
+                and current_step > 0
+                and current_step % self.arguments.save_steps == 0
+            ) and (
+                self.arguments.step_start_point is None
+                or current_step > self.arguments.step_start_point
+            )
         )
 
     def _should_run_evaluation(self, current_step):
@@ -1533,9 +1544,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
         dire = ePath(self.arguments.save_directory)
         if self.arguments.do_last_save:
-            filename = self._save_state(state=state, milestone=False, save_directory=dire)
-            if self.arguments.save_directory is not None:
-                checkpoint_path = dire / filename
+            # don't save checkpoint if `step` is still below `step_start_point`
+            step = self._get_current_step(state)
+            if step < self.arguments.step_start_point:
+                logger.info(f"Skipping checkpoint saving for step {step}.")
+            else:
+                filename = self._save_state(state=state, milestone=False, save_directory=dire)
+                if self.arguments.save_directory is not None:
+                    checkpoint_path = dire / filename
 
         return TrainerOutput(
             state=state,
@@ -1653,12 +1669,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def log_metrics(
         self,
-        metrics: MetricsType,
+        history: list[MetricsType],
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
-    ):
+    ) -> list[MetricsType]:
         """Log metrics and update progress bar."""
+
+        metrics = self.arguments.aggregate_metrics(history)
 
         if step % self.arguments.log_steps == 0:
             if step == 0:
@@ -1678,5 +1696,9 @@ class BaseTrainer(BaseTrainerProtocol):
             pbar.set_postfix(**display_metrics)
             update_size = 0 if step == 0 else self.arguments.log_steps
             pbar.update(update_size)
+
         if step % self.arguments.report_steps == 0:
             self.arguments.log_metrics(metrics=metrics, step=step)
+            return []
+        else:
+            return history

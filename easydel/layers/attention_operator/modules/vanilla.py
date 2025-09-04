@@ -131,7 +131,11 @@ class VanillaAttn(AttentionImpl):
             q = jnp.reshape(q, (b, qs, kh, num_reps, d))
             q, k, v = promote_dtype((q, k, v), dtype=dtype)
 
-            aw = jnp.einsum("bskhd,bmkd->bkhsm", q * sm_scale, k, optimize=True)
+            logits = jnp.einsum("bskhd,bmkd->bkhsm", q * sm_scale, k, optimize=True)
+
+        soft_cap = self.metadata.soft_cap
+        if soft_cap is not None:
+            logits = soft_cap * jnp.tanh(logits / soft_cap)
 
         if bias is not None:
             if bias.shape[1] == (kh * num_reps):
@@ -142,7 +146,7 @@ class VanillaAttn(AttentionImpl):
                 bias = bias.reshape(b, 1, 1, qs, ks)
             else:
                 raise NotImplementedError("bias heads wont match!")
-            aw = jnp.add(aw, bias.astype(aw.dtype))
+            logits = jnp.add(logits, bias.astype(logits.dtype))
 
         elif mask is not None:
             if mask.dtype != jnp.bool_:
@@ -167,7 +171,8 @@ class VanillaAttn(AttentionImpl):
             else:
                 raise ValueError(f"Unsupported mask shape: {mask.shape}")
 
-            aw = jnp.where(mask, aw, jnp.finfo(aw.dtype).min)
+            logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
+
         if softmax_aux is not None:
             if softmax_aux.ndim == 2:
                 sinks = softmax_aux.reshape(1, kh, -1, 1, 1)
@@ -177,12 +182,12 @@ class VanillaAttn(AttentionImpl):
                 sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, 1))
             else:
                 raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
-            combined_logits = jnp.concatenate([aw, sinks], axis=-1)
+            combined_logits = jnp.concatenate([logits, sinks], axis=-1)
             combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
             probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
             aw = probs[..., :-1]
         else:
-            aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)
+            aw = jax.nn.softmax(logits.astype(softmax_dtype), axis=-1).astype(dtype)
 
         dp = self.metadata.dropout_prob
         if not deterministic and dp > 0.0 and dropout_rng is not None:
@@ -196,6 +201,7 @@ class VanillaAttn(AttentionImpl):
 
         return AttentionOutput(
             attention_weights=aw,
+            attention_logits=logits,
             attention_outputs=with_sharding_constraint(arr=attention, sharding=a_sharding),
         )
 

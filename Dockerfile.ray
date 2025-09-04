@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+ARG RAY_IMAGE=rayproject/ray:2.45.0-py311
+FROM ${RAY_IMAGE}
+
+WORKDIR /home/ray
+
+RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends libgomp1 rsync ca-certificates curl git build-essential && sudo rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m pip install uv
+
+COPY pyproject.toml uv.lock* ./
+
+ARG HARDWARE_TYPE=cpu
+RUN --mount=type=cache,target=/root/.cache/uv uv venv /home/ray/.venv && \
+    if [ "$HARDWARE_TYPE" = "gpu" ]; then uv sync --frozen --no-dev --no-install-project --extra gpu; \
+    elif [ "$HARDWARE_TYPE" = "tpu" ]; then uv sync --frozen --no-dev --no-install-project --extra tpu; \
+    else uv sync --frozen --no-dev --no-install-project; fi
+
+ENV PATH="/home/ray/.venv/bin:$PATH" \
+    VIRTUAL_ENV="/home/ray/.venv" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN sed -i \
+    -e '/^# >>> conda initialize >>>/,/^# <<< conda initialize <<</d' \
+    -e '/^export \+PATH=\$HOME\/anaconda3\/bin:\$PATH$/d' \
+    /home/ray/.bashrc && \
+    printf 'export VIRTUAL_ENV=/home/ray/.venv\nexport PATH="/home/ray/.venv/bin:$PATH"\n' >> /home/ray/.bashrc
+
+COPY . .
+
+RUN uv pip install -e . --no-deps
+RUN uv pip install \
+    google-api-python-client \
+    google-auth-httplib2 \
+    google-auth-oauthlib \
+    cryptography
+
+RUN curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz && \
+    tar -xf google-cloud-cli-linux-x86_64.tar.gz && \
+    printf "N\nY\n\n" | script -qec ./google-cloud-sdk/install.sh && \
+    rm google-cloud-cli-linux-x86_64.tar.gz
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+COPY ./preemptible-fix.patch .
+# apply the patch to fix preemptible GCP in Ray in the installed ray package
+RUN patch -d /home/ray/.venv/lib/python3.11/site-packages/ -p2 < preemptible-fix.patch
+
+ARG VERSION
+ENV VERSION=$VERSION \
+    HARDWARE_TYPE=$HARDWARE_TYPE
+
+LABEL org.opencontainers.image.version=$VERSION \
+      org.opencontainers.image.description="EasyDeL on Ray base image" \
+      org.opencontainers.image.source="https://github.com/dvruette/EasyDeL"
+
+ENTRYPOINT []
+CMD ["bash"]

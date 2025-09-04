@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import typing as tp
 
 import jax
+import jax.numpy as jnp
 import jax.experimental
 import jax.lib
 from eformer.escale import with_sharding_constraint
@@ -240,6 +242,13 @@ class Trainer(BaseTrainer):
         with self.mesh:
             arr = with_sharding_constraint(arr, PartitionSpec(None))
         return arr
+    
+    def _should_skip_step(self, current_step):
+        """Determine if current step should be skipped."""
+        return (
+            (self._skip_first_steps > 0 and current_step < self._skip_first_steps) or
+            (self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step)
+        )
 
     def _run_training_loop(
         self,
@@ -291,15 +300,20 @@ class Trainer(BaseTrainer):
         start_epoch = 0
 
         if initial_step > 0:
-            pbar.update(initial_step)
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
             if self.arguments.use_grain:
                 logger.info(f"Resuming Grain dataset from step {initial_step}")
                 start_epoch = initial_step // steps_per_epoch
+                skipped_steps = start_epoch * steps_per_epoch
+                pbar.update(skipped_steps)
+                self._skip_first_steps = initial_step - skipped_steps
+                state = state.replace(step=jnp.array(skipped_steps, dtype=jnp.int32))
             else:
+                self._skip_first_steps = initial_step
+                state = state.replace(step=jnp.array(0, dtype=jnp.int32))
                 logger.info(
-                    f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
+                    f"Resuming training from step {initial_step} (non-seekable dataset, skipping first {self._skip_first_steps} steps)"
                 )
 
         train_iter = iter(self.dataloader_train)
@@ -420,74 +434,108 @@ class Trainer(BaseTrainer):
 
             def data_collator(x):
                 return x
+            
+        metrics_history = []
 
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
         for _ in range(steps_per_epoch):
             current_step = int(jax.device_get(state.step))
+
+            if os.getenv("EASYDEL_PROFILING") == "1":
+                # skip compilation and let training warm up a bit
+                if current_step == 5:
+                    logger.info("Starting JAX profiler...")
+                    options = jax.profiler.ProfileOptions()
+                    options.advanced_configuration = {
+                        "tpu_trace_mode" : "TRACE_ONLY_XLA",
+                        "tpu_num_sparse_cores_to_trace" : 2,
+                    }
+                    jax.profiler.start_trace(
+                        "/tmp/jax-trace",
+                        create_perfetto_link=False,
+                        create_perfetto_trace=True,
+                        # profiler_options=options,
+                    )
+                if current_step == 25:
+                    logger.info("Stopping JAX profiler")
+                    jax.profiler.stop_trace()
+
             if current_step >= self.max_training_steps:
                 break
-            try:
-                batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                step_metrics.start_step()
-                state = self.on_step_start(state=state, step=current_step)
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
-                return state, exect, train_iter
 
-            # Execute training step
-            with self.train_tracker.trace_compilation():
-                with capture_time() as execution_time:
-                    state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
-                    metrics.execution_time = execution_time()
-                    current_step = int(jax.device_get(state.step))
-            try:
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    loss=metrics.loss,
-                    accuracy=metrics.accuracy,
-                    step=current_step,
-                )
-                metrics = self.apply_training_hooks(metrics=metrics)
-                train_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=self.scheduler(current_step)
-                    if self.scheduler is not None
-                    else self.arguments.learning_rate,
-                    epoch=epoch,
-                    flops_per_token=self._backward_flops_per_token,
-                    extra_flops_per_token=self._extra_backward_flops_per_token,
-                    batch_size=self.training_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    mode="train",
-                )
-                state, metrics = self.on_step_end(
-                    state=state,
-                    metrics=metrics,
-                    step=current_step,
-                )
-                self.log_metrics(
-                    metrics=train_metrics,
-                    pbar=pbar,
-                    step=current_step,
-                    mode="train",
-                )
-                self.log_weight_distribution(state=state, step=current_step)
-                # Save checkpoint if needed
-                if self._should_save_checkpoint(current_step):
-                    _ = self._save_state(
-                        state=state,
-                        milestone=True,
-                        save_directory=self.arguments.save_directory,
+            with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
+                try:
+                    with capture_time() as dataloading_time:
+                        batch, train_iter = self._get_next_batch(train_iter, train_dataset)
+                    if self._should_skip_step(current_step):
+                        state = state.replace(step=state.step + 1)
+                        pbar.update(1)
+                        continue
+                    step_metrics.start_step()
+                    state = self.on_step_start(state=state, step=current_step)
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
+                    return state, exect, train_iter
+
+                # Execute training step
+                with self.train_tracker.trace_compilation():
+                    with capture_time() as execution_time:
+                        state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
+                        metrics.execution_time = execution_time()
+                        current_step = int(jax.device_get(state.step))
+                # Update and log metrics
+                try:
+                    
+
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        loss=metrics.loss,
+                        accuracy=metrics.accuracy,
+                        step=current_step,
                     )
-                if self._should_run_evaluation(current_step):
-                    for _ in self.eval(model_state=state):
-                        ...
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                return state, run_exception, train_iter
-            if run_exception is not None:
-                break
+                    metrics = self.apply_training_hooks(metrics=metrics)
+                    train_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=self.scheduler(current_step)
+                        if self.scheduler is not None
+                        else self.arguments.learning_rate,
+                        epoch=epoch,
+                        flops_per_token=self._backward_flops_per_token,
+                        extra_flops_per_token=self._extra_backward_flops_per_token,
+                        batch_size=self.training_batch_size,
+                        seq_length=self.arguments.max_sequence_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
+                        dataloading_time=dataloading_time(),
+                        mode="train",
+                    )
+                    state, metrics = self.on_step_end(
+                        state=state,
+                        metrics=metrics,
+                        step=current_step,
+                    )
+                    metrics_history.append(train_metrics)
+                    metrics_history = self.log_metrics(
+                        history=metrics_history,
+                        pbar=pbar,
+                        step=current_step,
+                        mode="train",
+                    )
+                    self.log_weight_distribution(state=state, step=current_step)
+                    # Save checkpoint if needed
+                    if self._should_save_checkpoint(current_step):
+                        _ = self._save_state(
+                            state=state,
+                            milestone=True,
+                            save_directory=self.arguments.save_directory,
+                        )
+                    if self._should_run_evaluation(current_step):
+                        for _ in self.eval(model_state=state):
+                            ...
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    return state, run_exception, train_iter
+                if run_exception is not None:
+                    break
         return state, run_exception, train_iter
 
     def _eval_epoch(
@@ -523,40 +571,43 @@ class Trainer(BaseTrainer):
                 return x
 
         for current_step in range(1, self.max_evaluation_steps + 1):
-            try:
-                batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
-                step_metrics.start_step()
-                with self.evalu_tracker.trace_compilation():
-                    with capture_time() as execution_time:
-                        metrics = self._execute_eval_step(state, data_collator(batch))
-                        metrics.execution_time = execution_time()
-                mean_loss, mean_accuracy = metrics_tracker.update(
-                    metrics.loss,
-                    metrics.accuracy,
-                    current_step,
-                )
-                eval_metrics = step_metrics.calculate(
-                    metrics=metrics,
-                    current_step=current_step,
-                    learning_rate=0.000,
-                    epoch=0,
-                    flops_per_token=self._forward_flops_per_token,
-                    extra_flops_per_token=self._extra_forward_flops_per_token,
-                    batch_size=self.evaluation_batch_size,
-                    seq_length=self.arguments.max_sequence_length,
-                    mean_loss=mean_loss,
-                    mean_accuracy=mean_accuracy,
-                    mode="eval",
-                )
-                self.log_metrics(
-                    metrics=eval_metrics,
-                    pbar=pbar,
-                    step=current_step,
-                    mode="eval",
-                )
-                yield eval_metrics
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
-                break
+            with jax.profiler.StepTraceAnnotation("eval", step_num=current_step):
+                try:
+                    with capture_time() as dataloading_time:
+                        batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
+                    step_metrics.start_step()
+                    with self.evalu_tracker.trace_compilation():
+                        with capture_time() as execution_time:
+                            metrics = self._execute_eval_step(state, data_collator(batch))
+                            metrics.execution_time = execution_time()
+                    mean_loss, mean_accuracy = metrics_tracker.update(
+                        metrics.loss,
+                        metrics.accuracy,
+                        current_step,
+                    )
+                    eval_metrics = step_metrics.calculate(
+                        metrics=metrics,
+                        current_step=current_step,
+                        learning_rate=0.000,
+                        epoch=0,
+                        flops_per_token=self._forward_flops_per_token,
+                        extra_flops_per_token=self._extra_forward_flops_per_token,
+                        batch_size=self.evaluation_batch_size,
+                        seq_length=self.arguments.max_sequence_length,
+                        mean_loss=mean_loss,
+                        mean_accuracy=mean_accuracy,
+                        dataloading_time=dataloading_time(),
+                        mode="eval",
+                    )
+                    self.log_metrics(
+                        metrics=eval_metrics,
+                        pbar=pbar,
+                        step=current_step,
+                        mode="eval",
+                    )
+                    yield eval_metrics
+                except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    break
 
     def _execute_eval_step(self, state, batch) -> LossMetrics:
         """

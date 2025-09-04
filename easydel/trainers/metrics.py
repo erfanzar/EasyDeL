@@ -65,6 +65,7 @@ class StepMetrics:
         batch_size: int,
         seq_length: int,
         learning_rate: float,
+        dataloading_time: float,
         mode: tp.Literal["eval", "train"] | None = None,
         **extras,
     ) -> dict[str, float]:
@@ -91,6 +92,7 @@ class StepMetrics:
             f"{perf_key}/extra_flops": float(extra_flops),
             f"{perf_key}/extra_flops_per_token": float(extra_flops_per_token),
             f"{perf_key}/step_time": float(step_time),
+            f"{perf_key}/dataloading_time": float(dataloading_time),
             f"{perf_key}/tflops": float(tflops),
             f"{perf_key}/throughput": throughput,
             f"{perf_key}/total_flops": float(total_flops),

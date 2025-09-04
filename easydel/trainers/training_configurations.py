@@ -207,10 +207,6 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to log gradient norms."},
     )
-    report_metrics: bool = field(
-        default=True,
-        metadata={"help": "Whether to report metrics to a logger."},
-    )
     log_steps: int = field(
         default=10,
         metadata={"help": "Log metrics every X steps."},
@@ -302,6 +298,14 @@ class TrainingArguments:
     report_steps: int = field(
         default=5,
         metadata={"help": "Report metrics every X steps."},
+    )
+    report_metrics: bool = field(
+        default=True,
+        metadata={"help": "Whether to report metrics to a logger."},
+    )
+    metrics_aggregation: tp.Literal["last", "mean", "median"] = field(
+        default="last",
+        metadata={"help": "The method to use for aggregating metrics over multiple steps."},
     )
     save_directory: str = field(
         default="EasyDeL-Checkpoints",
@@ -403,9 +407,9 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The Weights & Biases entity."},
     )
-    wandb_name: str | None = field(
+    wandb_kwargs: dict[str, str] | None = field(
         default=None,
-        metadata={"help": "The Weights & Biases run name."},
+        metadata={"help": "Additional keyword arguments for Weights & Biases."},
     )
     warmup_steps: int = field(
         default=0,
@@ -750,29 +754,84 @@ class TrainingArguments:
                     stacklevel=1,
                 )
                 return None
-            wandb_name = self.wandb_name
+
             prefix = self.trainer_prefix
             if prefix is None:
                 prefix = ""
             else:
                 prefix = "-" + prefix
-            if wandb_name is None:
-                _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{self.model_name.lower()}-{_time}"
+
+            _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            default_wandb_name = f"{self.model_name.lower()}-{_time}"
+
+            wandb_kwargs = self.wandb_kwargs or {}
+            if "entity" in wandb_kwargs:
+                del wandb_kwargs["entity"]
+                logger.warning("WandB entity needs to be specified through the `wandb_entity` argument on TrainingArguments directly.")
 
             return wandb.init(
-                project=f"EasyDeL{prefix}-{self.model_name}",
-                config=self.to_dict(),
-                save_code=True,
-                name=wandb_name,
-                tags=["EasyDeL", "Jax", "Train", "LLM", "VLM"],
                 entity=self.wandb_entity,
+                project=wandb_kwargs.pop("project", f"EasyDeL{prefix}-{self.model_name}"),
+                config=wandb_kwargs.pop("config", self.to_dict()),
+                save_code=wandb_kwargs.pop("save_code", True),
+                name=wandb_kwargs.pop("name", default_wandb_name),
+                tags=wandb_kwargs.pop("tags", ["EasyDeL", "Jax", "Train", "LLM", "VLM"]),
+                **wandb_kwargs,
             )
         return None
 
     def ensure_training_time_limit(self, time_passed):
         if self.training_time_limit is not None and time_passed > self._time_to_seconds(self.training_time_limit):
             raise EasyDeLTimerError("Time Out")
+        
+    def aggregate_metrics(
+        self,
+        history: list[MetricsType],
+    ) -> MetricsType:
+        if not history:
+            return {}
+        if len(history) == 1:
+            return history[0]
+        
+        N = len(history)
+        if self.metrics_aggregation == "last":
+            return history[-1]
+        elif self.metrics_aggregation == "mean":
+            def agg_fn(vals):
+                return sum(vals) / len(vals)
+            def numpy_agg_fn(vals):
+                return np.mean(np.stack(vals), axis=0)
+            def torch_agg_fn(vals):
+                return torch.mean(torch.stack(vals), dim=0)
+        elif self.metrics_aggregation == "median":
+            def agg_fn(vals):
+                return np.median(vals)
+            def numpy_agg_fn(vals):
+                return np.median(np.stack(vals), axis=0)
+            def torch_agg_fn(vals):
+                return torch.median(torch.stack(vals), dim=0)
+        else:
+            raise ValueError(f"Unknown aggregation method: {self.metrics_aggregation}")
+
+        metrics = {}
+        for key in history[0]:
+            vals = [h[key] for h in history if h.get(key) is not None]
+            if len(vals) == 0:
+                continue
+            if all(isinstance(v, str) for v in vals):
+                metrics[key] = vals[-1]  # Take the last string value
+            elif all(isinstance(v, (int, float)) for v in vals):
+                metrics[key] = agg_fn(vals)
+            elif all(isinstance(v, (list, tuple)) for v in vals):
+                # If all values are lists/tuples, aggregate them element-wise
+                metrics[key] = [agg_fn(x) for x in zip(*vals)]
+            elif all(isinstance(v, (np.ndarray, jnp.ndarray)) for v in vals):
+                metrics[key] = numpy_agg_fn(vals)
+            elif all(isinstance(v, torch.Tensor) for v in vals):
+                metrics[key] = torch_agg_fn(vals)
+            else:
+                logger.warning(f"Cannot aggregate metric \"{key}\" with mixed or unknown types: {vals}")
+        return metrics
 
     def log_metrics(
         self,
@@ -895,7 +954,10 @@ class TrainingArguments:
             if log_as == "summary":
                 wandb.summary.update(metrics)
             elif log_as == "config":
-                wandb.config.update(metrics)
+                try:
+                    wandb.config.update(metrics)
+                except Exception as e:
+                    logger.warning(f"Failed to update wandb.config: {e}")
             else:
                 wandb_metrics = {}
                 for key, value in metrics.items():
