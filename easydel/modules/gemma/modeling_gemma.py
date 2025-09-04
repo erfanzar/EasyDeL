@@ -51,6 +51,14 @@ logger = get_logger(__name__)
 
 
 class GemmaRMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization for Gemma models.
+
+    This normalization technique normalizes the inputs by the root mean square,
+    providing stability during training while being computationally efficient.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(self, config: GemmaConfig, dtype: jnp.dtype = jnp.float32):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
@@ -139,6 +147,15 @@ class GemmaAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states, num_heads):
+        """Split hidden states into multiple attention heads.
+
+        Args:
+            hidden_states: Input tensor to split.
+            num_heads: Number of attention heads.
+
+        Returns:
+            Reshaped tensor with separate head dimension.
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 
     def __call__(
@@ -249,6 +266,12 @@ class GemmaAttention(AttentionModule):
 
 
 class GemmaMLP(nn.Module):
+    """Multi-Layer Perceptron module for Gemma models.
+
+    Implements the feedforward network component of the transformer architecture
+    with gated linear units and optional activation functions.
+    """
+
     def __init__(
         self,
         config: GemmaConfig,
@@ -327,6 +350,12 @@ class GemmaMLP(nn.Module):
 
 
 class GemmaDecoderLayer(nn.Module):
+    """Single decoder layer for Gemma models.
+
+    Combines multi-head attention and feedforward networks with residual connections
+    and layer normalization to form a complete transformer decoder layer.
+    """
+
     def __init__(
         self,
         config: GemmaConfig,
