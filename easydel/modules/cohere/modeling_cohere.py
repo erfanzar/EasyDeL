@@ -57,6 +57,14 @@ def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
 
 
 class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization for Cohere models.
+
+    Implements RMS normalization with learnable scale parameters,
+    providing training stability without mean centering.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         dim: int | tuple,
@@ -263,6 +271,12 @@ class CohereAttention(AttentionModule):
 
 
 class CohereMLP(nn.Module):
+    """Multi-Layer Perceptron module for Cohere models.
+
+    Implements feedforward network with configurable activation functions
+    and gated linear units for enhanced representation learning.
+    """
+
     def __init__(
         self,
         config: CohereConfig,
@@ -308,6 +322,12 @@ class CohereMLP(nn.Module):
 
 
 class CohereBlock(nn.Module):
+    """Single transformer block for Cohere models.
+
+    Combines self-attention, feedforward networks, and layer normalization
+    with residual connections to form a complete transformer layer.
+    """
+
     def __init__(
         self,
         config: CohereConfig,

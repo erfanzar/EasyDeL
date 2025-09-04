@@ -141,6 +141,12 @@ def _create_chunked_attention_mask(
 
 
 class Llama4TextExperts(nn.Module):
+    """Mixture of Experts module for Llama4 text models.
+
+    Implements a sparse mixture of experts with top-k routing,
+    enabling efficient scaling and specialization of model capacity.
+    """
+
     def __init__(
         self,
         config: Llama4Config,
@@ -187,6 +193,14 @@ class Llama4TextExperts(nn.Module):
 
 
 class Llama4TextL2Norm(nn.Module):
+    """L2 normalization layer for Llama4 text models.
+
+    Normalizes inputs using L2 norm with learned scaling parameters,
+    providing stable gradients during training.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(self, eps: float = 1e-6) -> None:
         self.eps = eps
 
@@ -199,6 +213,12 @@ class Llama4TextL2Norm(nn.Module):
 
 
 class Llama4TextMLP(nn.Module):
+    """Multi-Layer Perceptron for Llama4 text models.
+
+    Implements feedforward network with SwiGLU activation function
+    for improved representation learning.
+    """
+
     def __init__(
         self,
         config: Llama4Config,
@@ -238,6 +258,12 @@ class Llama4TextMLP(nn.Module):
 
 
 class Llama4TextMoe(nn.Module):
+    """Mixture of Experts layer for Llama4 text models.
+
+    Routes inputs to specialized expert networks based on learned routing,
+    allowing for conditional computation and increased model capacity.
+    """
+
     def __init__(
         self,
         config: Llama4Config,
@@ -1062,6 +1088,12 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 
 
 class Llama4VisionMLP2(nn.Module):
+    """Two-layer MLP module for Llama4 vision models.
+
+    Implements a simple two-layer feedforward network with GELU activation
+    for vision feature transformation.
+    """
+
     def __init__(
         self,
         config,
@@ -1097,6 +1129,12 @@ class Llama4VisionMLP2(nn.Module):
 
 
 class Llama4MultiModalProjector(nn.Module):
+    """Multi-modal projector for Llama4 vision-language models.
+
+    Projects vision features into the text embedding space using MLP layers,
+    enabling cross-modal understanding and generation.
+    """
+
     def __init__(
         self,
         config,
@@ -1153,6 +1191,12 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
 
 
 class Llama4VisionPixelShuffleMLP(nn.Module):
+    """Pixel shuffle MLP for Llama4 vision models.
+
+    Performs spatial downsampling of vision features through pixel shuffling
+    and MLP transformations for efficient processing.
+    """
+
     def __init__(
         self,
         config,
@@ -1308,6 +1352,12 @@ class Llama4VisionAttention(AttentionModule):
 
 
 class Llama4VisionMLP(nn.Module):
+    """MLP module for Llama4 vision transformer.
+
+    Standard feedforward network with GELU activation for vision
+    feature transformation within transformer blocks.
+    """
+
     def __init__(
         self,
         config,
@@ -1345,6 +1395,12 @@ class Llama4VisionMLP(nn.Module):
 
 
 class Llama4VisionEncoderLayer(nn.Module):
+    """Single encoder layer for Llama4 vision models.
+
+    Combines self-attention and feedforward networks with layer normalization
+    and residual connections for vision feature encoding.
+    """
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -1439,6 +1495,12 @@ class Llama4VisionEncoderLayer(nn.Module):
 
 
 class Llama4VisionEncoder(nn.Module):
+    """Vision encoder stack for Llama4 models.
+
+    Stacks multiple vision encoder layers to progressively encode
+    visual features for downstream processing.
+    """
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -1505,6 +1567,12 @@ class Llama4VisionEncoder(nn.Module):
 
 
 class Llama4UnfoldConvolution(nn.Module):
+    """Unfold convolution module for Llama4 vision models.
+
+    Implements patch extraction with optional convolution,
+    converting images into sequences of patch embeddings.
+    """
+
     def __init__(
         self,
         config: Llama4VisionConfig,

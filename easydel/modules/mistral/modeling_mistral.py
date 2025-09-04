@@ -50,6 +50,12 @@ logger = get_logger(__name__)
 
 
 class MistralMLP(nn.Module):
+    """Multi-Layer Perceptron module for Mistral models.
+
+    Implements the feedforward network with SiLU activation function
+    for efficient and effective representation learning.
+    """
+
     def __init__(
         self,
         config: MistralConfig,
@@ -232,6 +238,12 @@ class MistralAttention(AttentionModule):
 
 
 class MistralDecoderLayer(nn.Module):
+    """Single decoder layer for Mistral models.
+
+    Combines sliding window attention with feedforward networks,
+    using RMS normalization and residual connections.
+    """
+
     def __init__(
         self,
         config: MistralConfig,

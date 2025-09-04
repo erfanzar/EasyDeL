@@ -57,6 +57,8 @@ class Cohere2LayerNorm(nn.Module):
       rngs (Optional[nn.Rngs]): Random number generators.
     """
 
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         dim: int | tuple,

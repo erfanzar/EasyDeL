@@ -226,6 +226,14 @@ class DbrxAttention(AttentionModule):
 
 
 class DbrxNormAttentionNorm(nn.Module):
+    """Normalization-Attention-Normalization module for DBRX models.
+
+    Implements a unique architecture pattern with normalization layers
+    surrounding the attention mechanism for improved gradient flow.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -332,6 +340,12 @@ class DbrxNormAttentionNorm(nn.Module):
 
 
 class DbrxExpertGLU(nn.Module):
+    """Gated Linear Unit expert module for DBRX mixture of experts.
+
+    Implements a single expert network with gated activation for
+    specialized processing in the MoE architecture.
+    """
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -388,6 +402,12 @@ class DbrxExpertGLU(nn.Module):
 
 
 class DbrxExperts(nn.Module):
+    """Collection of expert networks for DBRX mixture of experts.
+
+    Manages multiple expert networks that can be selected and combined
+    based on routing decisions for conditional computation.
+    """
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -428,6 +448,12 @@ class DbrxExperts(nn.Module):
 
 
 class DbrxRouter(nn.Module):
+    """Router module for DBRX mixture of experts.
+
+    Determines which experts to activate for each input token,
+    implementing sparse routing for efficient computation.
+    """
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -505,6 +531,12 @@ class DbrxRouter(nn.Module):
 
 
 class DbrxFFN(nn.Module):
+    """Feedforward network with mixture of experts for DBRX models.
+
+    Combines router and expert networks to implement sparse MoE
+    feedforward layers with conditional computation.
+    """
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -553,6 +585,12 @@ class DbrxFFN(nn.Module):
 
 
 class DbrxBlock(nn.Module):
+    """Single transformer block for DBRX models.
+
+    Integrates attention mechanisms with mixture of experts feedforward
+    networks, using residual connections and normalization.
+    """
+
     def __init__(
         self,
         config: DbrxConfig,
