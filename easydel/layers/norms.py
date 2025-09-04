@@ -76,6 +76,8 @@ class RMSNorm(nn.Module):
         __call__: Apply RMS normalization to input.
     """
 
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         dim: int,
@@ -101,11 +103,7 @@ class RMSNorm(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.kernel = nn.Param(
-            nn.initializers.ones(
-                rngs.params(),
-                (self.dim,),
-                self.param_dtype,
-            ),
+            RMSNorm.kernel_init(rngs.params(), (self.dim,), self.param_dtype),
         )
 
     def _norm(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:

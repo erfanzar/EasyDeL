@@ -50,6 +50,14 @@ logger = get_logger(__name__)
 
 
 class Gemma2RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization for Gemma2 models.
+
+    This normalization technique normalizes the inputs by the root mean square,
+    providing stability during training while being computationally efficient.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(self, config: Gemma2Config, dtype: jnp.dtype = jnp.float32):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
@@ -260,6 +268,12 @@ class Gemma2Attention(AttentionModule):
 
 
 class Gemma2MLP(nn.Module):
+    """Multi-Layer Perceptron module for Gemma2 models.
+
+    Implements the feedforward network component of the transformer architecture
+    with gated linear units and optional activation functions.
+    """
+
     def __init__(
         self,
         config: Gemma2Config,
@@ -324,6 +338,12 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2DecoderLayer(nn.Module):
+    """Single decoder layer for Gemma2 models.
+
+    Combines multi-head attention and feedforward networks with residual connections
+    and layer normalization to form a complete transformer decoder layer.
+    """
+
     def __init__(
         self,
         config: Gemma2Config,

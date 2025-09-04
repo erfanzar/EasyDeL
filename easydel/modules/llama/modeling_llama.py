@@ -48,6 +48,12 @@ from .llama_configuration import LlamaConfig
 
 
 class LlamaMLP(nn.Module):
+    """Multi-Layer Perceptron module for Llama models.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in Llama architecture.
+    """
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -230,6 +236,12 @@ class LlamaAttention(AttentionModule):
 
 
 class LlamaDecoderLayer(nn.Module):
+    """Single decoder layer for Llama models.
+
+    Combines multi-head attention and feedforward networks with
+    RMS normalization and residual connections.
+    """
+
     def __init__(
         self,
         config: LlamaConfig,

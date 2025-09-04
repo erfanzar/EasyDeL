@@ -482,6 +482,8 @@ class GiddRMSNorm(nn.Module):
         kernel (nn.Param): Learnable scale parameter.
     """
 
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         config: GiddConfig,
