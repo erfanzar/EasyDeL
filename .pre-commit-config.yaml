@@ -94,7 +94,7 @@ repos:
 
       - id: check-easydel-imports
         name: Check EasyDeL imports
-        entry: python -c "import easydel as ed;import jax;print(jax.devices())" # Placeholder - can add actual import checks
+        entry: .venv/bin/python -c "import easydel as ed;import jax;print(jax.devices())" # Placeholder - can add actual import checks
         language: python
         types: [python]
         pass_filenames: false

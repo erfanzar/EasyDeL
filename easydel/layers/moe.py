@@ -842,6 +842,10 @@ class ParallelMoELinear(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.partition_manager = partition_manager
+
+        self.kernel_init = kernel_init
+        self.bias_init = bias_init
+
         if direction is not None:
             assert direction in ["row", "column"]
             self._direction = direction

@@ -119,6 +119,14 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
 
 
 class Gemma3RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization for Gemma3 models.
+
+    Implements RMS normalization with Float8 support for efficient computation
+    and memory usage in Gemma3 architecture.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -317,6 +325,12 @@ class Gemma3Attention(AttentionModule):
 
 
 class Gemma3MLP(nn.Module):
+    """Multi-Layer Perceptron module for Gemma3 models.
+
+    Implements the feedforward network with gated activation functions
+    and optional Float8 scaling for improved performance.
+    """
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -369,6 +383,12 @@ class Gemma3MLP(nn.Module):
 
 
 class Gemma3DecoderLayer(nn.Module):
+    """Single decoder layer for Gemma3 models.
+
+    Combines self-attention, optional cross-attention, and feedforward networks
+    with residual connections and layer normalization.
+    """
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -967,6 +987,12 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 
 
 class Gemma3MultiModalProjector(nn.Module):
+    """Multi-modal projector for Gemma3 vision-language models.
+
+    Projects vision features into the text embedding space, enabling
+    cross-modal understanding and generation in Gemma3.
+    """
+
     def __init__(
         self,
         config: Gemma3Config,

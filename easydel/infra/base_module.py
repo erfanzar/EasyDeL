@@ -957,6 +957,117 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         raise NotImplementedError()
 
     @classmethod
+    def sequential_init(cls: type[Self], **kwargs) -> Self:
+        """Initialize model parameters sequentially with proper sharding.
+
+        This method performs lazy initialization followed by sequential parameter
+        initialization with appropriate sharding for distributed training. It's
+        particularly useful for large models that need memory-efficient initialization.
+
+        The method:
+        1. Creates a lazy (shape-only) version of the model
+        2. Iterates through all modules and initializes their parameters
+        3. Applies proper sharding based on partition rules
+
+        Args:
+            **kwargs: Arguments passed to lazy_init, including:
+                - config: Model configuration
+                - dtype: Computation dtype
+                - param_dtype: Parameter dtype
+                - precision: JAX precision setting
+                - rngs: Random number generators (required)
+
+        Returns:
+            Self: Fully initialized model with properly sharded parameters.
+
+        Example:
+            >>> config = LlamaConfig(hidden_size=1024, num_hidden_layers=4)
+            >>> model = LlamaModel.sequential_init(
+            ...     config=config,
+            ...     dtype=jnp.float32,
+            ...     param_dtype=jnp.float32,
+            ...     rngs=nn.Rngs(0)
+            ... )
+        """
+        from easydel.utils.traversals import iter_module_search
+
+        def _shard(x):
+            return x
+
+        rng = kwargs.get("rngs", flax.nnx.Rngs(44))
+        lazy_model = cls.lazy_init(**kwargs)
+        partition_rules = lazy_model.config.get_partition_rules()
+        for path, module in iter_module_search(lazy_model, flax.nnx.Module):
+            if path:
+                joined_path = "/".join([str(p) for p in path])
+                a = jnp.ones((1,))
+                partition_spec = jax.tree_util.tree_map(
+                    lambda x: NamedSharding(lazy_model.mesh, x),
+                    match_partition_rules(
+                        partition_rules,
+                        {
+                            joined_path + "/kernel": a,
+                            joined_path + "/bias": a,
+                            joined_path + "/embedding": a,
+                            joined_path + "/scale": a,
+                        },
+                        strict=False,
+                    ),
+                )
+
+                shardings = {
+                    "kernel": partition_spec[joined_path + "/kernel"],
+                    "bias": partition_spec[joined_path + "/bias"],
+                    "embedding": partition_spec[joined_path + "/embedding"],
+                    "scale": partition_spec[joined_path + "/scale"],
+                }
+            if hasattr(module, "kernel") and hasattr(module, "kernel_init"):
+                arr = module.kernel_init(
+                    key=rng.param(),
+                    shape=module.kernel.value.shape,
+                    dtype=module.kernel.value.dtype,
+                )
+                arr = jax.jit(_shard, out_shardings=shardings["kernel"])(arr)
+                if isinstance(module.kernel, flax.nnx.Param):
+                    module.kernel.value = arr
+                else:
+                    module.kernel = arr
+            if hasattr(module, "bias") and hasattr(module, "bias_init") and module.bias is not None:
+                arr = module.bias_init(
+                    key=rng.param(),
+                    shape=module.bias.value.shape,
+                    dtype=module.bias.value.dtype,
+                )
+                arr = jax.jit(_shard, out_shardings=shardings["bias"])(arr)
+                module.bias.value = arr
+
+            if hasattr(module, "embedding") and hasattr(module, "embedding_init"):
+                arr = module.embedding_init(
+                    key=rng.param(),
+                    shape=module.embedding.value.shape,
+                    dtype=module.embedding.value.dtype,
+                )
+                arr = jax.jit(_shard, out_shardings=shardings["embedding"])(arr)
+                module.embedding.value = arr
+
+            if hasattr(module, "scale") and hasattr(module, "scale_init"):
+                arr = module.scale_init(
+                    key=rng.param(),
+                    shape=module.scale.value.shape,
+                    dtype=module.scale.value.dtype,
+                )
+                arr = jax.jit(_shard, out_shardings=shardings["scale"])(arr)
+                module.scale.value = arr
+
+            if hasattr(module, "rngs"):
+                module.rngs = rng.fork()
+        for path, module in iter_module_search(lazy_model, nn.Param):
+            if path and type(module.value) is jax.ShapeDtypeStruct:
+                logger.warning("found empty array at " + ("/".join([str(s) for s in path])))
+
+        return lazy_model
+
+    @classmethod
     def lazy_init(cls: type[Self], **kwargs) -> Self:
         """
         Performs a "lazy" initialization using `nnx.eval_shape`.
