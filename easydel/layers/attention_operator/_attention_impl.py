@@ -101,7 +101,7 @@ class AttentionMetadata:
     runtime_dtype: jax.typing.DTypeLike
     runtime_softmax_dtype: jax.typing.DTypeLike | None = None
     sequence_axis_name: str = NOT_GIVEN
-    mesh: jax.sharding.Mesh | None = NOT_GIVEN
+    _stored_mesh: jax.sharding.Mesh | None = NOT_GIVEN
     platform: EasyDeLPlatforms = NOT_GIVEN
     backend: EasyDeLBackends = NOT_GIVEN
     partition_axis: PartitionAxis = NOT_GIVEN
@@ -141,14 +141,14 @@ class AttentionMetadata:
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
         self.set_attrs_carefully("platform", NOT_GIVEN, "platform")
-        self.set_attrs_carefully("mesh", NOT_GIVEN, "mesh")
+        self.set_attrs_carefully("_stored_mesh", NOT_GIVEN, "mesh")
         # fmt:on
-        if self.mesh is NOT_GIVEN and self.base_config is None:
+        if self._stored_mesh is NOT_GIVEN and self.base_config is None:
             mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-            assert (
-                not mesh.empty
-            ), "You should pass 'mesh' to `AttentionMetadata` or at least create that under mesh context manager"
-            self.mesh = mesh
+            assert not mesh.empty, (
+                "You should pass 'mesh' to `AttentionMetadata` or at least create that under mesh context manager"
+            )
+            self._stored_mesh = mesh
         self._safety_check()
         if self.backend is None:
             current_backend = jax.default_backend()
@@ -189,7 +189,6 @@ class AttentionMetadata:
             runtime_dtype=config.attn_dtype,
             runtime_softmax_dtype=config.attn_softmax_dtype,
             sequence_axis_name=config.sequence_axis_name,
-            mesh=config.mesh,
             platform=config.platform,
             backend=config.backend,
             partition_axis=config.partition_axis,
@@ -202,6 +201,19 @@ class AttentionMetadata:
             blocksize_k=config.blocksize_k,
             blocksize_b=config.blocksize_b,
         )
+
+    @property
+    def mesh(self) -> jax.sharding.Mesh | None:
+        """Get current mesh from base_config if available, otherwise return stored mesh."""
+        if self.base_config is not None:
+            return self.base_config.mesh
+        return self._stored_mesh
+
+    @mesh.setter
+    def mesh(self, value: jax.sharding.Mesh | None):
+        """Set mesh value for cases where base_config is not available."""
+        self._stored_mesh = value
+
 
     def get_shardings(
         self,
