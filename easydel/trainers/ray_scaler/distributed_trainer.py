@@ -15,10 +15,8 @@
 from __future__ import annotations
 
 import copy
-import glob
 import json
 import os
-import pathlib
 import typing as tp
 from functools import cached_property
 
@@ -50,78 +48,116 @@ logger = get_logger("RayTrainer")
 
 
 class RayDistributedConfig(BaseModel):
+    """
+    Configuration for RayDistributedTrainer that can be persisted to JSON.
+
+    This class handles serialization and deserialization of distributed training
+    configurations, with special handling for JAX dtypes and PartitionAxis objects.
+
+    Attributes:
+        pretrained_model_name_or_path: Path or identifier for the pretrained model
+        model_task: The task type for the model (e.g., CAUSAL_LM, SEQ2SEQ)
+        model_type: The model architecture type (e.g., 'llama', 'gpt2')
+        offload_backend: Backend device for offloading (e.g., 'cpu', 'gpu')
+        config_scaling_variables: Variables to scale by scaling_index (e.g., hidden_size)
+        config_variables: Fixed configuration variables (e.g., dtype, precision)
+
+    Notes:
+        - JAX dtype fields are converted to/from strings for JSON serialization
+        - PartitionAxis objects are converted to/from dictionary representation
+        - Use _saving_preprocess() before saving and _loading_postprocess() after loading
+    """
+
     pretrained_model_name_or_path: str
     model_task: TaskType | None = None
     model_type: str | None = None
-    offload_device: str | None = None
+    offload_backend: str | None = None
     config_scaling_variables: dict[str, int] | None = None
     config_variables: dict[str, tp.Any] | None = None
 
-    def _saveing_preprocess(self):
-        for k, v in list(self.config_variables.items()):
-            if v in STRING_TO_DTYPE_MAP.values():
-                self.config_variables[k] = DTYPE_TO_STRING_MAP[v]
+    def _saving_preprocess(self):
+        """Convert dtypes and PartitionAxis to JSON-serializable formats before saving."""
+        if self.config_variables:
+            for k, v in list(self.config_variables.items()):
+                if v in STRING_TO_DTYPE_MAP.values():
+                    self.config_variables[k] = DTYPE_TO_STRING_MAP[v]
+            if "partition_axis" in self.config_variables and isinstance(
+                self.config_variables["partition_axis"], PartitionAxis
+            ):
+                self.config_variables["partition_axis"] = self.config_variables["partition_axis"].__dict__
 
-        for k, v in list(self.config_scaling_variables.items()):
-            if v in STRING_TO_DTYPE_MAP.values():
-                self.config_scaling_variables[k] = DTYPE_TO_STRING_MAP[v]
+        if self.config_scaling_variables:
+            for k, v in list(self.config_scaling_variables.items()):
+                if v in STRING_TO_DTYPE_MAP.values():
+                    self.config_scaling_variables[k] = DTYPE_TO_STRING_MAP[v]
 
     def _loading_postprocess(self):
-        for k, v in list(self.config_variables.items()):
-            if v in DTYPE_TO_STRING_MAP.values():
-                self.config_variables[k] = STRING_TO_DTYPE_MAP[v]
+        """Convert string representations back to dtypes and PartitionAxis after loading."""
+        if self.config_variables:
+            for k, v in list(self.config_variables.items()):
+                if v in DTYPE_TO_STRING_MAP.values():
+                    self.config_variables[k] = STRING_TO_DTYPE_MAP[v]
+            if "partition_axis" in self.config_variables:
+                pa = self.config_variables["partition_axis"]
+                if not isinstance(pa, PartitionAxis):
+                    self.config_variables["partition_axis"] = PartitionAxis(**pa)
 
-        for k, v in list(self.config_scaling_variables.items()):
-            if v in DTYPE_TO_STRING_MAP.values():
-                self.config_scaling_variables[k] = STRING_TO_DTYPE_MAP[v]
-        if "partition_axis" in self.config_variables.keys():
-            paxis = self.config_variables["partition_axis"]
-            if not isinstance(paxis, PartitionAxis):
-                self.config_variables["partition_axis"] = PartitionAxis(**paxis)
+        if self.config_scaling_variables:
+            for k, v in list(self.config_scaling_variables.items()):
+                if v in DTYPE_TO_STRING_MAP.values():
+                    self.config_scaling_variables[k] = STRING_TO_DTYPE_MAP[v]
 
 
 class RayDistributedTrainer:
     """
-    A Ray-based distributed trainer for EasyDeL models.
+    Distributed trainer for Ray-based training with EasyDeL models.
 
-    This class facilitates distributed training of language models using Ray,
-    allowing for scaling experiments and efficient utilization of resources.
-    It handles model configuration, creation, state management, and the
-    training process.
+    This class provides a lightweight wrapper for distributed training that:
+    - Manages model configuration and scaling for different nodes
+    - Handles model/state initialization and checkpoint loading
+    - Delegates actual training to the underlying Trainer implementation
+
+    The trainer supports:
+    - Dynamic model scaling based on scaling_index
+    - Automatic tokenizer/processor setup with padding configuration
+    - Flexible checkpoint loading from various sources
+    - Integration with Ray for distributed training orchestration
+
+    Key Design Principles:
+    - Resume logic is handled by BaseTrainer (set arguments.resume_if_possible=True)
+    - State sharding is deferred to the main Trainer according to partition rules
+    - Explicit checkpoint paths are used without automatic run-* resolution
 
     Attributes:
-            model_task (TaskType): The task type of the model (e.g., Causal Language Modeling).
-            model_type (str): The type of the model (e.g., "llama", "mistral").
-            model_class (tp.Type[EasyDeLBaseModule]): The EasyDeL module class for the model.
-            state_class (tp.Type[EasyDeLState]): The EasyDeL state class for managing model state.
-            trainer_module (tp.Type[BaseTrainer | Trainer]): The trainer class to be used.
-            config_scaling_variables (tp.Dict[str, int]): Configuration parameters that scale
-                    with the `scaling_index`.
-            config_variables (tp.Dict[str, tp.Any]): Fixed configuration parameters.
-            pretrained_model_name_or_path (str): Path or identifier for the pretrained model
-                    or tokenizer.
-            _processor_loader_class (tp.Type[PreTrainedTokenizer]): The class used to load the tokenizer.
+        model_task: The task type for the model (e.g., CAUSAL_LM)
+        model_type: The model architecture type (e.g., 'llama')
+        model_class: The EasyDeL model class to instantiate
+        state_class: The state class for model checkpointing
+        offload_backend: Backend for memory offloading
+        trainer_module: The trainer class to use for actual training
+        CONFIG_SCALING_VARIABLES: Variables that scale with scaling_index
+        CONFIG_VARIABLES: Fixed configuration variables
     """
 
+    # Model identity
     model_task: TaskType
     model_type: str
-
     model_class: type[EasyDeLBaseModule]
     state_class: type[EasyDeLState]
 
-    offload_device: str
+    offload_backend: str
 
     trainer_module: type[BaseTrainer | Trainer]
 
-    CONFIG_SCALING_VARIABLES: tp.ClassVar = {
+    CONFIG_SCALING_VARIABLES: tp.ClassVar[dict[str, int]] = {
         "hidden_size": 256,
         "intermediate_size": 256 * 4,
+        "moe_intermediate_size": 256 * 2,
         "num_attention_heads": 2,
         "num_key_value_heads": 1,
     }
-    """Default scaling variables for model configuration."""
 
-    CONFIG_VARIABLES: tp.ClassVar = {
+    CONFIG_VARIABLES: tp.ClassVar[dict[str, tp.Any]] = {
         "dtype": jnp.bfloat16,
         "param_dtype": jnp.bfloat16,
         "precision": lax.Precision.DEFAULT,
@@ -133,47 +169,43 @@ class RayDistributedTrainer:
         "attn_mechanism": AttentionMechanisms.AUTO,
         "attn_dtype": jnp.bfloat16,
         "attn_softmax_dtype": jnp.bfloat16,
+        "sharding_axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
         "sharding_axis_dims": (1, -1, 1, 1, 1),
+        "sharding_dcn_axis_dims": (1, -1, 1, 1, 1),
     }
-    """Default fixed variables for model configuration."""
 
     _processor_loader_class: type[PreTrainedTokenizer] = AutoTokenizer
-    """The class used to load the tokenizer, defaults to AutoTokenizer."""
 
     def __init__(
         self,
         pretrained_model_name_or_path: str,
+        bucket_path: str | None = None,
         model_task: TaskType | None = None,
         model_type: str | None = None,
         model_class: type[EasyDeLBaseModule] | None = None,
         state_class: type[EasyDeLState] | None = None,
-        offload_device: str | None = None,
+        offload_backend: str | None = None,
         trainer_module: type[BaseTrainer | Trainer] | None = None,
         config_scaling_variables: dict[str, int] | None = None,
         config_variables: dict[str, tp.Any] | None = None,
     ):
         """
-        Initializes the RayDistributedTrainer.
+        Initialize the RayDistributedTrainer.
 
         Args:
-                pretrained_model_name_or_path: Path or identifier for the pretrained
-                        model or tokenizer. This is required.
-                model_task: The task type of the model. If None, it's inferred from
-                        `model_class` or requires `model_type` to be set.
-                model_type: The type of the model. If None, it's inferred from
-                        `model_class` or requires `model_task` to be set.
-                model_class: The EasyDeL module class. If None, it's determined using
-                        `model_type` and `model_task`.
-                state_class: The EasyDeL state class. Defaults to `EasyDeLState`.
-                trainer_module: The trainer class. Defaults to `Trainer`.
-                config_scaling_variables: Custom scaling variables to override defaults.
-                config_variables: Custom fixed variables to override defaults.
+            pretrained_model_name_or_path: Path or identifier for the pretrained model
+            bucket_path: Optional path to load checkpoints from cloud storage
+            model_task: Task type (inferred from model_class if not provided)
+            model_type: Model architecture type (inferred from model_class if not provided)
+            model_class: EasyDeL model class to use (auto-resolved if not provided)
+            state_class: State class for checkpointing (defaults to EasyDeLState)
+            offload_backend: Backend for memory offloading (defaults to 'cpu')
+            trainer_module: Trainer class to use (defaults to Trainer)
+            config_scaling_variables: Variables to scale with scaling_index
+            config_variables: Fixed configuration variables
 
         Raises:
-                AssertionError: If `model_class` is None and `model_type` or `model_task`
-                        is also None.
-                AssertionError: If `model_task` and `model_type` are provided but
-                        `model_class` is also provided (ambiguous).
+            AssertionError: If model class cannot be resolved or parameters are inconsistent
         """
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
@@ -181,13 +213,12 @@ class RayDistributedTrainer:
             assert (
                 model_task is None and model_type is None
             ), "If one of model_task or model_type is None, both must be None."
-            assert model_class is not None, "model_class must be provided if model_task and model_type are not."
+            assert model_class is not None, "model_class must be provided when model_task/model_type are omitted."
             model_type = model_class._model_type
             model_task = model_class._model_task
         elif model_class is not None:
             logger.warning(
-                "Both model_class and model_type/model_task were provided. "
-                "Using the provided model_class and inferring type/task from it."
+                "Both model_class and model_type/model_task provided. Using model_class and inferring type/task from it."
             )
             model_type = model_class._model_type
             model_task = model_class._model_task
@@ -196,26 +227,23 @@ class RayDistributedTrainer:
             assert (
                 model_type is not None and model_task is not None
             ), "model_type and model_task must be provided if model_class is not specified."
-            _, model_class_retrieved = get_modules_by_type(
-                model_type=model_type,
-                task_type=model_task,
-            )
-            assert model_class_retrieved is not None, f"Could not retrieve model class for {model_type} and {model_task}"
-            self.model_class = model_class_retrieved
+            _, resolved_class = get_modules_by_type(model_type=model_type, task_type=model_task)
+            assert resolved_class is not None, f"Could not resolve model class for {model_type}/{model_task}"
+            self.model_class = resolved_class
         else:
             self.model_class = model_class
 
-        self.config_scaling_variables = RayDistributedTrainer.CONFIG_SCALING_VARIABLES.copy()
-        self.config_variables = RayDistributedTrainer.CONFIG_VARIABLES.copy()
-
+        self.config_scaling_variables = copy.deepcopy(self.CONFIG_SCALING_VARIABLES)
+        self.config_variables = copy.deepcopy(self.CONFIG_VARIABLES)
         if config_scaling_variables is not None:
             self.config_scaling_variables.update(config_scaling_variables)
         if config_variables is not None:
             self.config_variables.update(config_variables)
 
+        self.bucket_path = bucket_path
         self.model_task = model_task
         self.model_type = model_type
-        self.offload_device = offload_device if offload_device is not None else "cpu"
+        self.offload_backend = offload_backend if offload_backend is not None else "cpu"
         self.state_class = state_class if state_class is not None else EasyDeLState
         self.trainer_module = trainer_module if trainer_module is not None else Trainer
 
@@ -227,72 +255,91 @@ class RayDistributedTrainer:
         state_class: type[EasyDeLState] | None = None,
         trainer_module: type[BaseTrainer | Trainer] | None = None,
     ):
-        config = RayDistributedConfig(**json.loads(ePath(path).read_text()))
+        """
+        Create a RayDistributedTrainer from a saved configuration file.
 
-        config._loading_postprocess()
+        Args:
+            path: Path to the JSON configuration file
+            model_class: Optional model class override
+            state_class: Optional state class override
+            trainer_module: Optional trainer module override
 
+        Returns:
+            RayDistributedTrainer: Initialized trainer instance
+        """
+        cfg = RayDistributedConfig(**json.loads(ePath(path).read_text()))
+        cfg._loading_postprocess()
         return cls(
-            pretrained_model_name_or_path=config.pretrained_model_name_or_path,
-            model_task=config.model_task,
-            model_type=config.model_type,
-            config_scaling_variables=config.config_scaling_variables,
-            config_variables=config.config_variables,
-            offload_device=config.offload_device,
+            pretrained_model_name_or_path=cfg.pretrained_model_name_or_path,
+            model_task=cfg.model_task,
+            model_type=cfg.model_type,
+            config_scaling_variables=cfg.config_scaling_variables,
+            config_variables=cfg.config_variables,
+            offload_backend=cfg.offload_backend,
             trainer_module=trainer_module,
             state_class=state_class,
             model_class=model_class,
         )
 
     def save_config(self, path: str | os.PathLike):
-        config = RayDistributedConfig(
+        """
+        Save the current configuration to a JSON file.
+
+        Args:
+            path: Path where the configuration will be saved
+        """
+        cfg = RayDistributedConfig(
             pretrained_model_name_or_path=self.pretrained_model_name_or_path,
             model_task=self.model_task,
             model_type=self.model_type,
-            offload_device=self.offload_device,
+            offload_backend=self.offload_backend,
             config_scaling_variables=self.config_scaling_variables,
             config_variables=self.config_variables,
         )
-        config._saveing_preprocess()
-        ePath(path).write_text(config.model_dump_json(indent=2))
+        cfg._saving_preprocess()
+        ePath(path).write_text(cfg.model_dump_json(indent=2))
 
     def load_processor(self) -> PreTrainedTokenizer:
         """
-        Loads and returns the tokenizer/processor.
+        Load the tokenizer/processor for the model.
 
         Returns:
-                The loaded PreTrainedTokenizer.
+            PreTrainedTokenizer: Loaded tokenizer with padding configuration
+
+        Notes:
+            - Automatically sets pad_token to eos_token if not defined
+            - Logs a warning when falling back to eos_token for padding
         """
-        base = self._processor_loader_class
-        processor = base.from_pretrained(self.pretrained_model_name_or_path)
-        has_eos = hasattr(processor, "eos_token_id")
-        pad_tkn = getattr(processor, "pad_token_id", None)
-        if pad_tkn is None and has_eos:
-            logger.warning(
-                "Your tokenizer doesn't have a specific token for padding (pad_token). "
-                "We'll use the end-of-sequence token (eos_token) for padding instead."
-            )
-            processor.pad_token_id = processor.eos_token_id
-        return processor
+        tok_cls = self._processor_loader_class
+        tokenizer = tok_cls.from_pretrained(self.pretrained_model_name_or_path)
+
+        has_eos = hasattr(tokenizer, "eos_token_id")
+        if getattr(tokenizer, "pad_token_id", None) is None and has_eos:
+            logger.warning("Tokenizer has no pad_token. Falling back to eos_token for padding.")
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        return tokenizer
 
     @cached_property
     def processor(self) -> PreTrainedTokenizer:
-        """
-        Provides cached access to the tokenizer/processor.
-
-        Returns:
-                The loaded PreTrainedTokenizer.
-        """
+        """Cached property for the tokenizer/processor."""
         return self.load_processor()
 
     @staticmethod
     def extract_column_names(dataset: Dataset) -> list[str] | None:
-        if hasattr(dataset, "column_names") and len(dataset.column_names) != 0:
-            return dataset.column_names
-        keys = None
-        for _sample in dataset:
-            keys = _sample.keys()
-            break
-        return keys
+        """
+        Extract column names from a dataset.
+
+        Args:
+            dataset: The dataset to extract column names from
+
+        Returns:
+            list[str] | None: Column names if available, None otherwise
+        """
+        if hasattr(dataset, "column_names") and dataset.column_names:
+            return list(dataset.column_names)
+        for sample in dataset:
+            return list(sample.keys())
+        return None
 
     def process_sample_data(
         self,
@@ -301,16 +348,15 @@ class RayDistributedTrainer:
         padding_side: str = "left",
     ) -> dict[str, jax.Array]:
         """
-        Processes a single sample of data using the tokenizer.
+        Process a text sample into model inputs.
 
         Args:
-                sample: The input sample (e.g., text).
-                max_length: The maximum sequence length for padding/truncation.
-                padding_side: The side to pad on ('left' or 'right').
-                        Defaults to "left".
+            sample: Raw text sample to process
+            max_length: Maximum sequence length
+            padding_side: Side to pad sequences ('left' or 'right')
 
         Returns:
-                A dictionary of tokenized data (e.g., 'input_ids', 'attention_mask').
+            dict[str, jax.Array]: Tokenized and padded inputs with flattened shapes
         """
         out = self.processor(
             sample,
@@ -321,8 +367,7 @@ class RayDistributedTrainer:
             return_attention_mask=True,
             truncation=True,
         )
-        out = {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
-        return out
+        return {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
 
     def process_messages_data(
         self,
@@ -331,17 +376,15 @@ class RayDistributedTrainer:
         padding_side: str = "left",
     ) -> dict[str, jax.Array]:
         """
-        Processes conversational data (messages) using the tokenizer's chat template.
+        Process chat messages using the tokenizer's chat template.
 
         Args:
-                messages: A list of messages in a conversational format compatible
-                        with the tokenizer's chat template.
-                max_length: The maximum sequence length for padding/truncation.
-                padding_side: The side to pad on ('left' or 'right').
-                        Defaults to "left".
+            messages: Chat messages to process
+            max_length: Maximum sequence length
+            padding_side: Side to pad sequences ('left' or 'right')
 
         Returns:
-                A dictionary of tokenized data.
+            dict[str, jax.Array]: Tokenized and padded inputs with flattened shapes
         """
         out = self.processor.apply_chat_template(
             messages,
@@ -352,35 +395,48 @@ class RayDistributedTrainer:
             return_dict=True,
             truncation=True,
         )
-
-        out = {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
-        return out
+        return {k: (v.reshape(-1) if hasattr(v, "shape") else v) for k, v in out.items()}
 
     def create_config(self, scaling_index: int) -> EasyDeLBaseConfig:
         """
-        Creates a model configuration based on a scaling index.
-
-        The `scaling_index` multiplies a base set of parameters (defined in
-        `self.config_scaling_variables`) to allow for easy scaling experiments.
+        Create a model configuration with scaled dimensions.
 
         Args:
-                scaling_index: An integer factor to scale certain configuration
-                        parameters (e.g., hidden_size, num_attention_heads).
+            scaling_index: Multiplier for scaling variables (e.g., hidden_size)
 
         Returns:
-                An EasyDeLBaseConfig instance.
+            EasyDeLBaseConfig: Configuration with scaled and fixed variables
+
+        Notes:
+            - Scaling variables are multiplied by scaling_index
+            - Fixed variables remain unchanged
+            - Useful for creating different model sizes in distributed training
         """
-        current_scaling_variables = {
-            k: v * scaling_index for k, v in copy.deepcopy(self.config_scaling_variables).items()
-        }
-        config_kwargs = {**self.config_variables, **current_scaling_variables}
+        scaled = {k: v * scaling_index for k, v in copy.deepcopy(self.config_scaling_variables).items()}
+        config_kwargs = {**self.config_variables, **scaled}
         config_class = self.model_class.config_class
         if config_class is None:
-            config_class, _ = get_modules_by_type(
-                model_type=self.model_type,
-                task_type=self.model_task,
-            )
+            config_class, _ = get_modules_by_type(model_type=self.model_type, task_type=self.model_task)
         return config_class(**config_kwargs)
+
+    def _get_offload_device(self):
+        """
+        Get the device for memory offloading.
+
+        Returns:
+            Device: Preferred local device or first available global device
+
+        Notes:
+            - Attempts to use local devices first for better performance
+            - Falls back to global devices if local unavailable
+        """
+        try:
+            devs = jax.local_devices(backend=self.offload_backend)
+            if len(devs) > 0:
+                return devs[0]
+        except Exception:
+            pass
+        return jax.devices(self.offload_backend)[0]
 
     def create_model(
         self,
@@ -392,18 +448,18 @@ class RayDistributedTrainer:
         lazy: bool = False,
     ) -> EasyDeLBaseModule:
         """
-        Creates an instance of the model.
+        Create a model instance from configuration.
 
         Args:
-                config: The model configuration object.
-                dtype: The data type for computations (default: bfloat16).
-                param_dtype: The data type for model parameters (default: bfloat16).
-                precision: The JAX precision level (e.g., lax.Precision.DEFAULT).
-                seed: Random seed for model initialization.
-                lazy: If True, uses lazy initialization for the model. Defaults to False.
+            config: Model configuration
+            dtype: Computation dtype
+            param_dtype: Parameter dtype
+            precision: JAX precision setting
+            seed: Random seed for initialization
+            lazy: Whether to use lazy initialization (memory efficient)
 
         Returns:
-                An instance of EasyDeLBaseModule.
+            EasyDeLBaseModule: Initialized model instance
         """
         if precision is None:
             precision = lax.Precision.DEFAULT
@@ -416,72 +472,36 @@ class RayDistributedTrainer:
             rngs=nn.Rngs(seed),
         )
 
-        with jax.default_device(jax.local_devices(backend=self.offload_device)[-1]):
-            if lazy:
-                return self.model_class.lazy_init(**init_kwargs)
-            else:
-                return self.model_class(**init_kwargs)
+        if lazy:
+            return self.model_class.lazy_init(**init_kwargs)
+        return self.model_class.sequential_init(**init_kwargs)
 
     def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
         """
-        Converts an initialized model module to an EasyDeLState object.
+        Convert a model module to a state object.
 
         Args:
-                model: The initialized EasyDeLBaseModule instance.
+            model: The model to convert
 
         Returns:
-                An EasyDeLState instance containing the model's parameters and state.
-        """
-        state = model.to_state(self.state_class)
-        state = state.shard_state()
-        return state
+            EasyDeLState: State object for checkpointing
 
-    def load_state(
-        self,
-        load_directory: str | os.PathLike,
-        scaling_index,
-        **kwargs,
-    ) -> EasyDeLState:
+        Notes:
+            - Does NOT perform sharding (handled by trainer)
+            - Uses the configured state_class for conversion
         """
-        Loads a model state from a specified directory.
+        return model.to_state(self.state_class)
+
+    def create_model_from_config(self, scaling_index: int) -> EasyDeLBaseModule:
+        """
+        Create a model with configuration scaled by the given index.
 
         Args:
-                load_directory: The directory from which to load the state.
-                **kwargs: Additional keyword arguments to pass to the state loading method.
+            scaling_index: Multiplier for scaling variables
 
         Returns:
-                The loaded EasyDeLState instance.
+            EasyDeLBaseModule: Initialized model with scaled configuration
         """
-
-        def _create():
-            model = self.create_model(
-                config=self.create_config(scaling_index=scaling_index),
-                dtype=self.config_variables["dtype"],
-                param_dtype=self.config_variables["param_dtype"],
-                precision=self.config_variables["precision"],
-                seed=self.config_variables["seed"],
-            )
-            return self.state_class.create(step=0, model=model)
-
-        if pathlib.Path(load_directory).exists():
-            checkpoint_files = glob.glob(os.path.join(load_directory, "run-*"))
-            checkpoint_files.sort(key=os.path.getmtime)
-            if len(checkpoint_files) != 0:
-                load_directory = checkpoint_files[-1]
-            else:
-                load_directory = load_directory
-            if pathlib.Path(load_directory).exists():
-                try:
-                    return self.state_class.load_state(load_directory=load_directory, **kwargs)
-                except Exception:
-                    logger.info("failed to load from provided checkpoint path creating new model.")
-                    return _create()
-            else:
-                return _create()
-        else:
-            return _create()
-
-    def create_model_from_config(self, scaling_index: int):
         return self.create_model(
             config=self.create_config(scaling_index=scaling_index),
             dtype=self.config_variables["dtype"],
@@ -499,36 +519,22 @@ class RayDistributedTrainer:
         state: EasyDeLState | None = None,
     ) -> BaseTrainer | Trainer:
         """
-        Creates and configures a trainer instance.
-
-        This method handles the logic for initializing the model state,
-        either by converting a provided model, loading from a checkpoint,
-        or using a directly provided state.
+        Create a trainer instance for model training.
 
         Args:
-                arguments: TrainingArguments for configuring the trainer.
-                dataset_train: The training dataset.
-                dataset_eval: The evaluation dataset (optional).
-                data_collator: Callable to collate data batches (optional).
-                checkpoint_path: Path to a checkpoint to load model state from.
-                        If `model` or `state` is provided, this is ignored.
-                state: An EasyDeLState object. If provided, this is used directly.
+            arguments: Training configuration and hyperparameters
+            dataset_train: Training dataset
+            dataset_eval: Optional evaluation dataset
+            data_collator: Optional data collator for batching
+            state: Model state to train
 
         Returns:
-                An instance of the configured trainer (BaseTrainer or Trainer).
-
-        Raises:
-                AssertionError: If no valid state can be obtained (from model,
-                        checkpoint, or direct input).
-                FileNotFoundError: If `checkpoint_path` is provided but the
-                        checkpoint is not found.
+            BaseTrainer | Trainer: Configured trainer instance
         """
-
         return self.trainer_module(
             arguments=arguments,
             dataset_train=dataset_train,
             dataset_eval=dataset_eval,
-            tokenizer=self.processor,
             data_collator=data_collator,
             model_state=state,
         )
@@ -540,46 +546,75 @@ class RayDistributedTrainer:
         dataset_train: Dataset,
         dataset_eval: Dataset | None = None,
         data_collator: tp.Callable | None = None,
-        checkpoint_path: str | os.PathLike | None = None,
         model: EasyDeLBaseModule | None = None,
         state: EasyDeLState | None = None,
-        load_state_kwargs: dict[str, tp.Any] | None = None,
     ):
         """
-        Initializes a model (if not provided) and starts the training process.
+        Execute distributed training with the configured model.
+
+        This method handles model/state initialization from various sources:
+        1. Provided state (highest priority)
+        2. Provided model (converted to state)
+        3. Checkpoint from bucket_path
+        4. New model creation with scaling_index
 
         Args:
-                scaling_index: Index for scaling model configuration. Used if a new
-                        model needs to be created.
-                arguments: TrainingArguments for the trainer.
-                dataset_train: The training dataset.
-                dataset_eval: Evaluation dataset (optional).
-                data_collator: Data collator function (optional).
-                checkpoint_path: Path to a checkpoint. Used if `model` and `state`
-                        are None.
-                model: An existing EasyDeLBaseModule instance (optional).
-                state: An existing EasyDeLState instance (optional).
-                load_state_kwargs: Arguments for loading state from checkpoint (optional).
+            scaling_index: Multiplier for model scaling (used if creating new model)
+            arguments: Training configuration
+            dataset_train: Training dataset
+            dataset_eval: Optional evaluation dataset
+            data_collator: Optional data collator
+            model: Optional pre-initialized model
+            state: Optional pre-initialized state
 
         Returns:
-                The result of the trainer's train() method.
+            Training results from the underlying trainer
+
+        Notes:
+            - For automatic resume from interruptions, set:
+                - arguments.resume_if_possible = True
+                - arguments.save_directory = "path/to/checkpoints"
+            - State sharding is handled by the trainer based on partition rules
+            - Checkpoint loading respects the priority order above
+
+        Raises:
+            AssertionError: If no valid model state can be obtained
         """
+        if state is None and model is None:
+            if self.bucket_path is not None:
+                import easydel as ed
 
-        if state is None and model is None and checkpoint_path is None:
-            logger.info(
-                f"No model, state, or checkpoint provided. Creating a new model with scaling_index={scaling_index}."
-            )
-            model = self.create_model_from_config(scaling_index=scaling_index)
-            state = self.convert_model_to_state(model)
-        elif checkpoint_path is not None:
-            load_state_kwargs = self.config_variables if load_state_kwargs is None else load_state_kwargs
-            state = self.load_state(checkpoint_path, scaling_index, **load_state_kwargs)
-            state = state.shard_state()
-        elif model is not None:
+                state = self.state_class.load_state(
+                    load_directory=self.bucket_path,
+                    dtype=self.config_variables["dtype"],
+                    param_dtype=self.config_variables["param_dtype"],
+                    precision=self.config_variables["precision"],
+                    auto_shard_model=True,
+                    sharding_axis_names=self.config_variables["sharding_axis_names"],
+                    sharding_axis_dims=self.config_variables["sharding_axis_dims"],
+                    sharding_dcn_axis_dims=self.config_variables["sharding_dcn_axis_dims"],
+                    config_kwargs=ed.EasyDeLBaseConfigDict(
+                        freq_max_position_embeddings=self.config_variables["max_position_embeddings"],
+                        mask_max_position_embeddings=self.config_variables["max_position_embeddings"],
+                        kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+                        attn_mechanism=self.config_variables["attn_mechanism"],
+                        attn_dtype=self.config_variables["attn_dtype"],
+                        attn_softmax_dtype=self.config_variables["attn_softmax_dtype"],
+                        gradient_checkpointing=self.config_variables["gradient_checkpointing"],
+                        use_pallas_group_matmul=self.config_variables.get("use_pallas_group_matmul", False),
+                    ),
+                    partition_axis=self.config_variables["partition_axis"],
+                    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+                )
+            else:
+                logger.info(f"No model/state/checkpoint. Creating a new model (scaling_index={scaling_index}).")
+                model = self.create_model_from_config(scaling_index=scaling_index)
+                state = self.convert_model_to_state(model)
+
+        elif model is not None and state is None:
             state = self.convert_model_to_state(model)
 
-        del model
-        assert state is not None, "Couldn't load or verify state."
+        assert state is not None, "Unable to obtain a valid model state."
 
         return self.create_trainer(
             arguments=arguments,
@@ -592,17 +627,15 @@ class RayDistributedTrainer:
     def __repr__(self):
         cls_name = self.__class__.__name__
         items = []
-
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
                 try:
-                    repr_str = str(v).replace("\n", "\n  ")
-                    if len(repr_str) > 200:
-                        repr_str = f"{v.__class__.__name__}(...)"
-                    items.append(f"  {k} : {repr_str}")
+                    s = str(v).replace("\n", "\n  ")
+                    if len(s) > 200:
+                        s = f"{v.__class__.__name__}(...)"
+                    items.append(f"  {k} : {s}")
                 except TypeError:
                     items.append(f"  {k} : <unrepresentable>")
-
         return f"{cls_name}(\n" + "\n".join(items) + "\n)"
 
     __str__ = __repr__

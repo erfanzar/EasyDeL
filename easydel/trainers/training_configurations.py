@@ -348,7 +348,7 @@ class TrainingArguments:
         metadata={"help": "The step to start training from (for resuming)."},
     )
     resume_if_possible: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Automatically resume from the latest checkpoint if available."},
     )
     shuffle_train_dataset: bool = field(

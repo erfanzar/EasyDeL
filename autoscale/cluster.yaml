@@ -15,9 +15,12 @@
 #    Format: {region}-{zone_letter}
 #    Example: us-central1-a, europe-west4-b, asia-southeast1-c
 #
-# 4. DOCKER_REGISTRY (line ~56): Update "us-east5-docker.pkg.dev" to match your region
+# 4. DOCKER_REGISTRY (line ~59): Update "us-east5-docker.pkg.dev" to match your region
 #    Format: {region}-docker.pkg.dev
 #    Example: us-central1-docker.pkg.dev, europe-west4-docker.pkg.dev
+#
+# 5. Gcloud AUTH SETUP (line 56~59): Replace "IM_UR_PROJECT_ID_HERE" with your GCP project ID
+#    and also make sure to change region to match your region.
 #
 # Optional Customizations:
 # - Docker image (line ~45): Update if using a custom EasyDeL image
@@ -53,6 +56,9 @@ docker:
     - -v "/var/run/docker.sock:/var/run/docker.sock"
 
 initialization_commands:
+  - gcloud config set project IM_UR_PROJECT_ID_HERE
+  - gcloud config set compute/region us-east5
+  - gcloud config set compute/zone us-east5-b
   - yes | gcloud auth configure-docker us-east5-docker.pkg.dev # <- CHANGE "us-east5" to match your region
   - "export TPU_WORKER_ID=$(curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number) || true"
   - which docker || (curl -fsSL https://get.docker.com -o get-docker.sh; sudo sh get-docker.sh; sudo usermod -aG docker $USER; sudo systemctl restart docker -f)
