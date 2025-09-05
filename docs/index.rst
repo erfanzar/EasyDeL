@@ -121,6 +121,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    getting_started
    trainers/base_trainer
    trainers/trainer_protocol
+   trainers/ray_distributed_trainer.md
    install.md
    contributing
    api_docs/apis
