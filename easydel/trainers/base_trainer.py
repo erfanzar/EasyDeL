@@ -29,6 +29,7 @@ import grain.python as grain
 import jax
 import jax.extend
 import numpy as np
+import orbax.checkpoint as ocp
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -1064,6 +1065,18 @@ class BaseTrainer(BaseTrainerProtocol):
             scheduler=scheduler,
             config=self.model.config,
         )
+
+    def _maybe_save_state(self, step: int, checkpoint_manager: ocp.CheckpointManager, state: EasyDeLState, *args, **kwargs) -> None:
+        chunk_byte_size = 1024**3  # 1GB
+        checkpoint_args = ocp.args.PyTreeSave(
+            item=state,
+            save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), state),
+            ocdbt_target_data_file_size=chunk_byte_size,
+        )
+        
+        saved = checkpoint_manager.save(step, args=checkpoint_args)
+        if saved:
+            logger.info(f"state saved at step {step}.")
 
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         """
