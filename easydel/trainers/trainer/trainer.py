@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import tempfile
 import typing as tp
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import jax.experimental
 import jax.lib
 from eformer.escale import with_sharding_constraint
+from eformer.paths import ePath
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
@@ -437,6 +440,8 @@ class Trainer(BaseTrainer):
             
         metrics_history = []
 
+        profiling_dir = os.getenv("EASYDEL_PROFILING_DIR", "/tmp/jax-trace")
+
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
         for _ in range(steps_per_epoch):
@@ -445,6 +450,10 @@ class Trainer(BaseTrainer):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
                 if current_step == 5:
+                    if profiling_dir.startswith("gs://"):
+                        tmpdir = tempfile.mkdtemp()
+                    else:
+                        tmpdir = profiling_dir
                     logger.info("Starting JAX profiler...")
                     options = jax.profiler.ProfileOptions()
                     options.advanced_configuration = {
@@ -452,7 +461,7 @@ class Trainer(BaseTrainer):
                         "tpu_num_sparse_cores_to_trace" : 2,
                     }
                     jax.profiler.start_trace(
-                        "/tmp/jax-trace",
+                        tmpdir,
                         create_perfetto_link=False,
                         create_perfetto_trace=True,
                         # profiler_options=options,
@@ -460,6 +469,14 @@ class Trainer(BaseTrainer):
                 if current_step == 25:
                     logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
+                    if profiling_dir.startswith("gs://"):
+                        upload_path = ePath(profiling_dir)
+                        for local_file in Path(tmpdir).rglob("*"):
+                            if local_file.is_file():
+                                relative_path = local_file.relative_to(tmpdir)
+                                upload_path = ePath(os.path.join(profiling_dir, relative_path.as_posix()))
+                                upload_path.blob.upload_from_filename(local_file)
+                        logger.info(f"Uploaded profiling traces to {profiling_dir}")
 
             if current_step >= self.max_training_steps:
                 break
