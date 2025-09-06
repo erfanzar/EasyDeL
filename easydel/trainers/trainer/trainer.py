@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import tempfile
+import time
 import typing as tp
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import jax.experimental
 import jax.lib
+import orbax.checkpoint as ocp
 from eformer.escale import with_sharding_constraint
 from eformer.paths import ePath
 from jax.sharding import NamedSharding, PartitionSpec
@@ -322,7 +324,17 @@ class Trainer(BaseTrainer):
         train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
-            with self.mesh:
+        
+            checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
+            options = ocp.CheckpointManagerOptions(
+                save_interval_steps=self.arguments.save_steps,
+                max_to_keep=self.arguments.save_total_limit,
+                enable_async_checkpointing=False,
+            )
+            with ocp.CheckpointManager(
+                ocp.test_utils.erase_and_create_empty(checkpoint_dir),
+                options=options,
+            ) as checkpoint_manager, self.mesh:
                 for epoch in range(start_epoch, self.arguments.num_train_epochs):
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
@@ -332,6 +344,7 @@ class Trainer(BaseTrainer):
                         step_metrics=step_metrics,
                         pbar=pbar,
                         epoch=epoch,
+                        checkpoint_manager=checkpoint_manager,
                     )
 
                     current_step = int(jax.device_get(state.step))
@@ -395,6 +408,7 @@ class Trainer(BaseTrainer):
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
         epoch: int,
+        checkpoint_manager: ocp.CheckpointManager,
     ):
         """
         Execute training for a single epoch.
@@ -450,33 +464,18 @@ class Trainer(BaseTrainer):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
                 if current_step == 5:
-                    if profiling_dir.startswith("gs://"):
-                        tmpdir = tempfile.mkdtemp()
-                    else:
-                        tmpdir = profiling_dir
                     logger.info("Starting JAX profiler...")
                     options = jax.profiler.ProfileOptions()
                     options.advanced_configuration = {
-                        "tpu_trace_mode" : "TRACE_ONLY_XLA",
+                        "host_tracer_level" : 2,
+                        "tpu_trace_mode" : "TRACE_COMPUTE_AND_SYNC",
                         "tpu_num_sparse_cores_to_trace" : 2,
                     }
-                    jax.profiler.start_trace(
-                        tmpdir,
-                        create_perfetto_link=False,
-                        create_perfetto_trace=True,
-                        # profiler_options=options,
-                    )
+                    jax.profiler.start_trace(profiling_dir)
                 if current_step == 25:
                     logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
-                    if profiling_dir.startswith("gs://"):
-                        upload_path = ePath(profiling_dir)
-                        for local_file in Path(tmpdir).rglob("*"):
-                            if local_file.is_file():
-                                relative_path = local_file.relative_to(tmpdir)
-                                upload_path = ePath(os.path.join(profiling_dir, relative_path.as_posix()))
-                                upload_path.blob.upload_from_filename(local_file)
-                        logger.info(f"Uploaded profiling traces to {profiling_dir}")
+                    logger.info(f"Saved profiling traces to {profiling_dir}")
 
             if current_step >= self.max_training_steps:
                 break
@@ -540,16 +539,26 @@ class Trainer(BaseTrainer):
                     )
                     self.log_weight_distribution(state=state, step=current_step)
                     # Save checkpoint if needed
-                    if self._should_save_checkpoint(current_step):
-                        _ = self._save_state(
-                            state=state,
-                            milestone=True,
-                            save_directory=self.arguments.save_directory,
-                        )
+                    # if self._should_save_checkpoint(current_step):
+                    #     with capture_time() as blocking_time:
+                    #         state = jax.block_until_ready(state)
+                    #         logger.info(f"Blocking time for checkpoint: {blocking_time()}s")
+                    #     # jax.experimental.multihost_utils.sync_global_devices("easydel:before_save_state")
+                    #     # time.sleep(10)
+                    #     _ = self._save_state(
+                    #         checkpoint_manager=checkpoint_manager,
+                    #         state=state,
+                    #         milestone=True,
+                    #         save_directory=self.arguments.save_directory,
+                    #     )
+                    #     # jax.experimental.multihost_utils.sync_global_devices("easydel:after_save_state")
+                    #     # time.sleep(10)
+                    self._maybe_save_state(current_step, checkpoint_manager, state)
                     if self._should_run_evaluation(current_step):
                         for _ in self.eval(model_state=state):
                             ...
                 except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
+                    raise
                     return state, run_exception, train_iter
                 if run_exception is not None:
                     break
