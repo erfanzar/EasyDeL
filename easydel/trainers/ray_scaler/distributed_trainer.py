@@ -210,9 +210,9 @@ class RayDistributedTrainer:
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
         if model_task is None or model_type is None:
-            assert (
-                model_task is None and model_type is None
-            ), "If one of model_task or model_type is None, both must be None."
+            assert model_task is None and model_type is None, (
+                "If one of model_task or model_type is None, both must be None."
+            )
             assert model_class is not None, "model_class must be provided when model_task/model_type are omitted."
             model_type = model_class._model_type
             model_task = model_class._model_task
@@ -224,9 +224,9 @@ class RayDistributedTrainer:
             model_task = model_class._model_task
 
         if model_class is None:
-            assert (
-                model_type is not None and model_task is not None
-            ), "model_type and model_task must be provided if model_class is not specified."
+            assert model_type is not None and model_task is not None, (
+                "model_type and model_task must be provided if model_class is not specified."
+            )
             _, resolved_class = get_modules_by_type(model_type=model_type, task_type=model_task)
             assert resolved_class is not None, f"Could not resolve model class for {model_type}/{model_task}"
             self.model_class = resolved_class
@@ -412,8 +412,9 @@ class RayDistributedTrainer:
             - Fixed variables remain unchanged
             - Useful for creating different model sizes in distributed training
         """
+        not_allowed = ["precision", "dtype", "param_dtype"]
         scaled = {k: v * scaling_index for k, v in copy.deepcopy(self.config_scaling_variables).items()}
-        config_kwargs = {**self.config_variables, **scaled}
+        config_kwargs = {**{k: v for k, v in self.config_variables.items() if k not in not_allowed}, **scaled}
         config_class = self.model_class.config_class
         if config_class is None:
             config_class, _ = get_modules_by_type(model_type=self.model_type, task_type=self.model_task)

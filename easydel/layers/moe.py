@@ -433,8 +433,13 @@ class BaseMoeModule(nn.Module, ABC):
         """
         inv_sort_idx = jnp.argsort(sort_idx)
         out_repeat = jnp.take(out_repeat_sort, inv_sort_idx, axis=0)
-        batch_size, seq_len, hidden_size = original_shape
-        out_repeat_unflat = jnp.reshape(out_repeat, (batch_size * seq_len, self.num_experts_per_tok, hidden_size))
+ 
+        k = self.num_experts_per_tok
+        hidden_size = original_shape[-1] 
+        assert (out_repeat.shape[0] % k) == 0, "out_repeat length must be divisible by k"
+
+        local_tokens = out_repeat.shape[0] // k
+        out_repeat_unflat = out_repeat.reshape((local_tokens, k, hidden_size))
         return out_repeat_unflat
 
     def _compute_load_balancing_loss(
