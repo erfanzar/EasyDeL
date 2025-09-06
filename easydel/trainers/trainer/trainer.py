@@ -255,11 +255,52 @@ class Trainer(BaseTrainer):
             (self.arguments.step_start_point is not None and self.arguments.step_start_point > current_step)
         )
 
+    def _restore_from_checkpoint(
+        self,
+        target_state_template: EasyDeLState, # A state with the desired new sharding
+        checkpoint_manager: ocp.CheckpointManager,
+    ) -> EasyDeLState:
+        """
+        Restores a checkpoint, allowing for a different sharding configuration.
+
+        Args:
+            checkpoint_manager: The Orbax CheckpointManager for the desired directory.
+            target_state_template: An example PyTree of the EasyDeLState that has the
+                correct structure and the *new* desired sharding for each leaf array.
+                The actual data values in this template do not matter.
+
+        Returns:
+            The restored EasyDeLState with the new sharding.
+        """
+        # Find the latest checkpoint step to restore from.
+        latest_step = checkpoint_manager.latest_step()
+        if latest_step is None:
+            logger.info("No checkpoints found to restore from.")
+            return target_state_template
+
+        logger.info(f"Restoring checkpoint from step {latest_step}.")
+
+        # Define the restore arguments. The `item` is our sharding template.
+        restore_args = ocp.args.PyTreeRestore(item=target_state_template)
+
+        # Restore the state. Orbax will read the saved data and apply the sharding
+        # from your target_state_template.
+        restored_state = checkpoint_manager.restore(
+            latest_step, 
+            args=restore_args
+        )
+
+
+        
+        logger.info(f"Successfully restored state from step {latest_step}.")
+        return restored_state
+
     def _run_training_loop(
         self,
         state: EasyDeLState,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
+        checkpoint_manager: ocp.CheckpointManager,
     ):
         """
         Execute the main training loop across all epochs.
@@ -300,6 +341,11 @@ class Trainer(BaseTrainer):
             desc="training process",
         )
 
+        state = self._restore_from_checkpoint(
+            target_state_template=state,
+            checkpoint_manager=checkpoint_manager,
+        )
+
         # Handle resumption based on dataset type
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
@@ -324,16 +370,7 @@ class Trainer(BaseTrainer):
         train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
-        
-            checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
-            options = ocp.CheckpointManagerOptions(
-                save_interval_steps=self.arguments.save_steps,
-                max_to_keep=self.arguments.save_total_limit,
-            )
-            with ocp.CheckpointManager(
-                ocp.test_utils.erase_and_create_empty(checkpoint_dir),
-                options=options,
-            ) as checkpoint_manager, self.mesh:
+            with self.mesh:
                 for epoch in range(start_epoch, self.arguments.num_train_epochs):
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
@@ -485,7 +522,8 @@ class Trainer(BaseTrainer):
                         batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                     if self._should_skip_step(current_step):
                         state = state.replace(step=state.step + 1)
-                        pbar.update(1)
+                        if state.step % self.arguments.log_steps == 0:
+                            pbar.update(self.arguments.log_steps)
                         continue
                     step_metrics.start_step()
                     state = self.on_step_start(state=state, step=current_step)
@@ -808,12 +846,25 @@ class Trainer(BaseTrainer):
         metrics_tracker = MetricsTracker()
         step_metrics = StepMetrics(self.arguments)
         self._setup_initial_metrics(state)
-        output, run_exception = self._run_training_loop(
-            state=self.model_state,
-            metrics_tracker=metrics_tracker,
-            step_metrics=step_metrics,
+
+        checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
+        options = ocp.CheckpointManagerOptions(
+            save_interval_steps=self.arguments.save_steps,
+            max_to_keep=self.arguments.save_total_limit,
+            enable_async_checkpointing=False,
         )
-        return self._finalize_training(output, run_exception)
+        with ocp.CheckpointManager(
+            checkpoint_dir,
+            options=options,
+        ) as checkpoint_manager:
+            state = self._restore_from_checkpoint(state, checkpoint_manager)
+            output, run_exception = self._run_training_loop(
+                state=self.model_state,
+                metrics_tracker=metrics_tracker,
+                step_metrics=step_metrics,
+                checkpoint_manager=checkpoint_manager,
+            )
+            return self._finalize_training(output, run_exception)
 
     def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
         """
