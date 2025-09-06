@@ -451,7 +451,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
             dcn_mesh_dims=sharding_dcn_axis_dims,
-            process_is_granule=process_is_granule,
             should_sort_granules_by_key=should_sort_granules_by_key,
             allow_split_physical_axes=allow_split_physical_axes,
             backend=backend,
