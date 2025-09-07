@@ -852,6 +852,7 @@ class Trainer(BaseTrainer):
             save_interval_steps=self.arguments.save_steps,
             max_to_keep=self.arguments.save_total_limit,
             enable_async_checkpointing=False,
+            create=True,
         )
         with ocp.CheckpointManager(
             checkpoint_dir,

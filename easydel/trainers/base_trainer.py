@@ -1067,16 +1067,20 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     def _maybe_save_state(self, step: int, checkpoint_manager: ocp.CheckpointManager, state: EasyDeLState, *args, **kwargs) -> None:
-        chunk_byte_size = 1024**3  # 1GB
-        checkpoint_args = ocp.args.PyTreeSave(
-            item=state,
-            save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), state),
-            ocdbt_target_data_file_size=chunk_byte_size,
-        )
-        
-        saved = checkpoint_manager.save(step, args=checkpoint_args)
-        if saved:
-            logger.info(f"state saved at step {step}.")
+        try:
+            chunk_byte_size = 1024**3  # 1GB
+            checkpoint_args = ocp.args.PyTreeSave(
+                item=state,
+                save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), state),
+                ocdbt_target_data_file_size=chunk_byte_size,
+            )
+            
+            saved = checkpoint_manager.save(step, args=checkpoint_args)
+            checkpoint_manager.wait_until_finished()
+            if saved:
+                logger.info(f"state saved at step {step}.")
+        except Exception as e:
+            logger.error(f"Failed to save state at step {step}: {e}")
 
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         """
