@@ -590,7 +590,9 @@ class Trainer(BaseTrainer):
                     #     )
                     #     # jax.experimental.multihost_utils.sync_global_devices("easydel:after_save_state")
                     #     # time.sleep(10)
+                    
                     self._maybe_save_state(current_step, checkpoint_manager, state)
+
                     if self._should_run_evaluation(current_step):
                         for _ in self.eval(model_state=state):
                             ...
@@ -853,6 +855,7 @@ class Trainer(BaseTrainer):
             max_to_keep=self.arguments.save_total_limit,
             enable_async_checkpointing=False,
             create=True,
+            multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
         )
         with ocp.CheckpointManager(
             checkpoint_dir,
