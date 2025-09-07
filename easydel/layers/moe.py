@@ -237,6 +237,8 @@ class BaseMoeModule(nn.Module, ABC):
 
         return sharded_route(router_probs)
 
+
+
     def _route_local(
         self, router_probs: Float[Array, "batch_seq num_experts"], strategy: MoeRoutingStrategy
     ) -> tuple[Int[Array, "batch_seq k"], Float[Array, "batch_seq k"]]:
@@ -313,29 +315,36 @@ class BaseMoeModule(nn.Module, ABC):
         Partitioned as: ((dp, fsdp), sp) for batch/seq, tp for hidden dimension
         """
         pmag = self.partition_manager
-        if hidden_states_flat.ndim == 2:
-            x_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
-        else:
-            x_in_specs = pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
 
-        if topk_idx_flat.ndim == 1:
-            idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+        if hidden_states_flat.ndim == 2:
+            x_in_specs = pmag.resolve(axes=[BATCH, TP], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
         else:
-            idx_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+            x_in_specs = pmag.resolve(axes=[BATCH, EMPTY, TP], mode=MODE_TRAIN, shape=hidden_states_flat.shape)
+
+        idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+
+        x_out_specs = pmag.resolve(
+            axes=[BATCH, TP],
+            mode=MODE_TRAIN,
+            shape=(topk_idx_flat.shape[0], hidden_states_flat.shape[-1]),
+        )
+        gs_out_specs = pmag.resolve(axes=[EXPERT], mode=MODE_TRAIN, shape=(self.n_routed_experts,))
+        sortidx_out_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=topk_idx_flat.shape)
+
+        batch_axis_names = tuple(n for n in getattr(self.mesh, "axis_names", ()) if n in ("dp", "fsdp"))
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(x_in_specs, idx_in_specs),
-            out_specs=(
-                pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=hidden_states_flat.shape),
-                pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN),
-                pmag.resolve(axes=[BATCH], mode=MODE_TRAIN),
-            ),
+            out_specs=(x_out_specs, gs_out_specs, sortidx_out_specs),
             check_rep=False,
         )
         def permute_sharded(x_flat_: jax.Array, topk_idx_flat_: jax.Array):
-            return self._permute_local(x_flat_, topk_idx_flat_)
+            x_repeat_sort, group_sizes_local, sort_idx = self._permute_local(x_flat_, topk_idx_flat_)
+            for ax in batch_axis_names:
+                group_sizes_local = jax.lax.psum(group_sizes_local, axis_name=ax)
+            return x_repeat_sort, group_sizes_local, sort_idx
 
         return permute_sharded(hidden_states_flat, topk_idx_flat)
 
@@ -391,23 +400,23 @@ class BaseMoeModule(nn.Module, ABC):
         pmag = self.partition_manager
 
         if out_repeat_sort.ndim == 2:
-            out_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
+            out_in_specs = pmag.resolve(axes=[BATCH, TP], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
         else:
-            out_in_specs = pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
+            out_in_specs = pmag.resolve(axes=[BATCH, EMPTY, TP], mode=MODE_TRAIN, shape=out_repeat_sort.shape)
 
-        if sort_idx.ndim == 1:
-            idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=sort_idx.shape)
-        else:
-            idx_in_specs = pmag.resolve(axes=[BATCH, EMPTY], mode=MODE_TRAIN, shape=sort_idx.shape)
+        idx_in_specs = pmag.resolve(axes=[BATCH], mode=MODE_TRAIN, shape=sort_idx.shape)
 
-        batch_size, seq_len, hidden_size = original_shape
-        output_shape = (batch_size * seq_len, self.num_experts_per_tok, hidden_size)
+        batch_size, seq_len, _hidden_size = original_shape
+        out_dim = out_repeat_sort.shape[-1]
+        output_shape = (batch_size * seq_len, self.num_experts_per_tok, out_dim)
+
+        out_specs = pmag.resolve(axes=[BATCH, EMPTY, TP], mode=MODE_TRAIN, shape=output_shape)
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(out_in_specs, idx_in_specs),
-            out_specs=pmag.resolve(axes=[BATCH, EMPTY, EMPTY], mode=MODE_TRAIN, shape=output_shape),
+            out_specs=out_specs,
             check_rep=False,
         )
         def unpermute_sharded(out_repeat_sort_: jax.Array, sort_idx_: jax.Array):
@@ -431,16 +440,10 @@ class BaseMoeModule(nn.Module, ABC):
         Returns:
             The locally un-permuted and reshaped expert outputs.
         """
-        inv_sort_idx = jnp.argsort(sort_idx)
-        out_repeat = jnp.take(out_repeat_sort, inv_sort_idx, axis=0)
- 
-        k = self.num_experts_per_tok
-        hidden_size = original_shape[-1] 
-        assert (out_repeat.shape[0] % k) == 0, "out_repeat length must be divisible by k"
 
-        local_tokens = out_repeat.shape[0] // k
-        out_repeat_unflat = out_repeat.reshape((local_tokens, k, hidden_size))
-        return out_repeat_unflat
+        out_repeat = jnp.take(out_repeat_sort, jnp.argsort(sort_idx), axis=0)
+        out_dim = out_repeat.shape[-1]
+        return jnp.reshape(out_repeat, (-1, self.num_experts_per_tok, out_dim))
 
     def _compute_load_balancing_loss(
         self,
@@ -941,9 +944,9 @@ class ParallelMoELinear(nn.Module):
             def mapped_fn(
                 x: Float[Array, "tokens hidden"],
                 w: Float[Array, "experts in_dim out_dim"],
-                gs: Int[Array, "groups"],  # noqa
+                gs: Int[Array, "groups"],  #noqa
             ) -> Float[Array, "tokens out_dim"]:
-                y = core(x, w, gs)  # [sum(gs), out_features]
+                y = core(x, w, gs)
                 if need_tp_psum:
                     y = jax.lax.psum(y, axis_name=axis_name)
                 return y
@@ -1043,13 +1046,21 @@ class ParallelMoELinear(nn.Module):
         """Expands the bias to match the ragged batch structure.
 
         This method repeats the bias for each expert according to the number of
-        tokens assigned to it.
+        tokens assigned to it. This is necessary because tokens are grouped by
+        expert, and each group needs its corresponding expert's bias.
 
         Args:
             group_sizes: The sizes of token groups for each expert.
+                Shape: (num_experts,). Each element indicates how many tokens
+                are assigned to that expert.
 
         Returns:
-            The expanded bias array.
+            The expanded bias array where each expert's bias is repeated
+            according to its group size. Shape: (total_tokens, out_features).
+
+        Example:
+            If expert 0 has 3 tokens, expert 1 has 2 tokens, and expert 2 has 4 tokens,
+            this will repeat bias[0] 3 times, bias[1] 2 times, and bias[2] 4 times.
         """
         return self.bias.value[jnp.repeat(jnp.arange(self.num_experts), group_sizes)]
 
