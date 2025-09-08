@@ -33,7 +33,7 @@ dependencies = [
 	"jax>=0.7.0",
 	"jaxlib>=0.7.0",
 	"ray[default]==2.34.0",
-	"eformer>=0.0.58",
+	"eformer>=0.0.59",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
 	"flax==0.11.0",
