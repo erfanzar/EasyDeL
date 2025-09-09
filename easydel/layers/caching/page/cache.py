@@ -30,6 +30,8 @@ from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
+from easydel.utils.helpers import check_bool_flag
+
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
 from .utils import kv_cache_update, kv_cache_update_jax
 
@@ -43,6 +45,8 @@ KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
 
 logger = get_logger(__name__)
+
+PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
 
 
 def cdiv(a, b):
@@ -290,7 +294,7 @@ class PagesCacheView(BaseCacheView):
         head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
         value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
-        use_kernel = jax.default_backend() == "tpu"
+        use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
         use_shardmap = use_kernel
 
         def _update_fn(kv, slots, pages, num_update_slices):
