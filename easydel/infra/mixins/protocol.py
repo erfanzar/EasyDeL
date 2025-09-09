@@ -11,6 +11,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Protocol definitions for EasyDeL base modules.
+
+This module defines the protocol (interface) that all EasyDeL models must implement.
+It provides the BaseModuleProtocol abstract base class which specifies the required
+methods and properties for model implementations, along with utility functions for
+module representation and formatting.
+
+The protocol ensures consistency across different model implementations and provides
+type hints for better IDE support and type checking.
+
+Classes:
+    BaseModuleProtocol: Abstract base class defining the interface for EasyDeL modules
+
+Functions:
+    return_type_adjuster: Decorator to adjust return types for type checking
+    get_module_repr: Get string representation of module parameters
+    prettify_nnx: Format module structure for display
+    printify_nnx: Create printable representation of NNX modules
+
+Type Aliases:
+    PartitionLike: Type for partition rule specifications
+    Self: Type variable for self-referencing types
+
+The protocol includes overloaded methods for different model types:
+- Causal Language Models
+- Sequence Classification
+- Mixture of Experts (MoE)
+- Vision models (CLIP)
+- Multi-modal models
+
+Example:
+    >>> from easydel.infra.mixins.protocol import BaseModuleProtocol
+    >>> 
+    >>> class MyModel(BaseModuleProtocol):
+    ...     # Implement required methods
+    ...     def __call__(self, input_ids, ...):
+    ...         # Forward pass implementation
+    ...         pass
+    ...     
+    ...     def compute_loss(self, input_ids, labels, ...):
+    ...         # Loss computation
+    ...         pass
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -37,7 +82,7 @@ from ..modeling_outputs import (
 )
 
 PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]  # noqa
-_CP = type[EasyDeLBaseConfig]
+_CP = type[EasyDeLBaseConfig]  # noqa: F841
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")
 
@@ -49,7 +94,7 @@ if tp.TYPE_CHECKING:
 
 
 def return_type_adjuster(
-    original_return_type: type[_T],
+    original_return_type: type[_T],  # noqa: ARG001
 ) -> tp.Callable[[tp.Callable[..., nn.Module]], tp.Callable[..., _T]]:
     def decorator(func: tp.Callable[..., nn.Module]) -> tp.Callable[..., _T]:
         def wrapper(*args: tp.Any, **kwargs: tp.Any) -> _T:
@@ -152,7 +197,7 @@ def prettify_nnx(
         output.append(current_line + "(")
         new_indent = indent + "  "
 
-        for _i, (key, child) in enumerate(children):
+        for key, child in children:
             child_param = params_children.get(key, None)
             child_str = prettify_nnx(
                 child,

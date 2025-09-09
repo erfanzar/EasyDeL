@@ -1,6 +1,5 @@
 import typing as tp
 
-import flax.core
 import flax.nnx
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp

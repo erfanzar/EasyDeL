@@ -97,6 +97,14 @@ class MistralMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+        """Apply SiLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -114,6 +122,8 @@ class MistralMLP(nn.Module):
 
 
 class MistralAttention(AttentionModule):
+    """Multi-head attention layer with RoPE embeddings for Mistral models."""
+
     def __init__(
         self,
         config: MistralConfig,
@@ -123,6 +133,7 @@ class MistralAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize attention layer with config."""
         super().__init__(config=config)
         self.dtype = dtype
         self.param_dtype = param_dtype

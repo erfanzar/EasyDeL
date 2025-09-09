@@ -24,6 +24,8 @@ from eformer import common_types
 from eformer import escale as es
 from eformer.escale import PartitionAxis, PartitionManager
 from eformer.jaximus import ImplicitArray
+from eformer.loggings import get_logger
+from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
@@ -39,6 +41,8 @@ else:
 EMPTY = common_types.EMPTY
 KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
+
+logger = get_logger(__name__)
 
 
 def cdiv(a, b):
@@ -82,6 +86,30 @@ def get_page_size_bytes(
     return page_size * num_combined_kv_heads * padded_head_size * kv_cache_dtype_bits // 8
 
 
+def per_device_hbm_budget_bytes(util=0.9, mode="free", safety_margin=256 << 20):
+    budgets = []
+    for d in jax.local_devices():
+        try:
+            s = d.memory_stats()
+        except Exception:
+            continue
+        limit = s.get("bytes_limit") or s.get("bytes_reservable_limit") or s.get("bytes_total")
+        used_in_use = s.get("bytes_in_use", 0)
+        used_reserved = s.get("bytes_reserved", 0)
+        used = max(used_in_use, used_reserved)
+        if limit is None:
+            continue
+
+        free = max(0, int(limit) - int(used))
+        if mode == "free":
+            usable = max(0, int(free * float(util)) - safety_margin)
+        else:
+            usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
+        budgets.append(usable)
+
+    return min(budgets) if budgets else 4 * (1024**3)
+
+
 @auto_pytree
 class PagesCacheMetaData(BaseCacheMetadata):
     """
@@ -106,17 +134,12 @@ class PagesCacheMetaData(BaseCacheMetadata):
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
-        partition_axis = partition_manager.paxis
-        size = mesh.shape[partition_axis.kv_head_axis]
-        try:
-            per_device_memory_stats = jax.local_devices()[0].memory_stats()
-            limit = per_device_memory_stats.get("bytes_limit", per_device_memory_stats.get("bytes_reservable_limit"))
-            used = per_device_memory_stats["bytes_in_use"]
-            usable = int(limit * hbm_utilization) - used
-            return abs(usable * size)
-        except Exception as e:
-            print(e)
-            return 4 * (1024**3)
+        kv_head_axis = partition_manager.paxis.kv_head_axis
+        size = int(mesh.shape[kv_head_axis])
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        available_alloc = budget * size
+        logger.info(f"{kv_head_axis=} {size=} {budget=} {available_alloc=} {hbm_utilization=}")
+        return available_alloc
 
     @classmethod
     def create(
@@ -149,8 +172,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
-        from eformer.mpric import DTYPE_TO_STRING_MAP
-
+        logger.info(f"Creating Metadata with {num_pages=} {page_bytes=} sequence_capacity={num_pages * page_bytes}")
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -252,7 +274,7 @@ class PagesCacheView(BaseCacheView):
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
         kv_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads * 2, metadata.k_headdim)
-        axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
+        axes = [common_types.EMPTY, common_types.EMPTY, common_types.KV_HEAD, common_types.EMPTY]
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):

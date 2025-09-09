@@ -422,6 +422,8 @@ class Mistral3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Mistral3Config, model_type="mistral3")
 class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
+    """Mistral3 model for conditional generation with vision-language capabilities."""
+
     loss_type = "ForCausalLM"
 
     def __init__(

@@ -66,6 +66,14 @@ class GemmaRMSNorm(nn.Module):
         self.kernel = nn.Param(jnp.ones(self.config.hidden_size, dtype=dtype))
 
     def __call__(self, hidden_states):
+        """Apply RMS normalization with learnable scale.
+
+        Args:
+            hidden_states: Input tensor to normalize
+
+        Returns:
+            Normalized and scaled hidden states
+        """
         variance = hidden_states.astype(jnp.float32)
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
@@ -75,6 +83,8 @@ class GemmaRMSNorm(nn.Module):
 
 
 class GemmaAttention(AttentionModule):
+    """Multi-head attention layer with RoPE embeddings for Gemma models."""
+
     def __init__(
         self,
         config: GemmaConfig,
@@ -86,6 +96,7 @@ class GemmaAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize attention layer with config."""
         super().__init__(config)
 
         self.dtype = dtype

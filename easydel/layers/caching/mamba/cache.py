@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mamba state-space model cache implementation for EasyDeL.
+
+This module provides caching for Mamba models, which use state-space
+formulations instead of attention mechanisms. Mamba caches maintain
+convolutional and SSM (State Space Model) states rather than key-value pairs.
+
+Mamba models process sequences using:
+- Convolutional states for local context
+- SSM states for long-range dependencies
+- Efficient linear-time complexity
+
+Key Components:
+    - MambaCacheMetaData: Configuration for Mamba cache dimensions
+    - MambaCacheView: Per-layer state storage for conv and SSM
+    - MambaCache: Multi-layer Mamba cache orchestration
+    - MambaMetadata: Runtime metadata (placeholder)
+
+Features:
+    - Separate convolutional and SSM state management
+    - Rolling buffer for convolutional states
+    - Direct SSM state updates
+    - Memory-efficient state representation
+
+Example:
+    >>> metadata = MambaCacheMetaData.create(
+    ...     num_hidden_layers=24,
+    ...     partition_axis=partition_axis,
+    ...     batch_size=2,
+    ...     intermediate_size=2048,
+    ...     ssm_state_size=16,
+    ...     conv_kernel_size=4
+    ... )
+    >>> cache = MambaCache.init_cache(
+    ...     metadata=metadata,
+    ...     dtype=jnp.float32
+    ... )
+    >>> # Update conv state for layer 0
+    >>> cache = cache.update_conv_state(
+    ...     layer_idx=0,
+    ...     new_conv_state=conv_state,
+    ...     cache_position=position
+    ... )
+"""
 
 import chex as cx
 from eformer import escale as es
@@ -133,15 +176,28 @@ class MambaCacheView(BaseCacheView):
         new_conv_state: cx.Array,
         cache_position: cx.Array,
     ) -> "MambaCacheView":
-        """
-        Update the convolutional state of the cache.
+        """Update the convolutional state with new values.
 
-        Arguments:
-            new_conv_state: New state to be inserted
-            cache_position: Position in the cache to update
+        Implements a rolling buffer for convolutional states, where
+        new states replace old ones in a circular fashion. This
+        maintains a fixed-size window of recent states.
+
+        The update process:
+        1. Roll existing states to make room
+        2. Insert new state at specified position
+        3. Return updated view (functional update)
+
+        Args:
+            new_conv_state (cx.Array): New convolutional state to insert.
+                Shape: [batch_size, intermediate_size]
+            cache_position (cx.Array): Position index for insertion.
+                Clamped to valid range [0, conv_kernel_size-1].
 
         Returns:
-            Updated MambaCacheView
+            MambaCacheView: Updated view with new conv state.
+
+        Note:
+            Position is automatically clamped to prevent out-of-bounds access.
         """
         # Clamp cache position to valid range
         cache_position = jnp.clip(cache_position, 0, self.metadata.conv_kernel_size - 1)
@@ -156,25 +212,37 @@ class MambaCacheView(BaseCacheView):
         self,
         new_ssm_state: cx.Array,
     ) -> "MambaCacheView":
-        """
-        Update the SSM state of the cache.
+        """Update the SSM (State Space Model) state.
 
-        Arguments:
-            new_ssm_state: New SSM state to replace the current one
+        Replaces the entire SSM state with new values. Unlike conv states
+        which use a rolling buffer, SSM states are completely replaced
+        as they represent the full model state at each timestep.
+
+        Args:
+            new_ssm_state (cx.Array): New SSM state tensor.
+                Shape: [batch_size, intermediate_size, ssm_state_size]
 
         Returns:
-            Updated MambaCacheView
+            MambaCacheView: Updated view with new SSM state.
+
+        Note:
+            SSM states encode the full history up to current position,
+            so replacement (not accumulation) is the correct operation.
         """
         self.ssm_states = new_ssm_state
 
     def reset(self) -> "MambaCacheView":
-        """
-        Reset both conv and ssm states to zeros.
+        """Reset all cache states to zeros.
+
+        Clears both convolutional and SSM states, effectively
+        resetting the model's memory. Useful for:
+        - Starting new sequences
+        - Clearing context between batches
+        - Debugging and testing
 
         Returns:
-            Reset MambaCacheView
+            MambaCacheView: Reset view with zeroed states.
         """
-
         self.conv_states = jnp.zeros_like(self.conv_states)
         self.ssm_states = jnp.zeros_like(self.ssm_states)
 
@@ -225,16 +293,29 @@ class MambaCache(BaseCache):
         new_conv_state: cx.Array,
         cache_position: cx.Array,
     ) -> "MambaCache":
-        """
-        Update the convolutional state for a specific layer.
+        """Update convolutional state for a specific layer.
 
-        Arguments:
-            layer_idx: Index of the layer to update
-            new_conv_state: New state to be inserted
-            cache_position: Position in the cache to update
+        Delegates to the specified layer's view to update its conv state,
+        then returns a new cache instance with the updated view.
+
+        Args:
+            layer_idx (int): Index of the layer to update.
+            new_conv_state (cx.Array): New convolutional state.
+                Shape: [batch_size, intermediate_size]
+            cache_position (cx.Array): Position for insertion.
 
         Returns:
-            Updated MambaCache
+            MambaCache: New cache instance with updated layer.
+
+        Raises:
+            ValueError: If specified layer view is None.
+
+        Example:
+            >>> cache = cache.update_conv_state(
+            ...     layer_idx=5,
+            ...     new_conv_state=hidden_states,
+            ...     cache_position=jnp.array([2])
+            ... )
         """
         if self.views[layer_idx] is None:
             raise ValueError(f"Cache view for layer {layer_idx} is None")
@@ -253,15 +334,27 @@ class MambaCache(BaseCache):
         layer_idx: int,
         new_ssm_state: cx.Array,
     ) -> "MambaCache":
-        """
-        Update the SSM state for a specific layer.
+        """Update SSM state for a specific layer.
 
-        Arguments:
-            layer_idx: Index of the layer to update
-            new_ssm_state: New SSM state to replace the current one
+        Replaces the SSM state for the specified layer with new values,
+        returning a new cache instance with the update.
+
+        Args:
+            layer_idx (int): Index of the layer to update.
+            new_ssm_state (cx.Array): New SSM state tensor.
+                Shape: [batch_size, intermediate_size, ssm_state_size]
 
         Returns:
-            Updated MambaCache
+            MambaCache: New cache instance with updated layer.
+
+        Raises:
+            ValueError: If specified layer view is None.
+
+        Example:
+            >>> cache = cache.update_ssm_state(
+            ...     layer_idx=5,
+            ...     new_ssm_state=ssm_output
+            ... )
         """
         if self.views[layer_idx] is None:
             raise ValueError(f"Cache view for layer {layer_idx} is None")
@@ -275,11 +368,16 @@ class MambaCache(BaseCache):
         return self.replace(views=new_views)
 
     def reset(self) -> "MambaCache":
-        """
-        Reset all cache views to their initial state.
+        """Reset all cache layers to zero states.
+
+        Clears the entire cache by resetting each layer's conv and SSM
+        states to zeros. Useful for sequence boundaries or reinitialization.
 
         Returns:
-            Reset MambaCache
+            MambaCache: New cache instance with all states zeroed.
+
+        Note:
+            Preserves cache structure; only clears state values.
         """
         new_views = [view.reset() if view is not None else None for view in self.views]
         return self.replace(views=new_views)
@@ -294,4 +392,11 @@ class MambaCache(BaseCache):
     __str__ = __repr__
 
 
-class MambaMetadata(BaseRunTimeMetadata): ...
+class MambaMetadata(BaseRunTimeMetadata):
+    """Runtime metadata for Mamba cache operations.
+
+    Placeholder for future Mamba-specific runtime metadata.
+    May include sequence positions, segment boundaries, etc.
+    """
+
+    ...

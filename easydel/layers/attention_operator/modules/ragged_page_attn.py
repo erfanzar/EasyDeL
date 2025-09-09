@@ -177,21 +177,16 @@ class RaggedPageAttn(AttentionImpl):
         resolve = manager.resolve
         num_seqs = cache_metadata.num_seqs.reshape(-1)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
-        pages_per_seq = cache_metadata.pages_tables.shape[1]
-        num_kv_pages_per_block = min(8, pages_per_seq)
 
-        if num_kv_pages_per_block <= 0 or num_kv_pages_per_block > pages_per_seq:
-            raise ValueError(f"num_kv_pages_per_block={num_kv_pages_per_block} must be in range (0, {pages_per_seq}].")
         output = jax.shard_map(
             partial(
                 pallas_ragged_paged_attention,
                 sm_scale=self.metadata.softmax_scale,
                 soft_cap=self.metadata.soft_cap,
-                num_kv_pages_per_block=num_kv_pages_per_block,
             ),
             in_specs=(
                 qaxes,
-                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
+                resolve(axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape),
                 Ps(),
                 Ps(),
                 Ps(),

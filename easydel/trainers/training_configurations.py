@@ -620,17 +620,25 @@ class TrainingArguments:
         return int(value) * unit_to_seconds
 
     def get_path(self) -> ePathLike:
-        """
-        Returns the path to the checkpoint directory.
+        """Get the path to the checkpoint directory.
 
         Returns:
-            ePathLike: The path to the checkpoint directory.
+            ePathLike: The path to the checkpoint directory, combining
+                      save_directory and model_name.
+
+        Note:
+            Creates a model-specific subdirectory within the main save directory.
         """
         return ePath(self.save_directory) / self.model_name
 
     def ensure_checkpoint_path(self):
-        """
-        Creates the checkpoint directory if it doesn't exist.
+        """Create the checkpoint directory if it doesn't exist.
+
+        Ensures the full checkpoint path including parent directories
+        exists on the filesystem. Safe to call multiple times.
+
+        Note:
+            Uses mkdir with parents=True to create full directory tree.
         """
         path = self.get_path()
         path.mkdir(parents=True, exist_ok=True)
@@ -687,11 +695,15 @@ class TrainingArguments:
         return optimizer, scheduler
 
     def get_streaming_checkpointer(self):
-        """
-        Returns the checkpoint manager, responsible for saving model checkpoints.
+        """Get the asynchronous checkpoint manager.
 
         Returns:
-            AsyncCheckpointManager: The checkpoint manager.
+            AsyncCheckpointManager: The checkpoint manager for handling
+                                   asynchronous model checkpointing.
+
+        Note:
+            The AsyncCheckpointManager allows non-blocking checkpoint
+            saves during training, improving training efficiency.
         """
 
         from eformer.serialization import AsyncCheckpointManager
@@ -700,6 +712,18 @@ class TrainingArguments:
 
     @functools.cached_property
     def _tensorboard(self):
+        """Lazy initialization of TensorBoard writer.
+
+        Returns:
+            SummaryWriter | None: TensorBoard writer instance, or None if:
+                - Path is None
+                - Path is on Google Cloud Storage (gs://)
+                - TensorBoard is not installed
+
+        Note:
+            Cached property to avoid multiple initializations.
+            TensorBoard doesn't support cloud storage paths directly.
+        """
         from flax.metrics.tensorboard import SummaryWriter  # type:ignore
 
         path = self._get_save_directory(create=True)
@@ -710,11 +734,15 @@ class TrainingArguments:
         return SummaryWriter(log_dir=str(path))
 
     def get_tensorboard(self) -> SummaryWriter | None:
-        """
-        Returns the TensorBoard SummaryWriter, used for logging metrics.
+        """Get the TensorBoard SummaryWriter for logging metrics.
 
         Returns:
-            flax.metrics.tensorboard.SummaryWriter: The TensorBoard SummaryWriter.
+            SummaryWriter | None: The TensorBoard writer instance, or None if
+                                 TensorBoard is not available or not configured.
+
+        Note:
+            Handles ModuleNotFoundError gracefully if TensorBoard is not installed.
+            Uses cached property internally for efficiency.
         """
         try:
             return self._tensorboard
@@ -967,14 +995,21 @@ class TrainingArguments:
                     summary_writer.flush()
 
     def _create_wandb_histogram(self, value):
-        """
-        Create a wandb.Histogram object from the given value.
+        """Create a wandb.Histogram object from the given value.
 
         Args:
-            value: The value to convert into a wandb.Histogram
+            value: The value to convert into a wandb.Histogram. Can be:
+                  - JAX array
+                  - NumPy array or generic
+                  - Other numeric types
 
         Returns:
-            wandb.Histogram or None: A wandb.Histogram object if successful, None if an error occurs
+            wandb.Histogram | None: A wandb.Histogram object if successful,
+                                   None if an error occurs.
+
+        Note:
+            Handles dtype conversion for bfloat16 to float32/float16 for
+            compatibility with wandb. Automatically moves JAX arrays to CPU.
         """
         try:
             if isinstance(value, jax.Array | np.generic):

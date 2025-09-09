@@ -111,6 +111,8 @@ def get_activation_fn(activation):
 
 
 class GLU(nn.Module):
+    """Gated Linear Unit for MiniMax models."""
+
     def __init__(
         self,
         d1,
@@ -153,10 +155,20 @@ class GLU(nn.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Apply gated linear transformation.
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            Gated output tensor
+        """
         return self.l3(self.l1(x) * self.l2(x))
 
 
 class MiniMaxText01LightningAttention(nn.Module):
+    """Lightning attention mechanism for MiniMax Text models."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -259,6 +271,8 @@ class MiniMaxText01LightningAttention(nn.Module):
 
 
 class MiniMaxText01Attention(AttentionModule):
+    """Multi-head attention layer for MiniMax Text models."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -400,6 +414,8 @@ class MiniMaxText01Attention(AttentionModule):
 
 
 class MiniMaxText01MLP(nn.Module):
+    """Feedforward network for MiniMax Text models."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -446,6 +462,8 @@ class MiniMaxText01MLP(nn.Module):
 
 
 class MiniMaxText01BlockSparseTop2MLP(nn.Module):
+    """Sparse top-2 MLP expert for MiniMax Text MoE layers."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -491,6 +509,8 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
 
 
 class MiniMaxText01SparseMoeBlock(nn.Module):
+    """Mixture of Experts block for MiniMax Text models."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -574,6 +594,8 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
 
 
 class MiniMaxText01DecoderLayer(nn.Module):
+    """Decoder layer for MiniMax Text models."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -774,6 +796,8 @@ class MiniMaxText01DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=MiniMaxText01Config, model_type="MiniMaxText01")
 class MiniMaxText01Model(EasyDeLBaseModule):
+    """Base MiniMax Text model with embeddings and decoder layers."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,
@@ -953,6 +977,8 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MiniMaxText01Config, model_type="MiniMaxText01")
 class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
+    """MiniMax Text model with language modeling head for causal generation."""
+
     def __init__(
         self,
         config: MiniMaxText01Config,

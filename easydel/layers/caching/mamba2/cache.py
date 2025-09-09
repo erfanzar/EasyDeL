@@ -12,6 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mamba2 enhanced state-space model cache implementation.
+
+This module provides caching for Mamba2 models, which extend the original
+Mamba architecture with additional features including:
+- Multi-head state space models
+- Group normalization capabilities
+- Enhanced convolutional processing
+- Improved sequence modeling
+
+Mamba2 introduces structured state spaces with head-based organization,
+similar to multi-head attention but for state-space models.
+
+Key Components:
+    - Mamba2CacheMetaData: Enhanced configuration with head/group support
+    - Mamba2CacheView: Per-layer state storage with sequence tracking
+    - Mamba2Cache: Multi-layer orchestration with sequence updates
+    - Mamba2Metadata: Runtime metadata (placeholder)
+
+Features:
+    - Head-based SSM organization
+    - Group normalization support
+    - Sequence position tracking
+    - Extended convolutional states
+
+Example:
+    >>> metadata = Mamba2CacheMetaData.create(
+    ...     partition_axis=partition_axis,
+    ...     num_hidden_layers=32,
+    ...     batch_size=2,
+    ...     intermediate_size=2816,
+    ...     num_heads=16,
+    ...     head_dim=64,
+    ...     state_size=128,
+    ...     conv_kernel_size=4,
+    ...     n_groups=8
+    ... )
+    >>> cache = Mamba2Cache.init_cache(
+    ...     num_hidden_layers=32,
+    ...     metadata=metadata,
+    ...     dtype=jnp.float32
+    ... )
+"""
 
 import chex as cx
 from eformer.escale import PartitionAxis, with_sharding_constraint
@@ -25,7 +67,23 @@ from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTim
 
 @auto_pytree
 class Mamba2CacheMetaData(BaseCacheMetadata):
-    """Metadata for Mamba2 cache configuration."""
+    """Metadata configuration for Mamba2 state-space cache.
+
+    Extends the original Mamba cache with support for multi-head
+    state-space models and group normalization. The head-based
+    organization allows for more expressive state representations.
+
+    Attributes:
+        partition_axis (PartitionAxis): Tensor partitioning configuration.
+        num_hidden_layers (int): Number of Mamba2 layers in the model.
+        batch_size (int): Number of sequences in batch.
+        intermediate_size (int): Hidden dimension of MLP layers.
+        num_heads (int): Number of SSM heads (similar to attention heads).
+        head_dim (int): Dimension per SSM head.
+        state_size (int): Size of the state-space representation.
+        conv_kernel_size (int): Size of convolutional kernel.
+        n_groups (int): Number of groups for group operations.
+    """
 
     partition_axis: PartitionAxis
     num_hidden_layers: int
@@ -50,7 +108,29 @@ class Mamba2CacheMetaData(BaseCacheMetadata):
         conv_kernel_size: int,
         n_groups: int,
     ) -> "Mamba2CacheMetaData":
-        """Create a Mamba2CacheMetaData instance with validation."""
+        """Create and validate Mamba2 cache metadata.
+
+        Factory method that validates all parameters before creating
+        the metadata instance. Ensures all dimensions are positive
+        and compatible.
+
+        Args:
+            partition_axis (PartitionAxis): Sharding configuration.
+            num_hidden_layers (int): Number of model layers.
+            batch_size (int): Batch size for cache allocation.
+            intermediate_size (int): MLP hidden dimension.
+            num_heads (int): Number of SSM heads.
+            head_dim (int): Dimension per head.
+            state_size (int): State-space size per head.
+            conv_kernel_size (int): Convolution kernel size.
+            n_groups (int): Number of normalization groups.
+
+        Returns:
+            Mamba2CacheMetaData: Validated metadata instance.
+
+        Raises:
+            ValueError: If any parameter is non-positive.
+        """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if intermediate_size <= 0:
@@ -81,6 +161,24 @@ class Mamba2CacheMetaData(BaseCacheMetadata):
 
 @auto_pytree
 class Mamba2CacheView(BaseCacheView):
+    """Single-layer cache view for Mamba2 state-space model.
+
+    Manages both convolutional and SSM states for one Mamba2 layer,
+    with additional tracking for sequence positions and offsets.
+    The multi-head organization allows for richer state representations.
+
+    Attributes:
+        conv_states (cx.Array | ImplicitArray): Convolutional states buffer.
+            Shape: [batch, intermediate_size + 2*n_groups*state_size, kernel_size]
+        ssm_states (cx.Array | ImplicitArray): State-space model states.
+            Shape: [batch, num_heads, head_dim, state_size]
+        positions (cx.Array): Current position per sequence.
+            Shape: [batch_size]
+        seqlen_offset (int): Global sequence offset for continuation.
+        metadata (Mamba2CacheMetaData): Static configuration.
+        layer_index (int | None): Layer index in model.
+    """
+
     conv_states: cx.Array | ImplicitArray
     ssm_states: cx.Array | ImplicitArray
     positions: cx.Array
@@ -134,7 +232,19 @@ class Mamba2CacheView(BaseCacheView):
         new_conv_state: cx.Array,
         cache_position: cx.Array,
     ) -> "Mamba2CacheView":
-        """Update the convolutional state of the cache."""
+        """Update convolutional state with new values.
+
+        Maintains a rolling buffer of convolutional states, with
+        support for the extended state size used in Mamba2.
+
+        Args:
+            new_conv_state (cx.Array): New conv state to insert.
+                Shape: [batch, intermediate_size + 2*n_groups*state_size]
+            cache_position (cx.Array): Position index for insertion.
+
+        Returns:
+            Mamba2CacheView: Updated view with new conv state.
+        """
         cache_position = jnp.clip(cache_position, 0, self.metadata.conv_kernel_size - 1)
         conv_state = jnp.roll(self.conv_states, shift=-1, axis=-1)
         updated_conv_states = conv_state.at[:, :, cache_position].set(new_conv_state)
@@ -145,12 +255,30 @@ class Mamba2CacheView(BaseCacheView):
         self,
         new_ssm_state: cx.Array,
     ) -> "Mamba2CacheView":
-        """Update the SSM state of the cache."""
+        """Update SSM state with head-structured representation.
+
+        Replaces the multi-head SSM state with new values,
+        maintaining the head-based organization.
+
+        Args:
+            new_ssm_state (cx.Array): New SSM state.
+                Shape: [batch, num_heads, head_dim, state_size]
+
+        Returns:
+            Mamba2CacheView: Updated view with new SSM state.
+        """
         self.ssm_states = new_ssm_state
         return self
 
     def reset(self) -> "Mamba2CacheView":
-        """Reset both conv and ssm states to zeros."""
+        """Reset all cache states to zeros.
+
+        Clears both convolutional and SSM states while preserving
+        structure and shape. Position tracking is maintained.
+
+        Returns:
+            Mamba2CacheView: Reset view with zeroed states.
+        """
         self.conv_states = jnp.zeros_like(self.conv_states)
         self.ssm_states = jnp.zeros_like(self.ssm_states)
         return self
@@ -158,6 +286,16 @@ class Mamba2CacheView(BaseCacheView):
 
 @auto_pytree
 class Mamba2Cache(BaseCache):
+    """Multi-layer Mamba2 cache container.
+
+    Orchestrates Mamba2 cache views across all model layers,
+    with additional support for sequence position tracking
+    and batch sequence updates.
+
+    Attributes:
+        views (list[Mamba2CacheView | None]): Per-layer cache views.
+    """
+
     views: list[Mamba2CacheView | None]
 
     @classmethod
@@ -259,6 +397,17 @@ class Mamba2Cache(BaseCache):
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def update_seq(self, num):
+        """Update sequence positions across all layers.
+
+        Increments position tracking for sequence continuation,
+        useful when processing long sequences in chunks.
+
+        Args:
+            num (int): Number of positions to advance.
+
+        Note:
+            Updates both positions and seqlen_offset for each layer.
+        """
         for view in self.views:
             if view is not None:
                 view.positions += num
@@ -270,4 +419,9 @@ class Mamba2Cache(BaseCache):
     __str__ = __repr__
 
 
-class Mamba2Metadata(BaseRunTimeMetadata): ...
+class Mamba2Metadata(BaseRunTimeMetadata):
+    """Runtime metadata for Mamba2 cache operations.
+
+    Placeholder for future Mamba2-specific runtime state.
+    May include head masks, group indices, etc.
+    """

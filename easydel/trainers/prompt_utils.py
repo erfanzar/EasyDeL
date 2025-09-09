@@ -14,6 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Prompt formatting and chat template utilities.
+
+This module provides utilities for converting between different conversation
+formats, applying chat templates, and handling various prompt structures.
+Originally from HuggingFace TRL, adapted for EasyDeL.
+
+Key functionality:
+- Convert between OpenAI format and simpler dictionary formats
+- Apply chat templates to conversational datasets
+- Detect conversational vs instruction formats
+- Handle multi-turn conversations and function calling
+"""
+
 import copy
 import typing as tp
 
@@ -36,9 +49,20 @@ OpenAIMessageList = list[OpenAIMessage]
 
 
 def _is_valid_openai_message_list(data: tp.Any) -> bool:
-    """
-    Checks if the input data strictly conforms to the OpenAIMessageList format
-    where content is specifically a list of parts (e.g., [{"type": "text", ...}]).
+    """Check if data conforms to OpenAI message list format.
+
+    Validates that the input data strictly follows the OpenAI Chat Completions
+    message format where content is a list of content parts.
+
+    Args:
+        data: Data to validate.
+
+    Returns:
+        bool: True if data is valid OpenAI message list, False otherwise.
+
+    Note:
+        Expected format:
+        [{"role": "user", "content": [{"type": "text", "text": "..."}]}]
     """
     if not isinstance(data, list):
         return False
@@ -64,9 +88,23 @@ def _is_valid_openai_message_list(data: tp.Any) -> bool:
 
 
 def _convert_single_dict(source_dict: InputDict) -> OpenAIMessage | None:
-    """
-    Converts a single source dictionary into the target OpenAI message format.
-    Handles variations in keys like 'content', 'text', 'message'.
+    """Convert a single dictionary to OpenAI message format.
+
+    Handles various input formats with flexible key names, converting them
+    to the standardized OpenAI message structure.
+
+    Args:
+        source_dict: Dictionary with message data. Searches for keys like
+                    'role', 'content', 'text', 'message' (case-insensitive).
+
+    Returns:
+        OpenAIMessage | None: Converted message in OpenAI format, or None if
+                             conversion fails.
+
+    Note:
+        - Defaults to 'user' role if not specified
+        - Handles non-standard roles with warnings
+        - Prioritizes 'content' > 'text' > 'message' for content extraction
     """
     if not isinstance(source_dict, dict):
         print(f"Warning: Expected a dictionary, but got {type(source_dict)}. Skipping.")
@@ -267,8 +305,21 @@ def convert_to_openai_format(input_data: InputType) -> OpenAIMessageList:
 
 
 def is_conversational(example: dict[str, tp.Any]) -> bool:
-    """
-    Check if the example is in a conversational format.
+    """Check if an example is in conversational format.
+
+    Detects whether the example contains conversation-style data with
+    role and content fields.
+
+    Args:
+        example: Dictionary to check. Looks for keys like 'prompt',
+                'chosen', 'rejected', 'completion', or 'messages'.
+
+    Returns:
+        bool: True if example contains conversational data with role/content
+             structure, False otherwise.
+
+    Note:
+        Used to determine whether to apply chat templates during processing.
     """
     supported_keys = ["prompt", "chosen", "rejected", "completion", "messages"]
     example_keys = {key for key in example.keys() if key in supported_keys}
@@ -289,10 +340,26 @@ def apply_chat_template(
     tokenizer: ProcessingClassType,
     tools: list[dict | tp.Callable] | None = None,
 ) -> dict[str, str]:
-    r"""
-    Apply a chat template to a conversational example along with the schema for a list of functions in `tools`.
+    """Apply chat template to conversational examples.
 
-    For more details, see [`maybe_apply_chat_template`].
+    Formats conversation data using the tokenizer's chat template,
+    handling various input formats and optionally including tool schemas.
+
+    Args:
+        example: Dictionary containing conversation data. Supported keys:
+                'prompt', 'chosen', 'rejected', 'completion', 'messages', 'label'.
+        tokenizer: Tokenizer with chat template support.
+        tools: Optional list of tool/function schemas for function calling.
+
+    Returns:
+        dict: Formatted example with chat template applied to text fields.
+
+    Raises:
+        ValueError: If example format is not supported.
+
+    Note:
+        Handles both single and multi-turn conversations.
+        Preserves original structure while applying templates.
     """
     supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "label"]
     example_keys = {key for key in example.keys() if key in supported_keys}
@@ -384,8 +451,22 @@ def maybe_apply_chat_template(
     tokenizer: ProcessingClassType,
     tools: list[dict | tp.Callable] | None = None,
 ) -> dict[str, str]:
-    """
-    If the example is in a conversational format, apply a chat template to it.
+    """Conditionally apply chat template to conversational examples.
+
+    Checks if the example is in conversational format and applies the
+    chat template if needed, otherwise returns the example unchanged.
+
+    Args:
+        example: Dictionary that may contain conversation data.
+        tokenizer: Tokenizer with chat template support.
+        tools: Optional list of tool/function schemas.
+
+    Returns:
+        dict: Example with chat template applied if conversational,
+             otherwise unchanged.
+
+    Note:
+        Useful for datasets that may contain mixed formats.
     """
     if is_conversational(example):
         return apply_chat_template(example, tokenizer, tools)
@@ -396,6 +477,19 @@ def maybe_apply_chat_template(
 def _unpair_row(
     examples: list[dict[str, list[dict[str, str]]]],
 ) -> list[dict[str, list[dict[str, str]]]]:
+    """Internal function to unpair preference data rows.
+
+    Converts paired chosen/rejected examples into separate rows with labels.
+
+    Args:
+        examples: Batch of paired preference examples.
+
+    Returns:
+        dict: Unpaired examples with 'completion' and 'label' fields.
+
+    Note:
+        Internal helper for unpair_preference_dataset.
+    """
     batch_size = len(examples["chosen"])
     new_rows = {
         "completion": examples["chosen"] + examples["rejected"],
@@ -411,8 +505,23 @@ def unpair_preference_dataset(
     num_proc: int | None = None,
     desc: str | None = None,
 ) -> DatasetType:
-    """
-    Unpair a preference dataset.
+    """Unpair a preference dataset into individual examples.
+
+    Transforms paired preference data (chosen/rejected) into separate
+    examples with binary labels, doubling the dataset size.
+
+    Args:
+        dataset: Dataset with 'chosen' and 'rejected' columns.
+        num_proc: Number of processes for parallel processing.
+        desc: Description for progress bar.
+
+    Returns:
+        DatasetType: Unpaired dataset with 'completion' and 'label' columns.
+                    Label is True for chosen, False for rejected.
+
+    Note:
+        Removes 'chosen' and 'rejected' columns after unpairing.
+        Preserves 'prompt' column if present.
     """
     return dataset.map(
         _unpair_row,
@@ -428,8 +537,22 @@ def maybe_unpair_preference_dataset(
     num_proc: int | None = None,
     desc: str | None = None,
 ) -> DatasetType:
-    """
-    Unpair a preference dataset if it is paired.
+    """Conditionally unpair a preference dataset.
+
+    Checks if dataset contains paired preference data and unpairs it
+    if needed, otherwise returns unchanged.
+
+    Args:
+        dataset: Dataset that may contain paired preference data.
+        num_proc: Number of processes for parallel processing.
+        desc: Description for progress bar.
+
+    Returns:
+        DatasetType: Unpaired dataset if originally paired, otherwise unchanged.
+
+    Note:
+        Checks for 'chosen' and 'rejected' columns to determine if unpairing
+        is needed. Handles both Dataset and DatasetDict types.
     """
     if isinstance(dataset, DatasetDict):
         column_names = dataset[next(iter(dataset.keys()))].column_names
@@ -442,9 +565,22 @@ def maybe_unpair_preference_dataset(
 
 
 def extract_prompt(example: dict[str, tp.Sequence]) -> dict[str, tp.Sequence]:
-    r"""
-    Extracts the shared prompt from a preference data example, where the prompt is implicit within both
-    the chosen and rejected completions.
+    """Extract the shared prompt from preference data.
+
+    Identifies and extracts the common prompt prefix from chosen and rejected
+    completions when the prompt is implicitly included in both.
+
+    Args:
+        example: Dictionary with 'chosen' and 'rejected' sequences that
+                share a common prompt prefix.
+
+    Returns:
+        dict: Dictionary with separated 'prompt', 'chosen', and 'rejected'
+             fields where prompt is extracted from the common prefix.
+
+    Note:
+        Finds the divergence point between chosen and rejected sequences.
+        Handles whitespace at boundaries correctly.
     """
     for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
         if example["chosen"][idx] != example["rejected"][idx]:
@@ -459,9 +595,21 @@ def extract_prompt(example: dict[str, tp.Sequence]) -> dict[str, tp.Sequence]:
 
 
 def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
-    r"""
-    Extracts the shared prompt from a preference data example, where the prompt is implicit within both
-    the chosen and rejected completions.
+    """Conditionally extract prompt from preference data.
+
+    Attempts to extract the shared prompt from chosen/rejected completions
+    if appropriate, otherwise returns the example unchanged.
+
+    Args:
+        example: Dictionary that may contain preference data with implicit prompt.
+
+    Returns:
+        dict: Example with extracted prompt if applicable, otherwise unchanged.
+
+    Note:
+        - Checks if prompt extraction is needed based on data structure
+        - Preserves existing prompt if already present and format-compatible
+        - Handles both conversational and non-conversational formats
     """
     if "chosen" not in example or "rejected" not in example:
         return example

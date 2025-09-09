@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Utility functions and classes for EasyDeL trainers.
+
+This module provides essential utilities for training, including:
+- JAX distributed configuration management
+- Dataset creation and manipulation functions
+- Data collation utilities for various training tasks
+- Conversation formatting and prompt processing
+- Memory and performance profiling tools
+- Training state management utilities
+"""
+
 import logging
 import random
 import typing as tp
@@ -37,13 +49,42 @@ logger = get_logger(__name__)
 
 
 class JaxDistributedConfig:
-    """
-    From EasyLM
-    Utility class for initializing JAX distributed.
+    """Configuration manager for JAX distributed training.
+
+    This class handles the initialization of JAX distributed computing
+    environments, enabling multi-host and multi-device training setups.
+    Originally from EasyLM project.
+
+    The class manages:
+    - Multi-process coordination
+    - Device assignment
+    - Communication setup between processes
+
+    Note:
+        This is typically used internally by TrainingArguments and should
+        not need to be configured directly by users in most cases.
     """
 
     @staticmethod
     def get_default_config(updates=None):
+        """Get default configuration for JAX distributed.
+
+        Args:
+            updates: Optional dictionary of configuration updates to apply
+                    to the default configuration.
+
+        Returns:
+            ConfigDict: Configuration dictionary with the following fields:
+                - initialize_jax_distributed: Whether to initialize distributed
+                - coordinator_address: Address of the coordinator process
+                - num_processes: Total number of processes
+                - process_id: ID of the current process
+                - local_device_ids: Comma-separated list of local device IDs
+
+        Note:
+            Uses ml_collections placeholders for required fields that must
+            be provided at runtime.
+        """
         config = ConfigDict()
         config.initialize_jax_distributed = False
         config.coordinator_address = placeholder(str)
@@ -57,6 +98,19 @@ class JaxDistributedConfig:
 
     @classmethod
     def initialize(cls, config=None):
+        """Initialize JAX distributed with the given configuration.
+
+        Args:
+            config: Configuration dictionary or None to use defaults.
+                   If provided, should contain distributed setup parameters.
+
+        Note:
+            Only initializes if config.initialize_jax_distributed is True.
+            Parses local_device_ids from comma-separated string if provided.
+
+        Raises:
+            RuntimeError: If JAX distributed initialization fails.
+        """
         config = cls.get_default_config(config)
         if config.initialize_jax_distributed:
             if config.local_device_ids is not None:
@@ -73,7 +127,30 @@ class JaxDistributedConfig:
 
 
 def create_prompt_creator(processing_class):
+    """Create a prompt formatting function for conversation data.
+
+    Args:
+        processing_class: Tokenizer or processor class used for formatting.
+
+    Returns:
+        Callable: A function that formats conversation samples into prompts
+                 suitable for training.
+
+    Note:
+        The returned function expects samples with a 'conversation' field
+        containing input/output pairs and formats them using the
+        conversations_formatting_function.
+    """
+
     def to_role_and_content(field):
+        """Convert field format to role-based conversation format.
+
+        Args:
+            field: Dictionary with 'conversation' key containing input/output pairs.
+
+        Returns:
+            dict: Reformatted conversation with 'role' and 'content' structure.
+        """
         return {
             "conversation": [
                 {"role": "user", "content": field["conversation"][0]["input"]},
@@ -82,6 +159,14 @@ def create_prompt_creator(processing_class):
         }
 
     def _pc(sample):
+        """Process a single sample into formatted prompt.
+
+        Args:
+            sample: Raw conversation sample to process.
+
+        Returns:
+            Formatted prompt ready for training.
+        """
         return conversations_formatting_function(processing_class, messages_field="conversation")(
             to_role_and_content(sample)
         )
@@ -235,6 +320,23 @@ def _collate_batch(
     processing_class,
     pad_to_multiple_of: int | None = None,
 ):
+    """Collate a batch of examples with optional padding.
+
+    Args:
+        examples: List of examples to collate into a batch.
+        processing_class: Tokenizer/processor with padding configuration.
+        pad_to_multiple_of: If set, pad the batch to a multiple of this value.
+
+    Returns:
+        jnp.ndarray: Batched and padded examples as a JAX array.
+
+    Raises:
+        ValueError: If padding is required but no pad token is defined.
+
+    Note:
+        Handles both left and right padding based on processing_class.padding_side.
+        Efficiently stacks examples of the same length without padding.
+    """
     if isinstance(examples[0], list | tuple):
         examples = [jnp.array(e, dtype=jnp.int64) for e in examples]
 
@@ -266,12 +368,23 @@ def _collate_batch(
 
 
 def tolist(x):
-    """from HF
+    """Convert various array types to Python list.
+
+    Utility function from HuggingFace for consistent list conversion.
+
     Args:
-        x:
+        x: Input to convert. Can be:
+           - Python list (returned as-is)
+           - NumPy array
+           - JAX array
+           - Tensor with .numpy() method
 
-    Returns: X as tp.List
+    Returns:
+        list: Python list representation of the input.
 
+    Note:
+        Handles tensors by first converting to NumPy if they have
+        a .numpy() method.
     """
     if isinstance(x, list):
         return x
@@ -281,9 +394,24 @@ def tolist(x):
 
 
 class DataCollatorForCompletionOnlyLM:
-    """Data collator used for completion tasks. It ensures that all the tokens of the labels are set to an 'ignore_index'
-    when they do not come from the assistant. This ensures that the loss is only
-    calculated on the completion made by the assistant.
+    """Data collator for training on assistant completions only.
+
+    This collator masks out non-assistant tokens in the labels, ensuring
+    that the loss is only calculated on the model's completions (assistant
+    responses) and not on the user prompts or system messages.
+
+    This is particularly useful for:
+    - Instruction tuning where you only want to train on responses
+    - Chat models where user inputs should not contribute to loss
+    - Maintaining the model's ability to understand prompts without
+      being trained to generate them
+
+    Attributes:
+        processing_class: Tokenizer or processor for encoding text.
+        response_template: Template or token IDs marking response start.
+        instruction_template: Optional template marking instruction start.
+        mlm: Whether using masked language modeling (default False).
+        ignore_index: Label value to ignore in loss calculation.
     """
 
     def __init__(
@@ -537,6 +665,27 @@ class RewardDataCollatorWithPaddingTFDS:
     truncation_mode: str = "keep_end"
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+        """Collate a batch of chosen/rejected pairs for reward modeling.
+
+        Args:
+            features: List of feature dictionaries, each containing:
+                     - input_ids_chosen: Token IDs for chosen response
+                     - input_ids_rejected: Token IDs for rejected response
+                     - attention_mask_chosen: Attention mask for chosen
+                     - attention_mask_rejected: Attention mask for rejected
+                     - margin (optional): Preference margin between responses
+
+        Returns:
+            dict: Collated batch with keys:
+                 - input_ids_chosen: Padded chosen input IDs
+                 - attention_mask_chosen: Padded chosen attention masks
+                 - input_ids_rejected: Padded rejected input IDs
+                 - attention_mask_rejected: Padded rejected attention masks
+                 - margin (optional): Stacked margins if provided
+
+        Raises:
+            ValueError: If required keys are missing from features.
+        """
         features_chosen = []
         features_rejected = []
         margin = []
@@ -593,16 +742,21 @@ class RewardDataCollatorWithPaddingTFDS:
 
 @auto_pytree
 class RewardDataCollatorWithPaddingGrain:
-    r"""
-    Reward DataCollator class that pads the inputs to the maximum length of the batch.
+    """Data collator for reward modeling with Grain data loading.
 
-    Args:
-        tokenizer (`ProcessingClassType`):
-            The tokenizer used for encoding the data.
-        padding (`Union[bool, str, `PaddingStrategy`]`, `optional`, defaults to `True`):
-            padding_strategy to pass to the tokenizer.
-        max_length (`int` or `None`, `optional`, defaults to `None`):
-            If set will pad the sequence to a maximum provided value.
+    Similar to RewardDataCollatorWithPaddingTFDS but designed for use with
+    Google's Grain data loading library. Handles single dictionaries instead
+    of lists of dictionaries.
+
+    Attributes:
+        tokenizer: The tokenizer/processor for encoding text.
+        padding: Padding strategy - 'max_length', True, or False.
+        max_length: Maximum sequence length for padding.
+        truncation_mode: How to truncate sequences ('keep_end' or 'keep_start').
+
+    Note:
+        Returns NumPy arrays instead of JAX arrays for Grain compatibility.
+        Expects a single feature dictionary rather than a list.
     """
 
     tokenizer: ProcessingClassType
@@ -611,6 +765,22 @@ class RewardDataCollatorWithPaddingGrain:
     truncation_mode: str = "keep_end"
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Collate chosen/rejected pairs for Grain-based reward modeling.
+
+        Args:
+            features: Single feature dictionary containing:
+                     - input_ids_chosen: Token IDs for chosen response
+                     - input_ids_rejected: Token IDs for rejected response
+                     - attention_mask_chosen: Attention mask for chosen
+                     - attention_mask_rejected: Attention mask for rejected
+                     - margin (optional): Preference margin
+
+        Returns:
+            dict: Collated batch with padded arrays for chosen/rejected pairs.
+
+        Raises:
+            ValueError: If required keys are missing from features.
+        """
         features_chosen = []
         features_rejected = []
         margin = []
@@ -667,7 +837,23 @@ class RewardDataCollatorWithPaddingGrain:
 
 @auto_pytree
 class DataCollatorForPreferenceTFDS:
-    r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
+    """Data collator for Direct Preference Optimization (DPO) with TFDS.
+
+    Handles batching and padding of prompt-completion pairs for preference
+    learning. Each example has a prompt, chosen completion, and rejected
+    completion that need to be padded separately.
+
+    Attributes:
+        max_prompt_length: Maximum length for prompt sequences.
+        max_completion_length: Maximum length for completion sequences.
+        pad_token_id: Token ID to use for padding (default 0).
+        label_pad_token_id: Token ID for label padding (default -100).
+        is_encoder_decoder: Whether using encoder-decoder architecture.
+
+    Note:
+        Supports multimodal inputs with pixel_values and pixel_attention_mask.
+        Can include reference model log probabilities if provided.
+    """
 
     max_prompt_length: int
     max_completion_length: int
@@ -676,6 +862,26 @@ class DataCollatorForPreferenceTFDS:
     is_encoder_decoder: bool | None = False
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+        """Collate a batch of preference examples for DPO training.
+
+        Args:
+            features: List of feature dictionaries, each containing:
+                     - prompt_input_ids: Token IDs for the prompt
+                     - chosen_input_ids: Token IDs for chosen completion
+                     - rejected_input_ids: Token IDs for rejected completion
+                     - pixel_values (optional): Image data for multimodal
+                     - pixel_attention_mask (optional): Image attention mask
+                     - ref_chosen_logps (optional): Reference model log probs
+                     - ref_rejected_logps (optional): Reference model log probs
+
+        Returns:
+            dict: Collated and padded batch with separate arrays for
+                 prompts, chosen completions, and rejected completions.
+
+        Note:
+            Prompts are left-padded, completions are right-padded.
+            Attention masks are automatically generated from input IDs.
+        """
         prompt_input_ids = [jnp.array(feature["prompt_input_ids"]) for feature in features]
         prompt_attention_mask = [jnp.ones_like(input_ids) for input_ids in prompt_input_ids]
         chosen_input_ids = [jnp.array(feature["chosen_input_ids"]) for feature in features]
@@ -729,7 +935,22 @@ class DataCollatorForPreferenceTFDS:
 
 @auto_pytree
 class DataCollatorForPreferenceGrain:
-    r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
+    """Data collator for Direct Preference Optimization (DPO) with Grain.
+
+    Grain-compatible version of DataCollatorForPreferenceTFDS. Processes
+    single dictionaries instead of lists for Grain's data pipeline.
+
+    Attributes:
+        max_prompt_length: Maximum length for prompt sequences.
+        max_completion_length: Maximum length for completion sequences.
+        pad_token_id: Token ID to use for padding (default 0).
+        label_pad_token_id: Token ID for label padding (default -100).
+        is_encoder_decoder: Whether using encoder-decoder architecture.
+
+    Note:
+        Returns NumPy arrays for Grain compatibility.
+        Handles single feature dictionary rather than list.
+    """
 
     max_prompt_length: int
     max_completion_length: int
@@ -738,6 +959,17 @@ class DataCollatorForPreferenceGrain:
     is_encoder_decoder: bool | None = False
 
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        """Collate preference data for Grain-based DPO training.
+
+        Args:
+            features: Single feature dictionary with prompt and completion data.
+
+        Returns:
+            dict: Collated and padded arrays for DPO training.
+
+        Note:
+            Similar to TFDS version but processes single dictionary input.
+        """
         prompt_input_ids = np.array(features["prompt_input_ids"])
         prompt_attention_mask = np.ones_like(prompt_input_ids)
         chosen_input_ids = np.array(features["chosen_input_ids"])
@@ -808,8 +1040,20 @@ class DataCollatorForPreferenceGrain:
 
 @auto_pytree
 class DPODataCollatorWithPaddingTFDS:
-    r"""
-    DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
+    """Advanced data collator for DPO training with TFDS.
+
+    Extended version of DataCollatorForPreferenceTFDS with additional
+    features for handling complex DPO scenarios including encoder-decoder
+    models and pre-padded data.
+
+    Attributes:
+        max_prompt_length: Maximum length for prompt sequences.
+        max_completion_length: Maximum length for completion sequences.
+        pad_token_id: Token ID to use for padding (default 0).
+        label_pad_token_id: Token ID for label padding (default -100).
+        is_encoder_decoder: Whether using encoder-decoder architecture.
+        output_arrays_only: If True, only return array-type outputs.
+        prepadded: If True, assumes inputs are already padded.
     """
 
     max_prompt_length: int
@@ -821,6 +1065,22 @@ class DPODataCollatorWithPaddingTFDS:
     prepadded: bool = True
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+        """Collate and pad a batch of DPO training examples.
+
+        Args:
+            features: List of feature dictionaries with various keys ending in
+                     _input_ids, _attention_mask, _labels, or _pixel_values.
+
+        Returns:
+            dict: Padded batch with appropriate padding for each field type.
+
+        Raises:
+            ValueError: If padding token is not configured or unexpected keys found.
+
+        Note:
+            Handles different padding strategies for prompts (left) vs completions (right).
+            Supports encoder-decoder architectures with special handling.
+        """
         camax_length = self.max_completion_length + self.max_prompt_length
         padded_batch = {}
         for k in features[0].keys():
@@ -1015,7 +1275,25 @@ class DPODataCollatorWithPaddingGrain:
 
 
 class HFDataSource(pygrain.RandomAccessDataSource):
-    """A Grain DataSource for Hugging Face IterableDatasets."""
+    """Grain-compatible data source for HuggingFace IterableDatasets.
+
+    Bridges HuggingFace's IterableDataset with Google's Grain data loading
+    library, enabling efficient distributed data loading with proper sharding.
+
+    This class handles:
+    - Multi-threaded data loading
+    - Dataset sharding across distributed workers
+    - Thread-safe iteration over dataset shards
+
+    Attributes:
+        dataset: The HuggingFace IterableDataset to wrap.
+        shard_options: Grain sharding configuration.
+        num_threads: Number of worker threads for data loading.
+
+    Note:
+        Automatically handles dataset sharding based on world size and rank.
+        Issues warnings if dataset shards don't match expected shard count.
+    """
 
     def __init__(
         self,
@@ -1023,6 +1301,19 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         shard_options: pygrain.ShardOptions,
         num_threads: int = 1,
     ):
+        """Initialize the HuggingFace data source for Grain.
+
+        Args:
+            dataset: HuggingFace IterableDataset to wrap.
+            shard_options: Grain sharding configuration specifying shard index
+                          and total shard count.
+            num_threads: Number of worker threads for parallel data loading
+                        (default 1).
+
+        Note:
+            Creates separate dataset shards for each worker thread to avoid
+            contention. Warns if dataset shards don't match expected count.
+        """
         self.dataset = dataset
         self.shard_options = shard_options
         self.num_threads = num_threads
@@ -1045,9 +1336,33 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         self.data_iters = []
 
     def __len__(self):
+        """Return a large number as IterableDatasets don't have fixed length.
+
+        Returns:
+            int: A very large number (10 billion) as placeholder length.
+
+        Note:
+            IterableDatasets are potentially infinite, so we return a large
+            number to prevent Grain from stopping prematurely.
+        """
         return 10_000_000_000
 
     def __getitem__(self, index):
+        """Get the next item from the appropriate dataset shard.
+
+        Args:
+            index: Index (unused for IterableDataset, kept for API compatibility).
+
+        Returns:
+            dict: Next data sample from the dataset.
+
+        Raises:
+            IndexError: When the iterator for the current worker is exhausted.
+
+        Note:
+            Determines which dataset shard to use based on the current thread ID.
+            Lazily initializes iterators on first access.
+        """
         if not self.data_iters:
             self.data_iters = [iter(ds) for ds in self.datasets]
         thread_id_str = current_thread().name.split("_")[-1]
@@ -1063,25 +1378,68 @@ class HFDataSource(pygrain.RandomAccessDataSource):
 
 @dataclass
 class CollateMapTransform(pygrain.MapTransform):
-    """A Grain MapTransform to apply a user-defined collation function."""
+    """Grain transform for applying custom collation functions.
+
+    Wraps a user-defined collation function as a Grain MapTransform,
+    allowing custom batch processing logic in the Grain pipeline.
+
+    Attributes:
+        collate_fn: Callable that processes/collates data elements.
+    """
 
     collate_fn: callable
 
     def map(self, element):
+        """Apply the collation function to an element.
+
+        Args:
+            element: Input data element to collate.
+
+        Returns:
+            Collated/processed element.
+        """
         return self.collate_fn(element)
 
 
 @dataclass
 class ToNumpy(pygrain.MapTransform):
-    """A Grain MapTransform to apply a user-defined collation function."""
+    """Grain transform to convert data elements to NumPy arrays.
+
+    Ensures all values in a dictionary are converted to NumPy arrays,
+    which is often required for JAX-based training pipelines.
+    """
 
     def map(self, element):
+        """Convert all values in element to NumPy arrays.
+
+        Args:
+            element: Dictionary with values to convert.
+
+        Returns:
+            dict: Same dictionary with all values as NumPy arrays.
+        """
         for name, value in element.items():
             element[name] = np.asarray(value)
         return element
 
 
 def shift_and_pad(mask, *tensors):
+    """Shift tensors to align with the first non-zero mask position.
+
+    Rolls each tensor so that the first '1' in the mask appears at position 0.
+    Useful for aligning sequences that have different starting positions.
+
+    Args:
+        mask: Binary mask array indicating valid positions.
+        *tensors: Additional tensors to shift along with the mask.
+
+    Returns:
+        tuple: Shifted mask and tensors (if provided), or just mask if no tensors.
+
+    Note:
+        Modifies inputs in-place. Each row is shifted independently based on
+        its first non-zero mask position.
+    """
     for i in range(mask.shape[0]):
         first_one_idx = np.nonzero(mask[i])[0][0].item()
         mask[i] = np.roll(mask[i], shift=-first_one_idx)
@@ -1100,8 +1458,25 @@ def pad(
     padding_value: int = 0,
     padding_side: str = "right",
 ) -> jnp.ndarray:
-    """
-    Pads a list of tensors to the same shape along the first dimension.
+    """Pad a list of JAX tensors to uniform shape.
+
+    Args:
+        tensors: List of JAX arrays to pad.
+        max_lenght: Target length for padding. If None, uses maximum length
+                   found in tensors.
+        padding_value: Value to use for padding (default 0).
+        padding_side: Where to add padding - 'left' or 'right' (default 'right').
+
+    Returns:
+        jnp.ndarray: Batched and padded tensor with shape
+                    [batch_size, *tensor_shape, max_length].
+
+    Raises:
+        ValueError: If padding_side is not 'left' or 'right'.
+
+    Note:
+        Efficiently handles variable-length sequences by padding to a common length.
+        Preserves dtype of input tensors.
     """
     output_shape = tensors[0].shape[:-1]
     current_max = tensors[0].shape[-1]
@@ -1136,8 +1511,24 @@ def pad_single(
     padding_value: int = 0,
     padding_side: str = "right",
 ) -> np.ndarray:
-    """
-    Pads a single tensor to a specified length along the last dimension.
+    """Pad a single NumPy tensor along the last dimension.
+
+    Args:
+        tensor: NumPy array to pad.
+        max_length: Target length for the last dimension. If None, returns
+                   tensor unchanged.
+        padding_value: Value to use for padding (default 0).
+        padding_side: Where to add padding - 'left' or 'right' (default 'right').
+
+    Returns:
+        np.ndarray: Padded tensor with last dimension of size max_length.
+
+    Raises:
+        ValueError: If padding_side is not 'left' or 'right'.
+
+    Note:
+        If tensor is already longer than max_length, it will be truncated
+        from the appropriate side based on padding_side.
     """
     current_length = tensor.shape[-1]
 
@@ -1168,8 +1559,21 @@ def np_pad(
     padding_value: int = 0,
     padding_side: str = "right",
 ) -> np.ndarray:
-    """
-    Pads a list of tensors to the same shape along the first dimension.
+    """Pad a list of NumPy tensors to uniform shape.
+
+    Similar to pad() but for NumPy arrays instead of JAX arrays.
+
+    Args:
+        tensors: List of NumPy arrays to pad.
+        max_lenght: Target length for padding. If None, uses current max.
+        padding_value: Value to use for padding (default 0).
+        padding_side: Where to add padding - 'left' or 'right' (default 'right').
+
+    Returns:
+        np.ndarray: Batched and padded array.
+
+    Raises:
+        ValueError: If padding_side is not 'left' or 'right'.
     """
     output_shape = tensors[0].shape[:-1]
     current_max = tensors[0].shape[-1]
@@ -1204,6 +1608,21 @@ def pad_to_length(
     pad_value: int | float,
     axis: int = -1,
 ) -> chex.Array:
+    """Pad or truncate a tensor to a specific length along an axis.
+
+    Args:
+        tensor: Input array to pad or truncate.
+        length: Target length for the specified axis.
+        pad_value: Value to use for padding.
+        axis: Axis along which to pad/truncate (default -1).
+
+    Returns:
+        chex.Array: Tensor padded or truncated to the specified length.
+
+    Note:
+        If tensor is already longer than length, it will be truncated.
+        Special handling for 2D tensors.
+    """
     if tensor.shape[axis] >= length:
         if tensor.ndim == 2:
             tensor = tensor[:, :length]
@@ -1226,6 +1645,22 @@ def pad_sequence(
     padding_value=0,
     max_len: int | None = None,
 ):
+    """Pad a list of sequences to the same length.
+
+    Args:
+        sequences: List of sequences (arrays) to pad.
+        batch_first: If True, output has batch dimension first.
+                    If False, adds padding to the left (default False).
+        padding_value: Value to use for padding (default 0).
+        max_len: Maximum length to pad to. If None, uses longest sequence.
+
+    Returns:
+        jnp.ndarray: Padded sequences as a single batched array.
+
+    Note:
+        Similar to PyTorch's pad_sequence but for JAX arrays.
+        When batch_first=False, padding is added to the left.
+    """
     max_len = max(seq.shape[-1] for seq in sequences) if max_len is None else max_len
     padding_value = jnp.array(padding_value).reshape(1)
     if batch_first:
@@ -1264,6 +1699,14 @@ def pad_sequence(
 
 @contextmanager
 def leave_alone_context_manager():
+    """No-op context manager that does nothing.
+
+    Useful as a placeholder when a context manager is required but
+    no actual context management is needed.
+
+    Yields:
+        None: Simply yields control back to the caller.
+    """
     # Perform setup actions (none in this case)
     yield
 
@@ -1273,10 +1716,26 @@ def conversations_formatting_function(
     messages_field: tp.Literal["messages", "conversations"],
     tools: list | None = None,
 ):
-    r"""
-    return a callable function that takes in a "messages"
-    dataset and returns a formatted dataset, based on the processing_class
-    apply chat template to the dataset
+    """Create a formatter for conversation/chat datasets.
+
+    Returns a function that applies chat templates to conversation data,
+    converting structured conversations into formatted text suitable for
+    training chat models.
+
+    Args:
+        processing_class: Tokenizer with chat template support.
+        messages_field: Field name containing conversations - either
+                       'messages' or 'conversations'.
+        tools: Optional list of tools for function calling support.
+
+    Returns:
+        Callable: Function that formats dataset examples using the
+                 tokenizer's chat template.
+
+    Note:
+        Handles both single conversations and batches of conversations.
+        The returned function expects datasets with the specified
+        messages_field containing role-based conversation data.
     """
 
     def format_dataset(examples):
@@ -1302,9 +1761,21 @@ def conversations_formatting_function(
 
 
 def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type:ignore #noqa
-    r"""from TRL
-    return a callable function that takes in an "instructions" dataset and returns a
-    formatted dataset, based on the processing_class apply chat template to the dataset
+    """Create a formatter for instruction-following datasets.
+
+    Returns a function that converts prompt-completion pairs into
+    chat format using the tokenizer's chat template. Originally from TRL.
+
+    Args:
+        processing_class: Tokenizer with chat template support.
+
+    Returns:
+        Callable: Function that formats instruction datasets by converting
+                 prompt/completion pairs to user/assistant conversations.
+
+    Note:
+        Expects datasets with 'prompt' and 'completion' fields.
+        Automatically converts to chat format with user/assistant roles.
     """
 
     def format_dataset(examples):
@@ -1332,6 +1803,27 @@ def get_formatting_func_from_dataset(
     processing_class: "AutoTokenizer",  # type:ignore #noqa
     tools: list | None = None,
 ) -> tp.Callable | None:
+    """Automatically detect and return appropriate formatting function.
+
+    Examines dataset structure to determine the appropriate formatting
+    function (chat format or instruction format) based on field names
+    and schemas.
+
+    Args:
+        dataset: HuggingFace Dataset to analyze.
+        processing_class: Tokenizer to use for formatting.
+        tools: Optional tools for function calling support.
+
+    Returns:
+        Callable | None: Appropriate formatting function, or None if
+                        no suitable format is detected.
+
+    Note:
+        Supports:
+        - ChatML format (messages/conversations fields)
+        - Instruction format (prompt/completion fields)
+        Returns None if dataset doesn't match known formats.
+    """
     try:
         from datasets import Dataset, Value
     except ImportError as e:
@@ -1382,6 +1874,27 @@ def add_bos_token_if_needed(
     rejected_prompt_len_input_ids: int,
     rejected_tokens: dict[str, list[int]],
 ):
+    """Add beginning-of-sequence token to prompts if needed.
+
+    Ensures all prompt sequences start with BOS token for consistency
+    in preference learning scenarios.
+
+    Args:
+        bos_token_id: BOS token ID, or None if not used.
+        prompt_len_input_ids: Length of main prompt.
+        prompt_tokens: Main prompt token dictionary.
+        chosen_prompt_len_input_ids: Length of chosen prompt.
+        chosen_tokens: Chosen response token dictionary.
+        rejected_prompt_len_input_ids: Length of rejected prompt.
+        rejected_tokens: Rejected response token dictionary.
+
+    Returns:
+        tuple: (prompt_tokens, chosen_tokens, rejected_tokens) with BOS added.
+
+    Note:
+        Only adds BOS if it's not already present at the beginning.
+        Updates both input_ids and attention_mask.
+    """
     if bos_token_id is not None:
         if prompt_len_input_ids == 0 or bos_token_id != prompt_tokens["prompt_input_ids"][0]:
             prompt_tokens["prompt_input_ids"] = [bos_token_id] + prompt_tokens["prompt_input_ids"]
@@ -1400,6 +1913,23 @@ def add_eos_token_if_needed(
     chosen_tokens: dict[str, list[int]],
     rejected_tokens: dict[str, list[int]],
 ):
+    """Add end-of-sequence token to responses if needed.
+
+    Ensures both chosen and rejected responses end with EOS token
+    for proper sequence termination.
+
+    Args:
+        eos_token_id: EOS token ID to add.
+        chosen_tokens: Chosen response token dictionary.
+        rejected_tokens: Rejected response token dictionary.
+
+    Returns:
+        tuple: (chosen_tokens, rejected_tokens) with EOS added.
+
+    Note:
+        Only adds EOS if it's not already present at the end.
+        Updates both input_ids and attention_mask.
+    """
     if len(chosen_tokens["input_ids"]) == 0 or eos_token_id != chosen_tokens["input_ids"][-1]:
         chosen_tokens["input_ids"].append(eos_token_id)
         chosen_tokens["attention_mask"].append(1)
@@ -1410,9 +1940,23 @@ def add_eos_token_if_needed(
 
 
 def first_true_indices(bools, dtype=jnp.int32):
-    """
-    Takes an N-dimensional bool array and returns an (N-1)-dimensional array of integers giving
-    the position of the first True in each "row".
+    """Find the index of the first True value along the last axis.
+
+    Takes an N-dimensional bool array and returns an (N-1)-dimensional array
+    of integers giving the position of the first True in each "row".
+
+    Args:
+        bools: N-dimensional boolean array to search.
+        dtype: Data type for the output indices (default jnp.int32).
+
+    Returns:
+        jnp.ndarray: (N-1)-dimensional array of indices where each element
+                    is the position of the first True in the corresponding row.
+                    Returns row_len if no True values found.
+
+    Note:
+        Uses a clever trick with minimum to find first True efficiently.
+        Returns the row length if no True value is found in a row.
     """
     row_len = bools.shape[-1]
     zero_or_index = row_len * (~bools).astype(dtype) + jnp.arange(row_len, dtype=dtype)
@@ -1420,8 +1964,24 @@ def first_true_indices(bools, dtype=jnp.int32):
 
 
 def truncate_right(input_ids, stop_token_id, pad_token_id):
-    """
-    Truncates the input array from the right side after the first occurrence of the stop token.
+    """Truncate sequences after the first occurrence of stop token.
+
+    Replaces all tokens after the first stop token with padding tokens
+    and creates a corresponding attention mask.
+
+    Args:
+        input_ids: 2D array of token IDs [batch_size, sequence_length].
+        stop_token_id: Token ID that marks where to stop.
+        pad_token_id: Token ID to use for padding truncated positions.
+
+    Returns:
+        tuple: (output_ids, mask) where:
+              - output_ids: Input with post-stop tokens replaced by padding
+              - mask: Binary attention mask (1 for valid, 0 for padded)
+
+    Note:
+        Useful for truncating generated sequences at EOS tokens.
+        Preserves the stop token itself in the output.
     """
     trunc_idxs = first_true_indices(input_ids == stop_token_id).reshape((-1, 1))
     idxs = jnp.arange(input_ids.shape[1]).reshape((1, -1))

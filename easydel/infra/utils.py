@@ -57,8 +57,6 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache, partial
 
-import flax
-import flax.core
 import jax
 import jax.tree_util
 import numpy as np
@@ -156,10 +154,38 @@ def canonicalize_dtype(
     return dtype
 
 
-def get_gradient_checkpoint_policy(name):
-    """
-    The get_gradient_checkpoint_policy function is a helper function that returns the gradient checkpoint policy
-    specified by the name parameter.
+def get_gradient_checkpoint_policy(name: str) -> tp.Callable:
+    """Get a gradient checkpointing policy by name.
+
+    Retrieves a JAX gradient checkpointing policy function that determines
+    which intermediate values to save during forward pass for use in backward pass.
+    This is used to trade compute for memory in gradient calculations.
+
+    Args:
+        name: Name of the checkpointing policy. Supported values:
+            - 'everything_saveable': Save all intermediate values
+            - 'nothing_saveable': Save no intermediate values (maximum recomputation)
+            - 'dots_saveable': Save dot product results
+            - 'checkpoint_dots': Checkpoint dot operations
+            - 'dots_with_no_batch_dims_saveable': Save dots without batch dimensions
+            - 'checkpoint_dots_with_no_batch_dims': Checkpoint dots without batch dims
+            - 'save_anything_except_these_names': Save all except specified names
+            - 'save_any_names_but_these': Save any names except specified
+            - 'save_only_these_names': Save only specified names
+            - 'save_from_both_policies': Combine two policies
+
+    Returns:
+        The corresponding JAX checkpoint policy function.
+
+    Raises:
+        KeyError: If the policy name is not recognized.
+
+    Example:
+        >>> policy = get_gradient_checkpoint_policy('dots_saveable')
+        >>> # Use with jax.checkpoint
+        >>> @jax.checkpoint(policy=policy)
+        ... def forward(x):
+        ...     return x @ x.T
     """
     gradients = dict(
         everything_saveable=jax.checkpoint_policies.everything_saveable,
@@ -240,7 +266,36 @@ def get_dot_general_by_bits(
     return {}  # empty just in case of not getting any error
 
 
-def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
+def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -> jax.Array:
+    """Apply a feed-forward network block-wise to reduce memory usage.
+
+    Implements the block-wise feed-forward approach from the near-infinite
+    context length paper. This technique processes the FFN in chunks along
+    the sequence dimension to reduce peak memory usage during training.
+
+    Args:
+        remat_ffn: The feed-forward network function to apply. Should be
+            rematerialized (checkpointed) for memory efficiency.
+        inputs: Input tensor with shape (batch_size, sequence_length, hidden_dim).
+        chunk_size: Size of chunks to process. Sequence length must be
+            divisible by chunk_size.
+
+    Returns:
+        Output tensor with same shape as inputs.
+
+    Raises:
+        EasyDeLBlockWiseFFNError: If inputs have wrong shape or chunk_size
+            doesn't divide sequence length evenly.
+
+    Note:
+        - For generation (sequence_length=1), applies FFN directly without chunking
+        - For training, processes sequence in chunks to reduce memory
+        - Requires sequence_length to be divisible by chunk_size
+
+    Example:
+        >>> ffn = lambda x: mlp(x)  # Your FFN function
+        >>> chunked_output = block_wise_ffn(ffn, inputs, chunk_size=256)
+    """
     generating = inputs.shape[1] == 1
     try:
         if generating:
@@ -492,7 +547,6 @@ def apply_sparsity_to_params(
     sparsify_module: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
     verbose: bool = True,
 ) -> dict[str, tp.Any] | tp.Any:
-    its_frozen = isinstance(params, flax.core.FrozenDict)
     flatten = is_flatten(params)
     if not flatten:
         params = flatten_dict(params)
@@ -529,8 +583,6 @@ def apply_sparsity_to_params(
 
     if not flatten:
         params = unflatten_dict(params)
-    if its_frozen:
-        return flax.core.FrozenDict(params)
     return params
 
 
@@ -928,6 +980,20 @@ def count_flop_jaxpr(jaxpr) -> int:
 
 
 class TraceResult:
+    """Container for XLA executable trace results with cost analysis.
+
+    Wraps an XLA executable and provides lazy access to its cost analysis,
+    including FLOP counts and other performance metrics.
+
+    Attributes:
+        _executable: The underlying XLA executable.
+        _cached_cost: Cached cost analysis result.
+
+    Properties:
+        cost_analysis: Returns the cost analysis dict (cached after first access).
+        flops: Returns the FLOP count from cost analysis.
+    """
+
     def __init__(self, executable):
         self._executable = executable
         self._cached_cost = None
@@ -943,6 +1009,22 @@ class TraceResult:
 
 
 class FunctionTracer:
+    """Tracer for capturing new XLA executables during compilation.
+
+    Used to track which functions are compiled during a trace operation.
+    Captures the difference between executables before and after tracing.
+
+    Attributes:
+        new_executables: List of TraceResult objects for newly compiled functions.
+        _before: Set of executables that existed before tracing started.
+
+    Example:
+        >>> with trace_functions() as tracer:
+        ...     result = jitted_function(x)
+        >>> print(f"Compiled {len(tracer.new_executables)} functions")
+        >>> print(f"Total FLOPs: {sum(t.flops for t in tracer.new_executables)}")
+    """
+
     def __init__(self):
         self.new_executables: list[TraceResult] = []
         self._before: set = set()
@@ -952,6 +1034,30 @@ class FunctionTracer:
 
 
 class CompilationTracker:
+    """Tracks XLA compilation and FLOP counts across function calls.
+
+    Monitors the compilation of XLA executables and accumulates their
+    FLOP counts. Useful for profiling and understanding computational
+    costs of JAX programs.
+
+    Attributes:
+        first_time: Whether this is the first compilation trace.
+        cached_flops: Total accumulated FLOPs from all compiled functions.
+        functions: List of compiled XLA executables.
+
+    Properties:
+        online_flops: Current total FLOPs from all tracked functions.
+
+    Methods:
+        trace_compilation: Context manager for tracing compilation.
+
+    Example:
+        >>> tracker = CompilationTracker()
+        >>> with tracker.trace_compilation():
+        ...     result = model(inputs)
+        >>> print(f"Total FLOPs: {tracker.cached_flops}")
+    """
+
     def __init__(self):
         self.first_time = True
         self.cached_flops = 0
@@ -1046,6 +1152,26 @@ class AttnMaskType(str, Enum):
 
 @auto_pytree
 class AttnMaskDetail:
+    """Details for attention mask configuration.
+
+    Specifies the type and parameters of attention masking to use.
+    Registered as a JAX pytree for use in JAX transformations.
+
+    Attributes:
+        mask_type: Type of attention mask (FULL, SLIDING, or CHUNK).
+        size: Size parameter for the mask (e.g., window size for sliding).
+        offset: Optional offset for mask positioning.
+        chunks: Optional number of chunks for chunk attention.
+        bricks: Optional number of bricks for hierarchical attention.
+
+    Example:
+        >>> mask_detail = AttnMaskDetail(
+        ...     mask_type=AttnMaskType.SLIDING,
+        ...     size=512,
+        ...     offset=0
+        ... )
+    """
+
     mask_type: AttnMaskType
     size: int
     offset: int | None = None
@@ -1071,6 +1197,52 @@ class TaskType(str, Enum):
 
 @dataclass
 class FlopCalcConfig:
+    """Configuration for calculating FLOPs in transformer models.
+
+    Comprehensive configuration that captures all parameters needed to
+    calculate the theoretical FLOP count for various transformer architectures
+    including encoder-decoder, MoE, and vision transformers.
+
+    Attributes:
+        hidden_dim: Hidden dimension of the model.
+        intermediate_dim: Dimension of FFN intermediate layer.
+        num_layers: Number of decoder (or encoder-only) layers.
+        num_heads: Number of attention heads.
+        kv_heads: Number of key-value heads (for GQA/MQA).
+        head_dim: Dimension of each attention head.
+        seq_len: Sequence length for decoder or encoder-only models.
+        enc_num_layers: Number of encoder layers (for seq2seq).
+        enc_seq_len: Encoder sequence length (for seq2seq).
+        glu: Whether using GLU activation in FFN.
+        num_experts: Number of MoE experts.
+        num_shared_experts: Number of shared experts in MoE.
+        num_experts_per_tok: Experts activated per token.
+        activation_type: Type of activation function.
+        task: Model task type (affects head computation).
+        vocab_size: Vocabulary size for LM head.
+        num_labels: Number of labels for classification.
+        vision_hidden_dim: Hidden dim for vision transformer.
+        vision_intermediate_dim: FFN dim for vision transformer.
+        vision_num_layers: Number of vision transformer layers.
+        vision_num_heads: Number of vision attention heads.
+        vision_seq_len: Vision sequence length (patches).
+        include_loss: Whether to include loss computation in FLOPs.
+
+    Example:
+        >>> config = FlopCalcConfig(
+        ...     hidden_dim=768,
+        ...     intermediate_dim=3072,
+        ...     num_layers=12,
+        ...     num_heads=12,
+        ...     kv_heads=12,
+        ...     head_dim=64,
+        ...     seq_len=1024,
+        ...     task=TaskType.CAUSAL_LM,
+        ...     vocab_size=50000
+        ... )
+        >>> flops = flops_per_token(config)
+    """
+
     # Core transformer body: for decoder-only and encoder-only models
     hidden_dim: int
     intermediate_dim: int
@@ -1326,10 +1498,22 @@ def trace_functions():
         tracer.new_executables = [TraceResult(exe) for exe in new]
 
 
-class ModuleCaches(nn.Cache): ...
+class ModuleCaches(nn.Cache):
+    """Cache container for module-level cached values.
+
+    Extends flax.nnx.Cache to provide caching functionality for
+    EasyDeL modules, particularly for caching computed values like
+    frequencies, masks, and other reusable tensors.
+    """
 
 
-class OverWriteWithGradient(nn.Param): ...
+class OverWriteWithGradient(nn.Param):
+    """Parameter type that allows gradient overwrites.
+
+    Special parameter container that permits gradients to directly
+    overwrite the parameter values during optimization, useful for
+    certain advanced optimization techniques.
+    """
 
 
 if tp.TYPE_CHECKING:

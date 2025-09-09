@@ -17,8 +17,6 @@ import os
 import typing as tp
 from abc import ABCMeta, abstractmethod
 
-import flax
-import flax.core
 import jax
 import numpy as np
 import optax
@@ -270,61 +268,145 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         This method ensures all required attributes are properly initialized,
         preventing AttributeError during training. It sets up timers, trackers,
         compilation managers, and other essential components.
+
+        Note:
+            Must be called during trainer initialization to set up:
+            - Timer and wandb runtime
+            - Dataloaders and max steps
+            - Optimizer and scheduler
+            - Flops tracking metrics
+            - Checkpoint manager
+            - Model state and sharding
+            - Compilation trackers
         """
         ...
 
     @abstractmethod
     def _initialize_memory_tracking(self):
         """
-        Initializes memory tracking if enabled.
+        Initialize memory tracking for GPU/TPU memory monitoring.
+
+        This method sets up memory monitoring to track memory usage
+        during training when track_memory is enabled in arguments.
+
+        Note:
+            Only initialized when performance_mode is False.
+            Uses SMPMemoryMonitor with configurable sampling interval.
         """
         ...
 
     @abstractmethod
     def initialize_trainer_utils(self):
         """
-        Initializes all trainer utilities.
+        Initialize all trainer utilities in the correct order.
+
+        This orchestration method sets up all trainer components:
+        1. Weights & Biases logging (if enabled)
+        2. Training timer for performance monitoring
+        3. Dataloaders for training and evaluation
+        4. Model, optimizer, and learning rate scheduler
+        5. Model state sharding across devices
+        6. Compiled training and evaluation functions
+
+        Note:
+            The initialization order is critical as later steps
+            depend on earlier ones being completed.
         """
         ...
 
     @abstractmethod
     def _initialize_wandb(self):
         """
-        Initializes Weights & Biases if enabled.
+        Initialize Weights & Biases logging integration.
+
+        Sets up W&B runtime for experiment tracking and metrics
+        logging when use_wandb is enabled in training arguments.
+
+        Note:
+            Only initialized if arguments.use_wandb is True.
+            Uses arguments.get_wandb_init() for configuration.
         """
         ...
 
     @abstractmethod
     def _initialize_timer(self):
         """
-        Initializes the training timer.
+        Initialize the timer for performance monitoring.
+
+        Sets up a Timers instance for tracking execution time
+        of various training operations with optional TensorBoard
+        integration for visualization.
+
+        Note:
+            TensorBoard writer is obtained from arguments.get_tensorboard().
         """
         ...
 
     @abstractmethod
     def _configure_dataloaders(self):
         """
-        Configures the dataloaders for training and evaluation.
+        Configure dataloaders for training and evaluation.
+
+        Sets up data loading pipelines using either Grain or TensorFlow
+        datasets based on configuration. Handles:
+        - Dataset offloading to specified devices if enabled
+        - Calculation of maximum training and evaluation steps
+        - Proper batch size and epoch configuration
+
+        Note:
+            Results are stored as dataloader_train, dataloader_eval,
+            max_training_steps, and max_evaluation_steps attributes.
         """
         ...
 
     @abstractmethod
     def _configure_model(self):
         """
-        Configures the model, optimizer, scheduler, and configuration.
+        Configure model, optimizer, scheduler, and configuration.
+
+        Retrieves and sets up:
+        - Model instance
+        - Gradient transformation (optimizer)
+        - Learning rate scheduler
+        - Model configuration
+
+        Note:
+            Results are stored as _model, tx, scheduler, and config attributes.
+            Time taken for configuration is logged for performance monitoring.
         """
         ...
 
     @abstractmethod
     def _configure_functions(self):
         """
-        Configures and JIT-compiles the training and evaluation step functions.
+        Configure and JIT-compile training and evaluation step functions.
+
+        Sets up:
+        - JIT-compiled training step function
+        - JIT-compiled evaluation step function (if applicable)
+        - Device mesh for distributed computation
+        - Checkpoint manager for saving/loading
+
+        Note:
+            Functions are compiled with appropriate static arguments
+            for optimal performance. Results stored as instance attributes.
         """
         ...
 
     @abstractmethod
     def _configure_state(self):
-        """Configures and JIT-compiles the sharded state"""
+        """
+        Configure and shard model state across devices.
+
+        Handles:
+        - Optimizer state initialization or reinitialization after checkpoint resumption
+        - Creation of sharding specifications based on partition rules
+        - Distribution of the model state across the device mesh
+
+        Note:
+            Ensures proper optimizer state initialization whether starting fresh
+            or resuming from checkpoint. Uses model's partition rules for sharding.
+        """
         ...
 
     @abstractmethod
@@ -334,7 +416,20 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         truncation_mode: tp.Literal["keep_end", "keep_start"],
     ) -> tp.Callable:
         """
-        Creates a function to collect and process batches of data for training or evaluation.
+        Create a Grain data collection function for batch processing.
+
+        Args:
+            max_sequence_length: Maximum allowed sequence length for padding/truncation.
+            truncation_mode: How to truncate sequences exceeding max length:
+                - "keep_end": Keep the end of the sequence
+                - "keep_start": Keep the beginning of the sequence
+
+        Returns:
+            Callable that processes batches for Grain dataloader.
+
+        Note:
+            Function should handle padding, truncation, and data format conversion
+            compatible with Grain's data pipeline.
         """
         ...
 
@@ -345,7 +440,20 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         truncation_mode: tp.Literal["keep_end", "keep_start"],
     ) -> tp.Callable:
         """
-        Creates a function to collect and process batches of data for training or evaluation.
+        Create a TensorFlow Dataset collection function for batch processing.
+
+        Args:
+            max_sequence_length: Maximum allowed sequence length for padding/truncation.
+            truncation_mode: How to truncate sequences exceeding max length:
+                - "keep_end": Keep the end of the sequence
+                - "keep_start": Keep the beginning of the sequence
+
+        Returns:
+            Callable that processes batches for TensorFlow datasets.
+
+        Note:
+            Function should handle padding, truncation, and data format conversion
+            compatible with tf.data API.
         """
         ...
 
@@ -356,7 +464,20 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         truncation_mode: tp.Literal["keep_end", "keep_start"],
     ) -> tp.Callable:
         """
-        Creates a function to collect and process batches of data for training or evaluation.
+        Create a generic data collection function for batch processing.
+
+        Args:
+            max_sequence_length: Maximum allowed sequence length for padding/truncation.
+            truncation_mode: How to truncate sequences exceeding max length:
+                - "keep_end": Keep the end of the sequence
+                - "keep_start": Keep the beginning of the sequence
+
+        Returns:
+            Callable that processes batches of data.
+
+        Note:
+            This is a generic version that can be used with any dataloader type.
+            Implementations should handle padding, truncation, and format conversion.
         """
         ...
 
@@ -377,14 +498,43 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @abstractmethod
     def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
         """
-        Configures the dataloaders for training and evaluation.
+        Configure dataloaders for training and evaluation.
+
+        Creates training and evaluation dataloaders using the provided
+        datasets and data collator. Determines the maximum number of
+        training and evaluation steps based on dataset sizes and arguments.
+
+        Returns:
+            TrainerConfigureDataloaderOutput containing:
+            - dataloader_train: Training data iterator
+            - max_training_steps: Total training steps
+            - dataloader_eval: Optional evaluation data iterator
+            - max_evaluation_steps: Optional total evaluation steps
+
+        Note:
+            Automatically selects between Grain and TensorFlow dataloaders
+            based on arguments.use_grain setting.
         """
         ...
 
     @abstractmethod
     def configure_model(self) -> TrainerConfigureModelOutput:
         """
-        Configures the model, optimizer, scheduler, and configuration.
+        Configure model, optimizer, scheduler, and configuration.
+
+        Retrieves model configuration from the model state and creates
+        the optimizer and scheduler using training arguments.
+
+        Returns:
+            TrainerConfigureModelOutput containing:
+            - model: The EasyDeL model instance
+            - tx: Gradient transformation (optimizer)
+            - scheduler: Learning rate schedule
+            - config: Optional model configuration
+
+        Note:
+            If pruning_module is set, it wraps the optimizer for
+            structured pruning support.
         """
         ...
 
@@ -496,22 +646,73 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
     @staticmethod
     @abstractmethod
     def count_model_parameters(prm):
-        """Prints the number of model parameters in billions."""
+        """
+        Count total number of model parameters.
+
+        Args:
+            prm: Model parameters (can be frozen or unfrozen PyTree).
+
+        Returns:
+            int: Total number of parameters in the model.
+
+        Note:
+            Handles both frozen and unfrozen Flax parameter dictionaries.
+        """
         ...
 
     @abstractmethod
     def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
-        """Apply training hooks to the model."""
+        """
+        Apply training hooks to check for issues and enforce limits.
+
+        Args:
+            metrics: Current training metrics including loss.
+
+        Returns:
+            LossMetrics: Potentially modified metrics.
+
+        Raises:
+            EasyDeLBreakRequest: If NaN loss detected and break_on_nan is True.
+            EasyDeLTimerError: If training time limit exceeded.
+
+        Note:
+            Checks for NaN losses and training time limits based on
+            configuration in training arguments.
+        """
         ...
 
     @abstractmethod
     def _should_save_checkpoint(self, current_step):
-        """Determine if checkpoint should be saved at current step."""
+        """
+        Determine if checkpoint should be saved at current step.
+
+        Args:
+            current_step: The current training step number.
+
+        Returns:
+            bool: True if checkpoint should be saved, False otherwise.
+
+        Note:
+            Based on save_steps configuration in training arguments.
+            Only saves if current_step > 0 and divisible by save_steps.
+        """
         ...
 
     @abstractmethod
     def _should_run_evaluation(self, current_step):
-        """Determine if evaluation process should be runned current step."""
+        """
+        Determine if evaluation should be run at current step.
+
+        Args:
+            current_step: The current training step number.
+
+        Returns:
+            bool: True if evaluation should be run, False otherwise.
+
+        Note:
+            Based on evaluation_steps configuration in training arguments.
+            Only evaluates if current_step > 0 and divisible by evaluation_steps.
+        """
         ...
 
     @abstractmethod
@@ -520,7 +721,23 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         state: EasyDeLState,
         run_exception: Exception | None = None,
     ):
-        """Prepare training output after training loop completion."""
+        """
+        Prepare final training output after training completion.
+
+        Args:
+            state: Final model state after training.
+            run_exception: Optional exception that interrupted training.
+
+        Returns:
+            TrainerOutput: Contains final state, mesh, and checkpoint path.
+
+        Note:
+            Handles different exception types appropriately:
+            - KeyboardInterrupt: Saves state and exits gracefully
+            - EasyDeLTimerError: Saves state when time limit reached
+            - StopIteration: Normal completion
+            - Other exceptions: Re-raised as RuntimeError
+        """
         ...
 
     @abstractmethod
@@ -531,17 +748,58 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
         gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
     ):
-        """Handle training interruption gracefully."""
+        """
+        Handle training interruption gracefully.
+
+        Args:
+            state: Current model state at interruption.
+            exception: The exception that caused interruption.
+            shard_fns: Functions for sharding data.
+            gather_fns: Functions for gathering sharded data.
+
+        Returns:
+            TrainerOutput or similar containing saved state.
+
+        Note:
+            Saves current state before exiting to allow resumption.
+            Handles KeyboardInterrupt and EasyDeLTimerError specially.
+        """
         ...
 
     @abstractmethod
     def _setup_initial_metrics(self, state):
-        """Setup initial metrics logging."""
+        """
+        Setup initial metrics logging at training start.
+
+        Args:
+            state: Model state for extracting parameter count.
+
+        Note:
+            Logs:
+            - Model parameter count
+            - Device and platform information
+            - JAX configuration flags
+            - Other system configuration
+        """
         ...
 
     @abstractmethod
     def _get_next_batch(self, data_iter, dataloader):
-        """Get next batch from iterator, reinitializing if needed."""
+        """
+        Get next batch from iterator, reinitializing if needed.
+
+        Args:
+            data_iter: Current data iterator.
+            dataloader: The dataloader to reinitialize from if exhausted.
+
+        Returns:
+            tuple: (batch, updated_data_iter) where batch is the next data
+                  and updated_data_iter is the potentially reinitialized iterator.
+
+        Note:
+            Automatically reinitializes iterator when StopIteration occurs.
+            Removes IDs specified in arguments.ids_to_pop_from_dataset.
+        """
         ...
 
     @abstractmethod
@@ -551,11 +809,38 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         desc: str = "",
         disabled: bool = False,
     ) -> BaseProgressBar:
-        """Create a progress bar of the specified type."""
+        """
+        Create a progress bar of the specified type.
+
+        Args:
+            total: Total number of steps for the progress bar.
+            desc: Description text to display.
+            disabled: Whether to disable the progress bar.
+
+        Returns:
+            BaseProgressBar: Progress bar instance of the configured type.
+
+        Note:
+            Type is determined by arguments.progress_bar_type:
+            - "tqdm": Standard tqdm progress bar
+            - "rich": Rich library progress bar with metrics
+            - "json": JSON-formatted progress output
+            - disabled=True returns NullProgressBar
+        """
 
     @abstractmethod
     def log_weight_distribution(self, state: EasyDeLState, step: int):
-        """Log distribution of weights."""
+        """
+        Log weight distribution statistics.
+
+        Args:
+            state: Model state containing parameters.
+            step: Current training step.
+
+        Note:
+            Logs statistics like mean, std, min, max of weights
+            for monitoring training stability.
+        """
 
     @abstractmethod
     def log_metrics(
@@ -565,7 +850,20 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         step: int,
         mode: str = "train",
     ) -> None:
-        """Log metrics and update progress bar."""
+        """
+        Log metrics and update progress bar.
+
+        Args:
+            metrics: Dictionary of metric names and values.
+            pbar: Progress bar instance to update.
+            step: Current step number.
+            mode: "train" or "eval" to prefix metrics.
+
+        Note:
+            - Updates progress bar every log_steps
+            - Logs to wandb/tensorboard every report_steps
+            - Filters out internal metrics (mlperf, grad_norm)
+        """
 
     @abstractmethod
     def _run_training_loop(
@@ -605,7 +903,21 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         step_metrics: StepMetrics,
         start_time: float,
     ):
-        """Core evaluation implementation."""
+        """
+        Execute the core evaluation loop.
+
+        Args:
+            state: Current model state.
+            metrics_tracker: Tracker for accumulating metrics.
+            step_metrics: Calculator for per-step metrics.
+            start_time: Evaluation start timestamp.
+
+        Returns:
+            tuple: (final_state, metrics) containing evaluation results.
+
+        Note:
+            Runs evaluation on the entire eval dataset without updating parameters.
+        """
         ...
 
     @abstractmethod
@@ -619,7 +931,25 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         pbar: BaseProgressBar,
         epoch: int,
     ):
-        """Handles training for a single epoch."""
+        """
+        Handle training for a single epoch.
+
+        Args:
+            state: Current model state.
+            train_dataset: Training dataset.
+            train_iter: Training data iterator.
+            metrics_tracker: Metrics accumulator.
+            step_metrics: Per-step metrics calculator.
+            pbar: Progress bar to update.
+            epoch: Current epoch number.
+
+        Returns:
+            tuple: (updated_state, updated_train_iter, exception_or_none)
+
+        Note:
+            Processes all batches in the epoch, updating parameters
+            and tracking metrics at each step.
+        """
         ...
 
     @abstractmethod
@@ -632,7 +962,24 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
     ):
-        """Handles training for a single epoch."""
+        """
+        Handle evaluation for a single epoch.
+
+        Args:
+            state: Current model state.
+            eval_dataset: Evaluation dataset.
+            eval_iter: Evaluation data iterator.
+            metrics_tracker: Metrics accumulator.
+            step_metrics: Per-step metrics calculator.
+            pbar: Progress bar to update.
+
+        Returns:
+            tuple: (final_state, updated_eval_iter)
+
+        Note:
+            Processes all batches without updating parameters,
+            only computing and tracking evaluation metrics.
+        """
         ...
 
     @property
@@ -650,45 +997,106 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def _configure_grain_dataloader(self) -> TrainerConfigureDataloaderOutput:
-        """Configure Grain dataloader."""
+        """
+        Configure Grain dataloaders for training and evaluation.
+
+        Returns:
+            TrainerConfigureDataloaderOutput containing:
+            - Grain DataLoader for training
+            - Maximum training steps
+            - Optional Grain DataLoader for evaluation
+            - Optional maximum evaluation steps
+
+        Note:
+            Grain is Google's data loading library optimized for JAX.
+            Handles sharding, batching, and preprocessing efficiently.
+        """
         ...
 
     @abstractmethod
     def _configure_tfds_dataloader(self) -> TrainerConfigureDataloaderOutput:
-        """Configure TensorFlow dataloader."""
+        """
+        Configure TensorFlow Dataset dataloaders.
+
+        Returns:
+            TrainerConfigureDataloaderOutput containing:
+            - TensorFlow Dataset for training
+            - Maximum training steps
+            - Optional TensorFlow Dataset for evaluation
+            - Optional maximum evaluation steps
+
+        Raises:
+            ImportError: If tensorflow is not installed.
+
+        Note:
+            Uses tf.data API with automatic batching and prefetching.
+            Disables GPU devices to prevent TensorFlow from using them.
+        """
         ...
 
     @abstractmethod
     def _execute_eval_step(self, state, batch) -> LossMetrics:
-        """Execute a single eval step."""
+        """
+        Execute a single evaluation step.
+
+        Args:
+            state: Current model state.
+            batch: Input batch data.
+
+        Returns:
+            LossMetrics: Evaluation metrics for this batch.
+
+        Note:
+            Should not update model parameters, only compute metrics.
+        """
         ...
 
     @abstractmethod
-    def _execute_train_step(self, state, batch) -> tuple[EasyDeLState, LossMetrics, Exception]:
-        """Execute a single train step."""
+    def _execute_train_step(self, state, batch) -> tuple[EasyDeLState, LossMetrics, Exception | None]:
+        """
+        Execute a single training step.
+
+        Args:
+            state: Current model state.
+            batch: Input batch data.
+
+        Returns:
+            tuple containing:
+            - Updated model state with new parameters
+            - Training metrics for this batch
+            - Exception if any occurred, None otherwise
+
+        Note:
+            Computes gradients and updates model parameters.
+        """
         ...
 
     @abstractmethod
     def _finalize_training(self, output, run_exception):
-        """Finalize training and prepare output."""
+        """
+        Finalize training and prepare output.
+
+        Args:
+            output: Training output to finalize.
+            run_exception: Exception that occurred during training, if any.
+
+        Returns:
+            Final training output with any necessary cleanup.
+
+        Note:
+            Performs cleanup tasks like closing progress bars,
+            finishing wandb runs, and preparing final checkpoint.
+        """
         ...
 
     @abstractmethod
-    def train(
-        self,
-        model_parameters: flax.core.FrozenDict | None = None,
-        state: EasyDeLState | None = None,
-    ) -> tp.Any:
+    def train(self) -> tp.Any:
         """
         Execute the complete training process.
 
         This is the main entry point for training. It orchestrates the entire
         training workflow including initialization, training loops, evaluation,
         checkpointing, and finalization.
-
-        Args:
-            model_parameters: Optional model parameters to use
-            state: Optional model state to use instead of self.model_state
 
         Returns:
             TrainerOutput or similar object containing final state and metrics

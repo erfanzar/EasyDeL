@@ -23,7 +23,6 @@ from functools import cached_property
 
 import contextlib2
 import flax
-import flax.core
 import flax.nnx
 import grain.python as grain
 import jax
@@ -33,7 +32,6 @@ from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from flax import nnx as nn
-from flax.core import unfreeze
 from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import PartitionSpec
@@ -164,6 +162,7 @@ class BaseTrainer(BaseTrainerProtocol):
         if self.arguments.track_memory and self.arguments.track_memory > 0:
             self._initialize_memory_tracking()
 
+    @classmethod
     def load_trainer_state(
         cls,
         load_directory: str | os.PathLike,
@@ -202,39 +201,96 @@ class BaseTrainer(BaseTrainerProtocol):
         This class method reconstructs a trainer instance from a previously saved
         checkpoint, including the model state and training arguments.
 
-        Args:
-            load_directory: Path to the checkpoint directory
-            dataset_train: Training dataset to use with the loaded trainer
-            dataset_eval: Evaluation dataset to use with the loaded trainer
-            data_collator: Data collation function
-            device: Device to load the model on (default: "cpu")
-            dtype: Data type for computations
-            param_dtype: Data type for model parameters
-            precision: JAX precision level for matrix multiplications
-            sharding_axis_dims: Dimensions for sharding axes (dp, fsdp, ep, tp, sp)
-            sharding_dcn_axis_dims: DCN-specific sharding dimensions
-            sharding_axis_names: Names for the sharding axes
-            partition_axis: Custom partition axis configuration
-            shard_attention_computation: Whether to shard attention computations
-            shard_fns: Custom sharding functions for specific operations
-            backend: Computation backend (CPU, GPU, TPU)
-            platform: Platform-specific configuration
-            config_kwargs: Additional configuration parameters
-            model_task: Task type for the model
-            auto_shard_model: Whether to automatically shard the model
-            partition_rules: Rules for partitioning model parameters
-            quantization_platform: Platform for quantization
-            quantization_method: Method for quantization
-            quantization_block_size: Block size for quantization
-            quantization_pattern: Pattern for selective quantization
-            quantize_tensors: Whether to quantize tensors
-            verbose: Whether to print loading progress
-            base_state: Base state class to use for loading
-            trainer_init_arguments: Additional arguments for trainer initialization
-            **kwargs: Additional keyword arguments
+        Parameters
+        ----------
+        load_directory : str | os.PathLike
+            Path to the checkpoint directory containing saved model state
+        dataset_train : Dataset | None, optional
+            Training dataset to use with the loaded trainer
+        dataset_eval : Dataset | None, optional
+            Evaluation dataset to use with the loaded trainer
+        data_collator : tp.Callable | None, optional
+            Function to collate batches of data
+        device : jax.Device | None, optional
+            Device to load the model on, by default "cpu"
+        dtype : jnp.dtype, optional
+            Data type for computations, by default jnp.bfloat16
+        param_dtype : jnp.dtype, optional
+            Data type for model parameters, by default jnp.bfloat16
+        precision : jax.lax.Precision | None, optional
+            JAX precision level for matrix multiplications
+        sharding_axis_dims : tp.Sequence[int], optional
+            Dimensions for sharding axes (dp, fsdp, ep, tp, sp), by default (1, -1, 1, 1, 1)
+        sharding_dcn_axis_dims : tp.Sequence[int] | None, optional
+            DCN-specific sharding dimensions for cross-data-center training
+        sharding_axis_names : tp.Sequence[str], optional
+            Names for the sharding axes, by default ("dp", "fsdp", "ep", "tp", "sp")
+        partition_axis : PartitionAxis | None, optional
+            Custom partition axis configuration
+        shard_attention_computation : bool, optional
+            Whether to shard attention computations, by default True
+        shard_fns : tp.Mapping[tuple, tp.Callable] | dict | None, optional
+            Custom sharding functions for specific operations
+        backend : EasyDeLBackends | None, optional
+            Computation backend (CPU, GPU, TPU)
+        platform : EasyDeLPlatforms | None, optional
+            Platform-specific configuration
+        config_kwargs : EasyDeLBaseConfigDict | None, optional
+            Additional configuration parameters
+        model_task : TaskType, optional
+            Task type for the model, by default TaskType.AUTO_BIND
+        auto_shard_model : bool, optional
+            Whether to automatically shard the model, by default True
+        partition_rules : tuple[tuple[str, PartitionSpec], ...] | None, optional
+            Rules for partitioning model parameters across devices
+        quantization_platform : EasyDeLPlatforms | None, optional
+            Platform for quantization operations
+        quantization_method : EasyDeLQuantizationMethods | None, optional
+            Method for quantization (e.g., INT8, FP8)
+        quantization_block_size : int, optional
+            Block size for quantization, by default 128
+        quantization_pattern : str | None, optional
+            Pattern for selective quantization of layers
+        quantize_tensors : bool, optional
+            Whether to quantize tensors, by default True
+        verbose : bool, optional
+            Whether to print loading progress, by default True
+        base_state : type[EasyDeLState] | None, optional
+            Base state class to use for loading, defaults to EasyDeLState
+        trainer_init_arguments : dict[str, tp.Any] | None, optional
+            Additional arguments for trainer initialization
+        **kwargs
+            Additional keyword arguments passed to state loading
 
         Returns:
-            BaseTrainer: A new trainer instance loaded from the checkpoint
+            BaseTrainer A new trainer instance loaded from the checkpoint with the specified configuration
+
+        Raises:
+            FileNotFoundError
+                If the checkpoint directory does not exist
+            ValueError
+                If the checkpoint files are corrupted or incompatible
+
+        Examples
+        --------
+        >>> # Load a trainer from checkpoint
+        >>> trainer = MyTrainer.load_trainer_state(
+        ...     load_directory="/path/to/checkpoint",
+        ...     dataset_train=train_dataset,
+        ...     dataset_eval=eval_dataset,
+        ...     device=jax.devices("gpu")[0]
+        ... )
+
+        >>> # Resume training from the loaded state
+        >>> output = trainer.train()
+
+        Notes
+        -----
+        The method performs the following steps:
+        1. Loads the model state from the checkpoint directory
+        2. Loads the training arguments from the checkpoint
+        3. Reconstructs the trainer with the loaded state and provided datasets
+        4. The trainer is ready to resume training from the checkpoint step
         """
         if base_state is None:
             base_state = EasyDeLState
@@ -280,10 +336,20 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @property
     def model(self):
+        """Get the model instance.
+
+        Returns:
+            The model instance used for training
+        """
         return self._model
 
     @property
     def mesh(self):
+        """Get the device mesh for distributed computation.
+
+        Returns:
+            The device mesh used for sharding computations
+        """
         return self.model.mesh
 
     @mesh.setter
@@ -292,14 +358,39 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @property
     def training_batch_size(self):
+        """Calculate the effective training batch size.
+
+        Returns:
+            The effective batch size including gradient accumulation
+
+        Notes
+        -----
+        The effective batch size is calculated as:
+        total_batch_size * gradient_accumulation_steps
+        """
         return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
 
     @cached_property
     def is_process_zero(self):
+        """Check if this is the main process (rank 0).
+
+        Returns:
+            True if this is the main process, False otherwise
+        """
         return self.arguments.is_process_zero
 
     @cached_property
     def is_enable(self):
+        """Check if operations are enabled for this process.
+
+        Returns:
+            True if operations are enabled, False if restricted to main process only
+
+        Notes
+        -----
+        When process_zero_is_admin is True, only the main process
+        will have operations enabled.
+        """
         enable = True
         if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
             enable = False
@@ -307,6 +398,11 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @property
     def evaluation_batch_size(self):
+        """Get the evaluation batch size.
+
+        Returns:
+            The batch size used for evaluation
+        """
         return self.arguments.eval_batch_size
 
     @property
@@ -342,7 +438,19 @@ class BaseTrainer(BaseTrainerProtocol):
         self._eval_shared_fn_extra_args_ = val
 
     def _initialize_attributes(self):
-        # Initialize all attributes with default values
+        """Initialize all trainer attributes with default values.
+
+        Notes:
+            This method initializes various trainer components including:
+            - Timer and wandb runtime
+            - Dataloaders for training and evaluation
+            - Maximum training/evaluation steps
+            - Optimizer (tx) and scheduler
+            - Flops tracking for performance monitoring
+            - Checkpoint manager and pruning module
+            - Model state and sharding configurations
+            - Compilation trackers for training and evaluation
+        """
         self.timer = getattr(self, "timer", None)
         self.wandb_runtime = getattr(self, "wandb_runtime", None)
         self.dataloader_train = getattr(self, "dataloader_train", None)
@@ -505,6 +613,12 @@ class BaseTrainer(BaseTrainerProtocol):
             return None
 
     def _initialize_memory_tracking(self):
+        """Initialize memory monitoring for tracking GPU/TPU memory usage.
+
+        Notes:
+            Only initializes when performance_mode is False.
+            Uses SMPMemoryMonitor with configurable interval.
+        """
         if not self.arguments.performance_mode:
             import easydel
 
@@ -512,12 +626,23 @@ class BaseTrainer(BaseTrainerProtocol):
             self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(interval)
 
     def __repr__(self):
+        """Return string representation of the trainer.
+
+        Returns:
+            str: Pretty-formatted string of trainer attributes.
+        """
         return pprint.pformat(self.__dict__, indent=2)
 
     __str__ = __repr__
 
     @staticmethod
     def finish():
+        """Clean up resources and finish any active logging sessions.
+
+        Notes:
+            Currently only finishes wandb session if active.
+            Safe to call even if wandb is not initialized.
+        """
         if wandb is not None:
             try:
                 wandb.finish()
@@ -529,7 +654,25 @@ class BaseTrainer(BaseTrainerProtocol):
         state: EasyDeLState,
         step: int,
     ) -> EasyDeLState:
-        """hook process to call in start of the step."""
+        """Hook method called at the start of each training step.
+
+        Parameters
+        ----------
+        state : EasyDeLState
+            The current model state
+        step : int
+            The current training step number
+
+        Returns
+        -------
+        EasyDeLState
+            The potentially modified model state
+
+        Notes
+        -----
+        This method can be overridden in subclasses to implement
+        custom logic at the beginning of each training step.
+        """
         return state
 
     def on_step_end(
@@ -538,15 +681,66 @@ class BaseTrainer(BaseTrainerProtocol):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
-        """hook process to call in start of the step."""
+        """Hook method called at the end of each training step.
+
+        Parameters
+        ----------
+        state : EasyDeLState
+            The current model state
+        metrics : MetricsType
+            The metrics computed for this step
+        step : int
+            The current training step number
+
+        Returns
+        -------
+        tuple[EasyDeLState, MetricsType]
+            The potentially modified model state and metrics
+
+        Notes
+        -----
+        This method can be overridden in subclasses to implement
+        custom logic at the end of each training step, such as
+        custom logging or state modifications.
+        """
         return state, metrics
 
     def _preprocess_batch_input(
         self, state: EasyDeLState, batch: dict[str, jax.Array], is_train: bool
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        """Preprocess a batch of input data before feeding to the model.
+
+        Parameters
+        ----------
+        state : EasyDeLState
+            The current model state
+        batch : dict[str, jax.Array]
+            The input batch data
+        is_train : bool
+            Whether this is a training batch (True) or evaluation batch (False)
+
+        Returns
+        -------
+        tuple[dict[str, jax.Array], dict[str, float | int | str]]
+            A tuple containing:
+            - The preprocessed batch data
+            - Additional metadata or metrics from preprocessing
+
+        Notes
+        -----
+        This method can be overridden to implement custom preprocessing
+        such as data augmentation, masking, or format conversion.
+        """
         return batch, {}
 
     def _ensure_functions_compiled(self):
+        """Ensure training and evaluation functions are compiled.
+
+        Notes
+        -----
+        This method triggers ahead-of-time compilation of the
+        training and evaluation step functions to improve performance.
+        """
         self.compile_aot()
 
     def initialize_trainer_utils(self):
@@ -575,10 +769,24 @@ class BaseTrainer(BaseTrainerProtocol):
         self._configure_functions()
 
     def _initialize_wandb(self):
+        """Initialize Weights & Biases logging if enabled.
+
+        Notes
+        -----
+        This method sets up the Weights & Biases runtime for experiment
+        tracking and logging when use_wandb is True in arguments.
+        """
         if self.arguments.use_wandb:
             self.wandb_runtime = self.arguments.get_wandb_init()
 
     def _initialize_timer(self):
+        """Initialize the timer for performance monitoring.
+
+        Notes
+        -----
+        Sets up a timer instance for tracking training and evaluation
+        performance metrics, with optional TensorBoard integration.
+        """
         self.timer = Timers(use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard)
 
     def _configure_dataloaders(self):
@@ -762,6 +970,20 @@ class BaseTrainer(BaseTrainerProtocol):
         raise NotImplementedError
 
     def _configure_grain_dataloader(self):
+        """Configure Grain dataloaders for training and evaluation.
+
+        Returns:
+            tuple: A tuple containing:
+                - dataloader_train: Grain DataLoader for training
+                - max_training_steps: Maximum number of training steps
+                - dataloader_eval: Grain DataLoader for evaluation (or None)
+                - max_evaluation_steps: Maximum evaluation steps (or None)
+
+        Notes:
+            Grain is Google's data loading library optimized for JAX.
+            Handles dataset sharding, batching, and preprocessing.
+        """
+
         def _create_grain_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> grain.DataLoader:
             """Creates a Grain DataLoader from a Hugging Face Dataset."""
 
@@ -859,6 +1081,22 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     def _configure_tfds_dataloader(self):
+        """Configure TensorFlow Dataset dataloaders for training and evaluation.
+
+        Returns:
+            tuple: A tuple containing:
+                - dataloader_train: TensorFlow Dataset for training
+                - max_training_steps: Maximum number of training steps
+                - dataloader_eval: TensorFlow Dataset for evaluation (or None)
+                - max_evaluation_steps: Maximum evaluation steps (or None)
+
+        Raises:
+            ImportError: If tensorflow is not installed.
+
+        Notes:
+            Uses TensorFlow's tf.data API for data loading.
+            Supports automatic sharding across devices.
+        """
         if not is_package_available("tensorflow"):
             raise ImportError("Please install `tensorflow` to use the `tensorflow-datasets` conversion.")
         import tensorflow as tf  # type:ignore
@@ -1094,6 +1332,14 @@ class BaseTrainer(BaseTrainerProtocol):
         return str(directory_name)
 
     def _get_current_step(self, state):
+        """Get the current training step from state.
+
+        Args:
+            state: The model state containing the step counter.
+
+        Returns:
+            int: Current step number, adjusted by step_start_point if set.
+        """
         step = int(jax.device_get(state.step))
         if self.arguments.step_start_point is not None:
             step += self.arguments.step_start_point
@@ -1183,6 +1429,11 @@ class BaseTrainer(BaseTrainerProtocol):
             _operate()
 
     def _save_readme(self, save_directory):
+        """Save training information as README.md in checkpoint directory.
+
+        Args:
+            save_directory: Directory where README.md will be saved.
+        """
         dst = ePath(save_directory) / "README.md"
         dst.write_text(self._get_information())
 
@@ -1398,16 +1649,41 @@ class BaseTrainer(BaseTrainerProtocol):
         return hf_model_config
 
     def specs_to_name_sharding(self, tree, mesh=None):
+        """Convert partition specs to named sharding.
+
+        Args:
+            tree: PyTree structure with partition specs.
+            mesh: Device mesh for sharding (uses trainer's mesh if None).
+
+        Returns:
+            PyTree with named sharding specifications.
+        """
         mesh = mesh or self.mesh or self.model.mesh
         return specs_to_name_sharding(tree, mesh)
 
     def calculate_number_total_flops(self, params, is_training=True):
-        return 6 * sum(x.size for x in jax.tree_util.tree_flatten(unfreeze(params))[0])
+        """Calculate total FLOPs for the model.
+
+        Args:
+            params: Model parameters.
+            is_training: Whether calculating for training (includes backward pass).
+
+        Returns:
+            int: Total FLOPs count.
+        """
+        return 6 * sum(x.size for x in jax.tree_util.tree_flatten(params)[0])
 
     @staticmethod
     def count_model_parameters(prm):
-        """Prints the number of model parameters in billions."""
-        return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
+        """Count total number of model parameters.
+
+        Args:
+            prm: Model parameters (can be frozen or unfrozen).
+
+        Returns:
+            int: Total number of parameters.
+        """
+        return sum(n.size for n in jax.tree_util.tree_flatten(prm)[0])
 
     def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
         if self.arguments.loss_config is not None and self.arguments.loss_config.break_on_nan:
@@ -1425,10 +1701,20 @@ class BaseTrainer(BaseTrainerProtocol):
         return metrics
 
     def start_training_hook(self):
+        """Hook called at the start of training.
+
+        Notes:
+            Sets up static metrics and records training start time.
+        """
         self._setup_static_metrics()
         self._training_time_start = time.time()
 
     def start_evaluation_hook(self):
+        """Hook called at the start of evaluation.
+
+        Notes:
+            Sets up static metrics and records evaluation start time.
+        """
         self._setup_static_metrics()
         self._evaluation_time_start = time.time()
 
@@ -1567,7 +1853,14 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     def _setup_initial_metrics(self, state):
-        """Setup initial metrics logging."""
+        """Setup initial metrics logging.
+
+        Args:
+            state: The model state for extracting parameter count.
+
+        Notes:
+            Logs model size, parameter count, and training configuration.
+        """
         # Calculate and log model size
         model_size = self.count_model_parameters(state.graphstate)
         self.arguments.log_metrics(
@@ -1585,7 +1878,19 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     def _get_next_batch(self, data_iter, dataloader):
-        """Get next batch from iterator, reinitializing if needed."""
+        """Get next batch from iterator, reinitializing if needed.
+
+        Args:
+            data_iter: Current data iterator.
+            dataloader: The dataloader to reinitialize from if needed.
+
+        Returns:
+            tuple: (batch, updated_data_iter) where batch is the next data batch
+                  and updated_data_iter is the potentially reinitialized iterator.
+
+        Raises:
+            StopIteration: If dataloader is exhausted and cannot be reinitialized.
+        """
         try:
             batch = next(data_iter)
         except (StopIteration, IndexError):
@@ -1649,6 +1954,15 @@ class BaseTrainer(BaseTrainerProtocol):
             raise NotImplementedError(f"Progress Bar type {rpr}'s not supported.")
 
     def log_weight_distribution(self, state: EasyDeLState, step: int):
+        """Log weight distribution statistics.
+
+        Args:
+            state: Model state containing parameters.
+            step: Current training step.
+
+        Notes:
+            Delegates to arguments.log_weight_distribution method.
+        """
         return self.arguments.log_weight_distribution(state=state, step=step)
 
     def log_metrics(

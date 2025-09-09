@@ -33,6 +33,8 @@ from .rwkv_configuration import RwkvConfig as RwkvConfig
 
 @auto_pytree
 class RwkvOutput(ModelOutput):
+    """Output type for RWKV model."""
+
     last_hidden_state: chex.Array = None
     state: tuple[chex.Array, ...] | None = None
     hidden_states: tuple[chex.Array, ...] | None = None
@@ -41,6 +43,8 @@ class RwkvOutput(ModelOutput):
 
 @auto_pytree
 class RwkvCausalLMOutput(ModelOutput):
+    """Output type for RWKV causal language model."""
+
     logits: chex.Array = None
     state: list[chex.Array] | None = None
     hidden_states: tuple[chex.Array, ...] | None = None
@@ -100,6 +104,8 @@ def rwkv_linear_attention(
 
 
 class RwkvSelfAttention(nn.Module):
+    """RWKV self-attention mechanism with linear complexity."""
+
     def __init__(
         self,
         config: RwkvConfig,
@@ -217,6 +223,8 @@ class RwkvSelfAttention(nn.Module):
 
 
 class RwkvFeedForward(nn.Module):
+    """RWKV feedforward network with channel mixing."""
+
     def __init__(
         self,
         config: RwkvConfig,
@@ -284,6 +292,8 @@ class RwkvFeedForward(nn.Module):
 
 
 class SingleStandRwkvBlock(nn.Module):
+    """Single RWKV transformer block with attention and feedforward layers."""
+
     def __init__(
         self,
         config: RwkvConfig,
@@ -369,6 +379,8 @@ RwkvBlock = nn.vmap(SingleStandRwkvBlock, in_axes=0, out_axes=0)
 
 @register_module(TaskType.BASE_MODULE, config=RwkvConfig, model_type="rwkv")
 class RwkvModel(EasyDeLBaseModule):
+    """RWKV base model with embedding and transformer blocks."""
+
     def __init__(
         self,
         config: RwkvConfig,
@@ -484,6 +496,8 @@ class RwkvModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
 class RwkvForCausalLM(EasyDeLBaseModule):
+    """RWKV model with language modeling head for causal generation."""
+
     def __init__(
         self,
         config: RwkvConfig,

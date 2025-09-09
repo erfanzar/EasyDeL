@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""EasyDeL utilities for enumerations and type definitions.
+
+This module provides enumerations and type definitions used throughout the EasyDeL
+framework for configuration and runtime options. It includes enums for optimizers,
+schedulers, quantization methods, platforms, backends, and various configuration
+options.
+
+Enumerations:
+    EasyDeLOptimizers: Available optimization algorithms
+    EasyDeLSchedulers: Learning rate scheduling strategies
+    EasyDeLGradientCheckPointers: Gradient checkpointing methods
+    EasyDeLQuantizationMethods: Model quantization techniques
+    EasyDeLPlatforms: Kernel execution platforms
+    EasyDeLBackends: JAX backend hardware targets
+
+Type Aliases:
+    AVAILABLE_GRADIENT_CHECKPOINTS: Literal type for gradient checkpoint options
+    AVAILABLE_SCHEDULERS: Literal type for scheduler options
+    AVAILABLE_OPTIMIZERS: Literal type for optimizer options
+    AVAILABLE_ATTENTION_MECHANISMS: Literal type for attention implementations
+    AVAILABLE_SPARSE_MODULE_TYPES: Literal type for sparse matrix formats
+
+Constants:
+    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism to use
+
+Functions:
+    define_flags_with_default: Create argparse flags from default values
+
+Example:
+    >>> from easydel.infra.etils import EasyDeLOptimizers, EasyDeLBackends
+    >>>
+    >>> # Use enums for configuration
+    >>> optimizer = EasyDeLOptimizers.ADAMW
+    >>> backend = EasyDeLBackends.TPU
+    >>>
+    >>> # Parse command-line arguments with defaults
+    >>> args, defaults = define_flags_with_default(
+    ...     learning_rate=1e-3,
+    ...     batch_size=32,
+    ...     _required_fields=["model_name"]
+    ... )
+"""
+
 import argparse
 import typing as tp
 from enum import Enum
