@@ -64,10 +64,11 @@ from eformer.escale import PartitionManager, get_incontext_mesh
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
-from jax.experimental.pallas.ops.tpu.megablox import gmm
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+
+from easydel.kernels.tpu_ops import pallas_grouped_matmul
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -1681,14 +1682,13 @@ class ParallelMoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
+        weight_axes = self.alt_sharding_axis
+        fn = partial(self._ragged_dot, out_first=self.out_first)
 
-        core = (
-            partial(self._ragged_dot, out_first=self.out_first)
-            if not self.use_pallas_group_matmul
-            else self._grouped_matmul
-        )
         if self.use_pallas_group_matmul and self.out_first:
             weight = jnp.transpose(weight, (0, 2, 1))
+            if weight_axes is not None:
+                weight_axes = [weight_axes[0], weight_axes[2], weight_axes[1]]
 
         if weight.dtype in (
             jnp.float8_e4m3b11fnuz,
@@ -1701,38 +1701,38 @@ class ParallelMoELinear(nn.Module):
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
 
-        fn = core
-
-        if self.can_use_shard_map and self.use_pallas_group_matmul:  # ragged decode works better without shardings
+        if self.can_use_shard_map and self.use_pallas_group_matmul:
             resolve = self.partition_manager.resolve
-            mesh = get_incontext_mesh()
-            weight_axes = self.alt_sharding_axis
-            in_axis_name = weight_axes[2] if self.out_first else weight_axes[1]
-            out_axis_name = weight_axes[1] if self.out_first else weight_axes[2]
-
-            need_tp_psum = (self.direction == "row") and (in_axis_name is not None)
-            axis_name = self.partition_manager.resolve(axes=[in_axis_name], mode=MODE_TRAIN)[0]
+            mesh = get_incontext_mesh() or self.partition_manager.mesh
+            in_axis_logical = weight_axes[1]
+            out_axis_logical = weight_axes[2]
+            axis_name = self.partition_manager.paxis.resolve_axis(axes=[in_axis_logical], mode=MODE_TRAIN)[0]
+            need_tp_psum = (self.direction == "row") and isinstance(axis_name, str) and (axis_name in mesh.axis_names)
+            group_sizes = group_sizes.astype(jnp.int32)
+            if isinstance(axis_name, str):
+                need_tp_psum &= mesh.shape[axis_name] > 1
 
             def mapped_fn(
                 x: Float[Array, "tokens hidden"],
                 w: Float[Array, "experts in_dim out_dim"],
                 gs: Int[Array, "groups"],  # noqa
             ) -> Float[Array, "tokens out_dim"]:
-                y = core(x, w, gs)
+                y = self._grouped_matmul(x, w, gs)
                 if need_tp_psum:
                     y = jax.lax.psum(y, axis_name=axis_name)
                 return y
 
-            inputs_axes = [None, in_axis_name]
-            group_sizes_axes = [weight_axes[0]]
-            out_axes = [None, out_axis_name]
+            inputs_axes = [None, in_axis_logical]
+
+            out_axes = [None, out_axis_logical]
+
             fn = shard_map(
                 mapped_fn,
                 mesh=mesh,
                 in_specs=(
                     resolve(axes=inputs_axes, mode=MODE_TRAIN, shape=inputs.shape),
                     resolve(axes=weight_axes, mode=MODE_TRAIN, shape=weight.shape),
-                    resolve(axes=group_sizes_axes, mode=MODE_TRAIN, shape=group_sizes.shape),
+                    resolve(axes=[None], mode=MODE_TRAIN, shape=group_sizes.shape),
                 ),
                 out_specs=resolve(axes=out_axes, mode=MODE_TRAIN, shape=(inputs.shape[0], self.out_features)),
                 check_rep=False,
@@ -1741,8 +1741,7 @@ class ParallelMoELinear(nn.Module):
         output = fn(inputs, weight, group_sizes)
 
         if self.bias is not None:
-            bias_expanded = self._expand_bias_ragged(group_sizes)
-            output = output + bias_expanded
+            output += self._expand_bias_ragged(group_sizes)
 
         return output
 
@@ -1806,7 +1805,7 @@ class ParallelMoELinear(nn.Module):
     ) -> Float[Array, "tokens_ragged out_dim"]:
         """Performs grouped matrix multiplication using the Pallas kernel.
 
-        This method uses a highly optimized Pallas kernel (gmm) specifically
+        This method uses a highly optimized Pallas kernel (grouped_matmul) specifically
         designed for TPUs. It provides significant speedup over standard ragged
         operations by leveraging TPU-specific matrix units and tiling strategies.
 
@@ -1837,22 +1836,27 @@ class ParallelMoELinear(nn.Module):
             >>> group_sizes = jnp.array([125, 125, 125, 125, 125, 125, 125, 125])
             >>> output = ParallelMoELinear._grouped_matmul(inputs, weights, group_sizes)
         """
-        original_batch_size = inputs.shape[0]
-        if inputs.shape[0] % 512:
-            pad_length = 512 - inputs.shape[0] % 512
-            inputs = jnp.pad(inputs, ((0, pad_length), (0, 0)))
-        m, k, n = inputs.shape[0], inputs.shape[1], weight.shape[2]
-        output = gmm(
+        group_sizes = group_sizes.astype(jnp.int32)
+
+        padding_amount = 0
+        pad_length = 512
+        input_shape = inputs.shape
+
+        if input_shape[0] % pad_length:
+            padding_amount = pad_length - input_shape[0] % pad_length
+            inputs = jax.lax.pad(inputs, jnp.array(0.0, dtype=inputs.dtype), [(0, padding_amount, 0), (0, 0, 0)])
+
+        out = pallas_grouped_matmul(
             inputs,
             weight,
             group_sizes,
-            preferred_element_type=inputs.dtype,
-            tiling=(min(m, 512), min(k, 1024), min(n, 1024)),
+            preferred_element_type=jnp.bfloat16 if jax.default_backend() == "tpu" else inputs.dtype,
+            tiling=(min(inputs.shape[0], 512), min(inputs.shape[1], 1024), min(weight.shape[2], 1024)),
             interpret=jax.default_backend() != "tpu",
         )
-        if original_batch_size % 512:
-            output = output[:original_batch_size]
-        return output
+        if padding_amount > 0:
+            out = out[: input_shape[0]]
+        return out
 
     def _expand_bias_ragged(self, group_sizes: Int[Array, "num_groups"]) -> Float[Array, "tokens_ragged out_dim"]:  # noqa
         """Expands the bias to match the ragged batch structure.

@@ -28,14 +28,14 @@ class EasyModelsTest(unittest.TestCase):
         self.num_hidden_layers: int = 8
         self.num_attention_heads: int = 8
         self.num_key_value_heads: int | None = 4
-        self.num_experts_per_tok = 2
-        self.num_experts = 4
+        self.num_experts_per_tok = 4
+        self.num_experts = 16
         self.num_local_experts = self.num_experts
         self.rms_norm_eps: float = 1e-6
         self.layer_norm_eps = self.rms_norm_eps
         self.initializer_range: float = 0.02
         self.use_cache: bool = True
-        self.use_pallas_group_matmul: bool = False
+        self.use_pallas_group_matmul: bool = True
         self.bos_token_id: int = 0
         self.eos_token_id: int = 1
         self.resid_pdrop: float = 0.0
@@ -67,7 +67,7 @@ class EasyModelsTest(unittest.TestCase):
         self.use_sliding_window = True
 
         self.scan_mlp_chunk_size = self.sequence_length // 2
-        self.sharding_axis_dims = (1, 2, 2, -1, 1)
+        self.sharding_axis_dims = (1, 1, -1, 1, 1)
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.use_parallel_residual = True
         self.qk_layernorm = True

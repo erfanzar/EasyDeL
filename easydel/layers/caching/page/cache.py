@@ -172,7 +172,10 @@ class PagesCacheMetaData(BaseCacheMetadata):
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
-        logger.info(f"Creating Metadata with {num_pages=} {page_bytes=} sequence_capacity={num_pages * page_bytes}")
+        logger.info(
+            f"Creating PagesCacheMetadata with {num_pages=} {page_bytes=} "
+            f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
+        )
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
