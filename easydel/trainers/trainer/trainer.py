@@ -590,7 +590,7 @@ class Trainer(BaseTrainer):
         self,
         state,
         batch,
-    ) -> tuple[EasyDeLState, LossMetrics, Exception]:
+    ) -> tuple[EasyDeLState, LossMetrics, Exception | None]:
         """
         Execute a single training step with gradient computation and updates.
 

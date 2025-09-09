@@ -11,6 +11,63 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Transformer key-value caching implementation for EasyDeL.
+
+This module provides the standard key-value caching system for transformer
+models, supporting various attention patterns including full attention,
+sliding window attention, and local attention.
+
+The transformer cache is designed for efficient autoregressive generation
+by storing previously computed key and value states, avoiding redundant
+computation during inference.
+
+Key Components:
+    - TransformerCacheMetaData: Configuration for cache dimensions and behavior
+    - TransformerCacheView: Per-layer cache storage and update logic
+    - TransformerCache: Multi-layer cache orchestration
+    - TransformerMetadata: Runtime metadata for cache operations
+    - AttnMaskDetail: Attention masking configuration
+
+Features:
+    - Support for multiple attention patterns (full, sliding, local)
+    - Quantization support for memory efficiency
+    - Distributed caching with JAX sharding
+    - Functional cache updates for JAX compatibility
+    - Dynamic mask generation and caching
+
+Example:
+    >>> # Initialize cache metadata
+    >>> metadata = TransformerCacheMetaData.create(
+    ...     batch_size=2,
+    ...     sequence_length=1024,
+    ...     num_hidden_layers=12,
+    ...     pad_token_id=0,
+    ...     num_heads=16,
+    ...     head_dim=64
+    ... )
+    >>>
+    >>> # Create cache
+    >>> cache = TransformerCache.init_cache(
+    ...     mesh=mesh,
+    ...     metadata=metadata,
+    ...     partition_manager=pm,
+    ...     dtype=jnp.bfloat16
+    ... )
+    >>>
+    >>> # Update cache during inference
+    >>> for layer_idx in range(12):
+    ...     key_cache, value_cache, mask, new_view = cache[layer_idx].concatenate_to_cache(
+    ...         query=query_states,
+    ...         key=key_states,
+    ...         value=value_states,
+    ...         attention_mask=attention_mask,
+    ...         quantizer=quantizer,
+    ...         partition_manager=pm
+    ...     )
+    ...     cache[layer_idx] = new_view
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -40,6 +97,20 @@ else:
 
 @auto_pytree
 class AttnMaskDetail:
+    """Configuration for attention masking patterns.
+
+    Defines the type and parameters of attention masking to apply
+    during cache operations. Supports various masking strategies
+    including sliding windows, chunks, and custom patterns.
+
+    Attributes:
+        mask_type (Enum): Type of attention mask (e.g., FULL, SLIDING, CHUNKED).
+        size (int): Primary size parameter for the mask (window size, chunk size, etc.).
+        offset (int | None): Optional offset for mask positioning.
+        chunks (int | None): Number of chunks for chunked attention.
+        bricks (int | None): Number of bricks for blocked attention patterns.
+    """
+
     mask_type: Enum
     size: int
     offset: int | None = None
@@ -69,6 +140,21 @@ def _(
     *args,
     **kwargs,
 ):
+    """Register handler for dynamic_update_slice with ImplicitArray operand.
+
+    Materializes the implicit array before performing the update operation.
+    This ensures compatibility with quantized or lazy-evaluated arrays.
+
+    Args:
+        primitive: JAX primitive for dynamic_update_slice.
+        operand: ImplicitArray to update (will be materialized).
+        update: Update values.
+        *args: Additional arguments for the primitive.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        Result of the dynamic_update_slice operation.
+    """
     operand = operand.materialize()
     return primitive.bind(operand, update, *args)
 
@@ -100,7 +186,33 @@ def _(
 
 @auto_pytree
 class TransformerCacheMetaData(BaseCacheMetadata):
-    """Metadata for transformer cache configuration."""
+    """Metadata configuration for transformer key-value caching.
+
+    Stores all static configuration needed to initialize and operate
+    a transformer cache. Supports various attention head configurations
+    including multi-head, multi-query, and grouped-query attention.
+
+    The metadata defines:
+    - Cache dimensions (batch, sequence, layers)
+    - Attention head configuration
+    - Masking and bias settings
+    - Special attention patterns (sliding window)
+
+    Attributes:
+        batch_size (int): Number of sequences in batch.
+        sequence_length (int): Maximum sequence length to cache.
+        num_hidden_layers (int): Number of transformer layers.
+        pad_token_id (int): Token ID used for padding.
+        num_heads (int | None): Number of attention heads (for regular MHA).
+        head_dim (int | None): Dimension of each attention head.
+        key_heads (int | None): Number of key heads (for MQA/GQA).
+        value_heads (int | None): Number of value heads (for MQA/GQA).
+        key_dim (int | None): Dimension of key projections.
+        value_dim (int | None): Dimension of value projections.
+        sliding_window (int | None): Size of sliding attention window.
+        update_causal_mask (bool): Whether to update causal masks dynamically.
+        create_attention_bias (bool): Whether to create attention bias terms.
+    """
 
     batch_size: int
     sequence_length: int
@@ -198,6 +310,33 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 
 @auto_pytree(frozen=False)
 class TransformerCacheView(BaseCacheView):
+    """Single-layer cache view for transformer key-value states.
+
+    Manages the cached key and value tensors for one transformer layer,
+    along with position tracking and masking information. Supports
+    various attention patterns and quantization strategies.
+
+    The view maintains:
+    - Key and value state tensors
+    - Current position indices for each sequence
+    - Starting positions for relative indexing
+    - Masking configuration for attention patterns
+
+    Attributes:
+        key (cx.Array | ImplicitArray): Cached key states.
+            Shape: [batch_size, seq_length, num_key_heads, key_dim]
+        value (cx.Array | ImplicitArray): Cached value states.
+            Shape: [batch_size, seq_length, num_value_heads, value_dim]
+        indexs (cx.Array | ImplicitArray): Current position index per sequence.
+            Shape: [batch_size]
+        starts (cx.Array | ImplicitArray): Starting position per sequence.
+            Shape: [batch_size]
+        metadata (TransformerCacheMetaData): Static cache configuration.
+        maximum_sequence_length (int): Maximum cacheable sequence length.
+        layer_index (int | None): Index of this layer in the model.
+        masking_details (AttnMaskDetail | None): Attention mask configuration.
+    """
+
     key: cx.Array | ImplicitArray
     value: cx.Array | ImplicitArray
     indexs: cx.Array | ImplicitArray
@@ -222,6 +361,30 @@ class TransformerCacheView(BaseCacheView):
         layer_index: int | None = None,
         masking_details: AttnMaskDetail | None = None,
     ):
+        """Initialize a transformer cache view for a single layer.
+
+        Creates and allocates cache tensors with appropriate shapes,
+        dtypes, and sharding for distributed execution. Applies
+        quantization if configured.
+
+        Args:
+            mesh (Mesh): JAX device mesh for distributed execution.
+            dtype (jnp.dtype): Data type for cache tensors.
+            metadata (TransformerCacheMetaData): Cache configuration.
+            quantizer (EasyQuantizer): Quantization configuration.
+            partition_manager (PartitionManager): Sharding strategy manager.
+            starts (jax.Array | None): Initial starting positions per sequence.
+                Defaults to zeros if not provided.
+            layer_index (int | None): Index of this layer in the model.
+            masking_details (AttnMaskDetail | None): Attention mask configuration.
+
+        Returns:
+            TransformerCacheView: Initialized cache view with allocated tensors.
+
+        Note:
+            For sliding window attention, cache dimensions are adjusted
+            based on the window size specified in masking_details.
+        """
         from easydel.infra.utils import AttnMaskType
 
         with jax.named_scope("easydel-transformer-cacheview-init"):
@@ -404,6 +567,23 @@ class TransformerCacheView(BaseCacheView):
 
 @auto_pytree
 class TransformerCache(BaseCache):
+    """Multi-layer transformer cache container.
+
+    Orchestrates cache views across all transformer layers, providing
+    methods for initialization, access, and batch operations. Supports
+    serialization for checkpointing and cache transfer.
+
+    The cache maintains:
+    - Ordered list of per-layer cache views
+    - Consistent configuration across layers
+    - Batch update operations
+    - Serialization/deserialization support
+
+    Attributes:
+        views (list[TransformerCacheView | None]): Cache views for each layer.
+            None indicates uninitialized layer.
+    """
+
     views: list[TransformerCacheView | None]
 
     @classmethod
@@ -442,6 +622,16 @@ class TransformerCache(BaseCache):
             )
 
     def to_pure(self):
+        """Convert cache to pure Python data structure for serialization.
+
+        Extracts raw tensors and metadata for checkpointing or transfer.
+        The pure representation can be pickled or saved to disk.
+
+        Returns:
+            tuple: Pair of (cache_data, metadata) where:
+                - cache_data: List of [key, value, indexs, starts] per layer
+                - metadata: Cache configuration metadata
+        """
         return (
             [[layer.key, layer.value, layer.indexs, layer.starts] for i, layer in enumerate(self.views)],
             self.views[-1].metadata,
@@ -449,6 +639,18 @@ class TransformerCache(BaseCache):
 
     @classmethod
     def from_pure(cls, pure, metadata):
+        """Reconstruct cache from pure Python data structure.
+
+        Restores a cache from serialized tensors and metadata,
+        typically after loading from disk or receiving from transfer.
+
+        Args:
+            pure: List of [key, value, indexs, starts] per layer.
+            metadata: Cache configuration metadata.
+
+        Returns:
+            TransformerCache: Reconstructed cache instance.
+        """
         return cls(
             views=[
                 TransformerCacheView(
@@ -463,6 +665,19 @@ class TransformerCache(BaseCache):
         )
 
     def insert_starts(self, starts, slot: int, partition_manager: PartitionManager):
+        """Insert starting positions at specified batch slot.
+
+        Updates the starting position indices for a specific batch slot
+        across all layers. Used for dynamic batching and cache management.
+
+        Args:
+            starts: New starting positions to insert.
+            slot (int): Batch slot index to update.
+            partition_manager (PartitionManager): Sharding configuration.
+
+        Returns:
+            TransformerCache: Updated cache instance.
+        """
         for idx in range(len(self.views)):
             view = self.views[idx]
             starts = jnp.array(starts).reshape(-1)
@@ -478,6 +693,19 @@ class TransformerCache(BaseCache):
         return self
 
     def insert_index(self, index, slot: int, partition_manager: PartitionManager):
+        """Insert position indices at specified batch slot.
+
+        Updates the current position indices for a specific batch slot
+        across all layers. Used for tracking generation progress.
+
+        Args:
+            index: New position index to insert.
+            slot (int): Batch slot index to update.
+            partition_manager (PartitionManager): Sharding configuration.
+
+        Returns:
+            TransformerCache: Updated cache instance.
+        """
         for idx in range(len(self.views)):
             view = self.views[idx]
             index = jnp.array(index).reshape(-1)
@@ -498,6 +726,22 @@ class TransformerCache(BaseCache):
         quantizer: EasyQuantizer,
         partition_manager: PartitionManager,
     ):
+        """Insert another cache's contents at specified batch slot.
+
+        Copies key-value states and indices from another cache into
+        this cache at the specified batch position. Useful for
+        batched generation with different sequences.
+
+        Args:
+            other (TransformerCache): Source cache to copy from.
+            slot (int): Batch slot index to insert into.
+            quantizer (EasyQuantizer): Quantization configuration.
+            partition_manager (PartitionManager): Sharding configuration.
+
+        Returns:
+            TransformerCache: Updated cache instance.
+        """
+
         def _maybe_materialize(x: ImplicitArray | Array):
             if hasattr(x, "materialize"):
                 x = x.materialize()
@@ -563,8 +807,19 @@ class TransformerCache(BaseCache):
 
 @auto_pytree
 class TransformerMetadata(BaseRunTimeMetadata):
-    """
-    holds optional metadata for attention runtime
+    """Runtime metadata for transformer cache operations.
+
+    Holds dynamic information needed during cache updates that isn't
+    part of the permanent cache state. This includes temporary indices
+    and flags for specific computation modes.
+
+    Attributes:
+        postpadded (bool): Whether sequences are post-padded.
+            Affects mask generation and position calculations.
+        starts (jax.Array | None): Starting positions for sequences.
+            Used for relative position calculations.
+        indexs (jax.Array | None): Current position indices.
+            Tracks generation progress per sequence.
     """
 
     postpadded: bool = False

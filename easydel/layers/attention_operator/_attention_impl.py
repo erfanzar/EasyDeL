@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+from easydel.utils.helpers import check_bool_flag
 
 from ..ops import BaseOperation
 
@@ -213,7 +214,6 @@ class AttentionMetadata:
     def mesh(self, value: jax.sharding.Mesh | None):
         """Set mesh value for cases where base_config is not available."""
         self._stored_mesh = value
-
 
     def get_shardings(
         self,
@@ -602,6 +602,9 @@ class AttentionImpl(BaseOperation):
         Raises:
             RuntimeError: If the backend specified in `self.metadata` is unknown.
         """
+        if check_bool_flag("FORCE_NATIVE_RUNTIME", False):
+            return self.forward_native(*args, **kwargs)
+
         match self.metadata.backend:
             case EasyDeLBackends.TPU:
                 logger.debug("Calling into TPU exec")

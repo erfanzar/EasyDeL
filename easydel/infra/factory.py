@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Factory and registry system for EasyDeL modules and configurations.
+
+This module provides a centralized registration system for managing EasyDeL model
+configurations and module implementations. It enables dynamic discovery and instantiation
+of models based on task types and model identifiers.
+
+The registry system supports:
+- Configuration class registration with type identifiers
+- Module registration with task-specific categorization
+- Metadata tracking for special layers (embeddings, layer norms)
+- Type-safe retrieval of registered components
+
+Example:
+    >>> from easydel.infra.factory import registry, register_config, register_module
+    >>> from easydel.infra.factory import TaskType, ConfigType
+    >>>
+    >>> # Register a configuration
+    >>> @register_config("my_model")
+    ... class MyModelConfig(EasyDeLBaseConfig):
+    ...     hidden_size: int = 768
+    >>>
+    >>> # Register a module for a specific task
+    >>> @register_module(
+    ...     task_type=TaskType.CAUSAL_LM,
+    ...     config=MyModelConfig,
+    ...     model_type="my_model",
+    ...     embedding_layer_names=["embed_tokens"],
+    ...     layernorm_names=["ln_1", "ln_2"]
+    ... )
+    ... class MyModelForCausalLM(EasyDeLBaseModule):
+    ...     pass
+    >>>
+    >>> # Retrieve registered components
+    >>> config_cls = registry.get_config("my_model")
+    >>> module_reg = registry.get_module_registration(TaskType.CAUSAL_LM, "my_model")
+
+The registry pattern allows for:
+- Clean separation of model definitions from registration logic
+- Easy extension with new model types without modifying core code
+- Consistent interface for model discovery and instantiation
+- Support for multiple task-specific implementations of the same model
+"""
+
 import inspect
 import typing as tp
 from enum import Enum

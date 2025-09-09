@@ -11,6 +11,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Base module implementation for EasyDeL models.
+
+This module provides the core foundation for all EasyDeL neural network models,
+implementing essential functionality for model initialization, parameter management,
+sharding, quantization, and integration with the broader EasyDeL ecosystem.
+
+The EasyDeLBaseModule class serves as the base class that all EasyDeL models inherit from,
+providing:
+- Parameter management and state handling
+- Model sharding and gathering for distributed training
+- Quantization and LoRA support
+- Loss computation framework
+- Integration with HuggingFace models
+- Generation capabilities through mixins
+
+Key Classes:
+    EasyDeLBaseModule: The base class for all EasyDeL models, providing common
+        functionality for parameter handling, sharding, and model operations.
+    ParameterTransformRule: Data class defining rules for transforming parameter
+        names and tensors, particularly useful for MoE models.
+
+Example:
+    >>> from easydel.infra import EasyDeLBaseModule, EasyDeLBaseConfig
+    >>> import flax.nnx as nn
+    >>>
+    >>> class MyModel(EasyDeLBaseModule):
+    ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
+    ...         super().__init__(config, dtype, param_dtype, precision, rngs)
+    ...         # Initialize model layers
+    ...         self.layer = nn.Linear(config.hidden_size, config.hidden_size)
+    ...
+    ...     def __call__(self, inputs):
+    ...         return self.layer(inputs)
+    >>>
+    >>> # Create and use the model
+    >>> config = EasyDeLBaseConfig(hidden_size=768)
+    >>> model = MyModel(
+    ...     config=config,
+    ...     dtype=jnp.float32,
+    ...     param_dtype=jnp.float32,
+    ...     precision='highest',
+    ...     rngs=nn.Rngs(0)
+    ... )
+
+The module integrates with JAX's sharding system for distributed training,
+supports various quantization methods, and provides utilities for converting
+between EasyDeL and HuggingFace model formats.
+"""
+
 from __future__ import annotations
 
 import re
@@ -58,7 +108,34 @@ BaseConf = EasyDeLBaseConfig
 
 @dataclass
 class ParameterTransformRule:
-    """Rule for transforming MoE parameter names and tensors."""
+    """Rule for transforming MoE parameter names and tensors.
+
+    This dataclass defines transformation rules that can be applied to parameter
+    names and their associated tensor values during model conversion or loading.
+    It's particularly useful for handling Mixture of Experts (MoE) models where
+    parameter naming conventions may differ between frameworks.
+
+    Attributes:
+        pattern: Regular expression pattern or string to match parameter names.
+            Can be a compiled Pattern object or a string that will be used for matching.
+        replacement: String to replace matched patterns in parameter names.
+            Supports regex replacement syntax (e.g., r'\1' for capture groups).
+        tensor_transform: Optional callable to transform the tensor values.
+            Should take a tensor and return a transformed tensor. If None, no
+            transformation is applied to the tensor values.
+        consolidate_experts: Whether to consolidate multiple expert parameters
+            into a single tensor. Useful for MoE models where experts may be
+            stored separately but need to be combined.
+
+    Example:
+        >>> # Rule to rename expert layers
+        >>> rule = ParameterTransformRule(
+        ...     pattern=r"expert_(\\d+)\\.weight",
+        ...     replacement=r"experts.\1.weight",
+        ...     tensor_transform=lambda x: x.transpose(),
+        ...     consolidate_experts=True
+        ... )
+    """
 
     pattern: str | Pattern
     replacement: str

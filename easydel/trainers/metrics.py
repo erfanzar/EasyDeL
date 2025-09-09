@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Metrics tracking and visualization for EasyDeL training.
+
+This module provides comprehensive metrics collection, aggregation, and
+visualization tools for training large language models. It includes:
+- Real-time metrics calculation (loss, accuracy, throughput, TFLOPs)
+- Progress bar implementations (tqdm, rich, JSON)
+- Weight distribution analysis and histograms
+- Performance profiling and benchmarking utilities
+"""
+
 from __future__ import annotations
 
 import abc
@@ -44,15 +55,38 @@ logger = get_logger("TrainerMetrics")
 
 
 class StepMetrics:
-    """Handles calculation and tracking of training metrics."""
+    """Handles calculation and tracking of training metrics.
+
+    This class computes various metrics for each training/evaluation step,
+    including loss, accuracy, performance metrics (TFLOPs, throughput),
+    and gradient statistics.
+
+    Attributes:
+        arguments: Training configuration arguments.
+        start_time: Global start time for training.
+        step_start_time: Start time for current step.
+
+    Note:
+        Designed to work efficiently within JAX training loops.
+        Automatically handles metric aggregation across devices.
+    """
 
     def __init__(self, arguments):
+        """Initialize the metrics calculator.
+
+        Args:
+            arguments: Training configuration with logging preferences.
+        """
         self.arguments = arguments
         self.start_time = time.time()
         self.step_start_time = time.time()
 
     def start_step(self):
-        """Mark the start of a training step."""
+        """Mark the start of a training step.
+
+        Records the current time for step duration calculation.
+        Should be called at the beginning of each training/evaluation step.
+        """
         self.step_start_time = time.time()
 
     def calculate(
@@ -68,7 +102,33 @@ class StepMetrics:
         mode: tp.Literal["eval", "train"] | None = None,
         **extras,
     ) -> dict[str, float]:
-        """Calculate comprehensive metrics for the training step."""
+        """Calculate comprehensive metrics for the training step.
+
+        Computes performance metrics, loss statistics, and optional detailed
+        metrics like gradient norms.
+
+        Args:
+            metrics: Loss metrics from the training step.
+            current_step: Current training/evaluation step number.
+            epoch: Current epoch number.
+            flops_per_token: FLOPs required per token for forward pass.
+            extra_flops_per_token: Additional FLOPs for backward pass.
+            batch_size: Number of samples in the batch.
+            seq_length: Sequence length of inputs.
+            learning_rate: Current learning rate value.
+            mode: 'train' or 'eval' to prefix metric names.
+            **extras: Additional metrics to include.
+
+        Returns:
+            dict: Comprehensive metrics including:
+                - Basic metrics (loss, perplexity, accuracy)
+                - Performance metrics (TFLOPs, throughput)
+                - MLPerf benchmark metrics
+                - Optional gradient norms and detailed statistics
+
+        Note:
+            In performance mode, detailed metrics are skipped for efficiency.
+        """
         step_time = time.time() - self.step_start_time
         total_time = time.time() - self.start_time
 
@@ -133,7 +193,20 @@ class StepMetrics:
         return basic_metrics
 
     def _calculate_detailed_metrics(self, metrics: LossMetrics):
-        """Calculate additional detailed metrics."""
+        """Calculate additional detailed metrics.
+
+        Computes gradient norms and other detailed statistics when not
+        in performance mode.
+
+        Args:
+            metrics: Loss metrics containing gradient information.
+
+        Returns:
+            dict: Detailed metrics including per-layer gradient norms.
+
+        Note:
+            Only computed when log_grad_norms is True and not in performance mode.
+        """
         detailed_metrics = {}
         getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
         if self.arguments.log_grad_norms:
@@ -157,16 +230,40 @@ class StepMetrics:
 
 
 class MetricsTracker:
-    """Tracks and aggregates training metrics over time."""
+    """Tracks and aggregates training metrics over time.
+
+    Maintains running averages of loss and accuracy across training steps,
+    useful for monitoring training progress and convergence.
+
+    Attributes:
+        loss_sum: Cumulative loss sum.
+        accuracy_sum: Cumulative accuracy sum.
+        metrics_history: Historical metrics for analysis.
+        step_offset: Step number offset for averaging.
+    """
 
     def __init__(self):
+        """Initialize the metrics tracker with empty state."""
         self.loss_sum = None
         self.accuracy_sum = None
         self.metrics_history = defaultdict(list)
         self.step_offset = 0
 
     def update(self, loss, accuracy, step):
-        """Update tracked metrics with new values."""
+        """Update tracked metrics with new values.
+
+        Args:
+            loss: Current step loss.
+            accuracy: Current step accuracy (can be None or inf).
+            step: Current step number.
+
+        Returns:
+            tuple | float: (mean_loss, mean_accuracy) if accuracy is valid,
+                          otherwise just mean_loss.
+
+        Note:
+            Handles missing accuracy values gracefully.
+        """
         self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
         mean_loss = self.loss_sum / (step - self.step_offset)
         if accuracy != float("inf"):
@@ -179,21 +276,52 @@ class MetricsTracker:
         return float(mean_loss)
 
     def reset(self, step):
-        """Reset tracked metrics."""
+        """Reset tracked metrics.
+
+        Args:
+            step: New step offset for averaging.
+
+        Note:
+            Typically called at the start of each epoch or evaluation phase.
+        """
         self.loss_sum = None
         self.accuracy_sum = None
         self.step_offset = step
 
 
 class MetricsColumn(ProgressColumn):
-    """A custom progress column for displaying metrics."""
+    """A custom Rich progress column for displaying metrics.
+
+    Formats and displays training metrics in a readable format within
+    Rich progress bars.
+
+    Attributes:
+        metrics_to_show: Optional list of metric names to display.
+                        If None, shows all metrics.
+    """
 
     def __init__(self, metrics_to_show=None):
+        """Initialize the metrics column.
+
+        Args:
+            metrics_to_show: Optional list of metric names to filter display.
+        """
         super().__init__()
         self.metrics_to_show = metrics_to_show
 
     def render(self, task: Task) -> Text:
-        """Render the metrics in a organized way."""
+        """Render the metrics in an organized way.
+
+        Args:
+            task: Rich Task object containing metrics to display.
+
+        Returns:
+            Text: Formatted metrics text with styling.
+
+        Note:
+            Automatically formats floats with scientific notation for
+            very small or large values.
+        """
         if not task.fields.get("metrics"):
             return Text("")
 
@@ -227,27 +355,47 @@ class MetricsColumn(ProgressColumn):
 
 
 class BaseProgressBar(abc.ABC):
-    """Abstract base class for progress bar implementations."""
+    """Abstract base class for progress bar implementations.
+
+    Defines the interface for different progress bar backends
+    (tqdm, rich, JSON logging).
+    """
 
     @abc.abstractmethod
     def update(self, n: int = 1) -> None:
+        """Update the progress bar.
+
+        Args:
+            n: Number of steps to advance.
+        """
         pass
 
     @abc.abstractmethod
     def set_postfix(self, **kwargs) -> None:
+        """Set postfix metrics to display.
+
+        Args:
+            **kwargs: Metric key-value pairs to display.
+        """
         pass
 
     @abc.abstractmethod
     def reset(self) -> None:
+        """Reset the progress bar to initial state."""
         pass
 
     @abc.abstractmethod
     def close(self) -> None:
+        """Close and cleanup the progress bar."""
         pass
 
 
 class NullProgressBar(BaseProgressBar):
-    """Dummy progress bar that does nothing - useful for multiprocessing."""
+    """Dummy progress bar that does nothing.
+
+    Useful for multiprocessing scenarios where only the main process
+    should display progress, or when progress display is disabled.
+    """
 
     def update(self, n: int = 1) -> None:
         pass
@@ -263,9 +411,20 @@ class NullProgressBar(BaseProgressBar):
 
 
 class TqdmProgressBar(BaseProgressBar):
-    """Wrapper for tqdm progress bar."""
+    """Wrapper for tqdm progress bar.
+
+    Adapts tqdm progress bars to the BaseProgressBar interface.
+
+    Attributes:
+        pbar: Underlying tqdm progress bar instance.
+    """
 
     def __init__(self, pbar: tqdm):
+        """Initialize with an existing tqdm progress bar.
+
+        Args:
+            pbar: tqdm progress bar instance.
+        """
         self.pbar = pbar
 
     def update(self, n: int = 1) -> None:
@@ -287,9 +446,21 @@ class TqdmProgressBar(BaseProgressBar):
 
 
 class JSONProgressBar(BaseProgressBar):
-    """Wrapper for JSON"""
+    """JSON-based progress reporting.
+
+    Outputs progress as JSON logs instead of a visual progress bar.
+    Useful for structured logging and CI/CD environments.
+
+    Attributes:
+        desc: Description text for the progress.
+    """
 
     def __init__(self, desc=""):
+        """Initialize JSON progress reporter.
+
+        Args:
+            desc: Description text for the progress.
+        """
         self.desc = desc
 
     def update(self, n: int = 1) -> None: ...
@@ -309,10 +480,24 @@ class JSONProgressBar(BaseProgressBar):
 
 
 class RichProgressBar(BaseProgressBar):
-    """Wrapper for rich progress bar."""
+    """Wrapper for Rich library progress bar.
+
+    Provides beautiful, customizable progress bars with support for
+    multiple columns and custom rendering.
+
+    Attributes:
+        progress: Rich Progress instance.
+        task_id: ID of the task being tracked.
+        _postfix: Current postfix metrics.
+    """
 
     def __init__(self, progress: Progress, task_id: TaskID):
-        """Initialize RichProgressBar with an existing Progress instance and task_id."""
+        """Initialize RichProgressBar with an existing Progress instance.
+
+        Args:
+            progress: Rich Progress instance managing the display.
+            task_id: ID of the task to track within the Progress instance.
+        """
         self.progress = progress
         self.task_id = task_id
         self._postfix = {}
@@ -446,12 +631,26 @@ def compute_weight_stats(
 ) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 
+    Analyzes model parameters matching the given pattern and computes
+    histograms and statistical measures for monitoring training stability.
+
     Args:
-        params: Model parameters
-        repattern: Regular expression pattern to match parameter paths
+        params: Model parameters as nested dictionary or PyTree.
+        repattern: Regular expression pattern to match parameter paths.
+                  Use '.*' to match all parameters.
 
     Returns:
-        Dictionary of weight statistics with keys formatted as 'path/to/param/histogram'
+        dict: Weight statistics with keys formatted as 'path/to/param/histogram'
+             containing MetricsHistogram objects.
+
+    Note:
+        JIT-compiled with static pattern argument for efficiency.
+        Useful for detecting gradient explosion, vanishing gradients,
+        or monitoring weight distributions during training.
+
+    Example:
+        >>> stats = compute_weight_stats(model.params, r'.*dense.*')
+        >>> # Gets statistics for all dense layer weights
     """
     stats = {}
     for path, param in traversals.flatten_dict(params).items():

@@ -75,11 +75,6 @@ class OpenAIBaseModel(BaseModel):
                     field_names.add(alias)
             cls.field_names = field_names
 
-        # if any(k not in field_names for k in data):
-        #     warnings.warn(
-        #         f"The following fields were present in the request but ignored: {data.keys() - field_names}",
-        #         stacklevel=1,
-        #     )
         return result
 
 

@@ -539,6 +539,52 @@ class eSurge:
                 self._scheduler_thread = None
             logger.info("Background scheduler terminated")
 
+    def _format_chat_prompt(
+        self,
+        messages: list[dict[str, str]],
+        add_generation_prompt: bool = True,
+        chat_template: str | None = None,
+        tools: list[dict] | None = None,
+    ) -> str:
+        """Format chat messages into a prompt string using the tokenizer's chat template.
+
+        Converts a list of chat messages into a formatted prompt string that can be
+        passed to the model for generation. Uses the tokenizer's built-in chat template
+        or a custom template if provided.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys.
+                Roles can be 'system', 'user', 'assistant', etc.
+            add_generation_prompt: Whether to add the generation prompt token/string
+                at the end to indicate the model should generate a response.
+            chat_template: Optional custom chat template to override the tokenizer's
+                default template. Should be a Jinja2 template string.
+            tools: Optional list of tool/function definitions that the model can use.
+                Format depends on the specific model's tool calling conventions.
+
+        Returns:
+            Formatted prompt string ready for tokenization and generation.
+
+        Example:
+            >>> messages = [
+            ...     {"role": "system", "content": "You are a helpful assistant."},
+            ...     {"role": "user", "content": "What is 2+2?"}
+            ... ]
+            >>> prompt = engine._format_chat_prompt(messages)
+            >>> # Returns formatted string like: "<|system|>You are a helpful assistant.<|user|>What is 2+2?<|assistant|>"
+
+        Note:
+            The exact format depends on the tokenizer's chat template. Different models
+            use different special tokens and formatting conventions.
+        """  # noqa
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            chat_template=chat_template,
+        )
+
     def generate(
         self,
         prompts: str | list[str],
@@ -805,6 +851,108 @@ class eSurge:
                 self._bytecode_decode = original_bytecode_decode
                 if not original_bytecode_decode:
                     self._smart_decoder = None
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        bytecode_decode: bool | None = None,
+        chat_template: str | None = None,
+    ):
+        """High-level chat interface compatible with vLLM and OpenAI APIs.
+
+        Provides a convenient chat-based interface for conversational AI applications.
+        Automatically formats messages using the model's chat template and handles
+        both streaming and non-streaming responses.
+
+        Args:
+            messages: List of message dictionaries representing the conversation history.
+                Each message must have 'role' and 'content' keys. Supported roles are
+                typically 'system', 'user', and 'assistant', but may vary by model.
+                Example: [{"role": "user", "content": "Hello!"}]
+            tools: Optional list of tool/function definitions for function calling.
+                Format should match the model's expected tool schema. Tools allow the
+                model to request function calls as part of its response.
+            sampling_params: Generation parameters controlling temperature, top_p,
+                max_tokens, etc. Defaults to SamplingParams(max_tokens=128) if None.
+            request_id: Optional unique identifier for tracking this request.
+                Auto-generated if None.
+            stream: If True, returns an iterator yielding incremental RequestOutput
+                objects with delta_text for real-time streaming. If False, returns
+                a single RequestOutput with the complete response.
+            bytecode_decode: Override the instance's bytecode_decode setting for this
+                specific chat. When True, enables smart UTF-8 handling to prevent
+                malformed characters. When None, uses the instance's default.
+            chat_template: Optional custom Jinja2 template to override the tokenizer's
+                default chat template. Useful for models with non-standard formats.
+
+        Returns:
+            - If stream=False: Single RequestOutput object containing the complete
+              assistant response with all metrics and generated text.
+            - If stream=True: Iterator[RequestOutput] yielding incremental updates
+              with delta_text containing newly generated text chunks.
+
+        Raises:
+            ValueError: If messages format is invalid or empty.
+            RuntimeError: If scheduler is not running or tokenizer lacks chat template.
+
+        Example:
+            >>> # Non-streaming chat
+            >>> messages = [
+            ...     {"role": "system", "content": "You are a helpful assistant."},
+            ...     {"role": "user", "content": "Explain quantum computing"}
+            ... ]
+            >>> response = engine.chat(messages, sampling_params=SamplingParams(max_tokens=200))
+            >>> print(response.get_text())
+            >>>
+            >>> # Streaming chat with function calling
+            >>> tools = [{
+            ...     "type": "function",
+            ...     "function": {
+            ...         "name": "get_weather",
+            ...         "description": "Get weather for a location",
+            ...         "parameters": {...}
+            ...     }
+            ... }]
+            >>> for chunk in engine.chat(messages, tools=tools, stream=True):
+            ...     print(chunk.delta_text, end="", flush=True)
+            >>>
+            >>> # Custom chat template
+            >>> custom_template = "{% for message in messages %}...{% endfor %}"
+            >>> response = engine.chat(messages, chat_template=custom_template)
+
+        Note:
+            This method provides compatibility with OpenAI's chat completions API
+            and vLLM's chat interface, making it easy to migrate existing applications.
+            The exact behavior of tool calling and special tokens depends on the
+            specific model being used.
+        """
+        prompt = self._format_chat_prompt(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            chat_template=chat_template,
+        )
+        if stream:
+            return self.stream(
+                prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                bytecode_decode=bytecode_decode,
+            )
+        else:
+            outs = self.generate(
+                prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                use_tqdm=False,
+                bytecode_decode=bytecode_decode,
+            )
+            # generate() returns a list; chat is single prompt, so return the first
+            return outs[0]
 
     def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         """Add a new request to the scheduler queue with intelligent context management.

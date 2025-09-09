@@ -84,6 +84,14 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -102,6 +110,8 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaAttention(AttentionModule):
+    """Multi-head attention layer with RoPE embeddings for Llama models."""
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -111,6 +121,7 @@ class LlamaAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize attention layer with config."""
         super().__init__(config=config)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -164,6 +175,24 @@ class LlamaAttention(AttentionModule):
         fcm_mask: chex.Array | None = None,
         frequencies: chex.Array | None = None,
     ) -> tuple[chex.Array, chex.Array]:
+        """Apply multi-head attention with RoPE.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+            attention_mask: Attention mask for padding
+            position_ids: Position indices for RoPE
+            causal_mask: Causal attention mask
+            mode: Runtime mode (train/eval/infer)
+            cache_view: Optional cache view for KV caching
+            cache_metadata: Optional cache metadata
+            segment_ids: Optional segment IDs
+            output_attentions: Whether to return attention weights
+            fcm_mask: Optional FCM mask
+            frequencies: Optional precomputed RoPE frequencies
+
+        Returns:
+            AttentionLayerOutput with attention output and optional weights
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
             self.q_proj(hidden_states),

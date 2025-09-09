@@ -11,6 +11,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Bridge mixin for EasyDeL-HuggingFace interoperability.
+
+This module provides the EasyBridgeMixin class that enables seamless integration
+between EasyDeL models and the HuggingFace ecosystem. It handles model serialization,
+loading from various formats, conversion between frameworks, and integration with
+the HuggingFace Hub.
+
+The bridge supports:
+- Loading models from HuggingFace Hub or local paths
+- Converting between PyTorch and JAX/Flax formats
+- Saving models in EasyDeL or HuggingFace formats
+- Pushing models to HuggingFace Hub
+- Automatic weight format detection and loading
+- Quantization during loading
+- Distributed loading with sharding
+
+Classes:
+    EasyBridgeMixin: Main mixin class providing bridge functionality
+
+Constants:
+    FLAX_WEIGHTS_NAME: Standard name for Flax model weights
+    SAFE_WEIGHTS_NAME: Standard name for SafeTensors weights
+    CANDIDATE_FILENAMES: List of possible weight file names to search
+
+Example:
+    >>> from easydel.infra.mixins import EasyBridgeMixin
+    >>>
+    >>> class MyModel(EasyDeLBaseModule, EasyBridgeMixin):
+    ...     pass
+    >>>
+    >>> # Load from HuggingFace
+    >>> model = MyModel.from_pretrained("gpt2")
+    >>>
+    >>> # Save locally
+    >>> model.save_pretrained("./my_model")
+    >>>
+    >>> # Push to Hub
+    >>> model.push_to_hub("username/my-model")
+"""
+
 from __future__ import annotations
 
 import gc
@@ -23,8 +64,6 @@ from copy import deepcopy
 import huggingface_hub
 import huggingface_hub.errors
 import jax
-import jax.extend
-import jax.tree_util
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -524,7 +563,7 @@ class EasyBridgeMixin(PushToHubMixin):
             if is_local:
                 # Local directory: look for index -> safetensors -> msgpack
                 root = ePath(pretrained_model_name_or_path) / subfolder
-                archive_file, picked_name = _pick_first_existing(root)
+                archive_file, _ = _pick_first_existing(root)
                 if not archive_file:
                     raise FileNotFoundError(
                         f"No model weights found in '{root}'. Tried: {', '.join(CANDIDATE_FILENAMES)}"
@@ -534,7 +573,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 # Sometimes the path is nested under subfolder
                 alt_root = ePath(subfolder) / pretrained_model_name_or_path
                 if alt_root.is_dir():
-                    archive_file, picked_name = _pick_first_existing(alt_root)
+                    archive_file, _ = _pick_first_existing(alt_root)
                     if archive_file:
                         is_local = True
 

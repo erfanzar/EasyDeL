@@ -11,6 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Lightning attention cache implementation for EasyDeL.
+
+This module provides a specialized caching system for Lightning attention,
+which uses a unified key-value representation for improved efficiency.
+Lightning attention combines keys and values into a single tensor,
+reducing memory bandwidth requirements.
+
+Key Components:
+    - LightningCacheMetaData: Configuration for Lightning cache
+    - LightningCacheView: Per-layer Lightning cache storage
+    - LightningCache: Multi-layer Lightning cache container
+    - LightningMetadata: Runtime metadata (placeholder)
+
+Features:
+    - Unified KV tensor representation
+    - Reduced memory bandwidth usage
+    - Compatible with Lightning attention kernels
+    - Supports standard transformer operations
+
+Example:
+    >>> metadata = LightningCacheMetaData.create(
+    ...     partition_axis=partition_axis,
+    ...     batch_size=2,
+    ...     num_heads=16,
+    ...     head_dim=64
+    ... )
+    >>> cache = LightningCache.init_cache(
+    ...     num_hidden_layers=12,
+    ...     metadata=metadata
+    ... )
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -33,7 +66,30 @@ else:
 
 @auto_pytree
 class LightningCacheMetaData(BaseCacheMetadata):
-    """Metadata for transformer cache configuration."""
+    """Metadata configuration for Lightning attention cache.
+
+    Stores configuration parameters specific to Lightning attention,
+    which uses a unified key-value representation. Similar to standard
+    transformer cache but optimized for Lightning's memory access patterns.
+
+    Attributes:
+        partition_axis (es.PartitionAxis): Axis configuration for tensor partitioning.
+            Defines how tensors are sharded across devices.
+        batch_size (int | None): Number of sequences in batch.
+            None allows dynamic batch sizes.
+        num_heads (int | None): Number of attention heads.
+            Used for standard multi-head attention.
+        head_dim (int | None): Dimension of each attention head.
+            Defines the feature size per head.
+        key_heads (int | None): Number of key heads.
+            For multi-query or grouped-query attention.
+        value_heads (int | None): Number of value heads.
+            For multi-query or grouped-query attention.
+        key_dim (int | None): Dimension of key projections.
+            Can differ from head_dim for asymmetric attention.
+        value_dim (int | None): Dimension of value projections.
+            Can differ from head_dim for asymmetric attention.
+    """
 
     partition_axis: es.PartitionAxis
     batch_size: int | None
@@ -56,13 +112,35 @@ class LightningCacheMetaData(BaseCacheMetadata):
         key_dim: int | None = None,
         value_dim: int | None = None,
     ) -> LightningCacheMetaData:
-        """
-        Create a LightningCacheMetaData instance with validation.
-        Returns:
-            LightningCacheMetaData instance
+        """Create and validate Lightning cache metadata.
 
-        Raises:
-            ValueError: If required parameters are missing or invalid.
+        Factory method for creating Lightning cache configuration.
+        Unlike standard transformer cache, Lightning allows more
+        flexibility in parameters as it handles unified KV tensors.
+
+        Args:
+            partition_axis (es.PartitionAxis): Tensor partitioning configuration.
+            batch_size (int | None): Batch size for cache allocation.
+                None for dynamic batching.
+            num_heads (int | None): Number of attention heads.
+                Defaults to None for flexible head configuration.
+            head_dim (int | None): Dimension per attention head.
+                Defaults to None for flexible dimensions.
+            key_heads (int | None): Number of key heads for MQA/GQA.
+                Defaults to None (same as num_heads).
+            value_heads (int | None): Number of value heads for MQA/GQA.
+                Defaults to None (same as num_heads).
+            key_dim (int | None): Key projection dimension.
+                Defaults to None (same as head_dim).
+            value_dim (int | None): Value projection dimension.
+                Defaults to None (same as head_dim).
+
+        Returns:
+            LightningCacheMetaData: Configured metadata instance.
+
+        Note:
+            Lightning attention's unified representation means some
+            parameters may be handled differently than standard cache.
         """
         return cls(
             partition_axis=partition_axis,
@@ -78,12 +156,42 @@ class LightningCacheMetaData(BaseCacheMetadata):
 
 @auto_pytree
 class LightningCacheView(BaseCacheView):
+    """Single-layer cache view for Lightning attention.
+
+    Manages the unified key-value cache for one layer using Lightning's
+    optimized representation. Unlike standard caches that store keys and
+    values separately, Lightning combines them for better memory efficiency.
+
+    Attributes:
+        key_value (cx.Array | ImplicitArray): Unified key-value tensor.
+            Lightning's special representation combining K and V.
+        metadata (LightningCacheMetaData): Static cache configuration.
+        layer_index (int | None): Index of this layer in the model.
+
+    Note:
+        The unified representation requires special handling during
+        concatenation and may not be compatible with standard attention.
+    """
+
     key_value: cx.Array | ImplicitArray
     metadata: LightningCacheMetaData
     layer_index: int | None = None
 
     @classmethod
     def init(cls, metadata: LightningCacheMetaData, layer_index: int | None = None):
+        """Initialize a Lightning cache view for a single layer.
+
+        Creates a cache view with placeholder for unified KV tensor.
+        Actual tensor allocation happens during first use to allow
+        for dynamic shapes.
+
+        Args:
+            metadata (LightningCacheMetaData): Cache configuration.
+            layer_index (int | None): Layer index in the model.
+
+        Returns:
+            LightningCacheView: Initialized view with None placeholder.
+        """
         return cls(
             key_value=None,
             metadata=metadata,
@@ -198,6 +306,17 @@ class LightningCacheView(BaseCacheView):
 
 @auto_pytree
 class LightningCache(BaseCache):
+    """Multi-layer Lightning attention cache container.
+
+    Orchestrates Lightning cache views across all model layers,
+    providing unified management of the specialized Lightning
+    attention cache format.
+
+    Attributes:
+        views (list[LightningCacheView | None]): Per-layer cache views.
+            None for uninitialized layers.
+    """
+
     views: list[LightningCacheView | None]
 
     @classmethod
@@ -206,6 +325,19 @@ class LightningCache(BaseCache):
         num_hidden_layers: int,
         metadata: LightningCacheMetaData,
     ):
+        """Initialize Lightning cache for all model layers.
+
+        Creates cache views for each layer with consistent configuration.
+        Views are initialized with placeholders; actual tensors are
+        allocated on first use.
+
+        Args:
+            num_hidden_layers (int): Number of layers in the model.
+            metadata (LightningCacheMetaData): Cache configuration.
+
+        Returns:
+            LightningCache: Initialized cache with views for all layers.
+        """
         return cls(
             views=[
                 LightningCacheView.init(metadata=metadata, layer_index=layer_index)
@@ -215,6 +347,17 @@ class LightningCache(BaseCache):
 
     @classmethod
     def init_empty(cls, num_hidden_layers):
+        """Initialize empty Lightning cache structure.
+
+        Creates cache container with None placeholders for all layers.
+        Useful for gradual cache building or testing.
+
+        Args:
+            num_hidden_layers (int): Number of layer slots to create.
+
+        Returns:
+            LightningCache: Empty cache structure.
+        """
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self):
@@ -223,4 +366,11 @@ class LightningCache(BaseCache):
     __str__ = __repr__
 
 
-class LightningMetadata(BaseRunTimeMetadata): ...
+class LightningMetadata(BaseRunTimeMetadata):
+    """Runtime metadata for Lightning attention cache operations.
+
+    Placeholder class for future Lightning-specific runtime metadata.
+    Currently empty but reserved for Lightning-specific runtime state.
+    """
+
+    ...

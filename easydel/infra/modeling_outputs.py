@@ -189,6 +189,21 @@ class ModelOutput(tp.OrderedDict):
 
 @auto_pytree
 class AttentionLayerOutput(ModelOutput):
+    """Output from a single attention layer.
+
+    Contains the attention computation results from a transformer attention layer,
+    including optional attention weights and cache views for efficient generation.
+
+    Args:
+        attention_output: Output tensor from the attention layer with shape
+            (batch_size, sequence_length, hidden_size).
+        attention_weight: Optional attention weights after softmax with shape
+            (batch_size, num_heads, sequence_length, sequence_length).
+            Only returned when output_attentions=True.
+        cache_view: Optional cache view for efficient autoregressive generation.
+            Contains cached key-value pairs from previous steps.
+    """
+
     attention_output: chex.Array
     attention_weight: chex.Array | None = None
     cache_view: TransformerCacheView | None = None
@@ -196,6 +211,21 @@ class AttentionLayerOutput(ModelOutput):
 
 @auto_pytree
 class EncoderLayerOutput(ModelOutput):
+    """Output from a single encoder layer.
+
+    Contains the outputs from a transformer encoder layer, including
+    the processed hidden states and optional attention weights.
+
+    Args:
+        hidden_states: Output hidden states from the encoder layer with shape
+            (batch_size, sequence_length, hidden_size).
+        residual_states: Optional residual connection states before layer norm
+            with shape (batch_size, sequence_length, hidden_size).
+        attention_weight: Optional attention weights after softmax with shape
+            (batch_size, num_heads, sequence_length, sequence_length).
+            Only returned when output_attentions=True.
+    """
+
     hidden_states: chex.Array
     residual_states: chex.Array | None = None
     attention_weight: chex.Array | None = None
@@ -203,6 +233,26 @@ class EncoderLayerOutput(ModelOutput):
 
 @auto_pytree
 class DecoderLayerOutput(ModelOutput):
+    """Output from a single decoder layer.
+
+    Contains the outputs from a transformer decoder layer, including
+    hidden states, attention weights, and optional MoE routing information.
+
+    Args:
+        hidden_states: Output hidden states from the decoder layer with shape
+            (batch_size, sequence_length, hidden_size).
+        residual_states: Optional residual connection states before layer norm
+            with shape (batch_size, sequence_length, hidden_size).
+        cross_attention: Optional cross-attention outputs when using encoder-decoder
+            architecture with shape (batch_size, sequence_length, hidden_size).
+        attention_weight: Optional self-attention weights after softmax with shape
+            (batch_size, num_heads, sequence_length, sequence_length).
+        router_logits: Optional MoE router logits for expert selection with shape
+            (batch_size, sequence_length, num_experts).
+        gate_loss: Optional auxiliary loss for MoE load balancing.
+        cache_view: Optional cache view for efficient autoregressive generation.
+    """
+
     hidden_states: chex.Array
     residual_states: chex.Array | None = None
     cross_attention: chex.Array | None = None
@@ -973,6 +1023,22 @@ class MoeCausalLMOutput(MaskedLMOutput):
 
 @auto_pytree
 class MambaOutput(BaseModelOutput):
+    """Output from Mamba state-space models.
+
+    Contains the outputs from Mamba models which use selective state-space
+    layers instead of attention for sequence modeling.
+
+    Args:
+        last_hidden_state: Final hidden states from the model with shape
+            (batch_size, sequence_length, hidden_size).
+        cache_params: Optional list of cached state-space parameters for
+            efficient autoregressive generation. Each element contains the
+            SSM state for a layer.
+        hidden_states: Optional tuple of hidden states from all layers.
+            Only returned when output_hidden_states=True.
+        loss: Optional loss value when labels are provided.
+    """
+
     last_hidden_state: chex.Array = None
     cache_params: list[chex.Array] | None = None
     hidden_states: tuple[chex.Array] | None = None
@@ -981,6 +1047,21 @@ class MambaOutput(BaseModelOutput):
 
 @auto_pytree
 class MambaCausalLMOutput(BaseModelOutput):
+    """Output from Mamba causal language models.
+
+    Contains the outputs from Mamba models configured for causal language
+    modeling, including logits over the vocabulary.
+
+    Args:
+        logits: Prediction scores over the vocabulary with shape
+            (batch_size, sequence_length, vocab_size).
+        cache_params: Optional list of cached state-space parameters for
+            efficient autoregressive generation.
+        hidden_states: Optional tuple of hidden states from all layers.
+            Only returned when output_hidden_states=True.
+        loss: Optional language modeling loss when labels are provided.
+    """
+
     logits: chex.Array = None
     cache_params: list[chex.Array] | None = None
     hidden_states: tuple[chex.Array] | None = None
