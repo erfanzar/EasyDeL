@@ -12,93 +12,133 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Custom VJP implementation for grouped matrix multiplication.
 
-import chex
+This module defines the custom forward and backward passes for grouped matrix
+multiplication operations, enabling efficient automatic differentiation on TPU.
+It wraps the low-level kernel implementations with JAX's custom VJP mechanism
+to provide gradient support.
+"""
+
 import jax
-from jax import numpy as jnp
+import jax.numpy as jnp
 
-from easydel.utils.compiling_utils import ejit
+from ._kernel import grouped_matmul as back_grouped_matmul
+from ._kernel import transposed_grouped_matmul as back_tgrouped_matmul
 
-from ._backward_pallas import _backward_fn
-from ._forward_pallas import _forward_fn
-from ._kernel import TilinFn
-from ._kernel import gmm as _pure_gmm
-
-_grouped_matmul = jax.custom_vjp(_pure_gmm, nondiff_argnums=(3, 4, 7, 8))
-
-_grouped_matmul.defvjp(_forward_fn, _backward_fn)
+grouped_matmul = jax.custom_vjp(back_grouped_matmul, nondiff_argnums=(3, 4, 7, 8))
 
 
-def grouped_matmul(
-    lhs: chex.Array,
-    rhs: chex.Array,
-    group_sizes: chex.Array,
+def _grouped_matmul_fwd(
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    group_sizes: jnp.ndarray,
     preferred_element_type: jnp.dtype = jnp.float32,
-    tiling: tuple[int, int, int] | TilinFn | None = (128, 128, 128),
-    group_offset: chex.Array | None = None,
-    existing_out: chex.Array | None = None,
+    tiling: tuple[int, int, int] = (128, 128, 128),
+    group_offset: jnp.ndarray | None = None,
+    existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
-) -> chex.Array:
-    return _grouped_matmul(
-        lhs=lhs,
-        rhs=rhs,
-        group_sizes=group_sizes,
-        preferred_element_type=preferred_element_type,
-        tiling=tiling,
-        group_offset=group_offset,
-        existing_out=existing_out,
+) -> tuple[
+    jnp.ndarray,
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
+]:
+    """Forward pass for grouped matrix multiplication with custom VJP.
+
+    Computes the grouped matrix multiplication and saves necessary tensors
+    for the backward pass. This function is called during the forward pass
+    of automatic differentiation.
+
+    Args:
+        lhs: Left-hand side matrix of shape [m, k].
+        rhs: Right-hand side tensor of shape [num_groups, k, n] or
+            [num_groups, n, k] if transpose_rhs is True.
+        group_sizes: Array of group sizes with shape [num_groups], dtype int32.
+            Each element specifies the number of rows from lhs for that group.
+        preferred_element_type: Output dtype, defaults to float32.
+        tiling: Tile dimensions (tm, tk, tn) for kernel execution.
+        group_offset: Starting group index for computation (for sharding).
+        existing_out: Optional existing output array to accumulate into.
+        transpose_rhs: Whether to transpose the last two dimensions of rhs.
+        interpret: Whether to run in interpret mode for debugging.
+
+    Returns:
+        Tuple of:
+            - out: Result of grouped matmul with shape [m, n]
+            - residual: Tuple of tensors needed for backward pass
+                (lhs, rhs, group_sizes, group_offset, num_groups)
+    """
+    out = back_grouped_matmul(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type,
+        tiling,
+        group_offset,
+        existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
     )
+    return out, (lhs, rhs, group_sizes, group_offset, rhs.shape[0])
 
 
-@ejit(static_argnames=("tile_size", "do_hostsync", "sync_axes"))
-def _grouped_matmul_sharded(
-    lhs: chex.Array,
-    rhs: chex.Array,
-    group_sizes: chex.Array,
-    tile_size: tuple[int, int, int] = (512, 1024, 1024),
-    do_hostsync: bool = False,
-    sync_axes: str = "tp",
-) -> jnp.ndarray:
-    hidden_state = lhs.shape
-    pad_length_fixed = tile_size[0]
-    if hidden_state[0] % pad_length_fixed:
-        pad_length = pad_length_fixed - hidden_state[0] % pad_length_fixed
-        lhs = jax.lax.pad(lhs, 0.0, [(0, pad_length, 0), (0, 0, 0)])
+def _grouped_matmul_bwd(
+    preferred_element_type: jnp.dtype,
+    tiling: tuple[int, int, int],
+    transpose_rhs: bool,
+    interpret: bool,
+    residual: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
+    grad: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray]:
+    """Backward pass for grouped matrix multiplication with custom VJP.
 
-    m, k, n = lhs.shape[0], lhs.shape[1], lhs.shape[2]
-    out = grouped_matmul(
-        lhs=lhs,
-        rhs=rhs,
-        group_sizes=group_sizes,
-        preferred_element_type=lhs.dtype,
-        tiling=(min(m, tile_size[0]), min(k, tile_size[1]), min(n, tile_size[2])),
+    Computes gradients with respect to lhs and rhs using the gradient of the
+    output and saved tensors from the forward pass. This function is called
+    during the backward pass of automatic differentiation.
+
+    Args:
+        preferred_element_type: Output dtype (unused in backward).
+        tiling: Tile dimensions (tm, tk, tn) for kernel execution.
+        transpose_rhs: Whether rhs was transposed in forward pass.
+        interpret: Whether to run in interpret mode for debugging.
+        residual: Saved tensors from forward pass containing
+            (lhs, rhs, group_sizes, group_offset, num_actual_groups).
+        grad: Gradient of the loss with respect to the output, shape [m, n].
+
+    Returns:
+        Tuple of gradients:
+            - grad_lhs: Gradient w.r.t. lhs, shape [m, k]
+            - grad_rhs: Gradient w.r.t. rhs, same shape as original rhs
+            - None: Placeholder for group_sizes gradient (non-differentiable)
+            - None: Placeholder for group_offset gradient (non-differentiable)
+            - grad: Pass-through gradient for existing_out
+    """
+
+    del preferred_element_type
+    lhs, rhs, group_sizes, group_offset, num_actual_groups = residual
+    grad_lhs = back_grouped_matmul(
+        grad,
+        rhs,
+        group_sizes,
+        lhs[0].dtype,
+        tiling,
+        group_offset,
+        transpose_rhs=not transpose_rhs,
+        interpret=interpret,
+    )
+    grad_rhs = back_tgrouped_matmul(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        rhs.dtype,
+        tiling,
+        group_offset,
+        num_actual_groups,
+        interpret=interpret,
     )
 
-    if do_hostsync:
-        out = jax.lax.psum(out, sync_axes)
-
-    if hidden_state[0] % pad_length_fixed:
-        out = out[: hidden_state[0]]
-
-    return out
+    grad_rhs = grad_rhs.swapaxes(1, 2) if transpose_rhs else grad_rhs
+    return grad_lhs, grad_rhs, None, None, grad
 
 
-def grouped_matmul_sharded(
-    lhs: chex.Array,
-    rhs: chex.Array,
-    group_sizes: chex.Array,
-    tile_size: tuple[int, int, int] = (512, 1024, 1024),
-    do_hostsync: bool = False,
-    sync_axes: str = "tp",
-) -> jnp.ndarray:
-    return _grouped_matmul_sharded(
-        lhs=lhs,
-        rhs=rhs,
-        group_sizes=group_sizes,
-        tile_size=tile_size,
-        do_hostsync=do_hostsync,
-        sync_axes=sync_axes,
-    )
+grouped_matmul.defvjp(_grouped_matmul_fwd, _grouped_matmul_bwd)
