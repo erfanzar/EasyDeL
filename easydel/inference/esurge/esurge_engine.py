@@ -327,7 +327,7 @@ class eSurge:
         from easydel.layers.attention import AttentionMechanisms
 
         if jax.default_backend() != "tpu" and page_size <= 128:
-            logger.warn(
+            logger.warning(
                 "for better performance and to utilize GPUs kernels (or even just on CPUs) "
                 "better it's recommended to use `page_size>=256`."
             )
