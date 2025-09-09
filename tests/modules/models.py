@@ -1,8 +1,3 @@
-import os
-
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["JAX_PLATFORMS"] = "cpu"
 import copy
 import gc
 import unittest
@@ -72,7 +67,7 @@ class EasyModelsTest(unittest.TestCase):
         self.use_sliding_window = True
 
         self.scan_mlp_chunk_size = self.sequence_length // 2
-        self.sharding_axis_dims = (1, 1, 1, -1, 1)
+        self.sharding_axis_dims = (1, 2, 2, -1, 1)
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.use_parallel_residual = True
         self.qk_layernorm = True

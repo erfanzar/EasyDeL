@@ -769,7 +769,6 @@ else:
 if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     import ray
     from eformer.executor import DistributedConfig as _DistributedConfig
-    from eformer.executor import RayClusterConfig as _RayClusterConfig
 
     try:
         _DistributedConfig().initialize()
@@ -778,12 +777,6 @@ if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     except Exception:  # maybe it's a single process
         _logger.warn("Failed to initialize jax-dist")
     del _DistributedConfig
-    if not ray.is_initialized():
-        try:
-            _RayClusterConfig().initialize()
-        except Exception:
-            ...
-    del _RayClusterConfig
 
 del _os
 del _logger
