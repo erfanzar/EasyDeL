@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import time
 import typing
+from collections import OrderedDict
 from functools import partial
 
 import jax
@@ -187,12 +188,23 @@ class ExecutionManager:
         self._compute_hidden_states_fn: None | pjit.JitWrapped = None
         self._compute_tokens_fn: None | pjit.JitWrapped = None
         self._fused_step_fn: None | pjit.JitWrapped = None
-
-        self._lowerd_history = dict()
+        self._cache_capacity = 64
+        self._lowerd_history = OrderedDict()
 
         logger.debug("Initializing execution functions")
         self.init_fns()
         logger.debug("ExecutionManager initialization complete")
+
+    def _cache_put(self, key, value):
+        self._lowerd_history[key] = value
+        self._lowerd_history.move_to_end(key)
+        if len(self._lowerd_history) > self._cache_capacity:
+            self._lowerd_history.popitem(last=False)
+
+    def _cache_get(self, key):
+        value = self._lowerd_history[key]
+        self._lowerd_history.move_to_end(key)
+        return value
 
     def execute_fused(
         self,
@@ -385,7 +397,7 @@ class ExecutionManager:
                 sampling_metadata,
                 self.rng_key,
             )
-            return token_ids, token_ids
+            return token_ids, None
 
     def compile(
         self,
@@ -425,26 +437,20 @@ class ExecutionManager:
         logger.debug(f"Starting compilation for {len(num_tokens_paddings)} token padding sizes")
         logger.debug(f"Token paddings: {num_tokens_paddings}")
         logger.debug(f"Max pages per request: {max_pages_per_req}, Max requests: {max_num_reqs}")
-
         ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
-        reqs_padds = list(set([ufn(num_reqs, max_num_reqs) for num_reqs in range(max_num_reqs)]))
+        reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
         total_compilations = len(num_tokens_paddings) * len(reqs_padds)
         compilation_count = 0
-
-        # Use the new ProgressLogger
         progress = ProgressLogger("eSurge", logger)
-
         for num_tokens in num_tokens_paddings:
             for reqs_padd in reqs_padds:
                 compile_start = time.time()
-
-                # Update progress
-                progress_msg = (
-                    f"Compiling [{compilation_count + 1}/{total_compilations}]:"
-                    f" {num_tokens:5d} tokens, {reqs_padd:2d} padded requests"
+                progress.update(
+                    compilation_count,
+                    total_compilations,
+                    f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
+                    f"{reqs_padd:2d} padded requests",
                 )
-                progress.update(compilation_count, total_compilations, progress_msg)
-
                 self._step_compile(
                     num_tokens=num_tokens,
                     num_reqs_max_model_len=num_reqs_max_model_len,
@@ -453,11 +459,8 @@ class ExecutionManager:
                     padded_num_reqs=reqs_padd,
                     metadata=metadata,
                 )
-                compile_time = time.time() - compile_start
-                logger.debug(f"Step completed in {compile_time:.2f}s")
+                logger.debug(f"Step completed in {time.time() - compile_start:.2f}s")
                 compilation_count += 1
-
-        # Complete the progress
         progress.complete(f"All {total_compilations} compilations completed")
 
     def _step_compile(
@@ -598,15 +601,27 @@ class ExecutionManager:
             model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
             with model.mesh:
                 logits = model.apply_lm_head(hidden_states[logits_indices])
-                keys = jax.random.split(rng_key, logits.shape[0] + 1)
+
+            is_all_greedy = jnp.all(sampling_params.temperature <= 0.0)
+
+            def do_greedy(_):
+                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+            def do_sample(_):
+                B = logits.shape[0]
+                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
                 samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
                     logits,
                     sampling_params.top_p.astype(logits.dtype),
                     sampling_params.temperature.astype(logits.dtype),
-                    keys[1:],
+                    row_keys,
                     64,
                 )
-                return samples.reshape(-1, 1), keys[0]
+                return samples.reshape(-1)
+
+            sampled = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None)
+            next_key = jax.random.fold_in(rng_key, jnp.int32(logits.shape[0]))
+            return sampled.reshape(-1, 1), next_key
 
         return _fn
 
@@ -666,10 +681,10 @@ class ExecutionManager:
                 es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
                 self._empty_sharding,  # input_ids_buf
                 self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # slot_mapping_buf
                 self._empty_sharding,  # query_start_loc_buf
                 self._empty_sharding,  # seq_lens_buf
                 self._empty_sharding,  # pages_tables_buf
+                self._empty_sharding,  # slot_mapping_buf
                 self._empty_sharding,  # rng_key
                 self._empty_sharding,  # out_tokens (full-size, masked)
                 self._empty_sharding,  # valid_mask (full-size)
@@ -713,10 +728,12 @@ class ExecutionManager:
             position_ids_buf = position_ids_buf.at[:num_tokens_static].set(positions)
             qsl = jnp.zeros((max_num_reqs + 1,), dtype=jnp.int32).at[1:].set(cum)
             seq_lens = jnp.where(mask_reqs, dev_state.num_computed_tokens + scheduled, 0)
+
             pt_array = dev_state.page_table[0].get_array()
             pt_src = pt_array[: min(pt_array.shape[0], num_reqs_max_model_len), :]
             mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
             pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
+
             s = dev_state.num_computed_tokens
             e = s + scheduled
             lps = s // page_size
@@ -758,17 +775,16 @@ class ExecutionManager:
             slot_mapping_buf = slot_mapping_buf.at[0, :].set(jnp.where(slice_active, kv_cache_start, slot_mapping_pad))
             slot_mapping_buf = slot_mapping_buf.at[1, :].set(jnp.where(slice_active, new_kv_start, slot_mapping_pad))
             slot_mapping_buf = slot_mapping_buf.at[2, :].set(jnp.where(slice_active, slice_lens, slot_mapping_pad))
+
             nr_safe = jnp.maximum(nr, 1)
             next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
             padded_num_reqs = jnp.where(nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2)
             padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
 
-            # logits indices from cum
             tmp_logits = cum - 1
             mask_logits = i_reqs < padded_num_reqs
             logits_indices = jnp.where(mask_logits, tmp_logits, 0)
 
-            # 2) Forward + sampling (unchanged below)
             input_ids_view = input_ids_buf[:num_tokens_static]
             position_ids_view = position_ids_buf[:num_tokens_static]
 
@@ -795,13 +811,23 @@ class ExecutionManager:
 
             temp = dev_state.temperature[:max_num_reqs].astype(logits.dtype)
             topp = dev_state.top_p[:max_num_reqs].astype(logits.dtype)
-            keys = jax.random.split(rng_key, logits.shape[0] + 1)
-            samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
-                logits, topp, temp, keys[1:], 64
-            )
-            sampled_flat = samples.reshape(-1)
 
-            # 3) Apply tokens
+            is_all_greedy = jnp.all(temp <= 0.0)
+
+            def do_greedy(_):
+                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+            def do_sample(_):
+                B = logits.shape[0]
+                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
+                samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
+                    logits, topp, temp, row_keys, 64
+                )
+                return samples.reshape(-1)
+
+            sampled_flat = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None).reshape(-1)
+            rng_key = jax.random.fold_in(rng_key, jnp.int32(num_tokens_static))
+
             seq_lens_now_full = dev_state.num_computed_tokens + scheduled
             meets_len_full = seq_lens_now_full >= req_num_tokens_full
             valid_mask_full = (i_reqs < nr) & active_mask_full & (scheduled > 0) & meets_len_full
@@ -825,7 +851,7 @@ class ExecutionManager:
                 seq_lens,
                 pt,
                 slot_mapping_buf,
-                keys[0],
+                rng_key,
                 out_tokens_full,
                 valid_mask_full,
             )
@@ -887,8 +913,15 @@ class ExecutionManager:
                     apply_lm_head=False,
                 )
                 logits = model.apply_lm_head(output.last_hidden_state.squeeze(0)[logits_indices])
-                keys = jax.random.split(rng_key, logits.shape[0] + 1)
 
+            is_all_greedy = jnp.all(sampling_params.temperature <= 0.0)
+
+            def do_greedy(_):
+                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+            def do_sample(_):
+                B = logits.shape[0]
+                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
                 samples = jax.vmap(
                     sample_top_p_efficient,
                     in_axes=(0, 0, 0, 0, None),
@@ -897,10 +930,14 @@ class ExecutionManager:
                     logits,
                     sampling_params.top_p.astype(logits.dtype),
                     sampling_params.temperature.astype(logits.dtype),
-                    keys[1:],
-                    32,
+                    row_keys,
+                    64,  # tuned chunk size
                 )
-                return samples.reshape(-1, 1), output.past_key_values, keys[0]
+                return samples.reshape(-1)
+
+            sampled = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None)
+            next_key = jax.random.fold_in(rng_key, jnp.int32(logits.shape[0]))
+            return sampled.reshape(-1, 1), output.past_key_values, next_key
 
         return _fn
 
@@ -918,47 +955,42 @@ class ExecutionManager:
             compargs: Compilation arguments for the model functions.
         """
         if self.use_fused_step:
-            fused_key = (num_tokens, padded_num_reqs, "fused")
-            if fused_key not in self._lowerd_history.keys():
-                logger.debug(f"Compiling fused step function for key {fused_key}")
+            fused_key = (num_tokens, "fused")
+            if fused_key not in self._lowerd_history:
                 lowered = self._fused_step_fn.lower(num_tokens, *compargs[2])
                 compiled = lowered.compile()
-                self._lowerd_history[fused_key] = compiled
+                self._cache_put(fused_key, compiled)
         elif self.use_aot_forward:
             if self.use_combined_forward:
-                logger.debug(f"Compiling combined forward function for key ({num_tokens}, {padded_num_reqs})")
-                lowered = self._main_fn.lower(*compargs)
-                compiled = lowered.compile()
-                self._lowerd_history[(num_tokens, padded_num_reqs)] = compiled
+                key = (num_tokens, padded_num_reqs)
+                if key not in self._lowerd_history:
+                    lowered = self._main_fn.lower(*compargs)
+                    compiled = lowered.compile()
+                    self._cache_put(key, compiled)
             else:
                 hskey = (num_tokens, padded_num_reqs, "hidden_states")
                 tskey = (num_tokens, padded_num_reqs, "tokens")
-                if hskey not in self._lowerd_history.keys():
-                    logger.debug(f"Compiling hidden states function for key {hskey}")
+                if hskey not in self._lowerd_history:
                     hidden_states_lowered = self._compute_hidden_states_fn.lower(*compargs[0])
                     hidden_states_compiled = hidden_states_lowered.compile()
-                    self._lowerd_history[hskey] = hidden_states_compiled
-                if tskey not in self._lowerd_history.keys():
-                    logger.debug(f"Compiling tokens function for key {tskey}")
+                    self._cache_put(hskey, hidden_states_compiled)
+                if tskey not in self._lowerd_history:
                     tokens_lowered = self._compute_tokens_fn.lower(*compargs[1])
                     tokens_compiled = tokens_lowered.compile()
-                    self._lowerd_history[tskey] = tokens_compiled
+                    self._cache_put(tskey, tokens_compiled)
         else:
+            # JIT-on-first-use (dev mode)
             if self.use_combined_forward:
-                logger.debug(f"Compiling combined forward function for key ({num_tokens}, {padded_num_reqs})")
+                key = (num_tokens, padded_num_reqs)
                 _, self.kv_pages, _ = self._main_fn(*compargs)
-                self._lowerd_history[(num_tokens, padded_num_reqs)] = self._main_fn
+                self._cache_put(key, self._main_fn)
             else:
                 hskey = (num_tokens, padded_num_reqs, "hidden_states")
                 tskey = (num_tokens, padded_num_reqs, "tokens")
-                if hskey not in self._lowerd_history.keys():
-                    logger.debug(f"Compiling hidden states function for key {hskey}")
-                    _, self.kv_pages = self._compute_hidden_states_fn(*compargs[0])
-                    self._lowerd_history[hskey] = self._compute_hidden_states_fn
-                if tskey not in self._lowerd_history.keys():
-                    logger.debug(f"Compiling tokens function for key {tskey}")
-                    _ = self._compute_tokens_fn(*compargs[1])
-                    self._lowerd_history[tskey] = self._compute_tokens_fn
+                _, self.kv_pages = self._compute_hidden_states_fn(*compargs[0])
+                self._cache_put(hskey, self._compute_hidden_states_fn)
+                _ = self._compute_tokens_fn(*compargs[1])
+                self._cache_put(tskey, self._compute_tokens_fn)
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
         """Retrieve pre-compiled functions for given input dimensions.
@@ -972,15 +1004,15 @@ class ExecutionManager:
             function for combined forward mode, fused step mode, or a tuple of
             (hidden_states_fn, tokens_fn) for separate mode.
         """
+
         if self.use_fused_step:
-            fused_key = (num_tokens, padded_num_reqs, "fused")
-            return self._lowerd_history[fused_key]
+            return self._cache_get((num_tokens, "fused"))
         elif self.use_combined_forward:
-            return self._lowerd_history[(num_tokens, padded_num_reqs)]
+            return self._cache_get((num_tokens, padded_num_reqs))
         else:
             hskey = (num_tokens, padded_num_reqs, "hidden_states")
             tskey = (num_tokens, padded_num_reqs, "tokens")
-            return self._lowerd_history[hskey], self._lowerd_history[tskey]
+            return self._cache_get(hskey), self._cache_get(tskey)
 
     def get_compile_configurations(
         self,
