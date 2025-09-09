@@ -122,7 +122,6 @@ class PagePool:
             assert prev_page.page_hash is not None
             prev_page_hash_value = prev_page.page_hash.get_hash_value()
 
-        new_hashes = None
         for i, blk in enumerate(new_full_pages):
             assert blk.page_hash is None
 
@@ -138,15 +137,12 @@ class PagePool:
                     f"{len(page_tokens)} at {blk_idx}th page for request "
                     f"{request.request_id}({request})"
                 )
-
                 page_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, None)
                 page_hashes.append(page_hash)
 
             page_hash_with_group_id = PageHashWithGroupId(page_hash, kv_cache_group_id)
             blk.page_hash = page_hash_with_group_id
             self.cached_page_hash_to_page[page_hash_with_group_id][blk.page_id] = blk
-            if new_hashes is not None:
-                new_hashes.append(page_hash.hash_value)
             prev_page_hash_value = page_hash.hash_value
 
     def get_new_pages(self, num_pages: int) -> list[CachePage]:
@@ -238,16 +234,14 @@ class PagePool:
         """
         num_used_pages = self.num_pages - self.get_num_free_pages()
         if num_used_pages != 1:
-            print("Failed to reset prefix cache because some pages (%d) are not freed yet", num_used_pages - 1)
+            print(f"Failed to reset prefix cache because some pages ({num_used_pages - 1}) are not freed yet")
             return False
 
-        self.cached_page_hash_to_page = defaultdict(dict)
-
+        self.cached_page_hash_to_page.clear()
         for page in self.pages:
             page.reset_hash()
 
         print("Successfully reset prefix cache")
-
         return True
 
     def get_num_free_pages(self) -> int:

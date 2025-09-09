@@ -511,17 +511,14 @@ class eSurgeRunner:
         total_sync_time = 0.0
         total_post_proc_time = 0.0
 
-        # Result lists
         req_ids_all: list[str] = []
         sampled_token_ids_all: list[list[int]] = []
 
-        # Initial device state conversion
         t_dev_state_start = time.time()
         dev_state = self.sequence_buffer.to_device_state()
         t_dev_state = time.time() - t_dev_state_start
 
         while start_index < self.sequence_buffer.num_reqs:
-            # Window preparation timing
             t_prep_start = time.time()
 
             num_reqs_total = self.sequence_buffer.num_reqs
@@ -541,32 +538,24 @@ class eSurgeRunner:
                 break
             end_index = start_index + num_reqs
 
-            # Host compute: num_tokens_static = smallest bucket >= total
             total_scheduled = sum(scheduled_list)
             idx = bisect_left(self.num_tokens_paddings, total_scheduled)
             if idx >= len(self.num_tokens_paddings):
                 idx = len(self.num_tokens_paddings) - 1
             num_tokens_static = int(self.num_tokens_paddings[idx])
 
-            # Array preparation using pre-allocated buffers
-            # Only update the parts we need - no full reset needed since ExecutionManager only reads [:num_reqs]
             if num_reqs > 0:
-                # Build arrays directly in numpy (faster for small arrays)
                 scheduled_np = np.array(scheduled_list, dtype=np.int32)
                 req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
                 active_mask_np = np.zeros(self.max_num_reqs, dtype=bool)
-
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         rs = self.requests.get(rid)
                         if rs:
                             req_num_tokens_np[i] = rs.num_tokens
                         active_mask_np[i] = True
-
-                # Single conversion to JAX arrays
                 self.scheduled_full_buf = jnp.asarray(scheduled_np, dtype=jnp.int32)
                 if len(scheduled_np) < self.max_num_reqs:
-                    # Pad with zeros
                     self.scheduled_full_buf = jnp.pad(
                         self.scheduled_full_buf,
                         (0, self.max_num_reqs - len(scheduled_np)),
@@ -575,7 +564,6 @@ class eSurgeRunner:
                 self.req_num_tokens_full_buf = jnp.asarray(req_num_tokens_np, dtype=jnp.int32)
                 self.active_mask_full_buf = jnp.asarray(active_mask_np, dtype=bool)
 
-            # Calculate padded_num_reqs
             nr_safe = max(num_reqs, 1)
             next_pow2 = 1 << (nr_safe - 1).bit_length()
             padded_num_reqs = min(self.min_input_pad if num_reqs <= self.min_input_pad else next_pow2, self.max_num_reqs)
@@ -583,7 +571,6 @@ class eSurgeRunner:
             t_prep = time.time() - t_prep_start
             total_prep_time += t_prep
 
-            # Execute model
             exec_start = time.time()
             (
                 dev_state,
@@ -606,44 +593,37 @@ class eSurgeRunner:
                 slot_mapping_buf=self.slot_mapping_buf,
                 padded_num_reqs=padded_num_reqs,
             )
+            # account for device time
+            jax.block_until_ready(valid_mask_win)
             t_exec = time.time() - exec_start
             total_exec_time += t_exec
 
-            # Async copy
-            out_tokens_win.copy_to_host_async()
-            valid_mask_win.copy_to_host_async()
+            # host copies once
+            tokens_np = np.asarray(out_tokens_win)
+            valid_np = np.asarray(valid_mask_win)
 
-            # Sequence buffer update timing
             sq_utime = time.time()
             self.sequence_buffer = self.sequence_buffer.from_device_state(dev_state)
             sq_utime_took = time.time() - sq_utime
             total_sync_time += sq_utime_took
 
-            # Post-processing - highly optimized
             up_wtime = time.time()
-
-            # Direct boolean array indexing (fastest)
             for i, rid in enumerate(req_ids_window):
                 if rid is None:
                     continue
                 req_ids_all.append(rid)
 
-                if valid_mask_win[i]:
-                    # Direct extraction without conversion overhead
-                    tid = int(out_tokens_win[i])
+                if valid_np[i]:
+                    tid = int(tokens_np[i])
                     sampled_token_ids_all.append([tid])
-                    # Only lookup if we need to update
                     if rid in self.requests:
                         self.requests[rid].output_token_ids.append(tid)
                 else:
                     sampled_token_ids_all.append([])
-
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
 
             start_index = end_index
-
-        # kv_pages and rng_key are already updated inside executor_manager
 
         metrics_collector = get_metrics_collector()
         if metrics_collector:
@@ -664,9 +644,11 @@ class eSurgeRunner:
             f"total={total_time:.3f}s"
         )
 
+        # Stable mapping for scheduler indexing
+        req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
         return ModelRunnerOutput(
             req_ids=req_ids_all,
-            req_id_to_index=self.sequence_buffer.req_id_to_index,
+            req_id_to_index=req_id_to_out_index,
             sampled_token_ids=sampled_token_ids_all,
             spec_token_ids=None,
             logprobs=None,

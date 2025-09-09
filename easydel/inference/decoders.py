@@ -133,9 +133,6 @@ class SmartBytecodeDecoder:
                 logger.debug(f"Decode error recovery: buffering {len(remaining_tokens)} tokens")
 
             return new_text, remaining_tokens, True
-
-        # Fall back to linear search from the end if binary search fails
-        # (This handles edge cases where binary search might miss valid points)
         for i in range(token_count - 1, 0, -1):
             try:
                 partial_decoded = self.processor.decode(tokens[:i], skip_special_tokens=True)
@@ -147,8 +144,6 @@ class SmartBytecodeDecoder:
             except Exception:
                 continue
 
-        # Complete failure
-        logger.warning("Could not find any valid decode point, using fallback")
         return self.fallback_char, [], True
 
     def _extract_new_text(self, decoded_text: str, previous_text: str) -> str:
