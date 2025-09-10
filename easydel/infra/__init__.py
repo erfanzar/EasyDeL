@@ -72,6 +72,8 @@ Note:
 
 from eformer import escale
 from eformer.escale import PartitionAxis
+from eformer.executor import DistributedConfig
+from eformer.loggings import get_logger
 from eformer.pytree import PyTree, auto_pytree
 from flax.nnx import Rngs
 
@@ -79,6 +81,36 @@ from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .base_module import EasyDeLBaseModule
 from .base_state import EasyDeLState
 from .loss_utils import LossConfig
+
+
+def init_cluster():
+    """
+    Initialize the distributed computing cluster for EasyDeL.
+
+    This function sets up the distributed configuration for JAX-based distributed
+    computing. It attempts to initialize the JAX distributed runtime using the
+    DistributedConfig from eformer.
+
+    The function handles two types of failures gracefully:
+    - RuntimeError: Occurs when JAX distributed is already initialized manually
+    - General Exception: Occurs when running in single-process mode
+
+    Both failures are logged as warnings and do not raise exceptions, allowing
+    the code to continue execution in both distributed and single-process scenarios.
+
+    Note:
+        This function should be called once at the beginning of your program
+        before any distributed operations.
+    """
+    _logger = get_logger("EasyDeL-Distributed")
+
+    try:
+        DistributedConfig().initialize()
+    except RuntimeError:
+        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
+    except Exception:  # maybe it's a single process
+        _logger.warn("Failed to initialize jax-dist")
+
 
 __all__ = (
     "EasyDeLBaseConfig",
@@ -91,4 +123,5 @@ __all__ = (
     "Rngs",
     "auto_pytree",
     "escale",
+    "init_cluster",
 )
