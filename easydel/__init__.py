@@ -30,6 +30,8 @@ from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
 _logger = _get_logger("EasyDeL")
+
+
 if _check_bool_flag("EASYDEL_AUTO", True):
     _sys.setrecursionlimit(10000)
 
@@ -122,6 +124,7 @@ _import_structure = {
         "SamplingParams",
         "ToolParser",
         "ToolParserManager",
+        "eLMConfig",
         "eSurge",
         "eSurgeApiServer",
         "eSurgeRunner",
@@ -149,6 +152,7 @@ _import_structure = {
         "Rngs",
         "auto_pytree",
         "escale",
+        "init_cluster",
     ],
     "infra.errors": [
         "EasyDeLRuntimeError",
@@ -538,6 +542,7 @@ if _tp.TYPE_CHECKING:
         SamplingParams,
         ToolParser,
         ToolParserManager,
+        eLMConfig,
         eSurge,
         eSurgeApiServer,
         eSurgeRunner,
@@ -565,6 +570,7 @@ if _tp.TYPE_CHECKING:
         Rngs,
         auto_pytree,
         escale,
+        init_cluster,
     )
     from .infra.errors import EasyDeLRuntimeError, EasyDeLSyntaxRuntimeError, EasyDeLTimerError
     from .infra.etils import (
@@ -766,8 +772,7 @@ else:
     del _eform_version
 
 
-if _check_bool_flag("AUTO_INIT_CLUSTER", True):
-    import ray
+if _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True):
     from eformer.executor import DistributedConfig as _DistributedConfig
 
     try:
@@ -777,6 +782,12 @@ if _check_bool_flag("AUTO_INIT_CLUSTER", True):
     except Exception:  # maybe it's a single process
         _logger.warn("Failed to initialize jax-dist")
     del _DistributedConfig
+else:
+    _logger.info(
+        "Skipping initialization of `DistributedConfig` (ENABLE_DISTRIBUTED_INIT=0), "
+        "you can initialize that via `ed.init_cluster()`."
+    )
+
 
 del _os
 del _logger
