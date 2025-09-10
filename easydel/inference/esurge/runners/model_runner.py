@@ -62,6 +62,7 @@ import time
 import typing
 from bisect import bisect_left
 from dataclasses import replace
+from functools import partial
 
 import jax
 import numpy as np
@@ -73,7 +74,15 @@ from ..outputs import ModelRunnerOutput
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..scheduler import SchedulerOutput
 from .execution_manager import ExecutionManager
-from .sequence_buffer import SequenceBuffer
+from .sequence_buffer import (
+    SequenceBuffer,
+    build_allowed_mask,
+    build_sampling_arrays,
+    fill_slice,
+    move_row,
+    pack_prompts,
+    swap_rows,
+)
 from .states import CachedRequestState
 
 if typing.TYPE_CHECKING:
@@ -312,6 +321,96 @@ class eSurgeRunner:
 
         logger.debug(f"Allocated buffers: max_padded_slices={self.max_padded_slices}")
 
+    def _precompile_jitted_helpers(
+        self,
+        reqs_padds: list[int],
+        prompt_len_buckets: list[int],
+        precompile_allowed_mask: bool = False,
+        allowed_max: int = 512,
+    ) -> None:
+        logger.info("Precompiling eSurgeRunner helper kernels")
+
+        B = self.max_num_reqs
+        T = self.max_model_len
+        V = int(self.model.config.get_text_config().vocab_size)
+
+        token_ids = jnp.zeros((B, T), dtype=jnp.int32)
+        num_prompt_tokens = jnp.zeros((B,), dtype=jnp.int32)
+
+        temperature = jnp.zeros((B,), dtype=jnp.float32)
+        min_p = jnp.zeros((B,), dtype=jnp.float32)
+        top_p = jnp.ones((B,), dtype=jnp.float32)
+        top_k = jnp.zeros((B,), dtype=jnp.int32)
+
+        for pr_len in prompt_len_buckets:
+            pr_len = min(pr_len, self.max_model_len)
+            for pr_reqs in reqs_padds:
+                try:
+                    lowered = pack_prompts.lower(
+                        token_ids,
+                        num_prompt_tokens,
+                        padded_num_reqs=pr_reqs,
+                        padded_prompt_len=pr_len,
+                        pad_id=V,
+                    )
+                    _ = lowered.compile()
+                    logger.debug(f"pack_prompts compiled for (padded_num_reqs={pr_reqs}, padded_prompt_len={pr_len})")
+                except Exception as e:
+                    logger.debug(f"pack_prompts skip ({pr_reqs}, {pr_len}): {e}")
+
+        for pr_reqs in reqs_padds:
+            try:
+                lowered = build_sampling_arrays.lower(
+                    temperature,
+                    min_p,
+                    top_p,
+                    top_k,
+                    jnp.int32(min(pr_reqs, B)),  # num_reqs <= padded_num_reqs
+                    padded_num_reqs=pr_reqs,
+                )
+                _ = lowered.compile()
+                logger.debug(f"build_sampling_arrays compiled for (padded_num_reqs={pr_reqs})")
+            except Exception as e:
+                logger.debug(f"build_sampling_arrays skip ({pr_reqs}): {e}")
+
+        for pr_reqs in reqs_padds:
+            try:
+                lowered = fill_slice.lower(
+                    temperature,
+                    jnp.float32(0.0),
+                    int(pr_reqs),
+                    int(pr_reqs),
+                )
+                _ = lowered.compile()
+                logger.debug(f"fill_slice compiled for (num_reqs={pr_reqs}, padded_num_reqs={pr_reqs})")
+            except Exception as e:
+                logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
+
+        try:
+            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
+            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
+            logger.debug("swap_rows and move_row compiled")
+        except Exception as e:
+            logger.debug(f"swap_rows/move_row skip: {e}")
+
+        if precompile_allowed_mask:
+            max_allowed = int(min(allowed_max, V))
+            allowed_ids_padded = jnp.zeros((B, max_allowed), dtype=jnp.int32)
+            allowed_lens = jnp.zeros((B,), dtype=jnp.int32)
+            try:
+                lowered = build_allowed_mask.lower(
+                    allowed_ids_padded,
+                    allowed_lens,
+                    vocab_size=int(V),
+                    max_allowed=max_allowed,
+                )
+                _ = lowered.compile()
+                logger.debug(f"build_allowed_mask compiled for (B={B}, V={V}, max_allowed={max_allowed})")
+            except Exception as e:
+                logger.debug(f"build_allowed_mask skip (V={V}, max_allowed={max_allowed}): {e}")
+
+        logger.info("Helper kernel precompilation finished")
+
     def compile(self):
         """Compile the model for all token padding sizes."""
         logger.info("Starting eSurgeRunner compilation")
@@ -327,6 +426,14 @@ class eSurgeRunner:
             max_pages_per_req=self.max_pages_per_req,
             max_num_reqs=self.max_num_reqs,
             metadata=self.metadata,
+        )
+        req_bucket = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
+
+        self._precompile_jitted_helpers(
+            reqs_padds=sorted({req_bucket(n, self.max_num_reqs) for n in range(1, self.max_num_reqs + 1)}),
+            prompt_len_buckets=[min(n, self.max_model_len) for n in self.num_tokens_paddings],
+            precompile_allowed_mask=False,
+            allowed_max=512,
         )
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
@@ -582,6 +689,8 @@ class eSurgeRunner:
                 self.seq_lens_buf,
                 self.pages_tables_buf,
                 self.slot_mapping_buf,
+                hidden_states,
+                logits,
             ) = self.executor_manager.execute_fused(
                 num_tokens=num_tokens_static,
                 dev_state=dev_state,

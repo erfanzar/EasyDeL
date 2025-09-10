@@ -260,7 +260,7 @@ NONE_HASH: int
 def init_none_hash():
     global NONE_HASH
 
-    hash_seed = os.getenv("PYTHONHASHSEED")
+    hash_seed = int(os.getenv("PYTHONHASHSEED", "1524618910112"))
     NONE_HASH = int.from_bytes(os.urandom(32), byteorder="big") if hash_seed is None else hash(hash_seed)
 
 
