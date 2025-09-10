@@ -300,7 +300,6 @@ class ExecutionManager:
                 self.rng_key,
             )
 
-        # Update internal state and return all buffers
         (
             dev_state,
             self.kv_pages,
@@ -313,6 +312,8 @@ class ExecutionManager:
             self.rng_key,
             out_tokens_full,
             valid_mask_full,
+            hidden_states,
+            logits,
         ) = result
 
         return (
@@ -325,6 +326,8 @@ class ExecutionManager:
             seq_lens_buf,
             pages_tables_buf,
             slot_mapping_buf,
+            hidden_states,
+            logits,
         )
 
     def execute(
@@ -688,6 +691,8 @@ class ExecutionManager:
                 self._empty_sharding,  # rng_key
                 self._empty_sharding,  # out_tokens (full-size, masked)
                 self._empty_sharding,  # valid_mask (full-size)
+                self._empty_sharding,  # hidden_states
+                self._empty_sharding,  # logits
             ),
         )
         def _fn(
@@ -854,6 +859,8 @@ class ExecutionManager:
                 rng_key,
                 out_tokens_full,
                 valid_mask_full,
+                hs,
+                logits,
             )
 
         return _fn
@@ -956,6 +963,7 @@ class ExecutionManager:
         """
         if self.use_fused_step:
             fused_key = (num_tokens, "fused")
+
             if fused_key not in self._lowerd_history:
                 lowered = self._fused_step_fn.lower(num_tokens, *compargs[2])
                 compiled = lowered.compile()
