@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import tempfile
-import time
 import typing as tp
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import jax.experimental
-import jax.lib
+import jax.experimental.multihost_utils as mh
 import orbax.checkpoint as ocp
 from eformer.escale import with_sharding_constraint
 from eformer.paths import ePath
@@ -231,13 +227,13 @@ class Trainer(BaseTrainer):
 
         mesh = self.model.mesh
         self.arguments.ensure_checkpoint_path()
-        checkpoint_manager = self.arguments.get_streaming_checkpointer()
+        # checkpoint_manager = self.arguments.get_streaming_checkpointer()
 
         return TrainerConfigureFunctionOutput(
             sharded_training_step_function=sharded_training_step_function,
             sharded_evaluation_step_function=sharded_evaluation_step_function,
             mesh=mesh,
-            checkpoint_manager=checkpoint_manager,
+            checkpoint_manager=None,
         )
 
     def _all_gather(self, arr: jax.Array) -> jax.Array:
@@ -500,6 +496,7 @@ class Trainer(BaseTrainer):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
                 if current_step == 5:
+                    mh.sync_global_devices("easydel:before_profiler_start")
                     logger.info("Starting JAX profiler...")
                     options = jax.profiler.ProfileOptions()
                     options.advanced_configuration = {
@@ -508,7 +505,8 @@ class Trainer(BaseTrainer):
                         "tpu_num_sparse_cores_to_trace" : 2,
                     }
                     jax.profiler.start_trace(profiling_dir)
-                if current_step == 25:
+                if current_step == 15:
+                    mh.sync_global_devices("easydel:before_profiler_stop")
                     logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
                     logger.info(f"Saved profiling traces to {profiling_dir}")
@@ -538,8 +536,6 @@ class Trainer(BaseTrainer):
                         current_step = int(jax.device_get(state.step))
                 # Update and log metrics
                 try:
-                    
-
                     mean_loss, mean_accuracy = metrics_tracker.update(
                         loss=metrics.loss,
                         accuracy=metrics.accuracy,
@@ -591,7 +587,8 @@ class Trainer(BaseTrainer):
                     #     # jax.experimental.multihost_utils.sync_global_devices("easydel:after_save_state")
                     #     # time.sleep(10)
                     
-                    self._maybe_save_state(current_step, checkpoint_manager, state)
+                    if self._should_save_checkpoint(current_step):
+                        self._maybe_save_state(current_step, checkpoint_manager, state)
 
                     if self._should_run_evaluation(current_step):
                         for _ in self.eval(model_state=state):
@@ -783,6 +780,7 @@ class Trainer(BaseTrainer):
             EasyDeLBreakRequest,
             TypeError,
         ) as run_exception:
+            logger.error(f"Exception occurred during train step: {run_exception}")
             return state, metrics, run_exception
 
     def _finalize_training(self, output, run_exception):
@@ -851,9 +849,15 @@ class Trainer(BaseTrainer):
 
         checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
         options = ocp.CheckpointManagerOptions(
+            async_options=ocp.options.AsyncOptions(
+                timeout_secs=60,
+                create_directories_asynchronously=False,
+                # barrier_sync_fn=multihost.get_barrier_sync_fn("checkpoint_manager"),
+            ),
             save_interval_steps=self.arguments.save_steps,
             max_to_keep=self.arguments.save_total_limit,
-            enable_async_checkpointing=False,
+            # enable_async_checkpointing=True,
+            enable_hns=True if "_hns" in checkpoint_dir else False,
             create=True,
             multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
         )
