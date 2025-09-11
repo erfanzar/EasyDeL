@@ -142,7 +142,7 @@ def minibatch_call(
     state: EasyDeLState,
     batch: dict,
     minibatch_size: int,
-    grad_fn: tp.Callable[[jax.Array, dict], tuple[jax.Array, LossMetrics]],
+    grad_fn: tp.Callable[[jax.Array, dict], tuple[tuple[jax.Array, LossMetrics], jax.Array]],
 ) -> tuple[jax.Array, LossMetrics]:
     """
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
