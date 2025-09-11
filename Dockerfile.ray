@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG RAY_IMAGE=rayproject/ray:2.45.0-py311
+ARG RAY_IMAGE=rayproject/ray:2.49.1-py311
 FROM ${RAY_IMAGE}
 
 WORKDIR /home/ray
