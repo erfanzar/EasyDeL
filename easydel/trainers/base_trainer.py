@@ -1069,7 +1069,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _maybe_save_state(self, step: int, checkpoint_manager: ocp.CheckpointManager, state: EasyDeLState, *args, **kwargs) -> None:
         jax.block_until_ready(state)
-        mh.sync_global_devices("before_checkpoint_save")
+        mh.sync_global_devices("easydel:before_checkpoint_save")
         try:
             chunk_byte_size = 1024**3  # 1GB
             checkpoint_args = ocp.args.PyTreeSave(
@@ -1084,7 +1084,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.info(f"state saved at step {step}.")
         except Exception as e:
             logger.error(f"Failed to save state at step {step}: {e}")
-        mh.sync_global_devices("after_checkpoint_save")
 
     def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
         """
