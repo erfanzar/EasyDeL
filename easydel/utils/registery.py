@@ -309,9 +309,9 @@ class Registry:
             return list(cls._registry.get(category, {}).keys())
 
     @classmethod
-    def get_category_registry(cls, category: _CategoryType, wakeup_filthy: bool = True) -> dict[str, type]:
+    def get_category_registry(cls, category: _CategoryType, wakeup: bool = True) -> dict[str, type]:
         """Get all implementations in a category."""
-        if wakeup_filthy:
+        if wakeup:
             try:
                 from easydel import inference  # noqa
                 from easydel import infra  # noqa
