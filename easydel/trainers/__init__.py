@@ -23,14 +23,6 @@ from .reward_trainer import RewardConfig, RewardTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
-from .utils import (
-    JaxDistributedConfig,
-    conversations_formatting_function,
-    create_constant_length_dataset,
-    create_prompt_creator,
-    get_formatting_func_from_dataset,
-    instructions_formatting_function,
-)
 
 __all__ = (
     "BaseTrainer",
@@ -40,7 +32,6 @@ __all__ = (
     "DistillationTrainer",
     "GRPOConfig",
     "GRPOTrainer",
-    "JaxDistributedConfig",
     "ORPOConfig",
     "ORPOTrainer",
     "RayDistributedTrainer",
@@ -50,10 +41,5 @@ __all__ = (
     "SFTTrainer",
     "Trainer",
     "TrainingArguments",
-    "conversations_formatting_function",
-    "create_constant_length_dataset",
-    "create_prompt_creator",
-    "get_formatting_func_from_dataset",
-    "instructions_formatting_function",
     "pack_sequences",
 )

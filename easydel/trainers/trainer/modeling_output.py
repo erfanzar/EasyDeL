@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Training output data structures.
+
+This module defines the output types returned by training operations,
+including the final state and associated metadata from training runs.
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -27,6 +34,21 @@ CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | dict[str, tp.Call
 
 @auto_pytree
 class TrainerOutput:
+    """Output from a training run.
+
+    Contains the final model state and metadata from the training process,
+    including checkpointing information and utility functions for state manipulation.
+
+    Attributes:
+        state: The final EasyDeLState after training completion.
+        mesh: The JAX sharding mesh used during training, if any.
+        checkpoint_manager: Manager object for handling model checkpoints.
+        gather_fns: Functions for gathering sharded parameters to host.
+        shard_fns: Functions for sharding parameters across devices.
+        last_save_file_name: Name of the most recently saved checkpoint file.
+        checkpoint_path: Full path to the checkpoint directory.
+    """
+
     state: EasyDeLState
     mesh: jax.sharding.Mesh | None
     checkpoint_manager: tp.Any

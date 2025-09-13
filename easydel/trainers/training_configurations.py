@@ -44,6 +44,7 @@ from easydel.infra.etils import (
     EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from .metrics import MetricsHistogram, compute_weight_stats
@@ -78,6 +79,7 @@ def get_safe_arr(xs):
 AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
 
+@Registry.register("trainer-arguments", "base")
 @auto_pytree
 class TrainingArguments:
     """

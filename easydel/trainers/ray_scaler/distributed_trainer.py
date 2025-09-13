@@ -12,6 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ray-based distributed trainer implementation for EasyDeL.
+
+This module provides a distributed training implementation using Ray for scaling
+language model training across multiple GPUs and nodes. It integrates Ray's
+distributed computing capabilities with EasyDeL's training infrastructure to
+enable efficient large-scale model training.
+
+The module includes:
+- RayDistributedTrainer: Main class for distributed training with Ray
+- Integration with Ray Train for distributed data loading and gradient synchronization
+- Support for both data and model parallelism strategies
+- Automatic resource management and fault tolerance
+- Checkpointing and recovery mechanisms for long-running training jobs
+
+Key Components:
+- Automatic distribution of training data across workers
+- Gradient synchronization using Ray's collective communication
+- Dynamic resource allocation and load balancing
+- Integration with Ray Tune for hyperparameter optimization
+- Support for heterogeneous hardware configurations
+
+The trainer abstracts away the complexity of distributed training, allowing users
+to scale from single GPU to multi-node clusters with minimal code changes.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -36,6 +61,7 @@ from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import TaskType
 from easydel.layers.attention import AttentionMechanisms
 from easydel.modules.auto.auto_configuration import get_modules_by_type
+from easydel.utils import Registry
 
 from ..base_trainer import BaseTrainer
 from ..trainer.trainer import Trainer
@@ -47,6 +73,7 @@ if tp.TYPE_CHECKING:
 logger = get_logger("RayTrainer")
 
 
+@Registry.register("trainer", "ray_dist")
 class RayDistributedConfig(BaseModel):
     """
     Configuration for RayDistributedTrainer that can be persisted to JSON.

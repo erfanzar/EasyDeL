@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, GenerationConfig, ProcessorMixin
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 from easydel.utils.traversals import deepcopy_model
@@ -49,6 +50,7 @@ except ImportError:
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
+
 logger = get_logger(__name__)
 RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
 
@@ -65,7 +67,46 @@ def delete_tree(pytree):
     )
 
 
+@Registry.register("trainer", "grpo")
 class GRPOTrainer(Trainer):
+    """Group Relative Policy Optimization trainer for RLHF.
+
+    GRPO is a reinforcement learning method that optimizes policies by comparing
+    responses within groups, providing more stable training than standard PPO.
+    It uses relative scoring within batches to reduce variance and improve
+    convergence in preference-based learning tasks.
+
+    Key features:
+    - Group-based advantage normalization
+    - Stable policy updates with KL regularization
+    - Support for multiple reward models
+    - Efficient generation and scoring pipeline
+
+    Attributes:
+        arguments: GRPOConfig instance with training hyperparameters
+        ref_state: Reference model state for KL divergence computation
+        processing_class: Tokenizer or processor for text encoding
+        reward_processing_classes: Optional separate processors for reward models
+        generation_config: Configuration for response generation
+        data_tokenize_fn: Function to tokenize dataset samples
+
+    Example:
+        >>> config = GRPOConfig(
+        ...     per_device_train_batch_size=4,
+        ...     grpo_n_samples=4,
+        ...     grpo_beta=0.1,
+        ...     learning_rate=1e-6
+        ... )
+        >>> trainer = GRPOTrainer(
+        ...     arguments=config,
+        ...     model=model,
+        ...     reward_funcs=reward_model,
+        ...     train_dataset=dataset,
+        ...     processing_class=tokenizer
+        ... )
+        >>> trainer.train()
+    """
+
     arguments: GRPOConfig  # type hinting
 
     def __init__(
@@ -79,9 +120,9 @@ class GRPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
-        assert (
-            arguments is not None
-        ), "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
+        assert arguments is not None, (
+            "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
+        )
         assert isinstance(arguments, GRPOConfig), f"arguments type must be `GRPOConfig` but got {type(arguments)}"
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
 
@@ -247,6 +288,7 @@ class GRPOTrainer(Trainer):
                 return_tensors="np",
                 padding="max_length",
                 padding_side="left",
+                tools=example.get("tools", None),
                 max_length=arguments.max_prompt_length,
                 truncation=True,
                 add_special_tokens=False,
@@ -259,18 +301,11 @@ class GRPOTrainer(Trainer):
             dataset = dataset.map(
                 self.data_tokenize_fn,
                 batched=True,
-                fn_kwargs={
-                    "tokenizer": processing_class,
-                    "tools": arguments.tools,
-                },
+                fn_kwargs={"tokenizer": processing_class, "tools": arguments.tools},
                 **map_kwargs,
             )
         else:
-            dataset = dataset.map(
-                _tokenize,
-                batched=True,
-                **map_kwargs,
-            )
+            dataset = dataset.map(_tokenize, batched=True, **map_kwargs)
         return dataset
 
     @property

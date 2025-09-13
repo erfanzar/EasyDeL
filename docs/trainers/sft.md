@@ -24,8 +24,7 @@ sft_config = SFTConfig(
     packing=False,               # Controls whether sequences are packed
 
     # Packing parameters
-    num_of_sequences=1024,       # Number of sequences for packing
-    chars_per_token=3.6,         # Characters per token estimate
+    num_of_sequences=1024,       # Number of sequences for packing 
 
     # Dataset processing
     dataset_num_proc=None,       # Number of processes for dataset processing
@@ -165,7 +164,6 @@ Sequence packing combines multiple shorter examples into a single training batch
 config = ed.SFTConfig(
     packing=True,               # Enable packing
     num_of_sequences=1024,      # Number of sequences to pack
-    chars_per_token=3.6,        # Estimate of characters per token
 )
 ```
 

@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Core training and evaluation step functions.
+
+This module provides the fundamental training and evaluation step implementations
+used by the Trainer class. These functions handle:
+
+- Training step: Gradient computation, model updates, and metrics tracking
+- Evaluation step: Loss computation and metrics collection without updates
+- Minibatch processing for gradient accumulation
+- Distributed training with sharding constraints
+
+The functions are designed to be JIT-compiled for optimal performance
+and support various model architectures through the EasyDeLState abstraction.
+"""
+
 import typing as tp
 
 import flax

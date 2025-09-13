@@ -467,6 +467,16 @@ class EasyDeLState(struct.PyTreeNode):
             raise e
 
     def save_optimizer(self, save_directory: str | ePathLike, float_dtype: jnp.dtype | None = None):
+        """Saves the optimizer state to a directory.
+
+        Saves optimizer state using AsyncCheckpointManager with optional dtype conversion.
+        The state is saved as a pytree with metadata including the current step.
+
+        Args:
+            save_directory: Directory path to save the optimizer state.
+            float_dtype: Optional dtype to convert floating-point values to before saving.
+                        Useful for reducing checkpoint size.
+        """
         save_directory = ePath(save_directory)
         if self.opt_state is not None:
             save_directory.mkdir(parents=True, exist_ok=True)
@@ -729,6 +739,7 @@ class EasyDeLState(struct.PyTreeNode):
         mesh = mesh or self.model._get_mesh(None)
 
         def appy_sharding_on_tree(tree):
+            """Helper to apply sharding to a pytree."""
             partition_specs = match_partition_rules(rules, tree)
             shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
             return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
@@ -736,7 +747,7 @@ class EasyDeLState(struct.PyTreeNode):
         return appy_sharding_on_tree(self)
 
     def gather_state(self):
-        """Gathers the entire state (model parameters and optimizer state) from distributed devices.
+        """Gathers the entire state from distributed devices.
 
         This is a convenience method that calls `gather_model` and `gather_optimizer_state`.
 
@@ -807,6 +818,11 @@ class EasyDeLState(struct.PyTreeNode):
 
     @property
     def mesh(self):
+        """Gets the JAX device mesh from the model.
+
+        Returns:
+            The JAX device mesh used for sharding.
+        """
         return self.model.mesh
 
     @property

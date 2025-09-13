@@ -16,11 +16,13 @@ from dataclasses import field
 
 from eformer.pytree import auto_pytree
 
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
+@Registry.register("trainer-arguments", "sft")
 @auto_pytree
 class SFTConfig(TrainingArguments):
     r"""
@@ -45,10 +47,6 @@ class SFTConfig(TrainingArguments):
             `packing`. Defaults to None.
         num_of_sequences (int, optional): Number of sequences to use for the [`ConstantLengthDataset`].
             Defaults to 1024.
-        chars_per_token (float, optional): Number of characters per token to use for the
-            [`ConstantLengthDataset`]. See
-            [chars_token_ratio](https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53)
-            for more details. Defaults to 3.6.
     """
 
     trainer_prefix: str | None = field(
@@ -65,7 +63,27 @@ class SFTConfig(TrainingArguments):
     )
     packing: bool = field(
         default=False,
-        metadata={"help": "Controls whether the sequences of the dataset are packed."},
+        metadata={
+            "help": "Whether to group multiple sequences into fixed-length blocks to improve computational efficiency "
+            "and reduce padding. Uses `max_length` to define sequence length."
+        },
+    )
+    packing_strategy: str = field(
+        default="bfd",
+        metadata={
+            "help": "Strategy for packing sequences. Can be either `'bfd'` (best-fit decreasing, default), or "
+            "`'wrapped'`."
+        },
+    )
+    assistant_only_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compute loss only on the assistant part of the sequence. If set to `True`, loss is "
+                "computed only on the assistant responses, which is supported only for conversational datasets."
+                " If `False`, loss is computed on the entire sequence."
+            )
+        },
     )
     learning_rate: float = field(
         default=2.0e-5,
@@ -90,10 +108,6 @@ class SFTConfig(TrainingArguments):
     num_of_sequences: int = field(
         default=1024,
         metadata={"help": "Number of sequences to use for the ConstantLengthDataset."},
-    )
-    chars_per_token: float = field(
-        default=3.6,
-        metadata={"help": "Number of characters per token to use for the ConstantLengthDataset."},
     )
 
     __hash__ = hash_fn
