@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Main Trainer implementation for EasyDeL.
+
+This module contains the core Trainer class that orchestrates the complete
+training pipeline for neural network models using JAX/Flax. The trainer
+provides a high-level interface for:
+
+- Distributed training across multiple devices and hosts
+- Automatic mixed precision training
+- Gradient accumulation for large batch sizes
+- Comprehensive checkpointing and recovery
+- Integration with various data loaders (Grain, TensorFlow datasets)
+- Metrics tracking and logging (WandB, TensorBoard)
+- Memory-efficient training with sharding strategies
+
+The Trainer class is designed to be flexible and extensible, supporting
+various model architectures including language models, vision models,
+and multimodal architectures.
+"""
+
 import typing as tp
 
 import jax
@@ -22,6 +42,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 
@@ -33,6 +54,7 @@ from .modeling_output import TrainerOutput
 logger = get_logger(__name__)
 
 
+@Registry.register("trainer", "base")
 class Trainer(BaseTrainer):
     """
     Main trainer implementation for EasyDeL models.
@@ -234,9 +256,25 @@ class Trainer(BaseTrainer):
         )
 
     def _all_gather(self, arr: jax.Array) -> jax.Array:
+        """Gather array from all devices to a single replicated array.
+
+        Args:
+            arr: Array to gather across devices.
+
+        Returns:
+            Array replicated across all devices.
+        """
         return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
 
     def _one_to_all(self, arr: jax.Array) -> jax.Array:
+        """Distribute array from one device to all devices.
+
+        Args:
+            arr: Array to distribute.
+
+        Returns:
+            Array distributed across devices.
+        """
         with self.mesh:
             arr = with_sharding_constraint(arr, PartitionSpec(None))
         return arr
@@ -247,6 +285,19 @@ class Trainer(BaseTrainer):
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
     ):
+        """Execute the main training loop across all epochs.
+
+        Coordinates training epochs, evaluation runs, and checkpointing.
+        Handles early stopping and training interruptions.
+
+        Args:
+            state: Current model state.
+            metrics_tracker: Tracker for training metrics.
+            step_metrics: Metrics for individual training steps.
+
+        Returns:
+            Final model state after training.
+        """
         """
         Execute the main training loop across all epochs.
 
@@ -332,6 +383,15 @@ class Trainer(BaseTrainer):
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
     ):
+        """Run evaluation on the validation dataset.
+
+        Performs a complete evaluation pass and logs metrics.
+
+        Args:
+            state: Current model state.
+            metrics_tracker: Tracker for evaluation metrics.
+            step_metrics: Metrics for individual evaluation steps.
+        """
         """
         Implements the core evaluation loop.
 
@@ -379,6 +439,23 @@ class Trainer(BaseTrainer):
         pbar: BaseProgressBar,
         epoch: int,
     ):
+        """Execute a single training epoch.
+
+        Processes all training batches, computes gradients, updates model parameters,
+        and tracks metrics throughout the epoch.
+
+        Args:
+            state: Current model state.
+            train_dataset: Training dataset.
+            train_iter: Iterator over training batches.
+            metrics_tracker: Tracker for training metrics.
+            step_metrics: Metrics for individual training steps.
+            pbar: Progress bar for tracking progress.
+            epoch: Current epoch number.
+
+        Returns:
+            Updated model state after the epoch.
+        """
         """
         Execute training for a single epoch.
 
@@ -499,6 +576,22 @@ class Trainer(BaseTrainer):
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
     ):
+        """Execute a single evaluation epoch.
+
+        Processes all evaluation batches without updating model parameters,
+        collecting metrics for model performance assessment.
+
+        Args:
+            state: Current model state.
+            eval_dataset: Evaluation dataset.
+            eval_iter: Iterator over evaluation batches.
+            metrics_tracker: Tracker for evaluation metrics.
+            step_metrics: Metrics for individual evaluation steps.
+            pbar: Progress bar for tracking progress.
+
+        Returns:
+            Unchanged model state (evaluation doesn't modify parameters).
+        """
         """
         Performs evaluation over one epoch.
 

@@ -26,6 +26,7 @@ from tqdm.autonotebook import tqdm
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import deepcopy_model
 
@@ -44,13 +45,51 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+@Registry.register("trainer", "dpo")
 class DPOTrainer(Trainer):
-    """
-    Trainer for Direct Preference Optimization (DPO).
+    """Trainer for Direct Preference Optimization (DPO).
 
-    This trainer handles the training, evaluation, and checkpointing of language models
-    using the DPO algorithm. It supports sharding, gradient accumulation, mixed precision
-    training, LoRA, and precomputed reference model log probabilities.
+    This trainer implements the Direct Preference Optimization algorithm for training
+    language models from human preferences without requiring a separate reward model.
+    DPO directly optimizes the policy to match human preferences by maximizing the
+    likelihood of preferred completions relative to rejected ones.
+
+    The trainer handles the full training pipeline including:
+    - Dataset preparation with chosen/rejected pairs
+    - Reference model management for KL regularization
+    - Multiple loss function variants (sigmoid, IPO, hinge, etc.)
+    - Distributed training with JAX sharding
+    - Gradient accumulation and mixed precision
+    - Evaluation and checkpointing
+
+    Attributes:
+        arguments (DPOConfig): Configuration object containing all training parameters.
+        processing_class: Tokenizer or processor for data preprocessing.
+        reference_state (EasyDeLState): Reference model state for KL divergence computation.
+        is_encoder_decoder (bool): Whether the model is encoder-decoder architecture.
+        padding_value (int): Token ID used for padding sequences.
+        _precomputed_train_ref_log_probs (bool): Whether reference log probs are precomputed for training.
+        _precomputed_eval_ref_log_probs (bool): Whether reference log probs are precomputed for evaluation.
+
+    Example:
+        >>> config = DPOConfig(
+        ...     beta=0.1,
+        ...     loss_type="sigmoid",
+        ...     max_length=512,
+        ...     learning_rate=5e-6
+        ... )
+        >>> trainer = DPOTrainer(
+        ...     arguments=config,
+        ...     model=model,
+        ...     reference_model=reference_model,
+        ...     processing_class=tokenizer,
+        ...     train_dataset=preference_dataset
+        ... )
+        >>> trainer.train()
+
+    Note:
+        The trainer expects datasets with 'prompt', 'chosen', and 'rejected' columns.
+        These will be automatically tokenized and prepared for training.
     """
 
     arguments: DPOConfig
@@ -65,9 +104,36 @@ class DPOTrainer(Trainer):
         eval_dataset: Dataset | None = None,
         data_collator: tp.Callable | None = None,
     ):
-        assert (
-            arguments is not None
-        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
+        """Initialize the DPO trainer.
+
+        Args:
+            arguments (DPOConfig): Configuration object containing all training hyperparameters
+                and settings for DPO training.
+            model (EasyDeLBaseModule | EasyDeLState): The policy model to be trained.
+                Can be either a module or a state object.
+            reference_model (EasyDeLBaseModule | EasyDeLState | None): The reference model
+                for KL regularization. If None, a deep copy of the policy model is used.
+            processing_class (ProcessingClassType): Tokenizer or processor for preparing
+                text data. Must have a pad_token_id attribute.
+            train_dataset (Dataset | None): Training dataset containing 'prompt', 'chosen',
+                and 'rejected' columns.
+            eval_dataset (Dataset | None): Evaluation dataset with the same format as
+                train_dataset. Can be a single dataset or a dict of datasets.
+            data_collator (tp.Callable | None): Optional custom data collator. If None,
+                uses default preference data collators.
+
+        Raises:
+            AssertionError: If arguments is None or not a DPOConfig instance.
+            AssertionError: If processing_class is None.
+            ValueError: If padding_value cannot be determined from arguments or processing_class.
+
+        Note:
+            The reference model is frozen during training and used to compute KL penalties
+            that prevent the policy from deviating too far from the original behavior.
+        """
+        assert arguments is not None, (
+            "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
+        )
         assert isinstance(arguments, DPOConfig), f"arguments type must be `DPOConfig` but got {type(arguments)}"
 
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
@@ -77,6 +143,7 @@ class DPOTrainer(Trainer):
         self.is_encoder_decoder = arguments.is_encoder_decoder
         self._precomputed_train_ref_log_probs = False
         self._precomputed_eval_ref_log_probs = False
+        self.is_vision_model = False
 
         if arguments.padding_value is not None:
             self.padding_value = arguments.padding_value
@@ -171,7 +238,28 @@ class DPOTrainer(Trainer):
         arguments: DPOConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
-        map_kwargs = {"writer_batch_size": 10}
+        """Prepare a dataset for DPO training by applying preprocessing steps.
+
+        This method performs the following preprocessing:
+        1. Extracts prompts from the dataset if needed
+        2. Applies chat templates to format conversations
+        3. Tokenizes the text into input IDs and attention masks
+
+        Args:
+            dataset (Dataset | IterableDataset): Raw dataset to prepare.
+            processing_class: Tokenizer or processor for text/image processing.
+            arguments (DPOConfig): Configuration with preprocessing parameters.
+            dataset_name (str): Name of the dataset for logging purposes.
+
+        Returns:
+            Dataset | IterableDataset: Preprocessed dataset ready for training
+                with tokenized 'prompt', 'chosen', and 'rejected' sequences.
+
+        Note:
+            The method removes the original text columns after tokenization to
+            save memory and only keeps the tokenized representations.
+        """
+        map_kwargs = {}
         from datasets import Dataset
 
         if isinstance(dataset, Dataset):
@@ -185,10 +273,7 @@ class DPOTrainer(Trainer):
             map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
         dataset = dataset.map(
             maybe_apply_chat_template,
-            fn_kwargs={
-                "tokenizer": processing_class,
-                "tools": arguments.tools,
-            },
+            fn_kwargs={"tokenizer": processing_class, "tools": arguments.tools},
             **map_kwargs,
         )
 
@@ -196,7 +281,7 @@ class DPOTrainer(Trainer):
             map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
         dataset = dataset.map(
-            self.tokenize_row,  # if not self.is_vision_model else self.process_row,
+            self.tokenize_row if not self.is_vision_model else self.process_row,
             remove_columns=["prompt", "chosen", "rejected"],
             fn_kwargs={
                 "processing_class": processing_class,
@@ -216,41 +301,46 @@ class DPOTrainer(Trainer):
         max_completion_length,
         add_special_tokens,
     ):
-        """
-        Tokenize a row of the dataset.
+        """Tokenize a single row of the preference dataset.
+
+        This method tokenizes the prompt, chosen, and rejected text sequences
+        for a single example in the dataset. It handles truncation to specified
+        maximum lengths and manages special tokens appropriately.
 
         Args:
-            features (`dict[str, str]`):
-                Row of the dataset, should contain the keys `"prompt"`, `"chosen"`, and `"rejected"`.
-            processing_class (`PreTrainedTokenizerBase`):
-                Processing class used to process the data.
-            max_prompt_length (`int` or `None`):
-                Maximum length of the prompt sequence. If `None`, the prompt sequence is not truncated.
-            max_completion_length (`int` or `None`):
-                Maximum length of the completion sequences. If `None`, the completion sequences are not truncated.
-            add_special_tokens (`bool`):
-                Whether to add special tokens to the sequences. Typically used for encoder-decoder models. If `True`,
-                the prompt sequence will have a bos token prepended and an eos token appended. In any case, the
-                completion sequences will have an eos token appended.
+            features (dict[str, str]): Row of the dataset containing:
+                - 'prompt': The input prompt/question
+                - 'chosen': The preferred response
+                - 'rejected': The non-preferred response
+            processing_class (PreTrainedTokenizerBase): Tokenizer used to convert
+                text to token IDs.
+            max_prompt_length (int | None): Maximum number of tokens for the prompt.
+                If None, no truncation is applied to prompts.
+            max_completion_length (int | None): Maximum number of tokens for
+                completions (chosen/rejected). If None, no truncation is applied.
+            add_special_tokens (bool): Whether to add special tokens (BOS/EOS).
+                For encoder-decoder models, adds BOS to prompt start and EOS to end.
+                For decoder-only models, typically set to False as tokens are
+                added during concatenation.
 
         Returns:
-            `dict[str, list[int]]`:
-                Tokenized sequences with the keys `"prompt_input_ids"`, `"chosen_input_ids"`, and
-                `"rejected_input_ids".
+            dict[str, list[int]]: Dictionary containing tokenized sequences:
+                - 'prompt_input_ids': Token IDs for the prompt
+                - 'prompt_attention_mask': Attention mask for the prompt
+                - 'chosen_input_ids': Token IDs for the chosen response
+                - 'chosen_attention_mask': Attention mask for chosen response
+                - 'rejected_input_ids': Token IDs for the rejected response
+                - 'rejected_attention_mask': Attention mask for rejected response
+
+        Note:
+            The method ensures that chosen and rejected sequences end with an
+            EOS token if not already present, which is crucial for proper
+            generation termination during training.
         """
         tokenizer = processing_class
-        prompt_input_ids = tokenizer(
-            features["prompt"],
-            add_special_tokens=False,
-        )["input_ids"]
-        chosen_input_ids = tokenizer(
-            features["chosen"],
-            add_special_tokens=False,
-        )["input_ids"]
-        rejected_input_ids = tokenizer(
-            features["rejected"],
-            add_special_tokens=False,
-        )["input_ids"]
+        prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
+        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
+        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
 
         if add_special_tokens:
             if tokenizer.bos_token_id is not None:
@@ -281,24 +371,11 @@ class DPOTrainer(Trainer):
         add_special_tokens,
     ):
         processor, tokenizer = (processing_class, processing_class.tokenizer)
-        processed_features = processor(
-            images=features["images"],
-            text=features["prompt"],
-            add_special_tokens=False,
-        )
-
+        processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
         prompt_input_ids = processed_features["input_ids"][0]
         pixel_values = processed_features["pixel_values"][0]
-        chosen_input_ids = tokenizer(
-            features["chosen"],
-            add_special_tokens=False,
-            return_tensors="jax",
-        )["input_ids"]
-        rejected_input_ids = tokenizer(
-            features["rejected"],
-            add_special_tokens=False,
-            return_tensors="jax",
-        )["input_ids"]
+        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False, return_tensors="jax")["input_ids"]
+        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False, return_tensors="jax")["input_ids"]
 
         if add_special_tokens:
             if tokenizer.bos_token_id is not None:
@@ -341,11 +418,7 @@ class DPOTrainer(Trainer):
             TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
         """
         mesh = self.model.mesh
-        empty_sharding = jax.sharding.NamedSharding(
-            spec=PartitionSpec(),
-            mesh=mesh,
-        )
-        # returns chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits
+        empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
         partial_concatenated_forward = partial(
             concatenated_forward,
@@ -533,12 +606,10 @@ class DPOTrainer(Trainer):
                 all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
 
                 self.eval_dataset = self.eval_dataset.add_column(
-                    name="reference_chosen_log_probs",
-                    column=all_reference_chosen_log_probs,
+                    name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
                 )
                 self.eval_dataset = self.eval_dataset.add_column(
-                    name="ref_rejected_logps",
-                    column=all_ref_rejected_logps,
+                    name="ref_rejected_logps", column=all_ref_rejected_logps
                 )
 
                 self._precomputed_eval_ref_log_probs = True

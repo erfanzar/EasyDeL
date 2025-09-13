@@ -17,6 +17,7 @@ from dataclasses import field
 
 from eformer.pytree import auto_pytree
 
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
@@ -37,6 +38,7 @@ LOSS_FN_VARIENTS = tp.Literal[
 ]
 
 
+@Registry.register("trainer-arguments", "dpo")
 @auto_pytree
 class DPOConfig(TrainingArguments):
     """Configuration class for Direct Preference Optimization (DPO) training.

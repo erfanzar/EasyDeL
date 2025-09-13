@@ -23,7 +23,7 @@ from lm_eval import evaluator
 from transformers import AutoTokenizer
 
 import easydel as ed
-from easydel.inference.evals import vSurgeLMEvalAdapter
+from easydel.inference.esurge.vsruge_eval import vSurgeLMEvalAdapter
 
 
 @auto_pytree

@@ -21,6 +21,8 @@ import numpy as np
 from flax import nnx as nn
 from jax import numpy as jnp
 
+from easydel.utils import Registry
+
 from .config import vWhisperInferenceConfig
 from .generation import _compiled_generate, get_decoder_input_ids
 from .utils import chunk_iter_with_batch, process_audio_input
@@ -31,6 +33,7 @@ if tp.TYPE_CHECKING:
     from easydel.modules.whisper import WhisperForConditionalGeneration
 
 
+@Registry.register("serve", "vwhisper")
 class vWhisperInference:
     """Speech-to-text inference engine using Whisper models.
 

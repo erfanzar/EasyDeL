@@ -80,6 +80,7 @@ from flax.nnx import Rngs
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .base_module import EasyDeLBaseModule
 from .base_state import EasyDeLState
+from .elarge_model import eLargeModel
 from .loss_utils import LossConfig
 
 
@@ -122,6 +123,7 @@ __all__ = (
     "PyTree",
     "Rngs",
     "auto_pytree",
+    "eLargeModel",
     "escale",
     "init_cluster",
 )

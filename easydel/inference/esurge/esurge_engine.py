@@ -86,6 +86,7 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.inference.sampling_params import SamplingParams
+from easydel.utils import Registry
 
 from ..decoders import SmartBytecodeDecoder
 from .engine_types import EngineCoreOutputs
@@ -96,7 +97,7 @@ from .scheduler import Scheduler
 from .utils import truncate_tokens
 
 if typing.TYPE_CHECKING:
-    from easydel import AutoEasyDeLModelForCausalLM
+    from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurgeEngine")
 
@@ -202,6 +203,7 @@ class RequestOutput:
         }
 
 
+@Registry.register("serve", "esurge")
 class eSurge:
     """High-level engine interface for text generation with eSurge.
 
@@ -248,7 +250,7 @@ class eSurge:
 
     def __init__(
         self,
-        model: str | AutoEasyDeLModelForCausalLM,
+        model: str | EasyDeLBaseModule,
         tokenizer: str | PreTrainedTokenizerBase | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         max_model_len: int = 8192,
@@ -363,6 +365,7 @@ class eSurge:
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
         else:
+            model = model.update_module(attn_mechanism="ragged_page_attention")
             self.model = model
 
         if tokenizer is None:
@@ -1642,3 +1645,21 @@ class eSurge:
                 self.stop_monitoring()
             except Exception:
                 pass
+
+    def __repr__(self):
+        attrs = [
+            f"name={self.esurge_name!r}",
+            f"max_model_len={self.max_model_len}",
+            f"max_num_seqs={self.max_num_seqs}",
+            f"page_size={self.page_size}",
+            f"reserve_tokens={self.reserve_tokens}",
+            f"auto_truncate_prompt={self.auto_truncate_prompt}",
+            f"auto_cap_new_tokens={self.auto_cap_new_tokens}",
+            f"strict_context={self.strict_context}",
+            f"truncate_mode={self.truncate_mode!r}",
+            f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
+            f"decode_truncated_prompt={self.decode_truncated_prompt}",
+            f"bytecode_decode={self._bytecode_decode}",
+            f"scheduler_running={self._scheduler_running}",
+        ]
+        return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

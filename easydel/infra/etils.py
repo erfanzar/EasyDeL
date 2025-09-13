@@ -195,6 +195,7 @@ AVAILABLE_OPTIMIZERS = tp.Literal[
 
 
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
+    "auto",
     "vanilla",
     "flash_attn2",
     "splash",
@@ -203,8 +204,10 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "blockwise",
     "sdpa",
     "autoregressive_decodeattn",
+    "ragged_page_attention",
+    "page_attention",
 ]
-
+AVAILABLE_QUANTIZATION_METHODS = tp.Literal[None, "nf4", "8bit"]
 
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]

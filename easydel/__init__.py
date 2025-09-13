@@ -16,6 +16,7 @@
 # pyright:reportImportCycles=none
 
 __version__ = "0.1.5"
+
 import os as _os
 import sys as _sys
 import typing as _tp
@@ -105,16 +106,21 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
-        "ejit",
-        "traversals",
+        "ArrayCache",
+        "DataCache",
         "DataManager",
         "DatasetLoadError",
         "DatasetMixture",
         "DatasetType",
-        "ePath",
-        "ePathLike",
+        "DataStreamOptimizer",
+        "FastDataLoader",
+        "FastDataManager",
         "TextDatasetInform",
         "VisualDatasetInform",
+        "ejit",
+        "ePath",
+        "ePathLike",
+        "traversals",
     ],
     "inference": [
         "EngineRequest",
@@ -140,7 +146,7 @@ _import_structure = {
         "vWhisperInference",
         "vWhisperInferenceConfig",
     ],
-    "inference.evals": ["vSurgeLMEvalAdapter"],
+    "inference.evaluations": ["eSurgeLMEvalAdapter", "vSurgeLMEvalAdapter"],
     "infra": [
         "EasyDeLBaseConfig",
         "EasyDeLBaseConfigDict",
@@ -151,6 +157,7 @@ _import_structure = {
         "PyTree",
         "Rngs",
         "auto_pytree",
+        "eLargeModel",
         "escale",
         "init_cluster",
     ],
@@ -177,6 +184,7 @@ _import_structure = {
     "layers.attention_operator._attention_impl": [
         "AttentionMetadata",
         "AttentionRegistry",
+        "AttentionImpl",
     ],
     "layers.attention": [
         "AttentionMechanisms",
@@ -512,7 +520,6 @@ _import_structure = {
         "DPOTrainer",
         "GRPOConfig",
         "GRPOTrainer",
-        "JaxDistributedConfig",
         "ORPOConfig",
         "ORPOTrainer",
         "RayDistributedTrainer",
@@ -528,6 +535,9 @@ _import_structure = {
         "ModelConverter",
         "StateDictConverter",
         "TensorConverter",
+    ],
+    "utils.registery": [
+        "Registry",
     ],
 }
 
@@ -558,7 +568,7 @@ if _tp.TYPE_CHECKING:
         vWhisperInference,
         vWhisperInferenceConfig,
     )
-    from .inference.evals import vSurgeLMEvalAdapter
+    from .inference.evaluations import eSurgeLMEvalAdapter, vSurgeLMEvalAdapter
     from .infra import (
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
@@ -569,6 +579,7 @@ if _tp.TYPE_CHECKING:
         PyTree,
         Rngs,
         auto_pytree,
+        eLargeModel,
         escale,
         init_cluster,
     )
@@ -583,7 +594,7 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.attention_operator._attention_impl import AttentionMetadata, AttentionRegistry
+    from .layers.attention_operator._attention_impl import AttentionImpl, AttentionMetadata, AttentionRegistry
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,
@@ -722,7 +733,6 @@ if _tp.TYPE_CHECKING:
         DPOTrainer,
         GRPOConfig,
         GRPOTrainer,
-        JaxDistributedConfig,
         ORPOConfig,
         ORPOTrainer,
         RayDistributedTrainer,
@@ -735,10 +745,15 @@ if _tp.TYPE_CHECKING:
         pack_sequences,
     )
     from .utils import (
+        ArrayCache,
+        DataCache,
         DataManager,
         DatasetLoadError,
         DatasetMixture,
         DatasetType,
+        DataStreamOptimizer,
+        FastDataLoader,
+        FastDataManager,
         TextDatasetInform,
         VisualDatasetInform,
         ejit,
@@ -747,6 +762,7 @@ if _tp.TYPE_CHECKING:
         traversals,
     )
     from .utils.parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
+    from .utils.registery import Registry
 else:
     _sys.modules[__name__] = _LazyModule(
         __name__,
