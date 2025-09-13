@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Internal functions for knowledge distillation training.
+
+This module contains the core computational functions used by the distillation trainer,
+including loss functions and training/evaluation step implementations. These functions
+implement knowledge distillation as described by Hinton et al., where a student model
+learns to mimic a teacher model's output distributions.
+
+The distillation process uses temperature scaling to soften probability distributions,
+allowing the student to learn from the teacher's confidence across all classes rather
+than just the hard labels. The loss combines KL divergence between teacher and student
+distributions with optional supervised learning loss.
+
+All functions are designed for JAX/Flax models and support distributed training.
+"""
+
 import typing as tp
 
 import chex
@@ -38,8 +53,36 @@ def distillation_loss(
     temperature: float = 4.0,
     alpha: float = 0.9,
 ):
-    """
-    Distillation loss that properly handles padding tokens using attention mask.
+    """Compute knowledge distillation loss between student and teacher models.
+
+    This function implements the distillation loss as described in Hinton et al.'s
+    "Distilling the Knowledge in a Neural Network". It combines KL divergence loss
+    between temperature-scaled teacher and student distributions with optional
+    supervised learning loss on hard labels.
+
+    Args:
+        student_logits (chex.Array): Raw logits from the student model.
+            Shape: [batch_size, sequence_length, vocab_size]
+        teacher_logits (chex.Array): Raw logits from the teacher model.
+            Shape: [batch_size, sequence_length, vocab_size]
+        attention_mask (chex.Array | None): Mask indicating valid tokens.
+            1 for valid tokens, 0 for padding. Shape: [batch_size, sequence_length]
+        labels (chex.Array | None): Ground truth labels for supervised loss.
+            Shape: [batch_size, sequence_length]
+        use_hard_labels (bool): Whether to include supervised loss with hard labels.
+            If True, combines distillation loss with cross-entropy loss.
+        temperature (float): Temperature for softening probability distributions.
+            Higher values create softer distributions. Default: 4.0
+        alpha (float): Weight for distillation loss vs supervised loss.
+            1.0 means pure distillation, 0.0 means pure supervised. Default: 0.9
+
+    Returns:
+        chex.Array: Scalar loss value combining distillation and optional supervised loss.
+
+    Note:
+        The loss is properly masked to ignore padding tokens when attention_mask
+        is provided. The temperature scaling allows the student to learn from
+        the teacher's relative confidence across all classes.
     """
     teacher_probs = jax.nn.softmax(teacher_logits / temperature, axis=-1)
     student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)

@@ -55,14 +55,22 @@ Example:
     ...     process(batch)
 """
 
-from .manager import DataManager
+from .cache import ArrayCache, DataCache, TokenCache
+from .fast_loader import DataStreamOptimizer, FastDataLoader
+from .manager import DataManager, FastDataManager
 from .types import DatasetLoadError, DatasetMixture, DatasetType, TextDatasetInform, VisualDatasetInform
 
 __all__ = (
+    "ArrayCache",
+    "DataCache",
     "DataManager",
+    "DataStreamOptimizer",
     "DatasetLoadError",
     "DatasetMixture",
     "DatasetType",
+    "FastDataLoader",
+    "FastDataManager",
     "TextDatasetInform",
+    "TokenCache",
     "VisualDatasetInform",
 )

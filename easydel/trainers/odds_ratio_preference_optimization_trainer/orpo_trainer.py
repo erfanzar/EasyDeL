@@ -27,6 +27,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
 from ..base_trainer import TrainerConfigureFunctionOutput
@@ -46,7 +47,49 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+@Registry.register("trainer", "orpo")
 class ORPOTrainer(Trainer):
+    """Odds Ratio Preference Optimization trainer.
+
+    ORPO is a reference-free preference optimization method that directly
+    optimizes the odds ratio between preferred and rejected responses.
+    Unlike DPO, ORPO doesn't require a reference model, making it more
+    memory-efficient while maintaining competitive performance.
+
+    Key features:
+    - Reference-free optimization (no KL divergence term)
+    - Direct odds ratio maximization
+    - Memory-efficient training
+    - Support for both encoder-decoder and decoder-only models
+
+    The ORPO loss combines:
+    1. Supervised fine-tuning loss on preferred responses
+    2. Odds ratio preference loss between chosen and rejected pairs
+
+    Attributes:
+        arguments: ORPOConfig with training hyperparameters
+        truncation_mode: How to truncate sequences ("keep_end" or "keep_start")
+        processing_class: Tokenizer or processor for text encoding
+        padding_value: Token ID used for padding
+        is_encoder_decoder: Whether the model is encoder-decoder architecture
+
+    Example:
+        >>> config = ORPOConfig(
+        ...     per_device_train_batch_size=4,
+        ...     orpo_beta=0.1,
+        ...     learning_rate=5e-6,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=512
+        ... )
+        >>> trainer = ORPOTrainer(
+        ...     arguments=config,
+        ...     model=model,
+        ...     train_dataset=preference_dataset,
+        ...     processing_class=tokenizer
+        ... )
+        >>> trainer.train()
+    """
+
     arguments: ORPOConfig
 
     def __init__(
@@ -58,9 +101,9 @@ class ORPOTrainer(Trainer):
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
     ):
-        assert (
-            arguments is not None
-        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
+        assert arguments is not None, (
+            "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
+        )
         assert isinstance(arguments, ORPOConfig), f"arguments type must be `ORPOConfig` but got {type(arguments)}"
 
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
@@ -117,28 +160,27 @@ class ORPOTrainer(Trainer):
 
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
+        kwargs_mp = dict()
 
-        train_dataset = train_dataset.map(
-            maybe_extract_prompt,
-            num_proc=arguments.dataset_num_proc,
-        )
+        from datasets import Dataset
+
+        if isinstance(train_dataset, Dataset):
+            kwargs_mp = dict(num_proc=arguments.dataset_num_proc)
+        train_dataset = train_dataset.map(maybe_extract_prompt, **kwargs_mp)
         train_dataset = train_dataset.map(
             maybe_apply_chat_template,
             fn_kwargs={"tokenizer": processing_class},
-            num_proc=arguments.dataset_num_proc,
+            **kwargs_mp,
         )
-        train_dataset = train_dataset.map(
-            self.tokenize_row,
-            num_proc=arguments.dataset_num_proc,
-        )
+        train_dataset = train_dataset.map(self.tokenize_row, **kwargs_mp)
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(maybe_extract_prompt, num_proc=arguments.dataset_num_proc)
+            eval_dataset = eval_dataset.map(maybe_extract_prompt, **kwargs_mp)
             eval_dataset = eval_dataset.map(
                 maybe_apply_chat_template,
                 fn_kwargs={"tokenizer": processing_class},
-                num_proc=arguments.dataset_num_proc,
+                **kwargs_mp,
             )
-            eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=arguments.dataset_num_proc)
+            eval_dataset = eval_dataset.map(self.tokenize_row, **kwargs_mp)
         self.arguments = arguments
         self.processing_class = processing_class
         super().__init__(
@@ -459,6 +501,7 @@ class ORPOTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
+        del max_sequence_length, truncation_mode  # Unused but required by interface
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -479,4 +522,5 @@ class ORPOTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
+        del max_sequence_length, truncation_mode  # Unused but required by interface
         return self.input_data_collator_tfds

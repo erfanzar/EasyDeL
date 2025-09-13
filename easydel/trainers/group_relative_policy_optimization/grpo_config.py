@@ -16,15 +16,29 @@ from dataclasses import field
 
 from eformer.pytree import auto_pytree
 
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
+@Registry.register("trainer-arguments", "grpo")
 @auto_pytree
 class GRPOConfig(TrainingArguments):
-    """
-    Configuration class for the GRPOTrainer.
+    """Configuration class for Group Relative Policy Optimization training.
+
+    GRPO is an efficient RLHF algorithm that optimizes policies using group-based
+    relative comparisons of rewards. It provides better training stability compared
+    to standard PPO by normalizing rewards within groups of samples.
+
+    This configuration extends TrainingArguments with GRPO-specific parameters
+    for controlling the policy optimization process, reward computation, and
+    generation sampling strategies.
+
+    Key concepts:
+    - Group-based normalization: Rewards are normalized within groups to reduce variance
+    - KL regularization: Prevents the policy from deviating too far from reference
+    - Reference model syncing: Optionally updates reference model during training
     """
 
     trainer_prefix: str | None = field(

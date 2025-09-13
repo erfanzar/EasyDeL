@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Internal functions for Direct Preference Optimization training.
+
+This module contains the core computational functions used by the DPO trainer,
+including various loss functions, forward pass implementations, and training/evaluation
+step functions. These functions are designed to work with JAX/Flax models and support
+distributed training through JAX's sharding capabilities.
+
+The module implements multiple DPO loss variants as described in various papers:
+- Standard DPO (sigmoid loss)
+- IPO (Identity Preference Optimization)
+- Hinge loss variant
+- Robust DPO with label smoothing
+- BCO (Binary Cross-entropy Optimization)
+- APO (Anchored Preference Optimization)
+- And several other experimental variants
+
+All functions are JIT-compilable for optimal performance on TPU/GPU hardware.
+"""
+
 import typing as tp
 
 import chex

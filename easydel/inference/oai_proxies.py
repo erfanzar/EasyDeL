@@ -151,8 +151,8 @@ class InferenceApiRouter:
             enable_function_calling: Enable function calling support
             **kwargs: Additional arguments for AsyncOpenAI client
         """
-        import openai
-        from openai import AsyncOpenAI
+        import openai  # type:ignore
+        from openai import AsyncOpenAI  # type:ignore
 
         self.client = AsyncOpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),

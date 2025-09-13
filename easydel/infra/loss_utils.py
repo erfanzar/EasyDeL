@@ -14,38 +14,60 @@
 
 """Loss computation utilities for EasyDeL models.
 
-Provides configurable loss functions for various tasks including language modeling,
-sequence classification, and custom objectives. Supports advanced features like
-label smoothing, z-loss regularization, and flexible normalization strategies.
+This module provides a comprehensive suite of loss functions optimized for large-scale
+language model training and inference. It includes memory-efficient implementations
+using chunking strategies, custom VJP for gradient computation, and support for
+various normalization and regularization techniques.
 
 Classes:
-    SpecialLossNormalizingFactor: Enum for dynamic loss normalization
-    LossConfig: Configuration for loss computation behavior
-    LossMetrics: Container for loss metrics and auxiliary information
-    ForCausalLMLoss: Loss function for causal language modeling
-    ForSequenceClassificationLoss: Loss function for sequence classification
+    SpecialLossNormalizingFactor: Enum for dynamic loss normalization strategies
+    LossConfig: Configuration class for customizing loss computation behavior
+    LossMetrics: Container for loss metrics and auxiliary training information
+
+Loss Functions:
+    ForCausalLMLoss: Causal language modeling with token shifting
+    ForSequenceClassificationLoss: Single/multi-label classification and regression
+    ForQuestionAnsweringLoss: Span-based question answering (SQuAD-style)
+    ForTokenClassification: Token-level classification (NER, POS tagging)
+
+Utility Functions:
+    cross_entropy_blockwise_logits: Memory-efficient CE for large vocabularies
+    sparse_cross_entropy_chunked_vocab: Chunked vocabulary processing
+    sparse_cross_entropy_chunked_tokens: Chunked token processing
+    compute_weighted_cross_entropy: Standard weighted CE with z-loss
+    auxiliary_load_balancing_loss_func: MoE load balancing loss
 
 Key Features:
-    - Flexible loss normalization strategies
+    - Memory-efficient chunking for large vocabulary/sequence lengths
+    - Flexible loss normalization (per-token, per-sequence, weighted)
     - Label smoothing and z-loss regularization
-    - Support for weighted losses
-    - NaN detection and handling
-    - Efficient JAX implementations
+    - Custom VJP for efficient gradient computation
+    - Support for packed sequences and attention masking
+    - Mixed precision computation support
+    - MoE auxiliary loss for expert load balancing
 
 Example:
-    >>> from easydel.infra import LossConfig
+    >>> from easydel.infra import LossConfig, ForCausalLMLoss
+    >>>
+    >>> # Configure loss with label smoothing and z-loss
     >>> config = LossConfig(
     ...     label_smoothing=0.1,
     ...     z_loss=1e-4,
-    ...     loss_normalizing_factor="NUM_REAL_TARGET_TOKENS"
+    ...     loss_normalizing_factor="NUM_REAL_TARGET_TOKENS",
+    ...     chunk_vocab_size=8192  # Enable vocabulary chunking
     ... )
-    >>> loss_fn = ForCausalLMLoss(config)
-    >>> loss, metrics = loss_fn(
-    ...     logits=model_output,
-    ...     labels=targets
+    >>>
+    >>> # Compute loss for language modeling
+    >>> metrics = ForCausalLMLoss(
+    ...     logits=model_output,  # [batch, seq_len, vocab_size]
+    ...     labels=targets,        # [batch, seq_len]
+    ...     attention_mask=mask,   # [batch, seq_len]
+    ...     config=config
     ... )
+    >>> print(f"Loss: {metrics.loss}, Accuracy: {metrics.accuracy}")
 """
 
+import dataclasses
 import enum
 import typing as tp
 from dataclasses import fields
@@ -147,10 +169,10 @@ class LossConfig:
     classification_problem_type: (
         tp.Literal["regression", "single_label_classification", "multi_label_classification"] | None
     ) = None
-
-    def __post_init__(self):
-        if self.z_loss <= 0:
-            self.loss_normalizing_factor = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+    chunk_vocab_size: int | None = None
+    chunk_token_size: int | None = None
+    chunk_block_size: int | None = None
+    compute_dtype: tp.Literal["fp32", "bf16"] | None = None
 
     def __repr__(self):
         cls_name = self.__class__.__name__
@@ -195,6 +217,307 @@ class LossMetrics:
     execution_time: float | None = None
 
 
+def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
+    """Compute logsumexp over the last dimension in chunks for memory efficiency.
+
+    This function computes log(sum(exp(x))) over the last dimension using a chunked
+    approach to reduce memory usage for large vocabulary sizes.
+
+    Args:
+        x: Input array with shape [..., V] where V is vocabulary size.
+        chunk_size: Size of chunks to process at a time.
+
+    Returns:
+        Array with shape [...] containing logsumexp values.
+    """
+    # x: [..., V]
+    V: int = x.shape[-1]  # static python int
+    n_full = V // chunk_size
+    tail = V - n_full * chunk_size  # static python int
+
+    # Pass 1: max
+    def max_body(i, m):
+        start = i * chunk_size
+        chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
+        return jnp.maximum(m, jnp.max(chunk, axis=-1))
+
+    m = jnp.full(x.shape[:-1], -jnp.inf, dtype=x.dtype)
+    m = lax.fori_loop(0, n_full, max_body, m)
+    if tail:
+        start = n_full * chunk_size
+        chunk = lax.dynamic_slice_in_dim(x, start, tail, axis=-1)
+        m = jnp.maximum(m, jnp.max(chunk, axis=-1))
+
+    # Pass 2: sum of exp(x - m)
+    def sum_body(i, s):
+        start = i * chunk_size
+        chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
+        return s + jnp.sum(jnp.exp(chunk - m[..., None]), axis=-1)
+
+    s = jnp.zeros_like(m)
+    s = lax.fori_loop(0, n_full, sum_body, s)
+    if tail:
+        start = n_full * chunk_size
+        chunk = lax.dynamic_slice_in_dim(x, start, tail, axis=-1)
+        s = s + jnp.sum(jnp.exp(chunk - m[..., None]), axis=-1)
+
+    return jnp.log(s) + m
+
+
+def cross_entropy_blockwise_logits(
+    logits: jax.Array,  # [B, T, V] or [N, V]
+    targets: jax.Array,  # [B, T] or [N]
+    weights: jax.Array | None = None,  # [B, T] or [N]
+    *,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    z_loss: float = 0.0,
+    block_size: int = 8192,
+    dtype: jnp.dtype | None = jnp.float32,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """
+    Blockwise sparse cross-entropy from logits without materializing softmax or one-hot.
+    Returns (total_loss, total_z_loss, weight_sum, accuracy).
+    """
+    # Flatten tokens
+    if logits.ndim == 3:
+        B, T, V = logits.shape
+        L = B * T
+        logits2d = logits.reshape(L, V)
+        y = targets.reshape(L)
+        w = None if weights is None else weights.reshape(L).astype(jnp.float32)
+    elif logits.ndim == 2:
+        L, V = logits.shape
+        logits2d = logits
+        y = targets
+        w = None if weights is None else weights.astype(jnp.float32)
+    else:
+        raise ValueError(f"logits must be [B, T, V] or [N, V], got {logits.shape}")
+
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+
+    # Upcast for numerical stability
+    logits2d = logits2d.astype(dtype or logits2d.dtype)
+
+    # Valid/weights
+    valid = y != ignore_index
+    y_safe = jnp.where(valid, y, 0)
+    w = valid.astype(jnp.float32) if w is None else valid.astype(jnp.float32) * w
+
+    # Accumulators
+    neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
+    m = jnp.full((L,), neg_inf)
+    log_z = jnp.full((L,), neg_inf)
+    o = jnp.zeros((L,), dtype=jnp.float32)  # sum of target logits
+    sum_logits = jnp.zeros((L,), dtype=jnp.float32)  # for smoothing
+    best_logit = jnp.full((L,), neg_inf)
+    best_id = jnp.zeros((L,), dtype=jnp.int32)
+
+    n_full = V // block_size
+    tail = V - n_full * block_size
+
+    def process_block(start: int, size: int, m, log_z, o, sum_logits, best_logit, best_id):
+        # Static slice sizes: size is either block_size (in a fori_loop) or tail (once)
+        chunk = lax.dynamic_slice_in_dim(logits2d, start, size, axis=1)  # [L, size]
+
+        # Running logsumexp via updated max
+        chunk_max = jnp.max(chunk, axis=1)
+        new_m = jnp.maximum(m, chunk_max)
+        log_z = new_m + jnp.log(jnp.exp(log_z - new_m) + jnp.sum(jnp.exp(chunk - new_m[:, None]), axis=1))
+        m = new_m
+
+        # Accumulate target logit (sparse)
+        in_block = (y_safe >= start) & (y_safe < start + size)
+        idx = jnp.where(in_block, (y_safe - start).astype(jnp.int32), 0)
+        logit_y_b = jnp.take_along_axis(chunk, idx[:, None], axis=1)[:, 0]
+        o = o + jnp.where(in_block, logit_y_b, 0.0)
+
+        # Sum logits for smoothing
+        sum_logits = sum_logits + jnp.sum(chunk, axis=1)
+
+        # Streamed argmax for accuracy
+        block_best = jnp.argmax(chunk, axis=1)
+        block_best_id = start + block_best.astype(jnp.int32)
+        update = chunk_max > best_logit
+        best_logit = jnp.where(update, chunk_max, best_logit)
+        best_id = jnp.where(update, block_best_id, best_id)
+
+        return m, log_z, o, sum_logits, best_logit, best_id
+
+    def full_body(i, carry):
+        start = i * block_size
+        return process_block(start, block_size, *carry)
+
+    carry = (m, log_z, o, sum_logits, best_logit, best_id)
+    if n_full > 0:
+        carry = lax.fori_loop(0, n_full, full_body, carry)
+    if tail:
+        start = n_full * block_size
+        carry = process_block(start, tail, *carry)
+
+    m, log_z, o, sum_logits, best_logit, best_id = carry
+
+    # Base CE
+    nll = log_z - o  # [L]
+
+    # Label smoothing: (1-eps)*NLL + eps*(log_z - mean(logits))
+    if label_smoothing and label_smoothing != 0.0:
+        eps = jnp.asarray(label_smoothing, dtype=jnp.float32)
+        mean_logits = sum_logits / float(V)
+        nll = (1.0 - eps) * nll + eps * (log_z - mean_logits)
+
+    # z-loss term
+    zterm = (z_loss * (log_z**2)) if (z_loss and z_loss != 0.0) else 0.0
+    per_tok = nll + (zterm if (z_loss and z_loss != 0.0) else 0.0)
+
+    total_loss = jnp.sum(per_tok * w)
+    total_z_loss = jnp.sum((zterm if (z_loss and z_loss != 0.0) else 0.0) * w)
+    weight_sum = jnp.sum(w)
+
+    # Weighted accuracy
+    acc = jnp.sum((best_id == y_safe).astype(jnp.float32) * w) / jnp.maximum(weight_sum, 1e-8)
+
+    return total_loss, total_z_loss, weight_sum, acc
+
+
+def sparse_cross_entropy_chunked_vocab(
+    logits: jnp.ndarray,  # [..., V]
+    targets: jnp.ndarray,  # [...]
+    weights: jnp.ndarray | None = None,  # [...]
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    z_loss: float = 0.0,
+    reduction: str = "mean",
+    chunk_size: int = 8192,
+    compute_dtype: jnp.dtype = jnp.float32,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    logits = logits.astype(compute_dtype)
+    valid = targets != ignore_index
+    safe_targets = jnp.where(valid, targets, 0)
+
+    lse = _logsumexp_chunked(logits, chunk_size)  # [...,]
+    logit_y = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
+    nll = lse - logit_y
+
+    if label_smoothing > 0.0:
+        eps = label_smoothing
+        nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(logits, axis=-1))
+
+    z_term = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
+    nll = nll + (z_term if z_loss > 0.0 else 0.0)
+
+    w = valid.astype(compute_dtype) if weights is None else valid.astype(compute_dtype) * weights.astype(compute_dtype)
+
+    total_loss = jnp.sum(nll * w)
+    total_z_loss = jnp.sum((z_term if z_loss > 0.0 else 0.0) * w)
+    weight_sum = jnp.sum(w)
+
+    if reduction == "mean":
+        total_loss = total_loss / jnp.maximum(weight_sum, 1e-8)
+
+    # Weighted accuracy
+    correct = (jnp.argmax(logits, axis=-1) == targets).astype(compute_dtype) * w
+    accuracy = jnp.sum(correct) / jnp.maximum(weight_sum, 1e-8)
+
+    return total_loss, total_z_loss, weight_sum, accuracy
+
+
+def sparse_cross_entropy_chunked_tokens(
+    logits: jnp.ndarray,  # [B, T, V] or [N, V]
+    targets: jnp.ndarray,  # [B, T] or [N]
+    weights: jnp.ndarray | None = None,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    z_loss: float = 0.0,
+    reduction: str = "sum",  # sum here; normalize outside for consistency
+    token_chunk_size: int = 8192,
+    compute_dtype: jnp.dtype = jnp.float32,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    logits = logits.astype(compute_dtype)
+    V = logits.shape[-1]
+    logits2d = logits.reshape(-1, V)
+    targets1d = targets.reshape(-1)
+    weights1d = None if weights is None else weights.reshape(-1).astype(compute_dtype)
+    N: int = logits2d.shape[0]
+    n_full = N // token_chunk_size
+    tail = N - n_full * token_chunk_size
+
+    def body(i, carry):
+        tot, wsum, acc_sum, zsum = carry
+        start = i * token_chunk_size
+        chunk_logits = lax.dynamic_slice_in_dim(logits2d, start, token_chunk_size, axis=0)
+        chunk_targets = lax.dynamic_slice_in_dim(targets1d, start, token_chunk_size, axis=0)
+        chunk_weights = (
+            None if weights1d is None else lax.dynamic_slice_in_dim(weights1d, start, token_chunk_size, axis=0)
+        )
+
+        lse = jax.scipy.special.logsumexp(chunk_logits, axis=-1)
+        logit_y = jnp.take_along_axis(chunk_logits, chunk_targets[:, None], axis=-1)[:, 0]
+        valid = chunk_targets != ignore_index
+        nll = lse - logit_y
+
+        if label_smoothing > 0.0:
+            eps = label_smoothing
+            nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(chunk_logits, axis=-1))
+
+        zterm = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
+        nll = nll + (zterm if z_loss > 0.0 else 0.0)
+
+        w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
+        loss_sum = jnp.sum(nll * w)
+        w_sum = jnp.sum(w)
+        z_sum = jnp.sum((zterm if z_loss > 0.0 else 0.0) * w)
+        acc = jnp.sum((jnp.argmax(chunk_logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
+
+        return (tot + loss_sum, wsum + w_sum, acc_sum + acc, zsum + z_sum)
+
+    # Full chunks
+    init = (
+        jnp.array(0.0, compute_dtype),
+        jnp.array(0.0, compute_dtype),
+        jnp.array(0.0, compute_dtype),
+        jnp.array(0.0, compute_dtype),
+    )
+    carry = init
+    carry = lax.fori_loop(0, n_full, body, carry)
+
+    # Tail
+    if tail:
+        start = n_full * token_chunk_size
+        chunk_logits = lax.dynamic_slice_in_dim(logits2d, start, tail, axis=0)
+        chunk_targets = lax.dynamic_slice_in_dim(targets1d, start, tail, axis=0)
+        chunk_weights = None if weights1d is None else lax.dynamic_slice_in_dim(weights1d, start, tail, axis=0)
+
+        lse = jax.scipy.special.logsumexp(chunk_logits, axis=-1)
+        logit_y = jnp.take_along_axis(chunk_logits, chunk_targets[:, None], axis=-1)[:, 0]
+        valid = chunk_targets != ignore_index
+        nll = lse - logit_y
+
+        if label_smoothing > 0.0:
+            eps = label_smoothing
+            nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(chunk_logits, axis=-1))
+
+        zterm = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
+        nll = nll + (zterm if z_loss > 0.0 else 0.0)
+
+        w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
+        loss_sum = jnp.sum(nll * w)
+        w_sum = jnp.sum(w)
+        z_sum = jnp.sum((zterm if z_loss > 0.0 else 0.0) * w)
+        acc = jnp.sum((jnp.argmax(chunk_logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
+
+        carry = (carry[0] + loss_sum, carry[1] + w_sum, carry[2] + acc, carry[3] + z_sum)
+
+    total_loss, total_wsum, acc_sum, total_z_loss = carry
+
+    if reduction == "mean":
+        total_loss = total_loss / jnp.maximum(total_wsum, 1e-8)
+
+    accuracy = acc_sum / jnp.maximum(total_wsum, 1e-8)
+    return total_loss, total_z_loss, total_wsum, accuracy
+
+
 def dynamic_cross_entropy_loss(
     logits: jnp.ndarray,
     targets: jnp.ndarray,
@@ -202,6 +525,7 @@ def dynamic_cross_entropy_loss(
     ignore_index: int = -100,
     reduction: str = "mean",
     label_smoothing: float = 0.0,
+    compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Computes the cross-entropy loss with optional label smoothing and ignore index,
@@ -226,45 +550,27 @@ def dynamic_cross_entropy_loss(
     Raises:
         ValueError: If an invalid reduction method is specified.
     """
-    num_classes = logits.shape[-1]
-    targets = jax.nn.one_hot(targets, num_classes=num_classes)
-
+    logits = logits.astype(compute_dtype)
+    valid = targets != ignore_index
+    safe_targets = jnp.where(valid, targets, 0)
+    lse = jax.scipy.special.logsumexp(logits, axis=-1)
+    logit_y = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
+    nll = lse - logit_y
     if label_smoothing > 0.0:
-        targets = targets * (1.0 - label_smoothing) + label_smoothing / num_classes
+        eps = label_smoothing
+        nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(logits, axis=-1))
+    w = valid.astype(compute_dtype) if weight is None else valid.astype(compute_dtype) * weight.astype(compute_dtype)
+    loss = nll * w
+    norm = jnp.maximum(jnp.sum(w), 1e-8)
 
-    loss = -jnp.sum(targets * jax.nn.log_softmax(logits, axis=-1), axis=-1)
-
-    # Create a mask for the ignore index
-    ignore_mask = targets[..., ignore_index] == 1
-
-    # Apply ignore_mask if ignore_index is used
-    if ignore_index >= 0:
-        loss = jnp.where(ignore_mask, 0.0, loss)
-
-    # Apply weights if provided
-    if weight is not None:
-        loss = loss * weight
-        # Adjust ignore_mask to consider weights as well
-        ignore_mask = ignore_mask | (weight == 0)
-
-    # Calculate the normalization factor (number of non-ignored elements or sum of weights)
-    if weight is None:
-        normalization_factor = jnp.sum(jnp.logical_not(ignore_mask))
-    else:
-        normalization_factor = jnp.sum(weight * jnp.logical_not(ignore_mask))
-
-    # Apply reduction
     if reduction == "mean":
-        loss = jnp.sum(loss) / jnp.maximum(normalization_factor, 1e-8)  # Avoid division by zero
+        return jnp.sum(loss) / norm, norm
     elif reduction == "sum":
-        loss = jnp.sum(loss)
+        return jnp.sum(loss), norm
     elif reduction == "none":
-        # Keep the loss per element
-        pass
+        return loss, w
     else:
         raise ValueError(f"Invalid reduction: {reduction}. Must be 'mean', 'sum', or 'none'.")
-
-    return loss, normalization_factor
 
 
 def sigmoid_cross_entropy_with_logits(
@@ -313,7 +619,7 @@ def sigmoid_cross_entropy_with_logits(
 
 def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
     """
-    Creates one-hot encoded versions of integer labels.
+    Create one-hot encoded versions of integer labels.
 
     Args:
         labels (jnp.ndarray): An array of integer labels.
@@ -328,7 +634,7 @@ def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
     """
     x = lax.eq(labels[..., None], jnp.arange(num_classes)[(None,) * labels.ndim])
     y = lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
-    return y.astype(jnp.float32)
+    return y
 
 
 @jax.custom_vjp
@@ -355,12 +661,11 @@ def cross_entropy_with_logits(
             - loss: The cross-entropy loss for each example (batch_size, ...).
             - z_loss: The z-loss value for each example (batch_size, ...). Returns zero if `z_loss` coeff is 0.
     """
-    logits_sum = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
-    log_softmax = logits - logits_sum
-    loss = -jnp.sum(targets * log_softmax, axis=-1)
-    log_z = jax.scipy.special.logsumexp(logits, axis=-1)
-    total_z_loss = z_loss * jax.lax.square(log_z)
-    return loss, total_z_loss
+    logsumexp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=False)
+    log_softmax = logits - logsumexp[..., None]
+    ce = -jnp.sum(targets * log_softmax, axis=-1)
+    z = z_loss * jnp.square(logsumexp)
+    return ce + z, z
 
 
 def _cross_entropy_with_logits_fwd(
@@ -383,27 +688,34 @@ def _cross_entropy_with_logits_fwd(
     ],
 ]:
     """
-    Forward pass for cross_entropy_with_logits VJP.
-    Calculates the loss and intermediates needed for the backward pass.
+    Forward pass for cross_entropy_with_logits custom VJP.
+
+    Computes cross-entropy loss with z-loss regularization and saves intermediates
+    for efficient gradient computation in the backward pass.
+
+    Args:
+        logits: Model predictions with shape (batch_size, ..., num_classes).
+        targets: One-hot encoded targets with same shape as logits.
+        z_loss: Coefficient for z-loss regularization.
+
+    Returns:
+        Tuple containing:
+            - (loss, z_loss_value): The computed losses.
+            - Residuals: Intermediate values needed for backward pass including
+              targets, z_loss coefficient, exp_shifted, sum_exp, log_softmax, and log_z.
     """
     max_logit = logits.max(axis=-1, keepdims=True)
     shifted = logits - max_logit
     exp_shifted = jnp.exp(shifted)
     sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
     log_softmax = shifted - jnp.log(sum_exp)
-    loss = -jnp.sum(targets * log_softmax, axis=-1)
+    ce = -jnp.sum(targets * log_softmax, axis=-1)
     log_z = jnp.squeeze(jnp.log(sum_exp) + max_logit, axis=-1)
-    total_z_loss = z_loss * jax.lax.square(log_z)
-    loss += total_z_loss
-    return (loss, total_z_loss), (
-        logits,
-        targets,
-        z_loss,
-        exp_shifted,
-        sum_exp,
-        log_softmax,
-        log_z,
-    )
+    z = z_loss * jax.lax.square(log_z)
+    ce_plus_z = ce + z
+    y = (ce_plus_z, z)
+    res = (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
+    return y, res
 
 
 def _cross_entropy_with_logits_bwd(
@@ -418,23 +730,33 @@ def _cross_entropy_with_logits_bwd(
     ],
     g: tuple[chex.Array, chex.Array],
 ) -> tuple[chex.Array, chex.Array, chex.Array]:
-    """Backward-mode of `cross_entropy_with_logits`."""
-    g = g[0]
-    logits, targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z = res
-    deriv = jnp.expand_dims(1 + 2 * z_loss * log_z, -1) * exp_shifted / sum_exp - targets
-    g_logits = jnp.expand_dims(g, axis=-1) * deriv
-    g_targets = -jnp.expand_dims(g, axis=-1) * log_softmax
+    """Backward pass for cross_entropy_with_logits custom VJP.
+
+    Computes gradients with respect to logits and targets using saved intermediates
+    from the forward pass.
+
+    Args:
+        res: Residuals from forward pass containing targets, z_loss, exp_shifted,
+             sum_exp, log_softmax, and log_z.
+        g: Gradient of the loss with respect to the output.
+
+    Returns:
+        Tuple of gradients with respect to (logits, targets, z_loss).
+    """
+    g0 = g[0]
+    targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z = res
+    softmax = exp_shifted / sum_exp
+    deriv = softmax - targets + jnp.expand_dims(2 * z_loss * log_z, -1) * softmax
+    g_logits = jnp.expand_dims(g0, -1) * deriv
+    g_targets = -jnp.expand_dims(g0, -1) * log_softmax
     return (
-        jnp.asarray(g_logits, logits.dtype),
-        jnp.asarray(g_targets, targets.dtype),
-        jnp.array(0.0),
+        jnp.asarray(g_logits, dtype=log_softmax.dtype),
+        jnp.asarray(g_targets, dtype=targets.dtype),
+        jnp.array(0.0, dtype=log_softmax.dtype),
     )
 
 
-cross_entropy_with_logits.defvjp(
-    _cross_entropy_with_logits_fwd,
-    _cross_entropy_with_logits_bwd,
-)
+cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_with_logits_bwd)
 
 
 def compute_weighted_cross_entropy(
@@ -444,6 +766,7 @@ def compute_weighted_cross_entropy(
     label_smoothing: float = 0.0,
     z_loss: float = 0.0,
     loss_normalizing_factor: float | None = None,
+    compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[chex.Array, chex.Array, chex.Array]:
     """
     Computes weighted cross-entropy loss, z-loss, and weight sum.
@@ -477,29 +800,20 @@ def compute_weighted_cross_entropy(
     normalizing_constant = -(
         confidence * jnp.log(confidence) + (vocab_size - 1) * low_confidence * jnp.log(low_confidence + 1e-20)
     )
-    soft_targets = onehot(
-        targets,
-        vocab_size,
-        on_value=confidence,
-        off_value=low_confidence,
-    )
-    total_loss, total_z_loss = cross_entropy_with_logits(
-        logits,
-        soft_targets,
-        z_loss=z_loss,
-    )
+    soft_targets = onehot(targets, vocab_size, on_value=confidence, off_value=low_confidence).astype(compute_dtype)
+    total_loss, total_z_loss = cross_entropy_with_logits(logits.astype(compute_dtype), soft_targets, z_loss=z_loss)
     total_loss = total_loss - normalizing_constant
 
-    shape_dtype_struct = jax.eval_shape(lambda x: x, targets)
-    weight_sum = reduce(mul, shape_dtype_struct.shape, 1)
+    weight_sum = jnp.array(reduce(mul, targets.shape, 1), dtype=compute_dtype)
     if weights is not None:
         total_loss = total_loss * weights
         total_z_loss = total_z_loss * weights
-        weight_sum = jnp.sum(weights)
+        weight_sum = jnp.sum(weights.astype(compute_dtype))
 
     if loss_normalizing_factor is not None:
         total_loss /= loss_normalizing_factor
         total_z_loss /= loss_normalizing_factor
+
     return jnp.sum(total_loss), jnp.sum(total_z_loss), weight_sum
 
 
@@ -510,6 +824,7 @@ def compute_weighted_cross_entropy_and_accuracy(
     label_smoothing: float = 0.0,
     z_loss: float = 0.0,
     loss_normalizing_factor: float | None = None,
+    compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
     """
     Computes weighted cross-entropy loss, z-loss, weight sum, and accuracy.
@@ -532,33 +847,55 @@ def compute_weighted_cross_entropy_and_accuracy(
         label_smoothing=label_smoothing,
         z_loss=z_loss,
         loss_normalizing_factor=loss_normalizing_factor,
+        compute_dtype=compute_dtype,
     )
 
     predictions = jnp.argmax(logits, axis=-1)
-    correct_predictions = jnp.equal(predictions, targets).astype(jnp.float32)
-    accuracy = jnp.sum(correct_predictions * weights) / weight_sum
-
+    correct = (predictions == targets).astype(compute_dtype)
+    if weights is None:
+        accuracy = jnp.mean(correct)
+    else:
+        w = weights.astype(compute_dtype)
+        denom = jnp.maximum(jnp.sum(w), 1e-8)
+        accuracy = jnp.sum(correct * w) / denom
     return total_loss, total_z_loss, weight_sum, accuracy
 
 
-def cross_entropy_loss_and_accuracy(source, target, valid=None):
+def cross_entropy_loss_and_accuracy(
+    source,
+    target,
+    valid=None,
+    compute_dtype: jnp.dtype = jnp.float32,
+):
+    """Compute cross-entropy loss and accuracy with optional masking.
+
+    Simple and efficient implementation for computing both loss and accuracy
+    in a single pass through the data.
+
+    Args:
+        source: Logits with shape [..., num_classes].
+        target: Integer labels with shape [...].
+        valid: Optional boolean mask indicating valid positions.
+        compute_dtype: Data type for computation.
+
+    Returns:
+        Tuple of (loss, accuracy) as scalar values.
+    """
+    source = source.astype(compute_dtype)
     if valid is None:
-        valid = jnp.ones(target.shape[:2])
-    valid = valid.astype(jnp.float32)
-    valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-    source = source.astype(jnp.float32)
-    token_log_prob = jnp.squeeze(
-        jnp.take_along_axis(
-            jax.nn.log_softmax(source, axis=-1),
-            jnp.expand_dims(target, -1),
-            axis=-1,
-        ),
-        -1,
-    )
-    token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
-    loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
-    correct = jnp.where(valid > 0.0, jnp.argmax(source, axis=-1) == target, jnp.array(False))
-    accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
+        valid = jnp.ones_like(target, dtype=compute_dtype)
+    else:
+        valid = valid.astype(compute_dtype)
+
+    lse = jax.scipy.special.logsumexp(source, axis=-1)
+    logit_y = jnp.take_along_axis(source, target[..., None], axis=-1)[..., 0]
+    nll = (lse - logit_y) * valid
+    weight_sum = jnp.maximum(jnp.sum(valid), 1e-8)
+    loss = jnp.sum(nll) / weight_sum
+
+    preds = jnp.argmax(source, axis=-1)
+    correct = (preds == target).astype(compute_dtype) * valid
+    accuracy = jnp.sum(correct) / weight_sum
     return loss, accuracy
 
 
@@ -590,9 +927,33 @@ def _sum_weights_per_segment(
     segment_ids: chex.Array,
     weights: chex.Array,
 ) -> chex.Array:
-    """Sums weights per packed segment to produce a normalizing vector."""
+    """Sum weights per packed segment to produce a normalizing vector.
+
+    This function is used for handling packed sequences where multiple sequences
+    are concatenated together. It computes the sum of weights for each segment
+    to enable per-sequence normalization.
+
+    Args:
+        positions: Position indices within each segment.
+        segment_ids: Segment identifiers for packed sequences.
+        weights: Weights to sum per segment.
+
+    Returns:
+        Array containing normalization factors for each position based on
+        the total weight in its segment.
+    """
 
     def _repeat_last_nonnegative(xs, reverse=False):
+        """Propagate the last non-zero value through zeros in the array.
+
+        Args:
+            xs: Input array.
+            reverse: If True, propagate in reverse direction.
+
+        Returns:
+            Array with zeros replaced by the last non-zero value.
+        """
+
         def fn(prev, x):
             y = jnp.where(x == 0, prev, x)
             return y, y
@@ -613,9 +974,10 @@ def _sum_weights_per_segment(
     return normalizer
 
 
-def get_loss_normalizing_factor_and_weights(
+def get_factor_and_weight(
     loss_normalizing_factor: FACTOR_TYPE,
     batch: tp.Mapping[str, chex.Array],
+    compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[float | None, chex.Array | None]:
     """
     Gets the loss normalizing factor and weights from a batch of data.
@@ -635,7 +997,7 @@ def get_loss_normalizing_factor_and_weights(
         loss_normalizing_factor = convert_special_loss_normalizing_factor_to_enum(loss_normalizing_factor)
 
     if loss_weights is None:
-        loss_weights = jnp.asarray(batch["decoder_target_tokens"] > 0, jnp.float32)
+        loss_weights = jnp.asarray(batch["decoder_target_tokens"] > 0, compute_dtype)
 
     output_normalizing_factor = None
     if loss_normalizing_factor == SLNF.NUM_REAL_TARGET_TOKENS:
@@ -664,6 +1026,7 @@ def auxiliary_load_balancing_loss_func(
     num_experts: int,
     top_k: int,
     attention_mask: chex.Array | None = None,
+    compute_dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array | int:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in JAX.
@@ -709,7 +1072,7 @@ def auxiliary_load_balancing_loss_func(
 
     routing_weights = jax.nn.softmax(concatenated_gate_logits, axis=-1)
     _, selected_experts = jax.lax.top_k(routing_weights, k=top_k)
-    expert_mask = jax.nn.one_hot(selected_experts, num_classes=num_experts, dtype=jnp.float32)
+    expert_mask = jax.nn.one_hot(selected_experts, num_classes=num_experts, dtype=compute_dtype)
 
     if attention_mask is None:
         tokens_per_expert = jnp.mean(expert_mask, axis=0)
@@ -797,68 +1160,120 @@ def fixed_cross_entropy(
         config = LossConfig()
     if source is None or target is None:
         raise ValueError("Logits and labels cannot be None")
-
+    compute_dtype = (
+        jnp.float32
+        if config.compute_dtype == "fp32"
+        else (jnp.bfloat16 if config.compute_dtype == "bf16" else source.dtype)
+    )
     mask = attention_mask if attention_mask is not None else (target != config.ignore_index)
-    nwn_cond = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
-    nwv_cond = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
     loss_factor = config.loss_normalizing_factor
+
     if config.reduction is not None:
-        (
-            loss,
-            accuracy,
-        ) = dynamic_cross_entropy_loss(
+        loss, norm = dynamic_cross_entropy_loss(
             logits=source,
             targets=target,
+            weight=mask.astype(compute_dtype),
             ignore_index=config.ignore_index,
             reduction=config.reduction,
             label_smoothing=config.label_smoothing,
+            compute_dtype=compute_dtype,
         )
-        total_z_loss = 0.0
-        weight_sum = 1.0
-    elif loss_factor is nwn_cond or loss_factor is nwv_cond:
-        loss, accuracy = cross_entropy_loss_and_accuracy(source, target, mask)
-        total_z_loss = 0.0
-        weight_sum = 1.0
+        total_z_loss = jnp.array(0.0, compute_dtype)
+        weight_sum = norm
+        preds = jnp.argmax(source, axis=-1)
+        correct = (preds == target).astype(compute_dtype) * mask.astype(compute_dtype)
+        accuracy = jnp.sum(correct) / jnp.maximum(norm, 1e-8)
+
+    elif (
+        loss_factor is SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+        or loss_factor is SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
+    ):
+        loss, accuracy = cross_entropy_loss_and_accuracy(
+            source.astype(compute_dtype), target, mask.astype(compute_dtype)
+        )
+        total_z_loss = jnp.array(0.0, compute_dtype)
+        weight_sum = jnp.sum(mask.astype(compute_dtype))
+
     else:
         if batch is None:
-            if config.loss_normalizing_factor in str(SLNF.NUM_REAL_TARGET_TOKENS):
-                batch = {
-                    "decoder_target_tokens": target,
-                    "decoder_loss_weights": mask,
-                }
-            else:
-                batch = {}
-        (
-            loss_normalizing_factor,
-            loss_weights,
-        ) = get_loss_normalizing_factor_and_weights(config.loss_normalizing_factor, batch)
+            lf = config.loss_normalizing_factor
+            if isinstance(lf, str):
+                lf = convert_special_loss_normalizing_factor_to_enum(lf)
+            batch = (
+                {"decoder_target_tokens": target, "decoder_loss_weights": mask.astype(compute_dtype)}
+                if lf == SLNF.NUM_REAL_TARGET_TOKENS
+                else {}
+            )
 
-        (
-            total_loss,
-            total_z_loss,
-            weight_sum,
-            accuracy,
-        ) = compute_weighted_cross_entropy_and_accuracy(
-            logits=source,
-            targets=target,
-            weights=loss_weights,
-            label_smoothing=config.label_smoothing,
-            z_loss=config.z_loss,
-            loss_normalizing_factor=loss_normalizing_factor,
-        )
+        loss_normalizing_factor, loss_weights = get_factor_and_weight(config.loss_normalizing_factor, batch)
 
-        loss = total_loss
+        use_chunk_vocab = config.chunk_vocab_size is not None
+        use_chunk_tokens = config.chunk_token_size is not None
+        use_block_size = config.chunk_block_size is not None
+
+        if use_chunk_vocab:
+            total_loss, total_z_loss, weight_sum, accuracy = sparse_cross_entropy_chunked_vocab(
+                source,
+                target,
+                weights=loss_weights,  # <- use loss_weights, not raw mask
+                ignore_index=config.ignore_index,
+                label_smoothing=config.label_smoothing,
+                z_loss=config.z_loss,
+                reduction="sum",
+                chunk_size=config.chunk_vocab_size,
+                ccompute_dtype=compute_dtype,
+            )
+        elif use_chunk_tokens:
+            total_loss, total_z_loss, weight_sum, accuracy = sparse_cross_entropy_chunked_tokens(
+                source,
+                target,
+                weights=loss_weights,
+                ignore_index=config.ignore_index,
+                label_smoothing=config.label_smoothing,
+                z_loss=config.z_loss,
+                reduction="sum",
+                token_chunk_size=config.chunk_token_size,
+                compute_dtype=compute_dtype,
+            )
+        elif use_block_size:
+            total_loss, total_z_loss, weight_sum, accuracy = cross_entropy_blockwise_logits(
+                logits=source,
+                targets=target,
+                weights=loss_weights,
+                ignore_index=config.ignore_index,
+                label_smoothing=config.label_smoothing,
+                z_loss=config.z_loss,
+                block_size=int(config.chunk_block_size),
+                dtype=compute_dtype,
+            )
+            if loss_normalizing_factor is not None:
+                total_loss = total_loss / loss_normalizing_factor
+                total_z_loss = total_z_loss / loss_normalizing_factor
+        else:
+            total_loss, total_z_loss, weight_sum, accuracy = compute_weighted_cross_entropy_and_accuracy(
+                logits=source,
+                targets=target,
+                weights=loss_weights,
+                label_smoothing=config.label_smoothing,
+                z_loss=config.z_loss,
+                loss_normalizing_factor=loss_normalizing_factor,
+                compute_dtype=compute_dtype,
+            )
+
+        # Apply loss_normalizing_factor in chunked paths (dense path already applied it)
+        if (use_chunk_vocab or use_chunk_tokens) and (loss_normalizing_factor is not None):
+            total_loss = total_loss / loss_normalizing_factor
+            total_z_loss = total_z_loss / loss_normalizing_factor
+
+        # Optional post-normalization
         if num_items_in_batch is not None:
             loss = total_loss / num_items_in_batch
         elif config.divide_weight_sum:
-            loss = total_loss / weight_sum
-        loss = loss + total_z_loss * (config.z_loss**2)
-    return LossMetrics(
-        loss=loss,
-        z_loss=total_z_loss,
-        weight_sum=weight_sum,
-        accuracy=accuracy,
-    )
+            loss = total_loss / jnp.maximum(weight_sum, 1e-8)
+        else:
+            loss = total_loss
+
+    return LossMetrics(loss=loss, z_loss=total_z_loss, weight_sum=weight_sum, accuracy=accuracy)
 
 
 def ForCausalLMLoss(
@@ -986,7 +1401,7 @@ def ForSequenceClassificationLoss(
         )
     else:
         raise ValueError(f"Invalid problem_type: {config.problem_type}")
-    return LossMetrics(total_loss=loss)
+    return LossMetrics(total_loss=loss, loss=loss)
 
 
 def ForQuestionAnsweringLoss(
@@ -1020,20 +1435,10 @@ def ForQuestionAnsweringLoss(
     start_positions = jnp.clip(start_positions, 0, ignored_index)
     end_positions = jnp.clip(end_positions, 0, ignored_index)
 
-    start_loss = fixed_cross_entropy(
-        source=start_logits,
-        target=start_positions,
-        config=config,
-        batch=batch,
-        **kwargs,
-    )
-    end_loss = fixed_cross_entropy(
-        source=end_logits,
-        target=end_positions,
-        config=config,
-        batch=batch,
-        **kwargs,
-    )
+    cfg = dataclasses.replace(config or LossConfig(), ignore_index=ignored_index)
+
+    start_loss = fixed_cross_entropy(source=start_logits, target=start_positions, config=cfg, batch=batch, **kwargs)
+    end_loss = fixed_cross_entropy(source=end_logits, target=end_positions, config=cfg, batch=batch, **kwargs)
     loss = (start_loss.loss + end_loss.loss) / 2
     accuracy = (start_loss.accuracy + end_loss.accuracy) / 2
     z_loss = (start_loss.z_loss + end_loss.z_loss) / 2

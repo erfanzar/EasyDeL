@@ -11,6 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Internal functions for Odds Ratio Preference Optimization training.
+
+This module contains the core computational functions used by the ORPO trainer,
+implementing odds ratio-based preference optimization without requiring a reference
+model. ORPO formulates preference learning through odds ratios, providing a
+mathematically principled and computationally efficient alternative to DPO.
+
+The module provides functions for:
+- Computing log probabilities and odds ratios for chosen/rejected samples
+- Implementing the ORPO loss function with log-odds differences
+- Handling both encoder-decoder and decoder-only architectures
+- Efficient batch processing with concatenated forward passes
+
+ORPO's key innovation is using odds ratios (p/(1-p)) instead of raw probabilities,
+which provides better gradient properties and eliminates the need for a reference model.
+
+All functions are JAX-compatible and support distributed training.
+"""
+
 import typing as tp
 
 import chex

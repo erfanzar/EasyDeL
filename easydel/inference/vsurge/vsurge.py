@@ -23,6 +23,8 @@ import jax
 from eformer.common_types import NOT_GIVEN, _Empty
 from eformer.loggings import get_logger
 
+from easydel.utils import Registry
+
 from ..decoders import SmartBytecodeDecoder
 from ..sampling_params import SamplingParams
 from .core import vDriver, vEngine
@@ -83,6 +85,7 @@ class ProcessState:
     buffered_tokens: list[int] = dataclasses.field(default_factory=list)
 
 
+@Registry.register("serve", "vsurge")
 class vSurge:
     """High-level interface for high-throughput text generation.
 

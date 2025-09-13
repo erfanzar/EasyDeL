@@ -19,7 +19,7 @@ from eformer.loggings import get_logger
 
 from easydel.infra.utils import ProcessingClassType
 
-from .vsurge import vSurge
+from ..vsurge import vSurge
 
 logger = get_logger("vSurgeLMEvalAdapter")
 
@@ -317,6 +317,37 @@ class vSurgeLMEvalAdapter(LM):
     def device(self):
         """Get the device (CPU/GPU)."""
         return "cpu"
+
+    @property
+    def tokenizer_name(self):
+        """Get the tokenizer name for chat template support.
+
+        Returns the name or path of the tokenizer/model being used.
+        This is required by lm_eval for proper chat template handling.
+        """
+        # Try to get the tokenizer name from various possible attributes
+        if hasattr(self.tokenizer, "name_or_path") and self.tokenizer.name_or_path:
+            return self.tokenizer.name_or_path
+        elif hasattr(self.tokenizer, "tokenizer_name") and self.tokenizer.tokenizer_name:
+            return self.tokenizer.tokenizer_name
+        elif hasattr(self.tokenizer, "__class__"):
+            # Return the class name as a fallback
+            return self.tokenizer.__class__.__name__
+        else:
+            return ""
+
+    def apply_chat_template(self, messages, add_generation_prompt: bool):
+        """Apply chat template to messages.
+
+        This method is required by lm_eval for chat-based evaluations.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content' keys
+
+        Returns:
+            String with the formatted chat template applied
+        """
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
 
     def tok_encode(self, string: str):
         """Encode a string into token IDs.

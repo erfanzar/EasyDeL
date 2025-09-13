@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Internal functions for Group Relative Policy Optimization training.
+
+This module contains the core computational functions used by the GRPO trainer,
+implementing group-based relative policy optimization for RLHF. GRPO improves
+training stability by normalizing rewards within groups of samples rather than
+across the entire batch, reducing variance in gradient estimates.
+
+The module provides functions for:
+- Computing per-token log probabilities from model outputs
+- Calculating KL divergence penalties between policy and reference models
+- Group-based reward normalization and advantage estimation
+- Policy gradient loss computation with various clipping strategies
+
+All functions are JAX-compatible and support distributed training through sharding.
+"""
+
 import typing as tp
 
 import flax
@@ -31,14 +47,28 @@ RewardFunc = tp.Union[EasyDeLState, tp.Callable[[list, list], list[float]]]  # n
 
 
 def get_per_token_logps(model, input_ids, attention_mask, prompt_length):
-    """
-    Get per-token log probabilities using the model outputs.
+    """Compute per-token log probabilities for generated sequences.
+
+    This function extracts log probabilities for each token in the completion
+    portion of the sequence (after the prompt). It's used to compute likelihood
+    ratios between policy and reference models for GRPO training.
 
     Args:
-        model: The language model
-        input_ids: Input token ids [batch_size, seq_len]
-        attention_mask: Input masks [batch_size, seq_len]
-        prompt_length: Length of the prompt
+        model: The language model (EasyDeLBaseModule) to compute log probabilities.
+        input_ids: Input token IDs including prompt and completion.
+            Shape: [batch_size, seq_len]
+        attention_mask: Binary mask indicating valid tokens (1) vs padding (0).
+            Shape: [batch_size, seq_len]
+        prompt_length: Number of tokens in the prompt portion. Log probabilities
+            are only computed for tokens after this position.
+
+    Returns:
+        chex.Array: Per-token log probabilities for the completion portion.
+            Shape: [batch_size, seq_len - prompt_length]
+
+    Note:
+        The function shifts logits by one position to align with the autoregressive
+        nature of language models, where each position predicts the next token.
     """
 
     logits = model(
