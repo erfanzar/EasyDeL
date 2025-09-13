@@ -26,6 +26,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.prompt_utils import maybe_apply_chat_template
 from easydel.trainers.trainer_protocol import TrainerConfigureFunctionOutput
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
 from ..trainer import Trainer
@@ -57,9 +58,48 @@ def _tokenize(batch: dict[str, list[tp.Any]], tokenizer: ProcessingClassType) ->
     return new_examples
 
 
+@Registry.register("trainer", "reward")
 class RewardTrainer(Trainer):
-    """
-    This trainer extends the `Trainer` and provides functionalities.
+    """Reward model trainer for RLHF pipelines.
+
+    Trains reward models that learn to score responses based on human preferences.
+    The reward model is typically used in the RLHF pipeline to provide feedback
+    signals for policy optimization methods like PPO or DPO.
+
+    Key features:
+    - Pairwise ranking loss for preference learning
+    - Support for multiple reward heads
+    - Efficient batching of chosen/rejected pairs
+    - Compatible with various model architectures
+
+    The trainer uses a pairwise ranking loss:
+        Loss = -log(sigmoid(r_chosen - r_rejected))
+    where r_chosen and r_rejected are the reward scores for preferred
+    and rejected responses respectively.
+
+    Attributes:
+        arguments: RewardConfig with training hyperparameters
+        processing_class: Tokenizer or processor for text encoding
+        input_data_collator_tfds: Data collator for TensorFlow datasets
+        input_data_collator_grain: Data collator for Grain datasets
+
+    Example:
+        >>> config = RewardConfig(
+        ...     per_device_train_batch_size=8,
+        ...     learning_rate=2e-5,
+        ...     max_sequence_length=512
+        ... )
+        >>> trainer = RewardTrainer(
+        ...     arguments=config,
+        ...     model=reward_model,
+        ...     train_dataset=preference_dataset,
+        ...     processing_class=tokenizer
+        ... )
+        >>> trainer.train()
+
+    Note:
+        The dataset should contain 'chosen' and 'rejected' columns with
+        text examples representing preferred and non-preferred responses.
     """
 
     def __init__(
@@ -237,6 +277,7 @@ class RewardTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
+        del max_sequence_length, truncation_mode  # Unused but required by interface
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -257,4 +298,5 @@ class RewardTrainer(Trainer):
         Returns:
             tp.Callable: The data collator function.
         """
+        del max_sequence_length, truncation_mode  # Unused but required by interface
         return self.input_data_collator_tfds

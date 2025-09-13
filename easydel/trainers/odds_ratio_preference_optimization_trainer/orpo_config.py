@@ -16,48 +16,68 @@ from dataclasses import field
 
 from eformer.pytree import auto_pytree
 
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
+@Registry.register("trainer-arguments", "orpo")
 @auto_pytree
 class ORPOConfig(TrainingArguments):
-    """
-    Configuration class for ORPO training settings.
+    """Configuration class for Odds Ratio Preference Optimization training.
 
-    This class inherits from TrainingArguments and holds configuration
-    parameters specific to the ORPO model training. The dataclass automatically
-    generates an initializer, and the __post_init__ method further processes
-    some of the parameters after object initialization.
+    ORPO is a reference-free preference optimization method that uses odds ratios
+    to model preferences between chosen and rejected responses. Unlike DPO, ORPO
+    doesn't require a reference model, making it more memory-efficient and simpler
+    to implement while achieving comparable or better performance.
+
+    The key innovation of ORPO is formulating preference learning through log-odds
+    differences: log(p/(1-p)), which provides better gradient properties than raw
+    probabilities and eliminates the need for KL regularization with a reference model.
 
     Attributes:
-        model_name (str): The name of the model. Default is "ORPOTrainer".
-        learning_rate (float): The learning rate used during training.
-                              Default is 1e-6.
-        max_length (Optional[int]): The maximum allowed sequence length for the input.
-                                   Default is 1024.
-        max_prompt_length (Optional[int]): The maximum allowed length of the prompt portion
-                                           of the input. Default is 512.
-        max_completion_length (Optional[int]): The maximum allowed length of the completion.
-                                               If not provided, it is set to max_length - max_prompt_length.
-        beta (float): A hyperparameter beta, with a default value of 0.1.
-        disable_dropout (bool): Flag to disable dropout during training.
-                                Default is True.
-        label_pad_token_id (int): The token id used for padding labels.
-                                  Default is -100.
-        padding_value (Optional[int]): The value used for padding sequences.
-                                       Default is None.
-        generate_during_eval (bool): Flag indicating whether to generate sequences during evaluation.
-                                     Default is False.
-        is_encoder_decoder (Optional[bool]): Flag to indicate if the model is encoder-decoder.
-                                             Default is None.
-        model_init_kwargs (Optional[Dict[str, Any]]): Additional keyword arguments for model initialization.
-                                                      Default is None.
-        dataset_num_proc (Optional[int]): Number of processes to use for dataset processing.
-                                          Default is None.
-        max_sequence_length (int): Computed attribute representing the maximum sequence length
-                                   used for training. It is set in the __post_init__ method.
+        trainer_prefix (str | None): Prefix for trainer logs and checkpoints.
+            Default: "orpotrainer"
+        learning_rate (float): Learning rate for the optimizer.
+            Default: 1e-6
+        max_length (int | None): Maximum total sequence length (prompt + completion).
+            Default: 1024
+        max_prompt_length (int | None): Maximum length for prompt sequences.
+            Default: 512
+        max_completion_length (int | None): Maximum length for completion sequences.
+            Automatically calculated as max_length - max_prompt_length if None.
+        beta (float): Temperature parameter controlling the strength of preference
+            optimization. Higher values make the model more selective between
+            chosen and rejected responses. Default: 0.1
+        disable_dropout (bool): Whether to disable dropout during training for
+            deterministic behavior. Default: True
+        label_pad_token_id (int): Token ID used for padding labels in loss computation.
+            Default: -100 (ignored by PyTorch/JAX loss functions)
+        padding_value (int | None): Value used for padding input sequences.
+            If None, uses the tokenizer's pad_token_id.
+        generate_during_eval (bool): Whether to generate sample outputs during
+            evaluation for qualitative assessment. Default: False
+        is_encoder_decoder (bool | None): Whether the model is encoder-decoder
+            architecture. Auto-detected if None.
+        model_init_kwargs (dict | None): Additional keyword arguments for model
+            initialization.
+        dataset_num_proc (int | None): Number of processes for parallel dataset
+            preprocessing. None uses sequential processing.
+        max_sequence_length (int): Computed attribute for maximum sequence length
+            used in training (2 * max_length for concatenated chosen/rejected).
+
+    Example:
+        >>> config = ORPOConfig(
+        ...     beta=0.2,
+        ...     max_length=2048,
+        ...     learning_rate=2e-6,
+        ...     num_train_epochs=3
+        ... )
+
+    Note:
+        ORPO loss = -log_sigmoid(beta * (log_odds_chosen - log_odds_rejected))
+        where log_odds = log(p/(1-p)) for each response.
     """
 
     trainer_prefix: str | None = field(

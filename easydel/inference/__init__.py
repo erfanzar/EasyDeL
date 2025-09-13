@@ -60,7 +60,6 @@ Attributes:
     vWhisperInferenceConfig: Configuration for vWhisper
 """
 
-from .elm_config import eLMConfig
 from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner
 from .oai_proxies import InferenceApiRouter
 from .sampling_params import JitableSamplingParams, SamplingParams
@@ -77,7 +76,6 @@ __all__ = (
     "SamplingParams",
     "ToolParser",
     "ToolParserManager",
-    "eLMConfig",
     "eSurge",
     "eSurgeApiServer",
     "eSurgeRunner",

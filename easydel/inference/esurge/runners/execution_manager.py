@@ -54,7 +54,7 @@ from jax._src import pjit
 from easydel.layers.caching import PagesCache, PagesCacheMetaData, PagesMetadata
 from easydel.utils import ejit
 
-from ...vsurge.core.functions import sample_top_p_efficient
+from ...sampling_funcs import sample_top_p_efficient
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from .sequence_buffer import DeviceSequenceState, ModelRunnerSamplingMetadata
 

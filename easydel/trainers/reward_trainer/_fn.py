@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Internal functions for Reward Model training.
+
+This module contains the core computational functions used by the reward trainer,
+implementing training and evaluation steps for reward models in RLHF pipelines.
+Reward models learn to predict human preferences between pairs of model outputs,
+serving as a proxy for human judgment when training policies with reinforcement learning.
+
+The module provides functions for:
+- Training step computation with pairwise ranking losses
+- Evaluation step for assessing reward model accuracy
+- Support for Bradley-Terry model and margin-based losses
+- Reward centering and normalization strategies
+
+The reward model is trained to assign higher scores to preferred (chosen) responses
+compared to non-preferred (rejected) responses, learning from human preference data.
+
+All functions are JAX-compatible and support distributed training through sharding.
+"""
+
 import typing as tp
 
 import flax

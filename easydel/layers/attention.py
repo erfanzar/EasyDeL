@@ -125,18 +125,18 @@ class AttentionMechanisms(str, Enum):
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
-    AUTO = "auto"
-    FLASH_ATTN2 = "flash_attn2"
-    RING = "ring"
-    VANILLA = "vanilla"
-    SPLASH = "splash"
-    CUDNN = "cudnn"
-    BLOCKWISE = "blockwise"
-    SDPA = "sdpa"
-    CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
-    RAGGED_PAGE_ATTENTION = "ragged_page_attention"
-    PAGED_ATTENTION = "ragged_page_attention"
-    REGRESSIVE_DECODE = "autoregressive_decodeattn"
+    AUTO: str = "auto"
+    FLASH_ATTN2: str = "flash_attn2"
+    RING: str = "ring"
+    VANILLA: str = "vanilla"
+    SPLASH: str = "splash"
+    CUDNN: str = "cudnn"
+    BLOCKWISE: str = "blockwise"
+    SDPA: str = "sdpa"
+    CUDA_FLASH_ATTN2: str = "cuda_flash_attn2"
+    RAGGED_PAGE_ATTENTION: str = "ragged_page_attention"
+    PAGED_ATTENTION: str = "page_attention"
+    REGRESSIVE_DECODE: str = "autoregressive_decodeattn"
 
 
 def tpu_version_check(version: str = "v4") -> bool:

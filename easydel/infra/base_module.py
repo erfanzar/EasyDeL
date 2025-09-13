@@ -67,10 +67,11 @@ import re
 import typing as tp
 import warnings
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property, partial
 from re import Pattern
-from typing import Self
+from typing import Self, Unpack
 
 import chex
 import flax
@@ -89,7 +90,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
-from .base_config import EasyDeLBaseConfig
+from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
 from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
@@ -214,13 +215,34 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
     @property
     def graphstate_type(self: Self):
+        """Determines the parameter type based on whether LoRA is enabled.
+
+        Returns:
+            nn.LoRAParam if LoRA is enabled, otherwise nn.Param.
+        """
         return nn.LoRAParam if self.lora_is_enabled else nn.Param
 
     def split_module(self: Self):
+        """Splits the module into graph definition and state components.
+
+        Returns:
+            Tuple of (GraphDef, GraphState, GraphState) representing structure,
+            parameters, and other state.
+        """
         return nn.split(self, self.graphstate_type, ...)
 
     @staticmethod
     def merge_module(graphdef: nn.GraphDef, graphstate: nn.GraphState, graphother: nn.GraphState):
+        """Merges graph components back into a complete module.
+
+        Args:
+            graphdef: The module's graph definition (structure).
+            graphstate: The module's parameter state.
+            graphother: The module's non-parameter state.
+
+        Returns:
+            The reconstructed module.
+        """
         return nn.merge(graphdef, graphstate, graphother)
 
     @property
@@ -388,6 +410,17 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
     @cached_property
     def lossfn_type(self: Self):
+        """Determines the loss function type for this model.
+
+        Attempts to determine the loss type from (in order):
+        1. config.loss_type attribute
+        2. self.loss_type attribute
+        3. Class name matching
+        4. Defaults to ForCausalLM if not found
+
+        Returns:
+            String identifier for the loss function type.
+        """
         if getattr(self.config, "loss_type", None) is not None:
             loss_type = self.config.loss_type
         elif getattr(self, "loss_type", None) is not None:
@@ -439,6 +472,14 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         return jax.tree_util.tree_leaves(params_state)[0].dtype
 
     def compute_complex_rotary(self, position_ids: jax.Array) -> jnp.ndarray:
+        """Computes complex-valued rotary position embeddings.
+
+        Args:
+            position_ids: Position indices to compute embeddings for.
+
+        Returns:
+            Complex exponential of frequencies for rotary embeddings.
+        """
         frequencies = jnp.transpose(
             self.inv_frequencies[None, :, None] @ position_ids[:, None, :].astype("f4"),
             (0, 2, 1),
@@ -801,6 +842,14 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         )[1]
 
     def apply_out_shardings(self, out_shardings):
+        """Applies output sharding specifications to the module state.
+
+        Args:
+            out_shardings: Sharding specifications to apply.
+
+        Returns:
+            Module with sharding constraints applied.
+        """
         splits = self.split_module()
 
         @partial(jax.jit, out_shardings=out_shardings)
@@ -1200,6 +1249,11 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
     @property
     def lora_is_enabled(self: Self):
+        """Checks if LoRA (Low-Rank Adaptation) is enabled for this module.
+
+        Returns:
+            True if any LoRA parameters are found in the module, False otherwise.
+        """
         for _, tensor in nn.iter_graph(self):
             if isinstance(tensor, nn.LoRAParam):
                 return True
@@ -1263,7 +1317,14 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
 
     @property
     def transform_fn(self):
-        """Transform function with rules."""
+        """Creates a transformation function for converting HuggingFace state dicts to EasyDeL format.
+
+        Identifies special layers (embeddings, LayerNorm, MoE) and returns a configured
+        transformation function with sharding rules applied.
+
+        Returns:
+            Partial function for state dict conversion with layer information and sharding.
+        """
         from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
@@ -1297,7 +1358,6 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphDef: A graph definition suitable for use during generation.
         """
-        from copy import deepcopy
 
         adjusted_config = deepcopy(self.config)
         adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
@@ -1323,7 +1383,6 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         Returns:
             nn.GraphState: A graph state containing non-parameter variables suitable for generation.
         """
-        from copy import deepcopy
 
         adjusted_config = deepcopy(self.config)
         adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
@@ -1652,3 +1711,28 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         )
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
+
+    def update_module(self, **kwargs: Unpack[EasyDeLBaseConfigDict]):
+        """Updates the module configuration and reinitializes the structure.
+
+        Creates a new lazy module with updated configuration while preserving
+        the current parameter state.
+
+        Args:
+            **kwargs: Configuration parameters to update.
+
+        Returns:
+            Updated module with new configuration.
+        """
+        config = self.config
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        module = self.lazy_init(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+        self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
+        return self

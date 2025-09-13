@@ -64,31 +64,32 @@ class DatasetType(str, Enum):
 class BaseDatasetInform:
     """Base class for dataset information."""
 
-    path: DatasetType | str | None = None
+    type: DatasetType | str | None = None
     data_files: os.PathLike | str = None
     num_rows: int | None = None
     split: str = "train"
 
     def __post_init__(self):
-        if self.path is None:
+        if self.type is None:
             inferred_type = DatasetType.infer_from_path(self.data_files)
             if inferred_type:
-                self.path = inferred_type
-            assert self.path is not None, (
-                "we couldn't automatically find path based on data files, "
-                "please provide correct path or format for data files"
+                self.type = inferred_type
+            assert self.type is not None, (
+                "we couldn't automatically find type based on data files, "
+                "please provide correct type or format for data files"
             )
-        if isinstance(self.path, str):
+        if isinstance(self.type, str):
             try:
-                self.path = DatasetType.from_string(self.path)
+                self.type = DatasetType.from_string(self.type)
             except ValueError:
                 pass
 
-    def get_str_path(self):
+    def get_str_type(self):
+        """Get string representation of dataset type."""
         try:
-            return self.path.value.lower()
+            return self.type.value.lower()
         except Exception:
-            return self.path
+            return self.type
 
 
 @auto_pytree

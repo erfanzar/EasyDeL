@@ -44,6 +44,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import load_compiled_fn, save_compiled_fn, smart_compile
 from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
@@ -112,6 +113,7 @@ class vInferenceMetaData(BaseModel):
     model_config = dict(arbitrary_types_allowed=True)
 
 
+@Registry.register("serve", "vinference")
 class vInference:
     """Streamlined inference engine for text generation.
 
@@ -708,9 +710,9 @@ class vInference:
     ) -> vInferencePreCompileConfig:
         if batch_size is None or prefill_length is None:
             _input_ids = getattr(kwargs, "input_ids", None)
-            assert (
-                _input_ids is not None
-            ), "if `batch_size` or `prefill_length` is None `input_ids` must be present in your model kwargs."
+            assert _input_ids is not None, (
+                "if `batch_size` or `prefill_length` is None `input_ids` must be present in your model kwargs."
+            )
             batch_size, prefill_length = _input_ids.shape
         vision_included = False
         vision_batch_size = None

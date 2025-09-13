@@ -48,6 +48,7 @@ import os
 import re
 import typing as tp
 import warnings
+from typing import NotRequired
 
 import chex
 import jax
@@ -72,6 +73,8 @@ from easydel.utils.helpers import check_bool_flag, get_logger
 
 from .etils import (
     AVAILABLE_ATTENTION_MECHANISMS,
+    AVAILABLE_GRADIENT_CHECKPOINTS,
+    AVAILABLE_QUANTIZATION_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
     EasyDeLBackends,
     EasyDeLGradientCheckPointers,
@@ -202,48 +205,48 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     from dictionaries or JSON.
     """
 
-    sharding_axis_dims: tp.Sequence[int]
-    sharding_dcn_axis_dims: tp.Sequence[int] | None
-    sharding_axis_names: tp.Sequence[str]
-    attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
-    decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
-    blocksize_k: int
-    blocksize_q: int
-    blocksize_b: int
-    moe_tiling_size_batch: int
-    moe_tiling_size_seqlen: int
-    moe_tiling_size_dim: int
-    partition_axis: PartitionAxis
-    shard_attention_computation: bool
-    use_sharded_kv_caching: bool
-    use_sharding_constraint: bool
-    use_pallas_group_matmul: bool
-    backend: EasyDeLBackends | None
-    platform: EasyDeLPlatforms | None
-    easy_method: tp.Literal["train", "serve", "convert"]
-    bits: int | None
-    scan_ring_attention: bool
-    scan_attention_layers: bool
-    use_scan_mlp: bool
-    scan_mlp_chunk_size: int
-    sequence_axis_name: str
-    gradient_checkpointing: EasyDeLGradientCheckPointers
-    kv_cache_quantization_method: EasyDeLQuantizationMethods
-    kv_cache_quantization_blocksize: int
-    kv_cache_sharding_sequence_axis_name: str | tuple[str, ...]
-    flash_attention_backward_pass_impl: tp.Literal["triton", "xla"]
-    attn_dtype: jnp.dtype
-    kvdtype: jnp.dtype
-    attn_softmax_dtype: jnp.dtype
-    fcm_max_ratio: float
-    fcm_min_ratio: float
-    hardware_abstraction: bool
-    pallas_m_block_size: int
-    pallas_k_block_size: int
-    pallas_n_block_size: int
-    mask_max_position_embeddings: int
-    freq_max_position_embeddings: int
-    precompute_masks: bool
+    sharding_axis_dims: NotRequired[tp.Sequence[int]]
+    sharding_dcn_axis_dims: NotRequired[tp.Sequence[int] | None]
+    sharding_axis_names: NotRequired[tp.Sequence[str]]
+    attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    decode_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    blocksize_k: NotRequired[int]
+    blocksize_q: NotRequired[int]
+    blocksize_b: NotRequired[int]
+    moe_tiling_size_batch: NotRequired[int]
+    moe_tiling_size_seqlen: NotRequired[int]
+    moe_tiling_size_dim: NotRequired[int]
+    partition_axis: NotRequired[PartitionAxis]
+    shard_attention_computation: NotRequired[bool]
+    use_sharded_kv_caching: NotRequired[bool]
+    use_sharding_constraint: NotRequired[bool]
+    use_pallas_group_matmul: NotRequired[bool]
+    backend: NotRequired[EasyDeLBackends | str | None]
+    platform: NotRequired[EasyDeLPlatforms | str | None]
+    easy_method: NotRequired[tp.Literal["train", "serve", "convert"]]
+    bits: NotRequired[int | None]
+    scan_ring_attention: NotRequired[bool]
+    scan_attention_layers: NotRequired[bool]
+    use_scan_mlp: NotRequired[bool]
+    scan_mlp_chunk_size: NotRequired[int]
+    sequence_axis_name: NotRequired[str]
+    gradient_checkpointing: NotRequired[EasyDeLGradientCheckPointers | str | AVAILABLE_GRADIENT_CHECKPOINTS]
+    kv_cache_quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
+    kv_cache_quantization_blocksize: NotRequired[int]
+    kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
+    flash_attention_backward_pass_impl: NotRequired[tp.Literal["triton", "xla"]]
+    attn_dtype: NotRequired[jnp.dtype]
+    kvdtype: NotRequired[jnp.dtype]
+    attn_softmax_dtype: NotRequired[jnp.dtype]
+    fcm_max_ratio: NotRequired[float]
+    fcm_min_ratio: NotRequired[float]
+    hardware_abstraction: NotRequired[bool]
+    pallas_m_block_size: NotRequired[int]
+    pallas_k_block_size: NotRequired[int]
+    pallas_n_block_size: NotRequired[int]
+    mask_max_position_embeddings: NotRequired[int]
+    freq_max_position_embeddings: NotRequired[int]
+    precompute_masks: NotRequired[bool]
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -510,9 +513,22 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return mesh
 
     def set_model_mesh(self, mesh: common_types.Mesh):
+        """Sets a custom mesh for the model, overriding the auto-generated one.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
         self._hidden_mesh = mesh
 
     def jax_mesh(self):
+        """Deprecated method for getting the JAX mesh.
+
+        Deprecated:
+            Use `mesh` property or `get_mesh()` method instead.
+
+        Returns:
+            JAX device mesh.
+        """
         warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
         return self.get_mesh()
 
@@ -559,6 +575,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return self.backend if not self.backend == "" else jax.extend.backend.get_backend().platform
 
     def read_basics_from_config(self, config: EasyDeLBaseConfig):
+        """Reads and applies basic configuration attributes from another config instance.
+
+        Copies EasyDeL-specific attributes like sharding, attention mechanism,
+        quantization settings, etc. from the provided config.
+
+        Args:
+            config: Source configuration to read attributes from.
+        """
         base_reads = [
             "sharding_axis_dims",
             "sharding_dcn_axis_dims",
@@ -804,6 +828,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return result
 
     def attach_custom_arguments(self, **kwargs):
+        """Attaches custom arguments as attributes to the configuration.
+
+        Args:
+            **kwargs: Arbitrary key-value pairs to attach as attributes.
+        """
         for k, v in kwargs.items():
             set_attrs_smartly(self, k, v, v)
 
@@ -991,6 +1020,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
+        """Loads a configuration dictionary from a JSON file.
+
+        Args:
+            json_file: Path to the JSON configuration file.
+
+        Returns:
+            Dictionary containing the parsed configuration.
+        """
         return json.loads(ePath(json_file).read_text(encoding="utf-8"))
 
     @classmethod
@@ -1218,6 +1255,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _create_causal_mask(target_length):
+        """Creates a causal attention mask for autoregressive models.
+
+        Generates a lower triangular boolean mask that prevents attending
+        to future tokens in the sequence.
+
+        Args:
+            target_length: The sequence length for the mask.
+
+        Returns:
+            4D boolean array with shape [1, 1, target_length, target_length].
+        """
         causal_mask_bool = jnp.zeros((target_length, target_length), dtype=jnp.bool_)
 
         if target_length != 1:
@@ -1236,11 +1284,26 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return causal_mask_bool
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail] | None:
+        """Gets attention mask details for different sequence lengths.
+
+        Returns:
+            Dictionary mapping sequence lengths to mask details,
+            or None if not applicable.
+        """
         if hasattr(self, "text_config"):
             return self.get_text_config().get_mask_details()
         return None
 
     def get_basic_causal_mask(self, *args, **kwargs):
+        """Gets or creates the basic causal attention mask.
+
+        Creates a causal mask for the maximum position embeddings and
+        places it on the appropriate device with sharding.
+
+        Returns:
+            ModuleCaches containing the causal mask, or False if masks
+            are not precomputed.
+        """
         from .utils import ModuleCaches
 
         if self.precompute_masks is False:
@@ -1251,6 +1314,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return ModuleCaches(jax.device_put(self._create_causal_mask(target_length), Ns(self.mesh, Ps())))
 
     def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
+        """Generates a Forgetful Causal Mask (FCM) for training.
+
+        FCM randomly drops causal constraints during training to improve
+        model robustness. Only applied in non-deterministic mode.
+
+        Args:
+            batch_size: Number of sequences in the batch.
+            seq_length: Length of each sequence.
+            deterministic: If True, returns None (no FCM applied).
+
+        Returns:
+            Boolean mask array or None if deterministic or FCM not configured.
+        """
         if not deterministic and self.fcm_max_ratio > 0:
             # Apply forgetful causal mask
 

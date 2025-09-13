@@ -21,6 +21,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
 from ..trainer import Trainer
@@ -35,7 +36,45 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+@Registry.register("trainer", "distillation")
 class DistillationTrainer(Trainer):
+    """Knowledge distillation trainer for model compression.
+
+    Implements knowledge distillation to transfer knowledge from a larger
+    teacher model to a smaller student model. The training combines distillation
+    loss (KL divergence between teacher and student outputs) with standard
+    supervised loss, controlled by the alpha parameter.
+
+    Key features:
+    - Temperature-scaled softmax for softer probability distributions
+    - Configurable balance between distillation and supervised loss
+    - Support for both language and multimodal models
+    - Efficient JAX-based implementation with JIT compilation
+
+    The distillation loss is computed as:
+        Loss = α * KL(student/T, teacher/T) * T² + (1-α) * CE(student, labels)
+    where T is the temperature parameter.
+
+    Attributes:
+        teacher_state: State of the teacher model (frozen during training)
+        arguments: DistillationConfig with training hyperparameters
+
+    Example:
+        >>> config = DistillationConfig(
+        ...     temperature=3.0,
+        ...     alpha=0.7,
+        ...     learning_rate=2e-5
+        ... )
+        >>> trainer = DistillationTrainer(
+        ...     arguments=config,
+        ...     student_model=student,
+        ...     teacher_model=teacher,
+        ...     train_dataset=dataset,
+        ...     processing_class=tokenizer
+        ... )
+        >>> trainer.train()
+    """  # noqa
+
     teacher_state: EasyDeLState
     arguments: DistillationConfig  # type hinting
 
