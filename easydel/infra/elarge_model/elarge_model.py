@@ -958,7 +958,7 @@ class eLargeModel:
             logger.info("evaluation summary:")
 
             for task, metrics in results.get("results", {}).items():
-                logger.info(f"\n{task}:")
+                logger.info(f"{task}:")
                 for metric, value in metrics.items():
                     if isinstance(value, int | float):
                         logger.info(f"  {metric}: {value:.4f}" if isinstance(value, float) else f"  {metric}: {value}")
