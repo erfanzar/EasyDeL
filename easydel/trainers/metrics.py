@@ -64,7 +64,6 @@ class StepMetrics:
         extra_flops_per_token: float,
         batch_size: int,
         seq_length: int,
-        learning_rate: float,
         dataloading_time: float,
         mode: tp.Literal["eval", "train"] | None = None,
         **extras,
@@ -106,23 +105,23 @@ class StepMetrics:
         basic_metrics = {
             "epoch": int(epoch),
             "execution_time": float(execution_time),
-            "learning_rate": float(np.array(learning_rate).item()),
-            "loss": float(loss),
-            "perplexity": float(jnp.exp(loss)),
+            "learning_rate": metrics.learning_rate,
+            "loss": loss,
+            # "perplexity": jnp.exp(loss),
             f"{mode}_step": int(current_step),
             f"{mode}_step_time": float(step_time),
             "tflops": float(tflops),
             "visited_tokens": visited_tokens,
-            "z_loss": float(z_loss) if z_loss is not None else None,
+            "z_loss": z_loss if z_loss is not None else None,
             **extras,
         }
 
         if metrics.accuracy is not None:
-            basic_metrics["accuracy"] = float(metrics.accuracy)
+            basic_metrics["accuracy"] = metrics.accuracy
         if metrics.chosen_rewards is not None:
-            basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
+            basic_metrics["chosen_rewards"] = jnp.mean(metrics.chosen_rewards)
         if metrics.rejected_rewards is not None:
-            basic_metrics["rejected_rewards"] = float(jnp.mean(metrics.rejected_rewards).item())
+            basic_metrics["rejected_rewards"] = jnp.mean(metrics.rejected_rewards)
         if metrics.other_metrics is not None:
             basic_metrics.update(metrics.other_metrics)
         if not self.arguments.performance_mode and (mode == "train" or mode is None):
@@ -171,14 +170,12 @@ class MetricsTracker:
         """Update tracked metrics with new values."""
         self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
         mean_loss = self.loss_sum / (step - self.step_offset)
-        if accuracy != float("inf"):
-            if accuracy is None:
-                accuracy = 0.0
-            self.accuracy_sum = accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-            mean_accuracy = self.accuracy_sum / (step - self.step_offset)
+        if accuracy is None:
+            accuracy = 0.0
+        self.accuracy_sum = accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
+        mean_accuracy = self.accuracy_sum / (step - self.step_offset)
 
-            return float(mean_loss), float(mean_accuracy)
-        return float(mean_loss)
+        return mean_loss, mean_accuracy
 
     def reset(self, step):
         """Reset tracked metrics."""

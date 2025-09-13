@@ -1696,11 +1696,11 @@ class BaseTrainer(BaseTrainerProtocol):
     ) -> list[MetricsType]:
         """Log metrics and update progress bar."""
 
-        metrics = self.arguments.aggregate_metrics(history)
-
+        metrics = None
         if step % self.arguments.log_steps == 0:
             if step == 0:
                 pbar.reset()
+            metrics = self.arguments.aggregate_metrics(history)
             display_metrics = {
                 k.replace("train/", "").replace("eval/", ""): v
                 for k, v in metrics.items()
@@ -1718,6 +1718,8 @@ class BaseTrainer(BaseTrainerProtocol):
             pbar.update(update_size)
 
         if step % self.arguments.report_steps == 0:
+            if metrics is None:
+                metrics = self.arguments.aggregate_metrics(history)
             self.arguments.log_metrics(metrics=metrics, step=step)
             return []
         else:

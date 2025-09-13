@@ -272,7 +272,7 @@ class Trainer(BaseTrainer):
         latest_step = checkpoint_manager.latest_step()
         if latest_step is None:
             logger.info("No checkpoints found to restore from.")
-            return target_state_template
+            return target_state_template, 0
 
         logger.info(f"Restoring checkpoint from step {latest_step}.")
 
@@ -285,11 +285,9 @@ class Trainer(BaseTrainer):
             latest_step, 
             args=restore_args
         )
-
-
         
         logger.info(f"Successfully restored state from step {latest_step}.")
-        return restored_state
+        return restored_state, latest_step
 
     def _run_training_loop(
         self,
@@ -337,14 +335,14 @@ class Trainer(BaseTrainer):
             desc="training process",
         )
 
-        state = self._restore_from_checkpoint(
+        state, initial_step = self._restore_from_checkpoint(
             target_state_template=state,
             checkpoint_manager=checkpoint_manager,
         )
 
         # Handle resumption based on dataset type
-        initial_step = int(jax.device_get(state.step))
         start_epoch = 0
+        self.current_step = 0
 
         if initial_step > 0:
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
@@ -358,7 +356,7 @@ class Trainer(BaseTrainer):
                 state = state.replace(step=jnp.array(skipped_steps, dtype=jnp.int32))
             else:
                 self._skip_first_steps = initial_step
-                state = state.replace(step=jnp.array(0, dtype=jnp.int32))
+                # state = state.replace(step=jnp.array(0, dtype=jnp.int32))
                 logger.info(
                     f"Resuming training from step {initial_step} (non-seekable dataset, skipping first {self._skip_first_steps} steps)"
                 )
@@ -379,8 +377,7 @@ class Trainer(BaseTrainer):
                         checkpoint_manager=checkpoint_manager,
                     )
 
-                    current_step = int(jax.device_get(state.step))
-                    if current_step >= self.max_training_steps:
+                    if self.current_step >= self.max_training_steps:
                         break
                     if run_exception is not None:
                         break
@@ -490,41 +487,42 @@ class Trainer(BaseTrainer):
 
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
-        for _ in range(steps_per_epoch):
-            current_step = int(jax.device_get(state.step))
 
+        run_exception = None
+        for _ in range(steps_per_epoch):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
-                if current_step == 5:
+                if self.current_step == 10:
                     mh.sync_global_devices("easydel:before_profiler_start")
                     logger.info("Starting JAX profiler...")
-                    options = jax.profiler.ProfileOptions()
-                    options.advanced_configuration = {
-                        "host_tracer_level" : 2,
-                        "tpu_trace_mode" : "TRACE_COMPUTE_AND_SYNC",
-                        "tpu_num_sparse_cores_to_trace" : 2,
-                    }
+                    # options = jax.profiler.ProfileOptions()
+                    # options.advanced_configuration = {
+                    #     "host_tracer_level" : 2,
+                    #     "tpu_trace_mode" : "TRACE_COMPUTE_AND_SYNC",
+                    #     "tpu_num_sparse_cores_to_trace" : 2,
+                    # }
                     jax.profiler.start_trace(profiling_dir)
-                if current_step == 15:
+                if self.current_step == 30:
                     mh.sync_global_devices("easydel:before_profiler_stop")
                     logger.info("Stopping JAX profiler")
                     jax.profiler.stop_trace()
                     logger.info(f"Saved profiling traces to {profiling_dir}")
 
-            if current_step >= self.max_training_steps:
+            if self.current_step >= self.max_training_steps:
                 break
 
-            with jax.profiler.StepTraceAnnotation("train", step_num=current_step):
+            with jax.profiler.StepTraceAnnotation("train", step_num=self.current_step):
                 try:
                     with capture_time() as dataloading_time:
                         batch, train_iter = self._get_next_batch(train_iter, train_dataset)
-                    if self._should_skip_step(current_step):
+                    if self._should_skip_step(self.current_step):
                         state = state.replace(step=state.step + 1)
+                        self.current_step += 1
                         if state.step % self.arguments.log_steps == 0:
                             pbar.update(self.arguments.log_steps)
                         continue
                     step_metrics.start_step()
-                    state = self.on_step_start(state=state, step=current_step)
+                    state = self.on_step_start(state=state, step=self.current_step)
                 except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
                     return state, exect, train_iter
 
@@ -533,64 +531,50 @@ class Trainer(BaseTrainer):
                     with capture_time() as execution_time:
                         state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
                         metrics.execution_time = execution_time()
-                        current_step = int(jax.device_get(state.step))
+                        self.current_step += 1
                 # Update and log metrics
                 try:
-                    mean_loss, mean_accuracy = metrics_tracker.update(
-                        loss=metrics.loss,
-                        accuracy=metrics.accuracy,
-                        step=current_step,
-                    )
+                    # mean_loss, mean_accuracy = metrics_tracker.update(
+                    #     loss=metrics.loss,
+                    #     accuracy=metrics.accuracy,
+                    #     step=current_step,
+                    # )
                     metrics = self.apply_training_hooks(metrics=metrics)
                     train_metrics = step_metrics.calculate(
                         metrics=metrics,
-                        current_step=current_step,
-                        learning_rate=self.scheduler(current_step)
-                        if self.scheduler is not None
-                        else self.arguments.learning_rate,
+                        current_step=self.current_step,
+                        # learning_rate=self.scheduler(current_step)
+                        # if self.scheduler is not None
+                        # else self.arguments.learning_rate,
                         epoch=epoch,
                         flops_per_token=self._backward_flops_per_token,
                         extra_flops_per_token=self._extra_backward_flops_per_token,
                         batch_size=self.training_batch_size,
                         seq_length=self.arguments.max_sequence_length,
-                        mean_loss=mean_loss,
-                        mean_accuracy=mean_accuracy,
+                        # mean_loss=mean_loss,
+                        # mean_accuracy=mean_accuracy,
                         dataloading_time=dataloading_time(),
                         mode="train",
                     )
                     state, metrics = self.on_step_end(
                         state=state,
                         metrics=metrics,
-                        step=current_step,
+                        step=self.current_step,
                     )
                     metrics_history.append(train_metrics)
                     metrics_history = self.log_metrics(
                         history=metrics_history,
                         pbar=pbar,
-                        step=current_step,
+                        step=self.current_step,
                         mode="train",
                     )
-                    self.log_weight_distribution(state=state, step=current_step)
-                    # Save checkpoint if needed
-                    # if self._should_save_checkpoint(current_step):
-                    #     with capture_time() as blocking_time:
-                    #         state = jax.block_until_ready(state)
-                    #         logger.info(f"Blocking time for checkpoint: {blocking_time()}s")
-                    #     # jax.experimental.multihost_utils.sync_global_devices("easydel:before_save_state")
-                    #     # time.sleep(10)
-                    #     _ = self._save_state(
-                    #         checkpoint_manager=checkpoint_manager,
-                    #         state=state,
-                    #         milestone=True,
-                    #         save_directory=self.arguments.save_directory,
-                    #     )
-                    #     # jax.experimental.multihost_utils.sync_global_devices("easydel:after_save_state")
-                    #     # time.sleep(10)
-                    
-                    if self._should_save_checkpoint(current_step):
-                        self._maybe_save_state(current_step, checkpoint_manager, state)
+                    self.log_weight_distribution(state=state, step=self.current_step)
 
-                    if self._should_run_evaluation(current_step):
+
+                    if self._should_save_checkpoint(self.current_step):
+                        self._maybe_save_state(self.current_step, checkpoint_manager, state)
+
+                    if self._should_run_evaluation(self.current_step):
                         for _ in self.eval(model_state=state):
                             ...
                 except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
@@ -850,7 +834,7 @@ class Trainer(BaseTrainer):
         checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
         options = ocp.CheckpointManagerOptions(
             async_options=ocp.options.AsyncOptions(
-                timeout_secs=60,
+                timeout_secs=180,
                 create_directories_asynchronously=False,
                 # barrier_sync_fn=multihost.get_barrier_sync_fn("checkpoint_manager"),
             ),
