@@ -15,6 +15,17 @@ jobs:
       packages: write
 
     steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+      
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -62,8 +73,8 @@ jobs:
             ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.version }}
             ghcr.io/erfanzar/easydel:latest
             ghcr.io/erfanzar/easydel:${{ steps.meta.outputs.date }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             HARDWARE_TYPE=cpu 
