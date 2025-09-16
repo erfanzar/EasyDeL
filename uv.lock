@@ -643,7 +643,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = ">=0.0.61" },
+    { name = "eformer", specifier = ">=0.0.62" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.0" },
@@ -684,7 +684,7 @@ provides-extras = ["torch", "gpu", "tpu", "tensorflow", "lm-eval", "profile"]
 
 [[package]]
 name = "eformer"
-version = "0.0.61"
+version = "0.0.62"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -704,9 +704,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b5/23/a77d3baca5c6075b10c50fbefe08a215052d6882c56f4d3a4d4def267843/eformer-0.0.61.tar.gz", hash = "sha256:256d9208b0b481a9fe7ddefe9901d6fba238a44407fdabb4df6864ee4525deee", size = 190464, upload-time = "2025-09-14T18:31:54.674Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/31/75754ca002bbb62c9d5aad432653b244bbe5272540cc868cfbd985f15e65/eformer-0.0.62.tar.gz", hash = "sha256:243824af00bff4120c9e6cbcd79dc8ccf4d6ba71a798be633e3e4209655ef51e", size = 190605, upload-time = "2025-09-16T16:24:36.386Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f6/7d/f5f5f10249fca419054ba49be54b86b5a3fbc104c5e9b4bb639e29153586/eformer-0.0.61-py3-none-any.whl", hash = "sha256:183db4d1f070a6fd8ff864cb60a6cfc05e66267e0ba3bc1e44da12ee6b8773a0", size = 242895, upload-time = "2025-09-14T18:31:52.665Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/2f/ebb54f29b4478b77c70c5ef48853b94b5c34b42e7e44f8925066126435b9/eformer-0.0.62-py3-none-any.whl", hash = "sha256:d7b5e8f6c171eb0874c0a806d6f5295bd4e6114e89e46acf8a4220d876d9a3c8", size = 243059, upload-time = "2025-09-16T16:24:34.534Z" },
 ]
 
 [[package]]
