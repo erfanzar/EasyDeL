@@ -22,9 +22,8 @@ import jax
 import jax.numpy as jnp
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from flax import nnx
+from flax import nnx, struct
 from flax import nnx as nn
-from flax import struct
 from flax.nnx import traversals
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
