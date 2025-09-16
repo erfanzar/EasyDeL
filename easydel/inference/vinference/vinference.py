@@ -710,9 +710,9 @@ class vInference:
     ) -> vInferencePreCompileConfig:
         if batch_size is None or prefill_length is None:
             _input_ids = getattr(kwargs, "input_ids", None)
-            assert _input_ids is not None, (
-                "if `batch_size` or `prefill_length` is None `input_ids` must be present in your model kwargs."
-            )
+            assert (
+                _input_ids is not None
+            ), "if `batch_size` or `prefill_length` is None `input_ids` must be present in your model kwargs."
             batch_size, prefill_length = _input_ids.shape
         vision_included = False
         vision_batch_size = None

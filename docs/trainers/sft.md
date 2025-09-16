@@ -24,7 +24,7 @@ sft_config = SFTConfig(
     packing=False,               # Controls whether sequences are packed
 
     # Packing parameters
-    num_of_sequences=1024,       # Number of sequences for packing 
+    num_of_sequences=1024,       # Number of sequences for packing
 
     # Dataset processing
     dataset_num_proc=None,       # Number of processes for dataset processing

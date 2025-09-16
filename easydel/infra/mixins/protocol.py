@@ -44,13 +44,13 @@ The protocol includes overloaded methods for different model types:
 
 Example:
     >>> from easydel.infra.mixins.protocol import BaseModuleProtocol
-    >>> 
+    >>>
     >>> class MyModel(BaseModuleProtocol):
     ...     # Implement required methods
     ...     def __call__(self, input_ids, ...):
     ...         # Forward pass implementation
     ...         pass
-    ...     
+    ...
     ...     def compute_loss(self, input_ids, labels, ...):
     ...         # Loss computation
     ...         pass
@@ -82,7 +82,7 @@ from ..modeling_outputs import (
 )
 
 PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]  # noqa
-_CP = type[EasyDeLBaseConfig]  # noqa: F841
+_CP = type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")
 
@@ -94,7 +94,7 @@ if tp.TYPE_CHECKING:
 
 
 def return_type_adjuster(
-    original_return_type: type[_T],  # noqa: ARG001
+    original_return_type: type[_T],
 ) -> tp.Callable[[tp.Callable[..., nn.Module]], tp.Callable[..., _T]]:
     def decorator(func: tp.Callable[..., nn.Module]) -> tp.Callable[..., _T]:
         def wrapper(*args: tp.Any, **kwargs: tp.Any) -> _T:

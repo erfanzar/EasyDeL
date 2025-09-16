@@ -42,9 +42,9 @@ done
 build_and_push() {
     local hardware_type=$1
     local tag_suffix=$2
-    
+
     echo "Building ${hardware_type} image..."
-    
+
     # Build the image
     sudo docker build \
         --build-arg HARDWARE_TYPE=${hardware_type} \
@@ -54,22 +54,22 @@ build_and_push() {
         -t ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest${tag_suffix} \
         -t ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${DATE}${tag_suffix} \
         .
-    
+
     if [ "$PUSH" = true ]; then
         echo "Pushing ${hardware_type} image to registry..."
-        
+
         # Check if logged in to registry
         if ! sudo docker pull ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest${tag_suffix} &>/dev/null; then
             echo "Please login to ${REGISTRY} first:"
             echo "  echo \$GITHUB_TOKEN | sudo docker login ${REGISTRY} -u USERNAME --password-stdin"
             exit 1
         fi
-        
+
         # Push all tags
         sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${VERSION}${tag_suffix}
         sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest${tag_suffix}
         sudo docker push ${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${DATE}${tag_suffix}
-        
+
         echo "Successfully pushed ${hardware_type} images"
     fi
 }

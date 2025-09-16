@@ -16,7 +16,7 @@ nohup.out
 sharding_test.py
 cluster.yaml
 exprimental.py
-autoscale/cluster.yaml 
+autoscale/cluster.yaml
 memory_log_dir/
 wandb
 io.py

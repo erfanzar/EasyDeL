@@ -48,11 +48,7 @@ from .builders import (
     to_vsurge_kwargs,
 )
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
-from .trainer_types import (
-    get_trainer_class,
-    get_training_arguments_class,
-    normalize_trainer_config,
-)
+from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
 from .types import ELMConfig
 from .utils import load_elm_config, save_elm_config
 

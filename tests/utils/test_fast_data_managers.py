@@ -4,13 +4,7 @@ import tempfile
 
 import numpy as np
 
-from easydel.utils.data_managers import (
-    ArrayCache,
-    DataCache,
-    DataStreamOptimizer,
-    FastDataLoader,
-    TokenCache,
-)
+from easydel.utils.data_managers import ArrayCache, DataCache, DataStreamOptimizer, FastDataLoader, TokenCache
 
 
 class TestFastDataLoader:

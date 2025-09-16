@@ -8,24 +8,22 @@ provider:
   availability_zone: us-central1-a
   project_id: easydel-project
 
-
 docker:
-    image: "ghcr.io/erfanzar/easydel:latest-tpu"
-    container_name: "ray_docker"
-    pull_before_run: true
-    worker_run_options:
-      - --privileged
-      - --ulimit memlock=-1:-1
-      - --shm-size=32gb
-      - -e TPU_WORKER_ID
-      - -v "/tmp:/tmp"
-      - -v "/var/run/docker.sock:/var/run/docker.sock"
-    head_run_options:
-      - --privileged
-      - -v "/tmp:/tmp"
-      - --ulimit nofile=1048576:1048576
-      - -e RAY_TPU_MAX_CONCURRENT_ACTIVE_CONNECTIONS=64
-
+  image: "ghcr.io/erfanzar/easydel:latest-tpu"
+  container_name: "ray_docker"
+  pull_before_run: true
+  worker_run_options:
+    - --privileged
+    - --ulimit memlock=-1:-1
+    - --shm-size=32gb
+    - -e TPU_WORKER_ID
+    - -v "/tmp:/tmp"
+    - -v "/var/run/docker.sock:/var/run/docker.sock"
+  head_run_options:
+    - --privileged
+    - -v "/tmp:/tmp"
+    - --ulimit nofile=1048576:1048576
+    - -e RAY_TPU_MAX_CONCURRENT_ACTIVE_CONNECTIONS=64
 
 initialization_commands:
   - gcloud config set project easydel-project
@@ -37,7 +35,6 @@ initialization_commands:
   - sudo usermod -aG docker $USER
   - sudo chmod 666 /var/run/docker.sock
 
-
 head_setup_commands:
   - mkdir $HOME/.cache/huggingface -p
   - gcloud secrets versions access latest --secret=HF_TOKEN > $HOME/.cache/huggingface/token || true
@@ -48,12 +45,11 @@ worker_setup_commands:
 
 head_node_type: head_default
 
-
 available_node_types:
   head_default:
     min_workers: 0
     max_workers: 0
-    resources: {"CPU": 0, "head_node": 1}
+    resources: { "CPU": 0, "head_node": 1 }
 
     node_config:
       machineType: n2-standard-8
