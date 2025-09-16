@@ -25,14 +25,14 @@ jobs:
           large-packages: true
           docker-images: false
           swap-storage: true
-      
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install toml package
         run: pip install toml

@@ -116,7 +116,7 @@ GENERATION_CONFIGS: dict[str, TPUGenerationConfig] = {
 
 
 def get_default_project_id() -> str | None:
-    pid = os.environ.get("GCP_PROJECT_ID", "my-phd-research-o")
+    pid = os.environ.get("GCP_PROJECT_ID")
     if pid:
         return pid
     _, default_project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])

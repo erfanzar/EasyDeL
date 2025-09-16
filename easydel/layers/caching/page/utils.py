@@ -181,9 +181,9 @@ def kv_cache_update(
         ...     page_size=32
         ... )
     """
-    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
-        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
-    )
+    assert (
+        slice_indices.shape[1] % slices_per_processing_page == 0
+    ), f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
     assert kv_cache_pages.shape[1] == num_kv_heads
     assert kv_cache_pages.shape[2] == head_dimension
