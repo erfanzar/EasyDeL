@@ -1,0 +1,196 @@
+cluster_name: easydel-europe-west1-d
+
+max_workers: 1024
+
+provider:
+  type: gcp
+  region: europe-west1
+  availability_zone: europe-west1-d
+  project_id: easydel-project
+
+
+docker:
+    image: "ghcr.io/erfanzar/easydel:latest-tpu"
+    container_name: "ray_docker"
+    pull_before_run: true
+    worker_run_options:
+      - --privileged
+      - --ulimit memlock=-1:-1
+      - --shm-size=32gb
+      - -e TPU_WORKER_ID
+      - -v "/tmp:/tmp"
+      - -v "/var/run/docker.sock:/var/run/docker.sock"
+    head_run_options:
+      - --privileged
+      - -v "/tmp:/tmp"
+      - --ulimit nofile=1048576:1048576
+      - -e RAY_TPU_MAX_CONCURRENT_ACTIVE_CONNECTIONS=64
+
+
+initialization_commands:
+  - gcloud config set project easydel-project
+  - gcloud config set compute/region europe-west1
+  - gcloud config set compute/zone europe-west1-d
+  - yes | gcloud auth configure-docker europe-west1-docker.pkg.dev
+  - "export TPU_WORKER_ID=$(curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number) || true"
+  - which docker || (curl -fsSL https://get.docker.com -o get-docker.sh; sudo sh get-docker.sh; sudo usermod -aG docker $USER; sudo systemctl restart docker -f)
+  - sudo usermod -aG docker $USER
+  - sudo chmod 666 /var/run/docker.sock
+
+
+head_setup_commands:
+  - mkdir $HOME/.cache/huggingface -p
+  - gcloud secrets versions access latest --secret=HF_TOKEN > $HOME/.cache/huggingface/token || true
+
+worker_setup_commands:
+  - mkdir $HOME/.cache/huggingface -p
+  - gcloud secrets versions access latest --secret=HF_TOKEN > $HOME/.cache/huggingface/token || true
+
+head_node_type: head_default
+
+
+available_node_types:
+  head_default:
+    min_workers: 0
+    max_workers: 0
+    resources: {"CPU": 0, "head_node": 1}
+
+    node_config:
+      machineType: n2-standard-8
+      disks:
+        - boot: true
+          autoDelete: true
+          type: PERSISTENT
+          initializeParams:
+            diskSizeGb: 200
+
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+  tpu_base_v5p_8:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-8
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-8-head: 1
+
+  tpu_slice_v5p_8:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-8
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-8-head: 1
+
+  tpu_slice_v5p_16:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-16
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-16-head: 1
+
+  tpu_slice_v5p_32:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-32
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-32-head: 1
+
+  tpu_slice_v5p_64:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-64
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-64-head: 1
+
+  tpu_slice_v5p_128:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-128
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-128-head: 1
+
+  tpu_slice_v5p_256:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-256
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-256-head: 1
+
+  tpu_slice_v5p_512:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-512
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-512-head: 1
+
+  tpu_slice_v5p_1024:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-1024
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-1024-head: 1
+
+  tpu_slice_v5p_2048:
+    max_workers: 1024
+    min_workers: 0
+    node_config:
+      acceleratorType: v5p-2048
+      runtimeVersion: v2-alpha-tpuv5
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+      tpu-v5p-2048-head: 1
