@@ -1,12 +1,12 @@
-cluster_name: { { NAME } }
+cluster_name: {{NAME}}
 
 max_workers: 1024
 
 provider:
   type: gcp
-  region: { { REGION } }
-  availability_zone: { { ZONE } }
-  project_id: { { PROJECT_ID } }
+  region: {{REGION}}
+  availability_zone: {{ZONE}}
+  project_id: {{PROJECT_ID}}
 
 docker:
   image: "ghcr.io/erfanzar/easydel:latest-tpu"
