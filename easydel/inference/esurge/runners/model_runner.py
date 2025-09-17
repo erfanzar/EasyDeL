@@ -689,8 +689,8 @@ class eSurgeRunner:
                 self.seq_lens_buf,
                 self.pages_tables_buf,
                 self.slot_mapping_buf,
-                hidden_states,
-                logits,
+                _hidden_states,
+                _logits,
             ) = self.executor_manager.execute_fused(
                 num_tokens=num_tokens_static,
                 dev_state=dev_state,

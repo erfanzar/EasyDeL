@@ -39,11 +39,12 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, MaskedLMOutput
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (
     PagesCache,
@@ -53,7 +54,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .opt_configuration import OPTConfig
 
@@ -132,7 +133,7 @@ class OPTAttention(AttentionModule):
             )
 
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=bias,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -201,14 +202,14 @@ class OPTAttention(AttentionModule):
         """
         is_cross_attention = key_value_states is not None
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_states = self.q_proj(hidden_states)
+        query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
 
         if is_cross_attention:
-            key_states = self.k_proj(key_value_states)
-            value_states = self.v_proj(key_value_states)
+            key_states = checkpoint_name(self.k_proj(key_value_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(key_value_states), "attn_value")
         else:
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
 
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
@@ -258,7 +259,7 @@ class OPTAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -328,7 +329,7 @@ class OPTDecoderLayer(nn.Module):
             rngs=rngs,
             epsilon=1e-05,
         )
-        self.fc1 = ParallelLinear(
+        self.fc1 = ColumnParallelLinear(
             self.embed_dim,
             self.embed_dim,
             dtype=dtype,
@@ -337,7 +338,7 @@ class OPTDecoderLayer(nn.Module):
             kernel_init=nn.initializers.normal(config.init_std),
             rngs=rngs,
         )
-        self.fc2 = ParallelLinear(
+        self.fc2 = RowParallelLinear(
             self.embed_dim,
             self.embed_dim,
             dtype=dtype,
@@ -396,7 +397,7 @@ class OPTDecoderLayer(nn.Module):
             cache_metadata=cache_metadata,
         )
         hidden_states = self.dropout_layer(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -414,13 +415,13 @@ class OPTDecoderLayer(nn.Module):
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.activation_fn(hidden_states), "mlp_gate")
 
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
 
-        hidden_states = (residual + hidden_states).reshape(hidden_states_shape)
+        hidden_states = checkpoint_name((residual + hidden_states).reshape(hidden_states_shape), "layer_output")
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -502,8 +503,8 @@ class OPTDecoder(EasyDeLBaseModule):
         embed_scale (float): Scaling factor for embeddings (usually 1.0).
         embed_tokens (nn.Embed): Token embedding layer.
         embed_positions (OPTLearnedPositionalEmbedding): Positional embedding layer.
-        project_out (ParallelLinear, optional): Optional linear projection layer after embeddings.
-        project_in (ParallelLinear, optional): Optional linear projection layer before embeddings.
+        project_out (ColumnParallelLinear, optional): Optional linear projection layer after embeddings.
+        project_in (ColumnParallelLinear, optional): Optional linear projection layer before embeddings.
         layers (tp.List[OPTDecoderLayer]): List of OPT decoder layers.
         dropout_layer (nn.Dropout): Dropout layer applied after embeddings.
         final_layer_norm (nn.LayerNorm, optional): Optional final layer normalization.
@@ -534,7 +535,13 @@ class OPTDecoder(EasyDeLBaseModule):
         self.padding_idx = self.config.pad_token_id
         self.max_target_positions = self.config.max_position_embeddings
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.word_embed_proj_dim,
             embedding_init=nn.initializers.normal(config.init_std),
@@ -554,7 +561,7 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         if self.config.word_embed_proj_dim != self.config.hidden_size:
-            self.project_in = ParallelLinear(
+            self.project_in = ColumnParallelLinear(
                 self.config.word_embed_proj_dim,
                 self.config.hidden_size,
                 use_bias=False,
@@ -563,7 +570,7 @@ class OPTDecoder(EasyDeLBaseModule):
                 precision=precision,
                 rngs=rngs,
             )
-            self.project_out = ParallelLinear(
+            self.project_out = RowParallelLinear(
                 self.config.hidden_size,
                 self.config.word_embed_proj_dim,
                 use_bias=False,
@@ -635,7 +642,7 @@ class OPTDecoder(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = checkpoint_name(self.embed_tokens(input_ids), "embeddings")
         if self.project_in is not None:
             inputs_embeds = self.project_in(inputs_embeds)
 
@@ -689,7 +696,9 @@ class OPTDecoder(EasyDeLBaseModule):
                 all_self_attns += (layer_outputs[1],)
 
         if self.final_layer_norm is not None:
-            hidden_state = self.final_layer_norm(hidden_states)
+            hidden_state = checkpoint_name(self.final_layer_norm(hidden_states), "model_output")
+        else:
+            hidden_state = checkpoint_name(hidden_states, "model_output")
 
         if self.project_out is not None:
             hidden_state = self.project_out(hidden_state)
@@ -844,7 +853,14 @@ class OPTForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
             offset=offset,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
@@ -912,7 +928,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
             lm_logits = self.lm_head.apply(hidden_states)
 
         else:
-            lm_logits = self.lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.lm_head(hidden_states), "lm_head_output")
 
         return MaskedLMOutput(
             logits=lm_logits,

@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -44,7 +45,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -83,8 +84,18 @@ class Xerxes2Attention(AttentionModule):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
 
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -95,17 +106,17 @@ class Xerxes2Attention(AttentionModule):
         )
 
         if self.config.q_lora_dim is not None:
-            self.qa_proj = linear_class(config.hidden_size, config.q_lora_dim)
+            self.qa_proj = column_parallel_linear(config.hidden_size, config.q_lora_dim)
             self.qa_norm = nn.LayerNorm(
                 config.q_lora_dim,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
             )
-            self.qb_proj = linear_class(config.q_lora_dim, self.num_heads * self.qhead_dim)
+            self.qb_proj = column_parallel_linear(config.q_lora_dim, self.num_heads * self.qhead_dim)
         else:
-            self.qc_proj = linear_class(config.hidden_size, self.num_heads * self.qhead_dim)
-        self.kv_mqa_proj = linear_class(
+            self.qc_proj = column_parallel_linear(config.hidden_size, self.num_heads * self.qhead_dim)
+        self.kv_mqa_proj = column_parallel_linear(
             config.hidden_size,
             config.kv_lora_dim + config.qk_rope_head_dim,
         )
@@ -115,11 +126,11 @@ class Xerxes2Attention(AttentionModule):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        self.kvi_proj = linear_class(
+        self.kvi_proj = column_parallel_linear(
             config.kv_lora_dim,
             self.num_heads * (self.qhead_dim - self.qk_rope_head_dim + self.vhead_dim),
         )
-        self.o_proj = linear_class(
+        self.o_proj = row_parallel_linear(
             self.num_heads * self.vhead_dim,
             self.config.hidden_size,
         )
@@ -242,7 +253,9 @@ class Xerxes2Attention(AttentionModule):
             causal=True,
         )
 
-        attn_output = self.o_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.o_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
+        )
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -268,8 +281,8 @@ class Xerxes2MLP(nn.Module):
         self.rngs = rngs
 
         self.act = nn.silu
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -278,8 +291,18 @@ class Xerxes2MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_up_proj = linear_class(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
-        self.down_proj = linear_class(config.intermediate_size, config.hidden_size, rngs=rngs)
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
+        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
 
     def __call__(self, hidden_states):
         hidden_states = apply_logical_sharding(
@@ -289,7 +312,7 @@ class Xerxes2MLP(nn.Module):
         )
         up_states = self.gate_up_proj(hidden_states)
         gate, up_states = jnp.split(up_states, 2, axis=-1)
-        hidden_states = self.down_proj(up_states * nn.silu(gate))
+        hidden_states = checkpoint_name(self.down_proj(up_states * nn.silu(gate)), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -349,9 +372,12 @@ class Xerxes2MoeMLPStack(nn.Module):
 
     def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array) -> chex.Array:
         """Forward pass through MoE MLP."""
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
-            group_sizes,
+        return checkpoint_name(
+            self.down_proj(
+                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+                group_sizes,
+            ),
+            "moe_output",
         )
 
 
@@ -403,7 +429,7 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_experts,
             use_bias=False,
@@ -466,6 +492,8 @@ class Xerxes2DecoderLayer(nn.Module):
             Xerxes2MLP,
             Xerxes2MoeSparseBlock,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             self.config,
@@ -591,7 +619,14 @@ class Xerxes2Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -773,7 +808,14 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             self.config.hidden_size,
             self.config.vocab_size,
             use_bias=False,

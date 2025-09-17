@@ -35,6 +35,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -49,7 +50,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .gidd_configuration import GiddConfig
 
@@ -94,8 +95,19 @@ class GiddMLP(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
+            scale="fan_in",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=self.config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.init_scale),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = partial(
+            RowParallelLinear,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
@@ -106,8 +118,8 @@ class GiddMLP(nn.Module):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
-        self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
+        self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
+        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
 
     def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
         """
@@ -127,11 +139,11 @@ class GiddMLP(nn.Module):
         )
 
         # First projection and activation
-        h = self.up_proj(h)
+        h = checkpoint_name(self.up_proj(h), name="mlp_up")
         h = nn.relu(h) ** 2  # Squared ReLU activation
 
         # Second projection
-        h = self.down_proj(h)
+        h = checkpoint_name(self.down_proj(h), name="mlp_down")
 
         # Apply logical sharding for distributed computation
         h = apply_logical_sharding(
@@ -216,8 +228,18 @@ class GiddAttention(AttentionModule):
             self.qk_scale = 1.0
 
         # Create linear projections for Q, K, V, and O
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
+            scale="fan_in",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.init_scale),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = partial(
+            RowParallelLinear,
             scale="fan_in",
             dtype=dtype,
             param_dtype=param_dtype,
@@ -227,22 +249,22 @@ class GiddAttention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.q_proj = linear_class(
+        self.q_proj = column_parallel_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
         )
-        self.k_proj = linear_class(
+        self.k_proj = column_parallel_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
         )
-        self.v_proj = linear_class(
+        self.v_proj = column_parallel_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
         )
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         # Initialize rotary position embeddings
         self.rotary = self.config.get_basic_rope(
@@ -383,9 +405,9 @@ class GiddAttention(AttentionModule):
 
         # Project inputs to Q, K, V
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
         )
 
         # Apply QK normalization if enabled
@@ -458,7 +480,10 @@ class GiddAttention(AttentionModule):
         )
 
         # Project attention outputs back to hidden dimension
-        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+            name="attn_output",
+        )
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -577,6 +602,8 @@ class GiddLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         # Initialize sub-modules
@@ -725,7 +752,14 @@ class GiddModel(EasyDeLBaseModule):
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
         # Initialize token embeddings
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -982,7 +1016,14 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         )
 
         # Initialize language modeling head
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,

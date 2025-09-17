@@ -26,9 +26,6 @@ from triton import Config
 from .._utils import dtype_index, get_sharding, get_strides, safe_autotune
 from ._utils import attention_pack_with_static_shape, attention_unpack_with_static_shape, calc_bias_strides, padded_load
 
-BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
-LN2: tl.constexpr = 1.44269504089
-
 
 def config_prune_kernel(
     configs: list[Config],
@@ -185,6 +182,8 @@ def _attn_bwd_dkdv(
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
 ):
+    LN2: tl.constexpr = 1.44269504089
+    BIG_NEG: tl.constexpr = -2147483648
     q_ptrs = q_ptrs + index_start_m * stride_qm
     do_ptrs = do_ptrs + index_start_m * stride_dom
     if BIAS_ON:
@@ -474,6 +473,7 @@ def _attn_bwd_dq(
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
 ):
+    BIG_NEG: tl.constexpr = -2147483648
     k_ptrs = k_ptrs + index_start_n * stride_kn
     v_ptrs = v_ptrs + index_start_n * stride_vn
     offs_n_curr = index_start_n + offs_n
@@ -1110,7 +1110,6 @@ def _bwd_attention_kernel_call(
             batch_size * nheads_q,
         ),
         kernel=_attn_bwd_preprocess,
-        disable_verbose_logging=False,
         name="triton::ops::_attn_bwd_preprocess",
     )
 
@@ -1167,7 +1166,6 @@ def _bwd_attention_kernel_call(
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         BOOL_BIAS=BOOL_BIAS,
         kernel=_attn_bwd,
-        disable_verbose_logging=False,
         grid=lambda META: (
             triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),
             batch_size * nheads_q,

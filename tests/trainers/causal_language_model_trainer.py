@@ -34,11 +34,14 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
         num_hidden_layers=4,
         intermediate_size=128,
         max_position_embeddings=sequence_length,
-        attn_dtype=jnp.float32,
-        attn_softmax_dtype=jnp.float32,
-        attn_mechanism=ed.AttentionMechanisms.VANILLA,
+        attn_dtype=jnp.float16,
+        attn_softmax_dtype=jnp.float16,
+        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
         num_experts=2,
         num_experts_per_tok=1,
+        vhead_dim=128,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=64,
     )
 
     model = ed.Xerxes2ForCausalLM(config=config, dtype=dtype, param_dtype=dtype, rngs=ed.Rngs(0))
@@ -109,7 +112,7 @@ def create_training_args(
         # training_time_limit="80Min",
         wandb_entity="erfanzar",
         model_name="CausalLanguageModelTrainerTest",
-        optimizer=ed.EasyDeLOptimizers.ADAMW,
+        optimizer=ed.EasyDeLOptimizers.SKEW,
         scheduler=ed.EasyDeLSchedulers.COSINE,
         clip_grad=1.0,
         warmup_steps=warmup_steps,

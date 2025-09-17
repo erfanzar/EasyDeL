@@ -26,9 +26,6 @@ from triton import Config
 from .._utils import dtype_index, get_sharding, get_strides, safe_autotune
 from ._utils import attention_pack_with_static_shape, attention_unpack_with_static_shape, calc_bias_strides, padded_load
 
-BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
-LN2: tl.constexpr = 1.44269504089
-
 
 def config_prune_kernel(
     configs: list[Config],
@@ -126,8 +123,10 @@ def _attn_fwd_inner(
 
     if BIAS_ON:
         if BOOL_BIAS:
+            BIG_NEG: tl.constexpr = -2147483648
             qk = tl.where(bias, qk, BIG_NEG)
         else:
+            LN2: tl.constexpr = 1.44269504089
             qk += bias * (LN2 / softmax_scale)
     m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, me_i)
     P_ij = tl.exp2(qk * softmax_scale - m_ij[:, None])
@@ -274,6 +273,7 @@ def _attn_fwd(
         cu_seq_start_q = 0
         cu_seq_start_k = 0
 
+    LN2: tl.constexpr = 1.44269504089
     softmax_scale = softmax_scale * LN2
 
     offs_m = i_start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -577,7 +577,6 @@ def _fwd_attention_kernel_call(
         dtype_index(q),
         kernel=_attn_fwd,
         out_shape=out_shape,
-        disable_verbose_logging=False,
         grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch * nheads_q),
         name="triton::ops::_attn_fwd",
         **metaparams,

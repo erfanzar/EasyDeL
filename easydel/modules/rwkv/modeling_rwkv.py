@@ -20,11 +20,12 @@ import jax.lax
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
@@ -145,7 +146,7 @@ class RwkvSelfAttention(nn.Module):
         self.time_mix_value = nn.Param(time_mix_value.astype(self.param_dtype))
         self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-        self.key = ParallelLinear(
+        self.key = ColumnParallelLinear(
             hidden_size,
             attention_hidden_size,
             use_bias=False,
@@ -154,7 +155,7 @@ class RwkvSelfAttention(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.value = ParallelLinear(
+        self.value = ColumnParallelLinear(
             hidden_size,
             attention_hidden_size,
             use_bias=False,
@@ -163,7 +164,7 @@ class RwkvSelfAttention(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.receptance = ParallelLinear(
+        self.receptance = RowParallelLinear(
             hidden_size,
             attention_hidden_size,
             use_bias=False,
@@ -172,7 +173,7 @@ class RwkvSelfAttention(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.output = ParallelLinear(
+        self.output = RowParallelLinear(
             attention_hidden_size,
             hidden_size,
             use_bias=False,
@@ -194,9 +195,9 @@ class RwkvSelfAttention(nn.Module):
         key_x = hidden * self.time_mix_key.reshape(-1) + c_x * (1 - self.time_mix_key.reshape(-1))
         value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (1 - self.time_mix_value.reshape(-1))
         receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (1 - self.time_mix_receptance.reshape(-1))
-        receptance_state = nn.sigmoid(self.receptance(receptance_x))
-        key_states = self.key(key_x)
-        value_states = self.value(value_x)
+        receptance_state = checkpoint_name(nn.sigmoid(self.receptance(receptance_x)), "attn_receptance")
+        key_states = checkpoint_name(self.key(key_x), "attn_key")
+        value_states = checkpoint_name(self.value(value_x), "attn_value")
 
         def step(in_state, kv):
             (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
@@ -217,7 +218,7 @@ class RwkvSelfAttention(nn.Module):
             return next_inner_state, next_c_x
 
         (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), (key_states, value_states))
-        out = hidden + self.output(receptance_state * c_x)
+        out = checkpoint_name(hidden + self.output(receptance_state * c_x), "attn_output")
         next_state = (hidden[-1, :], aa, bb, pp)
         return out, next_state
 
@@ -254,7 +255,7 @@ class RwkvFeedForward(nn.Module):
         self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
         self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-        self.key = ParallelLinear(
+        self.key = ColumnParallelLinear(
             hidden_size,
             intermediate_size,
             use_bias=False,
@@ -263,7 +264,7 @@ class RwkvFeedForward(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.receptance = ParallelLinear(
+        self.receptance = RowParallelLinear(
             intermediate_size,
             hidden_size,
             use_bias=False,
@@ -272,7 +273,7 @@ class RwkvFeedForward(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.value = ParallelLinear(
+        self.value = ColumnParallelLinear(
             intermediate_size,
             hidden_size,
             use_bias=False,
@@ -286,9 +287,9 @@ class RwkvFeedForward(nn.Module):
         sx = jnp.concatenate((jnp.expand_dims(state, 0), hidden[:-1, :]))
         xk = hidden * self.time_mix_key.reshape(-1) + sx * (1 - self.time_mix_key.reshape(-1))
         xr = hidden * self.time_mix_receptance.reshape(-1) + sx * (1 - self.time_mix_receptance.reshape(-1))
-        r = nn.sigmoid(self.receptance(xr))
-        k = jnp.square(nn.relu(self.key(xk)))
-        return r * self.value(k), hidden[-1, :]
+        r = checkpoint_name(nn.sigmoid(self.receptance(xr)), "mlp_gate")
+        k = checkpoint_name(jnp.square(nn.relu(self.key(xk))), "mlp_up")
+        return checkpoint_name(r * self.value(k), "mlp_output"), hidden[-1, :]
 
 
 class SingleStandRwkvBlock(nn.Module):
@@ -360,10 +361,10 @@ class SingleStandRwkvBlock(nn.Module):
             self.ln1(hidden),
             state=self_state,
         )
-        hidden = hidden + attention
+        hidden = checkpoint_name(hidden + attention, "residual")
 
         feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
-        hidden = hidden + feed_forward
+        hidden = checkpoint_name(hidden + feed_forward, "layer_output")
 
         outputs = (hidden, (self_state, ffd_state))
         if output_attentions:
@@ -447,7 +448,7 @@ class RwkvModel(EasyDeLBaseModule):
             )
 
         if inputs_embeds is None:
-            inputs_embeds = self.embeddings(input_ids)
+            inputs_embeds = checkpoint_name(self.embeddings(input_ids), "embeddings")
 
         if use_cache and state is None:
             shape = (
@@ -481,7 +482,7 @@ class RwkvModel(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attentions = (*all_self_attentions, attentions)
 
-        hidden_states = self.ln_out(hidden_states)
+        hidden_states = checkpoint_name(self.ln_out(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states = (*all_hidden_states, hidden_states)
@@ -521,7 +522,7 @@ class RwkvForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.head = ParallelLinear(
+        self.head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,

@@ -24,6 +24,7 @@ from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -38,7 +39,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -226,9 +227,13 @@ class DeepseekV2MLPMoE(nn.Module):
         )
 
         return apply_logical_sharding(
-            self.down_proj(
-                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
-                group_sizes,
+            checkpoint_name(
+                self.down_proj(
+                    self.act_fn(checkpoint_name(self.gate_proj(hidden_states, group_sizes), name="mlp_gate"))
+                    * checkpoint_name(self.up_proj(hidden_states, group_sizes), name="mlp_up"),
+                    group_sizes,
+                ),
+                name="mlp_down",
             ),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
@@ -249,7 +254,7 @@ class DeepseekV2MLP(nn.Module):
     ):
         self.config = config
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -271,9 +276,9 @@ class DeepseekV2MLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = self.act_fn(checkpoint_name(self.gate_proj(hidden_states), name="mlp_gate"))
+        up = checkpoint_name(self.up_proj(hidden_states), name="mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), name="mlp_down")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -460,13 +465,13 @@ class DeepseekV2Attention(AttentionModule):
         self.is_causal = True
 
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
         )
         if self.config.q_lora_rank is None:
-            self.q_proj = ParallelLinear(
+            self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads * self.q_head_dim,
                 use_bias=False,
@@ -568,9 +573,12 @@ class DeepseekV2Attention(AttentionModule):
         bsz, q_len, _ = hidden_states.shape
 
         if self.config.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
+            q = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            q = checkpoint_name(
+                self.q_b_proj(self.q_a_layernorm(checkpoint_name(self.q_a_proj(hidden_states), name="attn_query_a"))),
+                name="attn_query",
+            )
         q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         # Split into nope and pe parts
         q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
@@ -646,7 +654,7 @@ class DeepseekV2Attention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -683,6 +691,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -824,7 +834,14 @@ class DeepseekV2Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -1063,7 +1080,14 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,

@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -42,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .internlm2_configuration import InternLM2Config
@@ -103,7 +104,7 @@ class InternLM2Attention(AttentionModule):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.wqkv = ParallelLinear(
+        self.wqkv = ColumnParallelLinear(
             config.hidden_size,
             (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
             dtype=dtype,
@@ -114,7 +115,7 @@ class InternLM2Attention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.wo = ParallelLinear(
+        self.wo = RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
             dtype=dtype,
@@ -171,7 +172,7 @@ class InternLM2Attention(AttentionModule):
             tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         qkv_states = rearrange(
-            self.wqkv(hidden_states),
+            checkpoint_name(self.wqkv(hidden_states), name="attn_qkv"),
             "b q (h gs d) -> b q h gs d",
             gs=2 + self.num_key_value_groups,
             d=self.head_dim,
@@ -269,7 +270,7 @@ class InternLM2MLP(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -297,9 +298,9 @@ class InternLM2MLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        w1 = self.act_fn(self.w1(hidden_states))
-        w3 = self.w3(hidden_states)
-        hidden_states = self.w2(w1 * w3)
+        w1 = self.act_fn(checkpoint_name(self.w1(hidden_states), name="mlp_gate"))
+        w3 = checkpoint_name(self.w3(hidden_states), name="mlp_up")
+        hidden_states = checkpoint_name(self.w2(w1 * w3), name="mlp_down")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -354,6 +355,8 @@ class InternLM2Block(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.attention = attn_block(
@@ -730,7 +733,7 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.output = ParallelLinear(
+        self.output = RowParallelLinear(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -894,7 +897,7 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

@@ -25,6 +25,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -40,7 +41,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.layers.ops import _lightning_attention
 
@@ -126,7 +127,7 @@ class GLU(nn.Module):
     ):
         super().__init__()
 
-        self.l1 = ParallelLinear(
+        self.l1 = ColumnParallelLinear(
             d1,
             d2,
             use_bias=bias,
@@ -135,7 +136,7 @@ class GLU(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.l2 = ParallelLinear(
+        self.l2 = RowParallelLinear(
             d1,
             d2,
             use_bias=bias,
@@ -144,7 +145,7 @@ class GLU(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.l3 = ParallelLinear(
+        self.l3 = ColumnParallelLinear(
             d2,
             d1,
             use_bias=bias,
@@ -186,7 +187,7 @@ class MiniMaxText01LightningAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
 
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             self.head_dim * self.num_heads,
             self.hidden_size,
             use_bias=False,
@@ -204,7 +205,7 @@ class MiniMaxText01LightningAttention(nn.Module):
             param_dtype=param_dtype,
         )
 
-        self.qkv_proj = ParallelLinear(
+        self.qkv_proj = ColumnParallelLinear(
             self.hidden_size,
             3 * self.head_dim * self.num_heads,
             use_bias=False,
@@ -213,7 +214,7 @@ class MiniMaxText01LightningAttention(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.output_gate = ParallelLinear(
+        self.output_gate = RowParallelLinear(
             self.hidden_size,
             self.head_dim * self.num_heads,
             use_bias=False,
@@ -240,7 +241,9 @@ class MiniMaxText01LightningAttention(nn.Module):
     ):
         # TODO: fix these static issues here
         batch_size, sequence_length, _ = hidden_states.shape
-        query_states, key_states, value_states = jnp.split(self.act(self.qkv_proj(hidden_states)), 3, -1)
+        query_states, key_states, value_states = jnp.split(
+            self.act(checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")), 3, -1
+        )
 
         to_shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
         query_states = query_states.reshape(*to_shape)
@@ -265,8 +268,8 @@ class MiniMaxText01LightningAttention(nn.Module):
             cache_view.key_value = ola
         output = rearrange(output, "b h n d -> b n (h d)")
         output = self.norm(output)
-        output = jax.nn.sigmoid(self.g_proj(hidden_states)) * output
-        output = self.o_proj(output)
+        output = jax.nn.sigmoid(checkpoint_name(self.output_gate(hidden_states), name="attn_gate")) * output
+        output = checkpoint_name(self.o_proj(output), name="attn_output")
         return (output, None)
 
 
@@ -299,8 +302,8 @@ class MiniMaxText01Attention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -309,10 +312,20 @@ class MiniMaxText01Attention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size)
         self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
         self.rotary = self.config.get_basic_rope(
             self.dtype,
@@ -344,9 +357,9 @@ class MiniMaxText01Attention(AttentionModule):
     ) -> tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
         )
         qshape = (
             batch_size,
@@ -405,7 +418,10 @@ class MiniMaxText01Attention(AttentionModule):
             causal=True,
         )
 
-        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+            name="attn_output",
+        )
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -429,8 +445,8 @@ class MiniMaxText01MLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -439,9 +455,19 @@ class MiniMaxText01MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
-        self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
-        self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
+        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
+        self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -450,9 +476,9 @@ class MiniMaxText01MLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = self.act_fn(checkpoint_name(self.gate_proj(hidden_states), name="mlp_gate"))
+        up = checkpoint_name(self.up_proj(hidden_states), name="mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), name="mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -477,8 +503,8 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -487,9 +513,19 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.w1 = linear_class(config.hidden_size, config.intermediate_size)
-        self.w2 = linear_class(config.intermediate_size, config.hidden_size)
-        self.w3 = linear_class(config.hidden_size, config.intermediate_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.w1 = column_parallel_linear(config.hidden_size, config.intermediate_size)
+        self.w2 = row_parallel_linear(config.intermediate_size, config.hidden_size)
+        self.w3 = column_parallel_linear(config.hidden_size, config.intermediate_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -526,7 +562,7 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_local_experts,
             use_bias=False,
@@ -563,7 +599,9 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
                 minval=1.0 - self.jitter_noise,
                 maxval=1.0 + self.jitter_noise,
             )
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
+        router_logits = checkpoint_name(self.gate(hidden_states), name="moe_router_logits").astype(
+            jnp.promote_types(self.dtype, jnp.float32)
+        )
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = jax.nn.softmax(routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
         routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
@@ -622,6 +660,8 @@ class MiniMaxText01DecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -707,7 +747,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
                 precision=precision,
                 rngs=rngs,
             )
-            self.coefficient = ParallelLinear(
+            self.coefficient = ColumnParallelLinear(
                 self.hidden_size,
                 1,
                 use_bias=False,
@@ -815,7 +855,13 @@ class MiniMaxText01Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -1002,7 +1048,14 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             rngs=rngs,

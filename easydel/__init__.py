@@ -73,7 +73,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_force_compilation_parallelism=4 "
         "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
-        "--xla_gpu_graph_level=3 "
+        # "--xla_gpu_graph_level=3 " # deprecated in jax v0.7.2
         "--xla_gpu_enable_command_buffer=  "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
@@ -772,7 +772,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.62", "0.0.63"]
+    _targeted_versions = ["0.0.72", "0.0.73", "0.0.74", "0.0.75"]
 
     from eformer import __version__ as _eform_version
 

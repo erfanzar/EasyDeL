@@ -36,6 +36,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -55,7 +56,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 
 from .gpt2_configuration import GPT2Config as GPT2Config
 
@@ -266,7 +267,7 @@ class GPT2Attention(AttentionModule):
         is_cross_attention = key_value_states is not None
 
         if not is_cross_attention:
-            qkv_out = self.c_attn(hidden_states)
+            qkv_out = checkpoint_name(self.c_attn(hidden_states), "attn_query")
             query, key, value = jnp.split(qkv_out, 3, axis=2)
         else:
             q_out = self.q_attn(hidden_states)
@@ -311,7 +312,7 @@ class GPT2Attention(AttentionModule):
             segment_ids=None,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))
-        attn_output = self.c_proj(attn_output)
+        attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
@@ -388,7 +389,8 @@ class GPT2MLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.dropout(self.c_proj(self.act(self.c_fc(hidden_states))))
+        gate = checkpoint_name(self.act(self.c_fc(hidden_states)), "mlp_gate")
+        hidden_states = checkpoint_name(self.dropout(self.c_proj(gate)), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -443,6 +445,8 @@ class GPT2Block(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.attn = attn_block(
@@ -530,7 +534,7 @@ class GPT2Block(nn.Module):
             output_attentions,
         )
 
-        hidden_states = attn_outputs.attention_output + residual
+        hidden_states = checkpoint_name(attn_outputs.attention_output + residual, "residual")
         cross_attention = None
         if encoder_hidden_states is not None:
             if not hasattr(self, "crossattention"):
@@ -552,7 +556,7 @@ class GPT2Block(nn.Module):
                 output_attentions,
             )
             cross_attention = cross_attn_outputs.attention_weight
-            hidden_states = residual + cross_attn_outputs.attention_output
+            hidden_states = checkpoint_name(residual + cross_attn_outputs.attention_output, "residual")
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -564,7 +568,7 @@ class GPT2Block(nn.Module):
             )
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -572,7 +576,7 @@ class GPT2Block(nn.Module):
         )
 
         return DecoderLayerOutput(
-            hidden_states=hidden_states,
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             cross_attention=cross_attention,
             cache_view=attn_outputs.cache_view,
@@ -613,7 +617,13 @@ class GPT2Model(EasyDeLBaseModule):
         )
         self.embed_dim = self.config.hidden_size
 
-        self.wte = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=self.config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.wte = embed_block(
             self.config.vocab_size,
             self.embed_dim,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -621,7 +631,14 @@ class GPT2Model(EasyDeLBaseModule):
             rngs=rngs,
             param_dtype=param_dtype,
         )
-        self.wpe = nn.Embed(
+        pos_embed_block = nn.Embed
+        pos_embed_block = auto_remat(
+            pos_embed_block,
+            policy=self.config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.wpe = pos_embed_block(
             self.config.max_position_embeddings,
             self.embed_dim,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -696,7 +713,7 @@ class GPT2Model(EasyDeLBaseModule):
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
-        inputs_embeds = self.wte(input_ids.astype("i4"))
+        inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
         position_embeds = self.wpe(position_ids.astype("i4"))
 
         hidden_states = inputs_embeds + position_embeds
@@ -744,7 +761,7 @@ class GPT2Model(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -822,7 +839,14 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
@@ -891,7 +915,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutputWithCrossAttentions(
             logits=lm_logits,
