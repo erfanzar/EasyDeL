@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -41,7 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .olmo2_configuration import Olmo2Config
@@ -86,8 +87,8 @@ class Olmo2MLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -96,17 +97,27 @@ class Olmo2MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(
             config.hidden_size,
             config.intermediate_size,
             rngs=rngs,
         )
-        self.down_proj = linear_class(
+        self.down_proj = row_parallel_linear(
             config.intermediate_size,
             config.hidden_size,
             rngs=rngs,
         )
-        self.up_proj = linear_class(
+        self.up_proj = column_parallel_linear(
             config.hidden_size,
             config.intermediate_size,
             rngs=rngs,
@@ -119,15 +130,15 @@ class Olmo2MLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Olmo2Attention(AttentionModule):
@@ -189,8 +200,8 @@ class Olmo2Attention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.num_heads == self.config.num_key_value_heads
 
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -198,10 +209,19 @@ class Olmo2Attention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
         self.q_norm = RMSNorm(
             self.num_heads * self.head_dim,
             eps=config.rms_norm_eps,
@@ -265,9 +285,9 @@ class Olmo2Attention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_norm(self.q_proj(hidden_states)),
-            self.k_norm(self.k_proj(hidden_states)),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_norm(self.q_proj(hidden_states)), "attn_query"),
+            checkpoint_name(self.k_norm(self.k_proj(hidden_states)), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -315,7 +335,7 @@ class Olmo2Attention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -372,6 +392,8 @@ class Olmo2DecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -452,7 +474,7 @@ class Olmo2DecoderLayer(nn.Module):
 
         hidden_states = attention_output[0]
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         residual = hidden_states
         if self.config.use_scan_mlp:
@@ -465,7 +487,7 @@ class Olmo2DecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "layer_output")
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attention_output.attention_weight,
@@ -519,7 +541,13 @@ class Olmo2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -592,7 +620,7 @@ class Olmo2Model(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         all_attentions = () if output_attentions else None
@@ -650,7 +678,7 @@ class Olmo2Model(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -740,7 +768,14 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -814,7 +849,7 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -908,7 +943,7 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

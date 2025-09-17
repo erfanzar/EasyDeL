@@ -23,6 +23,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -37,7 +38,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.utils.compiling_utils import ejit
 
@@ -362,7 +363,7 @@ class PatchMerger(nn.Module):
             rngs=rngs,
         )
         self.mlp = [
-            ParallelLinear(
+            ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
                 dtype=dtype,
@@ -371,7 +372,7 @@ class PatchMerger(nn.Module):
                 rngs=rngs,
             ),
             partial(nn.gelu, approximate=False),
-            ParallelLinear(
+            RowParallelLinear(
                 self.hidden_size,
                 dim,
                 dtype=dtype,
@@ -401,7 +402,7 @@ class VisionMlp(nn.Module):
         rngs: nn.Rngs,
     ) -> None:
         super().__init__()
-        self.fc1 = ParallelLinear(
+        self.fc1 = ColumnParallelLinear(
             dim,
             hidden_dim,
             dtype=dtype,
@@ -410,7 +411,7 @@ class VisionMlp(nn.Module):
             rngs=rngs,
         )
         self.act = ACT2FN[hidden_act]
-        self.fc2 = ParallelLinear(
+        self.fc2 = RowParallelLinear(
             hidden_dim,
             dim,
             dtype=dtype,
@@ -439,7 +440,7 @@ class VisionAttention(AttentionModule):
         self.rngs = rngs
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = ParallelLinear(
+        self.qkv = ColumnParallelLinear(
             dim,
             dim * 3,
             use_bias=True,
@@ -448,7 +449,7 @@ class VisionAttention(AttentionModule):
             precision=precision,
             rngs=rngs,
         )
-        self.proj = ParallelLinear(
+        self.proj = RowParallelLinear(
             dim,
             dim,
             dtype=dtype,
@@ -591,8 +592,8 @@ class Qwen2VLMLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -601,17 +602,27 @@ class Qwen2VLMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(
             config.hidden_size,
             config.intermediate_size,
             rngs=rngs,
         )
-        self.down_proj = linear_class(
+        self.down_proj = row_parallel_linear(
             config.intermediate_size,
             config.hidden_size,
             rngs=rngs,
         )
-        self.up_proj = linear_class(
+        self.up_proj = column_parallel_linear(
             config.hidden_size,
             config.intermediate_size,
             rngs=rngs,
@@ -624,16 +635,16 @@ class Qwen2VLMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Qwen2VLAttention(AttentionModule):
@@ -660,33 +671,41 @@ class Qwen2VLAttention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
         )
-        self.k_proj = linear_class(
+        self.k_proj = column_parallel_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
         )
-        self.v_proj = linear_class(
+        self.v_proj = column_parallel_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
         )
-        self.o_proj = linear_class(
+        self.o_proj = row_parallel_linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             rngs=rngs,
@@ -719,9 +738,9 @@ class Qwen2VLAttention(AttentionModule):
     ) -> tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
         qshape = (batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         kv_shape = (batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -774,7 +793,10 @@ class Qwen2VLAttention(AttentionModule):
             sliding_window=self.sliding_window,
         )
 
-        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+            "attn_output",
+        )
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -802,6 +824,8 @@ class Qwen2VLDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.self_attn = attn_block(
@@ -861,7 +885,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             fcm_mask,
             frequencies,
         )
-        hidden_states = hidden_states + attn_outputs.attention_output
+        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -874,14 +898,14 @@ class Qwen2VLDecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(feed_forward_input)
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
         return DecoderLayerOutput(
-            hidden_states=hidden_states,
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
@@ -1066,7 +1090,13 @@ class Qwen2VLModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -1112,7 +1142,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         all_attentions = () if output_attentions else None
@@ -1170,7 +1200,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1245,7 +1275,14 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.vocab_size = config.vocab_size
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
@@ -1349,7 +1386,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
+            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
 
         return Qwen2VLCausalLMOutputWithPast(
             logits=logits,

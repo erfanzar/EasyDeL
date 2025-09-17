@@ -23,13 +23,14 @@ from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig
@@ -125,7 +126,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             rngs=rngs,
         )
 
-        self.linear_1 = ParallelLinear(
+        self.linear_1 = RowParallelLinear(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             self.alignment_intermediate_size,
             use_bias=True,
@@ -137,7 +138,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         )
 
         self.act = ACT2FN["silu"]
-        self.linear_2 = ParallelLinear(
+        self.linear_2 = RowParallelLinear(
             self.alignment_intermediate_size // 2,
             config.text_config.hidden_size,
             use_bias=True,
@@ -159,11 +160,11 @@ class AyaVisionMultiModalProjector(nn.Module):
         """
         image_features = self.pixel_shuffle(image_features)
         image_features = self.layernorm(image_features)
-        hidden_states = self.linear_1(image_features)
+        hidden_states = checkpoint_name(self.linear_1(image_features), name="mlp_gate")
         x, gate = jnp.split(hidden_states, 2, axis=-1)
         hidden_states = self.act(gate) * x
 
-        hidden_states = self.linear_2(hidden_states)
+        hidden_states = checkpoint_name(self.linear_2(hidden_states), name="mlp_output")
         return hidden_states
 
     def pixel_shuffle(self, image_features: jax.Array) -> jax.Array:
@@ -543,7 +544,14 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
             dtype=dtype,
@@ -623,7 +631,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), name="lm_head_output")
 
         return AyaVisionCausalLMOutputWithPast(
             loss=None,

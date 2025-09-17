@@ -24,6 +24,7 @@ from einops import rearrange
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -38,7 +39,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .mosaic_configuration import MptConfig as MptConfig
 
@@ -79,7 +80,7 @@ class MptMLP(nn.Module):
         """
         self.config = config
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             use_bias=config.use_bias,
             dtype=dtype,
@@ -108,8 +109,8 @@ class MptMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        up = jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
-        hidden_states = self.down_proj(up)
+        up = jax.nn.gelu(checkpoint_name(self.up_proj(hidden_states), name="mlp_up"), approximate=False)
+        hidden_states = checkpoint_name(self.down_proj(up), name="mlp_down")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -166,7 +167,7 @@ class MptAttention(AttentionModule):
         self.precision = precision
         self.rngs = rngs
         self.hidden_size = config.hidden_size
-        self.Wqkv = ParallelLinear(
+        self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             config.hidden_size * 3,
             rngs=rngs,
@@ -177,7 +178,7 @@ class MptAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
             rngs=rngs,
@@ -289,10 +290,13 @@ class MptAttention(AttentionModule):
             causal=False,
         )
 
-        attn_output = self.out_proj(
-            self.shard_attention_prod(
-                attention.attention_outputs.reshape(inp_shape),
-            )
+        attn_output = checkpoint_name(
+            self.out_proj(
+                self.shard_attention_prod(
+                    attention.attention_outputs.reshape(inp_shape),
+                )
+            ),
+            name="attn_output",
         )
 
         return AttentionLayerOutput(
@@ -351,6 +355,8 @@ class MptBlock(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.norm_1 = nn.LayerNorm(
@@ -669,7 +675,7 @@ class MptForCausalLM(EasyDeLBaseModule):
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
         transformer (MptModel): The core MPT transformer model.
-        lm_head (ParallelLinear, optional): The language modeling head. If `use_lm_head`
+        lm_head (ColumnParallelLinear, optional): The language modeling head. If `use_lm_head`
             in the config is True (tying embeddings), this will be None.
     """
 
@@ -706,7 +712,14 @@ class MptForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),

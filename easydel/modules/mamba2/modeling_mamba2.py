@@ -20,13 +20,14 @@ import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.caching.mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 
 from .mamba2_configuration import Mamba2Config as Mamba2Config
@@ -269,7 +270,7 @@ class Mamba2Mixer(nn.Module):
 
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
 
-        self.in_proj = ParallelLinear(
+        self.in_proj = ColumnParallelLinear(
             self.hidden_size,
             projection_size,
             use_bias=self.config.use_bias,
@@ -308,7 +309,7 @@ class Mamba2Mixer(nn.Module):
             eps=self.layer_norm_epsilon,
             dtype=self.param_dtype,
         )
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             use_bias=self.config.use_bias,
@@ -332,7 +333,7 @@ class Mamba2Mixer(nn.Module):
         dtype = input_states.dtype
 
         # Gated MLP's linear projection
-        projected_states = self.in_proj(input_states)
+        projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         d_mlp = (
             projected_states.shape[-1]
             - 2 * self.intermediate_size
@@ -564,7 +565,7 @@ class Mamba2Mixer(nn.Module):
                     cache_params.ssm_states[self.layer_idx] = ssm_state
 
                 scan_output = self.norm(y, gate)
-                contextualized_states = self.out_proj(scan_output.astype(dtype))
+                contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
                 # [batch, seq_len, hidden_size]
                 return contextualized_states, cache_params
 
@@ -594,9 +595,11 @@ class Mamba2Block(nn.Module):
             rngs=rngs,
         )
         block = Mamba2Mixer
-        (block,) = auto_remat(
+        block = auto_remat(
             block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.mixer = block(
             config=config,
@@ -774,7 +777,14 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,

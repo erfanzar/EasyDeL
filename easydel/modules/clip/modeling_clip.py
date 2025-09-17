@@ -21,6 +21,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -36,7 +37,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
@@ -251,7 +252,7 @@ class CLIPAttention(AttentionModule):
 
         self.dropout = config.attention_dropout
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -314,9 +315,9 @@ class CLIPAttention(AttentionModule):
         Returns:
                 Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
         """
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        query = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
+        key = checkpoint_name(self.k_proj(hidden_states), name="attn_key")
+        value = checkpoint_name(self.v_proj(hidden_states), name="attn_value")
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -363,7 +364,7 @@ class CLIPAttention(AttentionModule):
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -400,7 +401,7 @@ class CLIPMLP(nn.Module):
         self.rngs = rngs
         self.activation_fn = ACT2FN[config.hidden_act]
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -426,7 +427,9 @@ class CLIPMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        hidden_states = checkpoint_name(self.fc1(hidden_states), name="mlp_up")
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = checkpoint_name(self.fc2(hidden_states), name="mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1023,7 +1026,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.text_projection = ParallelLinear(
+        self.text_projection = ColumnParallelLinear(
             config.hidden_size,
             config.projection_dim,
             use_bias=False,
@@ -1063,7 +1066,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         )
 
         pooled_output = text_outputs[1]
-        text_embeds = self.text_projection(pooled_output)
+        text_embeds = checkpoint_name(self.text_projection(pooled_output), name="text_projection_output")
 
         return CLIPTextModelOutput(
             text_embeds=text_embeds,
@@ -1224,7 +1227,7 @@ class CLIPForImageClassification(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.classifier = ParallelLinear(
+        self.classifier = ColumnParallelLinear(
             config.vision_config.hidden_size,
             config.num_labels,
             rngs=rngs,
@@ -1331,7 +1334,7 @@ class CLIPModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(0.02),
@@ -1372,10 +1375,10 @@ class CLIPModel(EasyDeLBaseModule):
         )
 
         image_embeds = vision_outputs[1]
-        image_embeds = self.visual_projection(image_embeds)
+        image_embeds = checkpoint_name(self.visual_projection(image_embeds), name="visual_projection_output")
 
         text_embeds = text_outputs[1]
-        text_embeds = self.text_projection(text_embeds)
+        text_embeds = checkpoint_name(self.text_projection(text_embeds), name="text_projection_output")
 
         image_embeds = image_embeds / jnp.linalg.norm(image_embeds, axis=-1, keepdims=True)
         text_embeds = text_embeds / jnp.linalg.norm(text_embeds, axis=-1, keepdims=True)
@@ -1405,13 +1408,13 @@ class CLIPModel(EasyDeLBaseModule):
             position_ids=position_ids,
         )
         pooled_output = text_outputs[1]
-        text_features = self.text_projection(pooled_output)
+        text_features = checkpoint_name(self.text_projection(pooled_output), name="text_projection_output")
         return text_features
 
     def get_image_features(self, pixel_values: chex.Array):
         vision_outputs = self.vision_model(pixel_values=pixel_values)
         pooled_output = vision_outputs[1]  # pooled_output
-        image_features = self.visual_projection(pooled_output)
+        image_features = checkpoint_name(self.visual_projection(pooled_output), name="visual_projection_output")
         return image_features
 
     def compute_loss(

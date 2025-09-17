@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -40,7 +41,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .glm_configuration import GlmConfig
@@ -60,8 +61,8 @@ class GlmMLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -70,8 +71,18 @@ class GlmMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_up_proj = linear_class(config.hidden_size, 2 * config.intermediate_size)
-        self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size)
+        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -80,9 +91,9 @@ class GlmMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate_up_states = self.gate_up_proj(hidden_states)
+        gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
         gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
-        hidden_states = self.down_proj(up_states * self.act_fn(gate))
+        hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -114,8 +125,8 @@ class GlmAttention(AttentionModule):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
@@ -123,10 +134,19 @@ class GlmAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
 
@@ -153,9 +173,9 @@ class GlmAttention(AttentionModule):
     ) -> tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
         )
         qshape = (
             batch_size,
@@ -212,7 +232,10 @@ class GlmAttention(AttentionModule):
             segment_ids=segment_ids,
             causal=True,
         )
-        attn_output = self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+            name="attn_output",
+        )
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -244,6 +267,8 @@ class GlmDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -358,7 +383,14 @@ class GlmModel(EasyDeLBaseModule):
         )
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -522,7 +554,14 @@ class GlmForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.vocab_size = config.vocab_size
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -624,7 +663,7 @@ class GlmForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

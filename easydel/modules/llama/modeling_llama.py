@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -41,7 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .llama_configuration import LlamaConfig
@@ -67,8 +68,8 @@ class LlamaMLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=self.config.mlp_bias,
@@ -77,9 +78,19 @@ class LlamaMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
-        self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
-        self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=self.config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
+        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
+        self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
@@ -97,16 +108,16 @@ class LlamaMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = self.dropout(hidden_states)
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class LlamaAttention(AttentionModule):
@@ -136,8 +147,8 @@ class LlamaAttention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
@@ -145,10 +156,19 @@ class LlamaAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
 
@@ -195,9 +215,9 @@ class LlamaAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
         qshape = (
             batch_size,
@@ -254,8 +274,11 @@ class LlamaAttention(AttentionModule):
             segment_ids=segment_ids,
             causal=True,
         )
-        attn_output = self.resid_dropout(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
+        attn_output = checkpoint_name(
+            self.resid_dropout(
+                self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs)))
+            ),
+            "attn_output",
         )
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -290,6 +313,8 @@ class LlamaDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.self_attn = attn_block(
@@ -349,7 +374,7 @@ class LlamaDecoderLayer(nn.Module):
             fcm_mask,
             frequencies,
         )
-        hidden_states = hidden_states + attn_outputs.attention_output
+        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -362,12 +387,13 @@ class LlamaDecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(feed_forward_input)
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
@@ -406,7 +432,13 @@ class LlamaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -469,7 +501,7 @@ class LlamaModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         all_attentions = () if output_attentions else None
@@ -528,6 +560,7 @@ class LlamaModel(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -604,7 +637,14 @@ class LlamaForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -671,7 +711,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -748,7 +788,14 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        score_block = ColumnParallelLinear
+        score_block = auto_remat(
+            score_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.score = score_block(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

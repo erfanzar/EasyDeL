@@ -22,6 +22,7 @@ from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -42,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .exaone_configuration import ExaoneConfig
@@ -62,7 +63,7 @@ class ExaoneGatedMLP(nn.Module):
     ) -> None:
         self.config = config
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -81,7 +82,13 @@ class ExaoneGatedMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.c_proj(self.act_fn(self.c_fc_0(hidden_states)) * self.c_fc_1(hidden_states))
+        hidden_states = checkpoint_name(
+            self.c_proj(
+                self.act_fn(checkpoint_name(self.c_fc_0(hidden_states), name="mlp_gate"))
+                * checkpoint_name(self.c_fc_1(hidden_states), name="mlp_up")
+            ),
+            name="mlp_output",
+        )
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -118,7 +125,7 @@ class ExaoneAttentionInner(AttentionModule):
             )
 
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -181,9 +188,9 @@ class ExaoneAttentionInner(AttentionModule):
     ):
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -231,7 +238,7 @@ class ExaoneAttentionInner(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -311,6 +318,8 @@ class ExaoneDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.attn = attn_block(
             config=config,
@@ -610,7 +619,14 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -744,7 +760,7 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,
