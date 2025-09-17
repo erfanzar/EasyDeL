@@ -21,6 +21,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -42,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -112,8 +113,17 @@ class MixtralAttention(AttentionModule):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        linear = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            use_bias=getattr(config, "attention_bias", False),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nn.initializers.normal(),
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             use_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -122,10 +132,10 @@ class MixtralAttention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.q_proj = linear(self.hidden_size, self.num_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear(self.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear(self.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear(self.num_heads * self.head_dim, self.hidden_size, rngs=rngs)
+        self.q_proj = column_parallel_linear(self.hidden_size, self.num_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(self.num_heads * self.head_dim, self.hidden_size, rngs=rngs)
         self.sliding_window = config.sliding_window
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
@@ -172,9 +182,9 @@ class MixtralAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -225,7 +235,7 @@ class MixtralAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -284,10 +294,10 @@ class MixtralMoEMlp(nn.Module):
 
     def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
         """Forward pass through MoE MLP."""
-        hidden_states = self.act_fn(self.w1(x, group_sizes))
-        hidden_states = hidden_states * self.w3(x, group_sizes)
-        outputs = self.w2(hidden_states, group_sizes)
-        return outputs
+        hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes)), "mlp_gate")
+        hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes), "mlp_up")
+        outputs = checkpoint_name(self.w2(hidden_states, group_sizes), "mlp_down")
+        return checkpoint_name(outputs, "mlp_output")
 
 
 class MixtralSparseMoeBlock(BaseMoeModule):
@@ -318,7 +328,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
         self.precision = precision
 
         # Router/gate
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_local_experts,
             use_bias=False,
@@ -340,13 +350,14 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
     def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
-        return self._moe_call(
+        expert_output, router_logits = self._moe_call(
             gate_layer=self.gate,
             expert_layer=self.experts,
             hidden_state=hidden_state,
             output_metrics=False,
             validate_inputs=True,
         )
+        return checkpoint_name(expert_output, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -370,7 +381,13 @@ class MixtralDecoderLayer(nn.Module):
 
         attn_block = MixtralAttention
         mlp_block = MixtralSparseMoeBlock
-        attn_block, mlp_block = auto_remat(attn_block, mlp_block, policy=config.gradient_checkpointing)
+        attn_block, mlp_block = auto_remat(
+            attn_block,
+            mlp_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
 
         self.self_attn = attn_block(
             config=config,
@@ -442,16 +459,16 @@ class MixtralDecoderLayer(nn.Module):
             frequencies,
         )
         hidden_states = attn_outputs.attention_output
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states, router_logits = self.block_sparse_moe(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         return DecoderLayerOutput(
-            hidden_states=hidden_states,
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             router_logits=router_logits,
             cache_view=attn_outputs.cache_view,
@@ -503,7 +520,14 @@ class MixtralModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -593,7 +617,7 @@ class MixtralModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert sequence_length <= self.config.max_position_embeddings, (
@@ -659,7 +683,7 @@ class MixtralModel(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
@@ -749,7 +773,14 @@ class MixtralForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             rngs=rngs,
@@ -928,7 +959,7 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

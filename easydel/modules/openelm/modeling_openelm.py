@@ -21,6 +21,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -35,7 +36,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .openelm_configuration import OpenELMConfig, make_divisible
@@ -99,7 +100,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
         k_heads = config.num_kv_heads[layer_idx]
         v_heads = config.num_kv_heads[layer_idx]
 
-        self.qkv_proj = ParallelLinear(
+        self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
             (q_heads + k_heads + v_heads) * head_dim,
             dtype=dtype,
@@ -129,7 +130,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             self.q_norm = None
             self.k_norm = None
 
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             q_heads * head_dim,
             config.model_dim,
             dtype=dtype,
@@ -212,7 +213,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
         batch_size, sequence_length = hidden_states.shape[:2]
 
         # [B, S, d] --> [B, S, (q_h + k_h + v_h) * h]
-        qkv = self.qkv_proj(hidden_states)
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
         # [B, S, (q_h + k_h + v_h) * h] --> [B, S, (q_h + k_h + v_h), h]
         qkv = qkv.reshape(
             batch_size,
@@ -242,10 +243,16 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             :,
         ]
         if self.q_norm is not None:
-            query_states = self.q_norm(query_states)
+            query_states = checkpoint_name(self.q_norm(query_states), "attn_query")
+        else:
+            query_states = checkpoint_name(query_states, "attn_query")
 
         if self.k_norm is not None:
-            key_states = self.k_norm(key_states)
+            key_states = checkpoint_name(self.k_norm(key_states), "attn_key")
+        else:
+            key_states = checkpoint_name(key_states, "attn_key")
+
+        value_states = checkpoint_name(value_states, "attn_value")
         query_states, key_states, value_states = map(
             lambda x: x.transpose(0, 2, 1, 3),
             [query_states, key_states, value_states],
@@ -291,7 +298,9 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             causal=True,
         )
 
-        attn_output = self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
+        )
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -316,7 +325,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         ffn_with_glu (bool): Whether the FFN uses a Gated Linear Unit.
         proj_1 (ParallelLinear): First linear projection layer (or gate projection in GLU).
         proj_2 (ParallelLinear): Second linear projection layer (down projection).
-        gate_proj (ParallelLinear, optional): Gate projection layer used only if `ffn_with_glu` is True.
+        gate_proj (ColumnParallelLinear, optional): Gate projection layer used only if `ffn_with_glu` is True.
         activation_fn (callable): The activation function.
     """
 
@@ -356,7 +365,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         )
         if config.ffn_with_glu:
             # FFN with Gated linear unit, as described in https://arxiv.org/abs/2002.05202v1.
-            self.proj_1 = ParallelLinear(
+            self.proj_1 = ColumnParallelLinear(
                 config.model_dim,
                 2 * intermediate_dim,
                 use_bias=False,
@@ -367,7 +376,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 **get_dot_general_by_bits(config.bits, config.easy_method),
             )
-            self.proj_2 = ParallelLinear(
+            self.proj_2 = RowParallelLinear(
                 intermediate_dim,
                 config.model_dim,
                 use_bias=False,
@@ -380,7 +389,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
             )
             self.ffn_with_glu = True
         else:
-            self.proj_1 = ParallelLinear(
+            self.proj_1 = ColumnParallelLinear(
                 config.model_dim,
                 intermediate_dim,
                 use_bias=False,
@@ -391,7 +400,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 **get_dot_general_by_bits(config.bits, config.easy_method),
             )
-            self.proj_2 = ParallelLinear(
+            self.proj_2 = RowParallelLinear(
                 intermediate_dim,
                 config.model_dim,
                 use_bias=False,
@@ -414,18 +423,19 @@ class OpenELMFeedForwardNetwork(nn.Module):
         )
 
         if self.ffn_with_glu:
-            y_12 = self.proj_1(hidden_states)
+            y_12 = checkpoint_name(self.proj_1(hidden_states), "mlp_gate")
             y_1, y_2 = jnp.split(y_12, 2, axis=-1)
-            hidden_states = self.proj_2(self.act(y_1) * y_2)
+            hidden_states = checkpoint_name(self.proj_2(self.act(y_1) * y_2), "mlp_down")
         else:
-            hidden_states = self.proj_2(self.act(self.proj_1(hidden_states)))
+            proj_1_out = checkpoint_name(self.proj_1(hidden_states), "mlp_up")
+            hidden_states = checkpoint_name(self.proj_2(self.act(proj_1_out)), "mlp_down")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class OpenELMDecoderLayer(nn.Module):
@@ -481,6 +491,8 @@ class OpenELMDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.attn = attn_block(
@@ -562,7 +574,7 @@ class OpenELMDecoderLayer(nn.Module):
             fcm_mask,
             frequencies,
         )
-        hidden_states = residual + attn_outputs.attention_output
+        hidden_states = checkpoint_name(residual + attn_outputs.attention_output, "residual")
 
         # Fully Connected
         residual = hidden_states
@@ -575,7 +587,7 @@ class OpenELMDecoderLayer(nn.Module):
             )
         else:
             feed_forward_hidden_states = self.ffn(hidden_states)
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "layer_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -662,7 +674,7 @@ class OpenELMModel(EasyDeLBaseModule):
         if config.share_input_output_layers:
             self.classifier = None
         else:
-            self.classifier = ParallelLinear(
+            self.classifier = ColumnParallelLinear(
                 config.model_dim,
                 config.vocab_size,
                 use_bias=False,
@@ -726,7 +738,7 @@ class OpenELMModel(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
 
         if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.token_embeddings(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.token_embeddings(input_ids.astype("i4")), "embeddings")
         else:
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         batch_size, sequence_length, _ = inputs_embeds.shape
@@ -785,7 +797,7 @@ class OpenELMModel(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -840,7 +852,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
         transformer (OpenELMModel): The core OpenELM transformer model.
-        lm_head (ParallelLinear, optional): The linear layer for projecting hidden states to vocabulary logits.
+        lm_head (ColumnParallelLinear, optional): The linear layer for projecting hidden states to vocabulary logits.
             This is None if `config.share_input_output_layers` is True.
     """
 
@@ -877,7 +889,14 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.model_dim,
             config.vocab_size,
             dtype=dtype,
@@ -951,7 +970,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(outputs.last_hidden_state)
+            lm_logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,

@@ -24,13 +24,14 @@ from eformer.pytree import auto_pytree
 from einops import repeat
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import MambaCache, MambaCacheMetaData, MambaCacheView
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
 
 from .mamba_configuration import MambaConfig as MambaConfig
@@ -214,7 +215,7 @@ class MambaMixer(nn.Module):
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
 
         linear_class = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -267,7 +268,7 @@ class MambaMixer(nn.Module):
         dtype = input_states.dtype
 
         # 1. Gated MLP's linear projection
-        projected_states = self.in_proj(input_states)
+        projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         projected_states = jnp.swapaxes(projected_states, 2, 1)
         # [batch, 2 * intermediate_size, seq_len]
         hidden_states, gate = jnp.split(projected_states, 2, axis=1)
@@ -311,7 +312,7 @@ class MambaMixer(nn.Module):
 
         # 3. State Space Model sequence transformation
         # 3.a. Selection
-        ssm_parameters = self.x_proj(jnp.swapaxes(hidden_states, 2, 1))
+        ssm_parameters = checkpoint_name(self.x_proj(jnp.swapaxes(hidden_states, 2, 1)), name="ssm_x_proj")
         time_step, B, C = jnp.split(
             ssm_parameters,
             [
@@ -320,7 +321,7 @@ class MambaMixer(nn.Module):
             ],
             axis=-1,
         )
-        discrete_time_step = self.dt_proj(time_step)
+        discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
         # [batch, seq_len, intermediate_size]
         discrete_time_step = jnp.swapaxes(jax.nn.softplus(discrete_time_step), 2, 1)
         # [batch, intermediate_size, seq_len]
@@ -362,7 +363,7 @@ class MambaMixer(nn.Module):
             cache.ssm_states = ssm_state
 
         # 4. Final linear projection
-        contextualized_states = self.out_proj(jnp.swapaxes(scan_output, 2, 1))
+        contextualized_states = checkpoint_name(self.out_proj(jnp.swapaxes(scan_output, 2, 1)), name="ssm_output_proj")
         return contextualized_states, cache
 
 
@@ -389,10 +390,11 @@ class MambaBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
         )
-        block = MambaMixer
-        (block,) = auto_remat(
-            block,
+        block = auto_remat(
+            MambaMixer,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.mixer = block(
             config=config,
@@ -606,7 +608,14 @@ class MambaForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
