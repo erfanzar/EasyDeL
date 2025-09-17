@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -42,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -146,8 +147,8 @@ class Qwen2MoeMLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -156,9 +157,19 @@ class Qwen2MoeMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(config.hidden_size, intermediate_size, rngs=rngs)
-        self.down_proj = linear_class(intermediate_size, config.hidden_size, rngs=rngs)
-        self.up_proj = linear_class(config.hidden_size, intermediate_size, rngs=rngs)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
+        self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size, rngs=rngs)
+        self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size, rngs=rngs)
         self.act_fn = nn.silu
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -175,15 +186,15 @@ class Qwen2MoeMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Qwen2MoeAttention(AttentionModule):
@@ -237,33 +248,41 @@ class Qwen2MoeAttention(AttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
         )
-        self.k_proj = linear_class(
+        self.k_proj = column_parallel_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
         )
-        self.v_proj = linear_class(
+        self.v_proj = column_parallel_linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
         )
-        self.o_proj = linear_class(
+        self.o_proj = row_parallel_linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             rngs=rngs,
@@ -315,9 +334,9 @@ class Qwen2MoeAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -367,7 +386,7 @@ class Qwen2MoeAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         attn_output = self.resid_dropout(attn_output)
         return AttentionLayerOutput(
@@ -425,7 +444,7 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_experts,
             use_bias=False,
@@ -452,7 +471,7 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-        self.shared_expert_gate = ParallelLinear(
+        self.shared_expert_gate = ColumnParallelLinear(
             config.hidden_size,
             1,
             use_bias=False,
@@ -511,7 +530,9 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         shared_expert_output = jax.nn.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
         out = out + shared_expert_output
 
-        return out.reshape(batch_size, seq_len, hidden_size), router_logits
+        return checkpoint_name(out.reshape(batch_size, seq_len, hidden_size), "moe_expert_output"), checkpoint_name(
+            router_logits, "moe_router_logits"
+        )
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
@@ -572,6 +593,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -655,7 +678,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             fcm_mask,
             frequencies,
         )
-        hidden_states = hidden_states + attn_outputs.attention_output
+        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -667,10 +690,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
             feed_forward_hidden_states = mlp_out
             router_logits = None
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
 
         return DecoderLayerOutput(
-            hidden_states=hidden_states,
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             router_logits=router_logits if output_router_logits else None,
             cache_view=attn_outputs.cache_view,
@@ -721,7 +744,14 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -796,7 +826,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -865,7 +895,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -955,7 +985,14 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -1027,7 +1064,7 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(hidden_states)
+            logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
@@ -1128,7 +1165,7 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

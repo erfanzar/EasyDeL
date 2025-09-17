@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -36,7 +37,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .gpt_j_configuration import GPTJConfig as GPTJConfig
 
@@ -84,7 +85,7 @@ class GPTJAttention(AttentionModule):
         self.rotary_dim = config.rotary_dim
 
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             self.embed_dim,
             self.embed_dim,
             use_bias=False,
@@ -154,9 +155,9 @@ class GPTJAttention(AttentionModule):
             tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output
                 and optionally the attention weights.
         """
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
+        key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+        value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
 
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
@@ -202,7 +203,7 @@ class GPTJAttention(AttentionModule):
             causal=True,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
@@ -244,7 +245,7 @@ class GPTJMLP(nn.Module):
         embed_dim = config.hidden_size
         kernel_init = nn.initializers.normal(config.initializer_range)
 
-        self.fc_in = ParallelLinear(
+        self.fc_in = ColumnParallelLinear(
             embed_dim,
             intermediate_size,
             dtype=dtype,
@@ -254,7 +255,7 @@ class GPTJMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.fc_out = ParallelLinear(
+        self.fc_out = RowParallelLinear(
             intermediate_size,
             embed_dim,
             dtype=dtype,
@@ -277,7 +278,8 @@ class GPTJMLP(nn.Module):
         Returns:
             chex.Array: Output hidden states after processing through the MLP.
         """
-        hidden_states = self.dropout(self.fc_out(self.act(self.fc_in(hidden_states))))
+        gate = checkpoint_name(self.act(self.fc_in(hidden_states)), "mlp_gate")
+        hidden_states = checkpoint_name(self.dropout(self.fc_out(gate)), "mlp_output")
         return hidden_states
 
 
@@ -319,6 +321,8 @@ class GPTJBlock(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.ln_1 = nn.LayerNorm(
             self.config.hidden_size,
@@ -402,14 +406,14 @@ class GPTJBlock(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
-        hidden_states = attn_output + feed_forward_hidden_states + residual
+        hidden_states = checkpoint_name(attn_output + feed_forward_hidden_states + residual, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
         return DecoderLayerOutput(
-            hidden_states=hidden_states,
+            hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
         )
@@ -531,7 +535,7 @@ class GPTJModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
@@ -580,7 +584,7 @@ class GPTJModel(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
             past_key_values[idx] = layer_outputs.cache_view
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = checkpoint_name(self.ln_f(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -658,7 +662,14 @@ class GPTJForCausalLM(EasyDeLBaseModule):
             precision=self.precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             rngs=rngs,
@@ -727,7 +738,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,

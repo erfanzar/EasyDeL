@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -36,7 +37,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .falcon_configuration import FalconConfig
 
@@ -127,7 +128,7 @@ class FalconAttention(AttentionModule):
         self.num_kv_heads = config.num_kv_heads if (config.new_decoder_architecture or not config.multi_query) else 1
         self.new_decoder_architecture = config.new_decoder_architecture
         self.num_heads = config.num_attention_heads
-        self.query_key_value = ParallelLinear(
+        self.query_key_value = ColumnParallelLinear(
             config.hidden_size,
             qkv_out_dim,
             rngs=rngs,
@@ -138,7 +139,7 @@ class FalconAttention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.inv_norm_factor = 1 / math.sqrt(head_dim)
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             qkv_out_dim,
             config.hidden_size,
             rngs=rngs,
@@ -236,7 +237,7 @@ class FalconAttention(AttentionModule):
         output_attentions: bool = False,
         frequencies: chex.Array | None = None,
     ):
-        fused_qkv = self.query_key_value(hidden_states)
+        fused_qkv = checkpoint_name(self.query_key_value(hidden_states), name="attn_qkv")
         num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_states, key_states, value_states) = self._split_heads(fused_qkv)
@@ -305,7 +306,7 @@ class FalconAttention(AttentionModule):
             )
             attention_outputs = attention.attention_outputs
             attention_outputs = attention_outputs.reshape(batch_size, query_length, self.num_heads * self.head_dim)
-            output_tensor = self.dense(attention_outputs)
+            output_tensor = checkpoint_name(self.dense(attention_outputs), name="attn_output")
             return AttentionLayerOutput(
                 attention_output=output_tensor,
                 attention_weight=attention.attention_weights if output_attentions else None,
@@ -332,7 +333,7 @@ class FalconAttention(AttentionModule):
             attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0], *attn_output.shape[2:]))
             attn_output = self.shard_attention_prod(self._merge_heads(attn_output))
 
-            output_tensor = self.dense(attn_output)
+            output_tensor = checkpoint_name(self.dense(attn_output), name="attn_output")
 
             AttentionLayerOutput(
                 attention_output=output_tensor,
@@ -358,7 +359,7 @@ class FalconMlp(nn.Module):
         self.precision = precision
         self.rngs = rngs
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -382,7 +383,10 @@ class FalconMlp(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        x = self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
+        x = checkpoint_name(
+            self.dense_4h_to_h(nn.gelu(checkpoint_name(self.dense_h_to_4h(x), name="mlp_up"), approximate=False)),
+            name="mlp_down",
+        )
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -445,6 +449,8 @@ class FalconBlock(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.mlp = mlp_block(
@@ -758,7 +764,14 @@ class FalconForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,

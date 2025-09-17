@@ -24,6 +24,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -46,7 +47,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as Llama4TextRMSNorm
 from easydel.utils.compiling_utils import ejit
 
@@ -235,8 +236,8 @@ class Llama4TextMLP(nn.Module):
         self.precision = precision
         if intermediate_size is None:
             intermediate_size = config.intermediate_size
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -245,16 +246,26 @@ class Llama4TextMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_proj = linear_class(config.hidden_size, intermediate_size)
-        self.down_proj = linear_class(intermediate_size, config.hidden_size)
-        self.up_proj = linear_class(config.hidden_size, intermediate_size)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size)
+        self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size)
+        self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size)
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        gate = self.activation_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
-        return hidden_states
+        gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Llama4TextMoe(nn.Module):
@@ -288,7 +299,7 @@ class Llama4TextMoe(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.router = ParallelLinear(
+        self.router = ColumnParallelLinear(
             config.hidden_size,
             config.num_local_experts,
             use_bias=False,
@@ -315,7 +326,7 @@ class Llama4TextMoe(nn.Module):
         flattened_hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         tokens_per_expert = flattened_hidden_states.shape[0]
 
-        router_logits = self.router(flattened_hidden_states)
+        router_logits = checkpoint_name(self.router(flattened_hidden_states), "moe_router_logits")
         router_top_value, router_indices_topk = jax.lax.top_k(router_logits, self.top_k)
 
         scores_base = jnp.full_like(router_logits, -jnp.inf)
@@ -331,7 +342,7 @@ class Llama4TextMoe(nn.Module):
             expert_inputs = flattened_hidden_states * expert_mask
             expert_output = self.experts(expert_inputs)
             expert_outputs = expert_outputs + expert_output
-        final_output = out + expert_outputs
+        final_output = checkpoint_name(out + expert_outputs, "moe_expert_output")
         final_output = final_output.reshape(batch, seq_len, hidden_dim)
         router_scores_transposed = router_scores.T
         return final_output, router_scores_transposed
@@ -362,8 +373,8 @@ class Llama4TextAttention(AttentionModule):
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
 
-        linear_class = partial(
-            ParallelLinear,
+        column_parallel_linear = partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
@@ -371,10 +382,19 @@ class Llama4TextAttention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        row_parallel_linear = partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
         self.use_rope = int((layer_idx + 1) % 4 != 0)
         if self.use_rope:
             self.rotary = self.config.get_basic_rope(
@@ -415,9 +435,9 @@ class Llama4TextAttention(AttentionModule):
         batch_size, sequence_length = hidden_states.shape[:2]
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
         qshape = (
             batch_size,
@@ -482,7 +502,7 @@ class Llama4TextAttention(AttentionModule):
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attn_output)
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -514,6 +534,8 @@ class Llama4TextDecoderLayer(nn.Module):
             mlp_block,
             moe_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.self_attn = attn_block(
@@ -635,7 +657,13 @@ class Llama4TextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=self.config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -830,7 +858,14 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -974,7 +1009,7 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,
@@ -1110,7 +1145,7 @@ class Llama4VisionMLP2(nn.Module):
         self.rngs = rngs
         self.activation_fn = ACT2FN["gelu"]
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1149,7 +1184,7 @@ class Llama4MultiModalProjector(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.linear_1 = ParallelLinear(
+        self.linear_1 = RowParallelLinear(
             config.vision_config.vision_output_dim,
             config.text_config.hidden_size,
             use_bias=False,
@@ -1286,7 +1321,7 @@ class Llama4VisionAttention(AttentionModule):
         self.attention_dropout = config.attention_dropout
 
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=True,
@@ -1374,7 +1409,7 @@ class Llama4VisionMLP(nn.Module):
         self.rngs = rngs
 
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1423,6 +1458,8 @@ class Llama4VisionEncoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         self.self_attn = attn_block(
@@ -1597,7 +1634,7 @@ class Llama4UnfoldConvolution(nn.Module):
 
         # Linear layer similar to PyTorch's version
         in_features = self.num_channels * self.kernel_size[0] * self.kernel_size[1]
-        self.linear = ParallelLinear(
+        self.linear = ColumnParallelLinear(
             in_features=in_features,
             out_features=self.hidden_size,
             use_bias=False,
