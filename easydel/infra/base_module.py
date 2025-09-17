@@ -1269,13 +1269,10 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         Applies Low-Rank Adaptation (LoRA) layers to the specified linear layers within the module.
 
-        Replaces targeted `flax.linen.Dense` layers with `easydel.layers.lora.LoraLinear`
-        layers, initializing the LoRA matrices (A and B).
-
         Args:
             lora_rank (int): The rank of the LoRA decomposition.
             lora_pattern (tp.Optional[str], optional): A regular expression to match the names
-                of the `Dense` layers to apply LoRA to. If None, applies to common attention
+                of the `Linear` layers to apply LoRA to. If None, applies to common attention
                 and MLP layers. Defaults to None.
             verbose (bool, optional): If True, prints information about which layers are being
                 modified. Defaults to False.
@@ -1300,7 +1297,7 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         """
         Reverts the application of LoRA layers, restoring the original linear layers.
 
-        Replaces `easydel.layers.lora.LoraLinear` layers with their original `flax.linen.Dense`
+        Replaces `easydel.layers.lora.LoraLinear` layers with their original `flax.nnx.Linear`
         counterparts, discarding the LoRA matrices.
 
         Args:

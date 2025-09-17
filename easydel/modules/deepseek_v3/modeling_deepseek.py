@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -37,7 +38,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -188,7 +189,7 @@ class DeepseekV3MLP(nn.Module):
         self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -209,16 +210,16 @@ class DeepseekV3MLP(nn.Module):
                 dynamic_axes=common_types.HiddenStateSharding,
                 partition_manager=self.config.partition_manager,
             )
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         if hidden_states.ndim == 3:  # if not in moe infer
             hidden_states = apply_logical_sharding(
                 hidden_states,
                 dynamic_axes=common_types.HiddenStateSharding,
                 partition_manager=self.config.partition_manager,
             )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class MoEGate(nn.Module):
@@ -366,13 +367,16 @@ class DeepseekV3MLPMoE(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        return apply_logical_sharding(
-            self.down_proj(
-                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
-                group_sizes,
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states, group_sizes)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states, group_sizes), "mlp_up")
+        down = checkpoint_name(self.down_proj(gate * up, group_sizes), "mlp_down")
+        return checkpoint_name(
+            apply_logical_sharding(
+                down,
+                dynamic_axes=common_types.HiddenStateSharding,
+                partition_manager=self.config.partition_manager,
             ),
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            "mlp_output",
         )
 
 
@@ -443,6 +447,8 @@ class DeepseekV3MoE(BaseMoeModule):
             output_metrics=False,
             validate_inputs=False,
         )
+        router_logits = checkpoint_name(router_logits, "moe_router_logits")
+        y = checkpoint_name(y, "moe_expert_output")
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y, router_logits
@@ -481,14 +487,14 @@ class DeepseekV3Attention(AttentionModule):
         self.is_causal = True
 
         linear = functools.partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
         if self.config.q_lora_rank is None:
-            self.q_proj = ParallelLinear(
+            self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads * self.q_head_dim,
                 use_bias=False,
@@ -584,24 +590,25 @@ class DeepseekV3Attention(AttentionModule):
         bsz, q_len, _ = hidden_states.shape
 
         if self.config.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
+            q = checkpoint_name(self.q_proj(hidden_states), "attn_query")
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            q = checkpoint_name(self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))), "attn_query")
         q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         # Split into nope and pe parts
         q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
         # Key and Value projections with MQA (Multi-Query Attention) considerations
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv = checkpoint_name(self.kv_a_proj_with_mqa(hidden_states), "attn_key_value")
         k_pe = compressed_kv[..., self.kv_lora_rank :]
         compressed_kv = compressed_kv[..., : self.kv_lora_rank]
 
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = (
+        kv = checkpoint_name(
             self.kv_b_proj(
                 self.kv_a_layernorm(compressed_kv),
             )
             .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
+            .transpose(0, 2, 1, 3),
+            "attn_kv",
         )
 
         k_nope = kv[..., : self.qk_nope_head_dim]
@@ -662,7 +669,7 @@ class DeepseekV3Attention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -700,6 +707,8 @@ class DeepseekV3DecoderLayer(nn.Module):
             mlp_block,
             mlp_moe_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -800,7 +809,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             fcm_mask,
         )
         hidden_states = attn_out.attention_output
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         # Fully Connected
         residual = hidden_states
@@ -810,12 +819,13 @@ class DeepseekV3DecoderLayer(nn.Module):
         router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_out.attention_weight,
@@ -841,7 +851,14 @@ class DeepseekV3Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -936,7 +953,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         all_attentions = () if output_attentions else None
@@ -998,6 +1015,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             past_key_values[idx] = output.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1079,7 +1097,14 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -1148,7 +1173,7 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,

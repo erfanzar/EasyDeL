@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -37,7 +38,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
 
 from .phimoe_configuration import PhiMoeConfig
@@ -83,8 +84,18 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -96,9 +107,9 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         ffn_dim = config.intermediate_size
         hidden_dim = config.hidden_size
 
-        self.w1 = linear_class(hidden_dim, ffn_dim, rngs=rngs)
-        self.w2 = linear_class(ffn_dim, hidden_dim, rngs=rngs)
-        self.w3 = linear_class(hidden_dim, ffn_dim, rngs=rngs)
+        self.w1 = column_parallel_linear(hidden_dim, ffn_dim, rngs=rngs)
+        self.w2 = row_parallel_linear(ffn_dim, hidden_dim, rngs=rngs)
+        self.w3 = column_parallel_linear(hidden_dim, ffn_dim, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
@@ -112,7 +123,10 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
             Array: Output hidden states after processing by the expert.
                 Shape: (num_tokens_routed_to_expert, hidden_size).
         """
-        return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
+        gate = checkpoint_name(self.act_fn(self.w1(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.w3(hidden_states), "mlp_up")
+        down = checkpoint_name(self.w2(gate * up), "mlp_down")
+        return checkpoint_name(down, "mlp_output")
 
 
 class PhiMoEAttention(AttentionModule):
@@ -195,8 +209,17 @@ class PhiMoEAttention(AttentionModule):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
@@ -205,10 +228,10 @@ class PhiMoEAttention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.q_proj = linear_class(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = linear_class(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = linear_class(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
+        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
+        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
         self.sliding_window = config.sliding_window
 
@@ -261,9 +284,9 @@ class PhiMoEAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         (query_states, key_states, value_states) = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -323,7 +346,7 @@ class PhiMoEAttention(AttentionModule):
                     self.config.partition_axis.hidden_state_axis,
                 ),
             )
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -381,7 +404,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.num_local_experts,
             use_bias=False,
@@ -450,8 +473,8 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
                 * expert_layer_output
             )
-            final_hidden_state += expert_layer_output_exp
-        return final_hidden_state, router_logits
+            final_hidden_state += checkpoint_name(expert_layer_output_exp, "moe_expert_output")
+        return final_hidden_state, checkpoint_name(router_logits, "moe_router_logits")
 
 
 class PhiMoeDecoderLayer(nn.Module):
@@ -506,6 +529,8 @@ class PhiMoeDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -605,13 +630,14 @@ class PhiMoeDecoderLayer(nn.Module):
             attn_outputs.attention_weight,
         )
 
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits = self.block_sparse_moe(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
 
         outputs = (hidden_states,)
 
@@ -672,7 +698,13 @@ class PhiMoeModel(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -747,7 +779,7 @@ class PhiMoeModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
         batch_size, sequence_length, _ = inputs_embeds.shape
 
@@ -808,6 +840,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -898,7 +931,14 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=config.lm_head_bias,
@@ -963,7 +1003,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         hidden_states = outputs.last_hidden_state
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,

@@ -154,15 +154,20 @@ def canonicalize_dtype(
     return dtype
 
 
-def get_gradient_checkpoint_policy(name: str) -> tp.Callable:
-    """Get a gradient checkpointing policy by name.
+def get_gradient_checkpoint_policy(
+    name: str | EasyDeLGradientCheckPointers,
+    save_names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+) -> tp.Callable:
+    """Get a gradient checkpointing policy by name or create a custom one.
 
     Retrieves a JAX gradient checkpointing policy function that determines
     which intermediate values to save during forward pass for use in backward pass.
     This is used to trade compute for memory in gradient calculations.
 
     Args:
-        name: Name of the checkpointing policy. Supported values:
+        name: Name of the checkpointing policy or EasyDeLGradientCheckPointers enum.
+            Supported values:
             - 'everything_saveable': Save all intermediate values
             - 'nothing_saveable': Save no intermediate values (maximum recomputation)
             - 'dots_saveable': Save dot product results
@@ -173,20 +178,39 @@ def get_gradient_checkpoint_policy(name: str) -> tp.Callable:
             - 'save_any_names_but_these': Save any names except specified
             - 'save_only_these_names': Save only specified names
             - 'save_from_both_policies': Combine two policies
+        save_names: List of checkpoint names to save (used with 'save_only_these_names')
+        exclude_names: List of checkpoint names to exclude (used with 'save_anything_except_these_names')
 
     Returns:
         The corresponding JAX checkpoint policy function.
 
     Raises:
         KeyError: If the policy name is not recognized.
+        ValueError: If save_names or exclude_names are not provided when required.
 
     Example:
+        >>> # Basic policy
         >>> policy = get_gradient_checkpoint_policy('dots_saveable')
-        >>> # Use with jax.checkpoint
-        >>> @jax.checkpoint(policy=policy)
-        ... def forward(x):
-        ...     return x @ x.T
+        >>>
+        >>> # Custom policy saving only specific checkpoints
+        >>> policy = get_gradient_checkpoint_policy(
+        ...     'save_only_these_names',
+        ...     save_names=['attn_output', 'mlp_output']
+        ... )
     """
+    if isinstance(name, EasyDeLGradientCheckPointers):
+        name = name.value
+
+    if name == "save_only_these_names":
+        if save_names is None:
+            raise ValueError("save_names must be provided when using 'save_only_these_names' policy")
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name in ["save_anything_except_these_names", "save_any_names_but_these"]:
+        if exclude_names is None:
+            raise ValueError("exclude_names must be provided when using exclude-based policies")
+        return jax.checkpoint_policies.save_any_names_but_these(*exclude_names)
+
     gradients = dict(
         everything_saveable=jax.checkpoint_policies.everything_saveable,
         nothing_saveable=jax.checkpoint_policies.nothing_saveable,
@@ -194,12 +218,72 @@ def get_gradient_checkpoint_policy(name: str) -> tp.Callable:
         checkpoint_dots=jax.checkpoint_policies.checkpoint_dots,
         dots_with_no_batch_dims_saveable=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
         checkpoint_dots_with_no_batch_dims=jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
-        save_anything_except_these_names=jax.checkpoint_policies.save_anything_except_these_names,
-        save_any_names_but_these=jax.checkpoint_policies.save_any_names_but_these,
-        save_only_these_names=jax.checkpoint_policies.save_only_these_names,
         save_from_both_policies=jax.checkpoint_policies.save_from_both_policies,
     )
+
+    if name not in gradients:
+        raise KeyError(f"Unknown checkpoint policy: {name}")
+
     return gradients[name]
+
+
+def create_transformer_checkpoint_policy(
+    save_attention: bool = True,
+    save_mlp: bool = True,
+    save_residuals: bool = True,
+    save_layer_outputs: bool = False,
+    save_embeddings: bool = False,
+    custom_names: list[str] | None = None,
+) -> tp.Callable:
+    """Create a checkpoint policy optimized for transformer models.
+
+    Creates a custom checkpoint policy that selectively saves transformer
+    components based on the checkpoint_name calls we've added to all models.
+
+    Args:
+        save_attention: Whether to save attention outputs (attn_query, attn_key, attn_value, attn_output)
+        save_mlp: Whether to save MLP outputs (mlp_gate, mlp_up, mlp_down, mlp_output)
+        save_residuals: Whether to save residual connections
+        save_layer_outputs: Whether to save layer outputs
+        save_embeddings: Whether to save embeddings and model outputs
+        custom_names: Additional checkpoint names to save
+
+    Returns:
+        JAX checkpoint policy function
+
+    Example:
+        >>> # Save only critical transformer components
+        >>> policy = create_transformer_checkpoint_policy(
+        ...     save_attention=True,
+        ...     save_mlp=False,  # Recompute MLP
+        ...     save_residuals=True
+        ... )
+        >>> model = auto_remat(model, policy=policy)
+    """
+    names_to_save = []
+
+    if save_attention:
+        names_to_save.extend(["attn_query", "attn_key", "attn_value", "attn_output"])
+
+    if save_mlp:
+        names_to_save.extend(["mlp_gate", "mlp_up", "mlp_down", "mlp_output"])
+
+    if save_residuals:
+        names_to_save.extend(["residual"])
+
+    if save_layer_outputs:
+        names_to_save.extend(["layer_output"])
+
+    if save_embeddings:
+        names_to_save.extend(["embeddings", "model_output", "lm_head_output"])
+
+    if custom_names:
+        names_to_save.extend(custom_names)
+
+    if not names_to_save:
+        return jax.checkpoint_policies.nothing_saveable
+
+    return jax.checkpoint_policies.save_only_these_names(*names_to_save)
 
 
 def add_start_docstrings(*docstr):
@@ -617,18 +701,106 @@ def extract_static_parameters(module):
     return None
 
 
-M = tp.TypeVar("M")
+M = tp.TypeVar("M", bound=nn.Module)
+
+
+@tp.overload
+def auto_remat(
+    module: type[M],
+    /,
+    *,
+    policy: EasyDeLGradientCheckPointers | str | tp.Callable = EasyDeLGradientCheckPointers.NONE,
+    prevent_cse: bool = True,
+    save_names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+) -> type[M]: ...
+
+
+@tp.overload
+def auto_remat(
+    module1: type[M],
+    module2: type[M],
+    /,
+    *,
+    policy: EasyDeLGradientCheckPointers | str | tp.Callable = EasyDeLGradientCheckPointers.NONE,
+    prevent_cse: bool = True,
+    save_names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+) -> tuple[type[M], type[M]]: ...
+
+
+@tp.overload
+def auto_remat(
+    *modules: type[M],
+    policy: EasyDeLGradientCheckPointers | str | tp.Callable = EasyDeLGradientCheckPointers.NONE,
+    prevent_cse: bool = True,
+    save_names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+) -> tuple[type[M], ...]: ...
 
 
 def auto_remat(
     *modules: type[M],
-    policy: EasyDeLGradientCheckPointers | str = EasyDeLGradientCheckPointers.NONE,
+    policy: EasyDeLGradientCheckPointers | str | tp.Callable = EasyDeLGradientCheckPointers.NONE,
     prevent_cse: bool = True,
-) -> tuple[type[M], ...]:
-    if policy == EasyDeLGradientCheckPointers.NONE:
+    save_names: list[str] | None = None,
+    exclude_names: list[str] | None = None,
+) -> type[M] | tuple[type[M], ...]:
+    """Apply gradient checkpointing (rematerialization) to module(s).
+
+    Wraps module __call__ methods with JAX's remat (rematerialization) to trade
+    compute for memory during training. Supports fine-grained control via
+    checkpoint_name annotations added to models.
+
+    Args:
+        *modules: One or more module classes to wrap with remat.
+        policy: Checkpointing policy. Can be:
+            - EasyDeLGradientCheckPointers enum value
+            - String policy name (e.g., 'dots_saveable', 'nothing_saveable')
+            - Custom callable policy (e.g., from create_transformer_checkpoint_policy)
+            - 'save_only_these_names': Use with save_names param
+            - 'save_anything_except_these_names': Use with exclude_names param
+        prevent_cse: If True, prevents common subexpression elimination.
+        save_names: List of checkpoint names to save (for 'save_only_these_names').
+            Works with checkpoint_name calls in models.
+        exclude_names: List of checkpoint names to exclude from saving.
+
+    Returns:
+        Single module or tuple of modules with remat applied.
+
+    Examples:
+        >>> # Basic usage with predefined policy
+        >>> AttentionModule = auto_remat(AttentionModule, policy='dots_saveable')
+        >>>
+        >>> # Multiple modules
+        >>> AttentionModule, MLPModule = auto_remat(
+        ...     AttentionModule, MLPModule,
+        ...     policy='nothing_saveable'
+        ... )
+        >>>
+        >>> # Custom policy saving only specific checkpoints
+        >>> model = auto_remat(
+        ...     model,
+        ...     policy='save_only_these_names',
+        ...     save_names=['attn_output', 'mlp_output', 'residual']
+        ... )
+        >>>
+        >>> # Using transformer-optimized policy
+        >>> policy = create_transformer_checkpoint_policy(
+        ...     save_attention=True,
+        ...     save_mlp=False  # Recompute MLP to save memory
+        ... )
+        >>> model = auto_remat(model, policy=policy)
+    """
+    if policy == EasyDeLGradientCheckPointers.NONE or policy == "":
+        if len(modules) == 1:
+            return modules[0]
         return modules
-    if isinstance(policy, str):
-        policy = get_gradient_checkpoint_policy(policy)
+    if isinstance(policy, str | EasyDeLGradientCheckPointers):
+        policy = get_gradient_checkpoint_policy(policy, save_names, exclude_names)
+    elif not callable(policy):
+        raise ValueError(f"Invalid policy type: {type(policy)}")
+
     outs = ()
     for module in modules:
         assert issubclass(module, nn.Module)
@@ -644,6 +816,9 @@ def auto_remat(
         )
 
         outs += (module,)
+
+    if len(outs) == 1:
+        return outs[0]
     return outs
 
 

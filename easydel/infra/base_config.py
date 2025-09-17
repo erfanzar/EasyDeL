@@ -73,6 +73,7 @@ from easydel.utils.helpers import check_bool_flag, get_logger
 
 from .etils import (
     AVAILABLE_ATTENTION_MECHANISMS,
+    AVAILABLE_GRADIENT_CHECKPOINT_TARGETS,
     AVAILABLE_GRADIENT_CHECKPOINTS,
     AVAILABLE_QUANTIZATION_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
@@ -231,6 +232,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     scan_mlp_chunk_size: NotRequired[int]
     sequence_axis_name: NotRequired[str]
     gradient_checkpointing: NotRequired[EasyDeLGradientCheckPointers | str | AVAILABLE_GRADIENT_CHECKPOINTS]
+    gradient_checkpointing_targets: NotRequired[list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None]
     kv_cache_quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
     kv_cache_quantization_blocksize: NotRequired[int]
     kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
@@ -284,6 +286,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sequence_axis_name (str): Name of the attention axis. Default is "sp".
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method.
             Default is EasyDeLGradientCheckPointers.NONE.
+        gradient_checkpointing_targets (tp.Optional[tp.List[str]]): List of checkpoint names to save when
+            using save_only_these_names or save_any_names_but_these gradient checkpointing policies.
+            Default is None.
         kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method.
             Default is EasyDeLQuantizationMethods.NONE.
         kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
@@ -340,6 +345,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_mlp_chunk_size: int = 1024,
         sequence_axis_name: str = "sp",
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
         precompute_masks: bool = True,
         kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
         kv_cache_quantization_blocksize: int = 64,
@@ -397,6 +403,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
         )
         self.gradient_checkpointing = getattr(self, "gradient_checkpointing", gradient_checkpointing)
+        self.gradient_checkpointing_targets = getattr(
+            self, "gradient_checkpointing_targets", gradient_checkpointing_targets
+        )
         self.precompute_masks = getattr(self, "precompute_masks", precompute_masks)
 
         self.kv_cache_quantization_method = getattr(self, "kv_cache_quantization_method", kv_cache_quantization_method)
@@ -610,6 +619,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_mlp_chunk_size",
             "sequence_axis_name",
             "gradient_checkpointing",
+            "gradient_checkpointing_targets",
             "precompute_masks",
             "kv_cache_quantization_method",
             "kv_cache_quantization_blocksize",
@@ -658,6 +668,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_mlp_chunk_size: int = NOT_GIVEN,
         sequence_axis_name: str = NOT_GIVEN,
         gradient_checkpointing: EasyDeLGradientCheckPointers = NOT_GIVEN,
+        gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = NOT_GIVEN,
         precompute_masks: bool = NOT_GIVEN,
         kv_cache_quantization_method: EasyDeLQuantizationMethods = NOT_GIVEN,
         kv_cache_quantization_blocksize: int = NOT_GIVEN,
@@ -713,6 +724,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             sequence_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
             gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for
                 created or loaded module (applied on mlp and attn layers most of the times).
+            gradient_checkpointing_targets (tp.Optional[tp.List[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS]], optional):
+                List of checkpoint names to save when using save_only_these_names or save_any_names_but_these
+                gradient checkpointing policies. Valid names include: 'attn_query', 'attn_key', 'attn_value',
+                'attn_output', 'mlp_gate', 'mlp_up', 'mlp_down', 'mlp_output', etc. Default is None.
             kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization
                 type. Defaults to EasyDeLQuantizationMethods.NONE.
             kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
@@ -771,6 +786,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "kv_cache_quantization_blocksize", 128, kv_cache_quantization_blocksize)
         set_attrs_smartly(self, "kv_cache_sharding_sequence_axis_name", "sp", kv_cache_sharding_sequence_axis_name)
         set_attrs_smartly(self, "gradient_checkpointing", EasyDeLGradientCheckPointers.NONE, gradient_checkpointing)
+        set_attrs_smartly(self, "gradient_checkpointing_targets", None, gradient_checkpointing_targets)
         set_attrs_smartly(self, "precompute_masks", True, precompute_masks)
         set_attrs_smartly(
             self, "kv_cache_quantization_method", EasyDeLQuantizationMethods.NONE, kv_cache_quantization_method
