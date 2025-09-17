@@ -23,13 +23,14 @@ from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .llava_configuration import LlavaConfig
@@ -99,7 +100,7 @@ class LlavaMultiModalProjector(nn.Module):
 
         num_feature_layers = 1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
 
-        self.linear_1 = ParallelLinear(
+        self.linear_1 = RowParallelLinear(
             config.vision_config.hidden_size * num_feature_layers,
             config.text_config.hidden_size,
             use_bias=config.multimodal_projector_bias,
@@ -111,7 +112,7 @@ class LlavaMultiModalProjector(nn.Module):
         )
 
         self.act = ACT2FN[config.projector_hidden_act]
-        self.linear_2 = ParallelLinear(
+        self.linear_2 = RowParallelLinear(
             config.text_config.hidden_size,
             config.text_config.hidden_size,
             use_bias=config.multimodal_projector_bias,
@@ -123,9 +124,9 @@ class LlavaMultiModalProjector(nn.Module):
         )
 
     def __call__(self, image_features: jax.Array) -> jax.Array:
-        hidden_states = self.linear_1(image_features)
+        hidden_states = checkpoint_name(self.linear_1(image_features), name="projector_linear1")
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
+        hidden_states = checkpoint_name(self.linear_2(hidden_states), name="projector_linear2")
         return hidden_states
 
 
@@ -470,7 +471,14 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
             dtype=dtype,

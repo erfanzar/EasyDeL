@@ -17,6 +17,7 @@ from functools import partial
 
 import jax
 from eformer import common_types as ct
+from eformer.ops import autotune
 from jax import Array
 from jax.sharding import PartitionSpec as Ps
 
@@ -133,10 +134,9 @@ class RaggedPageAttn(AttentionImpl):
         num_seqs = cache_metadata.num_seqs.reshape(-1)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=q.shape)
         output = jax.shard_map(
-            partial(
-                triton_ragged_paged_attention,
-                softmax_scale=self.metadata.softmax_scale,
-                kv_pages_per_block=32,
+            autotune(
+                partial(triton_ragged_paged_attention, softmax_scale=self.metadata.softmax_scale),
+                hyperparams={"kv_pages_per_block": [16, 64, 128]},
             ),
             in_specs=(
                 qaxes,

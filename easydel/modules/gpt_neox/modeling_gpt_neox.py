@@ -21,6 +21,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -35,7 +36,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
@@ -75,7 +76,7 @@ class GPTNeoXAttention(AttentionModule):
             rotary_dim=int(self.head_dim * self.config.rotary_pct),
             base=self.config.rotary_emb_base,
         )
-        self.query_key_value = ParallelLinear(
+        self.query_key_value = ColumnParallelLinear(
             config.hidden_size,
             3 * config.hidden_size,
             dtype=dtype,
@@ -83,7 +84,7 @@ class GPTNeoXAttention(AttentionModule):
             precision=precision,
             rngs=rngs,
         )
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
             dtype=dtype,
@@ -185,7 +186,7 @@ class GPTNeoXAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.dense(attn_output)
+        attn_output = checkpoint_name(self.dense(attn_output), name="attn_output")
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -219,7 +220,7 @@ class GPTNeoXMlp(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense_h_to_4h = ParallelLinear(
+        self.dense_h_to_4h = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.intermediate_size,
             dtype=dtype,
@@ -227,7 +228,7 @@ class GPTNeoXMlp(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.dense_4h_to_h = ParallelLinear(
+        self.dense_4h_to_h = RowParallelLinear(
             self.config.intermediate_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -251,7 +252,10 @@ class GPTNeoXMlp(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.dense_4h_to_h(self.act(self.dense_h_to_4h(hidden_states)))
+        hidden_states = checkpoint_name(
+            self.dense_4h_to_h(self.act(checkpoint_name(self.dense_h_to_4h(hidden_states), name="mlp_up"))),
+            name="mlp_down",
+        )
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -298,6 +302,8 @@ class GPTNeoXBlock(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size,
@@ -629,7 +635,14 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,

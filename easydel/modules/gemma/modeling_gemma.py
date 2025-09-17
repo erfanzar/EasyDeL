@@ -23,6 +23,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -43,7 +44,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .gemma_configuration import GemmaConfig as GemmaConfig
 
@@ -114,8 +115,8 @@ class GemmaAttention(AttentionModule):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         kernel = jax.nn.initializers.normal(config.initializer_range)
-        linear = functools.partial(
-            ParallelLinear,
+        input_linear = functools.partial(
+            ColumnParallelLinear,
             use_bias=config.attention_bias,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -123,24 +124,33 @@ class GemmaAttention(AttentionModule):
             kernel_init=kernel,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.q_proj = linear(
+        output_linear = functools.partial(
+            RowParallelLinear,
+            use_bias=config.attention_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.q_proj = input_linear(
             self.embed_dim,
             self.num_heads * self.head_dim,
             rngs=rngs,
         )
-        self.k_proj = linear(
+        self.k_proj = input_linear(
             self.embed_dim,
             self.num_key_value_heads * self.head_dim,
             rngs=rngs,
         )
-        self.v_proj = linear(
+        self.v_proj = input_linear(
             self.embed_dim,
             self.num_key_value_heads * self.head_dim,
             rngs=rngs,
         )
-        self.o_proj = linear(
-            self.embed_dim,
+        self.o_proj = output_linear(
             self.num_heads * self.head_dim,
+            self.embed_dim,
             rngs=rngs,
         )
         self.attention_performer = FlexibleAttentionModule(
@@ -201,9 +211,9 @@ class GemmaAttention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         (query_states, key_states, value_states) = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(
@@ -267,7 +277,7 @@ class GemmaAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -314,8 +324,18 @@ class GemmaMLP(nn.Module):
             hidden_activation = self.config.hidden_activation
         self.act = ACT2FN[hidden_activation]
 
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -325,17 +345,17 @@ class GemmaMLP(nn.Module):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.gate_proj = linear_class(
+        self.gate_proj = column_parallel_linear(
             embed_dim,
             inner_dim,
             rngs=rngs,
         )
-        self.down_proj = linear_class(
+        self.down_proj = row_parallel_linear(
             inner_dim,
             embed_dim,
             rngs=rngs,
         )
-        self.up_proj = linear_class(
+        self.up_proj = column_parallel_linear(
             embed_dim,
             inner_dim,
             rngs=rngs,
@@ -348,16 +368,16 @@ class GemmaMLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        gate = self.act(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        hidden_states = self.down_proj(gate * up)
+        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class GemmaDecoderLayer(nn.Module):
@@ -387,6 +407,8 @@ class GemmaDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
 
         # Define layers
@@ -460,7 +482,7 @@ class GemmaDecoderLayer(nn.Module):
             frequencies,
         )
 
-        hidden_states = residual + attn_outputs.attention_output
+        hidden_states = checkpoint_name(residual + attn_outputs.attention_output, "residual")
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -474,12 +496,13 @@ class GemmaDecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = checkpoint_name(residual + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
@@ -506,7 +529,13 @@ class GemmaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.hidden_size = self.config.hidden_size
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=self.config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -565,7 +594,7 @@ class GemmaModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
@@ -624,6 +653,7 @@ class GemmaModel(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -686,7 +716,14 @@ class GemmaForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
@@ -753,7 +790,7 @@ class GemmaForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -818,7 +855,7 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             self.config.hidden_size,
             config.num_labels,
             dtype=dtype,

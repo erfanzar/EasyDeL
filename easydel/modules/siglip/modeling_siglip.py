@@ -22,6 +22,7 @@ from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import image as jimg
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -35,7 +36,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
@@ -235,7 +236,7 @@ class SiglipAttention(AttentionModule):
 
         self.dropout = config.attention_dropout
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -267,9 +268,9 @@ class SiglipAttention(AttentionModule):
         attention_mask: chex.Array | None = None,
         output_attentions: bool = False,
     ):
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
+        query = checkpoint_name(self.q_proj(hidden_states), "attn_query")
+        key = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+        value = checkpoint_name(self.v_proj(hidden_states), "attn_value")
 
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -313,7 +314,7 @@ class SiglipAttention(AttentionModule):
         )
 
         attn_output = self._merge_heads(attentions.attention_outputs)
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -338,7 +339,7 @@ class SiglipMLP(nn.Module):
         self.rngs = rngs
         self.activation_fn = ACT2FN[config.hidden_act]
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -355,7 +356,7 @@ class SiglipMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        hidden_states = checkpoint_name(self.fc2(self.activation_fn(self.fc1(hidden_states))), "mlp_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -536,7 +537,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.head = ParallelLinear(
+        self.head = ColumnParallelLinear(
             embed_dim,
             config.projection_size,
             dtype=dtype,
@@ -821,7 +822,7 @@ class MultiheadAttention(nn.Module):
 
         self.in_proj_weight = nn.Param(normal_init(embed_dim * 3, embed_dim))
         self.in_proj_bias = nn.Param(ze_init(3 * embed_dim))
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             embed_dim,
             embed_dim,
             use_bias=bias,
@@ -859,7 +860,7 @@ class MultiheadAttention(nn.Module):
             vout,
         )
 
-        return self.out_proj(attn.reshape(qbs, qss, qds))
+        return checkpoint_name(self.out_proj(attn.reshape(qbs, qss, qds)), "attn_output")
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
@@ -1206,7 +1207,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
         self.use_classif = config.num_labels > 0
         # Classifier head
         if self.use_classif:
-            self.classifier = ParallelLinear(
+            self.classifier = ColumnParallelLinear(
                 config.vision_config.hidden_size,
                 config.num_labels,
                 dtype=dtype,

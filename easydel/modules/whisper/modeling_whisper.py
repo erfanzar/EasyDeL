@@ -25,6 +25,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.inference.logits_process import (
     ForceTokensLogitsProcessor,
@@ -41,10 +42,10 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView, TransformerMetadata
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
 
@@ -170,7 +171,7 @@ class WhisperAttention(AttentionModule):
             )
 
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             self.embed_dim,
             self.embed_dim,
             dtype=dtype,
@@ -220,14 +221,14 @@ class WhisperAttention(AttentionModule):
                 - attn_weights (jnp.ndarray): Attention weights (batch, num_heads, seq_len, kv_seq_len).
         """
         is_cross_attention = key_value_states is not None
-        query_states = self.q_proj(hidden_states)
+        query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
 
         if is_cross_attention:
-            key_states = self.k_proj(key_value_states)
-            value_states = self.v_proj(key_value_states)
+            key_states = checkpoint_name(self.k_proj(key_value_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(key_value_states), "attn_value")
         else:
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+            value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
 
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
@@ -271,7 +272,9 @@ class WhisperAttention(AttentionModule):
             causal=self.causal,
         )
 
-        attn_output = self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))
+        attn_output = checkpoint_name(
+            self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
+        )
 
         return attn_output, attentions.attention_outputs, cache_view
 
@@ -340,7 +343,7 @@ class WhisperEncoderLayer(nn.Module):
             rngs=rngs,
         )
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -407,7 +410,7 @@ class WhisperEncoderLayer(nn.Module):
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.activation_fn(self.fc1(hidden_states))
         hidden_states = self.activation_dropout_layer(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -511,7 +514,7 @@ class WhisperDecoderLayer(nn.Module):
             rngs=rngs,
         )
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             param_dtype=self.param_dtype,
             precision=self.precision,
             dtype=self.dtype,
@@ -603,7 +606,7 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.activation_fn(self.fc1(hidden_states))
         hidden_states = self.activation_dropout_layer(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -844,7 +847,14 @@ class WhisperDecoder(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.config.d_model,
             dtype=dtype,
@@ -1285,7 +1295,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.proj_out = ParallelLinear(
+        self.proj_out = RowParallelLinear(
             config.d_model,
             config.vocab_size,
             use_bias=False,
@@ -1639,7 +1649,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
         num_layers = config.num_hidden_layers + 1
         if config.use_weighted_layer_sum:
             self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
-        self.projector = ParallelLinear(
+        self.projector = ColumnParallelLinear(
             config.d_model,
             config.classifier_proj_size,
             dtype=dtype,
@@ -1648,7 +1658,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.classifier = ParallelLinear(
+        self.classifier = ColumnParallelLinear(
             config.classifier_proj_size,
             config.num_labels,
             dtype=dtype,

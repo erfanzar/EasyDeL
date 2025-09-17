@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -42,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .dbrx_configuration import DbrxConfig
 
@@ -73,7 +74,7 @@ class DbrxAttention(AttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.num_attention_heads == self.config.attn_config.kv_n_heads
-        self.Wqkv = ParallelLinear(
+        self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
             dtype=dtype,
@@ -84,7 +85,7 @@ class DbrxAttention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
             dtype=dtype,
@@ -215,7 +216,7 @@ class DbrxAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.out_proj(attn_output)
+        attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 
         attn_output = self.resid_dropout(attn_output)
         return AttentionLayerOutput(
@@ -377,9 +378,9 @@ class DbrxExpertGLU(nn.Module):
             self.config.ffn_config.ffn_hidden_size,
             self.config.d_model,
         )
-        expert_w1 = self.w1.value.reshape(expert_shape)[expert_idx]
-        expert_v1 = self.v1.value.reshape(expert_shape)[expert_idx]
-        expert_w2 = self.w2.value.reshape(expert_shape)[expert_idx]
+        expert_w1 = checkpoint_name(self.w1.value.reshape(expert_shape)[expert_idx], name="moe_expert_w1")
+        expert_v1 = checkpoint_name(self.v1.value.reshape(expert_shape)[expert_idx], name="moe_expert_v1")
+        expert_w2 = checkpoint_name(self.w2.value.reshape(expert_shape)[expert_idx], name="moe_expert_w2")
 
         x1 = jnp.matmul(
             x,
@@ -476,7 +477,7 @@ class DbrxRouter(nn.Module):
         self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
         self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-        self.layer = ParallelLinear(
+        self.layer = ColumnParallelLinear(
             config.hidden_size,
             self.moe_num_experts,
             use_bias=False,
@@ -575,7 +576,8 @@ class DbrxFFN(nn.Module):
             partition_manager=self.config.partition_manager,
         )
         weights, top_weights, top_experts = self.router(x)
-        out = self.experts(x, weights, top_weights, top_experts)
+        weights = checkpoint_name(weights, name="moe_router_logits")
+        out = checkpoint_name(self.experts(x, weights, top_weights, top_experts), name="moe_expert_output")
         out = apply_logical_sharding(
             out,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -614,6 +616,8 @@ class DbrxBlock(nn.Module):
             attn_block,
             ffn_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.norm_attn_norm = attn_block(
             config=config,
@@ -931,7 +935,14 @@ class DbrxForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -1054,7 +1065,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             config.hidden_size,
             config.num_labels,
             dtype=dtype,

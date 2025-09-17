@@ -17,7 +17,7 @@ import re
 
 import chex
 import jax
-from eformer.ops.quantization import Array8B, ArrayNF4
+from eformer.ops.tools.quantization import Array8B, ArrayNF4
 from flax import nnx as nn
 from tqdm.autonotebook import tqdm
 

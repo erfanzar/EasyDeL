@@ -15,6 +15,10 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    [triton.Config({}, num_warps=w, num_stages=s) for w in [1, 4, 8, 16] for s in [1, 2, 3]],
+    key=["T", "PS", "PAGES_PER_SEQ_MAX", "KV_PAGES_PER_BLOCK"],
+)
 @triton.jit
 def _ragged_paged_attn_prefetch_kernel_combined(
     Q_ptr,  # float*  [T, KVH, QHG, D]

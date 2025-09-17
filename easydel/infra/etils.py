@@ -33,6 +33,7 @@ Type Aliases:
     AVAILABLE_OPTIMIZERS: Literal type for optimizer options
     AVAILABLE_ATTENTION_MECHANISMS: Literal type for attention implementations
     AVAILABLE_SPARSE_MODULE_TYPES: Literal type for sparse matrix formats
+    AVAILABLE_GRADIENT_CHECKPOINT_TARGETS: Literal type for checkpoint names used in models
 
 Constants:
     DEFAULT_ATTENTION_MECHANISM: Default attention mechanism to use
@@ -72,9 +73,13 @@ class EasyDeLOptimizers(str, Enum):
     """
 
     ADAFACTOR = "adafactor"
-    LION = "lion"
     ADAMW = "adamw"
+    MARS = "mars"
+    MUON = "muon"
     RMSPROP = "rmsprop"
+    LION = "lion"
+    SKEW = "skew"
+    QUAD = "quad"
 
 
 class EasyDeLSchedulers(str, Enum):
@@ -115,6 +120,12 @@ class EasyDeLGradientCheckPointers(str, Enum):
     CHECKPOINT_DOTS = "checkpoint_dots"
     CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS = "checkpoint_dots_with_no_batch_dims"
     NONE = ""
+    DOTS_SAVEABLE = "dots_saveable"
+    DOTS_WITH_NO_BATCH_DIMS_AVAILABLE = "dots_with_no_batch_dims_saveable"
+    SAVE_ANYTHING_EXCEPT_THESE_NAMES = "save_anything_except_these_names"
+    SAVE_ANY_NAMES_BUT_THESE = "save_any_names_but_these"
+    SAVE_ONLY_THESE_NAMES = "save_only_these_names"
+    SAVE_FROM_BOTH_POLICIES = "save_from_both_policies"
 
 
 class EasyDeLQuantizationMethods(str, Enum):
@@ -178,20 +189,17 @@ AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "checkpoint_dots",
     "checkpoint_dots_with_no_batch_dims",
     "",
+    "dots_saveable",
+    "dots_with_no_batch_dims_saveable",
+    "save_anything_except_these_names",
+    "save_any_names_but_these",
+    "save_only_these_names",
+    "save_from_both_policies",
 ]
 
-AVAILABLE_SCHEDULERS = tp.Literal[
-    "linear",
-    "cosine",
-    "none",
-]
+AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
-AVAILABLE_OPTIMIZERS = tp.Literal[
-    "adafactor",
-    "lion",
-    "adamw",
-    "rmsprop",
-]
+AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
 
 
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
@@ -211,6 +219,32 @@ AVAILABLE_QUANTIZATION_METHODS = tp.Literal[None, "nf4", "8bit"]
 
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
+
+AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
+    "attn_dense",
+    "attn_key",
+    "attn_key_value",
+    "attn_output",
+    "attn_qkv",
+    "attn_query",
+    "attn_receptance",
+    "attn_value",
+    "attn_weights",
+    "embeddings",
+    "layer_output",
+    "lm_head_output",
+    "mlp_down",
+    "mlp_gate",
+    "mlp_output",
+    "mlp_up",
+    "model_output",
+    "moe_expert_output",
+    "moe_gate_logits",
+    "moe_output",
+    "moe_router_logits",
+    "normed_input",
+    "residual",
+]
 
 
 def define_flags_with_default(

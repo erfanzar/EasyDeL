@@ -21,6 +21,7 @@ from flax import nnx as nn
 from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -44,7 +45,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
 
@@ -110,7 +111,7 @@ class RobertaEmbeddings(nn.Module):
         position_embeds = self.position_embeddings(position_ids.astype("i4"))
         token_type_embeddings = self.token_type_embeddings(token_type_ids.astype("i4"))
 
-        hidden_states = inputs_embeds + token_type_embeddings + position_embeds
+        hidden_states = checkpoint_name(inputs_embeds + token_type_embeddings + position_embeds, "embeddings")
 
         hidden_states = self.LayerNorm(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -145,7 +146,7 @@ class RobertaSelfAttention(AttentionModule):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
         )
-        self.query = ParallelLinear(
+        self.query = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -154,7 +155,7 @@ class RobertaSelfAttention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
-        self.key = ParallelLinear(
+        self.key = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -163,7 +164,7 @@ class RobertaSelfAttention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
-        self.value = ParallelLinear(
+        self.value = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -203,13 +204,13 @@ class RobertaSelfAttention(AttentionModule):
     ):
         is_cross_attention = key_value_states is not None
 
-        query_states = self.query(hidden_states)
+        query_states = checkpoint_name(self.query(hidden_states), "attn_query")
         if is_cross_attention:
-            key_states = self.key(key_value_states)
-            value_states = self.value(key_value_states)
+            key_states = checkpoint_name(self.key(key_value_states), "attn_key")
+            value_states = checkpoint_name(self.value(key_value_states), "attn_value")
         else:
-            key_states = self.key(hidden_states)
-            value_states = self.value(hidden_states)
+            key_states = checkpoint_name(self.key(hidden_states), "attn_key")
+            value_states = checkpoint_name(self.value(hidden_states), "attn_value")
 
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
@@ -260,7 +261,9 @@ class RobertaSelfAttention(AttentionModule):
             attn_weights = jnp.einsum("...hqk,h->...hqk", attn_weights, layer_head_mask)
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
 
-        attn_output = self.shard_attention_prod(attn_output.reshape((*attn_output.shape[:2], -1)))
+        attn_output = checkpoint_name(
+            self.shard_attention_prod(attn_output.reshape((*attn_output.shape[:2], -1))), "attn_output"
+        )
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -283,7 +286,7 @@ class RobertaSelfOutput(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -303,9 +306,9 @@ class RobertaSelfOutput(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob, rngs=rngs)
 
     def __call__(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
+        hidden_states = checkpoint_name(self.dense(hidden_states), "attn_dense")
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = checkpoint_name(self.LayerNorm(hidden_states + input_tensor), "residual")
         return hidden_states
 
 
@@ -384,7 +387,7 @@ class RobertaIntermediate(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.intermediate_size,
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -397,8 +400,8 @@ class RobertaIntermediate(nn.Module):
         self.activation = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.activation(hidden_states)
+        hidden_states = checkpoint_name(self.dense(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.activation(hidden_states), "mlp_gate")
         return hidden_states
 
 
@@ -416,7 +419,7 @@ class RobertaOutput(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.hidden_size,
             self.config.intermediate_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -439,9 +442,9 @@ class RobertaOutput(nn.Module):
         )
 
     def __call__(self, hidden_states, attention_output):
-        hidden_states = self.dense(hidden_states)
+        hidden_states = checkpoint_name(self.dense(hidden_states), "mlp_down")
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + attention_output)
+        hidden_states = checkpoint_name(self.LayerNorm(hidden_states + attention_output), "layer_output")
         return hidden_states
 
 
@@ -559,6 +562,8 @@ class RobertaEncoder(nn.Module):
         block = auto_remat(
             block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.layer = [
             block(
@@ -647,7 +652,7 @@ class RobertaPooler(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -678,7 +683,7 @@ class RobertaLMHead(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -695,7 +700,7 @@ class RobertaLMHead(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.decoder = ParallelLinear(
+        self.decoder = RowParallelLinear(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -745,7 +750,7 @@ class RobertaClassificationHead(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = ParallelLinear(
+        self.dense = RowParallelLinear(
             self.config.hidden_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -764,7 +769,7 @@ class RobertaClassificationHead(nn.Module):
             rate=classifier_dropout,
             rngs=rngs,
         )
-        self.out_proj = ParallelLinear(
+        self.out_proj = RowParallelLinear(
             self.config.num_labels,
             self.config.hidden_size,
             dtype=dtype,
@@ -871,7 +876,7 @@ class RobertaModel(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
-        hidden_states = outputs.last_hidden_state
+        hidden_states = checkpoint_name(outputs.last_hidden_state, "model_output")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -1035,7 +1040,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
             rate=self.config.hidden_dropout_prob,
             rngs=rngs,
         )
-        self.classifier = ParallelLinear(
+        self.classifier = ColumnParallelLinear(
             1,
             self.config.hidden_size,
             dtype=dtype,
@@ -1145,7 +1150,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
             rate=classifier_dropout,
             rngs=rngs,
         )
-        self.classifier = ParallelLinear(
+        self.classifier = ColumnParallelLinear(
             self.config.num_labels,
             self.config.hidden_size,
             dtype=dtype,
@@ -1245,7 +1250,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.qa_outputs = ParallelLinear(
+        self.qa_outputs = ColumnParallelLinear(
             self.config.num_labels,
             self.config.hidden_size,
             dtype=dtype,
@@ -1349,7 +1354,14 @@ class RobertaForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = RobertaLMHead(
+        lm_head_block = RobertaLMHead
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,

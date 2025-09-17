@@ -21,6 +21,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -41,7 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -91,7 +92,7 @@ class ArcticAttention(AttentionModule):
         self.max_position_embeddings = config.max_position_embeddings
 
         linear = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=getattr(self.config, "attention_bias", False),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -129,9 +130,9 @@ class ArcticAttention(AttentionModule):
     ):
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -181,7 +182,7 @@ class ArcticAttention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -305,7 +306,7 @@ class ArcticMLP(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
         linear_class = partial(
-            ParallelLinear,
+            ColumnParallelLinear,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -324,15 +325,15 @@ class ArcticMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        w1 = self.act_fn(self.w1(hidden_states))
-        w3 = self.w3(hidden_states)
-        hidden_states = self.w2(w1 * w3)
+        w1 = checkpoint_name(self.act_fn(self.w1(hidden_states)), "mlp_gate")
+        w3 = checkpoint_name(self.w3(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.w2(w1 * w3), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class ArcticMoeBlock(BaseMoeModule):
@@ -382,7 +383,7 @@ class ArcticMoeBlock(BaseMoeModule):
         self.is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
 
         if self.is_moe_layer:
-            self.gate = ParallelLinear(
+            self.gate = ColumnParallelLinear(
                 config.hidden_size,
                 config.num_local_experts,
                 use_bias=False,
@@ -424,12 +425,15 @@ class ArcticMoeBlock(BaseMoeModule):
                     hidden state and router logits (or 0.0 if not MoE).
         """
         if self.is_moe_layer:
-            return self._moe_call(
+            expert_output, router_logits = self._moe_call(
                 gate_layer=self.gate,
                 expert_layer=self.experts,
                 hidden_state=hidden_states,
                 output_metrics=False,
                 validate_inputs=True,
+            )
+            return checkpoint_name(expert_output, "moe_expert_output"), checkpoint_name(
+                router_logits, "moe_router_logits"
             )
         return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)
 
@@ -471,6 +475,8 @@ class ArcticDecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -555,7 +561,7 @@ class ArcticDecoderLayer(nn.Module):
             frequencies,
         )
         hidden_states = attn_outputs.attention_output
-        hidden_states = residual_input + hidden_states
+        hidden_states = checkpoint_name(residual_input + hidden_states, "residual")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -566,21 +572,22 @@ class ArcticDecoderLayer(nn.Module):
         if self.parallel_attn_mlp_res:
             hidden_states = self.residual_layernorm(hidden_states)
             hidden_states = self.residual_mlp(hidden_states)
-            residual_residual = residual_attn + hidden_states
+            residual_residual = checkpoint_name(residual_attn + hidden_states, "residual")
             # parallel mlp moe part
             hidden_states = self.post_attention_layernorm(residual_input)
             hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
-            hidden_states = residual_residual + hidden_states
+            hidden_states = checkpoint_name(residual_residual + hidden_states, "residual")
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
-            hidden_states = residual_attn + hidden_states
+            hidden_states = checkpoint_name(residual_attn + hidden_states, "residual")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -622,7 +629,14 @@ class ArcticModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -696,7 +710,7 @@ class ArcticModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         if attention_mask is None:
@@ -757,6 +771,7 @@ class ArcticModel(EasyDeLBaseModule):
             past_key_values[idx] = outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -841,7 +856,14 @@ class ArcticForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,
@@ -902,7 +924,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
 
@@ -987,7 +1009,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
-        self.score = ParallelLinear(
+        self.score = ColumnParallelLinear(
             config.hidden_size,
             config.num_labels,
             dtype=dtype,

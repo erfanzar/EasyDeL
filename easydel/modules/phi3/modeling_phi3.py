@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -36,7 +37,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
 
 from .phi3_configuration import Phi3Config
@@ -80,8 +81,8 @@ class Phi3MLP(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -90,12 +91,22 @@ class Phi3MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.gate_up_proj = linear_class(
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.gate_up_proj = column_parallel_linear(
             config.hidden_size,
             2 * config.intermediate_size,
             rngs=rngs,
         )
-        self.down_proj = linear_class(
+        self.down_proj = row_parallel_linear(
             config.intermediate_size,
             config.hidden_size,
             rngs=rngs,
@@ -118,14 +129,15 @@ class Phi3MLP(nn.Module):
         )
         up_states = self.gate_up_proj(hidden_states)
         gate, up_states = jnp.split(up_states, 2, axis=-1)
-        up_states = up_states * self.activation_fn(gate)
-        hidden_states = self.down_proj(up_states)
+        gate = checkpoint_name(self.activation_fn(gate), "mlp_gate")
+        up_states = checkpoint_name(up_states * gate, "mlp_up")
+        hidden_states = checkpoint_name(self.down_proj(up_states), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Phi3Attention(AttentionModule):
@@ -199,8 +211,17 @@ class Phi3Attention(AttentionModule):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        linear_class = functools.partial(
-            ParallelLinear,
+        column_parallel_linear = functools.partial(
+            ColumnParallelLinear,
+            use_bias=False,
+            precision=precision,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        row_parallel_linear = functools.partial(
+            RowParallelLinear,
             use_bias=False,
             precision=precision,
             dtype=dtype,
@@ -210,8 +231,8 @@ class Phi3Attention(AttentionModule):
         )
 
         op_size = self.num_heads * self.head_dim + 2 * (self.num_key_value_heads * self.head_dim)
-        self.o_proj = linear_class(self.num_heads * self.head_dim, self.hidden_size, rngs=rngs)
-        self.qkv_proj = linear_class(self.hidden_size, op_size, rngs=rngs)
+        self.o_proj = row_parallel_linear(self.num_heads * self.head_dim, self.hidden_size, rngs=rngs)
+        self.qkv_proj = column_parallel_linear(self.hidden_size, op_size, rngs=rngs)
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -263,9 +284,11 @@ class Phi3Attention(AttentionModule):
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv = self.qkv_proj(hidden_states)
         query_pos = self.num_heads * self.head_dim
-        query_states = qkv[..., :query_pos]
-        key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-        value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
+        query_states = checkpoint_name(qkv[..., :query_pos], "attn_query")
+        key_states = checkpoint_name(
+            qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim], "attn_key"
+        )
+        value_states = checkpoint_name(qkv[..., query_pos + self.num_key_value_heads * self.head_dim :], "attn_value")
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
         value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
@@ -312,7 +335,7 @@ class Phi3Attention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -369,6 +392,8 @@ class Phi3DecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
             config=config,
@@ -462,7 +487,7 @@ class Phi3DecoderLayer(nn.Module):
             frequencies,
         )
 
-        hidden_states = self.resid_attn_dropout(attn_outputs.attention_output) + residual
+        hidden_states = checkpoint_name(self.resid_attn_dropout(attn_outputs.attention_output) + residual, "residual")
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.config.use_scan_mlp:
@@ -474,7 +499,8 @@ class Phi3DecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
 
-        hidden_states = residual + self.resid_mlp_dropout(feed_forward_hidden_states)
+        hidden_states = checkpoint_name(residual + self.resid_mlp_dropout(feed_forward_hidden_states), "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -537,7 +563,13 @@ class Phi3Model(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embed(
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -616,7 +648,7 @@ class Phi3Model(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         all_attentions = () if output_attentions else None
@@ -676,6 +708,7 @@ class Phi3Model(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -766,7 +799,14 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.vocab_size = self.config.vocab_size
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             use_bias=False,
@@ -833,7 +873,7 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         return CausalLMOutput(
             logits=lm_logits,

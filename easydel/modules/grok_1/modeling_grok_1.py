@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -36,7 +37,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
 
 from .grok_1_configuration import Grok1Config
@@ -79,7 +80,7 @@ class Grok1Attention(AttentionModule):
 
         if self.num_key_value_groups == 1:
             assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = ParallelLinear(
+        self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             dtype=dtype,
@@ -90,7 +91,7 @@ class Grok1Attention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.k_proj = ParallelLinear(
+        self.k_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             dtype=dtype,
@@ -101,7 +102,7 @@ class Grok1Attention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.v_proj = ParallelLinear(
+        self.v_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             dtype=dtype,
@@ -112,7 +113,7 @@ class Grok1Attention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.o_proj = ParallelLinear(
+        self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             dtype=dtype,
@@ -181,9 +182,9 @@ class Grok1Attention(AttentionModule):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
+            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
+            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
         query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
@@ -231,7 +232,7 @@ class Grok1Attention(AttentionModule):
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = self.o_proj(attn_output)
+        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
 
         attn_output = self.resid_dropout(attn_output)
         return AttentionLayerOutput(
@@ -271,7 +272,7 @@ class Grok1BLockSparseMLP(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        self.linear = ParallelLinear(
+        self.linear = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             dtype=dtype,
@@ -282,7 +283,7 @@ class Grok1BLockSparseMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.linear_1 = ParallelLinear(
+        self.linear_1 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             dtype=dtype,
@@ -293,7 +294,7 @@ class Grok1BLockSparseMLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.linear_v = ParallelLinear(
+        self.linear_v = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             dtype=dtype,
@@ -319,13 +320,15 @@ class Grok1BLockSparseMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = self.linear_1(nn.gelu(self.linear(hidden_states)) * self.linear_v(hidden_states))
+        gate = checkpoint_name(nn.gelu(self.linear(hidden_states)), "mlp_gate")
+        up = checkpoint_name(self.linear_v(hidden_states), "mlp_up")
+        hidden_states = checkpoint_name(self.linear_1(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class Grok1SparseMoeBlock(nn.Module):
@@ -357,7 +360,7 @@ class Grok1SparseMoeBlock(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.gate = ParallelLinear(
+        self.gate = ColumnParallelLinear(
             self.config.hidden_size,
             self.config.num_experts,
             use_bias=False,
@@ -365,6 +368,7 @@ class Grok1SparseMoeBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=nn.initializers.normal(),
+            rngs=rngs,
         )
 
         self.experts = [
@@ -394,7 +398,9 @@ class Grok1SparseMoeBlock(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        router_logits = self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32))
+        router_logits = checkpoint_name(
+            self.gate(hidden_states).astype(jnp.promote_types(self.dtype, jnp.float32)), "moe_router_logits"
+        )
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = jax.nn.softmax(routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
         final_hidden_state = jnp.zeros_like(hidden_states)
@@ -402,12 +408,12 @@ class Grok1SparseMoeBlock(nn.Module):
         for index in range(self.config.num_experts):
             expert_layer_output = (
                 block_wise_ffn(
-                    self.layers[index],
+                    self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,
                 )
                 if self.config.use_scan_mlp
-                else self.layers[index](hidden_states)
+                else self.experts[index](hidden_states)
             )
             expert_layer_output_exp = (
                 jnp.sum(
@@ -420,7 +426,7 @@ class Grok1SparseMoeBlock(nn.Module):
                 * expert_layer_output
             )
             final_hidden_state += expert_layer_output_exp
-        return (final_hidden_state, router_logits)
+        return (checkpoint_name(final_hidden_state, "moe_expert_output"), router_logits)
 
 
 class Grok1DecoderLayer(nn.Module):
@@ -441,6 +447,7 @@ class Grok1DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Grok1Config,
+        layer_index: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -449,6 +456,7 @@ class Grok1DecoderLayer(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.layer_index = layer_index
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -459,10 +467,12 @@ class Grok1DecoderLayer(nn.Module):
             attn_block,
             mlp_block,
             policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
         )
         self.attn = attn_block(
             config=self.config,
-            layer_index=self.layer_index,
+            layer_index=layer_index,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -557,13 +567,14 @@ class Grok1DecoderLayer(nn.Module):
         )
         hidden_states = attn_outputs.attention_output
         hidden_states = self.post_attn_norm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         residual = hidden_states
         hidden_states = self.pre_moe_norm(hidden_states)
         hidden_states, router_logits = self.moe_block(hidden_states)
         hidden_states = self.post_moe_norm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,
@@ -605,7 +616,14 @@ class Grok1Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+
+        embed_block = auto_remat(
+            nn.Embed,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.embed_tokens = embed_block(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -692,7 +710,7 @@ class Grok1Model(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids.astype("i4"))
+            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length = inputs_embeds.shape[:2]
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
@@ -748,6 +766,7 @@ class Grok1Model(EasyDeLBaseModule):
             past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -826,7 +845,14 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.lm_head = ParallelLinear(
+        lm_head_block = ColumnParallelLinear
+        lm_head_block = auto_remat(
+            lm_head_block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        self.lm_head = lm_head_block(
             config.hidden_size,
             config.vocab_size,
             dtype=self.dtype,
@@ -892,7 +918,7 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
         )
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
+            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
         aux_loss = None
         if output_router_logits and outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(

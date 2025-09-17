@@ -44,7 +44,8 @@ class EasyModelsTest(unittest.TestCase):
         self.rope_theta: float = 10000.0
         self.attention_bias: bool = False
         self.tie_word_embeddings: bool = False
-        self.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
+        self.gradient_checkpointing = EasyDeLGradientCheckPointers.SAVE_ONLY_THESE_NAMES
+        self.gradient_checkpointing_targets = []
         self.fcm_min_ratio: float = -1
         self.fcm_max_ratio: float = -1
         self.rope_scaling: dict[str, str | float] | None = None
@@ -101,6 +102,15 @@ class EasyModelsTest(unittest.TestCase):
                 num_hidden_layers=self.num_hidden_layers,
                 num_layers=self.num_hidden_layers,
                 gradient_checkpointing=self.gradient_checkpointing,
+                gradient_checkpointing_targets=[
+                    "attn_key",
+                    "attn_dense",
+                    "residual",
+                    "normed_input",
+                    "moe_router_logits",
+                    "mlp_up",
+                    "mlp_output",
+                ],
                 max_position_embeddings=self.max_position_embeddings,
                 max_context_length=self.max_position_embeddings,
                 num_key_value_heads=self.num_key_value_heads,
