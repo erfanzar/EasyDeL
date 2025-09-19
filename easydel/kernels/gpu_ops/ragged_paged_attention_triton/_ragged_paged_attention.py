@@ -38,8 +38,7 @@ def ragged_paged_attention(
     QHG = QH // KVH
     pages_per_seq_max = int(block_tables.shape[1])
 
-    # Q reshape/scale + pad
-    q4 = (queries * softmax_scale).reshape(T, KVH, QHG, D)
+    q4 = queries.reshape(T, KVH, QHG, D)
     T_padded = max(T, 1)
     if T_padded > T:
         pad = jnp.zeros((T_padded - T, KVH, QHG, D), dtype=q4.dtype)
@@ -72,6 +71,18 @@ def ragged_paged_attention(
     def grid(meta):
         return (T_padded, KVH, QHG)
 
+    metaparams = dict(
+        grid=grid,
+        T=T_padded,
+        KVH=KVH,
+        QHG=QHG,
+        D=D,
+        PS=PS,
+        PAGES_PER_SEQ_MAX=pages_per_seq_max,
+        KV_PAGES_PER_BLOCK=KV_PAGES_PER_BLOCK,
+        MAX_KV_SUPERBLOCKS=int(MAX_KV_SUPERBLOCKS),
+        SCALE=softmax_scale,
+    )
     out4_padded = triton_call(
         q4,
         kv_pages,
@@ -82,15 +93,9 @@ def ragged_paged_attention(
         row_valid.astype(jnp.bool_),
         kernel=_ragged_paged_attn_prefetch_kernel_combined,
         out_shape=out_shape,
-        grid=grid,
-        T=T_padded,
-        KVH=KVH,
-        QHG=QHG,
-        D=D,
-        PS=PS,
-        PAGES_PER_SEQ_MAX=pages_per_seq_max,
-        KV_PAGES_PER_BLOCK=KV_PAGES_PER_BLOCK,
-        MAX_KV_SUPERBLOCKS=int(MAX_KV_SUPERBLOCKS),
+        num_warps=8,
+        num_stages=4,
+        **metaparams,
     )
 
     return out4_padded[:T].reshape(T, QH, D).astype(queries.dtype)
