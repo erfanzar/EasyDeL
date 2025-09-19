@@ -1,7 +1,5 @@
 """Example usage of the eSurge engine for text generation."""
 
-import asyncio
-
 from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.sampling_params import SamplingParams
 
@@ -115,69 +113,9 @@ def run_all_examples():
     print("=" * 60)
 
 
-async def run_async_examples():
-    """Run async examples with a single engine instance."""
-    print("\n" + "=" * 60)
-    print("Async Examples")
-    print("=" * 60)
-
-    engine = eSurge(
-        model="meta-llama/Llama-3.2-3B-Instruct",
-        max_model_len=256,
-        max_num_seqs=4,
-        hbm_utilization=0.4,
-    )
-
-    print("\nAsync Generation Example")
-    print("-" * 40)
-
-    prompts = [
-        "What is machine learning?",
-        "Explain deep learning:",
-        "What are transformers in AI?",
-    ]
-
-    tasks = [
-        engine.agenerate(
-            prompt,
-            sampling_params=SamplingParams(max_tokens=80),
-        )
-        for prompt in prompts
-    ]
-
-    results = await asyncio.gather(*tasks)
-
-    for outputs in results:
-        for output in outputs:
-            print(f"Prompt: {output.prompt}")
-            print(f"Response: {output.outputs[0].text}")
-            print()
-
-    print("Async Streaming Example")
-    print("-" * 40)
-
-    prompt = "Explain the concept of recursion:"
-
-    print(f"Prompt: {prompt}")
-    print("Streaming: ", end="", flush=True)
-
-    last_text = ""
-    async for output in engine.astream(
-        prompt,
-        sampling_params=SamplingParams(max_tokens=100),
-    ):
-        if output.outputs[0].text:
-            new_text = output.outputs[0].text[len(last_text) :]
-            print(new_text, end="", flush=True)
-            last_text = output.outputs[0].text
-
-    print("\n")
-
-
 def main():
     """Run all examples."""
     run_all_examples()
-    asyncio.run(run_async_examples())
 
 
 if __name__ == "__main__":
