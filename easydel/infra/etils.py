@@ -73,9 +73,13 @@ class EasyDeLOptimizers(str, Enum):
     """
 
     ADAFACTOR = "adafactor"
-    LION = "lion"
     ADAMW = "adamw"
+    MARS = "mars"
+    MUON = "muon"
     RMSPROP = "rmsprop"
+    LION = "lion"
+    SKEW = "skew"
+    QUAD = "quad"
 
 
 class EasyDeLSchedulers(str, Enum):
@@ -185,20 +189,17 @@ AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "checkpoint_dots",
     "checkpoint_dots_with_no_batch_dims",
     "",
+    "dots_saveable",
+    "dots_with_no_batch_dims_saveable",
+    "save_anything_except_these_names",
+    "save_any_names_but_these",
+    "save_only_these_names",
+    "save_from_both_policies",
 ]
 
-AVAILABLE_SCHEDULERS = tp.Literal[
-    "linear",
-    "cosine",
-    "none",
-]
+AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
-AVAILABLE_OPTIMIZERS = tp.Literal[
-    "adafactor",
-    "lion",
-    "adamw",
-    "rmsprop",
-]
+AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
 
 
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[

@@ -91,8 +91,6 @@ def ragged_paged_attention(
         PAGES_PER_SEQ_MAX=pages_per_seq_max,
         KV_PAGES_PER_BLOCK=KV_PAGES_PER_BLOCK,
         MAX_KV_SUPERBLOCKS=int(MAX_KV_SUPERBLOCKS),
-        num_warps=8,
-        num_stages=3,
     )
 
     return out4_padded[:T].reshape(T, QH, D).astype(queries.dtype)
