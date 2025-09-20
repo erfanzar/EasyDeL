@@ -1412,7 +1412,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         video_grid_thw=None,
         **kwargs,
     ):
-        batch_size, seq_length = input_ids.shape
+        batch_size, _seq_length = input_ids.shape
 
         if past_key_values is None:
             if starts is None:

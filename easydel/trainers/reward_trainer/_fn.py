@@ -87,7 +87,7 @@ def training_step(
                 - LossMetrics containing computed loss and other related metrics.
     """
     # Determine batch size, minibatch size, and enforce partition spec.
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,

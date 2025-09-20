@@ -676,7 +676,7 @@ def grouped_matmul(
         cost_estimate=cost_estimate,
     )
 
-    lhs_contracting_axis, rhs_contracting_axis = dot_general_dims[0]
+    _lhs_contracting_axis, rhs_contracting_axis = dot_general_dims[0]
 
     rhs_contracting_axis = map(lambda x: x + 1, rhs_contracting_axis)
 

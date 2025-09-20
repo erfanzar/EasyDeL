@@ -366,7 +366,7 @@ def _fwd_attention_kernel_call(
     )
     softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
     BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
-    stride_lb, stride_lh, stride_lg, stride_lm = get_strides((batch, num_kv_heads, num_groups, seqlen_q))
+    stride_lb, stride_lh, stride_lg, _stride_lm = get_strides((batch, num_kv_heads, num_groups, seqlen_q))
     metaparams = dict(
         BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
         HAVE_BIAS=HAVE_BIAS,
@@ -377,9 +377,9 @@ def _fwd_attention_kernel_call(
         num_warps=8,
     )
 
-    stride_qb, stride_qm, stride_qh, stride_qg, stride_qd = get_strides(query.shape)
-    stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
-    stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
+    stride_qb, stride_qm, stride_qh, stride_qg, _stride_qd = get_strides(query.shape)
+    stride_kb, stride_kn, stride_kh, _stride_kd = get_strides(key.shape)
+    stride_vb, stride_vn, stride_vh, _stride_vd = get_strides(value.shape)
     out, lse = triton_call(
         query,
         key,

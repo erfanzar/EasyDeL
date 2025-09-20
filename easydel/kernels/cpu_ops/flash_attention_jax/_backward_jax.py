@@ -52,7 +52,6 @@ def _bwd_flash_attn(
     ) = residuals
     dO = grad_in
 
-    b, h, _, d = query_state.shape
     q_seq = query_state.shape[2]
     k_seq = key_state.shape[2]
     assert q_seq % blocksize_q == 0

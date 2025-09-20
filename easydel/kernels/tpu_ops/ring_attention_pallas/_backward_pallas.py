@@ -47,7 +47,7 @@ def _ring_flash_attention_bwd_tpu(
 ):
     del float32_logits
     o, q, k, v, attn_bias, segment_ids, cache_idx, lse_, m = res
-    batch, num_heads, kv_len, dim_per_head = k.shape
+    _batch, _num_heads, kv_len, _dim_per_head = k.shape
     axis_size = lax.psum(1, axis_name)
     dq = jnp.zeros_like(q, dtype=jnp.float32)
     dk = jnp.zeros_like(k, dtype=jnp.float32)
@@ -180,7 +180,7 @@ def _flash_attention_bwd(
         debug=debug,
     )
 
-    dq, ds = _flash_attention_bwd_dq(
+    dq, _ds = _flash_attention_bwd_dq(
         q_chunk_idx_start,
         k_chunk_idx_start,
         q,

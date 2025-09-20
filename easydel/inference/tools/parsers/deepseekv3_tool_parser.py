@@ -263,7 +263,7 @@ class DeepSeekV3ToolParser(ToolParser):
                 else:
                     current_tool_call_name_matches = self.stream_tool_call_name_regex.match(tool_call_portion)
                     if current_tool_call_name_matches:
-                        tool_type, tool_name = current_tool_call_name_matches.groups()
+                        _tool_type, tool_name = current_tool_call_name_matches.groups()
                         current_tool_call["name"] = tool_name
                         current_tool_call["arguments"] = ""
                     else:

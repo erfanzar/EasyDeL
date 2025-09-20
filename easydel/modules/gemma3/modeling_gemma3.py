@@ -265,7 +265,7 @@ class Gemma3Attention(AttentionModule):
         Returns:
             tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
-        batch_size, sequence_length = hidden_states.shape[:2]
+        _batch_size, _sequence_length = hidden_states.shape[:2]
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 

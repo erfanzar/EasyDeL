@@ -294,7 +294,7 @@ class vDriver:
                 continue
 
             if len(data) == 2:
-                generate_timestep, result_tokens = data
+                _generate_timestep, result_tokens = data
                 result_tokens_np = result_tokens.convert_to_numpy()
 
                 # Process all live slots

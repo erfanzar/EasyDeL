@@ -233,7 +233,7 @@ class LightningCacheView(BaseCacheView):
         num_updated_cache_vectors = query.shape[1]
         end_index = self.index[0]
 
-        *batch_dims, max_length, num_heads, depth_per_head = self.value.shape
+        *batch_dims, max_length, _num_heads, _depth_per_head = self.value.shape
 
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
