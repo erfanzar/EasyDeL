@@ -676,7 +676,7 @@ class BaseMoeModule(nn.Module, ABC):
                 )
 
                 global_group_sizes = jax.lax.all_gather(g_sizes, axis_name=expert_axis_name)
-                x_local, local_sorted_idx, local_group_sizes, local_experts = _local_permute(
+                x_local, local_sorted_idx, local_group_sizes, _local_experts = _local_permute(
                     x_dispatched,
                     global_group_sizes,
                     local_E,
