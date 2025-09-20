@@ -75,7 +75,7 @@ class eLargeModel:
 
     This class provides a unified interface for:
     - Configuration management (load, save, create)
-    - Model building and initialization
+    - Model building and initialization (including teacher/reference models)
     - eSurge inference engine integration
     - Tokenizer management
 
@@ -164,6 +164,16 @@ class eLargeModel:
         """Get the resolved task type."""
         return resolve_task(self._config)
 
+    @property
+    def teacher_model_name(self) -> str | None:
+        """Get the teacher model name or path."""
+        return self._config.get("teacher_model", {}).get("name_or_path")
+
+    @property
+    def reference_model_name(self) -> str | None:
+        """Get the reference model name or path."""
+        return self._config.get("reference_model", {}).get("name_or_path")
+
     def update_config(self, updates: Mapping[str, Any]) -> eLargeModel:
         """Update configuration with new values.
 
@@ -188,6 +198,34 @@ class eLargeModel:
             Self for method chaining
         """
         self._config["model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_teacher_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the teacher model name or path for distillation training.
+
+        Args:
+            model_name_or_path: HuggingFace model ID or local path for teacher model
+
+        Returns:
+            Self for method chaining
+        """
+        if "teacher_model" not in self._config:
+            self._config["teacher_model"] = {}
+        self._config["teacher_model"]["name_or_path"] = model_name_or_path
+        return self
+
+    def set_reference_model(self, model_name_or_path: str) -> eLargeModel:
+        """Set the reference model name or path for preference optimization.
+
+        Args:
+            model_name_or_path: HuggingFace model ID or local path for reference model
+
+        Returns:
+            Self for method chaining
+        """
+        if "reference_model" not in self._config:
+            self._config["reference_model"] = {}
+        self._config["reference_model"]["name_or_path"] = model_name_or_path
         return self
 
     def set_dtype(self, dtype: str) -> eLargeModel:
@@ -518,6 +556,32 @@ class eLargeModel:
         self.build_model()
         return build_vsurge(self._config, self._model)
 
+    def build_teacher_model(self) -> EasyDeLBaseModule | None:
+        """Build the teacher model for distillation training.
+
+        Returns:
+            EasyDeLBaseModule instance or None if no teacher model configured
+        """
+        if "teacher_model" not in self._config:
+            return None
+
+        teacher_config = dict(self._config)
+        teacher_config["model"] = self._config["teacher_model"]
+        return build_model(teacher_config)
+
+    def build_reference_model(self) -> EasyDeLBaseModule | None:
+        """Build the reference model for preference optimization (DPO, etc.).
+
+        Returns:
+            EasyDeLBaseModule instance or None if no reference model configured
+        """
+        if "reference_model" not in self._config:
+            return None
+
+        reference_config = dict(self._config)
+        reference_config["model"] = self._config["reference_model"]
+        return build_model(reference_config)
+
     def build_dataset(self):
         """Build dataset from mixture configuration.
 
@@ -701,6 +765,8 @@ class eLargeModel:
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
         elif trainer_type == "dpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = self._model
             trainer_kwargs["reference_model"] = reference_model
@@ -745,6 +811,8 @@ class eLargeModel:
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
         elif trainer_type == "distillation":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["student_model"] = self._model
             trainer_kwargs["teacher_model"] = teacher_model

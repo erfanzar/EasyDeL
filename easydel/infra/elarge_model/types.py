@@ -319,6 +319,8 @@ class ELMConfig(TypedDict, total=False):
 
     Attributes:
         model: Model configuration (required)
+        teacher_model: Teacher model configuration for distillation training
+        reference_model: Reference model configuration for preference optimization (DPO, etc.)
         loader: Model loading configuration
         sharding: Distributed sharding configuration
         platform: Platform and backend configuration
@@ -333,6 +335,8 @@ class ELMConfig(TypedDict, total=False):
     Example:
         >>> config: ELMConfig = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
+        ...     "teacher_model": {"name_or_path": "meta-llama/Llama-2-13b"},  # For distillation
+        ...     "reference_model": {"name_or_path": "meta-llama/Llama-2-7b-instruct"},  # For DPO
         ...     "loader": {"dtype": "bf16"},
         ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)},
         ...     "mixture": {
@@ -349,6 +353,8 @@ class ELMConfig(TypedDict, total=False):
     """
 
     model: Required[ModelCfg]
+    teacher_model: NotRequired[ModelCfg]
+    reference_model: NotRequired[ModelCfg]
     loader: NotRequired[LoaderCfg]
     sharding: NotRequired[ShardingCfg]
     platform: NotRequired[PlatformCfg]
