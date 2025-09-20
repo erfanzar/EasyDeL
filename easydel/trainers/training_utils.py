@@ -178,7 +178,7 @@ def minibatch_call(
             }
             return new_acc, step_aux
 
-        final_acc, aux = jax.lax.scan(
+        final_acc, _aux = jax.lax.scan(
             accumulate_gradients,
             init_acc,
             batch,

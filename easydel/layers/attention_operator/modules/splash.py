@@ -137,8 +137,8 @@ class SplashAttn(AttentionImpl):
             q_sharding,
             k_sharding,
             v_sharding,
-            b_sharding,
-            m_sharding,
+            _b_sharding,
+            _m_sharding,
             a_sharding,
         ) = self.metadata.get_shardings(model_mode, BTHD=False, qkv_mni_sharding=True)
         if mask is not None and mask.shape[0] != q.shape[0]:

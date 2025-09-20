@@ -112,7 +112,7 @@ def blockwise_attn(
             return Carry(numerator, denominator, max_score), None
 
         def skip_upper_half(carry, args):
-            key_chunk, value_chunk, key_chunk_idx = args
+            _key_chunk, _value_chunk, key_chunk_idx = args
             skip_block = jnp.array(False)
             if causal:
                 skip_block = query_chunk_idx < key_chunk_idx
@@ -129,7 +129,7 @@ def blockwise_attn(
             jnp.zeros((batch, query_chunk_size, num_heads, dim_per_head), dtype=query.dtype),
             (-jnp.inf) * jnp.ones((batch, query_chunk_size, num_heads, 1), dtype=query.dtype),
         )
-        (numerator, denominator, max_score), _ = lax.scan(
+        (numerator, denominator, _max_score), _ = lax.scan(
             skip_upper_half, init_carry, xs=(key, value, jnp.arange(0, num_kv))
         )
         outputs = (numerator / denominator).astype(dtype)
@@ -263,7 +263,7 @@ class RingAttn(AttentionImpl):
 
         model_mode = self.get_mode(q=q, BTHD=True)
 
-        q_sharding, k_sharding, v_sharding, b_sharding, m_sharding, a_sharding = self.metadata.get_shardings(model_mode)
+        q_sharding, k_sharding, v_sharding, b_sharding, _m_sharding, a_sharding = self.metadata.get_shardings(model_mode)
 
         blocksize_k = min(self.metadata.blocksize_k, value_lenght)
         blocksize_q = min(self.metadata.blocksize_q, query_lenght)
@@ -340,7 +340,7 @@ class RingAttn(AttentionImpl):
 
         model_mode = self.get_mode(q=q, BTHD=True)
 
-        q_sharding, k_sharding, v_sharding, b_sharding, m_sharding, a_sharding = self.metadata.get_shardings(model_mode)
+        q_sharding, k_sharding, v_sharding, b_sharding, _m_sharding, a_sharding = self.metadata.get_shardings(model_mode)
 
         if mask is None and bias is None and init_bias is not None:
             bias = init_bias()

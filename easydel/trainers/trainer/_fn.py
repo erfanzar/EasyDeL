@@ -79,7 +79,7 @@ def training_step(
                 - LossMetrics containing computed loss and other related metrics.
     """
     # Determine batch size, minibatch size, and enforce partition spec.
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,
@@ -190,7 +190,7 @@ def evaluation_step(
         module = state.merge(tree)
         module.eval()
         labels = batch.pop("labels", None)
-        outputs, metrics = module.compute_loss(
+        _outputs, metrics = module.compute_loss(
             labels=labels,
             loss_config=loss_config,
             **batch,  # Additional inputs passed directly to the model.

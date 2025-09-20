@@ -137,7 +137,7 @@ class FlashAttn(AttentionImpl):
             k_sharding,
             v_sharding,
             b_sharding,
-            m_sharding,
+            _m_sharding,
             a_sharding,
         ) = self.metadata.get_shardings(model_mode, BTHD=False)
 

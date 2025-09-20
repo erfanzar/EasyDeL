@@ -875,7 +875,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         if not dimension_numbers:
             return 0
 
-        lhs_spec, rhs_spec, out_spec = dimension_numbers
+        lhs_spec, rhs_spec, _out_spec = dimension_numbers
 
         batch_size = lhs_shape[lhs_spec.index("N")]
         in_channels = lhs_shape[lhs_spec.index("C")]

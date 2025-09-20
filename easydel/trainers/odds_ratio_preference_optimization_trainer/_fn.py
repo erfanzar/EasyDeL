@@ -341,7 +341,7 @@ def orpo_step(
             - In "train" mode: A tuple containing the updated model state and the computed loss metrics.
             - In "eval" mode: The computed loss metrics.
     """
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         batch_partition_spec=partition_spec,
         gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,

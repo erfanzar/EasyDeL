@@ -148,7 +148,7 @@ def _blockwise_attention_bwd(
             )
 
         def skip_upper_half(carry, args):
-            key_chunk, value_chunk, k_chunk_idx = args
+            _key_chunk, _value_chunk, k_chunk_idx = args
             should_run = jnp.array(True)
             if blocksize_c is not None:
                 should_run = below_or_on_diag(

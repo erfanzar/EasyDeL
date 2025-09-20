@@ -799,9 +799,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         feed_forward_hidden_states = self.mlp(hidden_states)
-        router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
-            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+            feed_forward_hidden_states, _router_logits = feed_forward_hidden_states
         hidden_states = residual + feed_forward_hidden_states
         hidden_states = apply_logical_sharding(
             hidden_states,

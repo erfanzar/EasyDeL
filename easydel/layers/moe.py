@@ -705,7 +705,7 @@ class BaseMoeModule(nn.Module, ABC):
                     axis_name=expert_axis_name,
                 )
 
-                x_local, local_sorted_idx, local_group_sizes, local_experts = _local_permute(
+                x_local, local_sorted_idx, local_group_sizes, _local_experts = _local_permute(
                     x_local,
                     g_sizes[None, :],
                     local_E,

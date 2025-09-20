@@ -112,7 +112,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 
         def _compute(q, k, v, start, index):
             qb, qhead, qdim = q.shape
-            _, kvlen, kvhead, kvdim = k.shape
+            _, kvlen, kvhead, _kvdim = k.shape
             repeats = qhead // kvhead
             q = q.reshape(qb, kvhead, repeats, qdim)
             weight = jnp.einsum("bkhd,bmkd->bkhm", q * sm_scale, k)

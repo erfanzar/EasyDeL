@@ -444,7 +444,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 - router_logits: Logits computed by the router gate.
                   Shape: (batch_size * sequence_length, num_local_experts).
         """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        _batch_size, _sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed

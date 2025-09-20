@@ -30,7 +30,7 @@ def ragged_paged_attention(
     kv_pages_per_block: int = 8,
 ) -> jnp.ndarray:
     T, QH, D = queries.shape
-    P, PS, C, Dk = kv_pages.shape
+    _P, PS, C, Dk = kv_pages.shape
     assert D == Dk, "head_size mismatch"
     assert C % 2 == 0, "combined kv heads must be even"
     KVH = C // 2

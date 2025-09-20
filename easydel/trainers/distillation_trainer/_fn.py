@@ -122,7 +122,7 @@ def distillation_step(
     temperature: float = 4.0,
     alpha: float = 0.9,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+    _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,
         batch_partition_spec=partition_spec,

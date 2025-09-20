@@ -839,7 +839,7 @@ class MultiheadAttention(nn.Module):
         value: chex.Array,
     ):
         qbs, qss, qds = query.shape
-        b, s, d = value.shape
+        b, s, _d = value.shape
 
         qb, kb, vb = jnp.split(self.in_proj_bias, 3, -1)
         qw, kw, vw = jnp.split(self.in_proj_weight, 3, -1)
