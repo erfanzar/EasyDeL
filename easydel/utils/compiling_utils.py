@@ -78,8 +78,11 @@ RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
 
 CACHE_DIR = get_cache_dir()
-COMPILE_FUNC_DIR = CACHE_DIR / "ejit_compiled_functions"
-COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
+if not isinstance(COMPILE_FUNC_DIR, str):
+    COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
 COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
