@@ -149,9 +149,6 @@ class FlashAttn(AttentionImpl):
         k, v = self.repeat_kv_heads(k, v, q.shape[2] // k.shape[2])
         query_lenght = q.shape[1]
         value_lenght = v.shape[1]
-        if bias is not None:
-            if bias.shape[1] != v.shape[2]:
-                bias = jnp.repeat(bias, v.shape[2] // bias.shape[1], 1)
 
         block_sizes = BlockSizes(
             block_q=min(self.metadata.blocksize_q, query_lenght),
@@ -180,6 +177,10 @@ class FlashAttn(AttentionImpl):
             check_rep=False,
         )
         def _wraped_flash_attn(q, k, v, b):
+            if b is not None:
+                if b.shape[1] != v.shape[1]:
+                    b = jnp.repeat(b, v.shape[1] // b.shape[1], 1)
+            
             out = pallas_flash_attention(
                 q,
                 k,
