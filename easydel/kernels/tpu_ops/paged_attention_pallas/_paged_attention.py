@@ -231,8 +231,8 @@ def prefill_attention(
             num_scalar_prefetch=3,
             in_specs=[
                 q_block_spec,
-                pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
-                pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
             ],
             out_specs=[
                 q_block_spec,
@@ -429,8 +429,8 @@ def paged_attention(
 
     in_specs = [
         q_block_spec,
-        pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
-        pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
     ]
     scratch_shapes = (
         pltpu.VMEM((2, pages_per_compute_block, page_size, head_dim), k_pages.dtype),
