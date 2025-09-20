@@ -639,10 +639,10 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = ">=0.0.72" },
+    { name = "eformer", specifier = ">=0.0.73" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "fastapi", specifier = ">=0.115.2" },
-    { name = "flax", specifier = "==0.11.0" },
+    { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
     { name = "google-api-python-client", specifier = ">=2.179.0" },
     { name = "grain", specifier = "~=0.2.11" },
@@ -676,7 +676,7 @@ provides-extras = ["torch", "gpu", "tpu", "tensorflow", "lm-eval", "profile"]
 
 [[package]]
 name = "eformer"
-version = "0.0.72"
+version = "0.0.73"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -698,9 +698,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ad/58/8bee6f188e584f423942ac758cca4bbb5a51faa867369d8dcbc8386128b8/eformer-0.0.72.tar.gz", hash = "sha256:ab75d883cfdd868c588d6be7e2bf7fe79491f936331c56dc2a69564492c0fb1f", size = 241102, upload-time = "2025-09-19T18:36:19.267Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/ee/531fbd4bdc7023babd95eefc0d37e10f0dab225db6b0c9983d1431abaf41/eformer-0.0.73.tar.gz", hash = "sha256:226168c163a8c767b3fe1423d0d427b18eb37db664b0d9054440539392f114ff", size = 242488, upload-time = "2025-09-20T15:03:31.19Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7c/db/f8f4783c3817047e5df0575cb230549ea6e87198bd9c3c4eab43dd9de2a9/eformer-0.0.72-py3-none-any.whl", hash = "sha256:afc96b0dc217e4c79fd019f2e1ba36262f9cdb64fc0d2ecde9906a1e9bd0ea97", size = 310731, upload-time = "2025-09-19T18:36:16.984Z" },
+    { url = "https://files.pythonhosted.org/packages/62/0f/e4d18abc6c02088722463e50c6f8fb47a21d790c9506e8bc7446d34761f7/eformer-0.0.73-py3-none-any.whl", hash = "sha256:c6eac42d8dea6f5d4247d45b27e720c311a97d03bc5c26b93ee69294b793d474", size = 312066, upload-time = "2025-09-20T15:03:29.629Z" },
 ]
 
 [[package]]
@@ -803,7 +803,7 @@ wheels = [
 
 [[package]]
 name = "flax"
-version = "0.11.0"
+version = "0.11.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
@@ -817,9 +817,9 @@ dependencies = [
     { name = "treescope" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/47/44/1db7010083a43a4655325731729b413f085373315ce53f90e2ae92665043/flax-0.11.0.tar.gz", hash = "sha256:4b03b7938b5e1f8c5843f59af41116e9184f98e10ce61a8d33b5dd7d2ba91edd", size = 5072990, upload-time = "2025-07-29T21:05:16.449Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/b9/3d2a5f94eb4aa9ff2e5981ac73ea91cfedef5f9de35d903e56cdcf539f31/flax-0.11.2.tar.gz", hash = "sha256:55452529b70c704128075a17f7a54d94f1f90b0f2d9498bdc9578cae3646e460", size = 5201170, upload-time = "2025-08-28T17:56:34.658Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/70/476765f56b64d0533e3d2c4ee2772f1c12a14fe505dd985bf3ee2c6e55b8/flax-0.11.0-py3-none-any.whl", hash = "sha256:9dd67b7296e70c311a8cfd9a5fcd7bdaac9ccbc732ac70cc5c40b3534532d30a", size = 455936, upload-time = "2025-07-29T21:05:14.21Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/b2/5f520253823c84ca87ca0fe5a7b9d96417b1e549b98a38f5069555590d07/flax-0.11.2-py3-none-any.whl", hash = "sha256:61a5f60c27ab4e6420fda7f593f93b5ec1adba629fd33b2f0e52740ab7c04da9", size = 458093, upload-time = "2025-08-28T17:56:32.588Z" },
 ]
 
 [[package]]
