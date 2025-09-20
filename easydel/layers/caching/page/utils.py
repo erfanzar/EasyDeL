@@ -181,9 +181,9 @@ def kv_cache_update(
         ...     page_size=32
         ... )
     """
-    assert (
-        slice_indices.shape[1] % slices_per_processing_page == 0
-    ), f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
+    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
+        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
+    )
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
     assert kv_cache_pages.shape[1] == num_kv_heads
     assert kv_cache_pages.shape[2] == head_dimension
@@ -199,10 +199,10 @@ def kv_cache_update(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch_scalars),
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
-                pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
             ],
-            out_specs=[pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY)],
+            out_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)],
             grid=(cdiv(total_update_slices[0], slices_per_processing_page),),
             scratch_shapes=[vmem_scratch_buffer, pltpu.SemaphoreType.DMA],
         ),
