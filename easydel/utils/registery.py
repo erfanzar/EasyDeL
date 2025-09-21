@@ -264,7 +264,7 @@ class Registry:
         """
         if wakeup:
             try:
-                from easydel import (
+                from easydel import (  # noqa
                     inference,
                     infra,
                     kernels,
@@ -315,7 +315,7 @@ class Registry:
         """Get all implementations in a category."""
         if wakeup:
             try:
-                from easydel import (
+                from easydel import (  # noqa
                     inference,
                     infra,
                     kernels,

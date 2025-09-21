@@ -59,7 +59,6 @@ import typing as tp
 from abc import ABC, abstractmethod
 
 from eformer.pytree import auto_pytree
-from jaxtyping import Array, Bool, Float, Int
 
 
 @auto_pytree
