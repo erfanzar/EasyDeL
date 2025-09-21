@@ -88,14 +88,14 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_tpu_overlap_compute_collective_tc=true "
         "--xla_enable_async_all_gather=true "
         "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
-        "--xla_tpu_megacore_fusion_allow_ags=true "
+        "--xla_tpu_megacore_fusion_allow_ags=false "
         "TPU_MEGACORE=MEGACORE_DENSE "
     )
     _os.environ.update(
         {
             "NCCL_LL128_BUFFSIZE": "-2",
             "NCCL_LL_BUFFSIZE": "-2",
-            "NCCL_PROTO": "SIMPLE,LL,LL128",
+            "NCCL_PROTO": "SIMPLE,LL,LL128",  # NOTE: tweak this one
         }
     )
     if _os.getenv("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:

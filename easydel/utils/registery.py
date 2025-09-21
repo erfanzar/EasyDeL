@@ -264,12 +264,14 @@ class Registry:
         """
         if wakeup:
             try:
-                from easydel import inference  # noqa
-                from easydel import infra  # noqa
-                from easydel import kernels  # noqa
-                from easydel import layers  # noqa
-                from easydel import modules  # noqa
-                from easydel import trainers  # noqa
+                from easydel import (
+                    inference,
+                    infra,
+                    kernels,
+                    layers,
+                    modules,
+                    trainers,
+                )
             except Exception:
                 ...
         impl_cls = cls.get(category, impl_name)
@@ -313,12 +315,14 @@ class Registry:
         """Get all implementations in a category."""
         if wakeup:
             try:
-                from easydel import inference  # noqa
-                from easydel import infra  # noqa
-                from easydel import kernels  # noqa
-                from easydel import layers  # noqa
-                from easydel import modules  # noqa
-                from easydel import trainers  # noqa
+                from easydel import (
+                    inference,
+                    infra,
+                    kernels,
+                    layers,
+                    modules,
+                    trainers,
+                )
             except Exception:
                 ...
         with cls._lock:

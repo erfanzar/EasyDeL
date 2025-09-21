@@ -15,13 +15,13 @@
 
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -65,12 +65,21 @@ class Qwen3MLP(nn.Module):
         act_fn (callable): Activation function (SiLU).
     """
 
+    config: Qwen3Config
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    precision: jax.lax.PrecisionLike | None
+    gate_proj: ColumnParallelLinear
+    down_proj: RowParallelLinear
+    up_proj: ColumnParallelLinear
+    act_fn: callable
+
     def __init__(
         self,
         config: Qwen3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -124,23 +133,27 @@ class Qwen3MLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the Qwen3MLP module.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Float[Array, "batch seq_len hidden_dim"]: Output hidden states after MLP transformation.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+        gate: Float[Array, "batch seq_len intermediate_size"] = checkpoint_name(
+            self.act_fn(self.gate_proj(hidden_states)), "mlp_gate"
+        )
+        up: Float[Array, "batch seq_len intermediate_size"] = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(self.down_proj(gate * up), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -172,13 +185,30 @@ class Qwen3Attention(AttentionModule):
         rotary (RoPE): Rotary position embedding module.
     """
 
+    layer_idx: int
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    precision: jax.lax.PrecisionLike | None
+    rngs: nn.Rngs
+    hidden_size: int
+    head_dim: int
+    num_key_value_groups: int
+    q_proj: ColumnParallelLinear
+    k_proj: ColumnParallelLinear
+    v_proj: ColumnParallelLinear
+    o_proj: RowParallelLinear
+    attention_performer: FlexibleAttentionModule
+    q_norm: RMSNorm
+    k_norm: RMSNorm
+    sliding_window: int | None
+
     def __init__(
         self,
         config: Qwen3Config,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -285,39 +315,41 @@ class Qwen3Attention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch 1 seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim//2 2"] | None = None,
+    ) -> AttentionLayerOutput:
         """
         Forward pass of the Qwen3Attention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+            attention_mask (Bool[Array, "batch seq_len"]): Mask to apply on the attention scores.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
+            causal_mask (Union[Bool[Array, "batch 1 seq_len seq_len"], bool, None]): Causal mask for ensuring autoregressive behavior.
+            cache_view (Optional[Union[TransformerCacheView, PagesCacheView]]): Cache view for attention KVs.
+            cache_metadata (Optional[Union[TransformerMetadata, PagesMetadata]]): Metadata for paged attention.
+            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (Optional[Bool[Array, "batch seq_len seq_len"]]): Flash Chunking Mask (FCM) for attention.
+            frequencies (Optional[Float[Array, "seq_len head_dim//2 2"]]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
+            AttentionLayerOutput: A tuple containing the attention output hidden states, optionally attention weights, and cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
+
+        query_states: Float[Array, "batch seq_len num_heads*head_dim"]
+        key_states: Float[Array, "batch seq_len num_kv_heads*head_dim"]
+        value_states: Float[Array, "batch seq_len num_kv_heads*head_dim"]
 
         query_states, key_states, value_states = (
             checkpoint_name(self.q_proj(hidden_states), "attn_query"),
@@ -325,7 +357,7 @@ class Qwen3Attention(AttentionModule):
             checkpoint_name(self.v_proj(hidden_states), "attn_value"),
         )
 
-        query_states = self.q_norm(
+        query_states: Float[Array, "batch seq_len num_heads head_dim"] = self.q_norm(
             query_states.reshape(
                 batch_size,
                 sequence_length,
@@ -333,7 +365,7 @@ class Qwen3Attention(AttentionModule):
                 self.head_dim,
             )
         )
-        key_states = self.k_norm(
+        key_states: Float[Array, "batch seq_len num_kv_heads head_dim"] = self.k_norm(
             key_states.reshape(
                 batch_size,
                 sequence_length,
@@ -341,7 +373,7 @@ class Qwen3Attention(AttentionModule):
                 self.head_dim,
             )
         )
-        value_states = value_states.reshape(
+        value_states: Float[Array, "batch seq_len num_kv_heads head_dim"] = value_states.reshape(
             batch_size,
             sequence_length,
             self.config.num_key_value_heads,
@@ -390,9 +422,9 @@ class Qwen3Attention(AttentionModule):
             causal=True,
             sliding_window=self.sliding_window,
         )
-        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output: Float[Array, "batch seq_len hidden_dim"] = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attn_output)
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
+        attn_output: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(self.o_proj(attn_output), "attn_output")
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -420,13 +452,22 @@ class Qwen3DecoderLayer(nn.Module):
         post_attention_layernorm (RMSNorm): RMS normalization applied after the attention layer and before the MLP layer.
     """
 
+    config: Qwen3Config
+    dtype: jnp.dtype
+    param_dtype: jnp.dtype
+    precision: jax.lax.PrecisionLike | None
+    self_attn: Qwen3Attention
+    mlp: Qwen3MLP
+    input_layernorm: RMSNorm
+    post_attention_layernorm: RMSNorm
+
     def __init__(
         self,
         config: Qwen3Config,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -487,35 +528,34 @@ class Qwen3DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch 1 seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim//2 2"] | None = None,
+    ) -> DecoderLayerOutput:
         """Forward pass of the Qwen3DecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+            attention_mask (Bool[Array, "batch seq_len"]): Mask to apply on the attention scores.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
+            causal_mask (Union[Bool[Array, "batch 1 seq_len seq_len"], bool, None]): Causal mask for ensuring autoregressive behavior.
+            cache_view (Optional[Union[TransformerCacheView, PagesCacheView]]): Cache view for attention KVs.
+            cache_metadata (Optional[Union[TransformerMetadata, PagesMetadata]]): Metadata for paged attention.
+            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (Optional[Bool[Array, "batch seq_len seq_len"]]): Flash Chunking Mask (FCM) for attention.
+            frequencies (Optional[Float[Array, "seq_len head_dim//2 2"]]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: A tuple containing the output hidden states, optionally the attention weights, and cache view.
         """
 
         attn_outputs = self.self_attn(
@@ -531,19 +571,23 @@ class Qwen3DecoderLayer(nn.Module):
             fcm_mask,
             frequencies,
         )
-        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(
+            hidden_states + attn_outputs.attention_output, "residual"
+        )
 
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        feed_forward_input: Float[Array, "batch seq_len hidden_dim"] = self.post_attention_layernorm(hidden_states)
 
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            feed_forward_hidden_states: Float[Array, "batch seq_len hidden_dim"] = block_wise_ffn(
                 self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,
             )
         else:
-            feed_forward_hidden_states = self.mlp(feed_forward_input)
-        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
+            feed_forward_hidden_states: Float[Array, "batch seq_len hidden_dim"] = self.mlp(feed_forward_input)
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(
+            hidden_states + feed_forward_hidden_states, "residual"
+        )
         hidden_states = checkpoint_name(hidden_states, "layer_output")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -577,12 +621,16 @@ class Qwen3Model(EasyDeLBaseModule):
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
 
+    embed_tokens: nn.Embed
+    layers: list[Qwen3DecoderLayer]
+    norm: RMSNorm
+
     def __init__(
         self,
         config: Qwen3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -638,11 +686,11 @@ class Qwen3Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -653,21 +701,19 @@ class Qwen3Model(EasyDeLBaseModule):
         """Forward pass of the Qwen3Model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (Optional[Int[Array, "batch seq_len"]]): Input token IDs.
+            inputs_embeds (Optional[Float[Array, "batch seq_len hidden_dim"]]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
+            attention_mask (Optional[Bool[Array, "batch seq_len"]]): Mask to avoid performing attention on padding token indices.
+            position_ids (Optional[Int[Array, "batch seq_len"]]): Position indices for the tokens.
+            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs (unused).
+            output_attentions (Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+            output_hidden_states (Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (Optional[Union[TransformerCache, PagesCache]]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (Optional[Union[TransformerMetadata, PagesMetadata]]): Metadata for paged attention.
 
         Returns:
             BaseModelOutput: The model's output.
@@ -682,27 +728,31 @@ class Qwen3Model(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
         if inputs_embeds is None:
-            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+            inputs_embeds: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(
+                self.embed_tokens(input_ids.astype("i4")), "embeddings"
+            )
         batch_size, sequence_length, _ = inputs_embeds.shape
 
-        all_attentions = () if output_attentions else None
-        all_hidden_states = () if output_hidden_states else None
+        all_attentions: tuple[Float[Array, ...], ...] | None = () if output_attentions else None
+        all_hidden_states: tuple[Float[Array, "batch seq_len hidden_dim"], ...] | None = (
+            () if output_hidden_states else None
+        )
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
         if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+            attention_mask: Bool[Array, "batch seq_len"] = jnp.ones((batch_size, sequence_length), "b1")
         else:
             if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+                attention_mask: Bool[Array, "batch seq_len"] = jnp.astype(attention_mask == 1, "b1")
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
+            position_ids: Int[Array, "batch seq_len"] = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
-        hidden_states = inputs_embeds
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = inputs_embeds
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -740,7 +790,7 @@ class Qwen3Model(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
 
         if output_hidden_states:
@@ -753,27 +803,27 @@ class Qwen3Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
-    def get_encoder(self):
+    def get_encoder(self) -> None:
         """
         Returns the encoder part of the model's graph definition.
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
-    def get_decoder(self):
+    def get_decoder(self) -> "Qwen3Model":
         """
         Returns the decoder part of the model's graph definition.
         """
         return self
 
-    def get_lm_head(self):
+    def get_lm_head(self) -> None:
         """
         Returns the language model head of the module.
         Base Models don't have a Language Model Head.
         """
         raise NotImplementedError("The base model does not have a language model head.")
 
-    def get_embedding(self):
+    def get_embedding(self) -> nn.Embed:
         """
         Returns the embedding layer of the module.
         """
@@ -799,12 +849,15 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
         lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
     """
 
+    model: Qwen3Model
+    lm_head: ColumnParallelLinear
+
     def __init__(
         self,
         config: Qwen3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -853,11 +906,11 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -868,21 +921,19 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
         """Forward pass of the Qwen3ForCausalLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (Optional[Int[Array, "batch seq_len"]]): Input token IDs.
+            inputs_embeds (Optional[Float[Array, "batch seq_len hidden_dim"]]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
+            attention_mask (Optional[Bool[Array, "batch seq_len"]]): Mask to avoid performing attention on padding token indices.
+            position_ids (Optional[Int[Array, "batch seq_len"]]): Position indices for the tokens.
+            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs (unused).
+            output_attentions (Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+            output_hidden_states (Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (Optional[Union[TransformerCache, PagesCache]]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (Optional[Union[TransformerMetadata, PagesMetadata]]): Metadata for paged attention.
 
 
         Returns:
@@ -903,7 +954,7 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
             segment_ids=segment_ids,
         )
 
-        hidden_states = outputs.last_hidden_state
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = outputs.last_hidden_state
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -911,7 +962,7 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        lm_logits = None
+        lm_logits: Float[Array, "batch seq_len vocab_size"] | None = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
@@ -923,26 +974,26 @@ class Qwen3ForCausalLM(EasyDeLBaseModule):
             past_key_values=outputs.past_key_values,
         )
 
-    def get_encoder(self):
+    def get_encoder(self) -> None:
         """
         Returns the encoder part of the model's graph definition.
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
-    def get_decoder(self):
+    def get_decoder(self) -> Qwen3Model:
         """
         Returns the decoder part of the model's graph definition.
         """
         return self.model.get_decoder()
 
-    def get_lm_head(self):
+    def get_lm_head(self) -> ColumnParallelLinear:
         """
         Returns the language model head of the module.
         """
         return self.lm_head
 
-    def get_embedding(self):
+    def get_embedding(self) -> nn.Embed:
         """
         Returns the embedding layer of the module.
         """
@@ -968,12 +1019,15 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
         score (ParallelLinear): The linear layer for classification.
     """
 
+    model: Qwen3Model
+    score: ColumnParallelLinear
+
     def __init__(
         self,
         config: Qwen3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
+        precision: jax.lax.PrecisionLike | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -1021,11 +1075,11 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -1036,20 +1090,18 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
         """Forward pass of the Qwen3ForSequenceClassification model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (Optional[Int[Array, "batch seq_len"]]): Input token IDs.
+            inputs_embeds (Optional[Float[Array, "batch seq_len hidden_dim"]]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            attention_mask (Optional[Bool[Array, "batch seq_len"]]): Mask to avoid performing attention on padding token indices.
+            position_ids (Optional[Int[Array, "batch seq_len"]]): Position indices for the tokens.
+            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs (unused).
+            past_key_values (Optional[Union[TransformerCache, PagesCache]]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
+            cache_metadata (Optional[Union[TransformerMetadata, PagesMetadata]]): Metadata for paged attention.
+            output_attentions (Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+            output_hidden_states (Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
 
 
@@ -1074,8 +1126,8 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
             segment_ids=segment_ids,
         )
 
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
+        hidden_states: Float[Array, "batch seq_len hidden_dim"] = transformer_outputs.last_hidden_state
+        logits: Float[Array, "batch seq_len num_labels"] = self.score(hidden_states)
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
@@ -1083,6 +1135,8 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
 
         if self.config.pad_token_id is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+
+        sequence_lengths: int | Int[Array, ...]
         if self.config.pad_token_id is None:
             sequence_lengths = -1
         else:
@@ -1092,7 +1146,7 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
             else:
                 sequence_lengths = -1
 
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+        pooled_logits: Float[Array, "batch num_labels"] = logits[jnp.arange(batch_size), sequence_lengths]
 
         return SequenceClassifierOutput(
             logits=pooled_logits,
@@ -1101,27 +1155,27 @@ class Qwen3ForSequenceClassification(EasyDeLBaseModule):
             attentions=transformer_outputs.attentions,
         )
 
-    def get_encoder(self):
+    def get_encoder(self) -> None:
         """
         Returns the encoder part of the model's graph definition.
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
-    def get_decoder(self):
+    def get_decoder(self) -> Qwen3Model:
         """
         Returns the decoder part of the model's graph definition.
         """
         return self.model.get_decoder()
 
-    def get_lm_head(self):
+    def get_lm_head(self) -> None:
         """
         Returns the language model head of the module.
         This model has a sequence classification head, not an LM Head.
         """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
-    def get_embedding(self):
+    def get_embedding(self) -> nn.Embed:
         """
         Returns the embedding layer of the module.
         """

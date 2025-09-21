@@ -12,6 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Vanilla (standard) attention implementation for EasyDeL.
+
+This module provides a reference implementation of multi-head attention using
+standard JAX operations. It serves as both a baseline for comparison with optimized
+implementations and a fallback for platforms where specialized kernels are unavailable.
+
+The vanilla attention implementation:
+- Uses standard matrix multiplication and softmax operations
+- Supports all standard attention features (masking, bias, dropout)
+- Works on all platforms (TPU, GPU, CPU) without specialized kernels
+- Provides full attention weights for inspection when needed
+- Supports Grouped Query Attention (GQA) and Multi-Query Attention (MQA)
+
+Key characteristics:
+- Memory complexity: O(N²) where N is sequence length
+- Computation: Uses einsum for efficient batch matrix multiplication
+- Flexibility: Supports various mask and bias shapes
+- Compatibility: Works with any JAX backend without modification
+
+This implementation is ideal for:
+- Debugging and development
+- Small sequence lengths where memory is not a constraint
+- Platforms without optimized attention kernels
+- Cases where attention weights need to be inspected
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import VanillaAttn
+    >>>
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.float16,
+    ...     runtime_softmax_dtype=jnp.float32,  # Higher precision for softmax
+    ...     dropout_prob=0.1
+    ... )
+    >>> vanilla_attn = VanillaAttn(metadata)
+    >>> output = vanilla_attn(query, key, value, mask=attention_mask)
+    >>> attention_weights = output.attention_weights  # Available for inspection
+"""
+
 import typing as tp
 
 import jax
@@ -20,6 +59,8 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
@@ -60,15 +101,15 @@ class VanillaAttn(AttentionImpl):
     @jax.named_scope("easydel-vanillaimpl-native-xla")
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_q_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,  # Default to deterministic (no dropout)
         dropout_rng: jax.random.PRNGKey = None,
-        softmax_aux: Array | None = None,
+        softmax_aux: Float[Array, "..."] | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -79,22 +120,32 @@ class VanillaAttn(AttentionImpl):
         in float32), and optional dropout.
 
         Args:
-            q: Query tensor (B, T, H_q, D).
-            k: Key tensor (B, S, H_kv, D).
-            v: Value tensor (B, S, H_kv, D_v).
-            mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+            q: Query tensor with shape [batch, seq_len, num_q_heads, head_dim].
+                The main input sequence to attend from.
+            k: Key tensor with shape [batch, kv_len, num_kv_heads, head_dim].
+                Keys for attention computation. May have fewer heads than queries (GQA/MQA).
+            v: Value tensor with shape [batch, kv_len, num_kv_heads, head_dim].
+                Values to aggregate based on attention weights.
+            mask: Optional boolean mask with shape [batch, 1, seq_len, kv_len].
+                True values indicate positions to attend to, False positions are masked.
                 Used if `bias` is not provided.
-            bias: Optional attention bias tensor (broadcastable to B, H_q, T, S).
+            bias: Optional attention bias with shape [batch, num_heads, seq_len, kv_len].
+                Additive bias applied to attention scores before softmax.
                 Takes precedence over `mask`.
-            init_bias: Optional callable to initialize bias if mask/bias are None.
-            deterministic: If True, disables dropout.
-            dropout_rng: JAX PRNG key for dropout. Required if `deterministic` is False
-                and `dropout_prob` > 0.
-            **ignore: Ignored keyword arguments.
+            init_bias: Optional callable that returns bias tensor.
+                Used to lazily initialize bias if both mask and bias are None.
+            deterministic: If True, disables dropout (default). If False, applies dropout.
+            dropout_rng: JAX PRNG key for dropout. Required when deterministic=False
+                and dropout_prob > 0 in metadata.
+            softmax_aux: Optional auxiliary tensor for softmax computation.
+            **ignore: Additional keyword arguments that are ignored.
 
         Returns:
-            An `AttentionOutput` object containing the attention weights (if computed)
-            and the final attention outputs.
+            AttentionOutput containing:
+                - attention_outputs: Float[Array, "batch seq_len num_q_heads head_dim"]
+                  The attended representation.
+                - attention_weights: Float[Array, "batch num_heads seq_len kv_len"] | None
+                  The attention weights (if return_weights is True in metadata).
 
         Raises:
             NotImplementedError: If the bias head dimension cannot be reshaped correctly
@@ -200,36 +251,76 @@ class VanillaAttn(AttentionImpl):
         )
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Delegates to `forward_native`."""
+        """GPU forward pass. Delegates to `forward_native`.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_cuda(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """TPU forward pass. Delegates to `forward_native`."""
+        """TPU forward pass. Delegates to `forward_native`.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """CPU forward pass. Delegates to `forward_native`."""
+        """CPU forward pass. Delegates to `forward_native`.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """CUDA GPU forward pass. Delegates to `forward_native`."""
+        """CUDA GPU forward pass. Delegates to `forward_native`.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Delegates to `forward_native`."""
+        """ROCm GPU forward pass. Delegates to `forward_native`.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_native(*args, **kwargs)
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_q_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
         dropout_rng: jax.random.PRNGKey = None,
-        softmax_aux: Array | None = None,
+        softmax_aux: Float[Array, "..."] | None = None,
         **ignore,
     ) -> AttentionOutput:
         """

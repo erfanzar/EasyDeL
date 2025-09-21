@@ -40,6 +40,7 @@ from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -174,13 +175,13 @@ class OPTAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        causal_mask: chex.Array | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         key_value_states: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ) -> tuple[chex.Array]:
         """Forward pass of the OPTAttention module.
 
@@ -357,12 +358,12 @@ class OPTDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        causal_mask: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ) -> tuple[chex.Array]:
         """Forward pass of the OPTDecoderLayer.
 
@@ -608,9 +609,9 @@ class OPTDecoder(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -757,9 +758,9 @@ class OPTModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -873,9 +874,9 @@ class OPTForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -967,7 +968,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
         pad_token_id: int,
         starts: int | None = None,
         shardings=None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         # initializing the cache
         batch_size, seq_length = input_ids.shape

@@ -747,7 +747,7 @@ class AttentionModule(nn.Module):
 
         Raises:
             ValueError: If shapes are mismatched.
-        """  # noqa
+        """
 
         assert attention_mask.shape[-1] >= key.shape[1], "Attention mask length must match KV sequence length."
 

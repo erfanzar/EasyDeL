@@ -22,6 +22,7 @@ from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -298,9 +299,9 @@ class CLIPAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         """
@@ -412,7 +413,9 @@ class CLIPMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """
         Forward pass for the MLP layer.
 
@@ -495,9 +498,9 @@ class CLIPEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         """
@@ -586,8 +589,8 @@ class CLIPEncoder(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds: chex.Array,
-        attention_mask: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -688,9 +691,9 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -937,9 +940,9 @@ class CLIPTextModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1038,9 +1041,9 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> CLIPTextModelOutput:
@@ -1348,10 +1351,10 @@ class CLIPModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         pixel_values: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ) -> CLIPOutput:
@@ -1398,9 +1401,9 @@ class CLIPModel(EasyDeLBaseModule):
 
     def get_text_features(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
     ):
         text_outputs = self.text_model(
             input_ids=input_ids,

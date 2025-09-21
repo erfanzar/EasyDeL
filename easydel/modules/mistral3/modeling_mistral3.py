@@ -23,6 +23,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -40,7 +41,7 @@ logger = get_logger(__name__)
 
 @auto_pytree
 class Mistral3ModelOutput(BaseModelOutput):
-    image_hidden_states: chex.Array | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 @auto_pytree
@@ -83,7 +84,7 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
-    image_hidden_states: chex.Array | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 class Mistral3PatchMerger(nn.Module):
@@ -256,16 +257,16 @@ class Mistral3Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         image_sizes: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
@@ -372,12 +373,12 @@ class Mistral3Model(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -511,12 +512,12 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         return self.model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -532,17 +533,17 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         image_sizes: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         apply_lm_head: bool = True,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,

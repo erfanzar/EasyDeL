@@ -26,6 +26,7 @@ from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.inference.logits_process import (
     ForceTokensLogitsProcessor,
@@ -53,7 +54,7 @@ remat = nn.remat
 
 
 def shift_tokens_right(
-    input_ids: jnp.ndarray,
+    input_ids: Int[Array, "batch seq_len"],
     pad_token_id: int,
     decoder_start_token_id: int,
 ):
@@ -195,13 +196,13 @@ class WhisperAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         key_value_states: jnp.ndarray | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         cache_view: TransformerCacheView | None = None,
         cache_metadata: TransformerMetadata | None = None,
-        attention_mask: jnp.ndarray | None = None,
-        causal_mask: jnp.ndarray | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
     ) -> tuple[tp.Any, tp.Any]:
         """Forward pass of the attention module.
 
@@ -375,9 +376,9 @@ class WhisperEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        causal_mask: jnp.ndarray | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = True,
     ) -> tuple[jnp.ndarray]:
         """Forward pass of the encoder layer.
@@ -541,11 +542,11 @@ class WhisperDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        causal_mask: jnp.ndarray | None = None,
-        encoder_hidden_states: jnp.ndarray | None = None,
-        encoder_attention_mask: jnp.ndarray | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         cache_view: TransformerCacheView | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -896,10 +897,10 @@ class WhisperDecoder(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        position_ids: jnp.ndarray,
-        encoder_hidden_states: jnp.ndarray | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -1069,9 +1070,9 @@ class WhisperModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_features: jnp.ndarray,
-        decoder_input_ids: jnp.ndarray,
-        decoder_attention_mask: jnp.ndarray | None = None,
-        decoder_position_ids: jnp.ndarray | None = None,
+        decoder_input_ids: Int[Array, "batch seq_len"],
+        decoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -1144,10 +1145,10 @@ class WhisperModel(EasyDeLBaseModule):
 
     def decode(
         self,
-        encoder_hidden_states: jnp.ndarray,
-        decoder_input_ids: jnp.ndarray,
-        decoder_attention_mask: jnp.ndarray | None = None,
-        decoder_position_ids: jnp.ndarray | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        decoder_input_ids: Int[Array, "batch seq_len"],
+        decoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -1317,8 +1318,8 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
         self,
         input_features,
         decoder_input_ids,
-        decoder_attention_mask: jnp.ndarray | None = None,
-        decoder_position_ids: jnp.ndarray | None = None,
+        decoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -1364,9 +1365,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
         self,
         decoder_input_ids,
         encoder_outputs,
-        encoder_attention_mask: jnp.ndarray | None = None,
-        decoder_attention_mask: jnp.ndarray | None = None,
-        decoder_position_ids: jnp.ndarray | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        decoder_position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | None = None,
         cache_metadata: TransformerMetadata | None = None,
@@ -1422,7 +1423,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
     def encode(
         self,
         input_features: jnp.ndarray,
-        attention_mask: jnp.ndarray | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
@@ -1506,7 +1507,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
         input_features: jax.Array,
         forced_decoder_ids: jax.Array,
         return_timestamps: bool = False,
-        generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
+        generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # type:ignore
         **kwargs,
     ):
         if generation_config is None:

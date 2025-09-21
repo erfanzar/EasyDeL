@@ -12,6 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Scaled Dot-Product Attention implementation using JAX's optimized primitives.
+
+This module provides an attention implementation that leverages JAX's
+`jax.nn.dot_product_attention` API, which automatically dispatches to
+the most efficient implementation available on the current hardware.
+
+Key features:
+- Automatic backend selection (XLA, cuDNN, Flash Attention)
+- Support for multiple hardware backends (TPU, GPU, CPU)
+- Efficient handling through JAX's SDPA primitive
+- Automatic optimization based on hardware capabilities
+- Compatible with various attention patterns (causal, masked, biased)
+
+Implementation details:
+- On CUDA GPUs: Uses cuDNN's optimized attention kernels
+- On TPUs/CPUs: Uses XLA's optimized implementations
+- Automatically selects Flash Attention when available
+- Handles sharding for distributed computation
+
+The implementation is registered under multiple names:
+- "sdpa": Scaled Dot-Product Attention (generic name)
+- "cudnn": Specifically for CUDA/cuDNN backend
+- "cuda_flash_attn2": For Flash Attention v2 on CUDA
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import ScaledDotProductAttn
+    >>>
+    >>> # Configure for efficient SDPA
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.float16,
+    ...     softmax_scale=1.0 / math.sqrt(head_dim)
+    ... )
+    >>> sdpa_attn = ScaledDotProductAttn(metadata)
+    >>>
+    >>> # Automatically uses best available implementation
+    >>> output = sdpa_attn(query, key, value, mask=attention_mask, causal=True)
+
+Note:
+    JAX will automatically select the best implementation based on:
+    - Hardware availability (GPU with cuDNN, TPU, CPU)
+    - Tensor shapes and dtypes
+    - JAX version and installed libraries
+    - Specific operation parameters (causal, mask type)
+
+References:
+    - JAX documentation on dot_product_attention
+    - NVIDIA cuDNN documentation
+    - Flash Attention papers and implementations
+"""
+
 import functools
 import typing as tp
 
@@ -22,6 +73,8 @@ from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental.shard_map import shard_map
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 
@@ -63,12 +116,12 @@ class ScaledDotProductAttn(AttentionImpl):
     @jax.named_scope("easydel-sdpaimpl-native-xla")
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:
@@ -133,26 +186,50 @@ class ScaledDotProductAttn(AttentionImpl):
             )
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Delegates to the CUDA-specific implementation."""
+        """GPU forward pass. Delegates to the CUDA-specific implementation.
+
+        Args:
+            *args: Positional arguments for attention calculation.
+            **kwargs: Keyword arguments for attention calculation.
+
+        Returns:
+            AttentionOutput: Result from CUDA-optimized implementation.
+        """
         return self.forward_cuda(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-        """TPU forward pass. Delegates to `forward_native` (XLA implementation)."""
+        """TPU forward pass. Delegates to `forward_native` (XLA implementation).
+
+        Args:
+            *args: Positional arguments for attention calculation.
+            **kwargs: Keyword arguments for attention calculation.
+
+        Returns:
+            AttentionOutput: Result from XLA-optimized implementation.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """CPU forward pass. Delegates to `forward_native` (XLA implementation)."""
+        """CPU forward pass. Delegates to `forward_native` (XLA implementation).
+
+        Args:
+            *args: Positional arguments for attention calculation.
+            **kwargs: Keyword arguments for attention calculation.
+
+        Returns:
+            AttentionOutput: Result from XLA-optimized implementation.
+        """
         return self.forward_native(*args, **kwargs)
 
     @jax.named_scope("easydel-sdpaimpl-gpu-cuda")
     def forward_cuda(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:
@@ -216,18 +293,28 @@ class ScaledDotProductAttn(AttentionImpl):
             )
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Currently delegates to `forward_native`."""
+        """ROCm GPU forward pass. Currently delegates to `forward_native`.
+
+        Future versions may include ROCm-specific optimizations.
+
+        Args:
+            *args: Positional arguments for attention calculation.
+            **kwargs: Keyword arguments for attention calculation.
+
+        Returns:
+            AttentionOutput: Result from XLA implementation.
+        """
         # ROCm might require a specific implementation ("hipblaslt"?) if supported by JAX SDPA
         return self.forward_native(*args, **kwargs)
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:

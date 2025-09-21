@@ -12,6 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Core attention operator implementation framework for EasyDeL.
+
+This module provides the foundational classes and abstractions for implementing
+various attention mechanisms in JAX. It includes:
+
+- AttentionOutput: Container for attention computation results
+- AttentionMetadata: Configuration and runtime metadata for attention operations
+- AttentionImpl: Abstract base class for specific attention implementations
+- AttentionRegistry: Plugin system for discovering and managing attention implementations
+
+The module supports multiple attention backends (TPU, GPU, CPU) and provides
+common utilities for mask handling, head repetition (for GQA/MQA), and sharding
+specifications for distributed computation.
+
+Key Design Principles:
+1. Backend-agnostic interface with backend-specific optimizations
+2. Support for various attention patterns (vanilla, flash, ring, etc.)
+3. Efficient handling of different tensor layouts (BTHD vs BHTD)
+4. Integration with JAX's sharding and parallelism features
+5. Flexible metadata system for runtime configuration
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata, AttentionRegistry
+    >>>
+    >>> # Create metadata for attention configuration
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.float16,
+    ...     softmax_scale=1.0 / math.sqrt(head_dim),
+    ...     dropout_prob=0.1
+    ... )
+    >>>
+    >>> # Get and instantiate a specific attention implementation
+    >>> attn_impl = AttentionRegistry.create("flash", metadata)
+    >>>
+    >>> # Use the attention implementation
+    >>> output = attn_impl(query, key, value, mask=attention_mask)
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -28,6 +66,8 @@ from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
@@ -54,16 +94,31 @@ class AttentionOutput:
     """
     Container for the outputs of an attention operation.
 
+    This dataclass encapsulates the results of attention computation, including
+    the final attended representations and optionally the attention weights.
+
     Attributes:
-        attention_weights: The attention probabilities, typically of shape
-            (batch, num_heads, query_seq_len, key_value_seq_len). Optional.
-        attention_outputs: The final weighted sum of values, typically of shape
-            (batch, query_seq_len, num_heads, head_dim) or (batch, num_heads, query_seq_len, head_dim).
-            Optional.
+        attention_weights: Float[Array, "batch num_heads seq_len seq_len"] | None
+            The attention probabilities after softmax, showing how much each query
+            position attends to each key position. Shape represents:
+            - batch: Batch dimension
+            - num_heads: Number of attention heads
+            - seq_len (first): Query sequence length
+            - seq_len (second): Key/value sequence length
+            Optional, as some implementations may not compute/return weights for efficiency.
+
+        attention_outputs: Float[Array, "batch seq_len num_heads head_dim"] | None
+            The final attended representation after applying attention weights to values.
+            Shape represents:
+            - batch: Batch dimension
+            - seq_len: Query sequence length
+            - num_heads: Number of attention heads
+            - head_dim: Dimension per attention head
+            This is the primary output used in transformer models.
     """
 
-    attention_weights: Array | None = None
-    attention_outputs: Array | None = None
+    attention_weights: Float[Array, "batch num_heads seq_len seq_len"] | None = None
+    attention_outputs: Float[Array, "batch seq_len num_heads head_dim"] | None = None
 
 
 @auto_pytree
@@ -380,7 +435,7 @@ class AttentionImpl(BaseOperation):
             The `AttentionMetadata` instance passed during initialization.
         """
 
-    def get_mode(self, q: jax.Array, BTHD: bool = True) -> RUNTIME_MODE_TYPES:  # type:ignore
+    def get_mode(self, q: Float[Array, "batch ... num_heads head_dim"], BTHD: bool = True) -> RUNTIME_MODE_TYPES:  # type:ignore
         """
         Determines the runtime mode (normal or generation) based on query shape.
 
@@ -403,7 +458,9 @@ class AttentionImpl(BaseOperation):
         return jax.default_backend()
 
     @staticmethod
-    def _split_attention_mask(attn_mask: Array) -> tuple[Array, Array]:
+    def _split_attention_mask(
+        attn_mask: Bool[Array, "... seq_len seq_len"],
+    ) -> tuple[Bool[Array, "... seq_len"], Bool[Array, "... seq_len"]]:
         """
         Splits a combined attention mask into separate query and key-value masks.
 
@@ -429,7 +486,9 @@ class AttentionImpl(BaseOperation):
         )
 
     @staticmethod
-    def _combine_query_kv_masks(q_mask: Array, kv_mask: Array) -> Array:
+    def _combine_query_kv_masks(
+        q_mask: Bool[Array, "... q_seq"], kv_mask: Bool[Array, "... kv_seq"]
+    ) -> Bool[Array, "... q_seq kv_seq"]:
         """
         Combines separate query and key-value masks into a standard attention mask.
 
@@ -450,7 +509,7 @@ class AttentionImpl(BaseOperation):
         return q_mask * kv_mask
 
     @staticmethod
-    def _create_causal_mask(qseq: int) -> Array:
+    def _create_causal_mask(qseq: int) -> Bool[Array, "seq_len seq_len"]:
         """
         Creates a causal attention mask (lower triangular).
 
@@ -465,10 +524,10 @@ class AttentionImpl(BaseOperation):
 
     @staticmethod
     def repeat_kv_heads(
-        k: Array,
-        v: Array,
+        k: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        v: Float[Array, "batch seq_len num_kv_heads head_dim"],
         num_reps: int,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch seq_len num_q_heads head_dim"]]:
         """
         Repeats Key and Value heads for Grouped Query Attention (GQA) or Multi-Query Attention (MQA).
 
@@ -490,10 +549,10 @@ class AttentionImpl(BaseOperation):
 
     def _handle_kvhead(
         self,
-        array: Array | None,
+        array: Float[Array, "batch heads q_seq kv_seq"] | None,
         num_q_heads: int,
         num_kv_heads: int,
-    ) -> Array | None:
+    ) -> Float[Array, "batch num_q_heads q_seq kv_seq"] | None:
         """
         Processes an attention bias or similar array based on head configuration (GQA/MQA).
 
@@ -538,7 +597,7 @@ class AttentionImpl(BaseOperation):
         preserved_indices: list[int] | None = None,
         clone_ps: Ps | None = None,
         dep: Ps | bool | None = True,
-        tensor: jax.Array | None = None,
+        tensor: Float[Array, "..."] | None = None,
     ) -> Ps | None:
         """
         Helper to create a PartitionSpec, potentially preserving only certain axes.
