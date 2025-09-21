@@ -15,7 +15,6 @@
 
 import functools
 
-import chex
 import jax.lax
 from chex import Array
 from eformer import common_types

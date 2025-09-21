@@ -67,8 +67,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float, Int
 
 from easydel.kernels.gpu_ops import pallas_ragged_decode as gpu_pallas_ragged_decode
 from easydel.kernels.tpu_ops import pallas_ragged_decode as tpu_pallas_ragged_decode

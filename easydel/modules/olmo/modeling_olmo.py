@@ -15,7 +15,6 @@
 
 import functools
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types

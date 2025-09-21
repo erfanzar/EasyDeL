@@ -53,7 +53,6 @@ from math import prod
 from typing import Self
 
 import jax
-from jaxtyping import Array, Bool, Float, Int
 
 
 def cdiv(a: int, b: int) -> int:

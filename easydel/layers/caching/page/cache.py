@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import typing as tp
 
-import chex as cx
 import jax
 import jax.experimental
 import jax.numpy as jnp
@@ -29,7 +28,7 @@ from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int
 
 from easydel.utils.helpers import check_bool_flag
 

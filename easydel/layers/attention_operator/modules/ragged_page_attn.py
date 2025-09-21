@@ -19,8 +19,7 @@ import jax
 from eformer import common_types as ct
 from jax import Array
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.gpu_ops import triton_ragged_paged_attention
