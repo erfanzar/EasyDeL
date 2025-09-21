@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import typing as tp
 
-import chex as cx
 import jax
 from eformer import escale as es
 from eformer.jaximus import ImplicitArray

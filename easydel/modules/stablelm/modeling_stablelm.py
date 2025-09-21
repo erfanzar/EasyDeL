@@ -15,7 +15,6 @@
 
 from functools import cached_property, partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types

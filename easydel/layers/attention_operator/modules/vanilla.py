@@ -59,8 +59,7 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float
 
 from .._attention_impl import AttentionImpl, AttentionMetadata, AttentionOutput, AttentionRegistry
 

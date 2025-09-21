@@ -72,8 +72,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float
 
 from easydel.kernels.tpu_ops import pallas_ring_attention
 

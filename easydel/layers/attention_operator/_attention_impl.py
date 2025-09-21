@@ -66,8 +66,7 @@ from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
