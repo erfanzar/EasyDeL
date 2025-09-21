@@ -25,6 +25,7 @@ from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -94,7 +95,7 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
-    image_hidden_states: chex.Array | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 def bmm(inputs, kernel, precision):
@@ -185,7 +186,7 @@ class Llama4TextExperts(nn.Module):
 
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         hidden_states = hidden_states.reshape(self.num_experts, -1, self.hidden_size)
         gate_up = bmm(hidden_states, self.gate_up_proj, self.precision)
         gate, up = jnp.split(gate_up, 2, axis=-1)
@@ -261,7 +262,7 @@ class Llama4TextMLP(nn.Module):
         self.up_proj = column_parallel_linear(config.hidden_size, intermediate_size)
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
@@ -318,7 +319,9 @@ class Llama4TextMoe(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         batch, seq_len, hidden_dim = hidden_states.shape
         assert hidden_dim == self.hidden_dim, "Input hidden_dim mismatch"
 
@@ -420,17 +423,17 @@ class Llama4TextAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
         batch_size, sequence_length = hidden_states.shape[:2]
         input_shape = hidden_states.shape[:-1]
@@ -585,18 +588,18 @@ class Llama4TextDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -692,11 +695,11 @@ class Llama4TextModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -879,11 +882,11 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -1022,11 +1025,11 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -1158,7 +1161,7 @@ class Llama4VisionMLP2(nn.Module):
         self.fc1 = linear_class(self.intermediate_size, config.projector_input_dim)
         self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
         return self.activation_fn(hidden_states)
 
@@ -1195,7 +1198,7 @@ class Llama4MultiModalProjector(nn.Module):
             kernel_init=jax.nn.initializers.normal(0.01),
         )
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         return self.linear_1(hidden_states)
 
 
@@ -1344,8 +1347,8 @@ class Llama4VisionAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        frequencies: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
         output_attentions: bool = False,
     ) -> AttentionLayerOutput:
         input_shape = hidden_states.shape[:-1]
@@ -1422,7 +1425,7 @@ class Llama4VisionMLP(nn.Module):
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
         self.activation_fn = ACT2FN["gelu"]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
@@ -1497,9 +1500,9 @@ class Llama4VisionEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1644,7 +1647,7 @@ class Llama4UnfoldConvolution(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
         batch_size = hidden_states.shape[0]
 
         hidden_states_nhwc = jnp.transpose(hidden_states, (0, 2, 3, 1))
@@ -1913,15 +1916,15 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
@@ -2053,12 +2056,12 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         """Prepares inputs for text generation, including pixel values if provided.
 

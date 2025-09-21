@@ -55,12 +55,15 @@ Example:
     ... )
 """
 
+from __future__ import annotations
+
 import chex as cx
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from jaxtyping import Array, Bool, Float, Int
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
@@ -179,9 +182,9 @@ class Mamba2CacheView(BaseCacheView):
         layer_index (int | None): Layer index in model.
     """
 
-    conv_states: cx.Array | ImplicitArray
-    ssm_states: cx.Array | ImplicitArray
-    positions: cx.Array
+    conv_states: Float[Array, "batch extended_size conv_kernel_size"] | ImplicitArray
+    ssm_states: Float[Array, "batch num_heads head_dim state_size"] | ImplicitArray
+    positions: Int[Array, "batch"]  # noqa: F821
     seqlen_offset: int
     metadata: Mamba2CacheMetaData
     layer_index: int | None = None
@@ -193,7 +196,27 @@ class Mamba2CacheView(BaseCacheView):
         partition_specs: PartitionSpec,
         dtype: jnp.dtype,
         layer_index: int | None = None,
-    ):
+    ) -> Mamba2CacheView:
+        """Initialize a Mamba2 cache view with zero states.
+
+        Creates cache tensors for the extended Mamba2 architecture,
+        including multi-head SSM states and expanded convolutional
+        buffers that incorporate group normalization dimensions.
+
+        Args:
+            metadata (Mamba2CacheMetaData): Configuration for cache dimensions.
+            partition_specs (PartitionSpec): Sharding specification for
+                distributed execution.
+            dtype (jnp.dtype): Data type for state tensors.
+            layer_index (int | None): Optional layer index in model.
+
+        Returns:
+            Mamba2CacheView: Initialized cache view with allocated tensors.
+
+        Note:
+            Conv state size is extended by 2*n_groups*state_size to
+            accommodate group normalization features.
+        """
         return cls(
             conv_states=with_sharding_constraint(
                 arr=jnp.zeros(
@@ -224,14 +247,24 @@ class Mamba2CacheView(BaseCacheView):
             seqlen_offset=0,
         )
 
-    def concatenate_to_cache(self, *args, **kwargs):
+    def concatenate_to_cache(self, *args, **kwargs) -> tuple:
+        """Not implemented for Mamba2 cache.
+
+        Mamba2 uses separate update methods for conv and SSM states.
+
+        Raises:
+            NotImplementedError: Always raised.
+
+        Note:
+            Use `update_conv_state()` and `update_ssm_state()` instead.
+        """
         raise NotImplementedError()
 
     def update_conv_state(
         self,
-        new_conv_state: cx.Array,
-        cache_position: cx.Array,
-    ) -> "Mamba2CacheView":
+        new_conv_state: Float[Array, "batch extended_size"],
+        cache_position: Int[Array, "..."],
+    ) -> Mamba2CacheView:
         """Update convolutional state with new values.
 
         Maintains a rolling buffer of convolutional states, with
@@ -253,8 +286,8 @@ class Mamba2CacheView(BaseCacheView):
 
     def update_ssm_state(
         self,
-        new_ssm_state: cx.Array,
-    ) -> "Mamba2CacheView":
+        new_ssm_state: Float[Array, "batch num_heads head_dim state_size"],
+    ) -> Mamba2CacheView:
         """Update SSM state with head-structured representation.
 
         Replaces the multi-head SSM state with new values,
@@ -270,7 +303,7 @@ class Mamba2CacheView(BaseCacheView):
         self.ssm_states = new_ssm_state
         return self
 
-    def reset(self) -> "Mamba2CacheView":
+    def reset(self) -> Mamba2CacheView:
         """Reset all cache states to zeros.
 
         Clears both convolutional and SSM states while preserving
@@ -305,7 +338,30 @@ class Mamba2Cache(BaseCache):
         metadata: Mamba2CacheMetaData,
         dtype: jnp.dtype | None = None,
         partition_specs: PartitionSpec | None = None,
-    ):
+    ) -> Mamba2Cache:
+        """Initialize a complete Mamba2 cache for all layers.
+
+        Creates a fully initialized cache with allocated storage for
+        the specified number of layers. Each layer gets independent
+        multi-head SSM states and convolutional buffers.
+
+        Args:
+            num_hidden_layers (int): Number of Mamba2 layers to initialize.
+            metadata (Mamba2CacheMetaData): Configuration for cache dimensions.
+            dtype (jnp.dtype | None): Data type for tensors. Defaults to bfloat16.
+            partition_specs (PartitionSpec | None): Sharding specification.
+                If None, creates default spec with batch, head, and sequence axes.
+
+        Returns:
+            Mamba2Cache: Fully initialized multi-layer cache.
+
+        Example:
+            >>> cache = Mamba2Cache.init_cache(
+            ...     num_hidden_layers=32,
+            ...     metadata=metadata,
+            ...     dtype=jnp.float32
+            ... )
+        """
         paxis = PartitionAxis()
         partition_specs = partition_specs or PartitionSpec(
             paxis.batch_axis,
@@ -330,9 +386,9 @@ class Mamba2Cache(BaseCache):
     def update_conv_state(
         self,
         layer_idx: int,
-        new_conv_state: cx.Array,
-        cache_position: cx.Array,
-    ) -> "Mamba2Cache":
+        new_conv_state: Float[Array, "batch extended_size"],
+        cache_position: Int[Array, "..."],
+    ) -> Mamba2Cache:
         """
         Update the convolutional state for a specific layer.
 
@@ -359,8 +415,8 @@ class Mamba2Cache(BaseCache):
     def update_ssm_state(
         self,
         layer_idx: int,
-        new_ssm_state: cx.Array,
-    ) -> "Mamba2Cache":
+        new_ssm_state: Float[Array, "batch num_heads head_dim state_size"],
+    ) -> Mamba2Cache:
         """
         Update the SSM state for a specific layer.
 
@@ -382,7 +438,7 @@ class Mamba2Cache(BaseCache):
         new_views[layer_idx] = updated_view
         return self.replace(views=new_views)
 
-    def reset(self) -> "Mamba2Cache":
+    def reset(self) -> Mamba2Cache:
         """
         Reset all cache views to their initial state.
 
@@ -393,10 +449,24 @@ class Mamba2Cache(BaseCache):
         return self.replace(views=new_views)
 
     @classmethod
-    def init_empty(cls, num_hidden_layers):
+    def init_empty(cls, num_hidden_layers: int) -> Mamba2Cache:
+        """Initialize an empty Mamba2 cache structure.
+
+        Creates a cache with None placeholders for gradual initialization.
+
+        Args:
+            num_hidden_layers (int): Number of layer placeholders.
+
+        Returns:
+            Mamba2Cache: Cache with uninitialized views.
+
+        Example:
+            >>> cache = Mamba2Cache.init_empty(32)
+            >>> # Initialize layers individually later
+        """
         return cls(views=[None for _ in range(num_hidden_layers)])
 
-    def update_seq(self, num):
+    def update_seq(self, num: int) -> None:
         """Update sequence positions across all layers.
 
         Increments position tracking for sequence continuation,
@@ -413,7 +483,7 @@ class Mamba2Cache(BaseCache):
                 view.positions += num
                 view.seqlen_offset += num
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     __str__ = __repr__

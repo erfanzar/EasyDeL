@@ -86,6 +86,8 @@ from jax import numpy as jnp
 from jax.extend.core import Primitive
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
+from jaxtyping import Array as JAXArray
+from jaxtyping import Bool, Float, Int
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
@@ -139,7 +141,7 @@ def _(
     update: tp.Any,
     *args,
     **kwargs,
-):
+) -> JAXArray:
     """Register handler for dynamic_update_slice with ImplicitArray operand.
 
     Materializes the implicit array before performing the update operation.
@@ -166,7 +168,7 @@ def _(
     update: ImplicitArray,
     *args,
     **kwargs,
-):
+) -> JAXArray:
     update = update.materialize()
     return primitive.bind(operand, update, *args)
 
@@ -178,7 +180,7 @@ def _(
     update: ImplicitArray,
     *args,
     **kwargs,
-):
+) -> JAXArray:
     operand = operand.materialize()
     update = update.materialize()
     return primitive.bind(operand, update, *args)
@@ -337,10 +339,10 @@ class TransformerCacheView(BaseCacheView):
         masking_details (AttnMaskDetail | None): Attention mask configuration.
     """
 
-    key: cx.Array | ImplicitArray
-    value: cx.Array | ImplicitArray
-    indexs: cx.Array | ImplicitArray
-    starts: cx.Array | ImplicitArray
+    key: Float[JAXArray, "batch seq_len num_key_heads key_dim"] | ImplicitArray
+    value: Float[JAXArray, "batch seq_len num_value_heads value_dim"] | ImplicitArray
+    indexs: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
+    starts: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
 
     metadata: TransformerCacheMetaData
 
@@ -357,7 +359,7 @@ class TransformerCacheView(BaseCacheView):
         metadata: TransformerCacheMetaData,
         quantizer: EasyQuantizer,
         partition_manager: PartitionManager,
-        starts: jax.Array | None = None,
+        starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
         layer_index: int | None = None,
         masking_details: AttnMaskDetail | None = None,
     ):
@@ -422,17 +424,23 @@ class TransformerCacheView(BaseCacheView):
     @jax.named_scope("easydel-transformer-cacheview-concatenate-to-cache")
     def concatenate_to_cache(
         self,
-        query: cx.Array,
-        key: cx.Array,
-        value: cx.Array,
+        query: Float[JAXArray, "batch query_len num_heads head_dim"],
+        key: Float[JAXArray, "batch query_len num_key_heads key_dim"],
+        value: Float[JAXArray, "batch query_len num_value_heads value_dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         quantizer: EasyQuantizer,
         cache_metadata: TransformerMetadata | None,
-        attention_mask: cx.Array,
+        attention_mask: Bool[JAXArray, "batch 1 query_len seq_len"] | Float[JAXArray, "batch 1 query_len seq_len"],
         partition_manager: PartitionManager,
-        causal_mask: cx.Array | None = None,
-        token_type_ids: cx.Array | None = None,
-    ) -> tuple[cx.Array, cx.Array, cx.Array, TransformerCacheView, AttnMaskDetail | None]:
+        causal_mask: Bool[JAXArray, "batch 1 query_len seq_len"] | None = None,
+        token_type_ids: Int[JAXArray, "batch query_len"] | None = None,
+    ) -> tuple[
+        Float[JAXArray, "batch seq_len num_key_heads key_dim"],
+        Float[JAXArray, "batch seq_len num_value_heads value_dim"],
+        Bool[JAXArray, "batch 1 query_len seq_len"],
+        TransformerCacheView,
+        AttnMaskDetail | None,
+    ]:
         """
         Updates the KV cache functionally and returns the updated tensors along with the appropriate attention mask.
 
@@ -461,7 +469,9 @@ class TransformerCacheView(BaseCacheView):
         batch_dims = self.value.shape[0]
         sharding_statics = dict(mode=MODE_PREFILL, partition_manager=partition_manager)
 
-        def _kv_struct_shard(x: cx.Array) -> cx.Array:
+        def _kv_struct_shard(
+            x: Float[JAXArray, "batch seq_len num_heads head_dim"],
+        ) -> Float[JAXArray, "batch seq_len num_heads head_dim"]:
             return apply_logical_sharding(x, axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM], **sharding_statics)
 
         if attention_mask.ndim == 2:
@@ -474,7 +484,9 @@ class TransformerCacheView(BaseCacheView):
                 causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
 
             @partial(jax.vmap, in_axes=(0, 0), out_axes=0)
-            def _mask_slice(mask, slot):
+            def _mask_slice(
+                mask: Bool[JAXArray, "1 seq_len seq_len"], slot: Int[JAXArray, ""]
+            ) -> Bool[JAXArray, "1 query_len seq_len"]:
                 return lax.dynamic_slice(
                     mask,
                     (0, slot, 0),
@@ -497,17 +509,25 @@ class TransformerCacheView(BaseCacheView):
         else:
             attention_mask = attention_mask
 
-        def _maybe_materialize(x):
+        def _maybe_materialize(x: JAXArray | ImplicitArray) -> JAXArray:
             if hasattr(x, "materialize"):
                 x = x.materialize()
             return x
 
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
-        def _update_kv(old, new, slot):
+        def _update_kv(
+            old: Float[JAXArray, "seq_len num_heads head_dim"],
+            new: Float[JAXArray, "query_len num_heads head_dim"],
+            slot: Int[JAXArray, ""],
+        ) -> Float[JAXArray, "seq_len num_heads head_dim"]:
             return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
 
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
-        def _update_kv_sliding(old_cache, new_values, current_index):
+        def _update_kv_sliding(
+            old_cache: Float[JAXArray, "window_size num_heads head_dim"],
+            new_values: Float[JAXArray, "query_len num_heads head_dim"],
+            current_index: Int[JAXArray, ""],
+        ) -> Float[JAXArray, "window_size num_heads head_dim"]:
             """Update sliding window KV cache."""
             new_len = new_values.shape[0]
             window_size = old_cache.shape[0]
@@ -559,7 +579,7 @@ class TransformerCacheView(BaseCacheView):
             return self.__class__.__name__ + f"(key={self.key}, value={self.value}, layer_index={self.layer_index})"
 
     @property
-    def is_empty(self):
+    def is_empty(self) -> bool:
         return self.key is None
 
     __str__ = __repr__
@@ -593,7 +613,7 @@ class TransformerCache(BaseCache):
         metadata: TransformerCacheMetaData,
         partition_manager: PartitionManager,
         dtype: jnp.dtype | None = None,
-        starts: jax.Array | None = None,
+        starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
         quantizer: EasyQuantizer | None = None,
         mask_type_details: dict[int, AttnMaskDetail] | None = None,
     ):
@@ -621,7 +641,7 @@ class TransformerCache(BaseCache):
                 ]
             )
 
-    def to_pure(self):
+    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray]], TransformerCacheMetaData]:
         """Convert cache to pure Python data structure for serialization.
 
         Extracts raw tensors and metadata for checkpointing or transfer.
@@ -638,7 +658,9 @@ class TransformerCache(BaseCache):
         )
 
     @classmethod
-    def from_pure(cls, pure, metadata):
+    def from_pure(
+        cls, pure: list[list[JAXArray | ImplicitArray]], metadata: TransformerCacheMetaData
+    ) -> TransformerCache:
         """Reconstruct cache from pure Python data structure.
 
         Restores a cache from serialized tensors and metadata,
@@ -664,7 +686,9 @@ class TransformerCache(BaseCache):
             ]
         )
 
-    def insert_starts(self, starts, slot: int, partition_manager: PartitionManager):
+    def insert_starts(
+        self, starts: Int[JAXArray, "..."], slot: int, partition_manager: PartitionManager
+    ) -> TransformerCache:
         """Insert starting positions at specified batch slot.
 
         Updates the starting position indices for a specific batch slot
@@ -692,7 +716,9 @@ class TransformerCache(BaseCache):
             )
         return self
 
-    def insert_index(self, index, slot: int, partition_manager: PartitionManager):
+    def insert_index(
+        self, index: Int[JAXArray, "..."], slot: int, partition_manager: PartitionManager
+    ) -> TransformerCache:
         """Insert position indices at specified batch slot.
 
         Updates the current position indices for a specific batch slot
@@ -742,7 +768,7 @@ class TransformerCache(BaseCache):
             TransformerCache: Updated cache instance.
         """
 
-        def _maybe_materialize(x: ImplicitArray | Array):
+        def _maybe_materialize(x: ImplicitArray | JAXArray) -> JAXArray:
             if hasattr(x, "materialize"):
                 x = x.materialize()
             return x
@@ -796,7 +822,7 @@ class TransformerCache(BaseCache):
         return self
 
     @classmethod
-    def init_empty(cls, num_hidden_layers):
+    def init_empty(cls, num_hidden_layers: int) -> TransformerCache:
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self):
@@ -823,5 +849,5 @@ class TransformerMetadata(BaseRunTimeMetadata):
     """
 
     postpadded: bool = False
-    starts: jax.Array | None = None
-    indexs: jax.Array | None = None
+    starts: Int[JAXArray, "batch"] | None = None  # noqa: F821
+    indexs: Int[JAXArray, "batch"] | None = None  # noqa: F821

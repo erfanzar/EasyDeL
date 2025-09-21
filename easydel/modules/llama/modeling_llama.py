@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -94,7 +95,9 @@ class LlamaMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Apply SwiGLU feedforward transformation.
 
         Args:
@@ -183,18 +186,18 @@ class LlamaAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> AttentionLayerOutput:
         """Apply multi-head attention with RoPE.
 
         Args:
@@ -349,18 +352,18 @@ class LlamaDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-    ):
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+    ) -> DecoderLayerOutput:
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             attention_mask,
@@ -467,11 +470,11 @@ class LlamaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -658,11 +661,11 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -808,11 +811,11 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,

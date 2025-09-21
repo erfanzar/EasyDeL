@@ -22,6 +22,7 @@ from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -243,7 +244,7 @@ class PixtralMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         """Forward pass of the PixtralMLP module.
 
         Args:
@@ -356,11 +357,11 @@ class PixtralAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the PixtralAttention module.
 
@@ -533,11 +534,11 @@ class PixtralBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the PixtralBlock module.
 
@@ -630,10 +631,10 @@ class PixtralTransformer(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds: chex.Array,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         position_embeddings: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:

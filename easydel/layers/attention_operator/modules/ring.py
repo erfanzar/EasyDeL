@@ -12,6 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ring Attention implementation for distributed and ultra-long sequence processing.
+
+This module implements Ring Attention, a technique for computing attention over
+extremely long sequences that exceed single-device memory capacity. Ring Attention
+partitions sequences across devices and uses a ring communication pattern to
+compute exact attention without approximation.
+
+Key concepts:
+- **Ring Topology**: Devices arranged in a ring, each holding a chunk of the sequence
+- **Blockwise Processing**: Attention computed in blocks to minimize memory usage
+- **Communication Pattern**: Each device passes its KV chunks around the ring
+- **Exact Computation**: Produces the same result as standard attention
+
+The implementation provides:
+1. Native JAX scan-based version for all backends
+2. TPU-optimized Pallas kernel for maximum performance
+3. Support for sequences > 100K tokens
+4. Memory usage O(N/P) where N=sequence length, P=number of devices
+
+Ring Attention is ideal for:
+- Training on very long documents or books
+- Processing entire codebases as context
+- Multi-document reasoning tasks
+- Any scenario requiring exact attention over long sequences
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import RingAttn
+    >>>
+    >>> # Configure for distributed execution
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.bfloat16,
+    ...     blocksize_q=512,  # Query block size
+    ...     blocksize_k=1024,  # Key block size
+    ...     sequence_axis_name="sp",  # Sequence parallel axis
+    ...     scan_ring_attention=True
+    ... )
+    >>> ring_attn = RingAttn(metadata)
+    >>>
+    >>> # Process ultra-long sequences
+    >>> output = ring_attn(query, key, value, causal=True)
+
+References:
+    - Liu et al., "Ring Attention with Blockwise Transformers for Near-Infinite Context" (2023)
+    - https://arxiv.org/abs/2310.01889
+"""
+
 import functools
 import typing as tp
 from functools import partial
@@ -25,6 +72,8 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.tpu_ops import pallas_ring_attention
 
@@ -33,22 +82,47 @@ from .vanilla import VanillaAttn
 
 
 def blockwise_attn(
-    query,
-    key,
-    value,
-    bias=None,
-    deterministic=True,
-    dropout_rng=None,
-    attn_pdrop=0.0,
-    causal=True,
-    query_chunk_size=2048,
-    key_chunk_size=2048,
-    dtype=jnp.float32,
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch kv_len num_heads head_dim"],
+    value: Float[Array, "batch kv_len num_heads head_dim"],
+    bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+    deterministic: bool = True,
+    dropout_rng: jax.random.PRNGKey = None,
+    attn_pdrop: float = 0.0,
+    causal: bool = True,
+    query_chunk_size: int = 2048,
+    key_chunk_size: int = 2048,
+    dtype: jax.typing.DTypeLike = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable(),
-    precision=None,
-    float32_logits=True,
-    prevent_cse=True,
-):
+    precision: jax.lax.Precision | None = None,
+    float32_logits: bool = True,
+    prevent_cse: bool = True,
+) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    """Compute blockwise attention with chunked processing.
+
+    Implements memory-efficient attention by processing query and key-value
+    pairs in chunks. This reduces memory usage for long sequences.
+
+    Args:
+        query: Query tensor [batch, seq_len, num_heads, head_dim].
+        key: Key tensor [batch, kv_len, num_heads, head_dim].
+        value: Value tensor [batch, kv_len, num_heads, head_dim].
+        bias: Optional attention bias [batch, num_heads, seq_len, kv_len].
+        deterministic: If True, disables dropout.
+        dropout_rng: PRNG key for dropout.
+        attn_pdrop: Attention dropout probability.
+        causal: Whether to apply causal masking.
+        query_chunk_size: Chunk size for queries (default 2048).
+        key_chunk_size: Chunk size for keys/values (default 2048).
+        dtype: Computation dtype.
+        policy: Checkpoint policy for gradient computation.
+        precision: JAX precision setting.
+        float32_logits: Whether to compute logits in float32.
+        prevent_cse: Prevent common subexpression elimination.
+
+    Returns:
+        Attention output [batch, seq_len, num_heads, head_dim].
+    """
     query = query / jnp.sqrt(query.shape[-1]).astype(dtype)
     if float32_logits:
         query = query.astype(jnp.float32)
@@ -141,23 +215,58 @@ def blockwise_attn(
 
 
 class Carry(tp.NamedTuple):
-    numerator: jax.Array
-    denominator: jax.Array
-    max_so_far: jax.Array
+    """Carry state for scan-based attention computation.
+
+    This NamedTuple maintains the running state across chunks during
+    the blockwise attention computation using JAX's scan primitive.
+
+    Attributes:
+        numerator: Weighted sum of values accumulated so far.
+            Shape: [batch, query_chunk_size, num_heads, head_dim]
+        denominator: Sum of attention weights (for normalization).
+            Shape: [batch, query_chunk_size, num_heads, head_dim]
+        max_so_far: Maximum attention score seen so far (for numerical stability).
+            Shape: [batch, query_chunk_size, num_heads, 1]
+    """
+
+    numerator: Float[Array, "batch query_chunk_size num_heads head_dim"]
+    denominator: Float[Array, "batch query_chunk_size num_heads head_dim"]
+    max_so_far: Float[Array, "batch query_chunk_size num_heads 1"]
 
 
 def _chunk_attention_bias(
-    query_chunk_size,
-    key_chunk_size,
-    bias,
-    deterministic,
-    attn_dropout,
-    attn_pdrop,
-    causal,
-    dtype,
-    query_chunk_idx,
-    key_chunk_idx,
-):
+    query_chunk_size: int,
+    key_chunk_size: int,
+    bias: Float[Array, "batch num_heads seq_len kv_len"] | None,
+    deterministic: bool,
+    attn_dropout: Bool[Array, "batch num_heads seq_len kv_len"] | None,
+    attn_pdrop: float,
+    causal: bool,
+    dtype: jax.typing.DTypeLike,
+    query_chunk_idx: int,
+    key_chunk_idx: int,
+) -> Float[Array, "1 1 query_chunk_size key_chunk_size"]:
+    """Extract and compute bias for a specific query-key chunk pair.
+
+    This function handles slicing the global bias/mask tensors for a specific
+    chunk combination and applies causal masking and dropout masks as needed.
+
+    Args:
+        query_chunk_size: Size of query chunks.
+        key_chunk_size: Size of key/value chunks.
+        bias: Optional global attention bias tensor.
+        deterministic: If False and attn_pdrop > 0, apply dropout mask.
+        attn_dropout: Pre-computed dropout mask (binary).
+        attn_pdrop: Dropout probability (used only for validation).
+        causal: Whether to apply causal masking.
+        dtype: Data type for the output bias.
+        query_chunk_idx: Index of the current query chunk.
+        key_chunk_idx: Index of the current key chunk.
+
+    Returns:
+        Attention bias for the specified chunk pair, including any causal
+        or dropout masks. Shape: [1, 1, query_chunk_size, key_chunk_size]
+    """
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
     chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
@@ -200,33 +309,51 @@ def _chunk_attention_bias(
 @AttentionRegistry.register
 class RingAttn(AttentionImpl):
     """
-    Attention implementation using ring-passing algorithm or blockwise scan.
+    Ring attention implementation for distributed and memory-efficient processing.
 
-    This implementation supports:
-    - Native (scan-based) blockwise attention via `blockwise_attn`.
-    - TPU-specific ring attention using `pallas_ring_attention` kernel.
+    Ring attention processes attention in a ring topology, where each device/chunk
+    communicates with neighbors to compute attention over very long sequences.
+    This is particularly useful for sequences that don't fit in memory.
 
-    It is registered under the name "ring".
+    Features:
+        - Memory-efficient chunked processing
+        - Distributed computation across devices
+        - Support for sequences > 100K tokens
+        - Native JAX scan-based implementation
+        - TPU-optimized Pallas kernels
+
+    Registered name: "ring"
+
+    Attributes:
+        metadata: AttentionMetadata configuration
     """
 
     @classmethod
     def get_impl_name(cls) -> str | tuple[str]:
-        """Returns the registered name: "ring"."""
+        """Get the registered name for this attention implementation.
+
+        Returns:
+            str: The name "ring" used for registry lookup.
+        """
         return "ring"
 
     def get_impl_metadata(self) -> AttentionMetadata:
-        """Returns the metadata associated with this instance."""
+        """Get the metadata configuration for this attention instance.
+
+        Returns:
+            AttentionMetadata: Configuration including dtype, mesh, etc.
+        """
         return self.metadata
 
     @jax.named_scope("easydel-ringimpl-native-xla")
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = False,
         dropout_rng: jr.PRNGKey = None,
         causal: bool = True,
@@ -296,19 +423,29 @@ class RingAttn(AttentionImpl):
             return AttentionOutput(attention_weights=None, attention_outputs=output)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+        """GPU forward pass. Currently delegates to `forward_native` (scan-based).
+
+        Future versions may include GPU-specific ring attention kernels.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         # TODO: Implement GPU-specific ring attention kernel if available
         return self.forward_cuda(*args, **kwargs)
 
     @jax.named_scope("easydel-ringimpl-tpu")
     def forward_tpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = False,
         dropout_rng: jr.PRNGKey = None,
         causal: bool = True,
@@ -390,27 +527,55 @@ class RingAttn(AttentionImpl):
         )
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-        """CPU forward pass. Delegates to `forward_native` (scan-based)."""
+        """CPU forward pass. Delegates to `forward_native` (scan-based).
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-        """CUDA GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+        """CUDA GPU forward pass. Currently delegates to `forward_native` (scan-based).
+
+        Future versions may include CUDA-specific ring attention kernels.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         # TODO: Implement GPU-specific ring attention kernel if available
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-        """ROCm GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+        """ROCm GPU forward pass. Currently delegates to `forward_native` (scan-based).
+
+        Future versions may include ROCm-specific ring attention kernels.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
+        """
         # TODO: Implement ROCm-specific ring attention kernel if available
         return self.forward_native(*args, **kwargs)
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = False,
         dropout_rng: jr.PRNGKey = None,
         causal: bool = True,

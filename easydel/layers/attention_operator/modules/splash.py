@@ -12,6 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Splash Attention implementation for TPU acceleration.
+
+This module provides the Splash Attention implementation, a TPU-optimized
+attention mechanism that leverages the Pallas framework for maximum performance.
+Splash Attention is specifically designed to take advantage of TPU's matrix
+multiplication units and memory hierarchy.
+
+Key features:
+- TPU-specific optimization using Pallas kernels
+- Support for Multi-Query Attention (MQA) and Grouped-Query Attention (GQA)
+- Efficient handling of causal masks
+- Automatic fallback to vanilla attention for unsupported configurations
+- Optimized for sequences with lengths divisible by 128
+
+Implementation details:
+- Uses `make_splash_mqa_single_device` primitive from JAX experimental
+- Requires specific block sizes for optimal TPU utilization
+- Falls back to vanilla attention for:
+  * Single token generation (seq_len = 1)
+  * Non-causal attention patterns
+  * Sequences not divisible by 128
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import SplashAttn
+    >>>
+    >>> # Configure for TPU execution
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.bfloat16,
+    ...     softmax_scale=1.0 / math.sqrt(head_dim),
+    ...     blocksize_q=256,
+    ...     blocksize_k=512
+    ... )
+    >>> splash_attn = SplashAttn(metadata)
+    >>>
+    >>> # Use with sequences divisible by 128
+    >>> output = splash_attn(query, key, value, causal=True)
+
+Note:
+    Splash Attention is only available on TPU devices and will raise
+    NotImplementedError on CPU or GPU backends.
+
+References:
+    - JAX Pallas documentation for TPU kernels
+    - Google Research papers on TPU-optimized attention
+"""
 
 import functools
 
@@ -28,6 +74,8 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.tpu_ops import pallas_ragged_decode
 from easydel.layers.caching.transformer import TransformerMetadata
@@ -77,20 +125,40 @@ class SplashAttn(AttentionImpl):
         return self.metadata
 
     def forward_native(self, *args, **kwargs) -> AttentionOutput:
-        """Native (CPU) forward pass. Not implemented for Splash Attention."""
+        """Native (CPU) forward pass. Not implemented for Splash Attention.
+
+        Splash Attention is TPU-specific and has no CPU implementation.
+
+        Args:
+            *args: Ignored arguments.
+            **kwargs: Ignored keyword arguments.
+
+        Raises:
+            NotImplementedError: Always raised as CPU execution is not supported.
+        """
         raise NotImplementedError("Splash Attention does not have a native CPU implementation.")
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-        """GPU forward pass. Not implemented for Splash Attention."""
+        """GPU forward pass. Not implemented for Splash Attention.
+
+        Splash Attention is TPU-specific and has no GPU implementation.
+
+        Args:
+            *args: Ignored arguments.
+            **kwargs: Ignored keyword arguments.
+
+        Raises:
+            NotImplementedError: Always raised as GPU execution is not supported.
+        """
         raise NotImplementedError("Splash Attention does not have a generic GPU implementation.")
 
     @jax.named_scope("easydel-splashimpl-tpu")
     def forward_tpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
+        q: Float[Array, "batch seq_len num_q_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
         causal: bool = True,
         cache_metadata: TransformerMetadata | None = None,
         **ignore,
@@ -181,7 +249,15 @@ class SplashAttn(AttentionImpl):
             out_specs=self.create_stable_sharding(a_sharding, tensor=q, preserved_indices=[0, 2]),
             check_rep=False,
         )
-        def _wraped_flash_attn(q, k, v, q_mask, kv_mask, indexs, starts):
+        def _wraped_flash_attn(
+            q: Float[Array, "batch num_heads seq_len head_dim"],
+            k: Float[Array, "batch num_heads kv_len head_dim"],
+            v: Float[Array, "batch num_heads kv_len head_dim"],
+            q_mask: Int[Array, "batch seq_len"] | None,
+            kv_mask: Int[Array, "batch kv_len"] | None,
+            indexs: Int[Array, "..."] | None,
+            starts: Int[Array, "..."] | None,
+        ) -> Float[Array, "batch num_heads seq_len head_dim"]:
             if q.shape[-2] != 1:
                 output_shape = (*q.shape[:-1], v.shape[-1])
                 num_reps = q.shape[1] // k.shape[1]
@@ -233,10 +309,10 @@ class SplashAttn(AttentionImpl):
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
+        q: Float[Array, "batch seq_len num_q_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
         causal: bool = True,
         cache_metadata: TransformerMetadata | None = None,
         **ignore,

@@ -24,6 +24,7 @@ from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -324,7 +325,7 @@ class PatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -466,7 +467,7 @@ class VisionAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         cu_seqlens: chex.Array,
         rotary_pos_emb: chex.Array = None,
     ) -> chex.Array:
@@ -629,7 +630,7 @@ class Qwen2VLMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -724,17 +725,17 @@ class Qwen2VLAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> tuple[chex.Array, chex.Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -860,17 +861,17 @@ class Qwen2VLDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -1023,7 +1024,7 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
         grid_thw: chex.Array,
         max_grid_size,
     ) -> chex.Array:
@@ -1125,11 +1126,11 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -1294,14 +1295,14 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         apply_lm_head: bool = True,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         pixel_values: chex.Array | None = None,
