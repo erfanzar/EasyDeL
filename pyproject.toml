@@ -92,10 +92,19 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
-ignore = ["F722", "B008", "UP015", "A005"]
+ignore = [
+    "F722",  # Forward annotations needed for jaxtyping
+    "B008",  # Do not perform function calls in argument defaults
+    "UP015", # Unnecessary open mode
+    "A005",  # Module-level shadowing
+    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
+    "F401",  # Unused imports (sometimes needed for type checking)
+    "E501",  # Line too long (handled by formatter)
+]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
+"**/modeling_*.py" = ["UP037", "F821"]  # Allow quoted type annotations and forward refs in model files
 
 [tool.mypy]
 python_version = "3.11"

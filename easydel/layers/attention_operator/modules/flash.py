@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Flash Attention V2 implementation for EasyDeL.
+
+This module provides optimized Flash Attention V2 implementations for TPU and GPU
+backends using JAX's Pallas operations and Triton kernels respectively. Flash Attention
+is a memory-efficient attention mechanism that reduces memory usage from O(N²) to O(N)
+by computing attention in blocks and avoiding materialization of the full attention matrix.
+
+Key Features:
+- TPU implementation using JAX Pallas operations
+- GPU implementation using Triton kernels
+- Support for causal masking
+- Support for attention bias
+- Efficient handling of multi-query and grouped-query attention
+- Automatic sharding for distributed computation
+
+The implementation follows the Flash Attention V2 algorithm which:
+1. Processes attention in blocks to minimize HBM access
+2. Uses online softmax computation to avoid storing the full attention matrix
+3. Achieves significant speedup and memory savings compared to standard attention
+
+Note: This implementation does not support CPU execution as Flash Attention
+relies on specialized hardware features available only on TPUs and GPUs.
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import FlashAttn
+    >>>
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.float16,
+    ...     softmax_scale=1.0 / math.sqrt(head_dim),
+    ...     blocksize_q=512,
+    ...     blocksize_k=1024
+    ... )
+    >>> flash_attn = FlashAttn(metadata)
+    >>> output = flash_attn(query, key, value, causal=True)
+"""
 
 import functools
 import typing as tp
@@ -24,6 +60,8 @@ from jax import random as jr
 from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as pallas_flash_attention
 from jax.experimental.shard_map import shard_map
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.gpu_ops import triton_flash_attention
 
@@ -62,20 +100,30 @@ class FlashAttn(AttentionImpl):
 
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:
         """
         Native (CPU) forward pass for Flash Attention. Not implemented.
 
+        Args:
+            q: Query tensor [batch, seq_len, num_heads, head_dim]
+            k: Key tensor [batch, kv_len, num_kv_heads, head_dim]
+            v: Value tensor [batch, kv_len, num_kv_heads, head_dim]
+            mask: Optional boolean mask [batch, 1, seq_len, kv_len]
+            bias: Optional attention bias [batch, num_heads, seq_len, kv_len]
+            init_bias: Optional callable to initialize bias
+            causal: Whether to use causal masking
+            **ignore: Additional arguments are ignored
+
         Raises:
-            NotImplementedError: Flash Attention is not supported on CPU via this implementation.
+            NotImplementedError: Flash Attention is not supported on CPU.
         """
         raise NotImplementedError("Flash Attention v2 does not have a native CPU implementation.")
 
@@ -95,12 +143,12 @@ class FlashAttn(AttentionImpl):
     @jax.named_scope("easydel-flash-attnimpl-tpu")
     def forward_tpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:
@@ -176,11 +224,16 @@ class FlashAttn(AttentionImpl):
             out_specs=self.create_stable_sharding(a_sharding, tensor=q),
             check_rep=False,
         )
-        def _wraped_flash_attn(q, k, v, b):
+        def _wraped_flash_attn(
+            q: Float[Array, "batch num_heads seq_len head_dim"],
+            k: Float[Array, "batch num_heads kv_len head_dim"],
+            v: Float[Array, "batch num_heads kv_len head_dim"],
+            b: Float[Array, "batch num_heads seq_len kv_len"] | None,
+        ) -> Float[Array, "batch num_heads seq_len head_dim"]:
             if b is not None:
                 if b.shape[1] != v.shape[1]:
                     b = jnp.repeat(b, v.shape[1] // b.shape[1], 1)
-            
+
             out = pallas_flash_attention(
                 q,
                 k,
@@ -216,12 +269,12 @@ class FlashAttn(AttentionImpl):
     @jax.named_scope("easydel-flash-attnimpl-gpu-cuda-rocm")
     def forward_gpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:
@@ -303,18 +356,28 @@ class FlashAttn(AttentionImpl):
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
         """
         ROCm GPU forward pass.
+
+        Currently delegates to the standard GPU implementation. Future versions
+        may include ROCm-specific optimizations using hipFlashAttention or similar.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
         """
         # ROCm would require a specific hipFlashAttention kernel or similar
         return self.forward_gpu(*args, **kwargs)
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
-        mask: Array | None = None,
-        bias: Array | None = None,
-        init_bias: tp.Callable[[], Array] | None = None,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         causal: bool = False,
         **ignore,
     ) -> AttentionOutput:

@@ -23,6 +23,7 @@ from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import image as jimg
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -185,9 +186,9 @@ class SiglipTextEmbeddings(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
     ) -> chex.Array:
         seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
         max_position_embedding = self.position_embedding.embedding.shape[0]
@@ -264,8 +265,8 @@ class SiglipAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         query = checkpoint_name(self.q_proj(hidden_states), "attn_query")
@@ -350,7 +351,7 @@ class SiglipMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -411,8 +412,8 @@ class SiglipEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         residual = hidden_states
@@ -464,8 +465,8 @@ class SiglipEncoder(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds: chex.Array,
-        attention_mask: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -548,9 +549,9 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -639,9 +640,9 @@ class SiglipTextModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | BaseModelOutputWithPooling:
@@ -1030,9 +1031,9 @@ class SiglipModel(EasyDeLBaseModule):
 
     def get_text_features(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> chex.Array:
@@ -1078,10 +1079,10 @@ class SiglipModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         return_loss: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,

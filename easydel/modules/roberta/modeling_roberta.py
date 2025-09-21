@@ -22,6 +22,7 @@ from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -197,9 +198,9 @@ class RobertaSelfAttention(AttentionModule):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         key_value_states: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         is_cross_attention = key_value_states is not None
@@ -352,7 +353,7 @@ class RobertaAttention(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        causal_mask: chex.Array | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         key_value_states=None,
         output_attentions: bool = False,
     ):
@@ -399,7 +400,9 @@ class RobertaIntermediate(nn.Module):
         )
         self.activation = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = checkpoint_name(self.dense(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.activation(hidden_states), "mlp_gate")
         return hidden_states
@@ -502,9 +505,9 @@ class RobertaLayer(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        encoder_hidden_states: chex.Array | None = None,
-        encoder_attention_mask: chex.Array | None = None,
-        causal_mask: chex.Array | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         # Self Attention
@@ -581,9 +584,9 @@ class RobertaEncoder(nn.Module):
         hidden_states,
         attention_mask,
         head_mask,
-        causal_mask: chex.Array | None = None,
-        encoder_hidden_states: chex.Array | None = None,
-        encoder_attention_mask: chex.Array | None = None,
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         past_key_values: TransformerCacheView | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -663,7 +666,9 @@ class RobertaPooler(nn.Module):
             **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         cls_hidden_state = hidden_states[:, 0]
         cls_hidden_state = self.dense(cls_hidden_state)
         return nn.tanh(cls_hidden_state)
@@ -780,7 +785,9 @@ class RobertaClassificationHead(nn.Module):
             **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = hidden_states[:, 0, :]
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
@@ -841,10 +848,10 @@ class RobertaModel(EasyDeLBaseModule):
         input_ids,
         attention_mask,
         token_type_ids: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         head_mask: chex.Array | None = None,
-        encoder_hidden_states: chex.Array | None = None,
-        encoder_attention_mask: chex.Array | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         past_key_values: tuple[tuple[chex.Array, chex.Array]] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -1371,13 +1378,13 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         head_mask: chex.Array | None = None,
-        encoder_hidden_states: chex.Array | None = None,
-        encoder_attention_mask: chex.Array | None = None,
+        encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         past_key_values: tuple[tuple[chex.Array, chex.Array]] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,

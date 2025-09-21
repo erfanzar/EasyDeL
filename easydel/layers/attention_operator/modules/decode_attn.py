@@ -12,6 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Autoregressive decode attention implementation for efficient token generation.
+
+This module provides specialized attention implementations optimized for the
+autoregressive decoding phase of transformer models. During generation, models
+process one token at a time while attending to all previously generated tokens
+stored in a key-value cache.
+
+Key optimizations:
+- Single query token processing (query sequence length = 1)
+- Efficient cache access with ragged boundaries
+- Backend-specific kernels for TPU and GPU
+- Optimized memory access patterns for decode phase
+- Support for variable sequence lengths per batch element
+
+The implementation uses:
+- Pallas kernels for TPU acceleration
+- Triton kernels for GPU acceleration
+- Native JAX operations as fallback
+
+This is particularly important for:
+- Text generation and completion
+- Real-time inference serving
+- Streaming model outputs
+- Interactive applications
+
+Example:
+    >>> from easydel.layers.attention_operator import AttentionMetadata
+    >>> from easydel.layers.attention_operator.modules import AutoRegressiveDecodeAttn
+    >>> from easydel.layers.caching.transformer import TransformerMetadata
+    >>>
+    >>> # Configure for decoding
+    >>> metadata = AttentionMetadata(
+    ...     runtime_dtype=jnp.float16,
+    ...     softmax_scale=1.0 / math.sqrt(head_dim)
+    ... )
+    >>> decode_attn = AutoRegressiveDecodeAttn(metadata)
+    >>>
+    >>> # Use with cache during generation
+    >>> cache_metadata = TransformerMetadata(
+    ...     starts=jnp.array([0, 0, 0, 0]),  # Start indices per batch
+    ...     indexs=jnp.array([10, 15, 8, 12])  # Current lengths per batch
+    ... )
+    >>> output = decode_attn(query, cached_keys, cached_values, cache_metadata)
+"""
+
 from functools import partial
 
 import jax
@@ -22,6 +67,8 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.gpu_ops import pallas_ragged_decode as gpu_pallas_ragged_decode
 from easydel.kernels.tpu_ops import pallas_ragged_decode as tpu_pallas_ragged_decode
@@ -69,9 +116,9 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
     @jax.named_scope("easydel-autoregressive_decodeattn-native-xla")
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "batch 1 num_q_heads head_dim"],
+        k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
         cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
@@ -85,16 +132,22 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         and finally computes the weighted sum of values.
 
         Args:
-            q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
-            k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-            v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-            cache_metadata (TransformerMetadata): Contains metadata about the cache, specifically
-                `starts` (start indexs for valid keys/values) and `indexs` (current indexs or length).
-            **ignores: Ignored keyword arguments.
+            q: Query tensor with shape [batch, 1, num_q_heads, head_dim].
+                Single query token for autoregressive generation.
+            k: Key tensor from cache with shape [batch, kv_seq_len, num_kv_heads, head_dim].
+                Contains all previous keys in the sequence.
+            v: Value tensor from cache with shape [batch, kv_seq_len, num_kv_heads, head_dim].
+                Contains all previous values in the sequence.
+            cache_metadata: Metadata about the cache containing:
+                - starts: Start indices for valid keys/values
+                - indexs: Current indices or sequence lengths
+            **ignores: Additional keyword arguments that are ignored.
 
         Returns:
-            AttentionOutput: An object containing the attention outputs (`attention_outputs`)
-                of shape (batch_size, 1, num_query_heads, head_dim). Attention weights are not returned.
+            AttentionOutput containing:
+                - attention_outputs: Float[Array, "batch 1 num_q_heads head_dim"]
+                  The attended representation for the current query token.
+                - attention_weights: None (not computed for efficiency)
         """
         sm_scale = self.metadata.softmax_scale
         sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
@@ -110,7 +163,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         v = es.with_sharding_constraint(v, v_sharding)
         q = q.squeeze(1)
 
-        def _compute(q, k, v, start, index):
+        def _compute(
+            q: Float[Array, "batch num_q_heads head_dim"],
+            k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            start: Int[Array, "batch 1"],
+            index: Int[Array, "batch 1"],
+        ) -> Float[Array, "batch num_q_heads head_dim"]:
             qb, qhead, qdim = q.shape
             _, kvlen, kvhead, _kvdim = k.shape
             repeats = qhead // kvhead
@@ -132,14 +191,36 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
     @jax.named_scope("easydel-autoregressive_decodeattn-gpu-triton")
     def forward_gpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "batch 1 num_q_heads head_dim"],
+        k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
         cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
         """
-        GPU forward pass for autoregressive decoding attention.
+        GPU forward pass for autoregressive decoding attention using Triton kernels.
+
+        Utilizes GPU-optimized Pallas ragged decode kernel for efficient
+        attention computation during the decoding phase. The kernel handles
+        variable sequence lengths efficiently.
+
+        Args:
+            q: Query tensor with shape [batch, 1, num_q_heads, head_dim].
+                Single query token for current generation step.
+            k: Key tensor from cache with shape [batch, kv_seq_len, num_kv_heads, head_dim].
+                Contains all previous keys up to max cache size.
+            v: Value tensor from cache with shape [batch, kv_seq_len, num_kv_heads, head_dim].
+                Contains all previous values up to max cache size.
+            cache_metadata: Metadata about the cache containing:
+                - starts: Start indices for valid cache entries per batch element
+                - indexs: Current sequence lengths per batch element
+            **ignores: Additional keyword arguments that are ignored.
+
+        Returns:
+            AttentionOutput containing:
+                - attention_outputs: Float[Array, "batch 1 num_q_heads head_dim"]
+                  The attended representation for the current token.
+                - attention_weights: None (not computed for efficiency)
         """
         sm_scale = self.metadata.softmax_scale
         sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
@@ -164,7 +245,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             out_specs=self.create_stable_sharding(a_sharding, tensor=q, preserved_indices=[0, 2]),
             check_rep=False,
         )
-        def _compute(q: jax.Array, k: jax.Array, v: jax.Array, start: jax.Array, index: jax.Array):
+        def _compute(
+            q: Float[Array, "batch 1 num_q_heads head_dim"],
+            k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            start: Int[Array, "batch 1"],
+            index: Int[Array, "batch 1"],
+        ) -> Float[Array, "batch 1 num_q_heads head_dim"]:
             out = gpu_pallas_ragged_decode(
                 query_tensor=q.squeeze(1),
                 key_tensor=k,
@@ -182,9 +269,9 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 
     def forward_tpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "batch 1 num_q_heads head_dim"],
+        k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
         cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:
@@ -229,7 +316,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
             out_specs=self.create_stable_sharding(a_sharding, tensor=q, preserved_indices=[0, 2]),
             check_rep=False,
         )
-        def _compute(q: jax.Array, k: jax.Array, v: jax.Array, start: jax.Array, index: jax.Array):
+        def _compute(
+            q: Float[Array, "batch 1 num_q_heads head_dim"],
+            k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+            start: Int[Array, "batch 1"],
+            index: Int[Array, "batch 1"],
+        ) -> Float[Array, "batch 1 num_q_heads head_dim"]:
             return tpu_pallas_ragged_decode(
                 query_tensor=q,
                 key_tensor=k,
@@ -249,6 +342,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         CPU forward pass for autoregressive decoding attention.
 
         Delegates to the native JAX/XLA implementation (`forward_native`).
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
         """
         return self.forward_native(*args, **kwargs)
 
@@ -256,8 +356,15 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         """
         CUDA GPU forward pass for autoregressive decoding attention.
 
-        Delegates to the native JAX/XLA implementation (`forward_native`).
+        Delegates to the GPU implementation which uses Triton kernels.
         Future optimizations might add CUDA-specific kernels here.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
         """
         return self.forward_gpu(*args, **kwargs)
 
@@ -265,16 +372,23 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
         """
         ROCm GPU forward pass for autoregressive decoding attention.
 
-        Delegates to the native JAX/XLA implementation (`forward_native`).
-        Future optimizations might add ROCm-specific kernels here.
+        Delegates to the GPU implementation. Future optimizations might
+        add ROCm-specific kernels here.
+
+        Args:
+            *args: Positional arguments for the attention calculation.
+            **kwargs: Keyword arguments for the attention calculation.
+
+        Returns:
+            An `AttentionOutput` object containing the attention results.
         """
         return self.forward_gpu(*args, **kwargs)
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "batch 1 num_q_heads head_dim"],
+        k: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
+        v: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
         cache_metadata: TransformerMetadata,
         **ignores,
     ) -> AttentionOutput:

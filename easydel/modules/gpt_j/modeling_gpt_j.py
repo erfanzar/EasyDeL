@@ -23,6 +23,7 @@ from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -132,9 +133,9 @@ class GPTJAttention(AttentionModule):
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the GPTJAttention module.
 
@@ -358,9 +359,9 @@ class GPTJBlock(nn.Module):
         causal_mask: chex.Array | None = None,
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the GPTJBlock module.
 
@@ -503,7 +504,7 @@ class GPTJModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         inputs_embeds: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         extra_embedding: chex.Array | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -690,7 +691,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         extra_embedding: chex.Array | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,

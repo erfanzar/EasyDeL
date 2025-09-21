@@ -55,6 +55,7 @@ from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from jaxtyping import Array, Bool, Float, Int
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
@@ -173,12 +174,12 @@ class LightningCacheView(BaseCacheView):
         concatenation and may not be compatible with standard attention.
     """
 
-    key_value: cx.Array | ImplicitArray
+    key_value: Float[Array, "batch seq_len num_heads head_dim"] | ImplicitArray | None
     metadata: LightningCacheMetaData
     layer_index: int | None = None
 
     @classmethod
-    def init(cls, metadata: LightningCacheMetaData, layer_index: int | None = None):
+    def init(cls, metadata: LightningCacheMetaData, layer_index: int | None = None) -> LightningCacheView:
         """Initialize a Lightning cache view for a single layer.
 
         Creates a cache view with placeholder for unified KV tensor.
@@ -201,34 +202,55 @@ class LightningCacheView(BaseCacheView):
     @jax.named_scope("easydel-lightning-cacheview-concatenate-to-cache")
     def concatenate_to_cache(
         self,
-        query: cx.Array,
-        key: cx.Array,
-        value: cx.Array,
-        attention_mask: cx.Array,
+        query: Float[Array, "batch query_len num_heads head_dim"],
+        key: Float[Array, "batch query_len num_key_heads key_dim"],
+        value: Float[Array, "batch query_len num_value_heads value_dim"],
+        attention_mask: Bool[Array, "batch 1 query_len seq_len"] | Float[Array, "batch 1 query_len seq_len"],
         kv_sharding: PartitionSpec,
         quantizer: EasyQuantizer,
-        causal_mask: cx.Array | bool | None = None,
-        token_type_ids: cx.Array | None = None,
-    ) -> tuple[cx.Array, cx.Array, cx.Array]:
-        """
-        Updates the KV cache with new key/value states and adjusts the attention mask.
+        causal_mask: Bool[Array, "batch 1 query_len seq_len"] | bool | None = None,
+        token_type_ids: Int[Array, "batch query_len"] | None = None,
+    ) -> tuple[
+        Float[Array, "batch seq_len num_key_heads key_dim"],
+        Float[Array, "batch seq_len num_value_heads value_dim"],
+        Bool[Array, "batch 1 query_len seq_len"],
+    ]:
+        """Update cache with new key/value states for Lightning attention.
 
-        Internal helper function used when KV caching is enabled.
+        Concatenates new key and value states to the cache using Lightning's
+        unified KV representation. This method is called during each forward
+        pass to update the cache with newly computed states.
+
+        Note: This implementation appears to need refactoring as it references
+        attributes (self.index, self.key, self.value) that don't exist in the
+        current class definition. The actual Lightning implementation would
+        use the unified self.key_value tensor.
 
         Args:
-            query (Array): Current query states.
-            key (Array): Current key states.
-            value (Array): Current value states.
-            attention_mask (Array): Base attention mask.
-            causal_mask (tp.Optional[Array], optional): Causal mask. Defaults to None.
-            token_type_ids (tp.Optional[Array], optional): Token type IDs for segment-based masking.
-                                                            Defaults to None.
+            query: Query tensor with shape [batch, query_len, num_heads, head_dim].
+                Used to determine update dimensions.
+            key: Key tensor with shape [batch, query_len, num_key_heads, key_dim].
+                New keys to add to the cache.
+            value: Value tensor with shape [batch, query_len, num_value_heads, value_dim].
+                New values to add to the cache.
+            attention_mask: Boolean or float mask with shape [batch, 1, query_len, seq_len].
+                Defines which positions can attend to which.
+            kv_sharding: JAX PartitionSpec for sharding the KV cache.
+            quantizer: Quantization function for cache compression.
+            causal_mask: Optional causal mask for autoregressive attention.
+                Can be boolean array or boolean value.
+            token_type_ids: Optional token type IDs for segment-level masking.
+                Shape [batch, query_len].
 
         Returns:
-            tp.Tuple[Array, Array, Array]:
-                - Updated key cache tensor.
-                - Updated value cache tensor.
-                - Updated attention mask reflecting the cached sequence length.
+            Tuple containing:
+                - Updated key cache: Float[Array, "batch seq_len num_key_heads key_dim"]
+                - Updated value cache: Float[Array, "batch seq_len num_value_heads value_dim"]
+                - Updated attention mask: Bool[Array, "batch 1 query_len seq_len"]
+
+        Raises:
+            NotImplementedError: Current implementation needs refactoring to properly
+                use Lightning's unified KV representation.
         """
         num_updated_cache_vectors = query.shape[1]
         end_index = self.index[0]
@@ -296,7 +318,7 @@ class LightningCacheView(BaseCacheView):
         self.index = self.index + num_updated_cache_vectors
         return key_cache, value_cache, attention_mask
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             self.__class__.__name__ + f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
         )
@@ -324,7 +346,7 @@ class LightningCache(BaseCache):
         cls,
         num_hidden_layers: int,
         metadata: LightningCacheMetaData,
-    ):
+    ) -> LightningCache:
         """Initialize Lightning cache for all model layers.
 
         Creates cache views for each layer with consistent configuration.
@@ -346,7 +368,7 @@ class LightningCache(BaseCache):
         )
 
     @classmethod
-    def init_empty(cls, num_hidden_layers):
+    def init_empty(cls, num_hidden_layers: int) -> LightningCache:
         """Initialize empty Lightning cache structure.
 
         Creates cache container with None placeholders for all layers.
@@ -360,7 +382,7 @@ class LightningCache(BaseCache):
         """
         return cls(views=[None for _ in range(num_hidden_layers)])
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
 
     __str__ = __repr__
