@@ -1256,7 +1256,7 @@ DASHBOARD_HTML_FIXED = """
     </script>
 </body>
 </html>
-"""  # noqa
+"""
 
 
 class eSurgeWebDashboard:
