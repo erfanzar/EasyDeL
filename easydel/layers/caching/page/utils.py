@@ -25,11 +25,12 @@ import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jaxtyping import Array, Float, Int
 
 from easydel.utils.compiling_utils import ejit
 
 
-def cdiv(a, v):
+def cdiv(a: int, v: int) -> int:
     """Ceiling division: divide a by v and round up.
 
     Calculates the ceiling of a/v using integer arithmetic,
@@ -50,13 +51,13 @@ def cdiv(a, v):
 
 
 def _kv_cache_update_kernel(
-    slice_indices_ref,
-    new_kv_tokens_hbm_ref,
-    kv_cache_pages_hbm_ref,
-    _,
-    vmem_scratch_buffer,
-    dma_semaphore,
-):
+    slice_indices_ref,  # Pallas reference type
+    new_kv_tokens_hbm_ref,  # Pallas reference type
+    kv_cache_pages_hbm_ref,  # Pallas reference type
+    _,  # Placeholder
+    vmem_scratch_buffer,  # VMEM buffer
+    dma_semaphore,  # Semaphore
+) -> None:
     """Low-level TPU kernel for paged KV cache updates.
 
     Implements a two-phase DMA transfer strategy:
@@ -123,14 +124,14 @@ def _kv_cache_update_kernel(
 
 @ejit(static_argnames=["page_size", "slices_per_processing_page"])
 def kv_cache_update(
-    new_kv_tokens: jax.Array,  # [total_num_token, num_combined_kv_heads, head_dim]
-    slice_indices: jax.Array,  # [3, slices], list of (kv_cache_start, new_kv_start, slice_len)
-    kv_cache_pages: jax.Array,  # [total_num_pages * page_size, num_combined_kv_heads, head_dim]
-    total_update_slices: jax.Array,  # [1]
+    new_kv_tokens: Float[Array, "total_tokens num_combined_kv_heads head_dim"],
+    slice_indices: Int[Array, "3 num_slices"],
+    kv_cache_pages: Float[Array, "total_cache_positions num_combined_kv_heads head_dim"],
+    total_update_slices: Int[Array, ""],
     *,
     page_size: int = 32,
     slices_per_processing_page: int = 8,
-):
+) -> Float[Array, "total_cache_positions num_combined_kv_heads head_dim"]:
     """TPU-optimized paged KV cache update using Pallas kernels.
 
     Efficiently updates the KV cache with new tokens using hardware-accelerated
@@ -181,9 +182,9 @@ def kv_cache_update(
         ...     page_size=32
         ... )
     """
-    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
-        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
-    )
+    assert (
+        slice_indices.shape[1] % slices_per_processing_page == 0
+    ), f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
     assert kv_cache_pages.shape[1] == num_kv_heads
     assert kv_cache_pages.shape[2] == head_dimension
@@ -215,13 +216,13 @@ def kv_cache_update(
 
 @ejit(static_argnames=["page_size"])
 def kv_cache_update_jax(
-    new_kv_tokens: jax.Array,  # [total_num_token, num_kv_heads, head_dim]
-    slice_indices: jax.Array,  # [3, num_slices] - (cache_start, new_kv_start, length)
-    kv_cache_pages: jax.Array,  # [total_pages * page_size, num_kv_heads, head_dim]
-    total_update_slices: jax.Array,  # [1] - number of valid slices
+    new_kv_tokens: Float[Array, "total_tokens num_kv_heads head_dim"],
+    slice_indices: Int[Array, "3 num_slices"],
+    kv_cache_pages: Float[Array, "total_cache_positions num_kv_heads head_dim"],
+    total_update_slices: Int[Array, ""],
     *,
     page_size: int = 32,
-) -> jax.Array:
+) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
     """Pure JAX implementation of paged KV cache update.
 
     Provides a portable fallback implementation using JAX operations
@@ -275,7 +276,9 @@ def kv_cache_update_jax(
     num_valid_slices = total_update_slices[0]
     padded_new_kv = jnp.pad(new_kv_tokens, [(0, page_size), (0, 0), (0, 0)], mode="constant")
 
-    def update_single_slice(cache, slice_idx):
+    def update_single_slice(
+        cache: Float[Array, "total_cache_positions num_kv_heads head_dim"], slice_idx: int
+    ) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
         """Update cache with a single slice of new tokens.
 
         Performs a masked update of a cache slice, handling partial
@@ -307,7 +310,9 @@ def kv_cache_update_jax(
 
         return updated_cache
 
-    def scan_fn(cache, slice_idx):
+    def scan_fn(
+        cache: Float[Array, "total_cache_positions num_kv_heads head_dim"], slice_idx: Int[Array, ""]
+    ) -> tuple[Float[Array, "total_cache_positions num_kv_heads head_dim"], None]:
         """Scan function for iterating over cache slices.
 
         Conditionally updates cache based on slice validity.

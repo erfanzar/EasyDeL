@@ -53,9 +53,10 @@ from math import prod
 from typing import Self
 
 import jax
+from jaxtyping import Array, Bool, Float, Int
 
 
-def cdiv(a, b):
+def cdiv(a: int, b: int) -> int:
     """Ceiling division: divide a by b and round up.
 
     Computes the ceiling of a/b using integer arithmetic to avoid

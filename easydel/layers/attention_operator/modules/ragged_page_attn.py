@@ -19,6 +19,8 @@ import jax
 from eformer import common_types as ct
 from jax import Array
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array as JArray
+from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.cpu_ops import jax_ragged_paged_attention
 from easydel.kernels.gpu_ops import triton_ragged_paged_attention
@@ -69,9 +71,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def forward_native(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -117,9 +119,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def forward_gpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -158,9 +160,9 @@ class RaggedPageAttn(AttentionImpl):
     @jax.named_scope("easydel-pagedattn-tpu")
     def forward_tpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -203,9 +205,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def forward_cpu(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -221,9 +223,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def forward_cuda(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -239,9 +241,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def forward_rocm(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "total_tokens num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,
@@ -251,9 +253,9 @@ class RaggedPageAttn(AttentionImpl):
 
     def __call__(
         self,
-        q: Array,
-        k: Array,
-        v: Array,
+        q: Float[Array, "batch seq_len num_heads head_dim"],
+        k: Float[Array, "..."] | None,  # Not used in paged attention
+        v: Float[Array, "..."] | None,  # Not used in paged attention
         cache_view: PagesCacheView,
         cache_metadata: PagesMetadata,
         **ignore,

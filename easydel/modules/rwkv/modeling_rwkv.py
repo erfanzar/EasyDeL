@@ -21,6 +21,7 @@ from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -428,9 +429,9 @@ class RwkvModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         state: list[chex.Array] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
@@ -534,9 +535,9 @@ class RwkvForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         state: list[chex.Array] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,

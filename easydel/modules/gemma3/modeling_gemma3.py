@@ -25,6 +25,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -70,7 +71,7 @@ class Gemma3ModelOutputWithPast(ModelOutput):
     """
 
     last_hidden_state: chex.Array | None = None
-    image_hidden_states: chex.Array | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
@@ -116,7 +117,7 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
     past_key_values: TransformerCache | None = None
     hidden_states: tuple[chex.Array] | None = None
     attentions: tuple[chex.Array] | None = None
-    image_hidden_states: chex.Array | None = None
+    image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
 class Gemma3RMSNorm(nn.Module):
@@ -144,7 +145,7 @@ class Gemma3RMSNorm(nn.Module):
     def _norm(self, x: jax.Array) -> jax.Array:
         return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
         variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
         out = (1 + self.kernel.value.astype(self.param_dtype)) * variance
 
@@ -236,18 +237,18 @@ class Gemma3Attention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """
         Forward pass of the attention module.
@@ -386,7 +387,9 @@ class Gemma3MLP(nn.Module):
         self.down_proj = row_parallel_linear(inner_dim, embed_dim)
         self.up_proj = column_parallel_linear(embed_dim, inner_dim)
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -464,19 +467,19 @@ class Gemma3DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        causal_mask: chex.Array | bool | None,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"],
+        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | PagesCacheView | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: chex.Array | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        fcm_mask: chex.Array | None = None,
-        frequencies: chex.Array | None = None,
-        default_frequencies: chex.Array | None = None,
+        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """
         Forward pass of the module block.
@@ -619,11 +622,11 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -817,11 +820,11 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -954,11 +957,11 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
@@ -1155,15 +1158,15 @@ class Gemma3Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         token_type_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
@@ -1275,12 +1278,12 @@ class Gemma3Model(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
@@ -1378,16 +1381,16 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array = None,
+        input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | PagesCache | None = None,
         cache_metadata: TransformerMetadata | PagesMetadata | None = None,
         apply_lm_head: bool = True,
         token_type_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
@@ -1421,7 +1424,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
             image_hidden_states=outputs.image_hidden_states if pixel_values is not None else None,
         )
 
-    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+    def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
         lm_logits = super().apply_lm_head(hidden_states)
         if self.config.get_text_config().final_logit_softcapping is not None:
             cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
@@ -1460,12 +1463,12 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Int[Array, "batch seq_len"],
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
     ):
         return self.model.prepare_inputs_for_generation(

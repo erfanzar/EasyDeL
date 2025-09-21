@@ -29,6 +29,7 @@ from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree, field
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.utils.helpers import check_bool_flag
 
@@ -49,7 +50,7 @@ logger = get_logger(__name__)
 PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
 
 
-def cdiv(a, b):
+def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
@@ -68,7 +69,7 @@ def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
     return num_slices_per_page
 
 
-def get_dtype_packing(dtype):
+def get_dtype_packing(dtype: jnp.dtype) -> int:
     bits = jnp.finfo(dtype).bits
     if 32 % bits != 0:
         raise ValueError(f"The bit width must be divisible by 32, but got bits={bits}, dtype={{dtype}}")
@@ -90,7 +91,7 @@ def get_page_size_bytes(
     return page_size * num_combined_kv_heads * padded_head_size * kv_cache_dtype_bits // 8
 
 
-def per_device_hbm_budget_bytes(util=0.9, mode="free", safety_margin=256 << 20):
+def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
     budgets = []
     for d in jax.local_devices():
         try:
@@ -207,7 +208,7 @@ class PagesCacheMetaData(BaseCacheMetadata):
 
         return STRING_TO_DTYPE_MAP[self._kvdtype_str]
 
-    def get_padded_num_slices(self, num_tokens: int, max_num_reqs: int):
+    def get_padded_num_slices(self, num_tokens: int, max_num_reqs: int) -> int:
         padded_num_slices = 2 * max_num_reqs + num_tokens // self.page_size
         padded_num_slices = min(padded_num_slices, num_tokens)
         padded_num_slices = (
@@ -243,7 +244,7 @@ class PagesCacheView(BaseCacheView):
     metadata: PagesCacheMetaData
     layer_index: int
 
-    kv_pages: cx.Array | ImplicitArray
+    kv_pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"] | ImplicitArray
     partition_manager: PartitionManager = field(
         pytree_node=False,
         default_factory=lambda: PartitionManager(PartitionAxis()),
@@ -257,7 +258,7 @@ class PagesCacheView(BaseCacheView):
         layer_index: int,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
-    ):
+    ) -> PagesCacheView:
         """
         Initializes the PagesCacheView for a specific layer.
 
@@ -289,7 +290,12 @@ class PagesCacheView(BaseCacheView):
 
         return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages, partition_manager=partition_manager)
 
-    def concatenate_to_cache(self, key: cx.Array, value: cx.Array, cache_metadata: PagesMetadata):
+    def concatenate_to_cache(
+        self,
+        key: Float[Array, "batch seq_len num_key_heads head_dim"],
+        value: Float[Array, "batch seq_len num_value_heads head_dim"],
+        cache_metadata: PagesMetadata,
+    ) -> PagesCacheView:
         num_kv_heads = key.shape[2]
         head_size = key.shape[3]
         key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
@@ -297,7 +303,12 @@ class PagesCacheView(BaseCacheView):
         use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
         use_shardmap = use_kernel
 
-        def _update_fn(kv, slots, pages, num_update_slices):
+        def _update_fn(
+            kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
+            slots: Int[Array, "num_tokens"],  # noqa: F821
+            pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"],
+            num_update_slices: Int[Array, ""],
+        ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
             orgshape = pages.shape
             pages = pages.reshape(-1, *orgshape[2:])
             if use_kernel:
@@ -339,14 +350,14 @@ class PagesCacheView(BaseCacheView):
         return self.replace(kv_pages=kv_pages)
 
     @property
-    def key_pages(self) -> jax.Array:
+    def key_pages(self) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
         return self.kv_pages[:, :, 0::2, :]
 
     @property
-    def value_pages(self) -> jax.Array:
+    def value_pages(self) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
         return self.kv_pages[:, :, 1::2, :]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{self.__class__.__name__}(layer_index={self.layer_index}, kv_shape={self.key_pages.shape})"
 
     __str__ = __repr__
@@ -380,7 +391,7 @@ class PagesCache(BaseCache):
         metadata: PagesCacheMetaData,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
-    ):
+    ) -> PagesCache:
         """
         Initializes the entire PagesCache for all layers.
 
@@ -409,11 +420,11 @@ class PagesCache(BaseCache):
         ]
         return cls(views=views)
 
-    def init_empty(self, *args, **kwargs):
+    def init_empty(self, *args, **kwargs) -> None:
         """Not typically used for PagesCache; returns None."""
         return None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Provides a string representation of the entire paged cache."""
         idx = self.views[-1]
         try:
@@ -427,13 +438,13 @@ class PagesCache(BaseCache):
 
 @auto_pytree(max_print_length=3000)
 class PagesMetadata:
-    pages_tables: jax.Array
-    context_lens: jax.Array
-    query_start_loc: jax.Array
-    num_seqs: jax.Array
-    slot_mapping: jax.Array
-    position_ids: jax.Array | None = None
-    num_kv_update_slices: jax.Array | None = None
+    pages_tables: Int[Array, "max_num_reqs max_pages"]
+    context_lens: Int[Array, "max_num_reqs"]  # noqa: F821
+    query_start_loc: Int[Array, "max_num_reqs_plus_1"]  # noqa: F821
+    num_seqs: Int[Array, "max_num_reqs"]  # noqa: F821
+    slot_mapping: Int[Array, "num_tokens"]  # noqa: F821
+    position_ids: Int[Array, "num_tokens"] | None = None  # noqa: F821
+    num_kv_update_slices: Int[Array, ""] | None = None
     num_slices_per_kv_cache_update_page: int | None = field(pytree_node=False, default_factory=lambda: None)
     page_size: int = field(pytree_node=False, default=128)
     prefill_chunk_size: int = field(pytree_node=False, default=512)
