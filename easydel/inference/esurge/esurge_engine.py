@@ -579,7 +579,7 @@ class eSurge:
         Note:
             The exact format depends on the tokenizer's chat template. Different models
             use different special tokens and formatting conventions.
-        """  # noqa
+        """
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
