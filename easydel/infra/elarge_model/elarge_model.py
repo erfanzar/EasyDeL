@@ -83,6 +83,7 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         teacher_model: Teacher model for distillation training
         reward_funcs: Custom reward functions for GRPO
     """
+
     data_collator: NotRequired[typing.Callable]
     formatting_func: NotRequired[typing.Callable]
     reward_processing_classes: NotRequired[list[typing.Callable]]

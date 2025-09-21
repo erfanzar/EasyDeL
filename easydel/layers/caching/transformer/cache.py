@@ -74,14 +74,13 @@ import typing as tp
 from enum import Enum
 from functools import partial
 
-import chex as cx
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray, register
 from eformer.pytree import auto_pytree, field
 from flax import nnx as nn
-from jax import Array, lax
+from jax import lax
 from jax import numpy as jnp
 from jax.extend.core import Primitive
 from jax.sharding import Mesh

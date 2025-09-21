@@ -60,8 +60,7 @@ from jax import random as jr
 from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention as pallas_flash_attention
 from jax.experimental.shard_map import shard_map
-from jaxtyping import Array as JArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float
 
 from easydel.kernels.gpu_ops import triton_flash_attention
 

@@ -74,7 +74,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array as JArray
 from jaxtyping import Bool, Float, Int
 
 from easydel.kernels.tpu_ops import pallas_ragged_decode
