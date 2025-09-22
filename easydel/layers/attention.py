@@ -383,7 +383,7 @@ class AttentionModule(nn.Module):
         config (SC | EasyDeLBaseConfig): Configuration object for the attention module.
         cached_key (nn.Cache[Array] | None): Flax Cache for storing past key states (wont be used).
         cached_value (nn.Cache[Array] | None): Flax Cache for storing past value states (wont be used).
-        cache_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
+        layer_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
     """
 
     def __init__(self, config: SC):  # type:ignore
@@ -399,7 +399,7 @@ class AttentionModule(nn.Module):
 
         self.cached_key: nn.Cache[Array] | None = None
         self.cached_value: nn.Cache[Array] | None = None
-        self.cache_index: nn.Cache[Array] | None = None
+        self.layer_index: nn.Cache[Array] | None = None
 
     @staticmethod
     def apply_complex_rotary(

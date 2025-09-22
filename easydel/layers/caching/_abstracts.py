@@ -58,6 +58,7 @@ from __future__ import annotations
 import typing as tp
 from abc import ABC, abstractmethod
 
+import jax
 from eformer.pytree import auto_pytree
 
 
@@ -531,3 +532,10 @@ class BaseCache(ABC):
                 "The 'views' attribute has not been initialized. Ensure a concrete subclass initializes it."
             )
         return len(self.views)
+
+    @classmethod
+    def from_pure(cls, pure):
+        return jax.tree.unflatten(*pure)
+
+    def to_pure(self):
+        return jax.tree.flatten(self)

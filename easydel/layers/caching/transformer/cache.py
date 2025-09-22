@@ -71,7 +71,6 @@ Example:
 from __future__ import annotations
 
 import typing as tp
-from enum import Enum
 from functools import partial
 
 import jax
@@ -89,34 +88,12 @@ from jaxtyping import Array as JAXArray
 from jaxtyping import Bool, Float, Int
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
+from .._utils import AttnMaskDetail
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
-
-
-@auto_pytree
-class AttnMaskDetail:
-    """Configuration for attention masking patterns.
-
-    Defines the type and parameters of attention masking to apply
-    during cache operations. Supports various masking strategies
-    including sliding windows, chunks, and custom patterns.
-
-    Attributes:
-        mask_type (Enum): Type of attention mask (e.g., FULL, SLIDING, CHUNKED).
-        size (int): Primary size parameter for the mask (window size, chunk size, etc.).
-        offset (int | None): Optional offset for mask positioning.
-        chunks (int | None): Number of chunks for chunked attention.
-        bricks (int | None): Number of bricks for blocked attention patterns.
-    """
-
-    mask_type: Enum
-    size: int
-    offset: int | None = None
-    chunks: int | None = None
-    bricks: int | None = None
 
 
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -639,51 +616,6 @@ class TransformerCache(BaseCache):
                     for layer_index in range(metadata.num_hidden_layers)
                 ]
             )
-
-    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray]], TransformerCacheMetaData]:
-        """Convert cache to pure Python data structure for serialization.
-
-        Extracts raw tensors and metadata for checkpointing or transfer.
-        The pure representation can be pickled or saved to disk.
-
-        Returns:
-            tuple: Pair of (cache_data, metadata) where:
-                - cache_data: List of [key, value, indexs, starts] per layer
-                - metadata: Cache configuration metadata
-        """
-        return (
-            [[layer.key, layer.value, layer.indexs, layer.starts] for i, layer in enumerate(self.views)],
-            self.views[-1].metadata,
-        )
-
-    @classmethod
-    def from_pure(
-        cls, pure: list[list[JAXArray | ImplicitArray]], metadata: TransformerCacheMetaData
-    ) -> TransformerCache:
-        """Reconstruct cache from pure Python data structure.
-
-        Restores a cache from serialized tensors and metadata,
-        typically after loading from disk or receiving from transfer.
-
-        Args:
-            pure: List of [key, value, indexs, starts] per layer.
-            metadata: Cache configuration metadata.
-
-        Returns:
-            TransformerCache: Reconstructed cache instance.
-        """
-        return cls(
-            views=[
-                TransformerCacheView(
-                    key=layer[0],
-                    value=layer[1],
-                    indexs=layer[2],
-                    starts=layer[3],
-                    metadata=metadata,
-                )
-                for layer in pure
-            ]
-        )
 
     def insert_starts(
         self, starts: Int[JAXArray, "..."], slot: int, partition_manager: PartitionManager

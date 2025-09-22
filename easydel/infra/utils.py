@@ -115,7 +115,21 @@ ACT2FN = {
 Maps activation function names to their implementations.
 Supports common activations used in neural networks.
 """
-
+ACT2FN_TYPES = tp.Literal[
+    "gelu",
+    "relu",
+    "silu",
+    "swish",
+    "gelu_new",
+    "gelu_pytorch_tanh",
+    "tanh",
+    "sigmoid",
+    "leaky_relu",
+    "glu",
+    "elu",
+    "softmax",
+    "quick_gelu",
+]
 ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
 
 
@@ -1312,15 +1326,18 @@ class AttnMaskType(str, Enum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
+    LINEAR = "ATTN_MASK_LINEAR"
 
     @classmethod
-    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention"]):
+    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention", "linear_attention"]):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
         elif hf_type == "full_attention":
             return AttnMaskType.FULL
         elif hf_type == "chunk_attention":
             return AttnMaskType.CHUNK
+        elif hf_type == "linear_attention":
+            return AttnMaskType.LINEAR
         else:
             raise ValueError(f"`hf_type` {hf_type} is not available")
 
