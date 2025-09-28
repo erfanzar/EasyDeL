@@ -69,6 +69,8 @@ from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from eformer.serialization import AsyncCheckpointManager
 from flax import nnx as nn
+from huggingface_hub import CommitOperationAdd, create_branch, create_commit
+from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
@@ -321,6 +323,89 @@ class EasyBridgeMixin(PushToHubMixin):
             bool: True if the model can generate, False otherwise.
         """
         return True
+
+    def _upload_modified_files(
+        self,
+        working_dir: str | os.PathLike,
+        repo_id: str,
+        files_timestamps: dict[str, float],
+        commit_message: str | None = None,
+        token: bool | str | None = None,
+        create_pr: bool = False,
+        revision: str | None = None,
+        commit_description: str | None = None,
+    ):
+        """
+        Uploads all modified files under `working_dir` to `repo_id`, at arbitrary depth, based on `files_timestamps`.
+
+        files_timestamps should ideally map each file's relative POSIX path from `working_dir` (e.g. "a/b/c.txt")
+        to the last-uploaded mtime (float). For backward compatibility, if a full relative path key is missing,
+        this function falls back to a top-level key (first path segment) if present.
+        """
+        if commit_message is None:
+            if "Model" in self.__class__.__name__:
+                commit_message = "Upload model"
+            elif "Config" in self.__class__.__name__:
+                commit_message = "Upload config"
+            elif "Tokenizer" in self.__class__.__name__:
+                commit_message = "Upload tokenizer"
+            elif "FeatureExtractor" in self.__class__.__name__:
+                commit_message = "Upload feature extractor"
+            elif "Processor" in self.__class__.__name__:
+                commit_message = "Upload processor"
+            else:
+                commit_message = f"Upload {self.__class__.__name__}"
+
+        operations = []
+        modified_paths = []
+
+        for root, dirs, files in os.walk(working_dir):
+            if ".git" in dirs:
+                dirs.remove(".git")
+
+            for name in files:
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, working_dir)
+                rel_posix = rel.replace(os.sep, "/")
+
+                mtime = os.path.getmtime(src)
+                last = files_timestamps.get(rel_posix)
+
+                if last is None:
+                    top_level = rel_posix.split("/", 1)[0]
+                    top_last = files_timestamps.get(top_level)
+                    if top_last is not None and mtime <= top_last:
+                        continue
+                else:
+                    if mtime <= last:
+                        continue
+
+                operations.append(CommitOperationAdd(path_or_fileobj=src, path_in_repo=rel_posix))
+                modified_paths.append(rel_posix)
+
+        if not operations:
+            logger.info("No modified files found in %s; nothing to upload.", working_dir)
+            return None
+
+        if revision is not None and not revision.startswith("refs/pr"):
+            try:
+                create_branch(repo_id=repo_id, branch=revision, token=token, exist_ok=True)
+            except HfHubHTTPError as e:
+                if e.response.status_code == 403 and create_pr:
+                    pass
+                else:
+                    raise
+
+        logger.info(f"Uploading the files to {repo_id}")
+        return create_commit(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message=commit_message,
+            commit_description=commit_description,
+            token=token,
+            create_pr=create_pr,
+            revision=revision,
+        )
 
     @classmethod
     def _load_model_weights(
