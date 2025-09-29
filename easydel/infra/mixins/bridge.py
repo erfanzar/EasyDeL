@@ -434,6 +434,7 @@ class EasyBridgeMixin(PushToHubMixin):
         Returns:
             an easydel, with loaded parameter.
         """
+        callback = None
         if quantize_tensors:
             from easydel.layers.quantization.quantizers import EasyQuantizer
 
@@ -454,6 +455,18 @@ class EasyBridgeMixin(PushToHubMixin):
                         if callable_fn is not None:
                             x = callable_fn(x)
                     return quantizer(x, p)
+
+        if callback is None:
+
+            def callback(x, p):
+                if shard_fns is not None:
+                    key_get = p
+                    if isinstance(p, str):
+                        key_get = tuple(p.split("."))
+                    callable_fn = shard_fns.get(key_get)
+                    if callable_fn is not None:
+                        x = callable_fn(x)
+                return x
 
         extraargs = {}
         if resolved_archive_file:
