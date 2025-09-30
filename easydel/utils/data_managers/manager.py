@@ -151,7 +151,24 @@ class FastDataManager:
         return all_datasets
 
     def _load_single_dataset(self, inform: TextDatasetInform | VisualDatasetInform, mixture: DatasetMixture):
-        """Load and process a single dataset."""
+        """Load and process a single dataset from various sources.
+
+        Supports loading from:
+        - Direct file formats (JSON, JSONL, Parquet, CSV, Arrow)
+        - HuggingFace dataset IDs
+        - Local/remote file paths (GCS, S3, local filesystem)
+        - Saved dataset directories (from save_to_disk)
+
+        Args:
+            inform: Dataset configuration containing type, path, and field information
+            mixture: Dataset mixture configuration with cache and streaming settings
+
+        Returns:
+            Loaded dataset ready for processing
+
+        Raises:
+            RuntimeError: If dataset cannot be loaded from any source
+        """
         from datasets import load_dataset
 
         dataset_type = inform.get_str_type()
@@ -159,18 +176,69 @@ class FastDataManager:
         if dataset_type in ["json", "jsonl", "parquet", "csv", "arrow"]:
             dataset_loaded = self._fast_load_dataset(inform, mixture)
         else:
-            # For HuggingFace datasets, data_files should be the dataset ID
-            # and we don't pass data_files parameter to load_dataset
             if dataset_type == "huggingface" or dataset_type == "hf":
-                dataset_loaded = load_dataset(
-                    path=inform.data_files if isinstance(inform.data_files, str) else inform.data_files[0],
-                    split=inform.split,
-                    cache_dir=mixture.cache_dir,
-                    streaming=mixture.streaming,
-                    num_proc=self.num_workers if not mixture.streaming else None,
-                )
+                data_file_path = inform.data_files if isinstance(inform.data_files, str) else inform.data_files[0]
+
+                if "/" in data_file_path or "://" in data_file_path:
+                    has_extension = any(
+                        data_file_path.endswith(ext)
+                        for ext in [".arrow", ".parquet", ".pq", ".json", ".jsonl", ".csv"]
+                    )
+
+                    if not has_extension:
+                        try:
+                            from datasets import load_from_disk
+
+                            dataset_loaded = load_from_disk(data_file_path)
+                            if hasattr(dataset_loaded, "keys") and inform.split in dataset_loaded:
+                                dataset_loaded = dataset_loaded[inform.split]
+                        except Exception:
+                            try:
+                                dataset_loaded = load_dataset(
+                                    path="arrow",
+                                    data_files=f"{data_file_path}/**/*.arrow",
+                                    split=inform.split,
+                                    cache_dir=mixture.cache_dir,
+                                    streaming=mixture.streaming,
+                                    num_proc=self.num_workers if not mixture.streaming else None,
+                                )
+                            except Exception:
+                                dataset_loaded = load_dataset(
+                                    path="arrow",
+                                    data_files=data_file_path,
+                                    split=inform.split,
+                                    cache_dir=mixture.cache_dir,
+                                    streaming=mixture.streaming,
+                                    num_proc=self.num_workers if not mixture.streaming else None,
+                                )
+                    else:
+                        inferred_type = None
+                        if data_file_path.endswith(".arrow"):
+                            inferred_type = "arrow"
+                        elif data_file_path.endswith((".parquet", ".pq")):
+                            inferred_type = "parquet"
+                        elif data_file_path.endswith((".json", ".jsonl")):
+                            inferred_type = "json"
+                        elif data_file_path.endswith(".csv"):
+                            inferred_type = "csv"
+
+                        dataset_loaded = load_dataset(
+                            path=inferred_type or "arrow",
+                            data_files=inform.data_files,
+                            split=inform.split,
+                            cache_dir=mixture.cache_dir,
+                            streaming=mixture.streaming,
+                            num_proc=self.num_workers if not mixture.streaming else None,
+                        )
+                else:
+                    dataset_loaded = load_dataset(
+                        path=data_file_path,
+                        split=inform.split,
+                        cache_dir=mixture.cache_dir,
+                        streaming=mixture.streaming,
+                        num_proc=self.num_workers if not mixture.streaming else None,
+                    )
             else:
-                # For other types, assume it's a HuggingFace dataset ID or local path
                 dataset_loaded = load_dataset(
                     path=dataset_type,
                     data_files=inform.data_files,
@@ -179,6 +247,26 @@ class FastDataManager:
                     streaming=mixture.streaming,
                     num_proc=self.num_workers if not mixture.streaming else None,
                 )
+
+        if inform.format_fields is not None:
+            def rename_fields(example):
+                for old_name, new_name in inform.format_fields.items():
+                    if old_name in example:
+                        example[new_name] = example.pop(old_name)
+                return example
+
+            dataset_loaded = dataset_loaded.map(
+                rename_fields,
+                batched=False,
+                desc="Renaming fields",
+            )
+
+        if inform.format_callback is not None:
+            dataset_loaded = dataset_loaded.map(
+                inform.format_callback,
+                batched=False,
+                desc="Applying format callback",
+            )
 
         if isinstance(inform, TextDatasetInform):
             return self._process_text_dataset_fast(
@@ -197,7 +285,24 @@ class FastDataManager:
             raise ValueError(f"Unsupported dataset inform type: {type(inform)}")
 
     def _fast_load_dataset(self, inform: TextDatasetInform | VisualDatasetInform, mixture: DatasetMixture):
-        """Use fast loader for supported file types."""
+        """Load dataset using optimized fsspec-based fast loader.
+
+        Uses FastDataLoader for efficient loading of file-based datasets with support
+        for remote storage (GCS, S3) and local filesystems.
+
+        Args:
+            inform: Dataset configuration with file paths and type information
+            mixture: Dataset mixture configuration
+
+        Returns:
+            Loaded HuggingFace Dataset object
+
+        Supported formats:
+            - JSON/JSONL: Loaded with msgspec for speed
+            - Parquet: Loaded with pyarrow
+            - CSV: Loaded with pandas
+            - Arrow: Loaded with pyarrow memory mapping
+        """
         from datasets import Dataset
 
         file_type = inform.get_str_type()
@@ -265,7 +370,22 @@ class FastDataManager:
         inform: TextDatasetInform,
         target_field: str,
     ) -> DS:
-        """Process text dataset with optimizations."""
+        """Process and transform text dataset with field mapping and preprocessing.
+
+        Maps dataset fields to target fields and applies optional preprocessing functions.
+        Optimizes processing with parallel workers for non-streaming datasets.
+
+        Args:
+            dataset_loaded: Loaded HuggingFace dataset
+            inform: Text dataset configuration with field mappings
+            target_field: Target field name for content
+
+        Returns:
+            Processed dataset with mapped fields
+
+        Raises:
+            RuntimeError: If content field is not found in dataset columns
+        """
         if dataset_loaded.column_names is not None:
             if inform.content_field is not None and inform.content_field not in dataset_loaded.column_names:
                 raise RuntimeError(
@@ -287,16 +407,13 @@ class FastDataManager:
 
             return result
 
-        # Check if dataset is streaming
         is_streaming = hasattr(dataset_loaded, "_is_streaming") or hasattr(dataset_loaded, "__iter__")
 
         if is_streaming:
-            # For streaming datasets, don't use num_proc or load_from_cache_file
             ds_processed = dataset_loaded.map(transform_fn, batched=False)
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(inform.preprocessing_fn, batched=False)
         else:
-            # For regular datasets, use optimizations
             ds_processed = dataset_loaded.map(
                 transform_fn,
                 num_proc=self.num_workers,
@@ -320,7 +437,23 @@ class FastDataManager:
         text_target_field: str,
         image_target_field: str,
     ):
-        """Process visual dataset with optimizations."""
+        """Process and transform visual dataset with image resizing and field mapping.
+
+        Maps image and text fields to target fields, applies optional image resizing,
+        and runs preprocessing functions. Optimizes with parallel workers for non-streaming datasets.
+
+        Args:
+            dataset_loaded: Loaded HuggingFace dataset
+            inform: Visual dataset configuration with image and text field mappings
+            text_target_field: Target field name for text content
+            image_target_field: Target field name for image data
+
+        Returns:
+            Processed dataset with mapped and transformed fields
+
+        Raises:
+            ImportError: If pillow library is not installed
+        """
         try:
             from PIL import Image as PILImage  # type:ignore
         except ImportError as e:
@@ -338,11 +471,9 @@ class FastDataManager:
 
             return result
 
-        # Check if dataset is streaming
         is_streaming = hasattr(dataset_loaded, "_is_streaming") or hasattr(dataset_loaded, "__iter__")
 
         if is_streaming:
-            # For streaming datasets
             ds_processed = dataset_loaded.map(transform_fn, batched=False)
 
             if inform.image_size:
@@ -368,7 +499,6 @@ class FastDataManager:
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(inform.preprocessing_fn, batched=False)
         else:
-            # For regular datasets
             ds_processed = dataset_loaded.map(
                 transform_fn,
                 num_proc=self.num_workers,
@@ -412,14 +542,27 @@ class FastDataManager:
         return ds_processed
 
     def _optimized_interleave(self, datasets, seed=None, shuffle_buffer_size=None):
-        """Optimized dataset interleaving with prefetching."""
+        """Interleave multiple datasets with optional shuffling.
+
+        Combines multiple datasets by interleaving their examples. Uses HuggingFace datasets
+        library's native interleaving for optimal performance.
+
+        Args:
+            datasets: List of datasets to interleave
+            seed: Random seed for shuffling (optional)
+            shuffle_buffer_size: Buffer size for shuffling after interleaving (optional)
+
+        Returns:
+            Interleaved dataset, optionally shuffled
+
+        Raises:
+            ImportError: If datasets library is not installed
+        """
         try:
             from datasets import interleave_datasets
         except ImportError as e:
             raise ImportError("The 'datasets' library is required. Install it with 'pip install datasets'.") from e
 
-        # Don't wrap datasets with prefetch_stream for interleaving
-        # The datasets library handles its own optimizations
         interleaved = interleave_datasets(
             datasets,
             seed=seed,
@@ -427,13 +570,24 @@ class FastDataManager:
         )
 
         if shuffle_buffer_size:
-            interleaved = interleaved.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+            is_streaming = hasattr(interleaved, "_is_streaming") and interleaved._is_streaming
+            if is_streaming:
+                interleaved = interleaved.shuffle(buffer_size=shuffle_buffer_size, seed=seed)
+            else:
+                interleaved = interleaved.shuffle(seed=seed)
 
         return interleaved
 
     def _optimized_batch(self, dataset, batch_size: int):
-        """Optimized batching with prefetching."""
-        # Don't wrap with prefetch_stream as datasets library handles batching
+        """Batch dataset with specified batch size.
+
+        Args:
+            dataset: Dataset to batch
+            batch_size: Number of examples per batch
+
+        Returns:
+            Batched dataset
+        """
         return dataset.batch(batch_size)
 
     def create_data_iterator(
