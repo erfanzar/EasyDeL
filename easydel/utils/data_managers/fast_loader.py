@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Fast data loading utilities using fsspec for remote storage access.
+
+Provides optimized data loaders for various file formats with support for:
+- Remote storage (GCS, S3, HTTP/HTTPS)
+- Asynchronous and parallel loading
+- Automatic caching with TTL
+- Streaming and batch processing
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +39,23 @@ if tp.TYPE_CHECKING:
 
 
 class FastDataLoader:
-    """Optimized data loader using fsspec for fast I/O operations."""
+    """Optimized data loader using fsspec for fast I/O operations.
+
+    Provides efficient loading from local and remote storage with automatic caching.
+    Supports JSON, JSONL, Parquet, Arrow, and CSV formats.
+
+    Args:
+        cache_storage: Directory for caching remote files (default: ~/.cache/easydel_data)
+        use_async: Enable asynchronous loading (default: True)
+        num_workers: Number of parallel workers (default: 4)
+        buffer_size: Buffer size for I/O operations in bytes (default: 8192)
+        cache_ttl: Cache time-to-live in seconds (default: 3600)
+
+    Example:
+        >>> loader = FastDataLoader(num_workers=8, cache_ttl=7200)
+        >>> data = loader.load_json("gs://bucket/data.jsonl", lines=True)
+        >>> df = loader.load_parquet("s3://bucket/data.parquet")
+    """
 
     def __init__(
         self,
@@ -49,7 +74,17 @@ class FastDataLoader:
         self._fs_cache = {}
 
     def get_filesystem(self, path: str, cache: bool = True) -> fsspec.AbstractFileSystem:
-        """Get appropriate filesystem for path with optional caching."""
+        """Get appropriate filesystem for path with optional caching.
+
+        Automatically detects protocol (local, gs, s3, http) and returns cached filesystem instance.
+
+        Args:
+            path: File path with protocol (e.g., 'gs://bucket/file')
+            cache: Enable local caching for remote filesystems (default: True)
+
+        Returns:
+            Filesystem instance for the path protocol
+        """
         protocol = fsspec.utils.get_protocol(path)
 
         if protocol not in self._fs_cache:
@@ -71,12 +106,27 @@ class FastDataLoader:
 
     @lru_cache(maxsize=128)  # noqa: B019
     def _get_file_info(self, path: str) -> dict:
-        """Get cached file information."""
+        """Get cached file information from filesystem.
+
+        Args:
+            path: File path to query
+
+        Returns:
+            Dictionary with file metadata
+        """
         fs = self.get_filesystem(path)
         return fs.info(path)
 
     async def load_json_async(self, path: str, lines: bool = False) -> list | dict:
-        """Asynchronously load JSON/JSONL files with msgspec for speed."""
+        """Asynchronously load JSON/JSONL files with msgspec for speed.
+
+        Args:
+            path: Path to JSON file
+            lines: True for JSONL format (default: False)
+
+        Returns:
+            Parsed JSON data as dict or list
+        """
         fs = self.get_filesystem(path)
 
         if isinstance(fs, AsyncFileSystem):
@@ -93,13 +143,28 @@ class FastDataLoader:
             return msgspec.json.decode(content)
 
     def _load_bytes(self, path: str) -> bytes:
-        """Load file content as bytes."""
+        """Load file content as bytes.
+
+        Args:
+            path: File path to load
+
+        Returns:
+            File content as bytes
+        """
         fs = self.get_filesystem(path)
         with fs.open(path, "rb") as f:
             return f.read()
 
     def load_json(self, path: str, lines: bool = False) -> list | dict:
-        """Load JSON/JSONL files with msgspec for speed."""
+        """Load JSON/JSONL files with msgspec for speed.
+
+        Args:
+            path: Path to JSON file (local or remote)
+            lines: True for JSONL format (default: False)
+
+        Returns:
+            Parsed JSON data as dict or list
+        """
         if self.use_async:
             return asyncio.run(self.load_json_async(path, lines))
 
@@ -114,7 +179,16 @@ class FastDataLoader:
             return msgspec.json.decode(content)
 
     def load_parquet(self, path: str, columns: list[str] | None = None, filters: list | None = None) -> pd.DataFrame:
-        """Load Parquet files with optional column selection and filtering."""
+        """Load Parquet files with optional column selection and filtering.
+
+        Args:
+            path: Path to Parquet file
+            columns: Optional list of columns to load
+            filters: Optional row filters
+
+        Returns:
+            Pandas DataFrame with loaded data
+        """
         import pyarrow.parquet as pq
 
         fs = self.get_filesystem(path)

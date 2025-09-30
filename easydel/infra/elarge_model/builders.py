@@ -313,6 +313,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 content_field=inform_cfg.get("content_field"),
                 image_size=tuple(inform_cfg["image_size"]) if inform_cfg.get("image_size") else None,
                 num_rows=inform_cfg.get("num_rows"),
+                format_fields=inform_cfg.get("format_fields"),
             )
         else:
             inform = TextDatasetInform(
@@ -322,6 +323,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 content_field=inform_cfg.get("content_field", "content"),
                 additional_fields=inform_cfg.get("additional_fields"),
                 num_rows=inform_cfg.get("num_rows"),
+                format_fields=inform_cfg.get("format_fields"),
             )
         informs.append(inform)
 

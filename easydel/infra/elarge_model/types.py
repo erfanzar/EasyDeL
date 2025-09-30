@@ -209,6 +209,8 @@ class TextDatasetInformCfg(TypedDict, total=False):
     content_field: NotRequired[str]
     additional_fields: NotRequired[list[str]]
     num_rows: NotRequired[int | None]
+    format_callback: NotRequired[tp.Callable[[dict], dict] | None]
+    format_fields: NotRequired[dict[str, str] | None]
 
 
 class VisualDatasetInformCfg(TypedDict, total=False):
@@ -231,6 +233,8 @@ class VisualDatasetInformCfg(TypedDict, total=False):
     content_field: NotRequired[str | None]
     image_size: NotRequired[tuple[int, int] | None]
     num_rows: NotRequired[int | None]
+    format_callback: NotRequired[tp.Callable[[dict], dict] | None]
+    format_fields: NotRequired[dict[str, str] | None]
 
 
 class DataMixtureCfg(TypedDict, total=False):
