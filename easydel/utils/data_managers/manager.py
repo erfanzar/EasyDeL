@@ -96,6 +96,12 @@ class FastDataManager:
         else:
             all_datasets = self._sequential_load_datasets(mixture)
 
+        # Collect all additional_fields from all informs to ensure unified schema
+        all_additional_fields = set()
+        for inform in mixture.informs:
+            if hasattr(inform, "additional_fields") and inform.additional_fields:
+                all_additional_fields.update(inform.additional_fields)
+
         if mixture.streaming:
             combined_dataset = self._optimized_interleave(
                 all_datasets,
@@ -120,6 +126,20 @@ class FastDataManager:
 
             if mixture.shuffle_buffer_size:
                 combined_dataset = combined_dataset.shuffle(seed=mixture.seed)
+
+        if all_additional_fields:
+
+            def normalize_fields(example):
+                for field in all_additional_fields:
+                    if field not in example:
+                        example[field] = None
+                return example
+
+            is_streaming = hasattr(combined_dataset, "_ex_iterable") or hasattr(combined_dataset, "_is_streaming")
+            if is_streaming:
+                combined_dataset = combined_dataset.map(normalize_fields, batched=False)
+            else:
+                combined_dataset = combined_dataset.map(normalize_fields, batched=False, desc="Normalizing fields")
 
         if mixture.batch_size > 1:
             combined_dataset = self._optimized_batch(combined_dataset, mixture.batch_size)
@@ -682,6 +702,9 @@ class FastDataManager:
             finally:
                 features_module._check_if_features_can_be_aligned = original_check
                 iterable_module._check_if_features_can_be_aligned = original_check_iterable
+
+            if hasattr(interleaved, "_info") and hasattr(interleaved._info, "features"):
+                interleaved._info.features = None
         else:
             interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
 
