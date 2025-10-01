@@ -277,6 +277,12 @@ class FastDataManager:
             is_streaming = hasattr(dataset_loaded, "_ex_iterable")
             if is_streaming:
                 dataset_loaded = dataset_loaded.map(rename_fields, batched=False)
+                try:
+                    old_fields_in_features = [k for k in inform.format_fields.keys() if k in dataset_loaded.features]
+                    if old_fields_in_features:
+                        dataset_loaded = dataset_loaded.remove_columns(old_fields_in_features)
+                except Exception:
+                    pass
             else:
                 dataset_loaded = dataset_loaded.map(rename_fields, batched=False, desc="Renaming fields")
 
@@ -285,7 +291,11 @@ class FastDataManager:
             if is_streaming:
                 dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False)
             else:
-                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False, desc="Applying format callback")
+                dataset_loaded = dataset_loaded.map(
+                    inform.format_callback,
+                    batched=False,
+                    desc="Applying format callback",
+                )
 
         if isinstance(inform, TextDatasetInform):
             return self._process_text_dataset_fast(dataset_loaded, inform, mixture.text_target_field)
