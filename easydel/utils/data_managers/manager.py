@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from eformer.paths import ePath
+from pathlib import Path
 
 from .fast_loader import DataStreamOptimizer, FastDataLoader
 from .types import DatasetMixture, TextDatasetInform, VisualDatasetInform
@@ -37,7 +36,7 @@ class FastDataManager:
         buffer_size: int = 100,
         use_async: bool = True,
     ):
-        self.cache_dir = cache_dir or str(ePath.home() / ".cache" / "easydel")
+        self.cache_dir = cache_dir or str(Path.home() / ".cache" / "easydel")
         self.num_workers = num_workers
         self.prefetch_size = prefetch_size
         self.buffer_size = buffer_size
@@ -181,8 +180,7 @@ class FastDataManager:
 
                 if "/" in data_file_path or "://" in data_file_path:
                     has_extension = any(
-                        data_file_path.endswith(ext)
-                        for ext in [".arrow", ".parquet", ".pq", ".json", ".jsonl", ".csv"]
+                        data_file_path.endswith(ext) for ext in [".arrow", ".parquet", ".pq", ".json", ".jsonl", ".csv"]
                     )
 
                     if not has_extension:
@@ -249,10 +247,25 @@ class FastDataManager:
                 )
 
         if inform.format_fields is not None:
+
             def rename_fields(example):
                 for old_name, new_name in inform.format_fields.items():
                     if old_name in example:
                         example[new_name] = example.pop(old_name)
+
+                # Also transform nested list items if they contain the old field names
+                for field in list(example.keys()):
+                    if isinstance(example[field], list) and len(example[field]) > 0:
+                        if isinstance(example[field][0], dict):
+                            new_list = []
+                            for item in example[field]:
+                                new_item = dict(item)
+                                for old_name, new_name in inform.format_fields.items():
+                                    if old_name in new_item:
+                                        new_item[new_name] = new_item.pop(old_name)
+                                new_list.append(new_item)
+                            example[field] = new_list
+
                 return example
 
             dataset_loaded = dataset_loaded.map(
@@ -562,6 +575,29 @@ class FastDataManager:
             from datasets import interleave_datasets
         except ImportError as e:
             raise ImportError("The 'datasets' library is required. Install it with 'pip install datasets'.") from e
+
+        # Align schemas by finding common features
+        if len(datasets) > 1:
+            all_features = [ds.features for ds in datasets]
+            common_columns = set(all_features[0].keys())
+            for features in all_features[1:]:
+                common_columns &= set(features.keys())
+
+            # Remove columns that have incompatible types across datasets
+            aligned_datasets = []
+            for ds in datasets:
+                columns_to_remove = []
+                for col in ds.column_names:
+                    if col in common_columns:
+                        # Check if this column has the same type across all datasets
+                        col_types = [f[col] for f in all_features if col in f]
+                        if len(set(str(t) for t in col_types)) > 1:
+                            columns_to_remove.append(col)
+
+                if columns_to_remove:
+                    ds = ds.remove_columns(columns_to_remove)
+                aligned_datasets.append(ds)
+            datasets = aligned_datasets
 
         interleaved = interleave_datasets(
             datasets,
