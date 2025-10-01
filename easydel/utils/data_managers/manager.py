@@ -103,7 +103,21 @@ class FastDataManager:
                 mixture.shuffle_buffer_size,
             )
         else:
-            combined_dataset = concatenate_datasets(all_datasets)
+            import datasets.arrow_dataset as arrow_module
+            import datasets.features.features as features_module
+
+            original_check = features_module._check_if_features_can_be_aligned
+            original_check_arrow = arrow_module._check_if_features_can_be_aligned
+
+            features_module._check_if_features_can_be_aligned = lambda x: None
+            arrow_module._check_if_features_can_be_aligned = lambda x: None
+
+            try:
+                combined_dataset = concatenate_datasets(all_datasets)
+            finally:
+                features_module._check_if_features_can_be_aligned = original_check
+                arrow_module._check_if_features_can_be_aligned = original_check_arrow
+
             if mixture.shuffle_buffer_size:
                 combined_dataset = combined_dataset.shuffle(seed=mixture.seed)
 
