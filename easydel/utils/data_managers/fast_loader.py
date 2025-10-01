@@ -73,14 +73,14 @@ class FastDataLoader:
         self._executor = ThreadPoolExecutor(max_workers=num_workers)
         self._fs_cache = {}
 
-    def get_filesystem(self, path: str, cache: bool = True) -> fsspec.AbstractFileSystem:
+    def get_filesystem(self, path: str, cache: bool = False) -> fsspec.AbstractFileSystem:
         """Get appropriate filesystem for path with optional caching.
 
         Automatically detects protocol (local, gs, s3, http) and returns cached filesystem instance.
 
         Args:
             path: File path with protocol (e.g., 'gs://bucket/file')
-            cache: Enable local caching for remote filesystems (default: True)
+            cache: Enable local caching for remote filesystems (default: False)
 
         Returns:
             Filesystem instance for the path protocol
