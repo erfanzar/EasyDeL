@@ -184,13 +184,18 @@ class FastDataManager:
                     )
 
                     if not has_extension:
-                        try:
-                            from datasets import load_from_disk
+                        dataset_loaded = None
+                        if not mixture.streaming:
+                            try:
+                                from datasets import load_from_disk
 
-                            dataset_loaded = load_from_disk(data_file_path)
-                            if hasattr(dataset_loaded, "keys") and inform.split in dataset_loaded:
-                                dataset_loaded = dataset_loaded[inform.split]
-                        except Exception:
+                                dataset_loaded = load_from_disk(data_file_path)
+                                if hasattr(dataset_loaded, "keys") and inform.split in dataset_loaded:
+                                    dataset_loaded = dataset_loaded[inform.split]
+                            except Exception:
+                                dataset_loaded = None
+
+                        if dataset_loaded is None:
                             try:
                                 dataset_loaded = load_dataset(
                                     path="arrow",
@@ -268,31 +273,25 @@ class FastDataManager:
 
                 return example
 
-            dataset_loaded = dataset_loaded.map(
-                rename_fields,
-                batched=False,
-                desc="Renaming fields",
-            )
+            # IterableDataset.map() doesn't support 'desc' parameter
+            is_streaming = hasattr(dataset_loaded, "_ex_iterable")
+            if is_streaming:
+                dataset_loaded = dataset_loaded.map(rename_fields, batched=False)
+            else:
+                dataset_loaded = dataset_loaded.map(rename_fields, batched=False, desc="Renaming fields")
 
         if inform.format_callback is not None:
-            dataset_loaded = dataset_loaded.map(
-                inform.format_callback,
-                batched=False,
-                desc="Applying format callback",
-            )
+            is_streaming = hasattr(dataset_loaded, "_ex_iterable")
+            if is_streaming:
+                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False)
+            else:
+                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False, desc="Applying format callback")
 
         if isinstance(inform, TextDatasetInform):
-            return self._process_text_dataset_fast(
-                dataset_loaded,
-                inform,
-                mixture.text_target_field,
-            )
+            return self._process_text_dataset_fast(dataset_loaded, inform, mixture.text_target_field)
         elif isinstance(inform, VisualDatasetInform):
             return self._process_visual_dataset_fast(
-                dataset_loaded,
-                inform,
-                mixture.text_target_field,
-                mixture.image_target_field,
+                dataset_loaded, inform, mixture.text_target_field, mixture.image_target_field
             )
         else:
             raise ValueError(f"Unsupported dataset inform type: {type(inform)}")
@@ -576,34 +575,40 @@ class FastDataManager:
         except ImportError as e:
             raise ImportError("The 'datasets' library is required. Install it with 'pip install datasets'.") from e
 
-        # Align schemas by finding common features
+        # For streaming datasets, skip schema alignment (it would materialize them)
         if len(datasets) > 1:
-            all_features = [ds.features for ds in datasets]
-            common_columns = set(all_features[0].keys())
-            for features in all_features[1:]:
-                common_columns &= set(features.keys())
+            has_streaming = any(hasattr(ds, "_ex_iterable") for ds in datasets)
 
-            # Remove columns that have incompatible types across datasets
-            aligned_datasets = []
-            for ds in datasets:
-                columns_to_remove = []
-                for col in ds.column_names:
-                    if col in common_columns:
-                        # Check if this column has the same type across all datasets
-                        col_types = [f[col] for f in all_features if col in f]
-                        if len(set(str(t) for t in col_types)) > 1:
-                            columns_to_remove.append(col)
+            if not has_streaming:
+                # Only do schema alignment for non-streaming datasets
+                from datasets.features import Features
 
-                if columns_to_remove:
-                    ds = ds.remove_columns(columns_to_remove)
-                aligned_datasets.append(ds)
-            datasets = aligned_datasets
+                all_features = [ds.features for ds in datasets]
+                common_columns = set(all_features[0].keys())
+                for features in all_features[1:]:
+                    common_columns &= set(features.keys())
 
-        interleaved = interleave_datasets(
-            datasets,
-            seed=seed,
-            stopping_strategy="first_exhausted",
-        )
+                unified_features = {}
+                for col in common_columns:
+                    col_types = [f[col] for f in all_features if col in f]
+                    unified_features[col] = col_types[0]
+
+                aligned_datasets = []
+                for ds in datasets:
+                    cols_to_remove = [c for c in ds.column_names if c not in common_columns]
+                    if cols_to_remove:
+                        ds = ds.remove_columns(cols_to_remove)
+
+                    try:
+                        unified_subset = Features({k: v for k, v in unified_features.items() if k in ds.column_names})
+                        ds = ds.cast(unified_subset)
+                    except Exception:
+                        pass
+
+                    aligned_datasets.append(ds)
+                datasets = aligned_datasets
+
+        interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
 
         if shuffle_buffer_size:
             is_streaming = hasattr(interleaved, "_is_streaming") and interleaved._is_streaming

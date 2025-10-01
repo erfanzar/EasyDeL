@@ -194,7 +194,7 @@ class DatasetMixture:
         text_target_field: Target field name for text content (default: "text")
         image_target_field: Target field name for images (default: "image")
         batch_size: Batch size for data loading (default: 1)
-        shuffle_buffer_size: Buffer size for shuffling (default: 1000)
+        shuffle_buffer_size: Buffer size for shuffling (default: None, disabled)
         seed: Random seed for reproducibility (default: 42)
 
     Example:
@@ -215,7 +215,7 @@ class DatasetMixture:
     text_target_field: str = "text"
     image_target_field: str = "image"
     batch_size: int = 1
-    shuffle_buffer_size: int | None = 1000
+    shuffle_buffer_size: int | None = None
     seed: int | None = 42
 
     def __post_init__(self):
