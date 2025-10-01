@@ -288,13 +288,26 @@ class FastDataManager:
 
         if inform.format_callback is not None:
             is_streaming = hasattr(dataset_loaded, "_ex_iterable")
+
+            first_example_iter = iter(dataset_loaded.take(1)) if is_streaming else iter([dataset_loaded[0]])
+            first_example = next(first_example_iter)
+            columns_before = set(first_example.keys())
+            sample_after = inform.format_callback(first_example)
+            columns_after_callback = set(sample_after.keys())
+            columns_to_remove = list(columns_before - columns_after_callback)
+
             if is_streaming:
-                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False)
+                dataset_loaded = dataset_loaded.map(
+                    inform.format_callback,
+                    batched=False,
+                    remove_columns=columns_to_remove if columns_to_remove else None,
+                )
             else:
                 dataset_loaded = dataset_loaded.map(
                     inform.format_callback,
                     batched=False,
                     desc="Applying format callback",
+                    remove_columns=columns_to_remove if columns_to_remove else None,
                 )
 
         if isinstance(inform, TextDatasetInform):
@@ -431,8 +444,27 @@ class FastDataManager:
 
         is_streaming = hasattr(dataset_loaded, "_is_streaming") or hasattr(dataset_loaded, "__iter__")
 
+        columns_to_keep = {target_field}
+        if inform.additional_fields:
+            columns_to_keep.update(inform.additional_fields)
+        if dataset_loaded.column_names is not None:
+            current_columns = set(dataset_loaded.column_names)
+        elif hasattr(dataset_loaded, "features") and dataset_loaded.features is not None:
+            current_columns = set(dataset_loaded.features.keys())
+        else:
+            current_columns = columns_to_keep
+
+        columns_to_remove = list(current_columns - columns_to_keep)
+
         if is_streaming:
-            ds_processed = dataset_loaded.map(transform_fn, batched=False)
+            ds_processed = dataset_loaded.map(
+                transform_fn, batched=False, remove_columns=columns_to_remove if columns_to_remove else None
+            )
+            try:
+                ds_processed = ds_processed.select_columns(list(columns_to_keep))
+            except Exception:
+                pass
+
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(inform.preprocessing_fn, batched=False)
         else:
@@ -441,6 +473,7 @@ class FastDataManager:
                 num_proc=self.num_workers,
                 batched=False,
                 load_from_cache_file=True,
+                remove_columns=columns_to_remove if columns_to_remove else None,
             )
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(
@@ -618,7 +651,25 @@ class FastDataManager:
                     aligned_datasets.append(ds)
                 datasets = aligned_datasets
 
-        interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
+        has_streaming = len(datasets) > 1 and any(hasattr(ds, "_ex_iterable") for ds in datasets)
+
+        if has_streaming:
+            import datasets.features.features as features_module
+            import datasets.iterable_dataset as iterable_module
+
+            original_check = features_module._check_if_features_can_be_aligned
+            original_check_iterable = iterable_module._check_if_features_can_be_aligned
+
+            features_module._check_if_features_can_be_aligned = lambda x: None
+            iterable_module._check_if_features_can_be_aligned = lambda x: None
+
+            try:
+                interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
+            finally:
+                features_module._check_if_features_can_be_aligned = original_check
+                iterable_module._check_if_features_can_be_aligned = original_check_iterable
+        else:
+            interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
 
         if shuffle_buffer_size:
             is_streaming = hasattr(interleaved, "_is_streaming") and interleaved._is_streaming
