@@ -96,6 +96,12 @@ class FastDataManager:
         else:
             all_datasets = self._sequential_load_datasets(mixture)
 
+        # Collect all additional_fields from all informs to ensure unified schema
+        all_additional_fields = set()
+        for inform in mixture.informs:
+            if hasattr(inform, "additional_fields") and inform.additional_fields:
+                all_additional_fields.update(inform.additional_fields)
+
         if mixture.streaming:
             combined_dataset = self._optimized_interleave(
                 all_datasets,
@@ -103,9 +109,37 @@ class FastDataManager:
                 mixture.shuffle_buffer_size,
             )
         else:
-            combined_dataset = concatenate_datasets(all_datasets)
+            import datasets.arrow_dataset as arrow_module
+            import datasets.features.features as features_module
+
+            original_check = features_module._check_if_features_can_be_aligned
+            original_check_arrow = arrow_module._check_if_features_can_be_aligned
+
+            features_module._check_if_features_can_be_aligned = lambda x: None
+            arrow_module._check_if_features_can_be_aligned = lambda x: None
+
+            try:
+                combined_dataset = concatenate_datasets(all_datasets)
+            finally:
+                features_module._check_if_features_can_be_aligned = original_check
+                arrow_module._check_if_features_can_be_aligned = original_check_arrow
+
             if mixture.shuffle_buffer_size:
                 combined_dataset = combined_dataset.shuffle(seed=mixture.seed)
+
+        if all_additional_fields:
+
+            def normalize_fields(example):
+                for field in all_additional_fields:
+                    if field not in example:
+                        example[field] = None
+                return example
+
+            is_streaming = hasattr(combined_dataset, "_ex_iterable") or hasattr(combined_dataset, "_is_streaming")
+            if is_streaming:
+                combined_dataset = combined_dataset.map(normalize_fields, batched=False)
+            else:
+                combined_dataset = combined_dataset.map(normalize_fields, batched=False, desc="Normalizing fields")
 
         if mixture.batch_size > 1:
             combined_dataset = self._optimized_batch(combined_dataset, mixture.batch_size)
@@ -286,16 +320,37 @@ class FastDataManager:
             is_streaming = hasattr(dataset_loaded, "_ex_iterable")
             if is_streaming:
                 dataset_loaded = dataset_loaded.map(rename_fields, batched=False)
+                try:
+                    old_fields_in_features = [k for k in inform.format_fields.keys() if k in dataset_loaded.features]
+                    if old_fields_in_features:
+                        dataset_loaded = dataset_loaded.remove_columns(old_fields_in_features)
+                except Exception:
+                    pass
             else:
                 dataset_loaded = dataset_loaded.map(rename_fields, batched=False, desc="Renaming fields")
 
         if inform.format_callback is not None:
             is_streaming = hasattr(dataset_loaded, "_ex_iterable")
+
+            first_example_iter = iter(dataset_loaded.take(1)) if is_streaming else iter([dataset_loaded[0]])
+            first_example = next(first_example_iter)
+            columns_before = set(first_example.keys())
+            sample_after = inform.format_callback(first_example)
+            columns_after_callback = set(sample_after.keys())
+            columns_to_remove = list(columns_before - columns_after_callback)
+
             if is_streaming:
-                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False)
+                dataset_loaded = dataset_loaded.map(
+                    inform.format_callback,
+                    batched=False,
+                    remove_columns=columns_to_remove if columns_to_remove else None,
+                )
             else:
                 dataset_loaded = dataset_loaded.map(
-                    inform.format_callback, batched=False, desc="Applying format callback"
+                    inform.format_callback,
+                    batched=False,
+                    desc="Applying format callback",
+                    remove_columns=columns_to_remove if columns_to_remove else None,
                 )
 
         if isinstance(inform, TextDatasetInform):
@@ -437,8 +492,27 @@ class FastDataManager:
 
         is_streaming = hasattr(dataset_loaded, "_is_streaming") or hasattr(dataset_loaded, "__iter__")
 
+        columns_to_keep = {target_field}
+        if inform.additional_fields:
+            columns_to_keep.update(inform.additional_fields)
+        if dataset_loaded.column_names is not None:
+            current_columns = set(dataset_loaded.column_names)
+        elif hasattr(dataset_loaded, "features") and dataset_loaded.features is not None:
+            current_columns = set(dataset_loaded.features.keys())
+        else:
+            current_columns = columns_to_keep
+
+        columns_to_remove = list(current_columns - columns_to_keep)
+
         if is_streaming:
-            ds_processed = dataset_loaded.map(transform_fn, batched=False)
+            ds_processed = dataset_loaded.map(
+                transform_fn, batched=False, remove_columns=columns_to_remove if columns_to_remove else None
+            )
+            try:
+                ds_processed = ds_processed.select_columns(list(columns_to_keep))
+            except Exception:
+                pass
+
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(inform.preprocessing_fn, batched=False)
         else:
@@ -447,6 +521,7 @@ class FastDataManager:
                 num_proc=self.num_workers,
                 batched=False,
                 load_from_cache_file=True,
+                remove_columns=columns_to_remove if columns_to_remove else None,
             )
             if inform.preprocessing_fn:
                 ds_processed = ds_processed.map(
@@ -624,7 +699,28 @@ class FastDataManager:
                     aligned_datasets.append(ds)
                 datasets = aligned_datasets
 
-        interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
+        has_streaming = len(datasets) > 1 and any(hasattr(ds, "_ex_iterable") for ds in datasets)
+
+        if has_streaming:
+            import datasets.features.features as features_module
+            import datasets.iterable_dataset as iterable_module
+
+            original_check = features_module._check_if_features_can_be_aligned
+            original_check_iterable = iterable_module._check_if_features_can_be_aligned
+
+            features_module._check_if_features_can_be_aligned = lambda x: None
+            iterable_module._check_if_features_can_be_aligned = lambda x: None
+
+            try:
+                interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
+            finally:
+                features_module._check_if_features_can_be_aligned = original_check
+                iterable_module._check_if_features_can_be_aligned = original_check_iterable
+
+            if hasattr(interleaved, "_info") and hasattr(interleaved._info, "features"):
+                interleaved._info.features = None
+        else:
+            interleaved = interleave_datasets(datasets, seed=seed, stopping_strategy="first_exhausted")
 
         if shuffle_buffer_size:
             is_streaming = hasattr(interleaved, "_is_streaming") and interleaved._is_streaming
