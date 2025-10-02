@@ -177,8 +177,17 @@ class FastDataManager:
         else:
             if dataset_type == "huggingface" or dataset_type == "hf":
                 data_file_path = inform.data_files if isinstance(inform.data_files, str) else inform.data_files[0]
+                is_file_path = (
+                    "://" in data_file_path
+                    or data_file_path.startswith("/")
+                    or data_file_path.startswith("./")
+                    or data_file_path.startswith("../")
+                    or any(
+                        data_file_path.endswith(ext) for ext in [".arrow", ".parquet", ".pq", ".json", ".jsonl", ".csv"]
+                    )
+                )
 
-                if "/" in data_file_path or "://" in data_file_path:
+                if is_file_path:
                     has_extension = any(
                         data_file_path.endswith(ext) for ext in [".arrow", ".parquet", ".pq", ".json", ".jsonl", ".csv"]
                     )
@@ -285,7 +294,9 @@ class FastDataManager:
             if is_streaming:
                 dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False)
             else:
-                dataset_loaded = dataset_loaded.map(inform.format_callback, batched=False, desc="Applying format callback")
+                dataset_loaded = dataset_loaded.map(
+                    inform.format_callback, batched=False, desc="Applying format callback"
+                )
 
         if isinstance(inform, TextDatasetInform):
             return self._process_text_dataset_fast(dataset_loaded, inform, mixture.text_target_field)
@@ -398,11 +409,12 @@ class FastDataManager:
         Raises:
             RuntimeError: If content field is not found in dataset columns
         """
-        if dataset_loaded.column_names is not None:
-            if inform.content_field is not None and inform.content_field not in dataset_loaded.column_names:
-                raise RuntimeError(
-                    f"Couldn't find {inform.content_field} in available columns({dataset_loaded.column_names})."
-                )
+        if inform.format_callback is None:
+            if dataset_loaded.column_names is not None and inform.content_field is not None:
+                if inform.content_field not in dataset_loaded.column_names:
+                    raise RuntimeError(
+                        f"Couldn't find {inform.content_field} in available columns({dataset_loaded.column_names})."
+                    )
 
         def transform_fn(example):
             if inform.content_field is None:
@@ -410,7 +422,11 @@ class FastDataManager:
             try:
                 result = {target_field: example[inform.content_field]}
             except KeyError as e:
-                raise KeyError(f"couldn't access {inform.content_field} Available Keys {example.keys()}.") from e
+                raise KeyError(
+                    f"couldn't access {inform.content_field} in example. "
+                    f"Available keys: {list(example.keys())}. "
+                    f"This may indicate the format_callback didn't transform fields as expected."
+                ) from e
 
             if inform.additional_fields:
                 for field in inform.additional_fields:

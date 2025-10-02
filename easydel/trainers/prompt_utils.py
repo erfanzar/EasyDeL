@@ -657,15 +657,24 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
         raise TypeError("Input must be a list or a dictionary.")
 
 
-def keep_arrays_map(example: dict[str, tp.Any], array_fields: list[str] | None = None) -> dict[str, tp.Any]:
+def keep_arrays_map(
+    example: dict[str, tp.Any],
+    array_fields: list[str] | None = None,
+    drop_fields: list[str] | None = None,
+) -> dict[str, tp.Any]:
+    """Keep only array fields and convert them to numpy arrays for HF datasets compatibility."""
     results = {}
     if array_fields is None:
         array_fields = []
+    if drop_fields is None:
+        drop_fields = []
     for k, v in example.items():
         if k in array_fields:
-            v = jnp.asarray(v)
-        if isinstance(v, int | float | np.ndarray | jax.Array):
-            results[k] = v
+            results[k] = np.asarray(v)
+        if k in drop_fields:
+            continue
+        elif isinstance(v, (list, np.ndarray, jax.Array)):  # noqa
+            results[k] = np.asarray(v)
     return results
 
 
@@ -1178,6 +1187,10 @@ def pad_and_truncate_dataset(
     def process_batch(batch: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
         processed: dict[str, list[tp.Any]] = {}
         for k, v in batch.items():
+            # Ensure v is an array (handle cases where HF datasets returns lists)
+            if not hasattr(v, "shape"):
+                v = jnp.asarray(v)
+
             pad_val = get_padding_value(k)
             pad = max_length - v.shape[-1]
             if pad < 0 and truncate:
