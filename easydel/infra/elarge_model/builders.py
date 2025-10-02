@@ -315,7 +315,6 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 num_rows=inform_cfg.get("num_rows"),
                 format_callback=inform_cfg.get("format_callback"),
                 format_fields=inform_cfg.get("format_fields"),
-                format_callback=inform_cfg.get("format_callback"),
             )
         else:
             inform = TextDatasetInform(
@@ -327,7 +326,6 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 num_rows=inform_cfg.get("num_rows"),
                 format_callback=inform_cfg.get("format_callback"),
                 format_fields=inform_cfg.get("format_fields"),
-                format_callback=inform_cfg.get("format_callback"),
             )
         informs.append(inform)
 
