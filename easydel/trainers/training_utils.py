@@ -191,3 +191,95 @@ def minibatch_call(
         (_, metrics), gradients = grad_fn(state.graphstate, batch)
 
     return gradients, metrics
+
+
+def compute_group_advantages(
+    rewards: jax.Array,
+    num_generations: int,
+    epsilon: float = 1e-4,
+    enforce_mixed: bool = True,
+    jitter: float = 1e-3,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Compute group-normalised advantages following the GRPO/DAPO recipe.
+
+    Args:
+        rewards: Flat vector of rewards shaped (batch_size * num_generations,).
+        num_generations: Number of completions sampled per prompt.
+        epsilon: Small stabiliser added to the group standard deviation.
+        enforce_mixed: If True, inject a perturbation when the group variance collapses.
+        jitter: Magnitude of the perturbation applied to collapsed groups.
+
+    Returns:
+        Tuple containing (flattened advantages, group means, group stds, collapsed mask).
+    """
+
+    rewards = rewards.reshape(-1, num_generations)
+    group_mean = jnp.mean(rewards, axis=1, keepdims=True)
+    centered = rewards - group_mean
+    group_std = jnp.std(centered, axis=1, keepdims=True)
+    safe_std = jnp.maximum(group_std, epsilon)
+    advantages = centered / safe_std
+
+    collapsed = (group_std[..., 0] < epsilon) & enforce_mixed
+    if enforce_mixed:
+        if num_generations == 1:
+            fallback = jnp.zeros_like(advantages)
+        else:
+            neg = -jitter / jnp.maximum(1, num_generations - 1)
+            fallback = jnp.full_like(advantages, neg)
+            fallback = fallback.at[:, 0].set(jitter)
+        advantages = jnp.where(collapsed[:, None], fallback, advantages)
+
+    return (
+        advantages.reshape(-1),
+        group_mean.reshape(-1),
+        safe_std.reshape(-1),
+        collapsed,
+    )
+
+
+def compute_length_reward(
+    lengths: jax.Array,
+    max_completion_length: int,
+    cache_tokens: int,
+    mode: str,
+    scale: float,
+) -> jax.Array:
+    """DAPO-style reward shaping based on completion length."""
+
+    if mode == "none":
+        return jnp.zeros_like(lengths, dtype=jnp.float32)
+
+    lengths = lengths.astype(jnp.float32)
+    lmax = jnp.asarray(max_completion_length, dtype=jnp.float32)
+    cache = jnp.asarray(cache_tokens, dtype=jnp.float32)
+    shoulder = jnp.maximum(0.0, lmax - cache)
+
+    if mode == "linear":
+        inside = jnp.where(
+            lengths <= shoulder,
+            0.0,
+            jnp.where(
+                lengths <= lmax,
+                (shoulder - lengths) / jnp.maximum(cache, 1.0),
+                -1.0,
+            ),
+        )
+        shaped = inside
+    elif mode == "punitive":
+        shaped = -jnp.maximum(0.0, lengths - shoulder) / jnp.maximum(cache, 1.0)
+    else:
+        raise ValueError(f"Unknown length shaping mode: {mode}")
+
+    return scale * shaped
+
+
+def update_ema(previous: jax.Array | None, value: jax.Array, horizon: int) -> jax.Array:
+    """Update an exponential moving average with horizon H."""
+
+    if horizon <= 0:
+        return value
+    alpha = 1.0 / float(max(1, horizon))
+    if previous is None:
+        return value
+    return (1.0 - alpha) * previous + alpha * value

@@ -858,10 +858,21 @@ def training_step(
         if hasattr(model_output, "aux_loss"):
             losses += model_output["aux_loss"]
 
+        joint_logps = jnp.concatenate([chosen_logps, rejected_logps])
+        joint_ref_logps = jnp.concatenate([ref_chosen_logps, ref_rejected_logps])
+        approx_kl = jnp.mean(joint_logps - joint_ref_logps)
+        entropy = -jnp.mean(joint_logps)
+        logit_margin = jnp.mean(chosen_logps - rejected_logps)
+
         metrics = LossMetrics(
             loss=losses.mean(),
             rejected_rewards=rejected_rewards,
             chosen_rewards=chosen_rewards,
+            other_metrics={
+                "mean_kl": approx_kl,
+                "entropy": entropy,
+                "logit_margin": logit_margin,
+            },
         )
         return metrics.loss, metrics
 
