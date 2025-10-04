@@ -1,12 +1,12 @@
 # DiT-MoE: Mixture of Experts Diffusion Transformer
 
-DiT-MoE extends the Diffusion Transformer (DiT) architecture with sparse Mixture of Experts (MoE) following DeepSeek V2's design. This enables scaling to extremely large models while maintaining computational efficiency through sparse expert activation.
+DiT-MoE extends the Diffusion Transformer (DiT) architecture with sparse Mixture of Experts (MoE) following DeepSeek V3's design. This enables scaling to extremely large models while maintaining computational efficiency through sparse expert activation.
 
 ## Overview
 
 **DiT-MoE** combines two powerful architectural patterns:
 1. **DiT (Diffusion Transformer)**: Patch-based transformer for image diffusion with adaptive layer normalization
-2. **DeepSeek V2 MoE**: Sparse mixture of experts with shared + routed experts, without router auxiliary losses
+2. **DeepSeek V3 MoE: State-of-the-art sparse MoE with sigmoid scoring, token-choice routing, and 256 experts
 
 ### Key Features
 

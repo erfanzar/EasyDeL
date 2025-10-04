@@ -116,19 +116,19 @@ class DiTMoEConfig(EasyDeLBaseConfig):
 		class_dropout_prob: float = 0.1,
 		learn_sigma: bool = True,
 		use_conditioning: bool = True,
-		# MoE parameters
-		n_shared_experts: int = 2,
-		n_routed_experts: int = 64,
-		num_experts_per_tok: int = 6,
+		# MoE parameters (DeepSeek V3 style - improved over V2)
+		n_shared_experts: int = 1,  # V3: 1 shared expert (vs 2 in V2)
+		n_routed_experts: int = 256,  # V3: 256 experts (vs 64 in V2)
+		num_experts_per_tok: int = 8,  # V3: 8 experts per token
 		ep_size: int = 1,
-		routed_scaling_factor: float = 1.0,
-		topk_method: str = "greedy",
-		n_group: int | None = None,
-		topk_group: int | None = None,
+		routed_scaling_factor: float = 2.5,  # V3: 2.5 (vs 1.0 in V2)
+		topk_method: str = "noaux_tc",  # V3: token-choice routing without aux loss
+		n_group: int | None = 8,  # V3: 8 expert groups for load balancing
+		topk_group: int | None = 4,  # V3: select from top-4 groups
 		moe_layer_freq: int = 1,
 		first_k_dense_replace: int = 0,
-		norm_topk_prob: bool = False,
-		scoring_func: str = "softmax",
+		norm_topk_prob: bool = True,  # V3: normalize top-k (vs False in V2)
+		scoring_func: str = "sigmoid",  # V3: sigmoid (vs softmax in V2)
 		aux_loss_alpha: float = 0.001,
 		seq_aux: bool = True,
 		# Standard DiT parameters
