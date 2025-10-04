@@ -30,9 +30,10 @@ class DistillationConfig(TrainingArguments):
     knowledge distillation, where a smaller student model learns to mimic
     a larger teacher model's behavior.
 
-    Knowledge distillation uses temperature scaling to soften the probability
-    distributions from both models, allowing the student to learn from the
-    teacher's confidence across all classes rather than just hard labels.
+    Supports multiple distillation strategies:
+    - Logit distillation: Temperature-scaled KL divergence on output logits
+    - Attention transfer: Matching attention patterns between teacher and student
+    - Feature matching: Matching intermediate hidden representations
 
     Attributes:
         trainer_prefix (str | None): Prefix for trainer logs and checkpoints.
@@ -46,19 +47,61 @@ class DistillationConfig(TrainingArguments):
             - alpha=0.0: Pure supervised learning (only learn from labels)
             - 0<alpha<1: Combination of both losses
             Default: 0.9 (90% distillation, 10% supervised)
+        use_attention_transfer (bool): Enable attention transfer distillation.
+            Minimizes cosine distance between student and teacher attention maps.
+            Default: False
+        attention_loss_weight (float): Weight for attention transfer loss.
+            Only used if use_attention_transfer=True. Default: 0.1
+        attention_match_layers (tuple[int, ...] | None): Layer indices to match
+            attention maps. If None, matches all layers. Example: (6, 12, 18)
+            Default: None (all layers)
+        use_feature_matching (bool): Enable feature matching distillation.
+            Minimizes MSE between student and teacher hidden states.
+            Default: False
+        feature_loss_weight (float): Weight for feature matching loss.
+            Only used if use_feature_matching=True. Default: 0.1
+        feature_match_layers (tuple[int, ...] | None): Layer indices to match
+            hidden states. If None, matches all layers. Example: (6, 12, 18)
+            Default: None (all layers)
 
     Example:
+        >>> # Standard logit distillation
         >>> config = DistillationConfig(
         ...     temperature=5.0,
         ...     alpha=0.7,
         ...     learning_rate=1e-4,
         ...     num_train_epochs=10
         ... )
+        >>>
+        >>> # With attention transfer
+        >>> config = DistillationConfig(
+        ...     temperature=2.0,
+        ...     alpha=0.8,
+        ...     use_attention_transfer=True,
+        ...     attention_loss_weight=0.1,
+        ...     attention_match_layers=(6, 12, 18),
+        ...     learning_rate=1e-4
+        ... )
+        >>>
+        >>> # With both attention and feature matching
+        >>> config = DistillationConfig(
+        ...     temperature=2.0,
+        ...     alpha=0.7,
+        ...     use_attention_transfer=True,
+        ...     attention_loss_weight=0.1,
+        ...     use_feature_matching=True,
+        ...     feature_loss_weight=0.2,
+        ...     learning_rate=1e-4
+        ... )
 
     Note:
-        The distillation loss is computed as:
+        The total distillation loss is computed as:
         Loss = alpha * KL(student/T, teacher/T) + (1-alpha) * CE(student, labels)
+               + attention_weight * AttentionLoss + feature_weight * FeatureLoss
         where T is the temperature parameter.
+
+        When teacher and student have different hidden dimensions or number of layers,
+        automatic pooling is applied to match shapes.
     """
 
     trainer_prefix: str | None = field(
@@ -76,6 +119,46 @@ class DistillationConfig(TrainingArguments):
         metadata={
             "help": "Weight for distillation loss vs supervised loss. "
             "1.0 = pure distillation, 0.0 = pure supervised learning."
+        },
+    )
+    use_attention_transfer: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable attention transfer distillation. Minimizes cosine distance "
+            "between student and teacher attention maps."
+        },
+    )
+    attention_loss_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight for attention transfer loss. Only used if use_attention_transfer=True."
+        },
+    )
+    attention_match_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": "Layer indices to match attention maps. If None, matches all layers. "
+            "Example: (6, 12, 18) to match layers 6, 12, and 18."
+        },
+    )
+    use_feature_matching: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable feature matching distillation. Minimizes MSE between "
+            "student and teacher hidden states."
+        },
+    )
+    feature_loss_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight for feature matching loss. Only used if use_feature_matching=True."
+        },
+    )
+    feature_match_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": "Layer indices to match hidden states. If None, matches all layers. "
+            "Example: (6, 12, 18) to match layers 6, 12, and 18."
         },
     )
     __hash__ = hash_fn
