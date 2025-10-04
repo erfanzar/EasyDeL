@@ -117,6 +117,120 @@ class GRPOConfig(TrainingArguments):
             "lower values (e.g., <1.0) make the output more deterministic."
         },
     )
+    epsilon_low: float = field(
+        default=0.2,
+        metadata={
+            "help": "Lower clipping bound (1-ε_low) for the PPO style ratio used in GRPO updates."
+        },
+    )
+    epsilon_high: float = field(
+        default=0.2,
+        metadata={
+            "help": "Upper clipping bound (1+ε_high) for the PPO style ratio used in GRPO updates."
+        },
+    )
+    per_token_weighting: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, scale each token's loss contribution by the inverse completion length (DAPO style)."
+        },
+    )
+    adv_estimator: tp.Literal["group", "gae", "truncated"] = field(
+        default="group",
+        metadata={
+            "help": "Select the advantage estimator. 'group' performs z-score normalization within generations, "
+            "'gae' uses Monte Carlo rewards with (γ, λ), and 'truncated' applies a k-step return."
+        },
+    )
+    gae_gamma: float = field(
+        default=0.99,
+        metadata={"help": "Discount factor γ used when adv_estimator is 'gae' or 'truncated'."},
+    )
+    gae_lambda: float = field(
+        default=0.95,
+        metadata={"help": "Trace parameter λ for GAE style advantage estimation."},
+    )
+    truncated_return_k: int = field(
+        default=1,
+        metadata={
+            "help": "Number of steps for truncated returns when adv_estimator='truncated'. 1 reduces to Monte Carlo."
+        },
+    )
+    z_score_epsilon: float = field(
+        default=1e-4,
+        metadata={"help": "Numerical stabilizer added to the group standard deviation when normalising rewards."},
+    )
+    length_shaping: tp.Literal["none", "linear", "punitive"] = field(
+        default="none",
+        metadata={
+            "help": "Reward shaping applied based on completion length. 'linear' matches DAPO, 'punitive' applies a "
+            "strong penalty for overlong completions."
+        },
+    )
+    length_cache_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": "Cache span used by the length shaping schedule. Defaults to 10% of max_completion_length."
+        },
+    )
+    length_reward_scale: float = field(
+        default=1.0,
+        metadata={"help": "Scaling factor applied to any additional length shaping reward."},
+    )
+    enforce_mixed_sampling: bool = field(
+        default=True,
+        metadata={
+            "help": "Ensure each prompt group contains diversified rewards. When variance collapses, advantages are "
+            "jittered to avoid zero gradients."
+        },
+    )
+    dynamic_sampling_max_tries: int = field(
+        default=0,
+        metadata={
+            "help": "Number of additional regeneration attempts when enforce_mixed_sampling fails. 0 disables retries."
+        },
+    )
+    dynamic_sampling_jitter: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Magnitude of the fallback perturbation injected into collapsed reward groups."
+        },
+    )
+    positive_reward_threshold: float = field(
+        default=0.0,
+        metadata={
+            "help": "Threshold used to mark a completion as positive when computing sampling diagnostics."
+        },
+    )
+    kl_target: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional moving-average KL target. When exceeded, the reference policy reset logic is triggered."
+        },
+    )
+    kl_horizon: int = field(
+        default=100,
+        metadata={"help": "Horizon (in steps) for the exponential moving average used when tracking KL."},
+    )
+    reference_reset_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Force a reference reset every N steps regardless of KL. None disables the periodic trigger."
+        },
+    )
+    reference_reset_style: tp.Literal["none", "hard", "mix"] = field(
+        default="hard",
+        metadata={
+            "help": "Strategy for refreshing the reference model. 'hard' copies the policy, 'mix' interpolates using "
+            "ref_model_mixup_alpha, 'none' keeps the current reference."},
+    )
+    entropy_floor: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional minimum token entropy. If the running entropy drops below this floor the trainer will "
+            "report it and may trigger a reference reset when combined with kl_target."
+        },
+    )
 
     def __post_init__(self):
         """Post initialization to set dependent parameters."""
@@ -124,5 +238,10 @@ class GRPOConfig(TrainingArguments):
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
+
+        if self.length_cache_tokens is None:
+            self.length_cache_tokens = max(1, int(0.1 * self.max_completion_length))
+        if self.truncated_return_k < 1:
+            self.truncated_return_k = 1
 
     __hash__ = hash_fn
