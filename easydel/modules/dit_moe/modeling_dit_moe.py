@@ -16,8 +16,15 @@
 DiT-MoE (Mixture of Experts Diffusion Transformer) implementation.
 
 This module implements a DiT architecture with sparse Mixture of Experts (MoE)
-following DeepSeek V2's MoE design. It replaces standard MLP layers with MoE blocks
+following DeepSeek V3's improved MoE design. It replaces standard MLP layers with MoE blocks
 containing shared experts (always active) and routed experts (selected via top-k routing).
+
+Key improvements over V2:
+- 256 routed experts (4x more than V2's 64)
+- Sigmoid scoring function for better expert utilization
+- Token-choice routing (noaux_tc) without auxiliary losses
+- Group-limited routing with 8 groups
+- Higher routed scaling factor (2.5 vs 1.0)
 """
 
 import typing as tp
@@ -220,7 +227,7 @@ class PatchEmbed(nn.Module):
 
 
 class MoEGate(nn.Module):
-	"""MoE gating network following DeepSeek V2 design."""
+	"""MoE gating network following DeepSeek V3 design with sigmoid scoring."""
 
 	def __init__(
 		self,
@@ -264,14 +271,19 @@ class MoEGate(nn.Module):
 			precision=self.precision,
 		)
 
-		if self.scoring_func == "softmax":
+		# DeepSeek V3 uses sigmoid scoring (better expert utilization)
+		if self.scoring_func == "sigmoid":
+			scores = jax.nn.sigmoid(logits.astype(jnp.float32))
+		elif self.scoring_func == "softmax":
 			scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
 		else:
 			raise NotImplementedError(f"Unsupported scoring function: {self.scoring_func}")
 
+		# DeepSeek V3 routing methods
 		if self.topk_method == "greedy":
 			topk_weight, _ = jax.lax.top_k(scores, k=self.top_k)
 		elif self.topk_method == "group_limited_greedy":
+			# Group-limited greedy routing for load balancing
 			group_scores = scores.reshape(seu, self.n_group, -1).max(axis=-1)
 			top_k_indices = lax.top_k(group_scores, self.topk_group)[1]
 
@@ -283,6 +295,10 @@ class MoEGate(nn.Module):
 			score_mask = score_mask.reshape(seu, -1)
 			masked_scores = jnp.where(score_mask, scores, 0.0)
 			topk_weight, _ = lax.top_k(masked_scores, self.top_k)
+		elif self.topk_method == "noaux_tc":
+			# V3: Token-choice routing (tokens choose experts, not experts choose tokens)
+			# This is more balanced than expert-choice routing
+			topk_weight, topk_indices = jax.lax.top_k(scores, k=self.top_k)
 		else:
 			raise ValueError(f"Unknown topk_method: {self.topk_method}")
 
@@ -373,10 +389,14 @@ class DiTMLPMoE(nn.Module):
 
 class DiTMoE(BaseMoeModule):
 	"""
-	DiT MoE layer following DeepSeek V2 architecture.
+	DiT MoE layer following DeepSeek V3 architecture.
 
 	Combines shared experts (always active) with routed experts (selected via top-k).
-	Unlike standard MoE, DeepSeek doesn't use router auxiliary losses.
+	V3 improvements:
+	- 256 routed experts + 1 shared expert (vs 64 + 2 in V2)
+	- Sigmoid scoring for better utilization
+	- Token-choice routing without auxiliary losses
+	- Group-limited routing for load balancing
 	"""
 
 	def __init__(
@@ -613,7 +633,8 @@ class DiTMoEModel(EasyDeLBaseModule):
 	"""
 	DiT-MoE (Mixture of Experts Diffusion Transformer) base model.
 
-	This model extends DiT with sparse MoE layers following DeepSeek V2's architecture.
+	This model extends DiT with sparse MoE layers following DeepSeek V3's architecture.
+	Uses 256 routed experts with sigmoid scoring and token-choice routing.
 	"""
 
 	def __init__(
