@@ -91,17 +91,23 @@ class ImageDiffusionTrainer(Trainer):
 		logger.info("Initialized ImageDiffusionTrainer")
 
 	def prepare_batch(self, batch: dict[str, jax.Array]) -> dict[str, jax.Array]:
-		"""
-		Prepare a batch for training by adding random key.
+		"""Prepare a batch for JAX execution.
 
-		Args:
-			batch: Input batch dictionary
-
-		Returns:
-			Batch with additional fields
+		This converts numpy values to JAX arrays (when necessary) and attaches a
+		per-example RNG key that is later consumed inside the compiled training
+		step.
 		"""
-		self.key, curr_key = jax.random.split(self.key, 2)
-		batch["rng_key"] = curr_key
+		# Ensure values are JAX arrays so downstream transformations do not copy
+		# data implicitly during with_sharding_constraint.
+		batch = {
+			key: jnp.asarray(value)
+			if not isinstance(value, jax.Array)
+			else value
+			for key, value in batch.items()
+		}
+		batch_size = batch[next(iter(batch))].shape[0]
+		self.key, sample_key = jax.random.split(self.key)
+		batch["rng_keys"] = jax.random.split(sample_key, batch_size)
 		return batch
 
 	def configure_functions(self) -> TrainerConfigureFunctionOutput:
