@@ -119,8 +119,8 @@ def stable_diffusion_training_step(
 	Args:
 		unet_state: EasyDeLState for UNet model
 		vae_state: EasyDeLState for VAE model (frozen)
-		text_encoder_state: EasyDeLState for text encoder (may be frozen)
-		batch: Dict with 'pixel_values' (images) and 'input_ids' (text tokens)
+		text_encoder_state: EasyDeLState for text encoder (unused when embeddings are precomputed)
+		batch: Dict with 'pixel_values' (images) and 'encoder_hidden_states' (text embeddings)
 		noise_scheduler: Noise scheduler for adding noise and computing SNR
 		config: Training configuration
 		learning_rate_fn: Learning rate schedule function
@@ -138,18 +138,20 @@ def stable_diffusion_training_step(
 		batch_partition_spec=partition_spec,
 	)
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+	if "encoder_hidden_states" not in batch:
+		raise ValueError("Stable diffusion batch must contain 'encoder_hidden_states'.")
 
 	# Split RNG for different random operations
 	rng, sample_rng, noise_rng, timestep_rng, dropout_rng = jax.random.split(rng, 5)
 
 	# Get pixel values and input_ids from batch
 	pixel_values = batch["pixel_values"]
-	input_ids = batch["input_ids"]
+	encoder_hidden_states = batch["encoder_hidden_states"]
 
-	def compute_loss(unet_params, text_encoder_params, minibatch):
+	def compute_loss(unet_params, minibatch):
 		"""Compute diffusion loss for a minibatch."""
 		minibatch_pixel_values = minibatch["pixel_values"]
-		minibatch_input_ids = minibatch["input_ids"]
+		encoder_hidden_states = minibatch["encoder_hidden_states"]
 
 		# 1. Encode images to latent space using VAE
 		# VAE expects NCHW format, minibatch_pixel_values should already be in that format
@@ -186,16 +188,6 @@ def stable_diffusion_training_step(
 		# 4. Add noise to latents according to noise magnitude at each timestep
 		# This is the forward diffusion process
 		noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-		# 5. Get text embeddings for conditioning
-		if config.train_text_encoder:
-			# Use trainable text encoder parameters
-			# Assuming text encoder is a simple model that processes input_ids
-			# This would need to be adapted based on actual text encoder implementation
-			encoder_hidden_states = text_encoder_state.model(minibatch_input_ids, deterministic=True)
-		else:
-			# Use frozen text encoder
-			encoder_hidden_states = text_encoder_state.model(minibatch_input_ids, deterministic=True)
 
 		# Optional: Apply conditioning dropout for classifier-free guidance training
 		if config.conditioning_dropout_prob > 0.0:
@@ -260,72 +252,28 @@ def stable_diffusion_training_step(
 
 		return loss, metrics
 
-	# Prepare parameters for gradient computation
-	if config.train_text_encoder:
-		# Train both UNet and text encoder
-		params = (unet_state.graphstate, text_encoder_state.graphstate)
+	def loss_fn(unet_params, minibatch):
+		return compute_loss(unet_params, minibatch)
 
-		def loss_fn(params_tuple, minibatch):
-			unet_params, text_encoder_params = params_tuple
-			return compute_loss(unet_params, text_encoder_params, minibatch)
-
-	else:
-		# Train only UNet, text encoder is frozen
-		params = unet_state.graphstate
-
-		def loss_fn(unet_params, minibatch):
-			return compute_loss(unet_params, text_encoder_state.graphstate, minibatch)
-
-	# Compute gradients across minibatches
 	gradients, metrics = minibatch_call(
-		state=unet_state if not config.train_text_encoder else None,  # Will handle manually
+		state=unet_state,
 		batch=batch,
 		minibatch_size=minibatch_size,
 		grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
 	)
 
-	# Update states
-	if config.train_text_encoder:
-		unet_grads, text_encoder_grads = gradients
-
-		# Update UNet
-		unet_state = update_state_respectfully(
-			state=unet_state,
-			gradients=unet_grads,
-			loss_config=None,
-			metrics=update_metrics(
-				metrics=metrics,
-				learning_rate_fn=learning_rate_fn,
-				step=unet_state.step,
-				gradients=unet_grads,
-			),
-		)
-
-		# Update text encoder
-		text_encoder_state = update_state_respectfully(
-			state=text_encoder_state,
-			gradients=text_encoder_grads,
-			loss_config=None,
-			metrics=LossMetrics(
-				loss=metrics.loss,  # Same loss
-				aux_loss=jnp.array(0.0),
-				perplexity=jnp.array(0.0),
-				learned_perplexity=jnp.array(0.0),
-			),
-		)
-	else:
-		# Update only UNet
-		unet_state = update_state_respectfully(
-			state=unet_state,
-			gradients=gradients,
-			loss_config=None,
-			metrics=update_metrics(
-				metrics=metrics,
-				learning_rate_fn=learning_rate_fn,
-				step=unet_state.step,
-				gradients=gradients,
-			),
-		)
+	metrics = update_metrics(
+		metrics=metrics,
+		learning_rate_fn=learning_rate_fn,
+		step=unet_state.step,
+		gradients=gradients,
+	)
+	unet_state = update_state_respectfully(
+		state=unet_state,
+		gradients=gradients,
+		loss_config=None,
+		metrics=metrics,
+	)
 
 	return unet_state, text_encoder_state, metrics, rng
 
@@ -349,7 +297,7 @@ def stable_diffusion_evaluation_step(
 		unet_state: EasyDeLState for UNet model
 		vae_state: EasyDeLState for VAE model
 		text_encoder_state: EasyDeLState for text encoder
-		batch: Dict with 'pixel_values' and 'input_ids'
+		batch: Dict with 'pixel_values' and 'encoder_hidden_states'
 		noise_scheduler: Noise scheduler
 		config: Training configuration
 		partition_spec: Partition specification for sharding
@@ -359,12 +307,14 @@ def stable_diffusion_evaluation_step(
 		Tuple of (predictions, metrics, new_rng)
 	"""
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec or PartitionSpec())
+	if "encoder_hidden_states" not in batch:
+		raise ValueError("Stable diffusion evaluation batch must include 'encoder_hidden_states'.")
 
 	# Split RNG
 	rng, sample_rng, noise_rng, timestep_rng = jax.random.split(rng, 4)
 
 	pixel_values = batch["pixel_values"]
-	input_ids = batch["input_ids"]
+	encoder_hidden_states = batch["encoder_hidden_states"]
 
 	# Encode images to latents
 	vae_outputs = vae_state.model.encode(pixel_values, deterministic=True, return_dict=True)
@@ -378,9 +328,6 @@ def stable_diffusion_evaluation_step(
 
 	# Add noise to latents
 	noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-	# Get text embeddings
-	encoder_hidden_states = text_encoder_state.model(input_ids, deterministic=True)
 
 	# Predict noise
 	model_pred = unet_state.model(

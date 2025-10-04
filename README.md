@@ -18,17 +18,28 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
 ## Key Features
 
 - **Modern Architecture**: Built on Flax NNX for better integration, modularity, and performance
-- **Diverse Model Support**: Seamless support for Transformers, Mamba, RWKV, Vision Models and more
-- **Advanced Trainers**: Specialized trainers with unified base class for consistent behavior:
-  - SFTTrainer for supervised fine-tuning
-  - DPOTrainer for direct preference optimization
-  - ORPOTrainer for offline reinforcement learning
-  - More Trainers Like image-text-to-image and others are also supported in main trainer
 
-- **Vision Model Support**: Comprehensive support for:
-  - Vision-to-Vision tasks
-  - Image-Text-to-Image generation
-  - Image-to-Text processing
+- **Diverse Model Support**: 55+ transformer architectures including:
+  - LLMs: Llama, Mistral, Qwen, DeepSeek, Gemma, Phi, and more
+  - State Space Models: Mamba, Mamba2, RWKV
+  - Vision: CLIP, SigLIP, ViT
+  - Multimodal: LLaVA, Qwen2-VL, Pixtral
+  - MoE: Mixtral, DeepSeek V2/V3, Qwen2-MoE, Phi-MoE
+
+- **Advanced Trainers**: Specialized trainers with unified base class for consistent behavior:
+  - **SFTTrainer**: Supervised fine-tuning for causal LMs
+  - **DPOTrainer**: 12 preference optimization algorithms (DPO, IPO, BCO, AOT, APO, NCAP, and more)
+  - **ORPOTrainer**: Offline reinforcement learning from preferences
+  - **GRPOTrainer**: Group Relative Policy Optimization with ProRL/DAPO controls
+  - **Image Diffusion**: DiT training with rectified flow
+  - **Stable Diffusion**: Text-to-image training with VAE + UNet
+
+- **Image Diffusion Support**: Production-ready diffusion models:
+  - **DiT**: Diffusion Transformer with adaptive LayerNorm
+  - **DiT-MoE**: Sparse MoE DiT with 256 experts (DeepSeek V3 architecture)
+  - **Stable Diffusion**: UNet2D + VAE + Text Encoder pipeline
+  - **Flux**: State-of-the-art transformer with RoPE
+  - **Rectified Flow**: Velocity prediction with Min-SNR weighting for fast sampling
 - **Production-Ready Serving**:
   - `vInference` engine for efficient LLM inference
   - `vInferenceApiServer` for OpenAI-compatible API endpoints
@@ -164,6 +175,90 @@ ed.DPOTrainer(
 ).train()
 
 ```
+
+### Image Diffusion Training
+
+EasyDeL supports state-of-the-art image diffusion models with rectified flow training:
+
+#### DiT (Diffusion Transformer)
+
+Train class-conditional image generation with DiT:
+
+```python
+import easydel as ed
+from datasets import load_dataset
+
+# Load DiT-MoE with 256 experts (DeepSeek V3 architecture)
+model = ed.AutoEasyDeLModelForImageDiffusion.from_pretrained(
+    "dit_moe",
+    config=ed.DiTMoEConfig(
+        image_size=32,          # Image resolution
+        patch_size=2,           # Patch size
+        hidden_size=1152,       # Model dimension
+        num_hidden_layers=28,   # Transformer depth
+        n_routed_experts=256,   # DeepSeek V3: 256 experts
+        num_experts_per_tok=8,  # Activate 8 experts per token
+        n_shared_experts=1,     # 1 always-active shared expert
+        scoring_func="sigmoid", # V3: Sigmoid scoring
+    ),
+)
+
+# Train with rectified flow
+trainer = ed.ImageDiffusionTrainer(
+    model=model,
+    arguments=ed.ImageDiffusionConfig(
+        output_dir="./dit_moe_output",
+        prediction_type="velocity",  # Rectified flow
+        min_snr_gamma=5.0,            # Min-SNR weighting
+        num_train_timesteps=1000,
+        learning_rate=1e-4,
+    ),
+    train_dataset=load_dataset("imagenet-1k", split="train"),
+)
+trainer.train()
+```
+
+#### Stable Diffusion
+
+Train text-to-image models with Stable Diffusion:
+
+```python
+import easydel as ed
+
+# Load pretrained SD components
+model = ed.AutoEasyDeLModelForImageDiffusion.from_pretrained(
+    "stable-diffusion-v1-5",
+)
+
+# Train with text conditioning
+trainer = ed.StableDiffusionTrainer(
+    model=model,
+    arguments=ed.StableDiffusionConfig(
+        output_dir="./sd_output",
+        pretrained_model_name_or_path="stabilityai/stable-diffusion-2-1",
+        prediction_type="epsilon",  # or "velocity" for v-prediction
+        snr_gamma=5.0,
+        learning_rate=1e-6,
+        train_text_encoder=False,  # Freeze CLIP encoder
+    ),
+    train_dataset=load_dataset("lambdalabs/pokemon-blip-captions", split="train"),
+)
+trainer.train()
+```
+
+**Supported Architectures:**
+- **DiT**: Patch-based transformer with adaptive LayerNorm modulation
+- **DiT-MoE**: Sparse MoE variant with 256 experts (3.1% sparsity, 9/257 active)
+- **UNet2D**: Classic Stable Diffusion architecture with cross-attention
+- **Flux**: State-of-the-art with RoPE and dual-stream attention
+- **VAE**: Latent space encoder/decoder (SD 1.x, 2.x, SDXL compatible)
+
+**Key Features:**
+- ✅ **Rectified Flow**: Straight ODE paths for fast sampling (velocity prediction)
+- ✅ **Min-SNR Weighting**: γ=5.0 for training stability
+- ✅ **DeepSeek V3 MoE**: 256 routed + 1 shared expert, sigmoid scoring
+- ✅ **Distributed Training**: Expert parallelism with automatic sharding
+- ✅ **Mixed Precision**: bfloat16/float16 support for memory efficiency
 
 ### Building Custom Modules 🛠️
 

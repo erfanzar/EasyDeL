@@ -262,53 +262,13 @@ class MoEGate(nn.Module):
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
 		"""Compute gating weights for experts."""
-		seu = hidden_states.shape[0] * hidden_states.shape[1]  # batch * seq_len
-		hidden_states_flat = hidden_states.reshape(seu, -1)
-
+		hidden_states_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 		logits = jax.lax.batch_matmul(
 			hidden_states_flat.astype(jnp.float32),
 			self.kernel.value.astype(jnp.float32),
 			precision=self.precision,
 		)
-
-		# DeepSeek V3 uses sigmoid scoring (better expert utilization)
-		if self.scoring_func == "sigmoid":
-			scores = jax.nn.sigmoid(logits.astype(jnp.float32))
-		elif self.scoring_func == "softmax":
-			scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-		else:
-			raise NotImplementedError(f"Unsupported scoring function: {self.scoring_func}")
-
-		# DeepSeek V3 routing methods
-		if self.topk_method == "greedy":
-			topk_weight, _ = jax.lax.top_k(scores, k=self.top_k)
-		elif self.topk_method == "group_limited_greedy":
-			# Group-limited greedy routing for load balancing
-			group_scores = scores.reshape(seu, self.n_group, -1).max(axis=-1)
-			top_k_indices = lax.top_k(group_scores, self.topk_group)[1]
-
-			group_mask = jnp.zeros_like(group_scores)
-			n_indices = jnp.arange(group_mask.shape[0])[:, None]
-			group_mask = group_mask.at[n_indices, top_k_indices].set(1)
-
-			score_mask = jnp.repeat(group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=2)
-			score_mask = score_mask.reshape(seu, -1)
-			masked_scores = jnp.where(score_mask, scores, 0.0)
-			topk_weight, _ = lax.top_k(masked_scores, self.top_k)
-		elif self.topk_method == "noaux_tc":
-			# V3: Token-choice routing (tokens choose experts, not experts choose tokens)
-			# This is more balanced than expert-choice routing
-			topk_weight, topk_indices = jax.lax.top_k(scores, k=self.top_k)
-		else:
-			raise ValueError(f"Unknown topk_method: {self.topk_method}")
-
-		if self.top_k > 1 and self.norm_topk_prob:
-			denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-			topk_weight = topk_weight / denominator
-		else:
-			topk_weight = topk_weight * self.routed_scaling_factor
-
-		return topk_weight
+		return logits
 
 
 class DiTMLP(nn.Module):
@@ -456,19 +416,11 @@ class DiTMoE(BaseMoeModule):
 			)
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		"""
-		Forward pass.
-
-		Args:
-			hidden_states: Input tensor [batch_size, seq_len, hidden_size]
-
-		Returns:
-			Output tensor [batch_size, seq_len, hidden_size]
-		"""
+		"""Apply sparse MoE transformation to ``hidden_states``."""
 		identity = hidden_states
 
-		# Route to selected experts
-		y, router_logits = self._moe_call(
+		# BaseMoeModule handles routing, sorting, and aggregation.
+		outputs, _ = self._moe_call(
 			gate_layer=self.gate,
 			expert_layer=self.experts,
 			hidden_state=hidden_states,
@@ -476,11 +428,10 @@ class DiTMoE(BaseMoeModule):
 			validate_inputs=False,
 		)
 
-		# Add shared expert output
 		if self.config.n_shared_experts > 0:
-			y = y + self.shared_experts(identity)
+			outputs = outputs + self.shared_experts(identity)
 
-		return y
+		return outputs
 
 
 class DiTMoEBlock(nn.Module):

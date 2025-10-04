@@ -16,11 +16,18 @@
 
 import jax
 import jax.numpy as jnp
-import optax
+from eformer.escale import with_sharding_constraint
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.trainers.trainer_protocol import StepMetrics
+from easydel.infra.loss_utils import LossMetrics
+
+from ..training_utils import (
+	make_assertions_and_get_sizes,
+	minibatch_call,
+	update_metrics,
+	update_state_respectfully,
+)
 
 
 def compute_rectified_flow_loss(
@@ -77,14 +84,14 @@ def training_step(
 	num_train_timesteps: int = 1000,
 	prediction_type: str = "velocity",
 	min_snr_gamma: float = -1.0,
-	loss_config: dict | None = None,
-	scheduler: optax.Schedule | None = None,
+	loss_config=None,
+	scheduler=None,
 	step_partition_spec: PartitionSpec | None = None,
 	gradient_accumulation_steps: int = 1,
 	loss_aggregation: str = "mean",
 	loss_scale: float = 1.0,
 	is_train: bool = True,
-) -> tuple[EasyDeLState, StepMetrics] | StepMetrics:
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
 	"""
 	Single training/evaluation step for image diffusion.
 
@@ -105,33 +112,42 @@ def training_step(
 	Returns:
 		Updated state and metrics (if training) or just metrics (if eval)
 	"""
-	pixel_values = batch["pixel_values"]
-	labels = batch.get("labels", None)
-	batch_size = pixel_values.shape[0]
+	if "rng_keys" not in batch:
+		raise ValueError("Batch passed to image diffusion step must contain 'rng_keys'.")
 
-	def loss_fn(params):
-		"""Compute loss for the current batch."""
-		# Sample random timesteps
-		timesteps = jax.random.randint(
-			state.rng,
-			(batch_size,),
-			minval=0,
-			maxval=num_train_timesteps,
-		)
+	_batch_without_rng = {k: v for k, v in batch.items() if k != "rng_keys"}
+	_, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+		batch=_batch_without_rng,
+		gradient_accumulation_steps=gradient_accumulation_steps,
+		batch_partition_spec=step_partition_spec,
+	)
+	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-		# Sample noise
-		noise_rng, model_rng = jax.random.split(state.rng)
-		noise = jax.random.normal(noise_rng, pixel_values.shape)
+	def loss_fn(params, minibatch):
+		pixel_values = minibatch["pixel_values"].astype(jnp.float32)
+		labels = minibatch.get("labels", None)
+		rng_keys = minibatch["rng_keys"]
 
-		# Compute noisy samples using rectified flow interpolation
-		# x_t = (1 - t) * noise + t * x_1
-		t = timesteps[:, None, None, None].astype(jnp.float32) / num_train_timesteps
-		noisy_samples = (1 - t) * noise + t * pixel_values
+		# Split RNG keys per-example for sampling noise and timesteps.
+		def split_example(key):
+			return jax.random.split(key, 3)
 
-		# Compute target based on prediction type
+		subkeys = jax.vmap(split_example)(rng_keys)
+		sample_keys = subkeys[:, 0]
+		noise_keys = subkeys[:, 1]
+		timestep_keys = subkeys[:, 2]
+
+		latents_shape = pixel_values.shape[1:]
+
+		def sample_noise(key):
+			return jax.random.normal(key, latents_shape)
+
+		noise = jax.vmap(sample_noise)(noise_keys).astype(pixel_values.dtype)
+		timesteps = jax.vmap(lambda key: jax.random.randint(key, (), 0, num_train_timesteps))(timestep_keys)
+		t = timesteps.astype(jnp.float32)[:, None, None, None] / num_train_timesteps
+		noisy_samples = (1.0 - t) * noise + t * pixel_values
+
 		if prediction_type == "velocity":
-			# Velocity: v = x_1 - noise (for rectified flow with epsilon=0)
-			# More generally: v = x_1 - (1-epsilon)*noise
 			target = pixel_values - noise
 		elif prediction_type == "epsilon":
 			target = noise
@@ -140,17 +156,16 @@ def training_step(
 		else:
 			raise ValueError(f"Unknown prediction type: {prediction_type}")
 
-		# Forward pass
-		model_pred = state.call_model(
+		module = state.merge(params)
+		predictions = module(
 			pixel_values=noisy_samples,
 			timesteps=timesteps,
 			labels=labels,
-			params=params,
-		)
+			return_dict=True,
+		).last_hidden_state.astype(pixel_values.dtype)
 
-		# Compute loss
 		loss = compute_rectified_flow_loss(
-			model_pred=model_pred,
+			model_pred=predictions,
 			target=target,
 			timesteps=timesteps,
 			num_train_timesteps=num_train_timesteps,
@@ -158,51 +173,34 @@ def training_step(
 			min_snr_gamma=min_snr_gamma,
 			loss_aggregation=loss_aggregation,
 		)
-
-		# Scale loss
 		loss = loss * loss_scale
 
-		# Metrics
-		metrics = {
-			"loss": loss,
-			"pred_norm": jnp.sqrt(jnp.mean(model_pred**2)),
+		other_metrics = {
+			"pred_norm": jnp.sqrt(jnp.mean(predictions**2)),
 			"target_norm": jnp.sqrt(jnp.mean(target**2)),
 		}
-
-		return loss, metrics
+		return loss, LossMetrics(loss=loss, other_metrics=other_metrics)
 
 	if is_train:
-		# Compute gradients
-		(loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-
-		# Update state
-		updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
-		new_params = optax.apply_updates(state.params, updates)
-
-		# Additional metrics
-		metrics.update(
-			{
-				"grad_norm": optax.global_norm(grads),
-				"update_norm": optax.global_norm(updates),
-				"param_norm": optax.global_norm(new_params),
-			}
+		gradients, metrics = minibatch_call(
+			state=state,
+			batch=batch,
+			minibatch_size=minibatch_size,
+			grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
 		)
-
-		# Add learning rate if scheduler exists
-		if scheduler is not None:
-			metrics["learning_rate"] = scheduler(state.step)
-
-		# Update state
-		new_rng, _ = jax.random.split(state.rng)
-		new_state = state.replace(
-			step=state.step + 1,
-			params=new_params,
-			opt_state=new_opt_state,
-			rng=new_rng,
+		metrics = update_metrics(
+			metrics=metrics,
+			learning_rate_fn=scheduler,
+			step=state.step,
+			gradients=gradients,
 		)
+		state = update_state_respectfully(
+			state=state,
+			gradients=gradients,
+			loss_config=loss_config,
+			metrics=metrics,
+		)
+		return state, metrics
 
-		return new_state, metrics
-	else:
-		# Evaluation mode
-		loss, metrics = loss_fn(state.params)
-		return metrics
+	_, metrics = loss_fn(state.graphstate, batch)
+	return metrics

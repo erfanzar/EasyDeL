@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from eformer.loggings import get_logger
 from eformer.escale import match_partition_rules
 from jax.sharding import NamedSharding, PartitionSpec
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTokenizer, FlaxCLIPTextModel
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
@@ -161,20 +161,19 @@ class StableDiffusionTrainer(BaseTrainer):
 			revision=arguments.revision,
 		)
 
-		# Initialize text encoder (HuggingFace CLIP for now)
-		# TODO: Port to EasyDeL once CLIP is available
-		text_encoder = CLIPTextModel.from_pretrained(
+		# Initialize Flax CLIP text encoder for embedding generation during batching.
+		self.text_encoder = FlaxCLIPTextModel.from_pretrained(
 			arguments.pretrained_model_name_or_path,
 			subfolder="text_encoder",
 			revision=arguments.revision,
+			dtype=jnp.float32,
 		)
-
-		# For now, we'll wrap the HuggingFace model
-		# In a full implementation, this should be converted to JAX/Flax
-		logger.warning(
-			"Using HuggingFace CLIP text encoder. For full JAX implementation, "
-			"CLIP should be ported to EasyDeL."
-		)
+		self._text_encoder_params = self.text_encoder.params
+		if arguments.train_text_encoder:
+			raise NotImplementedError(
+				"Trainable CLIP text encoder is not yet integrated with StableDiffusionTrainer."
+			)
+		self.text_encoder_state = None
 
 		# Initialize UNet from EasyDeL
 		# TODO: Load from pretrained once conversion is available
@@ -235,10 +234,6 @@ class StableDiffusionTrainer(BaseTrainer):
 		)
 		self.vae_state = vae.to_state()
 
-		# Create text encoder state (placeholder for now)
-		# In full implementation, convert HF model to JAX
-		self.text_encoder_state = None  # Will be properly initialized later
-
 		logger.info("Models initialized successfully")
 
 	def create_grain_collect_function(
@@ -259,15 +254,15 @@ class StableDiffusionTrainer(BaseTrainer):
 
 		def collate_fn(batch):
 			"""Collate batch of images and captions."""
-			# Extract images and captions
+			import numpy as np
+			from PIL import Image
+
 			images = []
 			captions = []
-
 			for example in batch:
 				images.append(example[self.arguments.image_column])
 				captions.append(example[self.arguments.caption_column])
 
-			# Tokenize captions
 			tokenized = self.tokenizer(
 				captions,
 				padding="max_length",
@@ -275,32 +270,37 @@ class StableDiffusionTrainer(BaseTrainer):
 				truncation=True,
 				return_tensors="np",
 			)
+			input_ids = jnp.asarray(tokenized["input_ids"], dtype=jnp.int32)
+			attention_mask = jnp.asarray(tokenized["attention_mask"], dtype=jnp.int32)
 
-			# Process images to tensors
-			# Assuming images are PIL Images or similar
-			import numpy as np
-			from PIL import Image
+			txt_outputs = self.text_encoder(
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				params=self._text_encoder_params,
+				train=False,
+			)
+			encoder_hidden_states = jnp.asarray(txt_outputs.last_hidden_state, dtype=jnp.float32)
 
 			processed_images = []
 			for img in images:
 				if isinstance(img, Image.Image):
-					# Resize and center crop
 					if self.arguments.center_crop:
 						img = img.resize(
 							(self.arguments.resolution, self.arguments.resolution),
 							Image.LANCZOS,
 						)
-					# Convert to array and normalize
 					img_array = np.array(img).astype(np.float32) / 255.0
-					# Convert to CHW format
 					img_array = np.transpose(img_array, (2, 0, 1))
-					# Normalize to [-1, 1]
 					img_array = 2.0 * img_array - 1.0
 					processed_images.append(img_array)
 
+			pixel_values = jnp.asarray(processed_images, dtype=jnp.float32)
+
 			return {
-				"pixel_values": jnp.array(processed_images),
-				"input_ids": jnp.array(tokenized["input_ids"]),
+				"pixel_values": pixel_values,
+				"input_ids": input_ids,
+				"attention_mask": attention_mask,
+				"encoder_hidden_states": encoder_hidden_states,
 			}
 
 		return collate_fn
