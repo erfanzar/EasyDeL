@@ -14,9 +14,7 @@ keywords = [
 	"Deep Learning",
 	"Machine Learning",
 	"JAX",
-	"CUDA",
 	"XLA",
-	"Triton",
 	"Pallas",
 ]
 classifiers = [
@@ -71,11 +69,21 @@ where = ["."]
 "easydel" = ["py.typed"]
 
 [project.optional-dependencies]
+# CPU-only (Mac, Windows, Linux without GPU)
+cpu = ["tensorboard>=2.19.0"]
+# Mac with Apple Silicon optimizations
+mac = ["tensorboard>=2.19.0"]
+# PyTorch support (CPU-only)
 torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
+# GPU support (Linux with CUDA)
 gpu = ["jax[cuda12]>=0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
+# TPU support (Google Cloud TPU)
 tpu = ["jax[tpu]>=0.7.0", "tensorboard>=2.19.0"]
+# TensorFlow integration
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
+# Language model evaluation
 lm_eval = ["lm_eval~=0.4.9.1"]
+# Profiling tools
 profile = [
 	"xprof>=2.20.6",
 	"tb-nightly>=2.21.0a20250820",
@@ -147,6 +155,12 @@ reportPrivateImportUsage = "none"
 reportUnusedParameter = "none"
 
 [tool.uv]
+# Platform-specific dependency overrides
+# Triton only works on Linux x86_64, so we conditionally include it
+override-dependencies = [
+	"triton>=3.0.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
 conflicts = [
 	[
 		{ extra = "gpu" },
@@ -154,7 +168,11 @@ conflicts = [
 	],
 	[
 		{ extra = "gpu" },
-		{ extra = "torch" },
+		{ extra = "mac" },
+	],
+	[
+		{ extra = "tpu" },
+		{ extra = "mac" },
 	],
 ]
 
