@@ -33,23 +33,23 @@ _logger = _get_logger("EasyDeL")
 if _check_bool_flag("EASYDEL_AUTO", True):
     _sys.setrecursionlimit(10000)
 
-    # Tell jax xla bridge to stay quiet and only yied warnings or errors.
-    _getlogger("jax._src.xla_bridge").setLevel(30)
-    _getlogger("jax._src.mesh_utils").setLevel(30)
-    _getlogger("jax._src.distributed").setLevel(30)
-    # these people talk too much
-    _getlogger("eray-executor").setLevel(30)
-    _getlogger("absl").setLevel(30)
-    _getlogger("datasets").setLevel(30)
+    # # Tell jax xla bridge to stay quiet and only yied warnings or errors.
+    # _getlogger("jax._src.xla_bridge").setLevel(30)
+    # _getlogger("jax._src.mesh_utils").setLevel(30)
+    # _getlogger("jax._src.distributed").setLevel(30)
+    # # these people talk too much
+    # _getlogger("eray-executor").setLevel(30)
+    # _getlogger("absl").setLevel(30)
+    # # _getlogger("datasets").setLevel(30)
 
-    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    _os.environ["KMP_AFFINITY"] = "noverbose"
-    _os.environ["GRPC_VERBOSITY"] = "3"
-    _os.environ["GLOG_minloglevel"] = "3"
-    _os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-    _os.environ["CACHE_TRITON_KERNELS"] = "1"
-    _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
-    _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
+    # _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    # _os.environ["KMP_AFFINITY"] = "noverbose"
+    # _os.environ["GRPC_VERBOSITY"] = "3"
+    # _os.environ["GLOG_minloglevel"] = "3"
+    # _os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    # _os.environ["CACHE_TRITON_KERNELS"] = "1"
+    # _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
+    # _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -70,7 +70,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_force_compilation_parallelism=4 "
         "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
-        "--xla_gpu_graph_level=3 "
+        # "--xla_gpu_graph_level=3 "
         "--xla_gpu_enable_command_buffer=  "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
