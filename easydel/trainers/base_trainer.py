@@ -1517,9 +1517,11 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         return (
             (
-                self.arguments.save_steps is not None
-                and current_step > 0
-                and current_step % self.arguments.save_steps == 0
+                self.arguments.save_steps is not None and (
+                    current_step > 0 and current_step % self.arguments.save_steps == 0
+                    # or current_step < 1000 and any(current_step == 2**i for i in range(10))
+                )
+
             ) and (
                 self.arguments.step_start_point is None
                 or current_step > self.arguments.step_start_point

@@ -356,7 +356,7 @@ class Trainer(BaseTrainer):
                 state = state.replace(step=jnp.array(skipped_steps, dtype=jnp.int32))
             else:
                 self._skip_first_steps = initial_step
-                # state = state.replace(step=jnp.array(0, dtype=jnp.int32))
+                state = state.replace(step=jnp.array(0, dtype=jnp.int32))
                 logger.info(
                     f"Resuming training from step {initial_step} (non-seekable dataset, skipping first {self._skip_first_steps} steps)"
                 )
@@ -487,12 +487,11 @@ class Trainer(BaseTrainer):
 
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
-
         run_exception = None
         for _ in range(steps_per_epoch):
             if os.getenv("EASYDEL_PROFILING") == "1":
                 # skip compilation and let training warm up a bit
-                if self.current_step == 10:
+                if self.current_step == 20:
                     mh.sync_global_devices("easydel:before_profiler_start")
                     logger.info("Starting JAX profiler...")
                     # options = jax.profiler.ProfileOptions()
@@ -833,14 +832,16 @@ class Trainer(BaseTrainer):
 
         checkpoint_dir = str(self.arguments.get_path().resolve() / "orbax")
         options = ocp.CheckpointManagerOptions(
+            enable_async_checkpointing=True,
+            # should_save_fn=lambda step, _: step % self.arguments.save_steps == 0 if step < 1000 else any(step == i**2 for i in range(10)),
             async_options=ocp.options.AsyncOptions(
-                timeout_secs=180,
-                create_directories_asynchronously=False,
-                # barrier_sync_fn=multihost.get_barrier_sync_fn("checkpoint_manager"),
+                # timeout_secs=180,
+                create_directories_asynchronously=True,
             ),
-            save_interval_steps=self.arguments.save_steps,
+            enable_background_delete=True,
+            # save_interval_steps=self.arguments.save_steps,
+            save_interval_steps=1,
             max_to_keep=self.arguments.save_total_limit,
-            # enable_async_checkpointing=True,
             enable_hns=True if "_hns" in checkpoint_dir else False,
             create=True,
             multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
