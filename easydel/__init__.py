@@ -181,9 +181,9 @@ _import_structure = {
     ],
     "layers": [],
     "layers.attention_operator._attention_impl": [
-        "AttentionMetadata",
-        "AttentionRegistry",
-        "AttentionImpl",
+        "OperationMetadata",
+        "OperationRegistry",
+        "OperationImpl",
     ],
     "layers.attention": [
         "AttentionMechanisms",
@@ -592,7 +592,7 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.attention_operator._attention_impl import AttentionImpl, AttentionMetadata, AttentionRegistry
+    from .layers.operations._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,

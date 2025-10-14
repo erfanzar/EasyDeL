@@ -36,9 +36,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -388,8 +388,8 @@ class Glm4MoeAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -534,8 +534,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -643,8 +643,8 @@ class Glm4MoeModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -804,8 +804,8 @@ class Glm4MoeForCausalLM(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -919,8 +919,8 @@ class Glm4MoeForSequenceClassification(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,

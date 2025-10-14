@@ -36,9 +36,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -200,8 +200,8 @@ class MistralAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -337,8 +337,8 @@ class MistralDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -447,8 +447,8 @@ class MistralModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -460,9 +460,9 @@ class MistralModel(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional):
+            past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -645,8 +645,8 @@ class MistralForCausalLM(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -659,9 +659,9 @@ class MistralForCausalLM(EasyDeLBaseModule):
                 attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
                 position_ids (chex.Array, optional): Indices of positions of each input sequence token.
                 segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-                past_key_values (TransformerCache | PagesCache, optional):
+                past_key_values (TransformerCache | RaggedPagesCache, optional):
                     Cache containing precomputed key/value states.
-                cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+                cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
                 output_attentions (bool, optional): Whether to return attention weights.
                 output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -788,8 +788,8 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -804,9 +804,9 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional):
+            past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 

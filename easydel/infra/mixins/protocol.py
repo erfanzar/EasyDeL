@@ -90,7 +90,7 @@ if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
     from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+    from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 
 
 def return_type_adjuster(
@@ -264,8 +264,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -330,8 +330,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """
@@ -367,8 +367,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """
@@ -482,8 +482,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         loss_config: LossConfig | None = None,
@@ -554,8 +554,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeModelOutput, LossMetrics]:
@@ -592,8 +592,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeCausalLMOutput, LossMetrics]:

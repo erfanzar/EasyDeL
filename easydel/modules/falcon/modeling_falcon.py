@@ -31,9 +31,9 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -230,8 +230,8 @@ class FalconAttention(AttentionModule):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: chex.Array | bool | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         alibi: chex.Array | None = None,
@@ -478,8 +478,8 @@ class FalconBlock(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: chex.Array | bool | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         alibi: chex.Array | None = None,
@@ -606,8 +606,8 @@ class FalconModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> BaseModelOutput:
         """
@@ -793,8 +793,8 @@ class FalconForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """

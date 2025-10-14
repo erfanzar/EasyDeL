@@ -49,9 +49,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -240,8 +240,8 @@ class GPT2Attention(AttentionModule):
         key_value_states: chex.Array,
         attention_mask: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
         output_attentions: bool = False,
     ):
@@ -254,9 +254,9 @@ class GPT2Attention(AttentionModule):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
                 Defaults to None.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
@@ -494,8 +494,8 @@ class GPT2Block(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         attention_mask=None,
         causal_mask=None,
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         encoder_hidden_states: chex.Array | None = None,
         encoder_attention_mask: chex.Array | None = None,
         output_attentions: bool = False,
@@ -510,9 +510,9 @@ class GPT2Block(nn.Module):
                 Defaults to None.
             encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states in cross-attention.
                 Defaults to None.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
@@ -674,8 +674,8 @@ class GPT2Model(EasyDeLBaseModule):
         encoder_hidden_states: chex.Array | None = None,
         encoder_attention_mask: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -688,9 +688,9 @@ class GPT2Model(EasyDeLBaseModule):
             encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention.
                 Defaults to None.
             encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
                 precomputed key/value states. Defaults to None.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
                 Defaults to None.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
@@ -866,8 +866,8 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
         encoder_hidden_states: chex.Array | None = None,
         encoder_attention_mask: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -881,9 +881,9 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
             encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention.
                 Defaults to None.
             encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
                 key/value states. Defaults to None.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
                 Defaults to None.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.

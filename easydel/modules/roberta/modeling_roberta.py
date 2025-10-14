@@ -40,8 +40,8 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -196,8 +196,8 @@ class RobertaSelfAttention(AttentionModule):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         key_value_states: chex.Array | None = None,
         causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -351,8 +351,8 @@ class RobertaAttention(nn.Module):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         key_value_states=None,
         output_attentions: bool = False,
@@ -503,8 +503,8 @@ class RobertaLayer(nn.Module):
         attention_mask,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,

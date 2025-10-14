@@ -31,9 +31,9 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOut
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -154,8 +154,8 @@ class Grok1Attention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -168,9 +168,9 @@ class Grok1Attention(AttentionModule):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
             segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
             output_attentions (bool, optional): Whether to return attention weights.
@@ -522,8 +522,8 @@ class Grok1DecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -537,9 +537,9 @@ class Grok1DecoderLayer(nn.Module):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
             segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
@@ -670,8 +670,8 @@ class Grok1Model(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass through the Grok1Model.
 
@@ -684,9 +684,9 @@ class Grok1Model(EasyDeLBaseModule):
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
             output_router_logits (bool, optional): Whether to return router logits from MoE layers.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
                 precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
 
 
         Returns:
@@ -878,8 +878,8 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput | tuple:
         """Forward pass through the Grok1ForCausalLM model.
@@ -893,9 +893,9 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
             output_router_logits (bool, optional): Whether to return router logits from MoE layers.
-            past_key_values (TransformerCache | PagesCache, optional): Cache
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache
                 containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
 
 
         Returns:

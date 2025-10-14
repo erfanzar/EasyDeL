@@ -37,9 +37,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -120,8 +120,8 @@ class DbrxAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -285,8 +285,8 @@ class DbrxNormAttentionNorm(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -642,8 +642,8 @@ class DbrxBlock(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
@@ -776,8 +776,8 @@ class DbrxModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
     ) -> MoeModelOutput:
         """
         Forward pass of the model.
@@ -792,9 +792,9 @@ class DbrxModel(EasyDeLBaseModule):
                 output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
                 output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
                 output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
-                past_key_values (Optional[TransformerCache | PagesCache], optional): Cached key/values.
+                past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
                     Defaults to None.
-                cache_metadata (Optional[TransformerMetadata | PagesMetadata], optional): Cache metadata.
+                cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
                     Defaults to None.
 
 
@@ -966,8 +966,8 @@ class DbrxForCausalLM(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput | tuple:
         if output_router_logits is None:
@@ -1088,8 +1088,8 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
     ) -> SequenceClassifierOutput:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits

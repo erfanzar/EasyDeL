@@ -29,9 +29,9 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -347,8 +347,8 @@ class StableLmAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -361,9 +361,9 @@ class StableLmAttention(AttentionModule):
             attention_mask (chex.Array): Mask to apply on the attention scores (batch, 1, seq_len, kv_seq_len).
             position_ids (chex.Array): Position indices for the tokens (batch, seq_len).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]):
                 Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): If True, outputs attention weights alongside the hidden states (default: False).
@@ -543,8 +543,8 @@ class StableLmDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -557,9 +557,9 @@ class StableLmDecoderLayer(nn.Module):
             attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
             position_ids (chex.Array): Position IDs (batch, seq_len).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]):
                 Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to output attention weights (default: False).
@@ -728,8 +728,8 @@ class StableLmModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> BaseModelOutput:
         """Forward pass of the StableLM model.
@@ -745,9 +745,9 @@ class StableLmModel(EasyDeLBaseModule):
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
                 (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
 
         Returns:
@@ -938,8 +938,8 @@ class StableLmForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """Forward pass of the StableLM model for Causal Language Modeling.
@@ -955,9 +955,9 @@ class StableLmForCausalLM(EasyDeLBaseModule):
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all
                 layers (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
 
         Returns:

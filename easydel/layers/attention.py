@@ -68,8 +68,8 @@ from jaxtyping import Bool, Complex, Float, Int
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
-from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
-from .caching import PagesCacheView, PagesMetadata, TransformerCacheView, TransformerMetadata
+from .caching import RaggedPagesCacheView, RaggedPagesMetadata, TransformerCacheView, TransformerMetadata
+from .operations import AttentionOutput, OperationMetadata, OperationRegistry
 from .quantization.quantizers import EasyQuantizer
 
 logger = get_logger(__name__)
@@ -244,7 +244,7 @@ class FlexibleAttentionModule(nn.Module):
       impl (AttentionBackend): The chosen attention implementation backend instance.
       deterministic (bool): Flag indicating whether dropout should be applied (False) or not (True).
                             Currently hardcoded to True.
-      metadata (AttentionMetadata): Metadata derived from the configuration, used by the backend.
+      metadata (OperationMetadata): Metadata derived from the configuration, used by the backend.
     """
 
     def __init__(
@@ -273,26 +273,21 @@ class FlexibleAttentionModule(nn.Module):
             base_config.attn_softmax_dtype = _get_jax_dtype_from_string(base_config.attn_softmax_dtype)
         if base_config.attn_mechanism == AttentionMechanisms.AUTO:
             impl_name, runtime_dtype = get_optimal_config()
-            logger.debug(f"Automatically select AttentionImpl {impl_name} | {runtime_dtype}")
+            logger.debug(f"Automatically select OperationImpl {impl_name} | {runtime_dtype}")
             base_config.attn_mechanism = impl_name
             base_config.attn_dtype = runtime_dtype
 
-        metadata = AttentionMetadata.from_config(
-            config=base_config,
-            softmax_scale=softmax_scale,
-            dropout_prob=dropout_prob,
-        )
+        metadata = OperationMetadata.from_config(config=base_config)
         self.config = base_config
         self.metadata = metadata
         self.rngs = rngs
-        self.impl = AttentionRegistry.create(impl_name=base_config.attn_mechanism, metadata=metadata)
+        self.softmax_scale = softmax_scale
+        self.dropout_prob = dropout_prob
+        self.impl = OperationRegistry.create(impl_name=base_config.attn_mechanism, metadata=metadata)
         self.deterministic = True
         self.impl_decode = None
         if base_config.decode_attn_mechanism is not None:
-            self.impl_decode = AttentionRegistry.create(
-                impl_name=base_config.decode_attn_mechanism,
-                metadata=metadata,
-            )
+            self.impl_decode = OperationRegistry.create(impl_name=base_config.decode_attn_mechanism, metadata=metadata)
 
     @jax.named_scope("easydel-flexible-attention")
     def forward(
@@ -302,58 +297,142 @@ class FlexibleAttentionModule(nn.Module):
         value_states: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
         bias: Float[JArray, "batch heads seq_q seq_k"] | None = None,
-        sliding_window: int | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         init_bias: tp.Callable[[], Float[JArray, "batch heads seq_q seq_k"]] | None = None,
         attention_mask: Bool[JArray, "batch seq_q seq_k"] | None = None,
         segment_ids: Int[JArray, "batch seq"] | None = None,
+        q_segment_ids: Int[JArray, "batch seq_q"] | None = None,
+        kv_segment_ids: Int[JArray, "batch seq_k"] | None = None,
         causal: bool = True,
         softmax_aux: Float[JArray, "..."] | None = None,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        dropout_prob: float | None = None,
+        dropout_rng: tp.Any | None = None,
+        deterministic: bool | None = None,
+        precision: lax.PrecisionLike | None = None,
+        prevent_cse: bool = True,
+        cum_seqlens_q: Int[JArray, "batch_plus_one"] | None = None,  # noqa
+        cum_seqlens_k: Int[JArray, "batch_plus_one"] | None = None,  # noqa
+        normalize_output: bool = True,
+        fused_backward: bool = False,
+        compute_dtype: jnp.dtype | None = None,
+        optimized: bool = False,
+        mask_value: float | None = None,
+        vmem_limit_bytes: int | None = None,
+        policy: tp.Any | None = None,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
 
         Args:
-            query_states (Array): Query tensor.
-            key_states (Array): Key tensor.
-            value_states (Array): Value tensor.
-            bias (tp.Optional[Array], optional): Optional attention bias. Defaults to None.
-            init_bias (tp.Optional[tp.Callable[[], Array]], optional): Optional function to initialize bias.
-                                                                       Defaults to None.
-            attention_mask (tp.Optional[Array], optional): Mask to prevent attention to certain positions.
-                                                            Defaults to None.
-            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention (RingAttention).
-                                                        Defaults to None.
-            causal (bool, optional): If True, applies a causal mask. Defaults to True.
-            dropout_rng (tp.Optional[random.PRNGKey], optional): PRNG key for dropout. Defaults to None.
+            query_states (Array): Query tensor [batch, seq_q, heads, dim].
+            key_states (Array): Key tensor [batch, seq_k, heads, dim].
+            value_states (Array): Value tensor [batch, seq_v, heads, dim].
+            mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (TRAIN, PREFILL, DECODE).
+            bias (Array, optional): Optional attention bias [batch, heads, seq_q, seq_k]. Defaults to None.
+            sliding_window (int | tuple[int, int], optional): Sliding window size for attention. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Cache metadata. Defaults to None.
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): View into KV cache. Defaults to None.
+            init_bias (Callable, optional): Function to initialize bias tensor. Defaults to None.
+            attention_mask (Array, optional): Boolean mask [batch, seq_q, seq_k]. Defaults to None.
+            segment_ids (Array, optional): Segment IDs for both Q and KV [batch, seq]. Defaults to None.
+            q_segment_ids (Array, optional): Query segment IDs [batch, seq_q]. Defaults to None.
+            kv_segment_ids (Array, optional): Key/Value segment IDs [batch, seq_k]. Defaults to None.
+            causal (bool, optional): Apply causal masking. Defaults to True.
+            softmax_aux (Array, optional): Auxiliary tensor for softmax (e.g., sink tokens). Defaults to None.
+            softmax_scale (float, optional): Scaling factor for attention logits. Defaults to None.
+            logit_soft_cap (float, optional): Soft capping value for attention logits. Defaults to None.
+            dropout_prob (float, optional): Dropout probability for attention weights. Defaults to None.
+            dropout_rng (PRNGKey, optional): PRNG key for dropout. Defaults to None.
+            deterministic (bool, optional): If True, disables dropout. Defaults to None (uses self.deterministic).
+            precision (lax.PrecisionLike, optional): JAX precision setting. Defaults to None.
+            prevent_cse (bool, optional): Prevent common subexpression elimination. Defaults to True.
+            cum_seqlens_q (Array, optional): Cumulative sequence lengths for queries. Defaults to None.
+            cum_seqlens_k (Array, optional): Cumulative sequence lengths for keys. Defaults to None.
+            normalize_output (bool, optional): Normalize attention output. Defaults to True.
+            fused_backward (bool, optional): Use fused backward pass. Defaults to False.
+            compute_dtype (jnp.dtype, optional): Computation dtype. Defaults to None.
+            optimized (bool, optional): Use optimized kernel variant. Defaults to False.
+            mask_value (float, optional): Value for masked positions. Defaults to None.
+            vmem_limit_bytes (int, optional): VMEM limit in bytes for paged attention. Defaults to None.
+            policy (Any, optional): Checkpoint policy for gradients. Defaults to None.
 
         Returns:
             AttentionOutput: An object containing the attention output tensor and potentially
                              attention weights (depending on the backend).
         """
-        if isinstance(cache_view, PagesCacheView):
+        if isinstance(cache_view, RaggedPagesCacheView):
             assert self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
         try:
             rngs = self.rngs()
         except flax.errors.TraceContextError:
             rngs = None
+
+        # Handle segment_ids fallback
+        if q_segment_ids is None and segment_ids is not None:
+            q_segment_ids = segment_ids
+        if kv_segment_ids is None and segment_ids is not None:
+            kv_segment_ids = segment_ids
+
+        # Use provided dropout_rng or rngs
+        if dropout_rng is None:
+            dropout_rng = rngs
+
+        # Use provided deterministic or self.deterministic
+        if deterministic is None:
+            deterministic = self.deterministic
+
+        # Use provided softmax_scale or self.softmax_scale
+        if softmax_scale is None:
+            softmax_scale = self.softmax_scale
+
+        # Use provided dropout_prob or self.dropout_prob
+        if dropout_prob is None:
+            dropout_prob = self.dropout_prob
+
+        # Use provided precision or default
+        if precision is None:
+            precision = lax.Precision.DEFAULT
+
+        # Use provided policy or default
+        if policy is None:
+            policy = jax.checkpoint_policies.nothing_saveable
+
         with self.config.mesh:
             input_dict = dict(
-                q=query_states,
-                k=key_states,
-                v=value_states,
+                query=query_states,
+                key=key_states,
+                value=value_states,
                 bias=bias,
                 sliding_window=sliding_window,
                 cache_metadata=cache_metadata,
                 cache_view=cache_view,
                 init_bias=init_bias,
-                mask=attention_mask,
+                attention_mask=attention_mask,
                 segment_ids=segment_ids,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
                 causal=causal,
-                deterministic=self.deterministic,
-                dropout_rng=rngs,
+                deterministic=deterministic,
+                dropout_rng=dropout_rng,
                 softmax_aux=softmax_aux,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                dropout_prob=dropout_prob,
+                precision=precision,
+                prevent_cse=prevent_cse,
+                cum_seqlens_q=cum_seqlens_q,
+                cum_seqlens_k=cum_seqlens_k,
+                normalize_output=normalize_output,
+                fused_backward=fused_backward,
+                compute_dtype=compute_dtype,
+                optimized=optimized,
+                mask_value=mask_value,
+                vmem_limit_bytes=vmem_limit_bytes,
+                policy=policy,
             )
             if mode == common_types.MODE_DECODE:
                 assert cache_view is not None
@@ -697,8 +776,8 @@ class AttentionModule(nn.Module):
         value: Array,
         attention_mask: Array,
         mode: common_types.RUNTIME_MODE_TYPES | common_types.EMPTY_VAL = common_types.NOT_GIVEN,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: Array | None = None,
         token_type_ids: Array | None = None,
         fcm_mask: Array | None = None,
@@ -708,8 +787,8 @@ class AttentionModule(nn.Module):
         Array,
         Array,
         tp.Callable[[], Array],
-        TransformerCacheView | PagesCacheView | None,
-        TransformerMetadata | PagesMetadata | None,
+        TransformerCacheView | RaggedPagesCacheView | None,
+        TransformerMetadata | RaggedPagesMetadata | None,
     ]:
         """
         Prepares inputs for attention calculation, handling KV caching and mask merging.
@@ -724,9 +803,9 @@ class AttentionModule(nn.Module):
             value (Array): Current value states [Batch, kv_len, Heads, Dim].
             attention_mask (Array): Base attention mask (e.g., padding mask) [Batch, kv_len] or compatible.
             mode (common_types.RUNTIME_MODE_TYPES): The runtime mode (TRAIN, PREFILL, DECODE). Required.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional): View into the KV cache.
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): View into the KV cache.
                 If None, caching is disabled. Defaults to None.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional): Cache metadata.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
                 Defaults to None.
             causal_mask (tp.Optional[Array], optional): Causal mask [1, 1, q_len, kv_len]. Defaults to None.
             token_type_ids (tp.Optional[Array], optional): Token type IDs for segment masking [Batch, q_len].
@@ -737,7 +816,7 @@ class AttentionModule(nn.Module):
                 Defaults to None.
 
         Returns:
-            tp.Tuple[Array, Array, Array, tp.Callable[[], Array], tp.Optional[tp.Union[TransformerCacheView, PagesCacheView]]]:
+            tp.Tuple[Array, Array, Array, tp.Callable[[], Array], tp.Optional[tp.Union[TransformerCacheView, RaggedPagesCacheView]]]:
                 - key_states (Array): Final key states (potentially from cache).
                 - value_states (Array): Final value states (potentially from cache).
                 - attention_mask (Array): The final combined attention mask [Batch, Heads, q_len, kv_len].
@@ -773,7 +852,7 @@ class AttentionModule(nn.Module):
             cache_view=cache_view,
         )
 
-        if isinstance(cache_view, PagesCacheView):
+        if isinstance(cache_view, RaggedPagesCacheView):
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             def init_attention_bias():

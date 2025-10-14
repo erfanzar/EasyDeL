@@ -35,7 +35,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
-from easydel.layers.caching import PagesCache, TransformerCache
+from easydel.layers.caching import RaggedPagesCache, TransformerCache
 
 from ..sampling_params import JitableSamplingParams, SamplingParams
 
@@ -172,7 +172,7 @@ class GenerationState:
                           each sequence in the batch. Shape: (batch_size, 1).
     """
 
-    cache: TransformerCache | PagesCache
+    cache: TransformerCache | RaggedPagesCache
     index: jax.Array
     logits: jax.Array
     tokens: jax.Array

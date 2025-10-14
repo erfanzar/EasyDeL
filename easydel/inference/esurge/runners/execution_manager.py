@@ -51,7 +51,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src import pjit
 
-from easydel.layers.caching import PagesCache, PagesCacheMetaData, PagesMetadata
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils import ejit
 
 from ...sampling_funcs import sample_top_p_efficient
@@ -135,7 +135,7 @@ class ExecutionManager:
         self,
         model: EasyDeLBaseModule,
         mesh: jax.sharding.Mesh,
-        kv_pages: PagesCache,
+        kv_pages: RaggedPagesCache,
         use_combined_forward: bool = False,
         use_aot_forward: bool = True,
         use_fused_step: bool = False,
@@ -143,7 +143,7 @@ class ExecutionManager:
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
         max_num_tokens: int | None = None,
-        metadata: PagesCacheMetaData = None,
+        metadata: RaggedPagesCacheView = None,
     ):
         """Initialize the executor manager.
 
@@ -334,7 +334,7 @@ class ExecutionManager:
         self,
         input_ids_view: jax.Array,
         position_ids_view: jax.Array,
-        cache_metadata: PagesMetadata,
+        cache_metadata: RaggedPagesMetadata,
         logits_indices: jax.Array,
         sampling_metadata: ModelRunnerSamplingMetadata,
         padded_num_reqs: int,
@@ -408,7 +408,7 @@ class ExecutionManager:
         num_reqs_max_model_len: int,
         max_pages_per_req: int,
         max_num_reqs: int,
-        metadata: PagesCacheMetaData,
+        metadata: RaggedPagesCacheView,
     ) -> None:
         """Compile model execution functions for various input configurations.
 
@@ -473,7 +473,7 @@ class ExecutionManager:
         max_pages_per_req: int,
         max_num_reqs: int,
         padded_num_reqs: int,
-        metadata: PagesCacheMetaData,
+        metadata: RaggedPagesCacheView,
     ) -> None:
         """Compile a single step configuration.
 
@@ -551,8 +551,8 @@ class ExecutionManager:
             graphother,
             input_ids: jax.Array,
             position_ids: jax.Array,
-            kv_pages: PagesCache,
-            cache_metadata: PagesMetadata,
+            kv_pages: RaggedPagesCache,
+            cache_metadata: RaggedPagesMetadata,
         ):
             model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
             with model.mesh:
@@ -701,7 +701,7 @@ class ExecutionManager:
             graphstate,
             graphother,
             dev_state: DeviceSequenceState,
-            kv_pages: PagesCache,
+            kv_pages: RaggedPagesCache,
             scheduled_full: jax.Array,  # [max_num_reqs] int32
             req_num_tokens_full: jax.Array,  # [max_num_reqs] int32
             active_mask_full: jax.Array,  # [max_num_reqs] bool
@@ -799,7 +799,7 @@ class ExecutionManager:
                     input_ids=jnp.expand_dims(input_ids_view, 0),
                     position_ids=jnp.expand_dims(position_ids_view, 0),
                     past_key_values=kv_pages,
-                    cache_metadata=PagesMetadata(
+                    cache_metadata=RaggedPagesMetadata(
                         pages_tables=pt,
                         slot_mapping=slot_mapping_buf,
                         context_lens=seq_lens[:num_reqs_max_model_len],
@@ -904,8 +904,8 @@ class ExecutionManager:
             graphother,
             input_ids: jax.Array,
             position_ids: jax.Array,
-            kv_pages: PagesCache,
-            cache_metadata: PagesMetadata,
+            kv_pages: RaggedPagesCache,
+            cache_metadata: RaggedPagesMetadata,
             logits_indices: jax.Array,
             sampling_params: ModelRunnerSamplingMetadata,
             rng_key: jax.random.PRNGKey,
@@ -1024,14 +1024,14 @@ class ExecutionManager:
 
     def get_compile_configurations(
         self,
-        kv_pages: PagesCache,
+        kv_pages: RaggedPagesCache,
         rng_key: jax.random.PRNGKey,
         num_tokens: int,
         num_reqs_max_model_len: int,
         max_pages_per_req: int,
         max_num_reqs: int,
         padded_num_reqs: int,
-        metadata: PagesCacheMetaData,
+        metadata: RaggedPagesCacheView,
     ) -> tuple:
         """Generate example arguments for function compilation.
 
@@ -1103,7 +1103,7 @@ class ExecutionManager:
                 jnp.zeros((num_tokens,), dtype=jnp.int32),
                 jnp.zeros(num_tokens, dtype=jnp.int32),
                 kv_pages,
-                PagesMetadata(
+                RaggedPagesMetadata(
                     pages_tables=jnp.full(
                         (num_reqs_max_model_len, max_pages_per_req), fill_value=PAGE_TABLE_PADDING_VAL, dtype=jnp.int32
                     ),
@@ -1133,7 +1133,7 @@ class ExecutionManager:
                     jnp.zeros((num_tokens,), dtype=jnp.int32),
                     jnp.zeros(num_tokens, dtype=jnp.int32),
                     kv_pages,
-                    PagesMetadata(
+                    RaggedPagesMetadata(
                         pages_tables=jnp.full(
                             (num_reqs_max_model_len, max_pages_per_req),
                             fill_value=PAGE_TABLE_PADDING_VAL,

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from eformer.escale import PartitionAxis, PartitionManager
 
-from easydel.layers.caching.page import PagesCache, PagesCacheMetaData, PagesMetadata
+from easydel.layers.caching.ragged_page import RaggedPagesCache, RaggedPagesCacheMetaData, RaggedPagesMetadata
 
 
 def test_kv_cache_write():
@@ -15,7 +15,7 @@ def test_kv_cache_write():
     partition_manager = PartitionManager(PartitionAxis(kv_head_axis="tp"))
 
     # Create metadata
-    metadata = PagesCacheMetaData.create(
+    metadata = RaggedPagesCacheMetaData.create(
         mesh=mesh,
         partition_manager=partition_manager,
         kvdtype=jnp.float32,
@@ -33,7 +33,7 @@ def test_kv_cache_write():
     print(f"  max_num_pages_per_req: {metadata.max_num_pages_per_req}")
 
     # Initialize cache
-    cache = PagesCache.init_cache(
+    cache = RaggedPagesCache.init_cache(
         mesh=mesh,
         metadata=metadata,
         partition_manager=partition_manager,
@@ -63,7 +63,7 @@ def test_kv_cache_write():
         dtype=jnp.int32,
     )
 
-    cache_metadata = PagesMetadata(
+    cache_metadata = RaggedPagesMetadata(
         pages_tables=jnp.array([[1, -1, -1, -1]], dtype=jnp.int32),  # Use page 1
         context_lens=jnp.array([3], dtype=jnp.int32),
         query_start_loc=jnp.array([0, 3], dtype=jnp.int32),
