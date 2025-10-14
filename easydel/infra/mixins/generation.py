@@ -74,7 +74,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import PagesCache, PagesCacheMetaData
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheMetaData
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -176,17 +176,17 @@ class EasyGenerationMixin:
         hbm_utilization: float,
         page_size: int,
         max_model_length: int,
-    ) -> PagesCacheMetaData:
+    ) -> RaggedPagesCacheMetaData:
         """
         Creates the static configuration metadata required for initializing a Paged KV Cache.
 
         This method gathers necessary parameters from the model's configuration
         (like number of layers, heads, dimensions) and combines them with the provided
-        arguments to instantiate and return a `PagesCacheMetaData` object.
+        arguments to instantiate and return a `RaggedPagesCacheMetaData` object.
         This metadata object defines the structure and allocation parameters for the paged cache.
 
         Returns:
-            PagesCacheMetaData: An initialized metadata object containing the
+            RaggedPagesCacheMetaData: An initialized metadata object containing the
                 static configuration for the paged cache.
         """
         num_hidden_layers = _safepick(self.config, "num_hidden_layers")
@@ -203,7 +203,7 @@ class EasyGenerationMixin:
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
 
-        return PagesCacheMetaData.create(
+        return RaggedPagesCacheMetaData.create(
             mesh=self.mesh,
             partition_manager=self.config.partition_manager,
             kvdtype=self.config.kvdtype,
@@ -266,33 +266,33 @@ class EasyGenerationMixin:
 
     def init_pages(
         self,
-        metadata: PagesCacheMetaData | None = None,
+        metadata: RaggedPagesCacheMetaData | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
-    ) -> PagesCache:
+    ) -> RaggedPagesCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
-        This method orchestrates the creation of the `PagesCache`. It either uses
-        a pre-existing `PagesCacheMetaData` object passed via the `metadata`
+        This method orchestrates the creation of the `RaggedPagesCache`. It either uses
+        a pre-existing `RaggedPagesCacheMetaData` object passed via the `metadata`
         argument, or if `metadata` is None, it first creates the metadata by calling
         `self.create_paged_metadata` using the other provided arguments (page_size,
         batch_size, etc.).
 
-        Finally, it calls `PagesCache.init_cache` to allocate the necessary
+        Finally, it calls `RaggedPagesCache.init_cache` to allocate the necessary
         paged tensors (`key_pages`, `value_pages` for each layer) based on the
         metadata, model's mesh, dtype, partition manager, and quantization settings.
 
         Args:
-            metadata (tp.Optional[PagesCacheMetaData]): An optional pre-configured
+            metadata (tp.Optional[RaggedPagesCacheMetaData]): An optional pre-configured
                 metadata object. If provided, other arguments like page_size, batch_size etc.,
                 are ignored for metadata creation.
             page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
             hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
 
         Returns:
-            PagesCache: An initialized PagesCache object containing the allocated
+            RaggedPagesCache: An initialized RaggedPagesCache object containing the allocated
                 cache tensors (views) for all layers.
 
         Raises:
@@ -309,7 +309,7 @@ class EasyGenerationMixin:
                 page_size=page_size,
                 max_model_length=max_model_length,
             )
-        return PagesCache.init_cache(
+        return RaggedPagesCache.init_cache(
             mesh=self.config.mesh,
             metadata=metadata,
             partition_manager=self.config.partition_manager,

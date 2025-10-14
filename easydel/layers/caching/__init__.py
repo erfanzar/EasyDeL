@@ -19,7 +19,7 @@ to optimize memory usage and computation during inference.
 
 Cache Types:
     TransformerCache: Standard KV-cache for transformer models
-    PagesCache: Paged cache for efficient memory management
+    RaggedPagesCache: Paged cache for efficient memory management
     MambaCache: Cache for Mamba state-space models
     Mamba2Cache: Enhanced cache for Mamba2 models
     LightningCache: Cache for Lightning attention
@@ -61,7 +61,7 @@ from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, M
 from .lightning import LightningCache, LightningCacheMetaData, LightningCacheView, LightningMetadata
 from .mamba import MambaCache, MambaCacheMetaData, MambaCacheView, MambaMetadata
 from .mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView, Mamba2Metadata
-from .page import PagesCache, PagesCacheMetaData, PagesCacheView, PagesMetadata
+from .ragged_page import RaggedPagesCache, RaggedPagesCacheMetaData, RaggedPagesCacheView, RaggedPagesMetadata
 from .transformer import TransformerCache, TransformerCacheMetaData, TransformerCacheView, TransformerMetadata
 
 __all__ = (
@@ -81,10 +81,11 @@ __all__ = (
     "MambaCacheView",
     "MambaMetadata",
     "MambaSpec",
-    "PagesCache",
-    "PagesCacheMetaData",
-    "PagesCacheView",
-    "PagesMetadata",
+    "RaggedPagesCache",
+    "RaggedPagesCacheMetaData",
+    "RaggedPagesCacheView",
+    "RaggedPagesCacheView",
+    "RaggedPagesMetadata",
     "SlidingWindowSpec",
     "TransformerCache",
     "TransformerCacheMetaData",

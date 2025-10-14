@@ -31,9 +31,9 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -130,8 +130,8 @@ class GPTJAttention(AttentionModule):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
@@ -145,9 +145,9 @@ class GPTJAttention(AttentionModule):
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
             segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional): Cache
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache
                 view for key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
@@ -357,8 +357,8 @@ class GPTJBlock(nn.Module):
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         causal_mask: chex.Array | None = None,
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -371,9 +371,9 @@ class GPTJBlock(nn.Module):
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
             segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional): Cache view for
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache view for
                 key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional): Metadata for
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for
                 cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
@@ -501,8 +501,8 @@ class GPTJModel(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: chex.Array | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         extra_embedding: chex.Array | None = None,
@@ -515,9 +515,9 @@ class GPTJModel(EasyDeLBaseModule):
             input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
                 key_states/value_states states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
             extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
@@ -687,8 +687,8 @@ class GPTJForCausalLM(EasyDeLBaseModule):
         attention_mask: chex.Array | None = None,
         position_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
@@ -702,9 +702,9 @@ class GPTJForCausalLM(EasyDeLBaseModule):
             input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
                 key_states/value_states states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
             extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.

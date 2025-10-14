@@ -30,7 +30,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
@@ -287,8 +287,8 @@ class AyaVisionModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -302,8 +302,8 @@ class AyaVisionModel(EasyDeLBaseModule):
             attention_mask (Optional[chex.Array]): Mask for text attention.
             position_ids (Optional[chex.Array]): Position IDs for text.
             segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | PagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache]): Cached keys/values for language model.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
@@ -572,8 +572,8 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
@@ -588,8 +588,8 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             attention_mask (Optional[chex.Array]): Mask for text attention.
             position_ids (Optional[chex.Array]): Position IDs for text.
             segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | PagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache]): Cached keys/values for language model.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.

@@ -36,9 +36,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -122,8 +122,8 @@ class ArcticAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -537,8 +537,8 @@ class ArcticDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
@@ -679,8 +679,8 @@ class ArcticModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass through the ArcticModel.
 
@@ -692,9 +692,9 @@ class ArcticModel(EasyDeLBaseModule):
                 segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
                 output_attentions (Optional[bool]): Whether to return attention weights.
                 output_hidden_states (Optional[bool]): Whether to return all hidden states.
-                past_key_values (Optional[TransformerCache | PagesCache]):
+                past_key_values (Optional[TransformerCache | RaggedPagesCache]):
                     Cached key/value states for faster decoding.
-                cache_metadata (Optional[TransformerMetadata | PagesMetadata]):
+                cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]):
                     Metadata for paged attention cache.
 
         Returns:
@@ -887,8 +887,8 @@ class ArcticForCausalLM(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
@@ -901,9 +901,9 @@ class ArcticForCausalLM(EasyDeLBaseModule):
                 attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
                 position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
                 segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-                past_key_values (Optional[TransformerCache | PagesCache]):
+                past_key_values (Optional[TransformerCache | RaggedPagesCache]):
                     Cached key/value states for faster decoding.
-                cache_metadata (Optional[TransformerMetadata | PagesMetadata]):
+                cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]):
                     Metadata for paged attention cache.
                 inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
                 output_attentions (Optional[bool]): Whether to return attention weights.
@@ -1033,8 +1033,8 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -1046,9 +1046,9 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
                 attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
                 position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
                 segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-                past_key_values (Optional[TransformerCache | PagesCache]):
+                past_key_values (Optional[TransformerCache | RaggedPagesCache]):
                     Cached key/value states for faster decoding.
-                cache_metadata (Optional[TransformerMetadata | PagesMetadata]):
+                cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]):
                     Metadata for paged attention cache.
                 output_attentions (Optional[bool]): Whether to return attention weights.
                 output_hidden_states (Optional[bool]): Whether to return all hidden states.

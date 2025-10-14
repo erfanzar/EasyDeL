@@ -27,7 +27,7 @@ from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
 from easydel.inference.sampling_params import JitableSamplingParams
-from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.utils import ejit
 
 from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
@@ -409,8 +409,8 @@ class vEngine:
         true_length: int,
         sampling_params: JitableSamplingParams,
         rngs: jax.random.PRNGKey,
-        cache: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         slot: int = 0,
     ) -> tuple[GenerationState, ResultTokens]:
         """Performs the prefill step for initializing the generation process.
@@ -459,7 +459,7 @@ class vEngine:
         graphothers: nn.GraphState,
         state: GenerationState,
         rngs: jax.random.PRNGKey,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         slot: int = 0,
     ) -> tuple[GenerationState, ResultTokens]:
         """Performs a single decode step in the autoregressive generation loop.

@@ -843,7 +843,7 @@ class SequenceGroupMetadataDelta(msgspec.Struct, tag=True, array_like=True, omit
 
 
 class SequenceGroupMetadata(msgspec.Struct, tag=True, array_like=True, omit_defaults=True):
-    """Metadata for a sequence group. Used to create `AttentionMetadata`.
+    """Metadata for a sequence group. Used to create `OperationMetadata`.
 
     Args:
         request_id: The ID of the request.

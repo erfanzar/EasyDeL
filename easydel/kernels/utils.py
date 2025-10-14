@@ -14,7 +14,7 @@
 import jax
 import jax.numpy as jnp
 
-from easydel.layers.caching.page import PagesMetadata
+from easydel.layers.caching.ragged_page import RaggedPagesMetadata
 
 MAX_GPU_FUSED_SIZE = 65536
 
@@ -48,7 +48,7 @@ def generate_ragged_paged_attention_data(
     q_dtype: jnp.dtype = jnp.float32,
     kv_dtype: jnp.dtype = jnp.float32,
     seed: int = 42,
-) -> tuple[jax.Array, PagesMetadata, int]:
+) -> tuple[jax.Array, RaggedPagesMetadata, int]:
     """
     Generates realistic test data for a ragged paged attention kernel.
 
@@ -118,7 +118,7 @@ def generate_ragged_paged_attention_data(
     cu_q_lens_padded = _pad_to_shape(jnp.array(cu_q_lens_list, dtype=jnp.int32), (max_num_seq + 1,), pad_value=0)
     kv_lens_padded = _pad_to_shape(jnp.array(kv_lens_list, dtype=jnp.int32), (max_num_seq,), pad_value=0)
 
-    metadata = PagesMetadata(
+    metadata = RaggedPagesMetadata(
         slot_mapping=jnp.zeros([max_num_batched_tokens], "i4"),
         block_tables=page_indices_padded,
         context_lens=kv_lens_padded,
