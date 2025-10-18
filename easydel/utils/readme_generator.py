@@ -35,7 +35,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "vanilla": "VANILLA",
     "flash": "FLASH", "flash_attn": "FLASH", "flash_attention": "FLASH", "flashattn": "FLASH",
     "flash_attn2": "FLASH_ATTN2", "flash_attention2": "FLASH_ATTN2", "flashattn2": "FLASH_ATTN2",
-    "splash": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
+    "blocksparse": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
     "ring": "RING", "ring_attn": "RING", "ring_attention": "RING",
     "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention": "PAGED",
     "mistral": "MISTRAL"
@@ -180,7 +180,7 @@ JINJA_TEMPLATE = """
     "flash_attn2": "FLASH_ATTN2",
     "flash_attention2": "FLASH_ATTN2",
     "flashattn2": "FLASH_ATTN2",
-    "splash": "SPLASH",
+    "blocksparse": "SPLASH",
     "splash_attn": "SPLASH",
     "splash_attention": "SPLASH",
     "ring": "RING",

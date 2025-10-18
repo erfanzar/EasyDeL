@@ -69,11 +69,12 @@ import jax
 from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from ejkernel.modules import scaled_dot_product_attention
+from ejkernel.types import MaskInfo
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float, Int
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -119,7 +120,7 @@ class ScaledDotProductAttn(OperationImpl):
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         softmax_scale: float | None = None,
@@ -157,17 +158,17 @@ class ScaledDotProductAttn(OperationImpl):
         causal = causal if model_mode != common_types.MODE_DECODE else False
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
-        if attention_mask is None and bias is None and init_bias is not None:
+        if mask_info is None and bias is None and init_bias is not None:
             bias = init_bias()
 
         attention_output = scaled_dot_product_attention(
             query.astype(dtype),
             key.astype(dtype),
             value.astype(dtype),
-            attention_mask.astype("b1") if attention_mask is not None else None,
             bias.astype(dtype) if bias is not None else None,
             cum_seqlens_q,
             cum_seqlens_k,
+            mask_info=mask_info,
             softmax_scale=softmax_scale,
             causal=causal,
             sliding_window=sliding_window,
@@ -176,7 +177,6 @@ class ScaledDotProductAttn(OperationImpl):
                 self.create_stable_sharding(shardings.query, [0, 2], dep=query),
                 self.create_stable_sharding(shardings.key, [0, 2], dep=key),
                 self.create_stable_sharding(shardings.value, [0, 2], dep=value),
-                self.create_stable_sharding(shardings.mask, dep=attention_mask),
                 self.create_stable_sharding(shardings.bias, dep=bias),
                 self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_q),
                 self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_k),
@@ -255,7 +255,7 @@ class ScaledDotProductAttn(OperationImpl):
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         softmax_scale: float | None = None,
@@ -288,7 +288,7 @@ class ScaledDotProductAttn(OperationImpl):
             query=query,
             key=key,
             value=value,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             bias=bias,
             init_bias=init_bias,
             causal=causal,
@@ -308,7 +308,7 @@ if __name__ == "__main__":
     query = jr.normal(jr.key(0), (b, qs, qh, d), "f2")
     key = jr.normal(jr.key(1), (b, ks, kh, d), "f2")
     value = jr.normal(jr.key(2), (b, ks, kh, vd), "f2")
-    a = jnp.astype(jr.randint(jr.key(3), (b, 1, qs, ks), 0, 4) > 2, "b1")
+    mask_info = MaskInfo.from_random(b, qs, ks)
 
     gpu_attn = ScaledDotProductAttn(
         OperationMetadata(runtime_dtype=jnp.float16, base_config=EasyDeLBaseConfig(), backend="gpu")
@@ -320,8 +320,8 @@ if __name__ == "__main__":
         OperationMetadata(runtime_dtype=jnp.float16, base_config=EasyDeLBaseConfig(), backend="tpu")
     )
 
-    cout = cpu_attn(query=query, key=key, value=value, attention_mask=a).attention_outputs
-    gout = gpu_attn(query=query, key=key, value=value, attention_mask=a).attention_outputs
-    tout = tpu_attn(query=query, key=key, value=value, attention_mask=a).attention_outputs
+    cout = cpu_attn(query=query, key=key, value=value, mask_info=mask_info).attention_outputs
+    gout = gpu_attn(query=query, key=key, value=value, mask_info=mask_info).attention_outputs
+    tout = tpu_attn(query=query, key=key, value=value, mask_info=mask_info).attention_outputs
 
     print(jnp.allclose(cout, gout, atol=1e-3), jnp.allclose(tout, gout, atol=1e-3))

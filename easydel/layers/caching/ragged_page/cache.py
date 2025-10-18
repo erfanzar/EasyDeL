@@ -297,8 +297,8 @@ class RaggedPagesCacheView(BaseCacheView):
     ) -> RaggedPagesCacheView:
         num_kv_heads = key.shape[2]
         head_size = key.shape[3]
-        key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
-        value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages)
+        key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+        value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
         use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
         use_shardmap = use_kernel
 

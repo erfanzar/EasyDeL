@@ -19,8 +19,8 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
-from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
@@ -300,8 +300,7 @@ class CLIPAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        mask_info: MaskInfo | None,
         output_attentions: bool = False,
     ):
         """
@@ -324,43 +323,13 @@ class CLIPAttention(AttentionModule):
         key = self._split_heads(key)
         value = self._split_heads(value)
 
-        causal_attention_mask = None
-        if self.causal:
-            assert causal_mask is not None
-            query_length, key_length = query.shape[1], key.shape[1]
-            causal_attention_mask = causal_mask[:, :, key_length - query_length : key_length, :key_length]
-
-        if attention_mask is not None and causal_attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-            attention_mask = nn.combine_masks(
-                attention_mask,
-                causal_attention_mask,
-                dtype="i4",
-            )
-        elif causal_attention_mask is not None:
-            attention_mask = causal_attention_mask
-        elif attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        attention_bias = None
-        if attention_mask is not None:
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attention_mask = None
-
         attentions = self.attention_performer.forward(
             query_states=query,
             key_states=key,
             value_states=value,
             mode=common_types.MODE_TRAIN,
             bias=None,
-            init_bias=lambda: attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=None,
+            mask_info=mask_info,
             causal=self.causal,
         )
 
@@ -499,8 +468,7 @@ class CLIPEncoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        mask_info: MaskInfo | None,
         output_attentions: bool = False,
     ):
         """
@@ -520,8 +488,7 @@ class CLIPEncoderLayer(nn.Module):
         hidden_states = self.layer_norm1(hidden_states)
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
         )
         hidden_states = attn_outputs.attention_output
@@ -590,7 +557,7 @@ class CLIPEncoder(nn.Module):
     def __call__(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -618,8 +585,7 @@ class CLIPEncoder(nn.Module):
 
             layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=self.causal_mask,
+                mask_info=mask_info,
                 output_attentions=output_attentions,
             )
             hidden_states = layer_outputs.hidden_states
@@ -692,7 +658,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -717,10 +683,18 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         )
 
         hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
-
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+        else:
+            if attention_mask.dtype != jnp.bool:
+                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
@@ -941,7 +915,7 @@ class CLIPTextModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -959,6 +933,7 @@ class CLIPTextModel(EasyDeLBaseModule):
         Returns:
                 Union[BaseModelOutputWithPooling, Tuple]: Model output.
         """
+
         return self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1042,7 +1017,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,

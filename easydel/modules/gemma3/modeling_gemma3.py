@@ -23,6 +23,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -238,16 +239,12 @@ class Gemma3Attention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """
@@ -258,7 +255,6 @@ class Gemma3Attention(AttentionModule):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
@@ -295,7 +291,7 @@ class Gemma3Attention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -305,10 +301,7 @@ class Gemma3Attention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            token_type_ids=token_type_ids,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
             sliding_window=self.sliding_window,
         )
 
@@ -321,8 +314,7 @@ class Gemma3Attention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
             sliding_window=self.sliding_window,
         )
@@ -468,16 +460,12 @@ class Gemma3DecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -489,7 +477,6 @@ class Gemma3DecoderLayer(nn.Module):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
@@ -508,16 +495,12 @@ class Gemma3DecoderLayer(nn.Module):
 
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
-            token_type_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states = apply_logical_sharding(
@@ -626,7 +609,6 @@ class Gemma3TextModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -641,7 +623,6 @@ class Gemma3TextModel(EasyDeLBaseModule):
             input_ids (chex.Array): Input tensor containing token IDs.
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
             inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
@@ -666,6 +647,12 @@ class Gemma3TextModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+        if token_type_ids is not None:
+            mask_info = mask_info.apply_token_type_ids(token_type_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -696,23 +683,18 @@ class Gemma3TextModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        causal_mask = self.causal_mask
-
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=causal_mask,
-                token_type_ids=token_type_ids,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
                 default_frequencies=self.default_frequencies,
             )
@@ -824,7 +806,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -840,7 +821,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
             input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
             attention_mask (tp.Optional[chex.Array]): Mask for attention.
             position_ids (tp.Optional[chex.Array]): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
             token_type_ids (tp.Optional[chex.Array]): Token type IDs for handling different types of tokens.
             inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
@@ -862,7 +842,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             token_type_ids=token_type_ids,
         )
 
@@ -961,7 +940,6 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
@@ -978,7 +956,6 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state
@@ -1209,7 +1186,6 @@ class Gemma3Model(EasyDeLBaseModule):
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
             token_type_ids=token_type_ids,
-            segment_ids=None,
             **lm_kwargs,
         )
         return Gemma3ModelOutputWithPast(

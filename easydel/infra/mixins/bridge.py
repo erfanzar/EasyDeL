@@ -841,8 +841,8 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
         if "torch_dtype" not in kwargs.keys():
             kwargs["torch_dtype"] = torch.float16
-
-        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        torch_dtype = kwargs.pop("torch_dtype")
+        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, dtype=torch_dtype, **kwargs)
         generation_config = getattr(hf_model, "generation_config", None)
         config_class = config_class.from_pretrained(pretrained_model_name_or_path)
         state_dict = hf_model.state_dict()

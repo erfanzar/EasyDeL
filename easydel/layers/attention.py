@@ -45,19 +45,17 @@ Example:
 """
 
 import typing as tp
-import warnings
 from enum import Enum
 from functools import cached_property, partial
 
 import einops
-import flax
-import flax.errors
 import flax.nnx as nn
 import jax
 from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from jax import NamedSharding, lax
 from jax import numpy as jnp
 from jax import tree_util as jtu
@@ -129,7 +127,8 @@ class AttentionMechanisms(str, Enum):
     FLASH_ATTN2: str = "flash_attn2"
     RING: str = "ring"
     VANILLA: str = "vanilla"
-    SPLASH: str = "splash"
+    SPLASH: str = "blocksparse"
+    BLOCKSPARSE: str = "blocksparse"
     CUDNN: str = "cudnn"
     BLOCKWISE: str = "blockwise"
     SDPA: str = "sdpa"
@@ -188,10 +187,9 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
         case "tpu":
             if tpu_version_check("v3"):
                 return AttentionMechanisms.FLASH_ATTN2, jnp.float32
-            return AttentionMechanisms.SPLASH, jnp.bfloat16
+            return AttentionMechanisms.BLOCKSPARSE, jnp.bfloat16
         case "gpu":
-            return (AttentionMechanisms.FLASH_ATTN2, jnp.float16)
-            # float16 is better for flash attention
+            return (AttentionMechanisms.FLASH_ATTN2, jnp.bfloat16)
         case _:
             return AttentionMechanisms.VANILLA, jnp.bfloat16
 
@@ -296,15 +294,12 @@ class FlexibleAttentionModule(nn.Module):
         key_states: Float[JArray, "batch seq_k heads dim"],
         value_states: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
+        mask_info: MaskInfo | None = None,
         bias: Float[JArray, "batch heads seq_q seq_k"] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         init_bias: tp.Callable[[], Float[JArray, "batch heads seq_q seq_k"]] | None = None,
-        attention_mask: Bool[JArray, "batch seq_q seq_k"] | None = None,
-        segment_ids: Int[JArray, "batch seq"] | None = None,
-        q_segment_ids: Int[JArray, "batch seq_q"] | None = None,
-        kv_segment_ids: Int[JArray, "batch seq_k"] | None = None,
         causal: bool = True,
         softmax_aux: Float[JArray, "..."] | None = None,
         softmax_scale: float | None = None,
@@ -332,19 +327,22 @@ class FlexibleAttentionModule(nn.Module):
             key_states (Array): Key tensor [batch, seq_k, heads, dim].
             value_states (Array): Value tensor [batch, seq_v, heads, dim].
             mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (TRAIN, PREFILL, DECODE).
+            mask_info (MaskInfo, optional): Container for attention masks and segment IDs. Defaults to None.
+                If provided, contains:
+                - attention_mask: Boolean mask [batch, 1, seq_q, seq_k]
+                - q_segment_ids: Query segment IDs [batch, seq_q]
+                - kv_segment_ids: Key/Value segment IDs [batch, seq_k]
+                - q_positions: Query position indices [batch, seq_q]
+                - kv_positions: Key/Value position indices [batch, seq_k]
             bias (Array, optional): Optional attention bias [batch, heads, seq_q, seq_k]. Defaults to None.
             sliding_window (int | tuple[int, int], optional): Sliding window size for attention. Defaults to None.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Cache metadata. Defaults to None.
             cache_view (TransformerCacheView | RaggedPagesCacheView, optional): View into KV cache. Defaults to None.
             init_bias (Callable, optional): Function to initialize bias tensor. Defaults to None.
-            attention_mask (Array, optional): Boolean mask [batch, seq_q, seq_k]. Defaults to None.
-            segment_ids (Array, optional): Segment IDs for both Q and KV [batch, seq]. Defaults to None.
-            q_segment_ids (Array, optional): Query segment IDs [batch, seq_q]. Defaults to None.
-            kv_segment_ids (Array, optional): Key/Value segment IDs [batch, seq_k]. Defaults to None.
             causal (bool, optional): Apply causal masking. Defaults to True.
             softmax_aux (Array, optional): Auxiliary tensor for softmax (e.g., sink tokens). Defaults to None.
             softmax_scale (float, optional): Scaling factor for attention logits. Defaults to None.
-            logit_soft_cap (float, optional): Soft capping value for attention logits. Defaults to None.
+            logits_soft_cap (float, optional): Soft capping value for attention logits. Defaults to None.
             dropout_prob (float, optional): Dropout probability for attention weights. Defaults to None.
             dropout_rng (PRNGKey, optional): PRNG key for dropout. Defaults to None.
             deterministic (bool, optional): If True, disables dropout. Defaults to None (uses self.deterministic).
@@ -366,20 +364,15 @@ class FlexibleAttentionModule(nn.Module):
         """
         if isinstance(cache_view, RaggedPagesCacheView):
             assert self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
-        try:
-            rngs = self.rngs()
-        except flax.errors.TraceContextError:
-            rngs = None
-
-        # Handle segment_ids fallback
-        if q_segment_ids is None and segment_ids is not None:
-            q_segment_ids = segment_ids
-        if kv_segment_ids is None and segment_ids is not None:
-            kv_segment_ids = segment_ids
+        # NOTE: Attention Dropout is disabled for now.
+        # try:
+        #     rngs = self.rngs()
+        # except flax.errors.TraceContextError:
+        #     rngs = None
 
         # Use provided dropout_rng or rngs
-        if dropout_rng is None:
-            dropout_rng = rngs
+        # if dropout_rng is None:
+        dropout_rng = None
 
         # Use provided deterministic or self.deterministic
         if deterministic is None:
@@ -406,15 +399,12 @@ class FlexibleAttentionModule(nn.Module):
                 query=query_states,
                 key=key_states,
                 value=value_states,
+                mask_info=mask_info,
                 bias=bias,
                 sliding_window=sliding_window,
                 cache_metadata=cache_metadata,
                 cache_view=cache_view,
                 init_bias=init_bias,
-                attention_mask=attention_mask,
-                segment_ids=segment_ids,
-                q_segment_ids=q_segment_ids,
-                kv_segment_ids=kv_segment_ids,
                 causal=causal,
                 deterministic=deterministic,
                 dropout_rng=dropout_rng,
@@ -642,81 +632,37 @@ class AttentionModule(nn.Module):
         key: Float[JArray, "batch seq_k heads dim"],
         value: Float[JArray, "batch seq_v heads dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        attention_mask: Bool[JArray, "batch seq_q seq_k"],
+        mask_info: MaskInfo,
         cache_view: TransformerCacheView | None,
         cache_metadata: TransformerMetadata | None,
-        causal_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
-        token_type_ids: Int[JArray, "batch seq"] | None,
     ) -> tuple[
         Float[JArray, "batch seq_k heads dim"],
         Float[JArray, "batch seq_v heads dim"],
-        Bool[JArray, "batch seq_q seq_k"],
+        MaskInfo,
         TransformerCacheView | None,
         AttnMaskDetail | None,
     ]:
         """Handles concatenation of current KV states to the cache."""
         if cache_view is None:
-            return key, value, attention_mask, None, None
-        key, value, attention_mask, cache_view, masking_details = cache_view.concatenate_to_cache(
+            return key, value, mask_info, None, None
+        key, value, mask_info, cache_view, masking_details = cache_view.concatenate_to_cache(
             query=query,
             key=key,
             value=value,
             mode=mode,
             quantizer=self.quantizer,
-            causal_mask=causal_mask,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             cache_metadata=cache_metadata,
-            token_type_ids=token_type_ids,
             partition_manager=self.config.partition_manager,
         )
 
-        return key, value, attention_mask, cache_view, masking_details
-
-    def _merge_masks(
-        self,
-        attention_mask: Bool[JArray, "... seq_q seq_k"],
-        causal: bool,
-        causal_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
-        token_type_ids: Int[JArray, "batch seq"] | None,
-        fcm_mask: Bool[JArray, "batch heads seq_q seq_k"] | None,
-        query_length: int,
-        initial_key_length: int,
-        cache_view: TransformerCacheView | None,
-    ) -> Bool[JArray, "batch heads seq_q seq_k"]:
-        """Merges attention, causal, token-type, and FCM masks."""
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        if cache_view is None:
-            if causal:
-                target_length = initial_key_length
-                if isinstance(causal_mask, bool) or causal_mask is None:
-                    causal_mask = self.config._create_causal_mask(target_length=target_length)
-                causal_mask = causal_mask[:, :, :query_length, :initial_key_length]
-                causal_mask = jnp.broadcast_to(causal_mask, (attention_mask.shape[0], *causal_mask.shape[1:]))
-                if token_type_ids is not None and query_length != 1:
-                    token_type_mask = jnp.equal(jnp.expand_dims(token_type_ids, 2), jnp.expand_dims(token_type_ids, 1))
-                    token_type_mask = jnp.where(
-                        jnp.broadcast_to(jnp.expand_dims(token_type_ids == 0, -1), token_type_mask.shape),
-                        False,
-                        token_type_mask,
-                    )
-                    token_type_mask = jnp.expand_dims(token_type_mask, 1)
-                    sequence_length = token_type_ids.shape[1]
-                    masked_portion = jnp.logical_or(token_type_mask, causal_mask[:, :, :, :sequence_length])
-                    causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-
-                attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-                attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
-            else:
-                attention_mask = jnp.repeat(attention_mask, query_length, -2)
-
-        return attention_mask
+        return key, value, mask_info, cache_view, masking_details
 
     def _apply_sliding_window(
         self,
         key: Array,
         value: Array,
-        attention_mask: Array,
+        mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | None,
         sliding_window: int,
@@ -726,15 +672,15 @@ class AttentionModule(nn.Module):
     ) -> tuple[Array, Array, Array]:
         """Applies sliding window masking and slicing to KV and mask."""
 
-        offsets = jnp.zeros((key.shape[0],), "i4")
-        krange = key.shape[1] if masking_details is None else attention_mask.shape[-1]
-        if mode == common_types.MODE_DECODE and cache_view is not None:
-            indexs = cache_view.indexs
-            offsets = indexs - 1
-        elif mode == common_types.MODE_PREFILL and masking_details is not None:
-            indexs = jnp.array([query_length], "i4").repeat(key.shape[0], axis=0).reshape(-1)
-        else:
-            indexs = jnp.zeros((key.shape[0],), "i4") + 1
+        # offsets = jnp.zeros((key.shape[0],), "i4")
+        krange = key.shape[1] if masking_details is None else mask_info.kv_len
+        # if mode == common_types.MODE_DECODE and cache_view is not None:
+        #     indexs = cache_view.indexs
+        #     # offsets = indexs - 1
+        # elif mode == common_types.MODE_PREFILL and masking_details is not None:
+        #     indexs = jnp.array([query_length], "i4").repeat(key.shape[0], axis=0).reshape(-1)
+        # else:
+        #     indexs = jnp.zeros((key.shape[0],), "i4") + 1
 
         @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0, 0))
         def _select_slices(ikey, ival, imsk, offset, index):
@@ -756,16 +702,16 @@ class AttentionModule(nn.Module):
 
             return ikey, ival, imsk
 
-        key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
+        # key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
 
-        if cache_metadata is not None and mode == common_types.MODE_DECODE:
-            passed = cache_metadata.indexs - cache_metadata.starts
-            cache_metadata = TransformerMetadata(
-                starts=jax.lax.max(0, sliding_window - passed),
-                indexs=jnp.full((attention_mask.shape[0],), attention_mask.shape[-1]),
-            )
+        # if cache_metadata is not None and mode == common_types.MODE_DECODE:
+        #     passed = cache_metadata.indexs - cache_metadata.starts
+        #     cache_metadata = TransformerMetadata(
+        #         starts=jax.lax.max(0, sliding_window - passed),
+        #         indexs=jnp.full((attention_mask.shape[0],), attention_mask.shape[-1]),
+        #     )
 
-        return key, value, attention_mask, cache_metadata
+        return key, value, mask_info, cache_metadata
 
     @jax.named_scope("easydel-flax-attention-concatenate")
     def concatenate(
@@ -774,13 +720,10 @@ class AttentionModule(nn.Module):
         query: Array,
         key: Array,
         value: Array,
-        attention_mask: Array,
+        mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES | common_types.EMPTY_VAL = common_types.NOT_GIVEN,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: Array | None = None,
-        token_type_ids: Array | None = None,
-        fcm_mask: Array | None = None,
         sliding_window: int | None = None,
     ) -> tuple[
         Array,
@@ -808,7 +751,6 @@ class AttentionModule(nn.Module):
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
                 Defaults to None.
             causal_mask (tp.Optional[Array], optional): Causal mask [1, 1, q_len, kv_len]. Defaults to None.
-            token_type_ids (tp.Optional[Array], optional): Token type IDs for segment masking [Batch, q_len].
                 Defaults to None.
             fcm_mask (tp.Optional[Array], optional): Fused-Context-Mask [Batch, 1, q_len, kv_len].
                 Defaults to None.
@@ -827,13 +769,10 @@ class AttentionModule(nn.Module):
         Raises:
             ValueError: If shapes are mismatched.
         """
-
-        assert attention_mask.shape[-1] >= key.shape[1], "Attention mask length must match KV sequence length."
+        # TODO:MOVEIT
+        # assert mask_info.shape[-1] >= key.shape[1], "Attention mask length must match KV sequence length."
 
         query_length, initial_key_length = query.shape[1], key.shape[1]
-        if attention_mask.dtype != jnp.bool:
-            warnings.warn("attention_mask should be a boolean array", stacklevel=1)
-            attention_mask = (attention_mask == 1).astype(jnp.bool_)
 
         if isinstance(mode, common_types.EMPTY_VAL):
             if cache_view is None:
@@ -841,44 +780,28 @@ class AttentionModule(nn.Module):
             else:
                 mode = common_types.MODE_PREFILL if query_length != 1 else common_types.MODE_DECODE
 
-        attention_mask = self._merge_masks(
-            attention_mask=attention_mask,
-            causal=causal_mask is not None,
-            causal_mask=causal_mask,
-            token_type_ids=token_type_ids,
-            fcm_mask=fcm_mask,
-            query_length=query_length,
-            initial_key_length=initial_key_length,
-            cache_view=cache_view,
-        )
-
         if isinstance(cache_view, RaggedPagesCacheView):
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             def init_attention_bias():
                 return jnp.zeros((query.shape[0], 1, query_length, initial_key_length), dtype=self.dtype)
 
-            return key, value, attention_mask, init_attention_bias, cache_view, cache_metadata
+            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
 
         if cache_view is not None:
             assert query.shape[0] == cache_view.key.shape[0], "Batch size mismatch between query and cache."
-        key, value, attention_mask, cache_view, masking_details = self._handle_cache_concat(
+        key, value, mask_info, cache_view, masking_details = self._handle_cache_concat(
             query=query,
             key=key,
             value=value,
             mode=mode,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            causal_mask=causal_mask,
-            token_type_ids=token_type_ids,
         )
 
         if cache_metadata is None and cache_view is not None:
-            cache_metadata = TransformerMetadata(
-                starts=cache_view.starts,
-                indexs=cache_view.indexs,
-            )
+            cache_metadata = TransformerMetadata(starts=cache_view.starts, indexs=cache_view.indexs)
         if sliding_window is not None or (
             cache_view is not None
             and cache_view.masking_details is not None
@@ -887,10 +810,10 @@ class AttentionModule(nn.Module):
             masking_details = cache_view.masking_details if isinstance(cache_view, TransformerCacheView) else None
             if masking_details and masking_details.mask_type == AttnMaskType.SLIDING:
                 sliding_window = sliding_window or masking_details.size
-            key, value, attention_mask, cache_metadata = self._apply_sliding_window(
+            key, value, mask_info, cache_metadata = self._apply_sliding_window(
                 key=key,
                 value=value,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 mode=mode,
                 cache_view=cache_view,
                 sliding_window=sliding_window,
@@ -900,13 +823,9 @@ class AttentionModule(nn.Module):
             )
 
         def init_attention_bias():
-            return lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
+            return mask_info.create_bias(self.dtype)
 
-        return key, value, attention_mask, init_attention_bias, cache_view, cache_metadata
+        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]

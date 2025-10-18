@@ -59,6 +59,10 @@ from pathlib import Path
 
 from eformer.loggings import get_logger
 
+# Suppress Pydantic Field warnings from wandb library
+warnings.filterwarnings("ignore", message=".*'repr' attribute.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=UserWarning)
+
 if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
 try:

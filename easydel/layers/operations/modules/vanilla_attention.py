@@ -56,9 +56,10 @@ import typing as tp
 import jax
 from eformer.escale import with_sharding_constraint
 from ejkernel.modules import attention
+from ejkernel.types import MaskInfo
 from jax import numpy as jnp
 from jax import random as jr
-from jaxtyping import Array, Bool, Float, PRNGKeyArray
+from jaxtyping import Array, Float, PRNGKeyArray
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -103,7 +104,7 @@ class VanillaAttn(OperationImpl):
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
@@ -119,28 +120,22 @@ class VanillaAttn(OperationImpl):
         with self.metadata.mesh:
             model_mode = self.get_mode(query=query, BTHD=True)
             shardings = self.metadata.get_shardings(model_mode, layout="bthd")
-            if attention_mask is None and bias is None and init_bias is not None:
-                bias = init_bias()
-            if bias is None and attention_mask is None and init_bias is not None:
+            if mask_info is None and bias is None and init_bias is not None:
                 bias = init_bias()
             query = with_sharding_constraint(arr=query, sharding=shardings.query)
             key = with_sharding_constraint(arr=key, sharding=shardings.key)
             value = with_sharding_constraint(arr=value, sharding=shardings.value)
 
             bias = with_sharding_constraint(arr=bias, sharding=shardings.bias) if bias is not None else bias
-            attention_mask = (
-                with_sharding_constraint(arr=attention_mask, sharding=shardings.mask)
-                if attention_mask is not None
-                else attention_mask
-            )
+
             outputs, weights = attention(
                 query,
                 key,
                 value,
-                attention_mask,
                 bias,
                 dropout_rng,
                 softmax_aux,
+                mask_info=mask_info,
                 deterministic=deterministic,
                 dropout_prob=dropout_prob,
                 dtype=self.metadata.runtime_dtype,
@@ -221,7 +216,7 @@ class VanillaAttn(OperationImpl):
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
@@ -259,7 +254,7 @@ class VanillaAttn(OperationImpl):
             query=query,
             key=key,
             value=value,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             bias=bias,
             deterministic=deterministic,
             dropout_prob=dropout_prob,
@@ -282,7 +277,7 @@ if __name__ == "__main__":
     query = jr.normal(jr.key(0), (b, qs, qh, d), "f2")
     key = jr.normal(jr.key(1), (b, ks, kh, d), "f2")
     value = jr.normal(jr.key(2), (b, ks, kh, vd), "f2")
-    a = jnp.astype(jr.randint(jr.key(3), (b, 1, qs, ks), 0, 4) > 2, "b1")
+    mask_info = MaskInfo.from_random(b, qs, ks)
 
     metadata = OperationMetadata(
         runtime_dtype=jnp.float16,
@@ -290,5 +285,5 @@ if __name__ == "__main__":
         base_config=EasyDeLBaseConfig(),
     )
 
-    out = VanillaAttn(metadata)(query=query, key=key, value=value, mask=a)
+    out = VanillaAttn(metadata)(query=query, key=key, value=value, mask_info=mask_info)
     print(out.attention_outputs)

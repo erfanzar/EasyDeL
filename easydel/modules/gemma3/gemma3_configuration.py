@@ -170,6 +170,7 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         scan_layers: bool = False,
+        use_bidirectional_attention: bool = False,
         **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
@@ -214,7 +215,9 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
         self.rope_local_base_freq = rope_local_base_freq
         self.sliding_window_pattern = sliding_window_pattern
         self.layer_types = layer_types
-
+        self.use_bidirectional_attention = use_bidirectional_attention
+        if use_bidirectional_attention:
+            self.sliding_window = (self.sliding_window // 2) + 1
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if bool((i + 1) % self.sliding_window_pattern) else "full_attention"

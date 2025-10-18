@@ -120,12 +120,6 @@ if ED_DEFAULT_HARDWARE_ABSTRACTION:
 if DEFAULT_HARDWARE_ABSTRACTION:
     logger.info("HARDWARE_ABSTRACTION is ON by default")
 
-if EKERNEL_OPS:
-    logger.info("`EKERNEL_OPS` is ON and some operations will automatically be replaced by EasyDeL.")
-    from easydel.kernels.matmul import replace_dot_general_with_matmul
-
-    replace_dot_general_with_matmul()
-
 
 def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
     """Extract the commit hash from a resolved cache filename.

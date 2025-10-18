@@ -206,7 +206,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "auto",
     "vanilla",
     "flash_attn2",
-    "splash",
+    "blocksparse",
     "ring",
     "cudnn",
     "blockwise",

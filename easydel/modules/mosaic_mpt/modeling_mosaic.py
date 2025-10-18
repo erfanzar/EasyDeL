@@ -21,6 +21,7 @@ import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from einops import rearrange
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
@@ -206,7 +207,9 @@ class MptAttention(AttentionModule):
 
         self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
-            dropout_prob=self.config.attn_config.attn_pdrop,
+            dropout_prob=float(self.config.attn_config.attn_pdrop)
+            if self.config.attn_config.attn_pdrop is not None
+            else 0.0,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
         )
@@ -215,14 +218,11 @@ class MptAttention(AttentionModule):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         position_bias: chex.Array | tuple[chex.Array, chex.Array],
-        attention_mask: Bool[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
+        mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
     ):
         inp_shape = hidden_states.shape
         mixed_qkv = self.Wqkv(hidden_states)
@@ -246,7 +246,7 @@ class MptAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             _,
             cache_view,
             cache_metadata,
@@ -256,8 +256,7 @@ class MptAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             fcm_mask=fcm_mask,
         )
         if position_bias is not None:
@@ -270,11 +269,11 @@ class MptAttention(AttentionModule):
                 position_bias_query_index:,
                 position_bias_key_index:,
             ]
-        attention_mask = attention_mask.repeat(position_bias.shape[1], 1)
+        mask_ = mask_info.get_or_compute_attention_mask().repeat(position_bias.shape[1], 1)
         attention_bias = lax.select(
-            attention_mask.astype("bool"),
-            jnp.full(attention_mask.shape, 0.0).astype(self.dtype) + position_bias.astype(self.dtype),
-            jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+            mask_,
+            jnp.full(mask_.shape, 0.0).astype(self.dtype) + position_bias.astype(self.dtype),
+            jnp.full(mask_.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
 
         attention = self.attention_performer.forward(
@@ -286,8 +285,7 @@ class MptAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=lambda: attention_bias,
-            attention_mask=None,
-            segment_ids=segment_ids,
+            mask_info=None,
             causal=False,
         )
 
@@ -399,22 +397,17 @@ class MptBlock(nn.Module):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         position_bias: chex.Array | tuple[chex.Array, chex.Array],
-        attention_mask: Bool[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
+        mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
     ):
         attn_outputs = self.attn(
             self.norm_1(hidden_states),
             position_bias,
-            attention_mask,
-            causal_mask,
+            mask_info,
             mode,
-            segment_ids,
             cache_view,
             cache_metadata,
             output_attentions,
@@ -563,7 +556,6 @@ class MptModel(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -591,6 +583,10 @@ class MptModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
 
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, (1, 2))
@@ -608,14 +604,12 @@ class MptModel(EasyDeLBaseModule):
         for idx, block in enumerate(self.blocks):
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=self.causal_mask,
+                mask_info=mask_info,
                 output_attentions=output_attentions,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 position_bias=self.alibi,
-                segment_ids=segment_ids,
             )
             hidden_states = layer_outputs.hidden_states
             if output_attentions:
@@ -736,7 +730,6 @@ class MptForCausalLM(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -748,7 +741,6 @@ class MptForCausalLM(EasyDeLBaseModule):
         outputs: BaseModelOutput = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            segment_ids=segment_ids,
             inputs_embeds=inputs_embeds,
             mode=mode,
             past_key_values=past_key_values,

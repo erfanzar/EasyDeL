@@ -21,9 +21,10 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -127,13 +128,12 @@ class GPTJAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        attention_mask: chex.Array,
+        mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         causal_mask: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -176,7 +176,7 @@ class GPTJAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -186,8 +186,7 @@ class GPTJAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             fcm_mask=None,
         )
         attentions = self.attention_performer.forward(
@@ -199,8 +198,7 @@ class GPTJAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -353,13 +351,11 @@ class GPTJBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        attention_mask: chex.Array,
+        mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        causal_mask: chex.Array | None = None,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -387,13 +383,11 @@ class GPTJBlock(nn.Module):
 
         attn_outputs = self.attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
             mode,
             cache_view,
             cache_metadata,
-            causal_mask,
-            segment_ids,
             output_attentions,
             frequencies,
         )
@@ -406,7 +400,6 @@ class GPTJBlock(nn.Module):
             )
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
-        # residual connection
         hidden_states = checkpoint_name(attn_output + feed_forward_hidden_states + residual, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -504,7 +497,6 @@ class GPTJModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         extra_embedding: chex.Array | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -543,6 +535,10 @@ class GPTJModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -571,15 +567,13 @@ class GPTJModel(EasyDeLBaseModule):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
-                causal_mask=self.causal_mask,
             )
             hidden_states = layer_outputs.hidden_states
             if output_attentions:
@@ -691,7 +685,6 @@ class GPTJForCausalLM(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         extra_embedding: chex.Array | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -718,7 +711,6 @@ class GPTJForCausalLM(EasyDeLBaseModule):
         outputs = self.transformer(
             input_ids=input_ids,
             extra_embedding=extra_embedding,
-            segment_ids=segment_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             mode=mode,

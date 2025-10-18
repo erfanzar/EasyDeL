@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -184,15 +185,12 @@ class GemmaAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
         """
@@ -249,7 +247,7 @@ class GemmaAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -259,11 +257,8 @@ class GemmaAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
         )
-
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -273,8 +268,7 @@ class GemmaAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
         )
 
@@ -436,15 +430,12 @@ class GemmaDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
         """
@@ -474,15 +465,12 @@ class GemmaDecoderLayer(nn.Module):
 
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -566,7 +554,6 @@ class GemmaModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -605,6 +592,10 @@ class GemmaModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -639,14 +630,12 @@ class GemmaModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -745,7 +734,6 @@ class GemmaForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -781,7 +769,6 @@ class GemmaForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -876,7 +863,6 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
@@ -893,7 +879,6 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state
