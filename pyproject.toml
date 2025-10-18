@@ -97,7 +97,7 @@ ignore = [
     "B008",  # Do not perform function calls in argument defaults
     "UP015", # Unnecessary open mode
     "A005",  # Module-level shadowing
-    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals 
+    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
     "E501",  # Line too long (handled by formatter)
 ]
 
