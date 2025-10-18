@@ -58,6 +58,7 @@ from enum import Enum
 from functools import lru_cache, partial
 
 import jax
+import jax.extend
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
@@ -1253,9 +1254,9 @@ class CompilationTracker:
     @contextmanager
     def trace_compilation(self):
         if self.first_time:
-            before = set(jax.lib.xla_bridge.get_backend().live_executables())
+            before = set(jax.extend.backend.get_backend().live_executables())
             yield
-            after = set(jax.lib.xla_bridge.get_backend().live_executables())
+            after = set(jax.extend.backend.get_backend().live_executables())
             new = after - before
             if new:
                 cmpf = list(new)
@@ -1663,12 +1664,12 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
 @contextmanager
 def trace_functions():
     tracer = FunctionTracer()
-    tracer._before = set(jax.lib.xla_bridge.get_backend().live_executables())
+    tracer._before = set(jax.extend.backend.get_backend().live_executables())
 
     try:
         yield tracer
     finally:
-        after = set(jax.lib.xla_bridge.get_backend().live_executables())
+        after = set(jax.extend.backend.get_backend().live_executables())
         new = after - tracer._before
         tracer.new_executables = [TraceResult(exe) for exe in new]
 
