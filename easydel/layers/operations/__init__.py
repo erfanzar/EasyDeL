@@ -30,7 +30,7 @@ Implementations:
     RaggedPageAttn: Paged attention for efficient inference
     RingAttn: Ring attention for sequence parallelism
     ScaledDotProductAttn: Standard scaled dot-product attention
-    SplashAttn: Splash attention for TPUs
+    BlockSparseAttn: Splash attention for TPUs
     VanillaAttn: Basic dot-product attention
 
 Example:
@@ -50,17 +50,18 @@ from ._attention_outputs import AttentionOutput
 from ._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from .modules import (
     AutoRegressiveDecodeAttn,
+    BlockSparseAttn,
     FlashAttn,
     RaggedPageAttn,
     RingAttn,
     ScaledDotProductAttn,
-    SplashAttn,
     VanillaAttn,
 )
 
 __all__ = (
     "AttentionOutput",
     "AutoRegressiveDecodeAttn",
+    "BlockSparseAttn",
     "FlashAttn",
     "OperationImpl",
     "OperationMetadata",
@@ -68,6 +69,5 @@ __all__ = (
     "RaggedPageAttn",
     "RingAttn",
     "ScaledDotProductAttn",
-    "SplashAttn",
     "VanillaAttn",
 )

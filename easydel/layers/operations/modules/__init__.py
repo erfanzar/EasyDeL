@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .blocksparse_attention import SplashAttn
+from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
 from .ragged_page_attention import RaggedPageAttn
@@ -22,10 +22,10 @@ from .vanilla_attention import VanillaAttn
 
 __all__ = (
     "AutoRegressiveDecodeAttn",
+    "BlockSparseAttn",
     "FlashAttn",
     "RaggedPageAttn",
     "RingAttn",
     "ScaledDotProductAttn",
-    "SplashAttn",
     "VanillaAttn",
 )

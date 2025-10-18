@@ -625,7 +625,7 @@ class Mamba2Block(nn.Module):
             hidden_states,
             cache_params,
             cache_position,
-            attention_mask,
+            mask_info,
         )
         hidden_states = residual + hidden_states
         return hidden_states, cache_params

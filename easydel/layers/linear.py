@@ -47,6 +47,8 @@ Example:
     >>> output = layer(input_tensor)
 """
 
+from __future__ import annotations
+
 import typing as tp
 
 import jax.numpy as jnp
@@ -55,17 +57,9 @@ from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
-from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Shaped
-
-from easydel.kernels.collective_matmul import (
-    MatrixMultiplyMethod,
-    create_distributed_matmul,
-    prepare_matrix_for_all_gather,
-    prepare_matrix_for_reduce_scatter,
-)
 
 Dtype = jnp.dtype
 Initializer = nn.initializers.Initializer
@@ -98,7 +92,7 @@ def get_sharding(arr: Shaped[Array, "..."]) -> Ps | None:
 def get_output_partition_spec(
     lhs: Shaped[Array, "..."],
     rhs: Shaped[Array, "..."],
-    method: MatrixMultiplyMethod,
+    method: "MatrixMultiplyMethod",  # noqa #type:ignore
     axis_name: str,
 ) -> Ps | None:
     """Calculate output partition spec for matrix multiplication.
@@ -217,7 +211,7 @@ class TensorParallelConfig:
 
     mesh: Mesh = None
     axis_name: str = "tp"
-    matmul_method: MatrixMultiplyMethod | None = None
+    matmul_method: None = None
     reduce_output: bool = False
     reduce_scatter_output: bool = False
 
@@ -311,68 +305,69 @@ class ParallelLinear(nn.Module):
         else:
             self.bias = None
         self.distributed_matmul = None
-        if parallel_config is not None and parallel_config.matmul_method is not None:
-            self.distributed_matmul = create_distributed_matmul(
-                parallel_config.matmul_method,
-                parallel_config.axis_name,
-            )
 
-    def collective_forward(
-        self,
-        inputs: Shaped[Array, "... in_features"],
-        w: Array | None = None,
-    ) -> Shaped[Array, "... out_features"]:
-        kernel = self.kernel.value if w is None else w
-        bias = self.bias.value if self.use_bias else None
+    #     if parallel_config is not None and parallel_config.matmul_method is not None:
+    #         self.distributed_matmul = create_distributed_matmul(
+    #             parallel_config.matmul_method,
+    #             parallel_config.axis_name,
+    #         )
 
-        if bias is not None:
-            inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
-        else:
-            inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
+    # def collective_forward(
+    #     self,
+    #     inputs: Shaped[Array, "... in_features"],
+    #     w: Array | None = None,
+    # ) -> Shaped[Array, "... out_features"]:
+    #     kernel = self.kernel.value if w is None else w
+    #     bias = self.bias.value if self.use_bias else None
 
-        # Ensure inputs are 2D
-        orig_shape = inputs.shape
-        inputs_2d = inputs.reshape(-1, inputs.shape[-1])
+    #     if bias is not None:
+    #         inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
+    #     else:
+    #         inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
 
-        # Get partition specs
-        input_spec = get_sharding(inputs_2d)
-        kernel_spec = get_sharding(kernel)
-        output_spec = get_output_partition_spec(
-            inputs_2d,
-            kernel,
-            self.parallel_config.matmul_method,
-            self.parallel_config.axis_name,
-        )
+    #     # Ensure inputs are 2D
+    #     orig_shape = inputs.shape
+    #     inputs_2d = inputs.reshape(-1, inputs.shape[-1])
 
-        if self.parallel_config.matmul_method == MatrixMultiplyMethod.REDUCE_SCATTER:
-            kernel = prepare_matrix_for_reduce_scatter(
-                kernel,
-                self.parallel_config.mesh,
-                self.parallel_config.axis_name,
-            )
-        elif self.parallel_config.matmul_method == MatrixMultiplyMethod.ALL_GATHER:
-            kernel = prepare_matrix_for_all_gather(
-                kernel,
-                self.parallel_config.mesh,
-                self.parallel_config.axis_name,
-            )
+    #     # Get partition specs
+    #     input_spec = get_sharding(inputs_2d)
+    #     kernel_spec = get_sharding(kernel)
+    #     output_spec = get_output_partition_spec(
+    #         inputs_2d,
+    #         kernel,
+    #         self.parallel_config.matmul_method,
+    #         self.parallel_config.axis_name,
+    #     )
 
-        output_2d = shard_map(
-            self.distributed_matmul,
-            mesh=self.parallel_config.mesh,
-            in_specs=(input_spec, kernel_spec),
-            out_specs=output_spec,
-            check_rep=False,
-        )(inputs_2d, kernel)
+    #     if self.parallel_config.matmul_method == MatrixMultiplyMethod.REDUCE_SCATTER:
+    #         kernel = prepare_matrix_for_reduce_scatter(
+    #             kernel,
+    #             self.parallel_config.mesh,
+    #             self.parallel_config.axis_name,
+    #         )
+    #     elif self.parallel_config.matmul_method == MatrixMultiplyMethod.ALL_GATHER:
+    #         kernel = prepare_matrix_for_all_gather(
+    #             kernel,
+    #             self.parallel_config.mesh,
+    #             self.parallel_config.axis_name,
+    #         )
 
-        output = output_2d.reshape((*orig_shape[:-1], self.out_features))
+    #     output_2d = shard_map(
+    #         self.distributed_matmul,
+    #         mesh=self.parallel_config.mesh,
+    #         in_specs=(input_spec, kernel_spec),
+    #         out_specs=output_spec,
+    #         check_rep=False,
+    #     )(inputs_2d, kernel)
 
-        output = self._scale_operator(output)
+    #     output = output_2d.reshape((*orig_shape[:-1], self.out_features))
 
-        if bias is not None:
-            output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
+    #     output = self._scale_operator(output)
 
-        return output
+    #     if bias is not None:
+    #         output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
+
+    #     return output
 
     def native_forward(
         self,
@@ -422,9 +417,9 @@ class ParallelLinear(nn.Module):
         inputs: Shaped[Array, "... in_features"],
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
-        if self.distributed_matmul is None:
-            return self.native_forward(inputs=inputs, w=w)
-        return self.collective_forward(inputs=inputs, w=w)
+        # if self.distributed_matmul is None:
+        return self.native_forward(inputs=inputs, w=w)
+        # return self.collective_forward(inputs=inputs, w=w)
 
 
 class RowParallelLinear(ParallelLinear):

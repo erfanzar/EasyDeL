@@ -36,7 +36,7 @@ Implementation details:
 
 Example:
     >>> from easydel.layers.attention_operator import OperationMetadata
-    >>> from easydel.layers.attention_operator.modules import SplashAttn
+    >>> from easydel.layers.attention_operator.modules import BlockSparseAttn
     >>>
     >>> # Configure for TPU execution
     >>> metadata = OperationMetadata(
@@ -45,7 +45,7 @@ Example:
     ...     blocksize_q=256,
     ...     blocksize_k=512
     ... )
-    >>> splash_attn = SplashAttn(metadata)
+    >>> splash_attn = BlockSparseAttn(metadata)
     >>>
     >>> # Use with sequences divisible by 128
     >>> output = splash_attn(query, key, value, causal=True)
@@ -63,11 +63,13 @@ from __future__ import annotations
 
 import typing as tp
 
+import jax
 from ejkernel.modules import blocksparse_attention
+from ejkernel.types import MaskInfo
 from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float
 
 from easydel.layers.caching.transformer import TransformerMetadata
 
@@ -80,7 +82,7 @@ if tp.TYPE_CHECKING:
 
 
 @OperationRegistry.register
-class SplashAttn(OperationImpl):
+class BlockSparseAttn(OperationImpl):
     """
     An attention implementation using the Pallas Splash Attention kernel for TPUs.
 
@@ -97,7 +99,7 @@ class SplashAttn(OperationImpl):
         - Non-TPU forward methods (`forward_native`, `forward_gpu`, etc.) are not
           implemented and will raise `NotImplementedError`.
 
-    Registered under the name "splash".
+    Registered under the name "blocksparse".
     """
 
     @classmethod
@@ -106,9 +108,9 @@ class SplashAttn(OperationImpl):
         Returns the registered name of this attention implementation.
 
         Returns:
-            The string "splash".
+            The string "blocksparse".
         """
-        return "splash"
+        return "blocksparse"
 
     def get_impl_metadata(self) -> OperationMetadata:
         """
@@ -124,14 +126,8 @@ class SplashAttn(OperationImpl):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
-        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-        | Bool[Array, "batch 1 seq_len kv_len"]
-        | Int[Array, "batch num_heads seq_len kv_len"]
-        | Int[Array, "batch 1 seq_len kv_len"]
-        | None = None,
+        mask_info: MaskInfo | None = None,
         logits_soft_cap: float | None = None,
         softmax_scale: float | None = None,
         sliding_window: int | tuple[int, int] | None = None,
@@ -162,12 +158,15 @@ class SplashAttn(OperationImpl):
             are not computed or returned by Splash Attention.
         """
         query_lenght = query.shape[1]
-        if not causal or ((query.shape[-1] % 128) != 0) or ((value.shape[-1] % 128) != 0) or query_lenght == 1:
+        if (
+            (not causal or ((query.shape[-1] % 128) != 0) or ((value.shape[-1] % 128) != 0) or query_lenght == 1)
+            and jax.default_backend() == "tpu"
+        ) or (((query.shape[-1] % 16 != 0 or value.shape[-1] % 16) != 0) and jax.default_backend() == "gpu"):
             return VanillaAttn(self.metadata)(
                 query=query,
                 key=key,
                 value=value,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 causal=causal,
                 cache_metadata=cache_metadata,
                 softmax_scale=softmax_scale,
@@ -184,19 +183,16 @@ class SplashAttn(OperationImpl):
             qkv_mni_sharding=True,
             softmax_aux=softmax_aux,
         )
-        mask = attention_mask
-
+        query = query.transpose(0, 2, 1, 3).astype(dtype)
+        key = key.transpose(0, 2, 1, 3).astype(dtype)
+        value = value.transpose(0, 2, 1, 3).astype(dtype)
         outputs = blocksparse_attention(
-            query.transpose(0, 2, 1, 3).astype(dtype),
-            key.transpose(0, 2, 1, 3).astype(dtype),
-            value.transpose(0, 2, 1, 3).astype(dtype),
-            q_segment_ids,
-            kv_segment_ids,
-            None,
-            None,
+            query,
+            key,
+            value,
             softmax_aux,
             None,
-            mask,
+            mask_info=mask_info,
             logits_soft_cap=logits_soft_cap,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
@@ -208,23 +204,8 @@ class SplashAttn(OperationImpl):
                 self.create_stable_sharding(shardings.query, dep=query, tensor=query, preserved_indices=[0, 1]),
                 self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 1]),
                 self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 1]),
-                self.create_stable_sharding(
-                    shardings.q_segment_ids,
-                    dep=q_segment_ids,
-                    tensor=q_segment_ids,
-                    preserved_indices=[0],
-                ),
-                self.create_stable_sharding(
-                    shardings.kv_segment_ids,
-                    dep=kv_segment_ids,
-                    tensor=kv_segment_ids,
-                    preserved_indices=[0],
-                ),
-                PartitionSpec(None),
-                PartitionSpec(None),
                 self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
                 PartitionSpec(None),
-                self.create_stable_sharding(shardings.mask, dep=mask, tensor=mask, preserved_indices=[0]),
             ),
         ).transpose(0, 2, 1, 3)
 
@@ -305,14 +286,8 @@ class SplashAttn(OperationImpl):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
-        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-        | Bool[Array, "batch 1 seq_len kv_len"]
-        | Int[Array, "batch num_heads seq_len kv_len"]
-        | Int[Array, "batch 1 seq_len kv_len"]
-        | None = None,
+        mask_info: MaskInfo | None = None,
         logits_soft_cap: float | None = None,
         softmax_scale: float | None = None,
         sliding_window: int | tuple[int, int] | None = None,
@@ -345,11 +320,9 @@ class SplashAttn(OperationImpl):
             query=query,
             key=key,
             value=value,
-            attention_mask=attention_mask,
             causal=causal,
             cache_metadata=cache_metadata,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
+            mask_info=mask_info,
             softmax_aux=softmax_aux,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -364,7 +337,7 @@ if __name__ == "__main__":
 
     test_cases = [
         # (batch_size, q_seq_len, k_seq_len, q_heads, k_heads)
-        (1, 2048, 2048, 32, 4),
+        (1, 2048, 2048, 8, 8),
         # (2, 2**13, 2**13, 32, 8),
         # (4, 2**14, 2**14, 16, 8),
         # (4, 2**13, 2**14, 16, 4),
@@ -375,7 +348,7 @@ if __name__ == "__main__":
         base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, 1, -1)),
     )
 
-    splash_attn = SplashAttn(metadata)
+    splash_attn = BlockSparseAttn(metadata)
     vanilla_attn = VanillaAttn(metadata)
 
     for idx, (b, qs, ks, qh, kh) in enumerate(test_cases):
@@ -388,23 +361,21 @@ if __name__ == "__main__":
         query = jr.normal(key_q, (b, qs, qh, d), dtype=jnp.bfloat16)
         key = jr.normal(key_k, (b, ks, kh, d), dtype=jnp.bfloat16)
         value = jr.normal(key_v, (b, ks, kh, vd), dtype=jnp.bfloat16)
-
-        attention_mask = SplashAttn._create_causal_mask(max(qs, ks))[-qs:, :ks]
-        attention_mask = jnp.broadcast_to(attention_mask, (b, 1, qs, ks))
+        mask_info = MaskInfo.from_random(b, qs, ks)
         splash_out = splash_attn(
             query=query,
             key=key,
             value=value,
-            attention_mask=None,
-            causal=True,
+            mask_info=mask_info,
+            causal=False,
             sliding_window=None,
         ).attention_outputs
         vanilla_out = vanilla_attn(
             query=query,
             key=key,
             value=value,
-            attention_mask=None,
-            causal=True,
+            mask_info=mask_info,
+            causal=False,
             sliding_window=None,
         ).attention_outputs
         is_close = jnp.allclose(splash_out, vanilla_out, atol=0.125)

@@ -420,7 +420,7 @@ class MambaBlock(nn.Module):
             hidden_states,
             cache,
             position_ids,
-            attention_mask,
+            mask_info,
         )
         hidden_states = residual + hidden_states
         return hidden_states, cache
@@ -497,6 +497,10 @@ class MambaModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

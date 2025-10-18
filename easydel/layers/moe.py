@@ -61,14 +61,13 @@ from functools import partial
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager, get_incontext_mesh
+from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
-
-from easydel.kernels.tpu_ops import pallas_grouped_matmul
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
@@ -1846,7 +1845,7 @@ class ParallelMoELinear(nn.Module):
             padding_amount = pad_length - input_shape[0] % pad_length
             inputs = jax.lax.pad(inputs, jnp.array(0.0, dtype=inputs.dtype), [(0, padding_amount, 0), (0, 0, 0)])
 
-        out = pallas_grouped_matmul(
+        out = grouped_matmul(
             inputs,
             weight,
             group_sizes,

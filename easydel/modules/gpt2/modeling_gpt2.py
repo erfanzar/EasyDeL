@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -238,11 +239,10 @@ class GPT2Attention(AttentionModule):
         self,
         hidden_states: chex.Array,
         key_value_states: chex.Array,
-        attention_mask: chex.Array,
+        mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: chex.Array | None = None,
         output_attentions: bool = False,
     ):
         """Forward pass of the GPT2Attention module.
@@ -284,7 +284,7 @@ class GPT2Attention(AttentionModule):
             (
                 key,
                 value,
-                attention_mask,
+                mask_info,
                 init_attention_bias,
                 cache_view,
                 cache_metadata,
@@ -294,8 +294,7 @@ class GPT2Attention(AttentionModule):
                 value=value,
                 cache_view=cache_view,
                 cache_metadata=cache_metadata,
-                attention_mask=attention_mask,
-                causal_mask=causal_mask,
+                mask_info=mask_info,
                 fcm_mask=None,
             )
 
@@ -307,9 +306,8 @@ class GPT2Attention(AttentionModule):
             init_bias=init_attention_bias,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             causal=self.causal,
-            segment_ids=None,
         )
         attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))
         attn_output = checkpoint_name(self.c_proj(attn_output), "attn_output")
@@ -492,12 +490,11 @@ class GPT2Block(nn.Module):
         self,
         hidden_states,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        attention_mask=None,
-        causal_mask=None,
+        mask_info: MaskInfo | None = None,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         encoder_hidden_states: chex.Array | None = None,
-        encoder_attention_mask: chex.Array | None = None,
+        encoder_mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
         """Forward pass of the GPT2Block module.
@@ -526,11 +523,10 @@ class GPT2Block(nn.Module):
         attn_outputs = self.attn(
             hidden_states,
             None,
-            attention_mask,
+            mask_info,
             mode,
             cache_view,
             cache_metadata,
-            causal_mask,
             output_attentions,
         )
 
@@ -548,11 +544,10 @@ class GPT2Block(nn.Module):
             cross_attn_outputs = self.crossattention(
                 hidden_states,
                 encoder_hidden_states,
-                encoder_attention_mask,
+                encoder_mask_info,
                 mode,
                 None,
                 None,
-                causal_mask,
                 output_attentions,
             )
             cross_attention = cross_attn_outputs.attention_weight
@@ -707,6 +702,16 @@ class GPT2Model(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+        encoder_mask_info = None
+        if encoder_attention_mask is not None:
+            if encoder_attention_mask.ndim == 2:
+                encoder_mask_info = MaskInfo.from_segments(encoder_attention_mask)
+            else:
+                encoder_mask_info = MaskInfo.from_attention_mask(encoder_attention_mask)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -736,11 +741,10 @@ class GPT2Model(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=self.causal_mask,
+                mask_info=mask_info,
                 mode=mode,
                 encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
+                encoder_mask_info=encoder_mask_info,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,

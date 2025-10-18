@@ -1,5 +1,7 @@
 import logging
+import os
 
+os.environ["EJKERNEL_LOG_AUTOTUNE"] = "1"
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
 
@@ -35,8 +37,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
         intermediate_size=128,
         max_position_embeddings=sequence_length,
         attn_dtype=jnp.float16,
-        attn_softmax_dtype=jnp.float16,
-        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+        attn_mechanism=ed.AttentionMechanisms.BLOCKSPARSE,
         num_experts=2,
         num_experts_per_tok=1,
         vhead_dim=128,
@@ -71,10 +72,7 @@ def create_dummy_dataset(
     if not use_iterable_dataset:
         dataset = Dataset.from_generator(data_generator, gen_kwargs={"num_rows": num_rows})
     else:
-        dataset = IterableDataset.from_generator(
-            data_generator,
-            gen_kwargs={"num_rows": num_rows},
-        )
+        dataset = IterableDataset.from_generator(data_generator, gen_kwargs={"num_rows": num_rows})
 
     return dataset
 

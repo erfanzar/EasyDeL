@@ -198,9 +198,7 @@ class RobertaSelfAttention(AttentionModule):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         key_value_states: chex.Array | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         is_cross_attention = key_value_states is not None
@@ -219,16 +217,16 @@ class RobertaSelfAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
         ) = self.concatenate(
             query=query_states,
             key=key_states,
+            value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            value=value_states,
             attention_mask=attention_mask,
             causal_mask=causal_mask if self.causal else None,
             fcm_mask=None,
@@ -244,7 +242,6 @@ class RobertaSelfAttention(AttentionModule):
                 causal=True,
                 init_bias=init_attention_bias,
                 attention_mask=attention_mask,
-                segment_ids=segment_ids,
             )
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs
@@ -353,7 +350,6 @@ class RobertaAttention(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         key_value_states=None,
         output_attentions: bool = False,
     ):
@@ -507,7 +503,6 @@ class RobertaLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         output_attentions: bool = False,
     ):
         # Self Attention
@@ -584,7 +579,6 @@ class RobertaEncoder(nn.Module):
         hidden_states,
         attention_mask,
         head_mask,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         past_key_values: TransformerCacheView | None = None,
@@ -876,7 +870,6 @@ class RobertaModel(EasyDeLBaseModule):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             head_mask=head_mask,
-            causal_mask=self.causal_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             past_key_values=past_key_values,

@@ -61,15 +61,15 @@ References:
 
 import jax
 from ejkernel.modules import ring_attention
+from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Float, PRNGKeyArray
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
-from .vanilla_attention import VanillaAttn
 
 
 @OperationRegistry.register
@@ -118,9 +118,7 @@ class RingAttn(OperationImpl):
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-        attention_mask: Int[Array, "batch 1 seq_len kv_len"] | None = None,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        mask_info: MaskInfo | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
         softmax_scale: float | None = None,
         deterministic: bool = True,
@@ -166,23 +164,14 @@ class RingAttn(OperationImpl):
             softmax_aux=softmax_aux,
         )
 
-        if attention_mask is not None and attention_mask.shape[0] != query.shape[0]:
-            num_reps_mask = query.shape[0] // attention_mask.shape[0]
-            attention_mask = jnp.repeat(attention_mask, num_reps_mask, 0)
-
-        if attention_mask is not None and (kv_segment_ids is None or q_segment_ids is None):
-            q_segment_ids, kv_segment_ids = self._split_attention_mask(attention_mask)
-            q_segment_ids, kv_segment_ids = q_segment_ids.astype("i4"), kv_segment_ids.astype("i4")
-
         outputs = ring_attention(
             query.astype(dtype),
             key.astype(dtype),
             value.astype(dtype),
             bias,
-            q_segment_ids,
-            kv_segment_ids,
             softmax_aux,
             None,
+            mask_info=mask_info,
             sliding_window=sliding_window,
             softmax_scale=softmax_scale,
             axis_name=self.metadata.sequence_axis_name,
@@ -198,9 +187,7 @@ class RingAttn(OperationImpl):
                 self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 1, 2]),
                 self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 1, 2]),
                 self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias),
-                self.create_stable_sharding(shardings.q_segment_ids, dep=q_segment_ids, tensor=q_segment_ids),
-                self.create_stable_sharding(shardings.kv_segment_ids, dep=kv_segment_ids, tensor=kv_segment_ids),
-                self.create_stable_sharding(shardings.softmax_aux, dep=kv_segment_ids, tensor=kv_segment_ids),
+                self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
                 PartitionSpec(None),
             ),
             out_specs=self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 1, 2]),
@@ -271,9 +258,7 @@ class RingAttn(OperationImpl):
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-        attention_mask: Int[Array, "batch 1 seq_len kv_len"] | None = None,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        mask_info: MaskInfo | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
         softmax_scale: float | None = None,
         deterministic: bool = True,
@@ -313,8 +298,6 @@ class RingAttn(OperationImpl):
             key=key,
             value=value,
             bias=bias,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
@@ -326,7 +309,7 @@ class RingAttn(OperationImpl):
             pdrop=pdrop,
             policy=policy,
             dropout_rng=dropout_rng,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
         )
 
 
@@ -337,8 +320,7 @@ if __name__ == "__main__":
     q = jr.normal(jr.key(0), (b, qs, qh, d), "f2")
     k = jr.normal(jr.key(1), (b, ks, kh, d), "f2")
     v = jr.normal(jr.key(2), (b, ks, kh, vd), "f2")
-    cu_mask = VanillaAttn._create_causal_mask(qs)[None, None, :, :].repeat(b, 0)
-    # cu_mask = None
+    mask_info = MaskInfo.from_random(b, qs, ks)
     ring = RingAttn(
         OperationMetadata(
             runtime_dtype=jnp.bfloat16,
@@ -347,8 +329,8 @@ if __name__ == "__main__":
     )
     from ejkernel.modules import attention
 
-    out = attention(query=q, key=k, value=v, attention_mask=cu_mask)[0]
-    vout = ring(query=q, key=k, value=v, attention_mask=cu_mask).attention_outputs
+    out = attention(q, k, v, mask_info=mask_info)[0]
+    vout = ring(query=q, key=k, value=v, mask_info=mask_info).attention_outputs
 
     print(out[-1, -1, -1, -5:], out[-1, 0, -1, -5:])
     print(vout[-1, -1, -1, -5:], vout[-1, 0, -1, -5:])

@@ -58,7 +58,7 @@ class EasyModelsTest(unittest.TestCase):
         self.dtype: jax.numpy.dtype = jnp.float32
         self.precision = jax.lax.Precision("highest")
 
-        self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "vanilla"
+        self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "flash_attn2"
 
         self.blocksize_k: int = 128
         self.blocksize_q: int = 128
@@ -77,8 +77,8 @@ class EasyModelsTest(unittest.TestCase):
         self.header_config = None
         self.pad_token_id = None
         self.rope_scaling = None
-        self.attn_dtype = jnp.float32
-        self.attn_softmax_dtype = jnp.float32
+        self.attn_dtype = jnp.bfloat16
+        self.attn_softmax_dtype = jnp.bfloat16
         self.platform = None
 
     @torch.no_grad()
@@ -985,38 +985,38 @@ if __name__ == "__main__":
     test = EasyModelsTest()
     test.setUp()
 
-    test.test_arctic()  # Passed - Passes MoE CONOV
-    test.test_cohere()  # Passed
-    test.test_cohere2()  # Passed
-    test.test_dbrx()  # Passed
-    test.test_deepseek_v2()  # Passed - Passes MoE CONOV
-    test.test_deepseek_v3()  # Passed - Passes MoE CONOV
-    test.test_exaone()  # Passed
-    test.test_falcon()  # Passed
-    test.test_gemma()  # Passed
-    test.test_gemma2()  # Passed
-    test.test_gemma3_text()  # Passed
+    # test.test_arctic()  # Passed - Passes MoE CONOV
+    # test.test_cohere()  # Passed
+    # test.test_cohere2()  # Passed
+    # test.test_dbrx()  # Passed
+    # test.test_deepseek_v2()  # Passed - Passes MoE CONOV
+    # test.test_deepseek_v3()  # Passed - Passes MoE CONOV
+    # test.test_exaone()  # Passed
+    # test.test_falcon()  # Passed
+    # test.test_gemma()  # Passed
+    # test.test_gemma2()  # Passed
+    # test.test_gemma3_text()  # Passed
     # test.test_gemma3()  # Passed
-    test.test_glm()  # Passed
-    test.test_glm4()  # Passed
-    test.test_glm4_moe()  # Passed - Passes MoE CONOV
-    test.test_gptj()  # Passed
-    test.test_gpt_noex()  # Passed
-    test.test_gpt_oss()  # Passed
-    test.test_gpt2()  # Passed
-    test.test_internlm2()  # Passed
-    test.test_llama()  # Passed
-    test.test_llama4()  # Passed
+    # test.test_glm()  # Passed
+    # test.test_glm4()  # Passed
+    # test.test_glm4_moe()  # Passed - Passes MoE CONOV
+    # test.test_gptj()  # Passed
+    # test.test_gpt_noex()  # Passed
+    # test.test_gpt_oss()  # Passed
+    # test.test_gpt2()  # Passed
+    # test.test_internlm2()  # Passed
+    # test.test_llama()  # Passed
+    # test.test_llama4()  # Passed
     # test.test_llama4_cond()  # Passed
-    test.test_mamba()  # Passed
-    test.test_mamba2()  # Passed - ReCheck
-    test.test_mistral()  # Passed
-    test.test_mixtral()  # Passed - Passes MoE CONOV
-    test.test_mpt()  # Passed
-    test.test_olmo()  # Passed
-    test.test_olmo2()  # Passed
-    test.test_phi()  # Passed
-    test.test_phi3()  # Passed
+    # test.test_mamba()  # Passed
+    # test.test_mamba2()  # Passed - ReCheck
+    # test.test_mistral()  # Passed
+    # test.test_mixtral()  # Passed - Passes MoE CONOV
+    # test.test_mpt()  # Passed
+    # test.test_olmo()  # Passed
+    # test.test_olmo2()  # Passed
+    # test.test_phi()  # Passed
+    # test.test_phi3()  # Passed
     # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
     test.test_qwen2()  # Passed
     test.test_qwen2_moe()  # Passed - Passes MoE CONOV

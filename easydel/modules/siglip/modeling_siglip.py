@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import image as jimg
 from jax.ad_checkpoint import checkpoint_name
@@ -284,7 +285,7 @@ class SiglipAttention(AttentionModule):
             if attention_mask.ndim == 2:
                 attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
             attention_mask = nn.combine_masks(
-                attention_mask,
+                mask_info,
                 causal_attention_mask,
                 dtype="i4",
             )
@@ -310,7 +311,6 @@ class SiglipAttention(AttentionModule):
             bias=None,
             init_bias=lambda: attention_bias,
             attention_mask=attention_mask,
-            segment_ids=None,
             causal=self.causal,
         )
 
@@ -550,7 +550,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         output_hidden_states: bool = False,

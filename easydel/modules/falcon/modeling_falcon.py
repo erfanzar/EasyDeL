@@ -20,6 +20,7 @@ import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -227,13 +228,11 @@ class FalconAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        attention_mask: chex.Array,
+        mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: chex.Array | bool | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         alibi: chex.Array | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -276,7 +275,7 @@ class FalconAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -286,8 +285,7 @@ class FalconAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             fcm_mask=None,
         )
 
@@ -297,12 +295,11 @@ class FalconAttention(AttentionModule):
                 key_states=key_states,
                 value_states=value_states,
                 mode=mode,
-                bias=init_attention_bias(),
+                bias=None,
                 cache_metadata=cache_metadata,
                 cache_view=cache_view,
                 init_bias=init_attention_bias,
-                attention_mask=None,
-                segment_ids=segment_ids,
+                mask_info=mask_info,
                 causal=True,
             )
             attention_outputs = attention.attention_outputs
@@ -315,12 +312,7 @@ class FalconAttention(AttentionModule):
             )
 
         else:
-            attention_scores = jnp.einsum(
-                "...qhd,...khd->...hqk",
-                query_states,
-                key_states,
-                precision=self.precision,
-            )
+            attention_scores = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=self.precision)
             attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
             attention_scores = attention_scores + alibi.reshape(batch_size, self.num_heads, 1, -1)
             attention_scores *= self.inv_norm_factor
@@ -329,7 +321,6 @@ class FalconAttention(AttentionModule):
                 axis=-1,
             )
             attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
-            # matmul: [batch_size * num_heads, q_length, head_dim]
             attn_output = jax.lax.batch_matmul(attention_scores, value_states.transpose(0, 2, 1, 3))
             attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0], *attn_output.shape[2:]))
             attn_output = self.shard_attention_prod(self._merge_heads(attn_output))
@@ -475,13 +466,11 @@ class FalconBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        attention_mask: chex.Array,
+        mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: chex.Array | bool | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         alibi: chex.Array | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -494,7 +483,6 @@ class FalconBlock(nn.Module):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
             alibi (tp.Optional[chex.Array], optional): Alibi tensor for adding positional bias.
             init_cache (bool, optional): If True, initializes cache for caching keys and values.
             output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
@@ -514,13 +502,11 @@ class FalconBlock(nn.Module):
 
         attn_outputs = self.self_attention(
             attention_layernorm_out,
-            attention_mask,
+            mask_info,
             position_ids,
             mode,
             cache_view,
             cache_metadata,
-            causal_mask,
-            segment_ids,
             alibi,
             output_attentions,
             frequencies,
@@ -602,7 +588,6 @@ class FalconModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -617,7 +602,6 @@ class FalconModel(EasyDeLBaseModule):
             input_ids (chex.Array): Input tensor containing token IDs.
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
             inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
@@ -643,7 +627,7 @@ class FalconModel(EasyDeLBaseModule):
         alibi = None
         if self.config.alibi:
             alibi = built_bloom_alibi(
-                attention_mask,
+                mask_info,
                 self.config.num_attention_heads,
             ).astype(inputs_embeds.dtype)
         elif position_ids is None:
@@ -652,7 +636,9 @@ class FalconModel(EasyDeLBaseModule):
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
         if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (-3, -2))
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -666,14 +652,12 @@ class FalconModel(EasyDeLBaseModule):
             layer_outputs = layer(
                 hidden_states=hidden_states,
                 alibi=alibi,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
-                causal_mask=self.causal_mask,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -789,7 +773,6 @@ class FalconForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -804,7 +787,6 @@ class FalconForCausalLM(EasyDeLBaseModule):
             input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
             attention_mask (tp.Optional[chex.Array]): Mask for attention.
             position_ids (tp.Optional[chex.Array]): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
             inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
@@ -824,7 +806,6 @@ class FalconForCausalLM(EasyDeLBaseModule):
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
-            segment_ids=segment_ids,
         )
         logits = None
         if apply_lm_head:

@@ -79,14 +79,14 @@ from eformer import common_types
 from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray, register
 from eformer.pytree import auto_pytree, field
-from flax import nnx as nn
+from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
 from jax.extend.core import Primitive
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array as JAXArray
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Float, Int
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
@@ -429,14 +429,12 @@ class TransformerCacheView(BaseCacheView):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         quantizer: EasyQuantizer,
         cache_metadata: TransformerMetadata | None,
-        attention_mask: Bool[JAXArray, "batch 1 query_len seq_len"] | Float[JAXArray, "batch 1 query_len seq_len"],
+        mask_info: MaskInfo,
         partition_manager: PartitionManager,
-        causal_mask: Bool[JAXArray, "batch 1 query_len seq_len"] | None = None,
-        token_type_ids: Int[JAXArray, "batch query_len"] | None = None,
     ) -> tuple[
         Float[JAXArray, "batch seq_len num_key_heads key_dim"],
         Float[JAXArray, "batch seq_len num_value_heads value_dim"],
-        Bool[JAXArray, "batch 1 query_len seq_len"],
+        MaskInfo,
         TransformerCacheView,
         AttnMaskDetail | None,
     ]:
@@ -465,48 +463,12 @@ class TransformerCacheView(BaseCacheView):
         num_updated_cache_vectors = query.shape[1]
         masking_details = self.masking_details
         indexs = self.indexs
-        batch_dims = self.value.shape[0]
         sharding_statics = dict(mode=MODE_PREFILL, partition_manager=partition_manager)
 
         def _kv_struct_shard(
             x: Float[JAXArray, "batch seq_len num_heads head_dim"],
         ) -> Float[JAXArray, "batch seq_len num_heads head_dim"]:
             return apply_logical_sharding(x, axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM], **sharding_statics)
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-        if causal_mask is not None:
-            if hasattr(causal_mask, "value"):
-                causal_mask = causal_mask.value
-            if causal_mask.shape[0] != query.shape[0]:
-                causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
-
-            @partial(jax.vmap, in_axes=(0, 0), out_axes=0)
-            def _mask_slice(
-                mask: Bool[JAXArray, "1 seq_len seq_len"], slot: Int[JAXArray, ""]
-            ) -> Bool[JAXArray, "1 query_len seq_len"]:
-                return lax.dynamic_slice(
-                    mask,
-                    (0, slot, 0),
-                    (1, num_updated_cache_vectors, self.maximum_sequence_length),
-                )
-
-            causal_mask = _mask_slice(causal_mask, self.indexs)
-            if token_type_ids is not None and num_updated_cache_vectors != 1:
-                token_type_mask = jnp.equal(jnp.expand_dims(token_type_ids, 2), jnp.expand_dims(token_type_ids, 1))
-                token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
-                token_type_mask = jnp.expand_dims(token_type_mask, 1)
-                sequence_length = token_type_ids.shape[1]
-                masked_portion = jnp.logical_or(
-                    token_type_mask[:, :, :num_updated_cache_vectors, :],
-                    causal_mask[:, :, :, :sequence_length],
-                )
-                causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-
-            attention_mask = nn.combine_masks(attention_mask, causal_mask)
-        else:
-            attention_mask = attention_mask
 
         def _maybe_materialize(x: JAXArray | ImplicitArray) -> JAXArray:
             if hasattr(x, "materialize"):
@@ -551,9 +513,11 @@ class TransformerCacheView(BaseCacheView):
             key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
 
         indexs = indexs + num_updated_cache_vectors
-        pad_mask = jnp.broadcast_to(
-            (jnp.arange(self.maximum_sequence_length)[None, :] < indexs[:, None])[:, None, None, :],
-            (batch_dims, 1, num_updated_cache_vectors, self.maximum_sequence_length),
+        mask_info = mask_info.apply_kv_lengths(
+            kv_lengths=indexs,
+            q_len=num_updated_cache_vectors,
+            end_index=indexs,
+            update_segment_ids=True,
         )
 
         value_cache_updated = _kv_struct_shard(value_cache_updated).astype(runtime_dtype)
@@ -563,7 +527,7 @@ class TransformerCacheView(BaseCacheView):
         return (
             key_cache_updated,
             value_cache_updated,
-            _kv_struct_shard(jnp.logical_and(pad_mask, attention_mask)),
+            mask_info,
             self.replace(key=quantizer(key_cache_updated), value=quantizer(value_cache_updated), indexs=indexs_updated),
             masking_details,
         )

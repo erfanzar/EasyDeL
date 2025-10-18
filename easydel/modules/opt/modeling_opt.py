@@ -37,6 +37,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -179,7 +180,6 @@ class OPTAttention(AttentionModule):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         key_value_states: chex.Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ) -> tuple[chex.Array]:
@@ -231,7 +231,7 @@ class OPTAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -241,8 +241,7 @@ class OPTAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
         )
 
         attentions = self.attention_module(
@@ -362,7 +361,6 @@ class OPTDecoderLayer(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ) -> tuple[chex.Array]:
         """Forward pass of the OPTDecoderLayer.
@@ -655,6 +653,10 @@ class OPTDecoder(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+        if attention_mask.ndim == 2:
+            mask_info = MaskInfo.from_segments(attention_mask)
+        else:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
 
         if position_ids is None:
             position_ids = jnp.broadcast_to(

@@ -52,11 +52,12 @@ Example:
 import jax
 from eformer.escale import with_sharding_constraint
 from ejkernel.modules import flash_attention
+from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -97,7 +98,7 @@ class FlashAttn(OperationImpl):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -110,8 +111,6 @@ class FlashAttn(OperationImpl):
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -153,18 +152,15 @@ class FlashAttn(OperationImpl):
         dtype = self.metadata.runtime_dtype
         model_mode = self.get_mode(query=query, BTHD=True)
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
-        mask = attention_mask
         attn = flash_attention(
             query.astype(dtype),
             key.astype(dtype),
             value.astype(dtype),
-            attention_mask,
             bias.astype(dtype) if bias is not None else bias,
-            q_segment_ids,
-            kv_segment_ids,
             cum_seqlens_q,
             cum_seqlens_k,
             softmax_aux,
+            mask_info=mask_info,
             dropout_prob=dropout_prob,
             causal=causal,
             dropout_seed=dropout_seed,
@@ -178,20 +174,7 @@ class FlashAttn(OperationImpl):
                 self.create_stable_sharding(shardings.query, tensor=query, preserved_indices=[0, 2]),
                 self.create_stable_sharding(shardings.key, tensor=key, preserved_indices=[0, 2]),
                 self.create_stable_sharding(shardings.value, tensor=value, preserved_indices=[0, 2]),
-                self.create_stable_sharding(shardings.mask, dep=mask, tensor=mask, preserved_indices=[0, 1]),
                 self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias, preserved_indices=[0, 1]),
-                self.create_stable_sharding(
-                    shardings.q_segment_ids,
-                    dep=q_segment_ids,
-                    tensor=q_segment_ids,
-                    preserved_indices=[0],
-                ),
-                self.create_stable_sharding(
-                    shardings.kv_segment_ids,
-                    dep=kv_segment_ids,
-                    tensor=kv_segment_ids,
-                    preserved_indices=[0],
-                ),
                 self.create_stable_sharding(PartitionSpec(None), dep=cum_seqlens_q, tensor=cum_seqlens_q),
                 self.create_stable_sharding(PartitionSpec(None), dep=cum_seqlens_k, tensor=cum_seqlens_k),
                 self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
@@ -275,7 +258,7 @@ class FlashAttn(OperationImpl):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+        mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -288,8 +271,6 @@ class FlashAttn(OperationImpl):
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         **ignore,
     ) -> AttentionOutput:
         """
@@ -330,7 +311,7 @@ class FlashAttn(OperationImpl):
             softmax_aux=softmax_aux,
             cum_seqlens_k=cum_seqlens_k,
             cum_seqlens_q=cum_seqlens_q,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             softmax_scale=softmax_scale,
             dropout_prob=dropout_prob,
             causal=causal,
@@ -339,8 +320,6 @@ class FlashAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             normalize_output=normalize_output,
             precision=precision,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
         )
 
 

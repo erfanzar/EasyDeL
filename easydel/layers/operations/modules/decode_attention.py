@@ -57,14 +57,12 @@ Example:
     >>> output = decode_attn(query, cached_keys, cached_values, cache_metadata)
 """
 
-from functools import partial
-
 import jax
 from eformer import common_types
 from ejkernel.modules import ragged_decode_attention
 from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as Ps
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float
 
 from easydel.layers.caching.transformer import TransformerMetadata
 
@@ -161,44 +159,32 @@ class AutoRegressiveDecodeAttn(OperationImpl):
 
         starts = cache_metadata.starts.reshape(-1, 1)
         indexs = cache_metadata.indexs.reshape(-1, 1)
-
-        @partial(
-            shard_map,
+        query = query[:, -1, :, :]
+        starts = starts.reshape(-1)
+        indexs = indexs.reshape(-1)
+        attn_output = ragged_decode_attention(
+            query,
+            key,
+            value,
+            starts,
+            indexs,
+            softmax_aux,
+            softmax_scale=softmax_scale,
+            sliding_window=sliding_window,
+            logits_soft_cap=logits_soft_cap,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(shardings.query, dep=query, tensor=query, preserved_indices=[0, 2]),
+                self.create_stable_sharding(shardings.query3d, dep=query, tensor=query, preserved_indices=[0, 1]),
                 self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 2]),
                 self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 2]),
                 self.create_stable_sharding(views_sharding, dep=starts, tensor=starts, preserved_indices=[0]),
                 self.create_stable_sharding(views_sharding, dep=indexs, tensor=indexs, preserved_indices=[0]),
                 self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
             ),
-            out_specs=self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 2]),
-            check_rep=False,
+            out_specs=self.create_stable_sharding(shardings.query3d, tensor=query, preserved_indices=[0, 1]),
         )
-        def _compute(
-            query: Float[Array, "batch 1 num_q_heads head_dim"],
-            key: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
-            value: Float[Array, "batch kv_seq_len num_kv_heads head_dim"],
-            start: Int[Array, "batch 1"],
-            index: Int[Array, "batch 1"],
-            softmax_aux,
-        ) -> Float[Array, "batch 1 num_q_heads head_dim"]:
-            return ragged_decode_attention(
-                query=query,
-                key=key,
-                value=value,
-                sequence_start=start.reshape(-1),
-                sequence_end=index.reshape(-1),
-                softmax_scale=softmax_scale,
-                softmax_aux=softmax_aux,
-                sliding_window=sliding_window,
-                logits_soft_cap=logits_soft_cap,
-            )
 
-        attn_output = _compute(query, key, value, starts, indexs, softmax_aux)
-
-        return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
+        return AttentionOutput(attention_weights=None, attention_outputs=jax.numpy.expand_dims(attn_output, 1))
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """
