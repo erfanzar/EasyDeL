@@ -14,8 +14,7 @@
 
 
 import functools
-import math
-import typing as tp
+from typing import ClassVar
 
 import chex
 import jax
@@ -30,9 +29,17 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, ModuleCaches, auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    DecoderLayerOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -41,7 +48,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
@@ -50,121 +57,9 @@ from easydel.layers.moe import (
     RowParallelMoELinear,
 )
 from easydel.layers.norms import RMSNorm
+from easydel.layers.rotary_embedding import yarn_get_mscale
 
 from .deepseek_configuration import DeepseekV2Config
-
-
-def yarn_find_correction_dim(
-    num_rotations,
-    dim,
-    base=10000,
-    max_position_embeddings=2048,
-):
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
-
-
-def yarn_find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
-    low = math.floor(yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
-
-
-def yarn_get_mscale(scale=1.0, mscale=1.0):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def yarn_linear_ramp_mask(_min, _max, dim):
-    if _min == _max:
-        _max += 0.001  # Prevent singularity
-
-    linear_func = (jnp.arange(dim, dtype=jnp.float32) - _min) / (_max - _min)
-    return jnp.clip(linear_func, 0, 1)
-
-
-def init_deepseek_rotary_embedding(
-    dim,
-    max_position_embeddings=2048,
-    base=10000,
-    method: tp.Literal["linear", "yarn", "dynamic", None] = None,
-    kwargs: dict | None = None,
-):
-    if method is None:
-        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
-        t = jnp.arange(max_position_embeddings, dtype=inv_freq.dtype)
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        return jnp.sin(emb), jnp.cos(emb)
-    elif method == "linear":
-        assert kwargs is not None
-        inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
-        t = jnp.arange(max_position_embeddings, dtype=inv_freq.dtype) / kwargs.get("scaling_factor")
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        return jnp.sin(emb), jnp.cos(emb)
-    elif method == "dynamic":
-        assert kwargs is not None
-        targeted_len = kwargs.get("targeted_len", max_position_embeddings)
-        if targeted_len > max_position_embeddings:
-            base = base * (
-                (kwargs.get("scaling_factor") * targeted_len / max_position_embeddings)
-                - (kwargs.get("scaling_factor") - 1)
-            ) ** (dim / (dim - 2))
-            inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
-
-        else:
-            inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
-        t = jnp.arange(max_position_embeddings, dtype=inv_freq.dtype) / kwargs.get("scaling_factor")
-
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        return jnp.sin(emb), jnp.cos(emb)
-    elif method == "yarn":
-        scaling_factor = kwargs.get("scaling_factor", 1.0)
-        original_max_position_embeddings = kwargs.get("original_max_position_embeddings", 4096)
-        beta_fast = kwargs.get("beta_fast", 32)
-        beta_slow = kwargs.get("beta_slow", 1)
-        mscale = kwargs.get("mscale", 1)
-        mscale_all_dim = kwargs.get("mscale_all_dim", 0)
-        freq_extra = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-        freq_inter = 1.0 / (scaling_factor * base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-
-        low, high = yarn_find_correction_range(
-            beta_fast,
-            beta_slow,
-            dim,
-            base,
-            original_max_position_embeddings,
-        )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).astype("float32")
-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        t = jnp.arange(max_position_embeddings, dtype=jnp.float32)
-
-        freqs = jnp.outer(t, inv_freq)
-
-        _mscale = float(yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim))
-
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        return (jnp.sin(emb) * _mscale).astype("float32"), (jnp.cos(emb) * _mscale).astype("float32")
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return jnp.concatenate((-x2, x1), axis=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    cos = jnp.expand_dims(cos[position_ids], unsqueeze_dim)
-    sin = jnp.expand_dims(sin[position_ids], unsqueeze_dim)
-    b, h, s, d = q.shape
-    q = q.reshape(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
-    b, h, s, d = k.shape
-    k = k.reshape(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 class DeepseekV2MLPMoE(nn.Module):
@@ -271,7 +166,9 @@ class DeepseekV2MLP(nn.Module):
         self.down_proj = linear(imz, hs, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -436,7 +333,23 @@ class DeepseekV2MoE(BaseMoeModule):
         return y, router_logits
 
 
-class DeepseekV2Attention(AttentionModule):
+class DeepseekV2Attention(UnifiedAttention):
+    """DeepSeek V2 Multi-head Latent Attention.
+
+    Inherits MLA implementation from UnifiedAttention base class.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+        "output_projection": "o_proj",
+    }
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -446,217 +359,176 @@ class DeepseekV2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
         self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.q_lora_rank = config.q_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.kv_lora_rank = config.kv_lora_rank
-        self.v_head_dim = config.v_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
 
-        self.is_causal = True
-
-        linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="mla",
+            causal=True,
+            use_mla_lora=config.q_lora_rank is not None,
         )
-        if self.config.q_lora_rank is None:
-            self.q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads * self.q_head_dim,
-                use_bias=False,
-                rngs=rngs,
+
+        self.head_dim = self.v_head_dim
+
+    def define_network(
+        self,
+        config: DeepseekV2Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: nn.Rngs,
+    ):
+        """Define MLA-specific network structure."""
+
+        # Query projection with optional LoRA
+        if not self.use_mla_lora:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
             )
         else:
-            self.q_a_proj = linear(
-                self.hidden_size,
-                config.q_lora_rank,
-                use_bias=config.attention_bias,
-                rngs=rngs,
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.q_lora_rank,
+                    rngs=rngs,
+                    use_bias=config.attention_bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
             )
-            self.q_a_layernorm = RMSNorm(
-                config.q_lora_rank,
-                eps=1e-6,
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_layernorm"],
+                RMSNorm(
+                    config.q_lora_rank,
+                    eps=config.rms_norm_eps,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_b_proj"],
+                ColumnParallelLinear(
+                    config.q_lora_rank,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
+            )
+
+        # KV compression projection
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_proj_with_mqa"],
+            ColumnParallelLinear(
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                rngs=rngs,
+                use_bias=config.attention_bias,
                 dtype=dtype,
                 param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_layernorm"],
+            RMSNorm(
+                config.kv_lora_rank,
+                eps=config.rms_norm_eps,
                 rngs=rngs,
-            )
-            self.q_b_proj = linear(
-                config.q_lora_rank,
-                self.num_heads * self.q_head_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_b_proj"],
+            ColumnParallelLinear(
+                config.kv_lora_rank,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+                rngs=rngs,
                 use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
+        )
+
+        # Output projection
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            RowParallelLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
                 rngs=rngs,
-            )
-
-        self.kv_a_proj_with_mqa = linear(
-            self.hidden_size,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-            use_bias=config.attention_bias,
-            rngs=rngs,
-        )
-        self.kv_a_layernorm = RMSNorm(
-            config.kv_lora_rank,
-            dtype=dtype,
-            eps=1e-6,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.kv_b_proj = linear(
-            config.kv_lora_rank,
-            self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            use_bias=False,
-            rngs=rngs,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
         )
 
-        self.o_proj = linear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            use_bias=config.attention_bias,
-            rngs=rngs,
-        )
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
+    def _create_attention_performer(self, config, rngs):
+        """Create attention performer module.
+
+        Override for custom attention dropout or softmax scale.
+        """
         softmax_scale = self.q_head_dim**-0.5
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
             scaling_factor = self.config.rope_scaling["factor"]
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                softmax_scale = self.softmax_scale * mscale * mscale
-        self.attention_performer = FlexibleAttentionModule(
+                softmax_scale = softmax_scale * mscale * mscale
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=softmax_scale,
-            dropout_prob=config.attention_dropout,
-        )
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        frequencies: tuple[chex.Array, chex.Array],
-        mask_info: MaskInfo,
-        position_ids: chex.Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-    ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            frequencies (tp.Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
-        bsz, q_len, _ = hidden_states.shape
-
-        if self.config.q_lora_rank is None:
-            q = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
-        else:
-            q = checkpoint_name(
-                self.q_b_proj(self.q_a_layernorm(checkpoint_name(self.q_a_proj(hidden_states), name="attn_query_a"))),
-                name="attn_query",
-            )
-        q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        # Split into nope and pe parts
-        q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
-        # Key and Value projections with MQA (Multi-Query Attention) considerations
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pe = compressed_kv[..., self.kv_lora_rank :]
-        compressed_kv = compressed_kv[..., : self.kv_lora_rank]
-
-        k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = (
-            self.kv_b_proj(
-                self.kv_a_layernorm(compressed_kv),
-            )
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
-
-        sin, cos = frequencies
-
-        q_pe, k_pe = apply_rotary_pos_emb(
-            q=q_pe,
-            k=k_pe,
-            cos=cos,
-            sin=sin,
-            position_ids=position_ids,
-        )
-
-        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
-
-        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
-
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), name="attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+            dropout_prob=getattr(config, "attention_dropout", 0.0),
         )
 
 
@@ -738,14 +610,14 @@ class DeepseekV2DecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        frequencies: tuple[chex.Array, chex.Array],
         mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-    ):
+        frequencies: tuple[chex.Array, chex.Array] | None = None,
+    ) -> DecoderLayerOutput:
         """
         Forward pass of the module block.
 
@@ -774,14 +646,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         attn_outputs = self.self_attn(
             hidden_states,
-            frequencies,
             mask_info,
             position_ids,
             mode,
             cache_view,
             cache_metadata,
             output_attentions,
-            fcm_mask,
+            frequencies,
         )
         hidden_states = attn_outputs.attention_output
         hidden_states = residual + hidden_states
@@ -791,8 +662,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         feed_forward_hidden_states = self.mlp(hidden_states)
+        router_logits = None
         if isinstance(feed_forward_hidden_states, tuple):
-            feed_forward_hidden_states, _router_logits = feed_forward_hidden_states
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
         hidden_states = residual + feed_forward_hidden_states
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -804,6 +676,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
+            router_logits=router_logits,
         )
 
 
@@ -862,34 +735,11 @@ class DeepseekV2Model(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
-        initial_rope_kwargs = {}
-        method = None
-        if self.config.rope_scaling is not None:
-            scaling_type = self.config.rope_scaling["type"]
-            method = scaling_type
-            if scaling_type != "yarn":
-                initial_rope_kwargs = dict(scaling_factor=self.config.rope_scaling["factor"])
-            else:
-                initial_rope_kwargs = {
-                    key: self.config.rope_scaling[key]
-                    for key in [
-                        "original_max_position_embeddings",
-                        "beta_fast",
-                        "beta_slow",
-                        "mscale",
-                        "mscale_all_dim",
-                    ]
-                    if key in self.config.rope_scaling
-                }
-                initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling["factor"]
-        return ModuleCaches(
-            init_deepseek_rotary_embedding(
-                dim=self.config.qk_rope_head_dim,
-                max_position_embeddings=self.config.granted_freq_max_position_embedding,
-                base=self.config.rope_theta,
-                method=method,  # type:ignore
-                kwargs=initial_rope_kwargs,
-            )
+        """Compute RoPE frequencies using config's get_basic_frequencies method."""
+        return self.config.get_basic_frequencies(
+            head_size=self.config.qk_rope_head_dim,
+            rotary_dim=self.config.qk_rope_head_dim,
+            base=self.config.rope_theta,
         )
 
     def __call__(
@@ -898,11 +748,12 @@ class DeepseekV2Model(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
     ) -> BaseModelOutput:
         """
         Forward pass through the Deepseekv2 module.
@@ -931,6 +782,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        all_router_logits = () if output_router_logits else None
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -985,6 +837,9 @@ class DeepseekV2Model(EasyDeLBaseModule):
             if output_attentions:
                 all_attentions += (output.attention_weight,)
 
+            if output_router_logits and hasattr(output, "router_logits") and output.router_logits is not None:
+                all_router_logits += (output.router_logits,)
+
             past_key_values[idx] = output.cache_view
 
         hidden_states = self.norm(hidden_states)
@@ -992,11 +847,12 @@ class DeepseekV2Model(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutput(
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=past_key_values,
+            router_logits=all_router_logits,
         )
 
     def get_encoder(self) -> nn.Module:
@@ -1024,13 +880,11 @@ class DeepseekV2Model(EasyDeLBaseModule):
         """
         Returns the embedding layer of the module.
         """
-        # Assuming the embedding layer is named `embed_tokens` based on common conventions
-        # and the presence of `self.embed_tokens(input_ids.astype("i4"))` in typical __call__ methods.
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, DeepseekV2Config, model_type="deepseek_v2")
-class DeepseekV2ForCausalLM(EasyDeLBaseModule):
+class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config]):
     """
     DeepseekV2 model with a language modeling head for causal language modeling tasks.
 
@@ -1038,6 +892,10 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
     on top of the transformer model. It's designed for generative tasks and can be used
     for text generation.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "deepseek_v2"
+    _config_class = DeepseekV2Config
 
     def __init__(
         self,
@@ -1060,35 +918,14 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
         """
         super().__init__(
             config=config,
+            base_model_class=DeepseekV2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = DeepseekV2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
@@ -1097,13 +934,14 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+    ) -> MoeCausalLMOutput:
         """
         Forward pass of the causal language model.
 
@@ -1112,74 +950,43 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
             inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
             attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
             position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
-            segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
             output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
             output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
+            output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
             past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
                 Defaults to None.
             cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
                 Defaults to None.
 
-
         Returns:
-                CausalLMOutput: The model outputs, either as a named tuple or a standard tuple.
+                MoeCausalLMOutput: The model outputs with router logits and aux loss.
         """
-        outputs = self.model(
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-        hidden_states = outputs.last_hidden_state
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss for load balancing."""
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
 
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+        all_router_logits = jnp.stack(outputs.router_logits, axis=0)
+
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=all_router_logits,
+            num_experts=self.config.n_routed_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
         )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self) -> nn.Module:
-        """
-        Returns the encoder part of the model's graph definition.
-        For DeepseekV2ForCausalLM (decoder-only), this is not applicable.
-        """
-        raise NotImplementedError("DeepseekV2ForCausalLM is a decoder-only model and does not have a separate encoder.")
-
-    def get_decoder(self) -> nn.Module:
-        """
-        Returns the decoder part of the model's graph definition.
-        For DeepseekV2ForCausalLM, this is the underlying DeepseekV2Model.
-        """
-        # Assuming the base model is stored in `self.model`
-        return self.model.get_decoder()
-
-    def get_lm_head(self) -> nn.Module:
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self) -> nn.Module:
-        """
-        Returns the embedding layer of the module.
-        """
-        # Access the embedding layer through the decoder (DeepseekV2Model)
-        return self.model.get_embedding()  # Leverages DeepseekV2Model's get_embedding
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)

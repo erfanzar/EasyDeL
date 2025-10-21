@@ -39,7 +39,8 @@ Submodules:
     rotary_embedding: RoPE and position embeddings
 
 Example:
-    >>> from easydel.layers import ParallelLinear, RMSNorm
+    >>> from easydel.layers.norms import RMSNorm
+    >>> from easydel.layers.linear import ParallelLinear
     >>> from easydel.layers.attention import FlashAttention
     >>>
     >>> # Create a parallel linear layer

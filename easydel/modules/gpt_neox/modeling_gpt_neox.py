@@ -14,8 +14,8 @@
 
 
 import functools
+from typing import ClassVar
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -27,9 +27,14 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    DecoderLayerOutput,
+)
 from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -43,19 +48,29 @@ from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
 
-class GPTNeoXAttention(AttentionModule):
-    """GPT-NeoX Attention module.
+class GPTNeoXAttention(UnifiedAttention):
+    """GPT-NeoX Attention with partial RoPE.
 
-    This module implements the attention mechanism used in the GPT-NeoX model,
-    including rotary position embeddings and parallel linear layers for QKV.
-
-    Attributes:
-            config (GPTNeoXConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+    Inherits from UnifiedAttention.
+    Uses combined QKV projection (query_key_value) and partial rotary embeddings.
+    Overrides forward_standard to efficiently handle fused QKV projection.
     """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "query_projection": "q_proj",
+        "key_projection": "k_proj",
+        "value_projection": "v_proj",
+        "output_projection": "dense",
+        "query_key_value_projection": "query_key_value",
+        # MLA-specific projections (DeepSeek V2/V3)
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+    }
 
     def __init__(
         self,
@@ -65,130 +80,35 @@ class GPTNeoXAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
-    ) -> None:
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.rotary = self.config.get_basic_rope(
+    ):
+        """Initialize GPT-NeoX attention."""
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            use_fused_qkv=True,
+        )
+
+    def _create_rotary(self, config: GPTNeoXConfig, dtype: jnp.dtype):
+        """Create GPTNeoX-specific rotary embedding with partial RoPE."""
+        return config.get_basic_rope(
             dtype=dtype,
             head_size=self.head_dim,
-            rotary_dim=int(self.head_dim * self.config.rotary_pct),
-            base=self.config.rotary_emb_base,
+            rotary_dim=int(self.head_dim * config.rotary_pct),  # Partial RoPE
+            base=config.rotary_emb_base,
         )
-        self.query_key_value = ColumnParallelLinear(
-            config.hidden_size,
-            3 * config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.dense = RowParallelLinear(
-            config.hidden_size,
-            config.hidden_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.attention_performer = FlexibleAttentionModule(
+
+    def _create_attention_performer(self, config: GPTNeoXConfig, rngs: nn.Rngs):
+        """Create attention performer with config dropout."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
-        )
-
-    def _split_heads(self, hidden_states):
-        return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the GPTNeoXAttention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache view for
-                key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for
-                cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
-
-        Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output and optionally
-                the attention weights.
-        """
-        query_states, key_states, value_states = jnp.split(
-            self.query_key_value(hidden_states),
-            indices_or_sections=3,
-            axis=-1,
-        )
-
-        query_states = self._split_heads(query_states)
-        key_states = self._split_heads(key_states)
-        value_states = self._split_heads(value_states)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            fcm_mask=None,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.dense(attn_output), name="attn_output")
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
@@ -337,14 +257,14 @@ class GPTNeoXBlock(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo,
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+    ) -> DecoderLayerOutput:
         """Forward pass of the GPTNeoXBlock module.
 
         Args:
@@ -464,7 +384,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        extra_embedding: chex.Array | None = None,
+        extra_embedding: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -594,20 +514,12 @@ class GPTNeoXModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GPTNeoXConfig, model_type="gpt_neox")
-class GPTNeoXForCausalLM(EasyDeLBaseModule):
-    """GPT-NeoX model with a language modeling head.
+class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):
+    """GPT-NeoX model with a language modeling head."""
 
-    This model extends the base GPTNeoXModel by adding a linear layer on top to
-    predict the next token in a sequence, making it suitable for causal language
-    modeling tasks.
-
-    Attributes:
-            config (GPTNeoXConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gpt_neox"
+    _config_class = GPTNeoXConfig
 
     def __init__(
         self,
@@ -620,120 +532,12 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=GPTNeoXModel,
+            base_model_name="gpt_neox",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
+            lm_head_name="embed_out",
         )
-        self.gpt_neox = GPTNeoXModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        extra_embedding: chex.Array | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        """Forward pass through the GPTNeoXForCausalLM model.
-
-        Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
-                key_states/value_states states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-            Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
-        """
-        outputs = self.gpt_neox(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-            extra_embedding=extra_embedding,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states).astype(jnp.float32)
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.gpt_neox.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.gpt_neox.get_embedding()

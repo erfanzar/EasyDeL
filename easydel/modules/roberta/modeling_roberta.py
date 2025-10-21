@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -192,13 +191,13 @@ class RobertaSelfAttention(AttentionModule):
 
     def __call__(
         self,
-        hidden_states,
-        attention_mask,
-        layer_head_mask,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        attention_mask: Bool[Array, "batch seq_len"],
+        layer_head_mask: Bool[Array, "num_heads"] | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        key_value_states: chex.Array | None = None,
+        key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
     ):
         is_cross_attention = key_value_states is not None
@@ -839,14 +838,14 @@ class RobertaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids,
-        attention_mask,
-        token_type_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        head_mask: chex.Array | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: tuple[tuple[chex.Array, chex.Array]] | None = None,
+        past_key_values: TransformerCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1374,11 +1373,11 @@ class RobertaForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
-        head_mask: chex.Array | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: tuple[tuple[chex.Array, chex.Array]] | None = None,
+        past_key_values: TransformerCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):

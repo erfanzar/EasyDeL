@@ -33,7 +33,8 @@ dependencies = [
 	"jax>=0.8.0",
 	"jaxlib>=0.8.0",
 	"ray[default]==2.34.0",
-	"eformer>=0.0.78",
+	"eformer>=0.0.81",
+	"ejkernel>=0.0.1",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
 	"flax==0.11.2",
@@ -57,6 +58,8 @@ dependencies = [
 "Repository" = "https://github.com/erfanzar/EasyDeL"
 "Documentation" = "https://easydel.readthedocs.io/en/latest/"
 
+
+
 [tool.uv.build-backend]
 module-name = "easydel"
 module-root = "."
@@ -71,8 +74,8 @@ where = ["."]
 "easydel" = ["py.typed"]
 
 [project.optional-dependencies]
-torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]>=0.8.0", "torch==2.6.0", "tensorboard>=2.19.0"]
+torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]>=0.8.0", "torch==2.8.0", "tensorboard>=2.19.0"]
 tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]

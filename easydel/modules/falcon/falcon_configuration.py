@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-import typing
-
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -90,10 +88,6 @@ class FalconConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "falcon"
-    attribute_map: typing.ClassVar = {
-        "num_hidden_layers": "num_hidden_layers",
-        "num_attention_heads": "num_attention_heads",
-    }
 
     def __init__(
         self,

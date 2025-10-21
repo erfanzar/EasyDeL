@@ -18,6 +18,7 @@ from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseA
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
+from easydel.layers.rotary_embedding import RopeConfig
 
 
 @register_config("deepseek_v2")
@@ -326,3 +327,26 @@ class DeepseekV2Config(EasyDeLBaseConfig):
             "mask_max_position_embeddings",
             self.max_position_embeddings,
         )
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Get RoPE configuration from the instance attributes."""
+        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+            config = RopeConfig.from_dict(
+                dict(
+                    rope_type="yarn",
+                    base=10000,
+                    scaling_factor=1.0,
+                    original_max_position_embeddings=4096,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=1,
+                    mscale_all_dim=0,
+                )
+            )
+        else:
+            config = RopeConfig.from_dict(self.rope_scaling)
+
+            if config.original_max_position_embeddings is None:
+                config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        return config

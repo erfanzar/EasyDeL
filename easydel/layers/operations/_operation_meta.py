@@ -106,7 +106,7 @@ class OperationMetadata:
 
     _stored_mesh: jax.sharding.Mesh | None = NOT_GIVEN
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """
         Initializes default values and performs safety checks after dataclass creation.
 
@@ -128,20 +128,24 @@ class OperationMetadata:
         self.set_attrs_carefully("_stored_mesh", NOT_GIVEN, "mesh")
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
-            mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
+            mesh: jax.sharding.Mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
             assert (
                 not mesh.empty
             ), "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
             self._stored_mesh = mesh
         self._safety_check()
         if self.backend is None:
-            current_backend = jax.default_backend()
-            self.backend = getattr(EasyDeLBackends, current_backend, getattr(EasyDeLBackends, current_backend.upper()))
+            current_backend: str = jax.default_backend()
+            backend_enum: EasyDeLBackends = getattr(
+                EasyDeLBackends, current_backend, getattr(EasyDeLBackends, current_backend.upper())
+            )
+            self.backend = backend_enum
 
-    def _safety_check(self):
+    def _safety_check(self) -> None:
         """Ensures no essential attributes are left uninitialized (as NOT_GIVEN)."""
+        field: dataclasses.Field
         for field in dataclasses.fields(self):
-            val = getattr(self, field.name)
+            val: tp.Any = getattr(self, field.name)
             if val is NOT_GIVEN:
                 raise ValueError(f"`{field.name}` shouldn't be ellipsis")
 
@@ -211,10 +215,16 @@ class OperationMetadata:
                 - softmax_aux: Optional 2D softmax auxiliary output sharding
         """
 
-        pama = self.partition_manager
+        pama: PartitionManager = self.partition_manager
 
-        _h = HEAD if qkv_mni_sharding else KV_HEAD
-        _kvh = HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM
+        _h: common_types.DynamicShardingAxes = HEAD if qkv_mni_sharding else KV_HEAD
+        _kvh: common_types.DynamicShardingAxes = HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM
+
+        q_sharding: jax.sharding.PartitionSpec
+        k_sharding: jax.sharding.PartitionSpec
+        v_sharding: jax.sharding.PartitionSpec
+        q_segment_ids_sharding: jax.sharding.PartitionSpec
+        kv_segment_ids_sharding: jax.sharding.PartitionSpec
 
         if layout == "bthd":
             q_sharding = pama.resolve(axes=[BATCH, QUERY_LENGTH, HEAD, HEAD_DIM], mode=mode)
@@ -231,21 +241,26 @@ class OperationMetadata:
         else:
             raise NotImplementedError(f"Layout '{layout}' is not implemented")
 
-        qk_extern = (QUERY_LENGTH, BIAS_KV_SEQ)
+        qk_extern: tuple[common_types.DynamicShardingAxes, common_types.DynamicShardingAxes] = (
+            QUERY_LENGTH,
+            BIAS_KV_SEQ,
+        )
 
-        b_sharding = pama.resolve(axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern], mode=mode)
-        m_sharding = pama.resolve(axes=[BATCH, None, *qk_extern], mode=mode)
+        b_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern], mode=mode)
+        m_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, None, *qk_extern], mode=mode)
 
         # Softmax auxiliary output sharding (e.g., LSE, max) - 2D: [batch, num_heads]
-        softmax_aux_sharding = None
+        softmax_aux_sharding: jax.sharding.PartitionSpec | None = None
         if softmax_aux is not None:
-            if softmax_aux.ndim == 2:
+            num_dims: int = softmax_aux.ndim
+            if num_dims == 2:
                 softmax_aux_sharding = pama.resolve(axes=[EMPTY, KV_HEAD], mode=mode)
             else:
                 softmax_aux_sharding = pama.resolve(axes=[HEAD], mode=mode)
 
-        return AttnShardingRules(
-            query3d=pama.resolve(axes=[BATCH, HEAD, HEAD_DIM], mode=mode),
+        query3d_sharding: jax.sharding.PartitionSpec = pama.resolve(axes=[BATCH, HEAD, HEAD_DIM], mode=mode)
+        rules: AttnShardingRules = AttnShardingRules(
+            query3d=query3d_sharding,
             query=q_sharding,
             key=k_sharding,
             value=v_sharding,
@@ -256,6 +271,7 @@ class OperationMetadata:
             kv_segment_ids=kv_segment_ids_sharding,
             softmax_aux=softmax_aux_sharding,
         )
+        return rules
 
     def set_attrs_carefully(
         self,
@@ -263,7 +279,7 @@ class OperationMetadata:
         default: tp.Any | None,
         pickup_name: str | None = None,
         use_base_config: bool = True,
-    ):
+    ) -> None:
         """
         Internal helper to set an attribute if it's not already set (or is Ellipsis).
 
@@ -278,9 +294,10 @@ class OperationMetadata:
                 Defaults to `attr_name`.
             use_base_config: Whether to attempt retrieving the value from `base_config`.
         """
-        if not hasattr(self, attr_name) or getattr(self, attr_name, NOT_GIVEN) is NOT_GIVEN:
-            pn = attr_name if pickup_name is None else pickup_name
-            new_value = (
-                default if (self.base_config is None or not use_base_config) else getattr(self.base_config, pn, default)
-            )
+        has_attr: bool = hasattr(self, attr_name)
+        current_val: tp.Any = getattr(self, attr_name, NOT_GIVEN)
+        if not has_attr or current_val is NOT_GIVEN:
+            pn: str = attr_name if pickup_name is None else pickup_name
+            should_use_default: bool = self.base_config is None or not use_base_config
+            new_value: tp.Any = default if should_use_default else getattr(self.base_config, pn, default)
             setattr(self, attr_name, new_value)

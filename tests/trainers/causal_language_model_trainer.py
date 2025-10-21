@@ -17,7 +17,7 @@ NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
-SAVE_STEPS = 1000
+SAVE_STEPS = 500
 DO_LAST_SAVE = False
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -36,8 +36,8 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
         num_hidden_layers=4,
         intermediate_size=128,
         max_position_embeddings=sequence_length,
-        attn_dtype=jnp.float16,
-        attn_mechanism=ed.AttentionMechanisms.BLOCKSPARSE,
+        attn_dtype=jnp.bfloat16,
+        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
         num_experts=2,
         num_experts_per_tok=1,
         vhead_dim=128,
@@ -110,7 +110,7 @@ def create_training_args(
         # training_time_limit="80Min",
         wandb_entity="erfanzar",
         model_name="CausalLanguageModelTrainerTest",
-        optimizer=ed.EasyDeLOptimizers.SKEW,
+        optimizer=ed.EasyDeLOptimizers.MUON,
         scheduler=ed.EasyDeLSchedulers.COSINE,
         clip_grad=1.0,
         warmup_steps=warmup_steps,

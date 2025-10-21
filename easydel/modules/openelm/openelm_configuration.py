@@ -128,7 +128,12 @@ class OpenELMConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "openelm"
-    attribute_map: typing.ClassVar = {"tie_word_embedding": "share_input_output_layers"}
+    attribute_map: typing.ClassVar = {
+        "hidden_size": "model_dim",
+        "num_hidden_layers": "num_transformer_layers",
+        "max_position_embeddings": "max_context_length",
+        "tie_word_embeddings": "share_input_output_layers",
+    }
 
     def __init__(
         self,

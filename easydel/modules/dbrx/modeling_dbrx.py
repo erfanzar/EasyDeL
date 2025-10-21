@@ -14,6 +14,7 @@
 
 
 from functools import cached_property
+from typing import ClassVar
 
 import chex
 import jax
@@ -36,7 +37,9 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -50,7 +53,34 @@ from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from .dbrx_configuration import DbrxConfig
 
 
-class DbrxAttention(AttentionModule):
+class DbrxAttention(UnifiedAttention):
+    """DBRX Attention module with fused QKV projection.
+
+    This module implements the multi-head attention mechanism used in the DBRX model.
+    It supports Grouped Query Attention (GQA) and Rotary Position Embeddings (RoPE).
+    The query, key, and value projections are combined into a single fused linear layer
+    for efficiency, and supports optional QKV clipping.
+
+    Overrides forward_standard to efficiently handle fused QKV projection.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (nn.Rngs): Random number generators.
+        Wqkv (ColumnParallelLinear): Fused linear layer for query, key, and value projections.
+        out_proj (RowParallelLinear): Linear layer for the output projection.
+        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+        rotary (RoPE): Rotary position embedding module.
+        resid_dropout (nn.Dropout): Residual dropout layer.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "output_projection": "out_proj",
+        "query_key_value_projection": "Wqkv",
+    }
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -60,33 +90,59 @@ class DbrxAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
+        """Initializes the DbrxAttention module.
 
-        self.num_attention_heads = self.config.n_heads
-        self.num_key_value_heads = self.config.attn_config.kv_n_heads
-        config = self.config
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.d_model // self.config.n_heads
-        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        Args:
+            config (DbrxConfig): The configuration object for the DBRX model.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+        )
 
-        if self.num_key_value_groups == 1:
-            assert self.num_attention_heads == self.config.attn_config.kv_n_heads
+    def define_network(
+        self,
+        config: DbrxConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ):
+        """Override to create fused QKV projection instead of separate Q/K/V.
+
+        Args:
+            config: Model configuration
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: JAX precision setting
+            rngs: Random number generators
+        """
+        num_attention_heads = config.num_attention_heads
+        num_key_value_heads = config.num_key_value_heads
+        head_dim = config.hidden_size // config.num_attention_heads
+        qkv_size = num_attention_heads * head_dim + 2 * num_key_value_heads * head_dim
+
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
-            self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
+            qkv_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
+            precision=precision,
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
+
         self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
@@ -94,27 +150,50 @@ class DbrxAttention(AttentionModule):
             param_dtype=param_dtype,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
+            precision=precision,
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.rotary = self.config.get_basic_rope(
-            dtype=self.dtype,
-            rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-            head_size=self.config.hidden_size // self.config.num_attention_heads,
+        # Create attention performer
+        self.attention_performer = self._create_attention_performer(config, rngs)
+
+        # Create rotary embeddings
+        self.rotary = self._create_rotary(config, dtype)
+
+        # Create residual dropout
+        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+
+    def _create_rotary(self, config: DbrxConfig, dtype: jnp.dtype):
+        """Create rotary position embedding layer with DBRX specific configuration.
+
+        Args:
+            config: Model configuration
+            dtype: Data type for computations
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
+            rotary_dim=config.hidden_size // config.num_attention_heads,
+            head_size=config.hidden_size // config.num_attention_heads,
             is_neox_style=True,
-            base=self.config.attn_config.rope_theta,
+            base=config.attn_config.rope_theta,
         )
-        self.attention_performer = FlexibleAttentionModule(
+
+    def _create_attention_performer(self, config: DbrxConfig, rngs: nn.Rngs):
+        """Create attention performer module with DBRX specific settings.
+
+        Args:
+            config: Model configuration
+            rngs: Random number generators
+        """
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
         )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
-    def __call__(
+    def forward(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -124,64 +203,29 @@ class DbrxAttention(AttentionModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
+        """Override to handle fused QKV projection efficiently with optional clipping."""
         batch_size, sequence_length = hidden_states.shape[:2]
-        qkv_states = self.Wqkv(hidden_states)
+        qkv_states = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
         if self.config.attn_config.clip_qkv is not None:
             qkv_states = qkv_states.clip(
                 min=-self.config.attn_config.clip_qkv,
                 max=self.config.attn_config.clip_qkv,
             )
-
         query_size = self.hidden_size
         key_size = self.num_key_value_heads * self.head_dim
+        query_states = qkv_states[..., :query_size]
+        key_states = qkv_states[..., query_size : query_size + key_size]
+        value_states = qkv_states[..., query_size + key_size :]
 
-        query_states, key_value_states = jnp.split(qkv_states, [query_size], axis=2)
-        key_states, value_states = jnp.split(key_value_states, [key_size], axis=2)
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
 
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
         (
             key_states,
             value_states,
@@ -196,7 +240,10 @@ class DbrxAttention(AttentionModule):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
+            sliding_window=getattr(self, "sliding_window", None),
         )
+
+        # 7. Compute attention
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -207,18 +254,27 @@ class DbrxAttention(AttentionModule):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=True,
+            causal=self.causal,
+            sliding_window=getattr(self, "sliding_window", None),
         )
 
+        # 8. Merge heads and output projection
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 
-        attn_output = self.resid_dropout(attn_output)
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,
         )
+
+    def _get_output_proj(self):
+        """Override to access output projection with DBRX's naming convention.
+
+        Returns:
+            Output projection layer
+        """
+        return self.out_proj
 
 
 class DbrxNormAttentionNorm(nn.Module):
@@ -895,7 +951,13 @@ class DbrxModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=DbrxConfig, model_type="dbrx")
-class DbrxForCausalLM(EasyDeLBaseModule):
+class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
+    """DBRX model with a Causal Language Modeling head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "dbrx"
+    _config_class = DbrxConfig
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -907,35 +969,14 @@ class DbrxForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=DbrxModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.transformer = DbrxModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
@@ -951,74 +992,44 @@ class DbrxForCausalLM(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> MoeCausalLMOutput | tuple:
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        outputs = self.transformer(
+    ) -> MoeCausalLMOutput:
+        """Forward pass of the DbrxForCausalLM model."""
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-        )
-        logits = None
-        if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.ffn_config.moe_num_experts,
-                top_k=self.config.ffn_config.moe_top_k,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
-
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-    def get_encoder(self) -> nn.Module:
-        """
-        Returns the encoder part of the model's graph definition.
-        For DbrxForCausalLM (decoder-only), this is not applicable.
-        """
-        raise NotImplementedError("DbrxForCausalLM is a decoder-only model and does not have a separate encoder.")
-
-    def get_decoder(self) -> nn.Module:
-        """
-        Returns the decoder part of the model's graph definition.
-        For DbrxForCausalLM, this is the underlying DbrxModel.
-        """
-        return self.transformer.get_decoder()
-
-    def get_lm_head(self) -> nn.Module:
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self) -> nn.Module:
-        """
-        Returns the embedding layer of the module.
-        """
-        # Access the embedding layer through the decoder (DbrxModel)
-        return self.transformer.get_embedding()  # Leverages DbrxModel's get_embedding
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss from router logits."""
+        if outputs.router_logits is None:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.ffn_config.moe_num_experts,
+            top_k=self.config.ffn_config.moe_top_k,
+            attention_mask=attention_mask,
+        )
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
-class DbrxForSequenceClassification(EasyDeLBaseModule):
+class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, DbrxConfig]):
+    """DBRX model with a Sequence Classification head."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "dbrx"
+    _config_class = DbrxConfig
+
     def __init__(
         self,
         config: DbrxConfig,
@@ -1030,32 +1041,15 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=DbrxModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.transformer = DbrxModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
@@ -1073,7 +1067,8 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
     ) -> SequenceClassifierOutput:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        transformer_outputs = self.transformer(
+
+        transformer_outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1088,6 +1083,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 
         hidden_states = transformer_outputs.last_hidden_state
         logits = self.score(hidden_states)
+
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
@@ -1105,6 +1101,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
                 sequence_lengths = -1
 
         pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+
         aux_loss = None
         if output_router_logits and transformer_outputs.router_logits is not None:
             aux_loss = auxiliary_load_balancing_loss_func(
@@ -1113,7 +1110,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
                 top_k=self.config.ffn_config.moe_top_k,
                 attention_mask=attention_mask,
             )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
+            aux_loss = aux_loss * self.config.router_aux_loss_coef
 
         return SequenceClassifierOutput(
             logits=pooled_logits,
@@ -1122,35 +1119,3 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
             attentions=transformer_outputs.attentions,
             aux_loss=aux_loss,
         )
-
-    def get_encoder(self) -> nn.Module:
-        """
-        Returns the encoder part of the model's graph definition.
-        For DbrxForSequenceClassification (decoder-only), this is not applicable.
-        """
-        raise NotImplementedError(
-            "DbrxForSequenceClassification is a decoder-only model and does not have a separate encoder."
-        )
-
-    def get_decoder(self) -> nn.Module:
-        """
-        Returns the decoder part of the model's graph definition.
-        For DbrxForSequenceClassification, this is the underlying DbrxModel.
-        """
-        return self.transformer  # self.transformer is the DbrxModel instance
-
-    def get_lm_head(self) -> nn.Module:
-        """
-        Returns the language model head of the module.
-        DbrxForSequenceClassification uses a classification head instead.
-        """
-        raise NotImplementedError(
-            "DbrxForSequenceClassification uses a classification head (self.score), not an lm_head."
-        )
-
-    def get_embedding(self) -> nn.Module:
-        """
-        Returns the embedding layer of the module.
-        """
-        # Access the embedding layer through the decoder (DbrxModel)
-        return self.transformer.get_embedding()  # Leverages DbrxModel's get_embedding

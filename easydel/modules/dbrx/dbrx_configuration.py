@@ -270,6 +270,11 @@ class DbrxConfig(EasyDeLBaseConfig):
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+    @property
+    def num_key_value_heads(self) -> int:
+        """Get the number of key-value heads from the attention config."""
+        return self.attn_config.kv_n_heads
+
     def get_partition_rules(self, *args, **kwargs):
         """
         Get the partition rules for the model.

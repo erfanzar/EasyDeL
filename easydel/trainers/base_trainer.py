@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import pprint
-import re
 import time
 import typing as tp
 from abc import abstractmethod
@@ -28,21 +27,17 @@ import grain.python as grain
 import jax
 import jax.extend
 import numpy as np
-from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src.stages import Compiled
-from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
 from easydel import __version__
-from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
@@ -142,13 +137,39 @@ class BaseTrainer(BaseTrainerProtocol):
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
             try:
-                resumed_state = self._try_resume_from_checkpoint(model_state)
-            except Exception:
-                logger.warning("Resuming from checkpoint failed. Starting fresh training.")
-                resumed_state = None
-            if resumed_state is not None:
-                model_state = resumed_state
-                self._resumed_from_checkpoint = True
+                from eformer.serialization.checkpointer import find_latest_checkpoint
+
+                checkpoint_path = find_latest_checkpoint(str(self.arguments._get_save_directory(create=False)))
+                if checkpoint_path is not None:
+                    logger.info(f"Found latest checkpoint: {checkpoint_path}")
+                    model = model_state.model
+                    resumed_state = EasyDeLState.load_state(
+                        load_directory=checkpoint_path,
+                        dtype=model.dtype,
+                        param_dtype=model.param_dtype,
+                        precision=model.precision,
+                        auto_shard_model=True,
+                        partition_axis=model.config.partition_axis,
+                        sharding_axis_names=model.config.sharding_axis_names,
+                        sharding_axis_dims=model.config.sharding_axis_dims,
+                        sharding_dcn_axis_dims=model.config.sharding_dcn_axis_dims,
+                        model_task=model.model_task,
+                        verbose=True,
+                        tx_template=arguments.get_tx_template(),
+                    )
+                    actual_step = int(jax.device_get(resumed_state.step))
+                    logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
+
+                    if self.arguments.step_start_point is None:
+                        self.arguments.step_start_point = actual_step
+                        logger.info(f"Set step_start_point to {actual_step}")
+
+                    model_state = resumed_state
+                    self._resumed_from_checkpoint = True
+                else:
+                    logger.info("No checkpoints found. Starting fresh training.")
+            except Exception as e:
+                logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
         self.model_state = model_state
         self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
@@ -161,178 +182,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
         if self.arguments.track_memory and self.arguments.track_memory > 0:
             self._initialize_memory_tracking()
-
-    @classmethod
-    def load_trainer_state(
-        cls,
-        load_directory: str | os.PathLike,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
-        data_collator: tp.Callable | None = None,
-        device: jax.Device | None = "cpu",  # type:ignore
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
-        backend: EasyDeLBackends | None = None,
-        platform: EasyDeLPlatforms | None = None,
-        config_kwargs: EasyDeLBaseConfigDict | None = None,
-        model_task: TaskType = TaskType.AUTO_BIND,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_platform: EasyDeLPlatforms | None = None,
-        quantization_method: EasyDeLQuantizationMethods | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
-        quantize_tensors: bool = True,
-        verbose: bool = True,
-        base_state: type[EasyDeLState] | None = None,
-        trainer_init_arguments: dict[str, tp.Any] | None = None,
-        **kwargs,
-    ):
-        """
-        Load a trainer from a saved checkpoint directory.
-
-        This class method reconstructs a trainer instance from a previously saved
-        checkpoint, including the model state and training arguments.
-
-        Parameters
-        ----------
-        load_directory : str | os.PathLike
-            Path to the checkpoint directory containing saved model state
-        dataset_train : Dataset | None, optional
-            Training dataset to use with the loaded trainer
-        dataset_eval : Dataset | None, optional
-            Evaluation dataset to use with the loaded trainer
-        data_collator : tp.Callable | None, optional
-            Function to collate batches of data
-        device : jax.Device | None, optional
-            Device to load the model on, by default "cpu"
-        dtype : jnp.dtype, optional
-            Data type for computations, by default jnp.bfloat16
-        param_dtype : jnp.dtype, optional
-            Data type for model parameters, by default jnp.bfloat16
-        precision : jax.lax.Precision | None, optional
-            JAX precision level for matrix multiplications
-        sharding_axis_dims : tp.Sequence[int], optional
-            Dimensions for sharding axes (dp, fsdp, ep, tp, sp), by default (1, -1, 1, 1, 1)
-        sharding_dcn_axis_dims : tp.Sequence[int] | None, optional
-            DCN-specific sharding dimensions for cross-data-center training
-        sharding_axis_names : tp.Sequence[str], optional
-            Names for the sharding axes, by default ("dp", "fsdp", "ep", "tp", "sp")
-        partition_axis : PartitionAxis | None, optional
-            Custom partition axis configuration
-        shard_attention_computation : bool, optional
-            Whether to shard attention computations, by default True
-        shard_fns : tp.Mapping[tuple, tp.Callable] | dict | None, optional
-            Custom sharding functions for specific operations
-        backend : EasyDeLBackends | None, optional
-            Computation backend (CPU, GPU, TPU)
-        platform : EasyDeLPlatforms | None, optional
-            Platform-specific configuration
-        config_kwargs : EasyDeLBaseConfigDict | None, optional
-            Additional configuration parameters
-        model_task : TaskType, optional
-            Task type for the model, by default TaskType.AUTO_BIND
-        auto_shard_model : bool, optional
-            Whether to automatically shard the model, by default True
-        partition_rules : tuple[tuple[str, PartitionSpec], ...] | None, optional
-            Rules for partitioning model parameters across devices
-        quantization_platform : EasyDeLPlatforms | None, optional
-            Platform for quantization operations
-        quantization_method : EasyDeLQuantizationMethods | None, optional
-            Method for quantization (e.g., INT8, FP8)
-        quantization_block_size : int, optional
-            Block size for quantization, by default 128
-        quantization_pattern : str | None, optional
-            Pattern for selective quantization of layers
-        quantize_tensors : bool, optional
-            Whether to quantize tensors, by default True
-        verbose : bool, optional
-            Whether to print loading progress, by default True
-        base_state : type[EasyDeLState] | None, optional
-            Base state class to use for loading, defaults to EasyDeLState
-        trainer_init_arguments : dict[str, tp.Any] | None, optional
-            Additional arguments for trainer initialization
-        **kwargs
-            Additional keyword arguments passed to state loading
-
-        Returns:
-            BaseTrainer A new trainer instance loaded from the checkpoint with the specified configuration
-
-        Raises:
-            FileNotFoundError
-                If the checkpoint directory does not exist
-            ValueError
-                If the checkpoint files are corrupted or incompatible
-
-        Examples
-        --------
-        >>> # Load a trainer from checkpoint
-        >>> trainer = MyTrainer.load_trainer_state(
-        ...     load_directory="/path/to/checkpoint",
-        ...     dataset_train=train_dataset,
-        ...     dataset_eval=eval_dataset,
-        ...     device=jax.devices("gpu")[0]
-        ... )
-
-        >>> # Resume training from the loaded state
-        >>> output = trainer.train()
-
-        Notes
-        -----
-        The method performs the following steps:
-        1. Loads the model state from the checkpoint directory
-        2. Loads the training arguments from the checkpoint
-        3. Reconstructs the trainer with the loaded state and provided datasets
-        4. The trainer is ready to resume training from the checkpoint step
-        """
-        if base_state is None:
-            base_state = EasyDeLState
-        model_state = base_state.load_state(
-            load_directory=load_directory,
-            device=device,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            sharding_axis_dims=sharding_axis_dims,
-            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-            sharding_axis_names=sharding_axis_names,
-            partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
-            shard_fns=shard_fns,
-            backend=backend,
-            platform=platform,
-            config_kwargs=config_kwargs,
-            model_task=model_task,
-            auto_shard_model=auto_shard_model,
-            partition_rules=partition_rules,
-            quantization_platform=quantization_platform,
-            quantization_method=quantization_method,
-            quantization_block_size=quantization_block_size,
-            quantization_pattern=quantization_pattern,
-            quantize_tensors=quantize_tensors,
-            verbose=verbose,
-            **kwargs,
-        )
-
-        load_args_path = ePath(load_directory) / DEFAULT_ARGS_JSON_NAME
-        arguments = TrainingArguments.load_arguments(load_args_path)
-        if trainer_init_arguments is None:
-            trainer_init_arguments = {}
-        return cls(
-            arguments=arguments,
-            dataset_eval=dataset_eval,
-            dataset_train=dataset_train,
-            data_collator=data_collator,
-            model_state=model_state,
-            **trainer_init_arguments,
-        )
 
     @property
     def model(self):
@@ -522,95 +371,6 @@ class BaseTrainer(BaseTrainerProtocol):
             "_eval_shared_fn_extra_args_",
             (),
         )
-
-    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
-        """
-        Try to resume from the latest checkpoint if available.
-
-        This method searches for existing checkpoints in the save directory and
-        attempts to load the most recent one. It handles multiple checkpoint
-        directories and falls back gracefully if loading fails.
-
-        Args:
-            current_state: The current model state (used as fallback if no checkpoint found)
-
-        Returns:
-            The resumed state if a checkpoint was found and loaded, None otherwise
-
-        Note:
-            - Checkpoints are expected to be in directories named "run-{step}"
-            - The method will try multiple checkpoints if the most recent fails
-            - Sets step_start_point in arguments if resuming is successful
-            - ePath handles both local and cloud storage (gs://, s3://) transparently
-        """
-        try:
-            checkpoint_dir = self.arguments._get_save_directory(create=False)
-            all_paths = list(checkpoint_dir.glob("run-*"))
-
-            if not all_paths:
-                logger.info("No checkpoints found in save directory. Starting fresh training.")
-                return None
-
-            run_dir_names = set()
-            for path in all_paths:
-                parts = str(path).split("/")
-                for i, part in enumerate(parts):
-                    if part.startswith("run-") and part[4:].split("-")[0].isdigit():
-                        run_dir_path = "/".join(parts[: i + 1])
-                        run_dir_names.add(run_dir_path)
-                        break
-
-            if not run_dir_names:
-                logger.info("No valid run directories found. Starting fresh training.")
-                return None
-            sorted_run_dirs = sorted(
-                run_dir_names,
-                key=lambda x: int(x.split("run-")[-1].split("/")[0])
-                if x.split("run-")[-1].split("/")[0].isdigit()
-                else 0,
-                reverse=True,
-            )
-
-            for run_dir_path in sorted_run_dirs:
-                try:
-                    model = current_state.model
-                    logger.info(f"Attempting to resume from checkpoint: {run_dir_path}")
-                    run_dir = ePath(run_dir_path)
-
-                    resumed_state = EasyDeLState.load_state(
-                        load_directory=run_dir,
-                        dtype=model.dtype,
-                        param_dtype=model.param_dtype,
-                        precision=model.precision,
-                        auto_shard_model=True,
-                        partition_axis=model.config.partition_axis,
-                        sharding_axis_names=model.config.sharding_axis_names,
-                        sharding_axis_dims=model.config.sharding_axis_dims,
-                        sharding_dcn_axis_dims=model.config.sharding_dcn_axis_dims,
-                        model_task=model.model_task,
-                        verbose=True,
-                    )
-
-                    actual_step = int(jax.device_get(resumed_state.step))
-
-                    logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
-
-                    if self.arguments.step_start_point is None:
-                        self.arguments.step_start_point = actual_step
-                        logger.info(f"Set step_start_point to {actual_step}")
-
-                    return resumed_state
-
-                except Exception as e:
-                    logger.warning(f"Failed to load checkpoint from {run_dir_path}: {e}")
-                    continue
-
-            logger.warning("Could not load any checkpoints. Starting fresh training.")
-            return None
-
-        except Exception as e:
-            logger.warning(f"Error while trying to resume from checkpoint: {e}")
-            return None
 
     def _initialize_memory_tracking(self):
         """Initialize memory monitoring for tracking GPU/TPU memory usage.
@@ -850,6 +610,7 @@ class BaseTrainer(BaseTrainerProtocol):
             self.sharded_evaluation_step_function = sharded_evaluation_step_function
             self.mesh = functions.mesh
             self.checkpoint_manager = functions.checkpoint_manager
+            self.checkpointer = self._create_checkpointer()
         self.timer.log("configure functions and sharding them")
 
     def _configure_state(self):
@@ -1297,12 +1058,11 @@ class BaseTrainer(BaseTrainerProtocol):
             config=self.model.config,
         )
 
-    def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
+    def _save_state(self, state: EasyDeLState, save_directory: str | None = None, *args, **kwargs) -> str:
         """
         Save the current model state to a checkpoint.
 
         This method handles the complete checkpoint saving process including:
-        - Managing checkpoint limits (removing old checkpoints if needed)
         - Creating checkpoint directories with proper naming
         - Saving training arguments alongside the model
         - Generating README documentation for the checkpoint
@@ -1310,15 +1070,20 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Args:
             state: The model state to save
+            save_directory: Optional override for save directory. If None, uses
+                default directory based on current step.
             *args: Additional positional arguments
             **kwargs: Additional keyword arguments
 
         Returns:
             str: Path to the saved checkpoint directory
         """
-        step = self._get_current_step(state)
-        self._manage_checkpoint_limit(self.arguments._get_save_directory())
-        directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+        if save_directory is None:
+            step = self._get_current_step(state)
+            directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+        else:
+            directory_name = ePath(save_directory)
+
         logger.info(f"saving state {directory_name}.")
         directory_name.mkdir(exist_ok=True)
         self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
@@ -1330,6 +1095,72 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
         return str(directory_name)
+
+    def _create_checkpointer(self):
+        """Create and configure the Checkpointer instance.
+
+        Returns:
+            Checkpointer: Configured checkpointer with policies from training arguments.
+
+        Note:
+            - Uses save_steps from TrainingArguments to create checkpoint policies
+            - No time-based saving by default (can be extended via save_interval_timedelta)
+            - Checkpoints are saved to the base output directory
+        """
+        return self.arguments.get_streaming_checkpointer()
+
+    def _cleanup_old_checkpoints(self):
+        """Clean up old permanent checkpoints based on save_total_limit.
+
+        Only affects permanent checkpoints (run-based saves). Temporary checkpoints
+        are managed automatically by Checkpointer.
+
+        Uses Checkpointer's async deletion queue for non-blocking cleanup.
+
+        Note:
+            - Reads metadata.json to identify permanent vs temporary checkpoints
+            - Keeps the N most recent permanent checkpoints (N = save_total_limit)
+            - Sorts by modification time to determine which are oldest
+            - Queues deletion asynchronously (non-blocking)
+        """
+        if self.arguments.save_total_limit is None:
+            return
+
+        from eformer.serialization.checkpointer import _read_checkpoint_metadata
+
+        save_dir = ePath(self.arguments._get_save_directory())
+        if not save_dir.exists():
+            return
+
+        # Find all checkpoint directories with metadata
+        checkpoint_dirs = []
+        for path in save_dir.glob("run-*"):
+            if path.is_dir() and (path / "metadata.json").exists():
+                try:
+                    metadata = _read_checkpoint_metadata(str(path))
+                    # Only consider permanent checkpoints
+                    if not metadata.get("is_temporary", False):
+                        checkpoint_dirs.append(path)
+                except Exception:
+                    continue
+
+        if len(checkpoint_dirs) <= self.arguments.save_total_limit:
+            return
+
+        # Sort by modification time (oldest first)
+        def get_mtime(path):
+            try:
+                return path.stat().get("mtime", 0)
+            except Exception:
+                return 0
+
+        checkpoint_dirs.sort(key=get_mtime)
+
+        # Queue oldest checkpoints for async deletion
+        to_delete = checkpoint_dirs[: -self.arguments.save_total_limit]
+        for old_checkpoint in to_delete:
+            logger.info(f"Queueing old permanent checkpoint for deletion: {old_checkpoint}")
+            self.checkpointer._queue_checkpoint_removal(str(old_checkpoint))
 
     def _get_current_step(self, state):
         """Get the current training step from state.
@@ -1344,89 +1175,6 @@ class BaseTrainer(BaseTrainerProtocol):
         if self.arguments.step_start_point is not None:
             step += self.arguments.step_start_point
         return step
-
-    def _manage_checkpoint_limit(self, save_directory):
-        """
-        Manage the checkpoint limit by removing old checkpoints.
-
-        This method enforces the save_total_limit by removing the oldest
-        checkpoints when the limit is exceeded. It safely handles directory
-        removal and ensures only valid checkpoint directories are deleted.
-
-        Args:
-            save_directory: Base directory containing checkpoints
-
-        Note:
-            - Only removes directories matching the pattern "run-{number}"
-            - Sorts checkpoints by modification time to identify oldest
-            - Handles errors gracefully to prevent training interruption
-        """
-
-        def _remove_directory_recursive(path):
-            """Recursively remove directory using ePath methods"""
-            if not path.exists():
-                return
-
-            if path.is_file():
-                path.unlink(missing_ok=True)
-            elif path.is_dir():
-                try:
-                    for item in path.iterdir():
-                        _remove_directory_recursive(item)
-                    path.rmdir()
-                except Exception as e:
-                    logger.warning(f"Error removing directory {path}: {e}")
-
-        def _operate():
-            try:
-                save_path = ePath(save_directory)
-                checkpoint_dirs = []
-                try:
-                    all_run_paths = list(save_path.glob("run-*"))
-                    checkpoint_dirs = [p for p in all_run_paths if p.is_dir()]
-
-                    if not checkpoint_dirs:
-                        return
-
-                    run_pattern = re.compile(r"^run-\d+$")
-                    checkpoint_dirs = [p for p in checkpoint_dirs if run_pattern.match(p.name)]
-
-                except Exception as e:
-                    logger.warning(f"Error listing checkpoint directories in {save_path}: {e}")
-                    return
-
-                if not checkpoint_dirs:
-                    return
-
-                def get_mtime(path):
-                    try:
-                        return path.stat().get("mtime", 0)
-                    except Exception:
-                        return 0
-
-                checkpoint_dirs.sort(key=get_mtime)
-
-                if self.arguments.save_total_limit == 0:
-                    _do_dele = checkpoint_dirs
-                else:
-                    _do_dele = checkpoint_dirs[: -self.arguments.save_total_limit]
-
-                for old_save_directory in _do_dele:
-                    try:
-                        # Double-check it's a directory and matches pattern before removal
-                        if old_save_directory.is_dir() and old_save_directory.name.startswith("run-"):
-                            _remove_directory_recursive(old_save_directory)
-                            logger.info(f"Removed old checkpoint directory: {old_save_directory}")
-                        else:
-                            logger.warning(f"Skipping non-directory or invalid pattern: {old_save_directory}")
-                    except Exception as e:
-                        logger.error(f"Failed to remove directory {old_save_directory}: {e}")
-
-            except Exception as e:
-                logger.error(f"Error in checkpoint limit management: {e}")
-
-        if self.arguments.save_total_limit is not None:
-            _operate()
 
     def _save_readme(self, save_directory):
         """Save training information as README.md in checkpoint directory.
@@ -1764,23 +1512,6 @@ class BaseTrainer(BaseTrainerProtocol):
 
         return compiled
 
-    def _should_save_checkpoint(self, current_step):
-        """
-        Determine if checkpoint should be saved at current step.
-
-        Args:
-            current_step: The current training step
-
-        Returns:
-            bool: True if a checkpoint should be saved at this step
-
-        Note:
-            Based on save_steps configuration in training arguments
-        """
-        return (
-            self.arguments.save_steps is not None and current_step > 0 and current_step % self.arguments.save_steps == 0
-        )
-
     def _should_run_evaluation(self, current_step):
         """
         Determine if evaluation should be run at current step.
@@ -1819,9 +1550,30 @@ class BaseTrainer(BaseTrainerProtocol):
 
         dire = ePath(self.arguments.save_directory)
         if self.arguments.do_last_save:
-            filename = self._save_state(state=state, milestone=False, save_directory=dire)
-            if self.arguments.save_directory is not None:
-                checkpoint_path = dire / filename
+            # Use checkpointer.on_step with force=True for final save
+            current_step = int(jax.device_get(state.step))
+
+            # Track the saved directory in the callback
+            saved_directory = [None]  # Use list for mutability in closure
+
+            def save_callback(dest, mesh, meta, s=state):
+                full_path = str(self.arguments._get_save_directory() / dest)
+                saved_directory[0] = self._save_state(state=s, save_directory=full_path)
+                # Clean up old permanent checkpoints if save_total_limit is set
+                self._cleanup_old_checkpoints()
+
+            self.checkpointer.on_step(
+                mesh=self.mesh,
+                pytree=None,
+                step=current_step,
+                force=True,  # Force final checkpoint save
+                true_callbacks=[save_callback],
+            )
+
+            if saved_directory[0] is not None:
+                filename = saved_directory[0]
+                if self.arguments.save_directory is not None:
+                    checkpoint_path = dire / filename
 
         return TrainerOutput(
             state=state,

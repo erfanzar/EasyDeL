@@ -46,7 +46,7 @@ Example:
 
 import typing as tp
 from enum import Enum
-from functools import cached_property, partial
+from functools import cached_property
 
 import einops
 import flax.nnx as nn
@@ -91,7 +91,7 @@ def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
         >>> dtype == jnp.float32
         True
     """
-    dtype_mapping = {
+    dtype_mapping: dict[str, jnp.dtype] = {
         "<class 'jax.numpy.float32'>": jnp.float32,
         "<class 'jax.numpy.float64'>": jnp.float64,
         "<class 'jax.numpy.int32'>": jnp.int32,
@@ -100,7 +100,8 @@ def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
         "<class 'jax.numpy.complex64'>": jnp.complex64,
         "<class 'jax.numpy.complex128'>": jnp.complex128,
     }
-    return dtype_mapping.get(dtype_string, dtype_string)
+    result: jnp.dtype | str = dtype_mapping.get(dtype_string, dtype_string)
+    return result
 
 
 class AttentionMechanisms(str, Enum):
@@ -156,7 +157,11 @@ def tpu_version_check(version: str = "v4") -> bool:
         ...     # Use TPU v5 optimizations
         ...     pass
     """
-    if version in getattr(jax.local_devices()[0], "device_kind", "").lower():
+    first_device: tp.Any = jax.local_devices()[0]
+    device_kind: str = getattr(first_device, "device_kind", "")
+    device_kind_lower: str = device_kind.lower()
+    version_matches: bool = version in device_kind_lower
+    if version_matches:
         return True
 
     return False
@@ -183,15 +188,25 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
         ... )
     """
 
-    match jax.default_backend():
+    current_backend: str = jax.default_backend()
+    match current_backend:
         case "tpu":
-            if tpu_version_check("v3"):
-                return AttentionMechanisms.FLASH_ATTN2, jnp.float32
-            return AttentionMechanisms.BLOCKSPARSE, jnp.bfloat16
+            is_tpu_v3: bool = tpu_version_check("v3")
+            if is_tpu_v3:
+                result_mechanism: AttentionMechanisms = AttentionMechanisms.FLASH_ATTN2
+                result_dtype: jnp.dtype = jnp.float32
+                return result_mechanism, result_dtype
+            result_mechanism_v4: AttentionMechanisms = AttentionMechanisms.BLOCKSPARSE
+            result_dtype_v4: jnp.dtype = jnp.bfloat16
+            return result_mechanism_v4, result_dtype_v4
         case "gpu":
-            return (AttentionMechanisms.FLASH_ATTN2, jnp.bfloat16)
+            gpu_mechanism: AttentionMechanisms = AttentionMechanisms.FLASH_ATTN2
+            gpu_dtype: jnp.dtype = jnp.bfloat16
+            return (gpu_mechanism, gpu_dtype)
         case _:
-            return AttentionMechanisms.VANILLA, jnp.bfloat16
+            fallback_mechanism: AttentionMechanisms = AttentionMechanisms.VANILLA
+            fallback_dtype: jnp.dtype = jnp.bfloat16
+            return fallback_mechanism, fallback_dtype
 
 
 DEFAULT_ATTENTION_MECHANISM = "auto"
@@ -263,29 +278,43 @@ class FlexibleAttentionModule(nn.Module):
             dropout_prob (float, optional): The dropout probability for attention weights.
                                              Defaults to 0.0.
         """
+        rngs_computed: nn.Rngs
         if rngs is None:
-            rngs = nn.Rngs(42)
-        if isinstance(base_config.attn_dtype, str):
+            rngs_computed = nn.Rngs(42)
+        else:
+            rngs_computed = rngs
+
+        attn_dtype_is_string: bool = isinstance(base_config.attn_dtype, str)
+        if attn_dtype_is_string:
             base_config.attn_dtype = _get_jax_dtype_from_string(base_config.attn_dtype)
-        if isinstance(base_config.attn_softmax_dtype, str):
+
+        attn_softmax_dtype_is_string: bool = isinstance(base_config.attn_softmax_dtype, str)
+        if attn_softmax_dtype_is_string:
             base_config.attn_softmax_dtype = _get_jax_dtype_from_string(base_config.attn_softmax_dtype)
-        if base_config.attn_mechanism == AttentionMechanisms.AUTO:
+
+        is_auto_mechanism: bool = base_config.attn_mechanism == AttentionMechanisms.AUTO
+        if is_auto_mechanism:
+            impl_name: AttentionMechanisms
+            runtime_dtype: jnp.dtype
             impl_name, runtime_dtype = get_optimal_config()
             logger.debug(f"Automatically select OperationImpl {impl_name} | {runtime_dtype}")
             base_config.attn_mechanism = impl_name
             base_config.attn_dtype = runtime_dtype
 
-        metadata = OperationMetadata.from_config(config=base_config)
-        self.config = base_config
-        self.metadata = metadata
-        self.rngs = rngs
-        self.softmax_scale = softmax_scale
-        self.dropout_prob = dropout_prob
-        self.impl = OperationRegistry.create(impl_name=base_config.attn_mechanism, metadata=metadata)
-        self.deterministic = True
-        self.impl_decode = None
-        if base_config.decode_attn_mechanism is not None:
-            self.impl_decode = OperationRegistry.create(impl_name=base_config.decode_attn_mechanism, metadata=metadata)
+        metadata: OperationMetadata = OperationMetadata.from_config(config=base_config)
+        self.config: EasyDeLBaseConfig = base_config
+        self.metadata: OperationMetadata = metadata
+        self.rngs: nn.Rngs = rngs_computed
+        self.softmax_scale: float = softmax_scale
+        self.dropout_prob: float = dropout_prob
+        impl_name_final: str = base_config.attn_mechanism
+        self.impl: tp.Any = OperationRegistry.create(impl_name=impl_name_final, metadata=metadata)
+        self.deterministic: bool = True
+        self.impl_decode: tp.Any | None = None
+        has_decode_mechanism: bool = base_config.decode_attn_mechanism is not None
+        if has_decode_mechanism:
+            decode_impl_name: str = base_config.decode_attn_mechanism
+            self.impl_decode = OperationRegistry.create(impl_name=decode_impl_name, metadata=metadata)
 
     @jax.named_scope("easydel-flexible-attention")
     def forward(
@@ -362,8 +391,10 @@ class FlexibleAttentionModule(nn.Module):
             AttentionOutput: An object containing the attention output tensor and potentially
                              attention weights (depending on the backend).
         """
-        if isinstance(cache_view, RaggedPagesCacheView):
-            assert self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
+        is_ragged_page_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
+        if is_ragged_page_cache:
+            mechanism_is_ragged_page: bool = self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
+            assert mechanism_is_ragged_page
         # NOTE: Attention Dropout is disabled for now.
         # try:
         #     rngs = self.rngs()
@@ -372,30 +403,40 @@ class FlexibleAttentionModule(nn.Module):
 
         # Use provided dropout_rng or rngs
         # if dropout_rng is None:
-        dropout_rng = None
 
         # Use provided deterministic or self.deterministic
+        deterministic_computed: bool
         if deterministic is None:
-            deterministic = self.deterministic
+            deterministic_computed = self.deterministic
+        else:
+            deterministic_computed = deterministic
 
         # Use provided softmax_scale or self.softmax_scale
+        softmax_scale_computed: float
         if softmax_scale is None:
-            softmax_scale = self.softmax_scale
+            softmax_scale_computed = self.softmax_scale
+        else:
+            softmax_scale_computed = softmax_scale
 
-        # Use provided dropout_prob or self.dropout_prob
-        if dropout_prob is None:
-            dropout_prob = self.dropout_prob
+        dropout_prob_final: float = 0.0
+        dropout_rng_final: tp.Any | None = None
 
         # Use provided precision or default
+        precision_computed: lax.PrecisionLike
         if precision is None:
-            precision = lax.Precision.DEFAULT
+            precision_computed = lax.Precision.DEFAULT
+        else:
+            precision_computed = precision
 
         # Use provided policy or default
+        policy_computed: tp.Any
         if policy is None:
-            policy = jax.checkpoint_policies.nothing_saveable
+            policy_computed = jax.checkpoint_policies.nothing_saveable
+        else:
+            policy_computed = policy
 
         with self.config.mesh:
-            input_dict = dict(
+            input_dict: dict[str, tp.Any] = dict(
                 query=query_states,
                 key=key_states,
                 value=value_states,
@@ -406,13 +447,13 @@ class FlexibleAttentionModule(nn.Module):
                 cache_view=cache_view,
                 init_bias=init_bias,
                 causal=causal,
-                deterministic=deterministic,
-                dropout_rng=dropout_rng,
+                deterministic=deterministic_computed,
+                dropout_rng=dropout_rng_final,
                 softmax_aux=softmax_aux,
-                softmax_scale=softmax_scale,
+                softmax_scale=softmax_scale_computed,
                 logits_soft_cap=logits_soft_cap,
-                dropout_prob=dropout_prob,
-                precision=precision,
+                dropout_prob=dropout_prob_final,
+                precision=precision_computed,
                 prevent_cse=prevent_cse,
                 cum_seqlens_q=cum_seqlens_q,
                 cum_seqlens_k=cum_seqlens_k,
@@ -422,25 +463,35 @@ class FlexibleAttentionModule(nn.Module):
                 optimized=optimized,
                 mask_value=mask_value,
                 vmem_limit_bytes=vmem_limit_bytes,
-                policy=policy,
+                policy=policy_computed,
             )
-            if mode == common_types.MODE_DECODE:
-                assert cache_view is not None
-                callable_attn = self.impl if self.impl_decode is None else self.impl_decode
+            is_decode_mode: bool = mode == common_types.MODE_DECODE
+            output: AttentionOutput
+            if is_decode_mode:
+                cache_view_is_none: bool = cache_view is None
+                assert not cache_view_is_none
+                has_decode_impl: bool = self.impl_decode is not None
+                callable_attn: tp.Any = self.impl_decode if has_decode_impl else self.impl
                 output = callable_attn(**input_dict)
             else:
                 output = self.impl(**input_dict)
 
-        return jtu.tree_map(lambda x: x.astype(self.impl.metadata.runtime_dtype), output)
+        target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
+
+        def cast_to_dtype(x: tp.Any) -> tp.Any:
+            return x.astype(target_dtype)
+
+        result: AttentionOutput = jtu.tree_map(cast_to_dtype, output)
+        return result
 
     __call__ = forward
 
 
-SC = tp.TypeVar("SC")
+Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
 """Type variable for configuration objects."""
 
 
-class AttentionModule(nn.Module):
+class AttentionModule(nn.Module, tp.Generic[Cfg]):
     """
     Base class for Flax attention modules in EasyDeL, providing common utilities.
 
@@ -449,22 +500,22 @@ class AttentionModule(nn.Module):
     and head manipulation. Concrete attention implementations often inherit from this class.
 
     Attributes:
-        config (SC | EasyDeLBaseConfig): Configuration object for the attention module.
+        config (Cfg | EasyDeLBaseConfig): Configuration object for the attention module.
         cached_key (nn.Cache[Array] | None): Flax Cache for storing past key states (wont be used).
         cached_value (nn.Cache[Array] | None): Flax Cache for storing past value states (wont be used).
         cache_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
     """
 
-    def __init__(self, config: SC):  # type:ignore
+    def __init__(self, config: Cfg):
         """
         Initializes the AttentionModule.
 
         Args:
-            config (SC): The configuration object for this attention module.
+            config (Cfg): The configuration object for this attention module.
                          It should conform to or include attributes from EasyDeLBaseConfig.
         """
         super().__init__()
-        self.config: SC | EasyDeLBaseConfig = config
+        self.config = config
 
         self.cached_key: nn.Cache[Array] | None = None
         self.cached_value: nn.Cache[Array] | None = None
@@ -476,24 +527,26 @@ class AttentionModule(nn.Module):
         xk: Float[JArray, "... seq heads dim"],
         freqs_cis: Complex[JArray, "batch seq 1 dim_2"],
     ) -> tuple[Float[JArray, "... seq heads dim"], Float[JArray, "... seq heads dim"]]:
-        xq_reshaped = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-        xk_reshaped = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
-        xq_complex = xq_reshaped[..., 0] + 1j * xq_reshaped[..., 1]
-        xk_complex = xk_reshaped[..., 0] + 1j * xk_reshaped[..., 1]
-        xq_out_complex = xq_complex * freqs_cis[:, :, None, :]
-        xk_out_complex = xk_complex * freqs_cis[:, :, None, :]
-        xq_out_real = jnp.stack(
-            [jnp.real(xq_out_complex), jnp.imag(xq_out_complex)],
-            axis=-1,
-        )
-        xk_out_real = jnp.stack(
-            [jnp.real(xk_out_complex), jnp.imag(xk_out_complex)],
-            axis=-1,
-        )
-        xq_out = xq_out_real.reshape(*xq_out_real.shape[:-2], -1)
-        xk_out = xk_out_real.reshape(*xk_out_real.shape[:-2], -1)
-        xq_out = xq_out.astype(xq.dtype)
-        xk_out = xk_out.astype(xk.dtype)
+        xq_float32: Float[JArray, "... seq heads dim"] = xq.astype(jnp.float32)
+        xk_float32: Float[JArray, "... seq heads dim"] = xk.astype(jnp.float32)
+        xq_reshaped: Float[JArray, "... seq heads dim_2 2"] = xq_float32.reshape(*xq.shape[:-1], -1, 2)
+        xk_reshaped: Float[JArray, "... seq heads dim_2 2"] = xk_float32.reshape(*xk.shape[:-1], -1, 2)
+        xq_complex: Complex[JArray, "... seq heads dim_2"] = xq_reshaped[..., 0] + 1j * xq_reshaped[..., 1]
+        xk_complex: Complex[JArray, "... seq heads dim_2"] = xk_reshaped[..., 0] + 1j * xk_reshaped[..., 1]
+        xq_out_complex: Complex[JArray, "batch seq heads dim_2"] = xq_complex * freqs_cis[:, :, None, :]
+        xk_out_complex: Complex[JArray, "batch seq heads dim_2"] = xk_complex * freqs_cis[:, :, None, :]
+        xq_real_part: Float[JArray, "batch seq heads dim_2"] = jnp.real(xq_out_complex)
+        xq_imag_part: Float[JArray, "batch seq heads dim_2"] = jnp.imag(xq_out_complex)
+        xk_real_part: Float[JArray, "batch seq heads dim_2"] = jnp.real(xk_out_complex)
+        xk_imag_part: Float[JArray, "batch seq heads dim_2"] = jnp.imag(xk_out_complex)
+        xq_out_real = jnp.stack([xq_real_part, xq_imag_part], axis=-1)
+        xk_out_real = jnp.stack([xk_real_part, xk_imag_part], axis=-1)
+        xq_out_reshaped: Float[JArray, "batch seq heads dim"] = xq_out_real.reshape(*xq_out_real.shape[:-2], -1)
+        xk_out_reshaped: Float[JArray, "batch seq heads dim"] = xk_out_real.reshape(*xk_out_real.shape[:-2], -1)
+        xq_original_dtype: jnp.dtype = xq.dtype
+        xk_original_dtype: jnp.dtype = xk.dtype
+        xq_out: Float[JArray, "batch seq heads dim"] = xq_out_reshaped.astype(xq_original_dtype)
+        xk_out: Float[JArray, "batch seq heads dim"] = xk_out_reshaped.astype(xk_original_dtype)
         return xq_out, xk_out
 
     def apply_qk_shardings(
@@ -501,17 +554,17 @@ class AttentionModule(nn.Module):
         q: Float[JArray, "batch seq heads dim"],
         k: Float[JArray, "batch seq heads dim"],
     ) -> tuple[Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]]:
-        q = apply_logical_sharding(
+        q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
             partition_manager=self.config.partition_manager,
         )
-        k = apply_logical_sharding(
+        k_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
             partition_manager=self.config.partition_manager,
         )
-        return q, k
+        return q_sharded, k_sharded
 
     def apply_qkv_shardings(
         self,
@@ -521,22 +574,22 @@ class AttentionModule(nn.Module):
     ) -> tuple[
         Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]
     ]:
-        q = apply_logical_sharding(
+        q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
             partition_manager=self.config.partition_manager,
         )
-        k = apply_logical_sharding(
+        k_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             k,
             dynamic_axes=common_types.AttnKVSharding,
             partition_manager=self.config.partition_manager,
         )
-        v = apply_logical_sharding(
+        v_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             v,
             dynamic_axes=common_types.AttnKVSharding,
             partition_manager=self.config.partition_manager,
         )
-        return q, k, v
+        return q_sharded, k_sharded, v_sharded
 
     @staticmethod
     def build_cache_pos(
@@ -556,14 +609,23 @@ class AttentionModule(nn.Module):
             jax.Array: An array representing the position of each token in the sequence,
                        adjusted by the cache index if provided. Shape usually [batch, q_len].
         """
-        end_index = 0
-        if isinstance(cache_view, TransformerCacheView) and mode == common_types.MODE_DECODE:
-            end_index = jnp.reshape(cache_view.indexs, (-1, 1))
-        inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
-        return (inipos - (inipos >= 1)) + end_index
+        end_index: int | Int[JArray, "batch 1"] = 0
+        is_cache_view: bool = isinstance(cache_view, TransformerCacheView)
+        is_decode: bool = mode == common_types.MODE_DECODE
+        should_use_cache_index: bool = is_cache_view and is_decode
+        if should_use_cache_index:
+            cache_indexs = cache_view.indexs
+            end_index = jnp.reshape(cache_indexs, (-1, 1))
+        mask_any_kv: Bool[JArray, "batch heads seq_q"] = jnp.any(attention_mask, -1)
+        mask_last_head: Bool[JArray, "batch seq_q"] = mask_any_kv[:, -1, :]
+        inipos: Int[JArray, "batch seq_q"] = jnp.cumsum(mask_last_head, axis=-1)
+        inipos_ge_one: Bool[JArray, "batch seq_q"] = inipos >= 1
+        inipos_adjusted: Int[JArray, "batch seq_q"] = inipos - inipos_ge_one
+        result: Int[JArray, "batch seq_q"] = inipos_adjusted + end_index
+        return result
 
     @cached_property
-    def quantizer(self):
+    def quantizer(self) -> EasyQuantizer:
         """
         Provides an EasyQuantizer instance based on the module's configuration.
 
@@ -572,13 +634,16 @@ class AttentionModule(nn.Module):
         Returns:
             EasyQuantizer: The quantizer instance.
         """
-        return EasyQuantizer(
-            quantization_method=self.config.kv_cache_quantization_method,
-            block_size=self.config.kv_cache_quantization_blocksize,
+        quant_method: str = self.config.kv_cache_quantization_method
+        block_size: int = self.config.kv_cache_quantization_blocksize
+        quantizer_instance: EasyQuantizer = EasyQuantizer(
+            quantization_method=quant_method,
+            block_size=block_size,
         )
+        return quantizer_instance
 
     @property
-    def default_key_value_sharding(self):
+    def default_key_value_sharding(self) -> NamedSharding:
         """
         Defines the default JAX sharding for key and value tensors.
 
@@ -587,16 +652,19 @@ class AttentionModule(nn.Module):
         Returns:
             NamedSharding: The default sharding configuration for K/V tensors.
         """
-        paxis = self.config.partition_axis
-        return NamedSharding(
-            mesh=self.config.mesh,
-            spec=PartitionSpec(
-                paxis.batch_axis,
-                paxis.key_sequence_axis,
-                paxis.head_axis,
-                paxis.attention_dim_axis,
-            ),
+        paxis: tp.Any = self.config.partition_axis
+        mesh: tp.Any = self.config.mesh
+        spec: PartitionSpec = PartitionSpec(
+            paxis.batch_axis,
+            paxis.key_sequence_axis,
+            paxis.head_axis,
+            paxis.attention_dim_axis,
         )
+        sharding: NamedSharding = NamedSharding(
+            mesh=mesh,
+            spec=spec,
+        )
+        return sharding
 
     def get_sharding_safely(self, tensor: Float[JArray, "..."]) -> PartitionSpec:
         """
@@ -611,7 +679,9 @@ class AttentionModule(nn.Module):
         return getattr(tensor, "sharding", self.default_key_value_sharding).spec
 
     @staticmethod
-    def _transpose_sequence_head(*args):
+    def _transpose_sequence_head(
+        *args: Float[JArray, "batch seq heads dim"],
+    ) -> tp.Iterator[Float[JArray, "batch heads seq dim"]]:
         """
         Transposes the sequence and head dimensions of input tensors.
 
@@ -624,7 +694,13 @@ class AttentionModule(nn.Module):
         Returns:
             map: A map object yielding the transposed arrays.
         """
-        return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
+
+        def transpose_array(x: Float[JArray, "batch seq heads dim"]) -> Float[JArray, "batch heads seq dim"]:
+            transposed: Float[JArray, "batch heads seq dim"] = jnp.transpose(x, (0, 2, 1, 3))
+            return transposed
+
+        result_iterator: tp.Iterator[Float[JArray, "batch heads seq dim"]] = map(transpose_array, args)
+        return result_iterator
 
     def _handle_cache_concat(
         self,
@@ -643,20 +719,29 @@ class AttentionModule(nn.Module):
         AttnMaskDetail | None,
     ]:
         """Handles concatenation of current KV states to the cache."""
-        if cache_view is None:
+        cache_is_none: bool = cache_view is None
+        if cache_is_none:
             return key, value, mask_info, None, None
-        key, value, mask_info, cache_view, masking_details = cache_view.concatenate_to_cache(
-            query=query,
-            key=key,
-            value=value,
-            mode=mode,
-            quantizer=self.quantizer,
-            mask_info=mask_info,
-            cache_metadata=cache_metadata,
-            partition_manager=self.config.partition_manager,
+
+        key_cached: Float[JArray, "batch seq_k heads dim"]
+        value_cached: Float[JArray, "batch seq_v heads dim"]
+        mask_info_updated: MaskInfo
+        cache_view_updated: TransformerCacheView
+        masking_details: AttnMaskDetail | None
+        key_cached, value_cached, mask_info_updated, cache_view_updated, masking_details = (
+            cache_view.concatenate_to_cache(
+                query=query,
+                key=key,
+                value=value,
+                mode=mode,
+                quantizer=self.quantizer,
+                mask_info=mask_info,
+                cache_metadata=cache_metadata,
+                partition_manager=self.config.partition_manager,
+            )
         )
 
-        return key, value, mask_info, cache_view, masking_details
+        return key_cached, value_cached, mask_info_updated, cache_view_updated, masking_details
 
     def _apply_sliding_window(
         self,
@@ -669,11 +754,11 @@ class AttentionModule(nn.Module):
         query_length: int,
         masking_details: AttnMaskDetail | None,
         cache_metadata: TransformerMetadata | None,
-    ) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, Array, MaskInfo, TransformerMetadata | None]:
         """Applies sliding window masking and slicing to KV and mask."""
 
         # offsets = jnp.zeros((key.shape[0],), "i4")
-        krange = key.shape[1] if masking_details is None else mask_info.kv_len
+        # krange = key.shape[1] if masking_details is None else mask_info.kv_len
         # if mode == common_types.MODE_DECODE and cache_view is not None:
         #     indexs = cache_view.indexs
         #     # offsets = indexs - 1
@@ -682,25 +767,25 @@ class AttentionModule(nn.Module):
         # else:
         #     indexs = jnp.zeros((key.shape[0],), "i4") + 1
 
-        @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0, 0))
-        def _select_slices(ikey, ival, imsk, offset, index):
-            row_ids_sliding = offset + jax.lax.broadcasted_iota(jnp.int32, (query_length, 1), 0)
-            col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, krange), 1)
-            rhm = col_ids_sliding <= row_ids_sliding
-            lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
+        # @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0, 0))
+        # def _select_slices(ikey, ival, imsk, offset, index):
+        #     row_ids_sliding = offset + jax.lax.broadcasted_iota(jnp.int32, (query_length, 1), 0)
+        #     col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, krange), 1)
+        #     rhm = col_ids_sliding <= row_ids_sliding
+        #     lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
 
-            imsk = (lhm & rhm) & imsk.astype(jnp.bool_)
-            if mode == common_types.MODE_DECODE and masking_details is not None:
-                start_index = jax.lax.max(0, index - sliding_window)
-                if imsk.shape[-1] > sliding_window:
-                    imsk = jax.lax.dynamic_slice_in_dim(imsk, start_index, sliding_window, 2)
-                if ikey.shape[0] > sliding_window:
-                    ikey = jax.lax.dynamic_slice_in_dim(ikey, start_index, sliding_window, 0)
-                    ival = jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0)
-            elif mode == common_types.MODE_PREFILL:
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, max(0, query_length - sliding_window), sliding_window, 2)
+        #     imsk = (lhm & rhm) & imsk.astype(jnp.bool_)
+        #     if mode == common_types.MODE_DECODE and masking_details is not None:
+        #         start_index = jax.lax.max(0, index - sliding_window)
+        #         if imsk.shape[-1] > sliding_window:
+        #             imsk = jax.lax.dynamic_slice_in_dim(imsk, start_index, sliding_window, 2)
+        #         if ikey.shape[0] > sliding_window:
+        #             ikey = jax.lax.dynamic_slice_in_dim(ikey, start_index, sliding_window, 0)
+        #             ival = jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0)
+        #     elif mode == common_types.MODE_PREFILL:
+        #         imsk = jax.lax.dynamic_slice_in_dim(imsk, max(0, query_length - sliding_window), sliding_window, 2)
 
-            return ikey, ival, imsk
+        #     return ikey, ival, imsk
 
         # key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
 
@@ -711,7 +796,11 @@ class AttentionModule(nn.Module):
         #         indexs=jnp.full((attention_mask.shape[0],), attention_mask.shape[-1]),
         #     )
 
-        return key, value, mask_info, cache_metadata
+        key_result: Array = key
+        value_result: Array = value
+        mask_info_result: MaskInfo = mask_info
+        cache_metadata_result: TransformerMetadata | None = cache_metadata
+        return key_result, value_result, mask_info_result, cache_metadata_result
 
     @jax.named_scope("easydel-flax-attention-concatenate")
     def concatenate(
@@ -772,60 +861,119 @@ class AttentionModule(nn.Module):
         # TODO:MOVEIT
         # assert mask_info.shape[-1] >= key.shape[1], "Attention mask length must match KV sequence length."
 
-        query_length, initial_key_length = query.shape[1], key.shape[1]
+        query_length: int = query.shape[1]
+        initial_key_length: int = key.shape[1]
 
-        if isinstance(mode, common_types.EMPTY_VAL):
-            if cache_view is None:
-                mode = common_types.MODE_TRAIN
+        mode_is_empty: bool = isinstance(mode, common_types.EMPTY_VAL)
+        mode_computed: common_types.RUNTIME_MODE_TYPES
+        if mode_is_empty:
+            cache_view_is_none: bool = cache_view is None
+            if cache_view_is_none:
+                mode_computed = common_types.MODE_TRAIN
             else:
-                mode = common_types.MODE_PREFILL if query_length != 1 else common_types.MODE_DECODE
+                query_is_single_token: bool = query_length != 1
+                mode_computed = common_types.MODE_PREFILL if query_is_single_token else common_types.MODE_DECODE
+        else:
+            mode_computed = mode
 
-        if isinstance(cache_view, RaggedPagesCacheView):
-            cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
+        is_ragged_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
+        if is_ragged_cache:
+            cache_view_updated_ragged: RaggedPagesCacheView = cache_view.concatenate_to_cache(
+                key=key, value=value, cache_metadata=cache_metadata
+            )
 
-            def init_attention_bias():
-                return jnp.zeros((query.shape[0], 1, query_length, initial_key_length), dtype=self.dtype)
+            batch_size: int = query.shape[0]
+            dtype_for_bias: jnp.dtype = self.dtype
 
-            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
+            def init_attention_bias() -> Float[JArray, "batch 1 query_length initial_key_length"]:
+                bias: Float[JArray, "batch 1 query_length initial_key_length"] = jnp.zeros(
+                    (batch_size, 1, query_length, initial_key_length), dtype=dtype_for_bias
+                )
+                return bias
 
-        if cache_view is not None:
-            assert query.shape[0] == cache_view.key.shape[0], "Batch size mismatch between query and cache."
-        key, value, mask_info, cache_view, masking_details = self._handle_cache_concat(
+            return key, value, mask_info, init_attention_bias, cache_view_updated_ragged, cache_metadata
+
+        cache_exists: bool = cache_view is not None
+        if cache_exists:
+            query_batch: int = query.shape[0]
+            cache_batch: int = cache_view.key.shape[0]
+            batches_match: bool = query_batch == cache_batch
+            assert batches_match, "Batch size mismatch between query and cache."
+
+        key_cached: Array
+        value_cached: Array
+        mask_info_cached: MaskInfo
+        cache_view_cached: TransformerCacheView | None
+        masking_details: AttnMaskDetail | None
+        key_cached, value_cached, mask_info_cached, cache_view_cached, masking_details = self._handle_cache_concat(
             query=query,
             key=key,
             value=value,
-            mode=mode,
+            mode=mode_computed,
             mask_info=mask_info,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
         )
 
-        if cache_metadata is None and cache_view is not None:
-            cache_metadata = TransformerMetadata(starts=cache_view.starts, indexs=cache_view.indexs)
-        if sliding_window is not None or (
-            cache_view is not None
-            and cache_view.masking_details is not None
-            and cache_view.masking_details.mask_type == AttnMaskType.SLIDING
-        ):
-            masking_details = cache_view.masking_details if isinstance(cache_view, TransformerCacheView) else None
-            if masking_details and masking_details.mask_type == AttnMaskType.SLIDING:
-                sliding_window = sliding_window or masking_details.size
-            key, value, mask_info, cache_metadata = self._apply_sliding_window(
-                key=key,
-                value=value,
-                mask_info=mask_info,
-                mode=mode,
-                cache_view=cache_view,
-                sliding_window=sliding_window,
-                query_length=query_length,
-                masking_details=masking_details,
-                cache_metadata=cache_metadata,
+        metadata_is_none: bool = cache_metadata is None
+        cache_view_exists: bool = cache_view_cached is not None
+        should_create_metadata: bool = metadata_is_none and cache_view_exists
+        cache_metadata_computed: TransformerMetadata | RaggedPagesMetadata | None
+        if should_create_metadata:
+            starts = cache_view_cached.starts
+            indexs = cache_view_cached.indexs
+            cache_metadata_computed = TransformerMetadata(starts=starts, indexs=indexs)
+        else:
+            cache_metadata_computed = cache_metadata
+
+        sliding_window_provided: bool = sliding_window is not None
+        has_cache_sliding: bool = (
+            cache_view_cached is not None
+            and cache_view_cached.masking_details is not None
+            and cache_view_cached.masking_details.mask_type == AttnMaskType.SLIDING
+        )
+        should_apply_sliding: bool = sliding_window_provided or has_cache_sliding
+        key_final: Array
+        value_final: Array
+        mask_info_final: MaskInfo
+        cache_metadata_final: TransformerMetadata | RaggedPagesMetadata | None
+        if should_apply_sliding:
+            is_transformer_cache: bool = isinstance(cache_view_cached, TransformerCacheView)
+            masking_details_final: AttnMaskDetail | None = (
+                cache_view_cached.masking_details if is_transformer_cache else None
             )
+            has_masking_details: bool = masking_details_final is not None
+            is_sliding_type: bool = has_masking_details and masking_details_final.mask_type == AttnMaskType.SLIDING
+            sliding_window_computed: int
+            if is_sliding_type:
+                sliding_window_computed = sliding_window or masking_details_final.size
+            else:
+                sliding_window_computed = sliding_window
 
-        def init_attention_bias():
-            return mask_info.create_bias(self.dtype)
+            key_final, value_final, mask_info_final, cache_metadata_final = self._apply_sliding_window(
+                key=key_cached,
+                value=value_cached,
+                mask_info=mask_info_cached,
+                mode=mode_computed,
+                cache_view=cache_view_cached,
+                sliding_window=sliding_window_computed,
+                query_length=query_length,
+                masking_details=masking_details_final,
+                cache_metadata=cache_metadata_computed,
+            )
+        else:
+            key_final = key_cached
+            value_final = value_cached
+            mask_info_final = mask_info_cached
+            cache_metadata_final = cache_metadata_computed
 
-        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
+        dtype_self: jnp.dtype = self.dtype
+
+        def init_attention_bias() -> Array:
+            bias: Array = mask_info_final.create_bias(dtype_self)
+            return bias
+
+        return key_final, value_final, mask_info_final, init_attention_bias, cache_view_cached, cache_metadata_final
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]

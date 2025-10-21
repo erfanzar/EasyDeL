@@ -50,6 +50,7 @@ Example:
 """
 
 import jax
+from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from ejkernel.modules import flash_attention
 from ejkernel.types import MaskInfo
@@ -148,15 +149,75 @@ class FlashAttn(OperationImpl):
             AttentionOutput: Object containing attention outputs [batch, seq_len_q, num_heads, head_dim].
                 Attention weights are not computed for efficiency.
         """
-        softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-        dtype = self.metadata.runtime_dtype
-        model_mode = self.get_mode(query=query, BTHD=True)
+        head_dim: int = query.shape[-1]
+        softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
+
+        # Check dimension compatibility for MLA-style attention
+        query_dim: int = query.shape[-1]
+        key_dim: int = key.shape[-1]
+        value_dim: int = value.shape[-1]
+        dims_incompatible: bool = query_dim != value_dim != key_dim
+
+        if dims_incompatible:
+            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
+            fallback_output: AttentionOutput = vanilla_attn(
+                query=query,
+                key=key,
+                value=value,
+                bias=bias,
+                softmax_aux=softmax_aux,
+                mask_info=mask_info,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale_computed,
+                sliding_window=sliding_window,
+                causal=causal,
+                **ignore,
+            )
+            return fallback_output
+
+        dtype: jnp.dtype = self.metadata.runtime_dtype
+        model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
-        attn = flash_attention(
-            query.astype(dtype),
-            key.astype(dtype),
-            value.astype(dtype),
-            bias.astype(dtype) if bias is not None else bias,
+
+        # Cast tensors to runtime dtype
+        query_casted: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype)
+        key_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype)
+        value_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype)
+        bias_casted: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = (
+            bias.astype(dtype) if bias is not None else None
+        )
+
+        # Create sharding specs
+        query_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.query, tensor=query, preserved_indices=[0, 2]
+        )
+        key_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.key, tensor=key, preserved_indices=[0, 2]
+        )
+        value_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.value, tensor=value, preserved_indices=[0, 2]
+        )
+        bias_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.bias, dep=bias, tensor=bias, preserved_indices=[0, 1]
+        )
+        cum_seqlens_q_sharding: PartitionSpec | None = self.create_stable_sharding(
+            PartitionSpec(None), dep=cum_seqlens_q, tensor=cum_seqlens_q
+        )
+        cum_seqlens_k_sharding: PartitionSpec | None = self.create_stable_sharding(
+            PartitionSpec(None), dep=cum_seqlens_k, tensor=cum_seqlens_k
+        )
+        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        )
+        output_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.output, tensor=query, preserved_indices=[0, 2]
+        )
+
+        attn: Float[Array, "batch seq_len_q num_heads head_dim"] = flash_attention(
+            query_casted,
+            key_casted,
+            value_casted,
+            bias_casted,
             cum_seqlens_q,
             cum_seqlens_k,
             softmax_aux,
@@ -171,20 +232,25 @@ class FlashAttn(OperationImpl):
             logits_dtype=jnp.bfloat16,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(shardings.query, tensor=query, preserved_indices=[0, 2]),
-                self.create_stable_sharding(shardings.key, tensor=key, preserved_indices=[0, 2]),
-                self.create_stable_sharding(shardings.value, tensor=value, preserved_indices=[0, 2]),
-                self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias, preserved_indices=[0, 1]),
-                self.create_stable_sharding(PartitionSpec(None), dep=cum_seqlens_q, tensor=cum_seqlens_q),
-                self.create_stable_sharding(PartitionSpec(None), dep=cum_seqlens_k, tensor=cum_seqlens_k),
-                self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                bias_sharding,
+                cum_seqlens_q_sharding,
+                cum_seqlens_k_sharding,
+                softmax_aux_sharding,
             ),
-            out_specs=self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 2]),
+            out_specs=output_sharding,
         )
-        return AttentionOutput(
+
+        attn_sharded: Float[Array, "batch seq_len_q num_heads head_dim"] = with_sharding_constraint(
+            arr=attn, sharding=shardings.output
+        )
+        output: AttentionOutput = AttentionOutput(
             attention_weights=None,
-            attention_outputs=with_sharding_constraint(arr=attn, sharding=shardings.output),
+            attention_outputs=attn_sharded,
         )
+        return output
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
         """

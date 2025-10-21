@@ -70,6 +70,7 @@ from jaxtyping import Array, Float, PRNGKeyArray
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .vanilla_attention import VanillaAttn
 
 
 @OperationRegistry.register
@@ -152,9 +153,31 @@ class RingAttn(OperationImpl):
         Returns:
             AttentionOutput containing the attention result.
         """
+        # Check dimension compatibility for MLA-style attention
+        query_dim: int = query.shape[-1]
+        key_dim: int = key.shape[-1]
+        value_dim: int = value.shape[-1]
+        dims_incompatible: bool = query_dim != value_dim != key_dim
 
-        softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-        dtype = self.metadata.runtime_dtype
+        if dims_incompatible:
+            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
+            fallback_output: AttentionOutput = vanilla_attn(
+                query=query,
+                key=key,
+                value=value,
+                bias=bias,
+                softmax_aux=softmax_aux,
+                mask_info=mask_info,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale,
+                sliding_window=sliding_window,
+                **ignore,
+            )
+            return fallback_output
+
+        head_dim: int = query.shape[-1]
+        softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
+        dtype_runtime: jnp.dtype = self.metadata.runtime_dtype
         model_mode = self.get_mode(query=query, BTHD=False)
 
         shardings = self.metadata.get_shardings(
@@ -164,36 +187,60 @@ class RingAttn(OperationImpl):
             softmax_aux=softmax_aux,
         )
 
-        outputs = ring_attention(
-            query.astype(dtype),
-            key.astype(dtype),
-            value.astype(dtype),
+        # Cast tensors to runtime dtype
+        query_casted: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype_runtime)
+        key_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype_runtime)
+        value_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype_runtime)
+
+        # Create sharding specs
+        query_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.query, dep=query, tensor=query, preserved_indices=[0, 1, 2]
+        )
+        key_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.key, dep=key, tensor=key, preserved_indices=[0, 1, 2]
+        )
+        value_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.value, dep=value, tensor=value, preserved_indices=[0, 1, 2]
+        )
+        bias_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias)
+        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        )
+        output_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.output, tensor=query, preserved_indices=[0, 1, 2]
+        )
+
+        outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
+            query_casted,
+            key_casted,
+            value_casted,
             bias,
             softmax_aux,
             None,
             mask_info=mask_info,
             sliding_window=sliding_window,
-            softmax_scale=softmax_scale,
+            softmax_scale=softmax_scale_computed,
             axis_name=self.metadata.sequence_axis_name,
             precision=precision,
             deterministic=deterministic,
             prevent_cse=prevent_cse,
-            dtype=dtype,
+            dtype=dtype_runtime,
             pdrop=pdrop,
             policy=policy,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(shardings.query, dep=query, tensor=query, preserved_indices=[0, 1, 2]),
-                self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 1, 2]),
-                self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 1, 2]),
-                self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias),
-                self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                bias_sharding,
+                softmax_aux_sharding,
                 PartitionSpec(None),
             ),
-            out_specs=self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 1, 2]),
+            out_specs=output_sharding,
         )
 
-        return AttentionOutput(attention_weights=None, attention_outputs=outputs)
+        result: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=outputs)
+        return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Currently delegates to `forward_native` (scan-based).

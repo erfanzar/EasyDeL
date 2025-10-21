@@ -28,14 +28,15 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -156,30 +157,13 @@ class Qwen2MLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen2Attention(AttentionModule):
-    """Qwen2 Attention module.
+class Qwen2Attention(UnifiedAttention):
+    """Qwen2 Attention module with sliding window support.
 
-    This module implements the multi-head attention mechanism used in the Qwen2 model.
-    It supports Grouped Query Attention (GQA) and Rotary Position Embeddings (RoPE).
-    It also includes a residual dropout layer.
-
-    Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        hidden_size (int): Dimensionality of the hidden states.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for the output projection.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        resid_dropout (nn.Dropout): Dropout applied to the residual connection within the attention block
-            (if config enables).
-        rotary (RoPE): Rotary position embedding module.
+    Inherits from UnifiedAttention with Qwen2-specific customizations:
+    - Sliding window attention (layer-specific)
+    - Custom bias configuration (Q/K/V use bias, O doesn't)
+    - Residual dropout
     """
 
     def __init__(
@@ -192,176 +176,102 @@ class Qwen2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2Attention module.
+        """Initialize Qwen2Attention with sliding window configuration.
 
         Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            ValueError: If `hidden_size` is not divisible by `num_attention_heads`.
+            config: Model configuration
+            layer_idx: Layer index for determining sliding window usage
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: JAX precision setting
+            rngs: Random number generators
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+        # Set sliding window before super().__init__ so it's available during network definition
+        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
+
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for query projection (Qwen2-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.k_proj = column_parallel_linear(
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for key projection (Qwen2-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.v_proj = column_parallel_linear(
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=True for value projection (Qwen2-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.o_proj = row_parallel_linear(
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=False for output projection (Qwen2-specific)."""
+        from easydel.layers.linear import RowParallelLinear
+
+        return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             rngs=rngs,
             use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+    def _create_rotary(self, config: Qwen2Config, dtype: jnp.dtype):
+        """Create Qwen2-specific rotary embedding layer."""
+        return config.get_basic_rope(
+            head_size=config.hidden_size // config.num_attention_heads,
+            rotary_dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            dtype=dtype,
+        )
 
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_attention_performer(self, config: Qwen2Config, rngs: nn.Rngs):
+        """Create attention performer with Qwen2's attention dropout."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
-        )
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
-        self.rotary = self.config.get_basic_rope(
-            head_size=config.hidden_size // config.num_attention_heads,
-            rotary_dim=config.hidden_size // config.num_attention_heads,
-            base=config.rope_theta,
-            dtype=self.dtype,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> AttentionLayerOutput:
-        """
-        Forward pass of the Qwen2Attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        attn_output = self.resid_dropout(attn_output)
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
@@ -604,12 +514,11 @@ class Qwen2Model(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the Qwen2Model.
 
@@ -744,23 +653,12 @@ class Qwen2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen2Config, model_type="qwen2")
-class Qwen2ForCausalLM(EasyDeLBaseModule):
-    """Qwen2 model with a Causal Language Modeling head.
+class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model with a Causal Language Modeling head."""
 
-    This model consists of the base Qwen2 transformer (`Qwen2Model`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-    Optionally, the input token embeddings can be tied to the output projection layer.
-
-    Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (Qwen2Model): The core Qwen2 transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
 
     def __init__(
         self,
@@ -771,47 +669,15 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2ForCausalLM model.
-
-        Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
 
     def __call__(
@@ -911,23 +777,12 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2Config, model_type="qwen2")
-class Qwen2ForSequenceClassification(EasyDeLBaseModule):
-    """Qwen2 model with a Sequence Classification head.
+class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model with a Sequence Classification head."""
 
-    This model consists of the base Qwen2 transformer (`Qwen2Model`) followed by a
-    linear layer (`score`) that projects the transformer's output hidden states
-    (typically the hidden state of the last token or a pooled representation) to
-        the number of classes for classification.
-
-    Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (Qwen2Model): The core Qwen2 transformer model.
-        score (ParallelLinear): The linear layer for classification.
-    """
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
 
     def __init__(
         self,
@@ -938,46 +793,16 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2ForSequenceClassification model.
-
-        Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-                Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            AssertionError: If `config.num_labels` is not defined.
-        """
         super().__init__(
             config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
         )
 
     def __call__(

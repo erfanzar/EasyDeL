@@ -180,10 +180,18 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
-    "layers.attention_operator._attention_impl": [
+    "layers.operations": [
+        "AttentionOutput",
+        "AutoRegressiveDecodeAttn",
+        "BlockSparseAttn",
+        "FlashAttn",
+        "OperationImpl",
         "OperationMetadata",
         "OperationRegistry",
-        "OperationImpl",
+        "RaggedPageAttn",
+        "RingAttn",
+        "ScaledDotProductAttn",
+        "VanillaAttn",
     ],
     "layers.attention": [
         "AttentionMechanisms",
@@ -592,7 +600,19 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.operations._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+    from .layers.operations import (
+        AttentionOutput,
+        AutoRegressiveDecodeAttn,
+        BlockSparseAttn,
+        FlashAttn,
+        OperationImpl,
+        OperationMetadata,
+        OperationRegistry,
+        RaggedPageAttn,
+        RingAttn,
+        ScaledDotProductAttn,
+        VanillaAttn,
+    )
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,
@@ -770,13 +790,23 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.78", "0.0.79", "0.0.80"]
+    _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
+    _targeted_ejkernel_versions = ["0.0.1"]
 
     from eformer import __version__ as _eform_version
+    from ejkernel import __version__ as _ejker_version
 
-    assert _version(_eform_version) in [_version(_targeted_version) for _targeted_version in _targeted_versions], (
-        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
+    assert _version(_eform_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_eformer_versions
+    ], (
+        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_eformer_versions)},"
         f" but found eformer {_eform_version}"
+    )
+    assert _version(_ejker_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_ejkernel_versions
+    ], (
+        f"this version of EasyDeL is only compatible with ejkernel {', '.join(_targeted_ejkernel_versions)},"
+        f" but found ejkernel {_ejker_version}"
     )
 
     if not _is_package_available("torch"):

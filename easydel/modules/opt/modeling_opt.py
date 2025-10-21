@@ -45,9 +45,10 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, MaskedLMOutput
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention import AttentionModule
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -151,20 +152,7 @@ class OPTAttention(AttentionModule):
         self.out_proj = linear(embed_dim, embed_dim, rngs=rngs)
 
         self.dropout_layer = nn.Dropout(rate=self.dropout, rngs=rngs)
-        self.attention_module: AttentionModule = AttentionModule(
-            dropout_prob=config.attention_dropout,
-            num_q_heads=config.num_attention_heads,
-            num_kv_heads=config.num_attention_heads,
-            head_dims=self.head_dim,
-            precision=precision,
-            force_float32_tpu=True,
-            attn_mechanism=config.attn_mechanism,
-            dtype=config.attn_dtype,
-            mesh=config.mesh,
-            softmax_scale=self.head_dim**-0.5,
-            axis_name=config.sequence_axis_name,
-            base_config=config,
-        )
+        self.attention_module = FlexibleAttentionModule(base_config=config, softmax_scale=self.head_dim**-0.5)
 
     def _split_heads(self, hidden_states):
         """Splits the hidden states into multiple heads."""
@@ -226,8 +214,7 @@ class OPTAttention(AttentionModule):
             else:
                 if attention_mask.ndim == 2:
                     attention_mask = attention_mask.reshape(batch_size, 1, sequence_length, 1)
-        if not self.causal:
-            causal_mask = None
+
         (
             key_states,
             value_states,
@@ -244,18 +231,15 @@ class OPTAttention(AttentionModule):
             mask_info=mask_info,
         )
 
-        attentions = self.attention_module(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
+        attentions = self.attention_module.__call__(
+            query_states,
+            key_states,
+            value_states,
             mode=mode,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             causal=self.causal,
-            query_sequence_length=query_states.shape[1],
-            key_value_sequence_length=key_states.shape[1],
             uses_cache=cache_view is not None,
-            causal_mask=causal_mask,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
@@ -358,11 +342,12 @@ class OPTDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    ) -> tuple[chex.Array]:
+        output_attentions: bool = False,
+    ) -> DecoderLayerOutput:
         """Forward pass of the OPTDecoderLayer.
 
         Args:
@@ -389,7 +374,7 @@ class OPTDecoderLayer(nn.Module):
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             mode=mode,
             causal_mask=causal_mask,
             cache_view=cache_view,
@@ -430,7 +415,11 @@ class OPTDecoderLayer(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states, self_attn_weights
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=self_attn_weights if output_attentions else None,
+            cache_view=cache_view,
+        )
 
 
 class OPTLearnedPositionalEmbedding(nn.Embed):
@@ -687,7 +676,7 @@ class OPTDecoder(EasyDeLBaseModule):
 
             layer_outputs = decoder_layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 output_attentions=output_attentions,
                 mode=mode,
                 past_key_values=past_key_values.views[idx],
@@ -816,20 +805,12 @@ class OPTModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=OPTConfig, model_type="opt")
-class OPTForCausalLM(EasyDeLBaseModule):
-    """OPT Model with a Causal Language Modeling head.
+class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):
+    """OPT Model with a Causal Language Modeling head."""
 
-    This model consists of the base OPTModel followed by a linear layer
-    (the language modeling head) to predict the next token logits.
-
-    Attributes:
-        config (OPTConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        model (OPTModel): The base OPT model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "opt"
+    _config_class = OPTConfig
 
     def __init__(
         self,
@@ -841,14 +822,18 @@ class OPTForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.model = OPTModel(
+        """Initialize OPT for Causal LM.
+
+        Args:
+            config: OPT configuration
+            offset: Offset for position embeddings (OPT-specific, default 2)
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: JAX precision setting
+            rngs: Random number generators
+        """
+        # Pre-instantiate base model with OPT-specific offset parameter
+        base_model = OPTModel(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -856,112 +841,28 @@ class OPTForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
             offset=offset,
         )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
+
+        super().__init__(
+            config=config,
+            base_model=base_model,  # Pass pre-instantiated model
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            kernel_init=nn.initializers.normal(config.init_std),
             rngs=rngs,
+            lm_head_bias=False,
+            tie_word_embeddings=config.tie_word_embeddings if hasattr(config, "tie_word_embeddings") else False,
         )
 
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        """Forward pass of the OPTForCausalLM model.
-
-        Args:
-            input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
-            attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            output_attentions (bool): Whether to return attention weights. Defaults to False.
-            output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
-             Defaults to True.
-
-        Returns:
-            tp.Union[MaskedLMOutput, tp.Tuple]: The model's output.
-                returns a `MaskedLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply LM head with OPT's special tie_word_embeddings handling."""
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.decoder.embed_tokens.embedding.value.T
+            # OPT's unique approach: tie at forward pass time
+            shared_kernel = self.base_model.decoder.embed_tokens.embedding.value.T
             self.lm_head.kernel.value = shared_kernel
-            lm_logits = self.lm_head.apply(hidden_states)
-
+            return self.lm_head.apply(hidden_states)
         else:
-            lm_logits = checkpoint_name(self.lm_head(hidden_states), "lm_head_output")
-
-        return MaskedLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-    def set_input_embeddings(self, value):
-        """Sets the input embeddings for the model."""
-        self.model.decoder.embed_tokens = value
-
-    def get_input_embeddings(self):
-        """Gets the input embeddings from the model."""
-        return self.model.decoder.embed_tokens
-
-    def set_decoder(self, decoder):
-        """Sets the decoder module for the model."""
-        self.model.decoder = decoder
-
-    def get_decoder(self):
-        """Gets the decoder module from the model."""
-        return self.model.decoder
-
-    def get_output_embeddings(self):
-        """Gets the output embeddings (language modeling head)."""
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        """Sets the output embeddings (language modeling head)."""
-        self.lm_head = new_embeddings
+            return self.lm_head(hidden_states)
 
     def prepare_inputs_for_generation(
         self,
