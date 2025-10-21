@@ -31,6 +31,7 @@ from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -797,7 +798,7 @@ class Grok1Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Grok1Config, model_type="grok-1")
-class Grok1ForCausalLM(EasyDeLBaseModule):
+class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
     """Grok-1 model with a language modeling head.
 
     This model extends the base Grok1Model by adding a linear layer on top to
@@ -812,6 +813,10 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             rngs (nn.Rngs): Random number generators.
     """
 
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "grok-1"
+    _config_class = Grok1Config
+
     def __init__(
         self,
         config: Grok1Config,
@@ -823,37 +828,15 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Grok1Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
-        self.model = Grok1Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=self.dtype,
-            rngs=rngs,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
         self.output_multiplier_scale = self.config.output_multiplier_scale
 
     def __call__(
@@ -865,11 +848,11 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> MoeCausalLMOutput | tuple:
+    ) -> MoeCausalLMOutput:
         """Forward pass through the Grok1ForCausalLM model.
 
         Args:
@@ -877,7 +860,6 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
             output_router_logits (bool, optional): Whether to return router logits from MoE layers.
@@ -885,74 +867,40 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
                 containing precomputed key/value states.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
 
-
         Returns:
             MoeCausalLMOutput: Model outputs (logits, optional auxiliary loss, optional hidden states,
                 optional attentions, optional router logits)
         """
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        outputs = self.model(
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
-        logits = None
-        if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.num_experts,
-                top_k=self.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
 
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss for load balancing."""
+        if outputs.router_logits is None:
+            return None
+
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
         )
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
     def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+        """Apply LM head with Grok-1's output multiplier scale."""
         lm_logits = super().apply_lm_head(hidden_states)
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()

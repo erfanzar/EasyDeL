@@ -157,12 +157,53 @@ class BlockSparseAttn(OperationImpl):
             An `AttentionOutput` object containing the attention outputs. Attention weights
             are not computed or returned by Splash Attention.
         """
-        query_lenght = query.shape[1]
-        if (
-            (not causal or ((query.shape[-1] % 128) != 0) or ((value.shape[-1] % 128) != 0) or query_lenght == 1)
-            and jax.default_backend() == "tpu"
-        ) or (((query.shape[-1] % 16 != 0 or value.shape[-1] % 16) != 0) and jax.default_backend() == "gpu"):
-            return VanillaAttn(self.metadata)(
+        query_length: int = query.shape[1]
+
+        # Check dimension compatibility for MLA-style attention
+        query_dim: int = query.shape[-1]
+        key_dim: int = key.shape[-1]
+        value_dim: int = value.shape[-1]
+        dims_incompatible: bool = query_dim != value_dim != key_dim
+
+        if dims_incompatible:
+            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
+            fallback_output_1: AttentionOutput = vanilla_attn(
+                query=query,
+                key=key,
+                value=value,
+                softmax_aux=softmax_aux,
+                mask_info=mask_info,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale,
+                sliding_window=sliding_window,
+                causal=causal,
+                cache_metadata=cache_metadata,
+                **ignore,
+            )
+            return fallback_output_1
+
+        # Check hardware-specific constraints for block sparse attention
+        current_backend: str = jax.default_backend()
+        is_tpu: bool = current_backend == "tpu"
+        is_gpu: bool = current_backend == "gpu"
+
+        # TPU constraints: dimensions divisible by 128, causal=True, seq_len > 1
+        query_dim_mod_128: int = query_dim % 128
+        value_dim_mod_128: int = value_dim % 128
+        tpu_constraints_failed: bool = (
+            not causal or query_dim_mod_128 != 0 or value_dim_mod_128 != 0 or query_length == 1
+        )
+
+        # GPU constraints: dimensions divisible by 16
+        query_dim_mod_16: int = query_dim % 16
+        value_dim_mod_16: int = value_dim % 16
+        gpu_constraints_failed: bool = query_dim_mod_16 != 0 or value_dim_mod_16 != 0
+
+        should_fallback: bool = (tpu_constraints_failed and is_tpu) or (gpu_constraints_failed and is_gpu)
+
+        if should_fallback:
+            vanilla_attn_2: VanillaAttn = VanillaAttn(self.metadata)
+            fallback_output_2: AttentionOutput = vanilla_attn_2(
                 query=query,
                 key=key,
                 value=value,
@@ -173,8 +214,11 @@ class BlockSparseAttn(OperationImpl):
                 softmax_aux=softmax_aux,
                 **ignore,
             )
-        softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-        dtype = self.metadata.runtime_dtype
+            return fallback_output_2
+
+        head_dim: int = query.shape[-1]
+        softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
+        dtype: jnp.dtype = self.metadata.runtime_dtype
         model_mode = self.get_mode(query=query, BTHD=False)
 
         shardings = self.metadata.get_shardings(
@@ -183,33 +227,57 @@ class BlockSparseAttn(OperationImpl):
             qkv_mni_sharding=True,
             softmax_aux=softmax_aux,
         )
-        query = query.transpose(0, 2, 1, 3).astype(dtype)
-        key = key.transpose(0, 2, 1, 3).astype(dtype)
-        value = value.transpose(0, 2, 1, 3).astype(dtype)
-        outputs = blocksparse_attention(
-            query,
-            key,
-            value,
+
+        # Transpose from BTHD to BHTD format and cast to runtime dtype
+        query_transposed: Float[Array, "batch num_heads seq_len head_dim"] = query.transpose(0, 2, 1, 3).astype(dtype)
+        key_transposed: Float[Array, "batch kv_num_heads kv_len head_dim"] = key.transpose(0, 2, 1, 3).astype(dtype)
+        value_transposed: Float[Array, "batch kv_num_heads kv_len vhead_dim"] = value.transpose(0, 2, 1, 3).astype(dtype)
+
+        # Create sharding specs
+        query_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.query, dep=query_transposed, tensor=query_transposed, preserved_indices=[0, 1]
+        )
+        key_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.key, dep=key_transposed, tensor=key_transposed, preserved_indices=[0, 1]
+        )
+        value_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.value, dep=value_transposed, tensor=value_transposed, preserved_indices=[0, 1]
+        )
+        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        )
+        output_sharding: PartitionSpec | None = self.create_stable_sharding(
+            shardings.output, tensor=query_transposed, preserved_indices=[0, 1]
+        )
+
+        outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
+            query_transposed,
+            key_transposed,
+            value_transposed,
             softmax_aux,
             None,
             mask_info=mask_info,
             logits_soft_cap=logits_soft_cap,
-            softmax_scale=softmax_scale,
+            softmax_scale=softmax_scale_computed,
             sliding_window=sliding_window,
             causal=causal,
             fused_backward=fused_backward,
             mesh=self.metadata.mesh,
-            out_specs=self.create_stable_sharding(shardings.output, tensor=query, preserved_indices=[0, 1]),
+            out_specs=output_sharding,
             in_specs=(
-                self.create_stable_sharding(shardings.query, dep=query, tensor=query, preserved_indices=[0, 1]),
-                self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 1]),
-                self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 1]),
-                self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                softmax_aux_sharding,
                 PartitionSpec(None),
             ),
-        ).transpose(0, 2, 1, 3)
+        )
 
-        return AttentionOutput(attention_weights=None, attention_outputs=outputs)
+        # Transpose back from BHTD to BTHD format
+        outputs: Float[Array, "batch seq_len num_heads head_dim"] = outputs_bhtd.transpose(0, 2, 1, 3)
+
+        result: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=outputs)
+        return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Not implemented for Splash Attention.

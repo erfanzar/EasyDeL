@@ -689,9 +689,13 @@ def compute_deepseek_frequencies(
         dtype=jnp.float32,
     )
     freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-    mscale = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim) * attn_factor
+    # DeepSeek mscale calculation
+    attention_factor = (
+        yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim) * attn_factor
+    )
 
-    return jnp.concatenate([jnp.cos(freqs) * mscale, jnp.sin(freqs) * mscale], axis=-1)
+    # Standard RoPE format: concatenate cos and sin
+    return jnp.concatenate([jnp.cos(freqs) * attention_factor, jnp.sin(freqs) * attention_factor], axis=-1)
 
 
 @jax.named_scope("easydel-rotary-apply-basic-rope")
@@ -1223,7 +1227,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     """
     if scale <= 1:
         return 1.0
-    return 0.1 * mscale * jnp.log(scale) + 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 @rope_wraper("deepseek_yarn")
@@ -1435,7 +1439,8 @@ def get_rope(
                 dtype=dtype,
             )
         elif scaling_type == "yarn":
-            scaling_factor = rope_scaling["factor"]
+            scaling_factor = rope_scaling.get("factor", rope_scaling.get("scaling_factor"))
+            assert scaling_factor is not None
             original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
             extra_kwargs = {
                 k: v
@@ -1590,19 +1595,34 @@ def get_frequencies(
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
-                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+                if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "mscale", "mscale_all_dim")
             }
 
-            frequencies = compute_yarn_frequencies(
-                base=base,
-                rotary_dim=rotary_dim,
-                beta_fast=extra_kwargs.get("beta_fast", 32),
-                beta_slow=extra_kwargs.get("beta_slow", 1),
-                max_position_embeddings=original_max_position,
-                scaling_factor=scaling_factor,
-                extrapolation_factor=extra_kwargs.get("extrapolation_factor", 1.0),
-                attn_factor=extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
-            )
+            # Check if this is DeepSeek-style YaRN (has mscale and mscale_all_dim parameters)
+            if "mscale" in extra_kwargs and "mscale_all_dim" in extra_kwargs:
+                frequencies = compute_deepseek_frequencies(
+                    base,
+                    rotary_dim,
+                    scaling_factor,
+                    extra_kwargs.get("extrapolation_factor", 1.0),
+                    extra_kwargs.get("beta_fast", 32),
+                    extra_kwargs.get("beta_slow", 1),
+                    original_max_position,
+                    extra_kwargs["mscale"],
+                    extra_kwargs["mscale_all_dim"],
+                    extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
+                )
+            else:
+                frequencies = compute_yarn_frequencies(
+                    base=base,
+                    rotary_dim=rotary_dim,
+                    beta_fast=extra_kwargs.get("beta_fast", 32),
+                    beta_slow=extra_kwargs.get("beta_slow", 1),
+                    max_position_embeddings=original_max_position,
+                    scaling_factor=scaling_factor,
+                    extrapolation_factor=extra_kwargs.get("extrapolation_factor", 1.0),
+                    attn_factor=extra_kwargs.get("attn_factor", extra_kwargs.get("attention_factor", 1)),
+                )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]
@@ -1831,6 +1851,10 @@ class RopeConfig:
     short_factor: float | None = None
     long_mscale: float | None = None
     short_mscale: float | None = None
+    beta_fast: int | None = None
+    beta_slow: int | None = None
+    mscale: int | None = None
+    mscale_all_dim: int | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, tp.Any]) -> RopeConfig:
@@ -1845,9 +1869,10 @@ class RopeConfig:
         Returns:
             RopeConfig: An instance populated from the dictionary.
         """
+
         return cls(
             rope_type=config_dict.get("rope_type") or config_dict.get("type", "default"),
-            factor=config_dict.get("factor"),
+            factor=config_dict.get("factor") or config_dict.get("scaling_factor"),
             low_freq_factor=config_dict.get("low_freq_factor"),
             high_freq_factor=config_dict.get("high_freq_factor"),
             original_max_position_embeddings=config_dict.get("original_max_position_embeddings"),
@@ -1855,6 +1880,10 @@ class RopeConfig:
             short_factor=config_dict.get("short_factor"),
             long_mscale=config_dict.get("long_mscale"),
             short_mscale=config_dict.get("short_mscale"),
+            beta_fast=config_dict.get("beta_fast"),
+            beta_slow=config_dict.get("beta_slow"),
+            mscale=config_dict.get("mscale"),
+            mscale_all_dim=config_dict.get("mscale_all_dim"),
         )
 
     def to_dict(self) -> dict[str, tp.Any]:

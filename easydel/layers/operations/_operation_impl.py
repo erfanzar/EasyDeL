@@ -243,18 +243,25 @@ class OperationImpl(BaseOperation):
         if array is None:
             return None
 
-        if array.shape[1] == num_q_heads or array.shape[1] == 1:
+        current_num_heads: int = array.shape[1]
+        matches_q_heads: bool = current_num_heads == num_q_heads
+        is_broadcastable: bool = current_num_heads == 1
+
+        if matches_q_heads or is_broadcastable:
             return array
 
-        elif array.shape[1] == num_kv_heads:
-            return einops.repeat(
+        matches_kv_heads: bool = current_num_heads == num_kv_heads
+        if matches_kv_heads:
+            repetitions: int = num_q_heads // current_num_heads
+            repeated: Float[Array, "batch num_q_heads q_seq kv_seq"] = einops.repeat(
                 array,
                 "b h q k -> b (h r) q k",
-                r=num_q_heads // array.shape[1],
+                r=repetitions,
             )
+            return repeated
         else:
             raise ValueError(
-                f"Incompatible array shape. Got {array.shape[1]} heads, expected {num_q_heads}, {num_kv_heads}, or 1"
+                f"Incompatible array shape. Got {current_num_heads} heads, expected {num_q_heads}, {num_kv_heads}, or 1"
             )
 
     def create_stable_sharding(
@@ -280,6 +287,7 @@ class OperationImpl(BaseOperation):
                 preserved indices, instead of using `state_ps`.
             dep: A dependency flag or PartitionSpec. If None, returns None. Defaults to True.
                 (The exact purpose might be context-specific, potentially for control flow).
+            tensor: Optional tensor to get corrected sharding for.
 
         Returns:
             A new PartitionSpec with only specified axes partitioned, or None based on `dep`.
@@ -295,15 +303,20 @@ class OperationImpl(BaseOperation):
             if preserved_indices is None:
                 if tensor is None:
                     return state_ps
-                return es.get_corrected_named_sharding(tensor.shape, state_ps).spec
+                corrected: Ps = es.get_corrected_named_sharding(tensor.shape, state_ps).spec
+                return corrected
 
-            new_spec = [None] * len(state_ps)
+            num_dims: int = len(state_ps)
+            new_spec: list[str | None] = [None] * num_dims
+            idx: int
             for idx in preserved_indices:
-                new_spec[idx] = state_ps[idx] if clone_ps is None else clone_ps[idx]
+                source_ps: Ps = state_ps if clone_ps is None else clone_ps
+                new_spec[idx] = source_ps[idx]
 
-            sharding = Ps(*new_spec)
+            sharding: Ps = Ps(*new_spec)
 
             if tensor is None:
                 return sharding
             else:
-                return es.get_corrected_named_sharding(tensor.shape, sharding).spec
+                corrected_sharding: Ps = es.get_corrected_named_sharding(tensor.shape, sharding).spec
+                return corrected_sharding

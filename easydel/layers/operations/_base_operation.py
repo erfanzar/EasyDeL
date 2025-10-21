@@ -273,12 +273,17 @@ class OperationRegistry:
             The registered class itself.
         """
 
-        impl_names = impl_cls.get_impl_name()
-        if not isinstance(impl_names, list | tuple):
-            impl_names = [impl_names]
+        impl_names_raw: str | tuple[str, ...] = impl_cls.get_impl_name()
+        impl_names: list[str] | tuple[str, ...]
+        if not isinstance(impl_names_raw, list | tuple):
+            impl_names = [impl_names_raw]
+        else:
+            impl_names = impl_names_raw
 
+        impl_name: str
         for impl_name in impl_names:
-            if impl_name in cls._registry:
+            already_registered: bool = impl_name in cls._registry
+            if already_registered:
                 logger.warning(f"Operation implementation '{impl_name}' already registered. Overwriting.")
             cls._registry[impl_name] = impl_cls
             logger.debug(f"Registered attention implementation: {impl_name}")
@@ -298,12 +303,14 @@ class OperationRegistry:
         Raises:
             ValueError: If no implementation is registered with that name.
         """
-        if impl_name not in cls._registry:
+        is_registered: bool = impl_name in cls._registry
+        if not is_registered:
+            available_impls: list[str] = list(cls._registry.keys())
             raise ValueError(
-                f"Operation implementation '{impl_name}' not found. Available "
-                f"implementations: {list(cls._registry.keys())}"
+                f"Operation implementation '{impl_name}' not found. Available " f"implementations: {available_impls}"
             )
-        return cls._registry[impl_name]
+        impl_class: type[BaseOperation] = cls._registry[impl_name]
+        return impl_class
 
     @classmethod
     def create(cls, impl_name: str, metadata: OperationMetadata) -> BaseOperation:
@@ -323,8 +330,9 @@ class OperationRegistry:
         Raises:
             ValueError: If no implementation is registered with `impl_name`.
         """
-        impl_cls = cls.get(impl_name)
-        return impl_cls(metadata)
+        impl_cls: type[BaseOperation] = cls.get(impl_name)
+        instance: BaseOperation = impl_cls(metadata)
+        return instance
 
     @classmethod
     def list_implementations(cls) -> list[str]:

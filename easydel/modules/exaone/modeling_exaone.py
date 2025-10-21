@@ -14,8 +14,8 @@
 
 
 import functools
+from typing import ClassVar
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -29,14 +29,12 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
-    CausalLMOutput,
     DecoderLayerOutput,
-    SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -78,7 +76,9 @@ class ExaoneGatedMLP(nn.Module):
         self.c_proj = linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.activation_function]
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -99,147 +99,45 @@ class ExaoneGatedMLP(nn.Module):
         return hidden_states
 
 
-class ExaoneAttentionInner(AttentionModule):
-    def __init__(
-        self,
-        config: ExaoneConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: nn.Rngs,
-    ):
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.attention_dropout_rate = config.attention_dropout
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                "embed_dim must be divisible by num_heads (got `embed_dim`: "
-                f"{self.embed_dim} and `num_heads`: {self.num_heads})."
-            )
+class ExaoneAttentionInner(UnifiedAttention):
+    """Exaone attention with partial RoPE."""
 
-        linear = functools.partial(
-            ColumnParallelLinear,
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "query_projection": "q_proj",
+        "key_projection": "k_proj",
+        "value_projection": "v_proj",
+        "output_projection": "out_proj",
+        "qkv_projection": "qkv_proj",
+    }
+
+    def _create_rotary(self, config: ExaoneConfig, dtype: jnp.dtype):
+        """Override to use partial rotary factor."""
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        rotary_dim = int((config.hidden_size // config.num_attention_heads) * partial_rotary_factor)
+
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=config.hidden_size // config.num_attention_heads,
+            rotary_dim=rotary_dim,
+            is_neox_style=True,
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create output projection with Exaone's custom naming (out_proj)."""
+        return ColumnParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.q_proj = linear(
-            self.embed_dim,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.k_proj = linear(
-            self.embed_dim,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.v_proj = linear(
-            self.embed_dim,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.out_proj = linear(
-            self.embed_dim,
-            self.num_heads * self.head_dim,
-            rngs=rngs,
-        )
-
-        dim = int(
-            (config.hidden_size // config.num_attention_heads)
-            * (config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0)
-        )
-        self.rotary = self.config.get_basic_rope(
-            dtype=self.dtype,
-            head_size=self.config.hidden_size // self.config.num_attention_heads,
-            rotary_dim=dim,
-            is_neox_style=True,
-        )
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    def _get_output_proj(self):
+        """Access output projection using Exaone's naming."""
+        return self.o_proj
 
 
 class ExaoneAttention(nn.Module):
@@ -430,7 +328,7 @@ class ExaoneModel(EasyDeLBaseModule):
         ]
         self.ln_f = RMSNorm(
             dim=self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=self.config.layer_norm_epsilon,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -452,11 +350,11 @@ class ExaoneModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -560,14 +458,12 @@ class ExaoneModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, ExaoneConfig, model_type="exaone")
-class ExaoneForCausalLM(EasyDeLBaseModule):
-    """
-    Exaone model with a language modeling head for causal language modeling tasks.
+class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
+    """Exaone model with a language modeling head for causal language modeling tasks."""
 
-    This model extends the base ExaoneModel by adding a linear language modeling head
-    on top of the transformer model. It's designed for generative tasks and can be used
-    for text generation.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "exaone"
+    _config_class = ExaoneConfig
 
     def __init__(
         self,
@@ -582,139 +478,32 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 
         Args:
             config (ExaoneConfig): The model configuration.
-            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
                 Defaults to None.
             rngs (nn.Rngs): The random number generators.
         """
         super().__init__(
             config=config,
+            base_model_class=ExaoneModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
         )
-        self.transformer = ExaoneModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
-        """
-        Forward pass of the causal language model.
-
-        Args:
-            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
-            segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
-            output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
-            output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
-                Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
-                Defaults to None.
-
-
-        Returns:
-                CausalLMOutput: The model outputs, either as a named tuple or a standard tuple.
-        """
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.transformer.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.transformer.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ExaoneConfig, model_type="exaone")
-class ExaoneForSequenceClassification(EasyDeLBaseModule):
+class ExaoneForSequenceClassification(BaseSequenceClassificationModule[ExaoneModel, ExaoneConfig]):
+    """Exaone model with a Sequence Classification head."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "exaone"
+    _config_class = ExaoneConfig
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -726,106 +515,12 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=ExaoneModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
-        self.model = ExaoneModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
-        """
-        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()

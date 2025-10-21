@@ -14,12 +14,12 @@
 
 
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from einops import rearrange
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
@@ -28,14 +28,15 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -50,26 +51,18 @@ from easydel.layers.norms import RMSNorm
 from .internlm2_configuration import InternLM2Config
 
 
-class InternLM2Attention(AttentionModule):
-    """InternLM2 Attention module.
+class InternLM2Attention(UnifiedAttention):
+    """InternLM2 Attention with full RoPE.
 
-    Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        rngs (nn.Rngs): Random number generators.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of key/value heads (for GQA).
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        max_position_embeddings (int): Maximum sequence length supported.
-        wqkv (ParallelLinear): Linear layer for query, key, and value projections.
-        wo (ParallelLinear): Linear layer for the output projection.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        rotary (RoPE): Rotary position embedding module.
+    Inherits from UnifiedAttention.
+    Uses combined QKV projection (wqkv) instead of separate projections.
+    Overrides forward_standard to efficiently handle fused QKV with GQA layout.
     """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "output_projection": "wo",
+        "query_key_value_projection": "wqkv",
+    }
 
     def __init__(
         self,
@@ -80,34 +73,23 @@ class InternLM2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the InternLM2Attention module.
+        """Initialize InternLM2 attention."""
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            use_fused_qkv=True,
+            use_gqa=True,
+        )
 
-        Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.wqkv = ColumnParallelLinear(
+    def _create_fused_qkv_proj(self, config, dtype, param_dtype, precision, rngs):
+        return ColumnParallelLinear(
             config.hidden_size,
-            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            (config.num_attention_heads + 2 * config.num_key_value_heads) * self.head_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=config.bias,
@@ -116,8 +98,10 @@ class InternLM2Attention(AttentionModule):
             precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.wo = RowParallelLinear(
-            self.num_heads * self.head_dim,
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        return RowParallelLinear(
+            config.num_attention_heads * self.head_dim,
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -128,102 +112,22 @@ class InternLM2Attention(AttentionModule):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_rotary(self, config: InternLM2Config, dtype: jnp.dtype):
+        """Create InternLM2-specific rotary embedding with full RoPE."""
+        return config.get_basic_rope(
+            dtype=dtype,
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,  # Full RoPE
+            base=config.rope_theta,
+        )
+
+    def _create_attention_performer(self, config: InternLM2Config, rngs: nn.Rngs):
+        """Create attention performer with zero dropout."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
-        )
-
-        self.rotary = self.config.get_basic_rope(
-            dtype=self.dtype,
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            base=config.rope_theta,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
-        qkv_states = rearrange(
-            checkpoint_name(self.wqkv(hidden_states), name="attn_qkv"),
-            "b q (h gs d) -> b q h gs d",
-            gs=2 + self.num_key_value_groups,
-            d=self.head_dim,
-        )
-
-        query_states = qkv_states[..., : self.num_key_value_groups, :]
-        query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
-        key_states = qkv_states[..., -2, :]
-        value_states = qkv_states[..., -1, :]
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = self.wo(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs)))
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
@@ -532,11 +436,11 @@ class InternLM2Model(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the InternLM2Model.
 
@@ -673,22 +577,12 @@ class InternLM2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=InternLM2Config, model_type="internlm2")
-class InternLM2ForCausalLM(EasyDeLBaseModule):
-    """InternLM2 model with a Causal Language Modeling head.
+class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
+    """InternLM2 model with a Causal Language Modeling head."""
 
-    This model consists of the base InternLM2 transformer (`InternLM2Model`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-
-    Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        rngs (nn.Rngs): Random number generators.
-        module (InternLM2Model): The core InternLM2 transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "internlm2"
+    _config_class = InternLM2Config
 
     def __init__(
         self,
@@ -699,41 +593,17 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the InternLM2ForCausalLM model.
-
-        Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=InternLM2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-
-        self.model = InternLM2Model(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.output = RowParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            lm_head_name="output",  # InternLM2 uses 'output' not 'lm_head'
+            lm_head_class=RowParallelLinear,  # InternLM2 uses RowParallelLinear
         )
 
     def __call__(
@@ -742,12 +612,12 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
         """Forward pass of the InternLM2ForCausalLM model.
 

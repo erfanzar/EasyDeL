@@ -351,7 +351,9 @@ class SiglipMLP(nn.Module):
         self.fc1 = linear_class(config.hidden_size, config.intermediate_size)
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,

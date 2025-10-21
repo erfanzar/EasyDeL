@@ -14,6 +14,7 @@
 
 
 import functools
+from typing import ClassVar
 
 import jax.lax
 from chex import Array
@@ -27,9 +28,10 @@ from jaxtyping import Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -89,7 +91,7 @@ class PhiMLP(nn.Module):
         self.rngs = rngs
 
         self.fc1 = ColumnParallelLinear(
-            config.n_embd,
+            config.hidden_size,
             config.intermediate_size,
             kernel_init=nn.initializers.normal(config.initializer_range),
             dtype=dtype,
@@ -99,7 +101,7 @@ class PhiMLP(nn.Module):
         )
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
-            config.n_embd,
+            config.hidden_size,
             kernel_init=nn.initializers.normal(config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -108,14 +110,16 @@ class PhiMLP(nn.Module):
         )
         self.act = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the PhiMLP module.
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states: Input hidden states.
 
         Returns:
-            Array: Output hidden states after MLP transformation.
+            Output hidden states after MLP transformation.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -132,41 +136,27 @@ class PhiMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class PhiAttention(AttentionModule):
-    """Phi Attention module.
+class PhiAttention(UnifiedAttention):
+    """Phi Attention with Q/K normalization.
 
-    This module implements the multi-head attention mechanism used in the Phi model.
-    It supports Grouped Query Attention (GQA), partial Rotary Position Embeddings (RoPE),
-    and optional Layer Normalization for query and key projections.
-
-    Attributes:
-        config (PhiConfig): Configuration object for the model.
-        layer_idx (int, optional): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        attention_dropout (float): Dropout probability for attention scores.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention query heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of attention key/value heads (for GQA).
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        max_position_embeddings (int): Maximum sequence length supported by RoPE.
-        rope_theta (float): Base value for RoPE frequency calculation.
-        partial_rotary_factor (float): Factor determining the fraction of head dimension subject to RoPE.
-        is_causal (bool): Whether the attention is causal (always True for this implementation).
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        dense (ParallelLinear): Linear layer for the output projection.
-        rotary_emb_dim (int): The dimension of the rotary embeddings.
-        qk_layernorm (bool): Whether to apply LayerNorm to query and key projections.
-        q_layernorm (nn.LayerNorm, optional): Layer normalization for query projections.
-        k_layernorm (nn.LayerNorm, optional): Layer normalization for key projections.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        rotary (RoPE): Rotary position embedding module.
+    Inherits Q/K normalization from QKNormAttention.
+    Features:
+    - Uses LayerNorm instead of RMSNorm
+    - Standard LayerNorm on full hidden_size (not per-head)
+    - Partial RoPE (partial_rotary_factor)
+    - Custom bias configuration
     """
+
+    norms_mapping: ClassVar[dict[str, str]] = {
+        "query_normalization": "q_layernorm",
+        "key_normalization": "k_layernorm",
+    }
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "query_projection": "q_proj",
+        "key_projection": "k_proj",
+        "value_projection": "v_proj",
+        "output_projection": "dense",
+    }
 
     def __init__(
         self,
@@ -178,202 +168,61 @@ class PhiAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiAttention module.
-
-        Args:
-            config (PhiConfig): The configuration object for the Phi model.
-            layer_idx (int, optional): Index of the current layer. Defaults to None.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            ValueError: If `hidden_size` is not divisible by `num_heads`.
-        """
-        super().__init__(config=config)
+        self.qk_layernorm = config.qk_layernorm
+        config.attention_bias = True
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            use_qk_norm=config.qk_layernorm,
+        )
 
         self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
         self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
         self.partial_rotary_factor = config.partial_rotary_factor
+        self.rotary_emb_dim = int(config.partial_rotary_factor * self.head_dim)
         self.is_causal = True
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use standard LayerNorm on hidden_size if qk_layernorm is enabled."""
 
-        linear_class = functools.partial(
-            ColumnParallelLinear,
-            use_bias=True,
-            precision=precision,
+        return nn.LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-        self.q_proj = linear_class(
-            self.hidden_size,
-            self.num_heads * self.head_dim,
+            use_bias=True,
             rngs=rngs,
         )
-        self.k_proj = linear_class(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use standard LayerNorm on hidden_size if qk_layernorm is enabled."""
+
+        return nn.LayerNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=True,
             rngs=rngs,
         )
-        self.v_proj = linear_class(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-        )
-        self.dense = linear_class(
-            self.num_heads * self.head_dim,
-            self.hidden_size,
-            rngs=rngs,
-        )
-        self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
-        self.qk_layernorm = config.qk_layernorm
-        if self.qk_layernorm:
-            self.q_layernorm = nn.LayerNorm(
-                config.hidden_size,
-                epsilon=config.layer_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-                use_bias=True,
-            )
-            self.k_layernorm = nn.LayerNorm(
-                config.hidden_size,
-                epsilon=config.layer_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-                use_bias=True,
-            )
 
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
+    def _create_rotary(self, config, dtype):
+        """Override for partial RoPE."""
+        return config.get_basic_rope(
+            dtype,
+            head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
+            rotary_dim=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
         )
 
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=int(
-                self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
-            ),
-            rotary_dim=int(
-                self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
-            ),
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the PhiAttention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        if self.qk_layernorm:
-            query_states = self.q_layernorm(query_states)
-            key_states = self.k_layernorm(key_states)
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            mask_info=mask_info,
-            fcm_mask=fcm_mask,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.dense(attn_output), "attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    def _preprocess_qkv(self, query_states, key_states, value_states):
+        if self.use_qk_norm:
+            return self.query_normalization(query_states), self.key_normalization(key_states), value_states
+        return query_states, key_states, value_states
 
 
 class PhiDecoderLayer(nn.Module):
@@ -630,12 +479,11 @@ class PhiModel(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the PhiModel.
 
@@ -771,23 +619,12 @@ class PhiModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=PhiConfig, model_type="phi")
-class PhiForCausalLM(EasyDeLBaseModule):
-    """Phi model with a Causal Language Modeling head.
+class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
+    """Phi model with a Causal Language Modeling head."""
 
-    This model consists of the base Phi transformer (`PhiModel`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-    Optionally, the input token embeddings can be tied to the output projection layer.
-
-    Attributes:
-        config (PhiConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        transformer (PhiModel): The core Phi transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "phi"
+    _config_class = PhiConfig
 
     def __init__(
         self,
@@ -798,46 +635,15 @@ class PhiForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiForCausalLM model.
-
-        Args:
-            config (PhiConfig): The configuration object for the Phi model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=PhiModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = PhiModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = self.config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=True,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=True,
         )
 
     def __call__(

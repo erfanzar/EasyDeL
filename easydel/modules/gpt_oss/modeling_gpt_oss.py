@@ -13,9 +13,6 @@
 # limitations under the License.
 
 
-from functools import partial
-
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -35,8 +32,9 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.infra.utils import auto_remat
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -45,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .gpt_oss_configuration import GptOssConfig
@@ -231,7 +229,13 @@ class GptOssMLP(nn.Module):
         return routed_out, router_scores
 
 
-class GptOssAttention(AttentionModule):
+class GptOssAttention(UnifiedAttention):
+    """GPT-OSS Attention with sink tokens support.
+
+    Inherits from UnifiedAttention.
+    Supports layer-specific sliding windows and sink tokens for improved attention.
+    """
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -242,63 +246,34 @@ class GptOssAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
-
+        """Initialize GPT-OSS attention with sink tokens."""
         self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
 
-        self.hidden_size = config.hidden_size
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", head_dim)
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
-        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        self.sliding_window = config.sliding_window if self.is_sliding else None
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-
-        self.attention_performer = FlexibleAttentionModule(
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-            base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=self.config.attention_dropout,
+            attention_type="standard",
+            causal=True,
         )
+
+        # Set sliding window attribute for layer-specific attention
+        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        if is_sliding:
+            self.sliding_window = config.sliding_window
+
+        # Sink tokens for improved attention
         self.sinks = nn.Param(
-            jax.nn.initializers.normal(self.config.initializer_range)(
+            jax.nn.initializers.normal(config.initializer_range)(
                 rngs.param(),
                 shape=(config.num_attention_heads,),
                 dtype=param_dtype,
             )
         )
 
-    def __call__(
+    def forward_standard(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
@@ -308,37 +283,30 @@ class GptOssAttention(AttentionModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+    ):
+        """Override to add sink tokens support."""
         batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-        qshape = (
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        kv_shape = (
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        query_states = query_states.reshape(qshape)
-        key_states = key_states.reshape(kv_shape)
-        value_states = value_states.reshape(kv_shape)
+
+        # 1. Project Q/K/V
+        query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
+        key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
+        value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
+
+        # 2. Reshape to multi-head format
+        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+
+        # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+
+        # 4. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
+        # 5. Apply RoPE
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
+        # 6. KV cache concatenation
         (
             key_states,
             value_states,
@@ -355,6 +323,8 @@ class GptOssAttention(AttentionModule):
             mask_info=mask_info,
             sliding_window=self.sliding_window,
         )
+
+        # 7. Compute attention with sink tokens
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -365,13 +335,15 @@ class GptOssAttention(AttentionModule):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=True,
-            softmax_aux=self.sinks.value,
+            causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=self.sinks.value,  # Sink tokens
         )
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
-            name="attn_output",
-        )
+
+        # 8. Merge heads and output projection
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -725,25 +697,20 @@ class GptOssModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GptOssConfig, model_type="gpt_oss")
-class GptOssForCausalLM(EasyDeLBaseModule):
-    """GptOss model with a Causal Language Modeling head.
+class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
+    """GPT-OSS model with a Causal Language Modeling head.
 
-    This model consists of the base GptOss transformer (`GptOssModel`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction. It also handles
-    the calculation of the auxiliary loss from the MoE layers.
+    This model consists of the base GPT-OSS transformer (GptOssModel) followed by a
+    language modeling head for next token prediction. Supports MoE with auxiliary loss.
 
-    Attributes:
-        config (GptOssConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (GptOssModel): The core GptOss transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-        num_experts (int): Total number of experts.
-        num_experts_per_tok (int): Number of experts to route per token.
+    Type Parameters:
+        GptOssModel: The base model type
+        GptOssConfig: The configuration type
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gpt_oss"
+    _config_class = GptOssConfig
 
     def __init__(
         self,
@@ -754,46 +721,25 @@ class GptOssForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the GptOssForCausalLM model.
+        """Initialize the GPT-OSS Causal LM module.
 
         Args:
-            config (GptOssConfig): The configuration object for the GptOss model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config: Model configuration
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: Precision setting for JAX operations
+            rngs: Random number generators
         """
         super().__init__(
             config=config,
+            base_model_class=GptOssModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = GptOssModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=config.router_aux_loss_coef,
         )
 
     def __call__(
@@ -809,95 +755,51 @@ class GptOssForCausalLM(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> MoeCausalLMOutput | tuple:
-        """Forward pass of the GptOssForCausalLM model.
+    ) -> MoeCausalLMOutput:
+        """Forward pass for GPT-OSS MoE model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-                output_attentions (tp.Optional[bool]): Whether to return attention weights.
-            Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
-                Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids: Input token IDs
+            inputs_embeds: Input embeddings (alternative to input_ids)
+            attention_mask: Mask to avoid attention on padding tokens
+            position_ids: Position indices for tokens
+            output_attentions: Whether to return attention weights
+            output_hidden_states: Whether to return hidden states
+            output_router_logits: Whether to return router logits
+            mode: Runtime mode (train, eval, etc.)
+            past_key_values: Cache containing precomputed key/value states
+            cache_metadata: Metadata for cache handling
+            apply_lm_head: Whether to apply the LM head
 
         Returns:
-            MoeCausalLMOutput: The model's output.
-                returns a `MoeCausalLMOutput` object containing `logits`, `aux_loss` (optional),
-                `hidden_states` (optional), `attentions` (optional), and `router_logits` (optional).
-
+            MoeCausalLMOutput with logits, aux_loss, router_logits, etc.
         """
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-        )
-        logits = None
-        if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
+
+        def _aux_loss_fn(outputs, attention_mask):
+            """Custom auxiliary loss for GPT-OSS."""
+            if outputs.router_logits is None:
+                return None
+            return auxiliary_load_balancing_loss_func(
                 gate_logits=outputs.router_logits,
                 num_experts=self.config.num_local_experts,
                 top_k=self.config.num_experts_per_tok,
                 attention_mask=attention_mask,
             )
-            aux_loss = aux_loss * self.config.router_aux_loss_coef
 
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=_aux_loss_fn,
         )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GptOssConfig, model_type="gpt_oss")

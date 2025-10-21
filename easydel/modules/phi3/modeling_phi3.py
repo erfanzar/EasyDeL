@@ -14,6 +14,7 @@
 
 
 import functools
+from typing import ClassVar
 
 import jax.lax
 from chex import Array
@@ -29,7 +30,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -114,14 +116,16 @@ class Phi3MLP(nn.Module):
         )
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Array) -> Array:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the Phi3MLP module.
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states: Input hidden states.
 
         Returns:
-            Array: Output hidden states after MLP transformation.
+            Output hidden states after MLP transformation.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -141,12 +145,13 @@ class Phi3MLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Phi3Attention(AttentionModule):
-    """Phi3 Attention module.
+class Phi3Attention(UnifiedAttention):
+    """Phi3 Attention module with fused QKV projection.
 
     This module implements the multi-head attention mechanism used in the Phi-3 model.
-    It supports Grouped Query Attention (GQA) and Rotary Position Embeddings (RoPE).
-    The query, key, and value projections are combined into a single linear layer.
+    It supports Grouped Query Attention (GQA), Rotary Position Embeddings (RoPE), and
+    sliding window attention. The query, key, and value projections are combined into
+    a single fused linear layer for efficiency.
 
     Attributes:
         config (Phi3Config): Configuration object for the model.
@@ -154,20 +159,17 @@ class Phi3Attention(AttentionModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        attention_dropout (float): Dropout probability for attention scores.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention query heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of attention key/value heads (for GQA).
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        max_position_embeddings (int): Maximum sequence length supported by RoPE.
-        original_max_position_embeddings (int): Original max sequence length for RoPE scaling.
-        is_causal (bool): Whether the attention is causal (always True for this implementation).
-        o_proj (ParallelLinear): Linear layer for the output projection.
-        qkv_proj (ParallelLinear): Combined linear layer for query, key, and value projections.
+        sliding_window (int): Sliding window size for local attention.
+        qkv_proj (ColumnParallelLinear): Fused linear layer for query, key, and value projections.
+        o_proj (RowParallelLinear): Linear layer for the output projection.
         attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        rotary (RoPE): Rotary position embedding module.
+        rotary (RoPE): Rotary position embedding module with partial RoPE support.
     """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "output_projection": "o_proj",
+        "query_key_value_projection": "qkv_proj",
+    }
 
     def __init__(
         self,
@@ -182,67 +184,75 @@ class Phi3Attention(AttentionModule):
 
         Args:
             config (Phi3Config): The configuration object for the Phi-3 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
 
         Raises:
             ValueError: If `hidden_size` is not divisible by `num_heads`.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.original_max_position_embeddings = config.original_max_position_embeddings
-        self.is_causal = True
         self.sliding_window = config.sliding_window
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            use_bias=False,
-            precision=precision,
+        super().__init__(
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            use_bias=False,
             precision=precision,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-        op_size = self.num_heads * self.head_dim + 2 * (self.num_key_value_heads * self.head_dim)
-        self.o_proj = row_parallel_linear(self.num_heads * self.head_dim, self.hidden_size, rngs=rngs)
-        self.qkv_proj = column_parallel_linear(self.hidden_size, op_size, rngs=rngs)
-        self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
+            attention_type="standard",
+            causal=True,
         )
 
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
+    def define_network(
+        self,
+        config: Phi3Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ):
+        """Override to create fused QKV projection instead of separate Q/K/V.
+
+        Args:
+            config: Model configuration
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: JAX precision setting
+            rngs: Random number generators
+        """
+        qkv_size = config.num_attention_heads * self.head_dim + 2 * config.num_key_value_heads * self.head_dim
+
+        self.qkv_proj = ColumnParallelLinear(
+            config.hidden_size,
+            qkv_size,
+            rngs=rngs,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
+        self.attention_performer = self._create_attention_performer(config, rngs)
+        self.rotary = self._create_rotary(config, dtype)
+        if hasattr(config, "resid_pdrop") and config.resid_pdrop > 0:
+            self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
+        else:
+            self.resid_dropout = None
+
+    def _create_rotary(self, config: Phi3Config, dtype: jnp.dtype):
+        """Create rotary position embedding layer with Phi-3 specific configuration.
+
+        Phi-3 uses partial RoPE with custom base theta.
+
+        Args:
+            config: Model configuration
+            dtype: Data type for computations
+        """
+        return config.get_basic_rope(
+            dtype=dtype,
             head_size=self.head_dim,
             base=config.rope_theta,
             is_neox_style=True,
@@ -258,47 +268,53 @@ class Phi3Attention(AttentionModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the Phi3Attention module.
+    ) -> AttentionLayerOutput:
+        """Forward pass of the Phi3Attention module.
+
+        Uses the parent DecoderAttention implementation with sliding window support.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            hidden_states: Input hidden states.
+            mask_info: Mask information for attention.
+            position_ids: Position indices for the tokens.
+            mode: Runtime mode (train/eval/infer).
+            cache_view: Cache view for attention KVs.
+            cache_metadata: Metadata for paged attention.
+            output_attentions: Whether to return attention weights.
+            frequencies: Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
+            AttentionLayerOutput containing attention output and optional weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        qkv = self.qkv_proj(hidden_states)
-        query_pos = self.num_heads * self.head_dim
-        query_states = checkpoint_name(qkv[..., :query_pos], "attn_query")
-        key_states = checkpoint_name(
-            qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim], "attn_key"
+        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
+        q_size = self.config.num_attention_heads * self.head_dim
+        kv_size = self.config.num_key_value_heads * self.head_dim
+        query_states = qkv[..., :q_size]
+        key_states = qkv[..., q_size : q_size + kv_size]
+        value_states = qkv[..., q_size + kv_size :]
+
+        query_states = query_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim,
         )
-        value_states = checkpoint_name(qkv[..., query_pos + self.num_key_value_heads * self.head_dim :], "attn_value")
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
+        key_states = key_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
+        )
+        value_states = value_states.reshape(
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
+        )
+
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
         (
             key_states,
             value_states,
@@ -311,10 +327,10 @@ class Phi3Attention(AttentionModule):
             key=key_states,
             value=value_states,
             cache_view=cache_view,
+            cache_metadata=cache_metadata,
             mask_info=mask_info,
             sliding_window=self.sliding_window,
         )
-
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -328,9 +344,11 @@ class Phi3Attention(AttentionModule):
             causal=True,
             sliding_window=self.sliding_window,
         )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
+        attn_output = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(attn_output=attn_output)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+        if self.resid_dropout is not None:
+            attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
             attention_output=attn_output,
@@ -597,12 +615,11 @@ class Phi3Model(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the Phi3Model.
 
@@ -738,23 +755,12 @@ class Phi3Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Phi3Config, model_type="phi3")
-class Phi3ForCausalLM(EasyDeLBaseModule):
-    """Phi-3 model with a Causal Language Modeling head.
+class Phi3ForCausalLM(BaseCausalLMModule[Phi3Model, Phi3Config]):
+    """Phi-3 model with a Causal Language Modeling head."""
 
-    This model consists of the base Phi-3 transformer (`Phi3Model`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-    Optionally, the input token embeddings can be tied to the output projection layer.
-
-    Attributes:
-        config (Phi3Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (Phi3Model): The core Phi-3 transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "phi3"
+    _config_class = Phi3Config
 
     def __init__(
         self,
@@ -765,46 +771,15 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Phi3ForCausalLM model.
-
-        Args:
-            config (Phi3Config): The configuration object for the Phi-3 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=Phi3Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Phi3Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = self.config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(

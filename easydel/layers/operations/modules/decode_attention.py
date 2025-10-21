@@ -60,7 +60,6 @@ Example:
 import jax
 from eformer import common_types
 from ejkernel.modules import ragged_decode_attention
-from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
@@ -68,8 +67,6 @@ from easydel.layers.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
-
-shard_map = shard_map.shard_map
 
 
 @OperationRegistry.register
@@ -150,41 +147,75 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                 - attention_weights: None (not computed for memory efficiency).
         """
 
-        softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-        model_mode = self.get_mode(query=query, BTHD=True)
-        assert model_mode == common_types.MODE_DECODE
+        head_dim: int = query.shape[-1]
+        softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
+        model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
+        assert model_mode == common_types.MODE_DECODE, "AutoRegressiveDecodeAttn requires decode mode"
+
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
-        views_sharding = Ps(shardings.query[0])
+        # Create sharding for cache metadata (batch dimension only)
+        views_sharding: Ps = Ps(shardings.query[0])
 
-        starts = cache_metadata.starts.reshape(-1, 1)
-        indexs = cache_metadata.indexs.reshape(-1, 1)
-        query = query[:, -1, :, :]
-        starts = starts.reshape(-1)
-        indexs = indexs.reshape(-1)
-        attn_output = ragged_decode_attention(
-            query,
+        # Reshape cache metadata for processing
+        starts_2d = cache_metadata.starts.reshape(-1, 1)
+        indexs_2d = cache_metadata.indexs.reshape(-1, 1)
+
+        # Extract last query token and flatten cache metadata
+        query_squeezed: Float[Array, "batch num_q_heads head_dim"] = query[:, -1, :, :]
+        starts_flat = starts_2d.reshape(-1)
+        indexs_flat = indexs_2d.reshape(-1)
+
+        # Create sharding specs for all inputs
+        query_sharding: Ps | None = self.create_stable_sharding(
+            shardings.query3d, dep=query_squeezed, tensor=query_squeezed, preserved_indices=[0, 1]
+        )
+        key_sharding: Ps | None = self.create_stable_sharding(
+            shardings.key, dep=key, tensor=key, preserved_indices=[0, 2]
+        )
+        value_sharding: Ps | None = self.create_stable_sharding(
+            shardings.value, dep=value, tensor=value, preserved_indices=[0, 2]
+        )
+        starts_sharding: Ps | None = self.create_stable_sharding(
+            views_sharding, dep=starts_flat, tensor=starts_flat, preserved_indices=[0]
+        )
+        indexs_sharding: Ps | None = self.create_stable_sharding(
+            views_sharding, dep=indexs_flat, tensor=indexs_flat, preserved_indices=[0]
+        )
+        softmax_aux_sharding: Ps | None = self.create_stable_sharding(
+            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        )
+        output_sharding: Ps | None = self.create_stable_sharding(
+            shardings.query3d, tensor=query_squeezed, preserved_indices=[0, 1]
+        )
+
+        attn_output: Float[Array, "batch num_q_heads head_dim"] = ragged_decode_attention(
+            query_squeezed,
             key,
             value,
-            starts,
-            indexs,
+            starts_flat,
+            indexs_flat,
             softmax_aux,
-            softmax_scale=softmax_scale,
+            softmax_scale=softmax_scale_computed,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(shardings.query3d, dep=query, tensor=query, preserved_indices=[0, 1]),
-                self.create_stable_sharding(shardings.key, dep=key, tensor=key, preserved_indices=[0, 2]),
-                self.create_stable_sharding(shardings.value, dep=value, tensor=value, preserved_indices=[0, 2]),
-                self.create_stable_sharding(views_sharding, dep=starts, tensor=starts, preserved_indices=[0]),
-                self.create_stable_sharding(views_sharding, dep=indexs, tensor=indexs, preserved_indices=[0]),
-                self.create_stable_sharding(shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux),
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                starts_sharding,
+                indexs_sharding,
+                softmax_aux_sharding,
             ),
-            out_specs=self.create_stable_sharding(shardings.query3d, tensor=query, preserved_indices=[0, 1]),
+            out_specs=output_sharding,
         )
 
-        return AttentionOutput(attention_weights=None, attention_outputs=jax.numpy.expand_dims(attn_output, 1))
+        # Expand to match expected output shape [batch, 1, num_q_heads, head_dim]
+        attn_output_expanded: Float[Array, "batch 1 num_q_heads head_dim"] = jax.numpy.expand_dims(attn_output, 1)
+
+        result: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=attn_output_expanded)
+        return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """

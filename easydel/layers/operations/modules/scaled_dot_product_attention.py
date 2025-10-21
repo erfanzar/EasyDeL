@@ -151,42 +151,78 @@ class ScaledDotProductAttn(OperationImpl):
             An `AttentionOutput` object. Note that `jax.nn.dot_product_attention`
             typically does not return attention weights.
         """
-        softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-        dtype = self.metadata.runtime_dtype
-        model_mode = self.get_mode(query=query, BTHD=True)
+        head_dim: int = query.shape[-1]
+        softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
+        dtype: jnp.dtype = self.metadata.runtime_dtype
+        model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
 
-        causal = causal if model_mode != common_types.MODE_DECODE else False
+        # Disable causal masking in decode mode
+        is_decode_mode: bool = model_mode == common_types.MODE_DECODE
+        causal_computed: bool = causal if not is_decode_mode else False
+
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
-        if mask_info is None and bias is None and init_bias is not None:
-            bias = init_bias()
+        # Initialize bias if needed
+        needs_bias_init: bool = mask_info is None and bias is None and init_bias is not None
+        bias_computed: Float[Array, "batch num_heads seq_len kv_len"] | None
+        if needs_bias_init:
+            bias_computed = init_bias()
+        else:
+            bias_computed = bias
 
-        attention_output = scaled_dot_product_attention(
-            query.astype(dtype),
-            key.astype(dtype),
-            value.astype(dtype),
-            bias.astype(dtype) if bias is not None else None,
+        # Cast tensors to runtime dtype
+        query_casted: Float[Array, "batch seq_len num_q_heads head_dim"] = query.astype(dtype)
+        key_casted: Float[Array, "batch kv_len num_kv_heads head_dim"] = key.astype(dtype)
+        value_casted: Float[Array, "batch kv_len num_kv_heads head_dim"] = value.astype(dtype)
+        bias_casted: Float[Array, "batch num_heads seq_len kv_len"] | None = (
+            bias_computed.astype(dtype) if bias_computed is not None else None
+        )
+
+        # Create sharding specs
+        query_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.query, [0, 2], dep=query)
+        key_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.key, [0, 2], dep=key)
+        value_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.value, [0, 2], dep=value)
+        bias_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.bias, dep=bias_computed)
+        cum_seqlens_q_sharding: PartitionSpec | None = self.create_stable_sharding(
+            PartitionSpec(shardings.query[0]), dep=cum_seqlens_q
+        )
+        cum_seqlens_k_sharding: PartitionSpec | None = self.create_stable_sharding(
+            PartitionSpec(shardings.query[0]), dep=cum_seqlens_k
+        )
+        output_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.output, [0, 2])
+
+        attention_output: Float[Array, "batch seq_len num_q_heads head_dim"] = scaled_dot_product_attention(
+            query_casted,
+            key_casted,
+            value_casted,
+            bias_casted,
             cum_seqlens_q,
             cum_seqlens_k,
             mask_info=mask_info,
-            softmax_scale=softmax_scale,
-            causal=causal,
+            softmax_scale=softmax_scale_computed,
+            causal=causal_computed,
             sliding_window=sliding_window,
             mesh=self.metadata.mesh,
             in_specs=(
-                self.create_stable_sharding(shardings.query, [0, 2], dep=query),
-                self.create_stable_sharding(shardings.key, [0, 2], dep=key),
-                self.create_stable_sharding(shardings.value, [0, 2], dep=value),
-                self.create_stable_sharding(shardings.bias, dep=bias),
-                self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_q),
-                self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_k),
+                query_sharding,
+                key_sharding,
+                value_sharding,
+                bias_sharding,
+                cum_seqlens_q_sharding,
+                cum_seqlens_k_sharding,
             ),
-            out_specs=self.create_stable_sharding(shardings.output, [0, 2]),
+            out_specs=output_sharding,
         )
-        return AttentionOutput(
+
+        attention_output_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
+            arr=attention_output, sharding=shardings.output
+        )
+
+        result: AttentionOutput = AttentionOutput(
             attention_weights=None,
-            attention_outputs=with_sharding_constraint(arr=attention_output, sharding=shardings.output),
+            attention_outputs=attention_output_sharded,
         )
+        return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Delegates to the CUDA-specific implementation.

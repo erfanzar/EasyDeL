@@ -117,39 +117,93 @@ class VanillaAttn(OperationImpl):
         sliding_window: int | tuple[int, int] | None = None,
         **ignore,
     ) -> AttentionOutput:
+        """
+        Standard multi-head attention implementation using basic JAX operations.
+
+        Args:
+            query: Query tensor [batch, seq_len, num_q_heads, head_dim].
+            key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
+            value: Value tensor [batch, kv_len, num_kv_heads, head_dim].
+            mask_info: Optional mask information for attention.
+            bias: Optional attention bias [batch, num_heads, seq_len, kv_len].
+            init_bias: Optional callable to initialize bias if mask_info and bias are None.
+            deterministic: If True, disables dropout.
+            dropout_rng: JAX PRNG key for dropout.
+            softmax_aux: Auxiliary softmax tensor (e.g., for sink tokens).
+            softmax_scale: Scaling factor for attention logits.
+            logits_soft_cap: Soft capping value for attention logits.
+            dropout_prob: Dropout probability.
+            causal: Apply causal masking.
+            sliding_window: Sliding window size for local attention.
+            **ignore: Additional ignored arguments.
+
+        Returns:
+            AttentionOutput containing attention outputs and weights.
+        """
         with self.metadata.mesh:
             model_mode = self.get_mode(query=query, BTHD=True)
             shardings = self.metadata.get_shardings(model_mode, layout="bthd")
-            if mask_info is None and bias is None and init_bias is not None:
-                bias = init_bias()
-            query = with_sharding_constraint(arr=query, sharding=shardings.query)
-            key = with_sharding_constraint(arr=key, sharding=shardings.key)
-            value = with_sharding_constraint(arr=value, sharding=shardings.value)
 
-            bias = with_sharding_constraint(arr=bias, sharding=shardings.bias) if bias is not None else bias
+            # Initialize bias if needed
+            needs_bias_init: bool = mask_info is None and bias is None and init_bias is not None
+            bias_computed: Float[Array, "batch num_heads seq_len kv_len"] | None
+            if needs_bias_init:
+                bias_computed = init_bias()
+            else:
+                bias_computed = bias
 
+            # Apply sharding constraints to inputs
+            query_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
+                arr=query, sharding=shardings.query
+            )
+            key_sharded: Float[Array, "batch kv_len num_kv_heads head_dim"] = with_sharding_constraint(
+                arr=key, sharding=shardings.key
+            )
+            value_sharded: Float[Array, "batch kv_len num_kv_heads head_dim"] = with_sharding_constraint(
+                arr=value, sharding=shardings.value
+            )
+
+            bias_sharded: Float[Array, "batch num_heads seq_len kv_len"] | None
+            if bias_computed is not None:
+                bias_sharded = with_sharding_constraint(arr=bias_computed, sharding=shardings.bias)
+            else:
+                bias_sharded = None
+
+            # Compute attention
+            runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
+            softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
+
+            outputs: Float[Array, "batch seq_len num_q_heads head_dim"]
+            weights: Float[Array, "batch num_heads seq_len kv_len"] | None
             outputs, weights = attention(
-                query,
-                key,
-                value,
-                bias,
+                query_sharded,
+                key_sharded,
+                value_sharded,
+                bias_sharded,
                 dropout_rng,
                 softmax_aux,
                 mask_info=mask_info,
                 deterministic=deterministic,
                 dropout_prob=dropout_prob,
-                dtype=self.metadata.runtime_dtype,
+                dtype=runtime_dtype,
                 sliding_window=sliding_window,
-                softmax_dtype=self.metadata.runtime_softmax_dtype,
+                softmax_dtype=softmax_dtype,
                 softmax_scale=softmax_scale,
                 init_bias=None,
                 causal=causal,
                 logits_soft_cap=logits_soft_cap,
             )
-            return AttentionOutput(
-                attention_weights=weights,
-                attention_outputs=with_sharding_constraint(arr=outputs, sharding=shardings.output),
+
+            # Apply output sharding
+            outputs_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
+                arr=outputs, sharding=shardings.output
             )
+
+            result: AttentionOutput = AttentionOutput(
+                attention_weights=weights,
+                attention_outputs=outputs_sharded,
+            )
+            return result
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Delegates to `forward_native`.

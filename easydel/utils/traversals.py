@@ -493,7 +493,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
         nnx.State: The updated nnx state with the attached parameter tree.
     """
     params, others = nnx.State.split(state, nnx.Param, ...)
-
+    lost_data = False
     if not is_flatten(params):
         params = flatten_dict(params)
     if not is_flatten(tree):
@@ -507,10 +507,11 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
             if keys[-1] != "bias":
                 _path = ".".join([str(k) for k in keys])
                 logger.info(f"a parameter's missing at {_path}, please double check.")
-
+                lost_data = True
             # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
             params[keys].value = None
-
+    if lost_data:
+        logger.info(f"tree-array strc keys {tree.keys()}")
     others = recreate_meta_values(others)
     state = refine_graphs(others, params)
     return state

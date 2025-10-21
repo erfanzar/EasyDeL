@@ -551,13 +551,22 @@ class Trainer(BaseTrainer):
                     mode="train",
                 )
                 self.log_weight_distribution(state=state, step=current_step)
-                # Save checkpoint if needed
-                if self._should_save_checkpoint(current_step):
-                    _ = self._save_state(
-                        state=state,
-                        milestone=True,
-                        save_directory=self.arguments.save_directory,
+                # Save checkpoint if needed (handled by checkpointer policies)
+
+                def checkpoint_callback(dest, mesh, meta, s=state):
+                    self._save_state(
+                        state=s,
+                        save_directory=str(self.arguments._get_save_directory() / dest),
                     )
+                    # Clean up old permanent checkpoints if save_total_limit is set
+                    self._cleanup_old_checkpoints()
+
+                self.checkpointer.on_step(
+                    mesh=self.mesh,
+                    pytree=None,  # State saving handled via callback
+                    step=current_step,
+                    true_callbacks=[checkpoint_callback],
+                )
                 if self._should_run_evaluation(current_step):
                     for _ in self.eval(model_state=state):
                         ...

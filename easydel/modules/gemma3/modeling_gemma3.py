@@ -31,7 +31,6 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
@@ -39,7 +38,9 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -155,7 +156,16 @@ class Gemma3RMSNorm(nn.Module):
         return out
 
 
-class Gemma3Attention(AttentionModule):
+class Gemma3Attention(UnifiedAttention):
+    """Gemma3 Attention with Q/K normalization.
+
+    Inherits Q/K normalization from QKNormAttention.
+    Features:
+    - Custom Gemma3RMSNorm for Q/K normalization
+    - Layer-specific sliding window
+    - Custom softmax scaling (query_pre_attn_scalar)
+    """
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -168,164 +178,64 @@ class Gemma3Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config)
-        self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.is_cross_attention = is_cross_attention
-        self.rngs = rngs
-        self.causal = causal
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        kernel = jax.nn.initializers.normal(config.initializer_range)
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            use_bias=config.attention_bias,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=kernel,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(self.embed_dim, self.num_heads * self.head_dim)
-        self.k_proj = column_parallel_linear(self.embed_dim, self.num_key_value_heads * self.head_dim)
-        self.v_proj = column_parallel_linear(self.embed_dim, self.num_key_value_heads * self.head_dim)
-        self.o_proj = row_parallel_linear(self.num_heads * self.head_dim, self.embed_dim)
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
-        self.q_norm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype, dim=self.head_dim)
-        self.k_norm = Gemma3RMSNorm(self.config, param_dtype=self.param_dtype, dim=self.head_dim)
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            use_qk_norm=True,
+        )
 
-        self.attention_performer = FlexibleAttentionModule(
+        self.layer_idx = layer_idx
+        self.is_cross_attention = is_cross_attention
+        self.causal = causal
+
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use Gemma3RMSNorm instead of standard RMSNorm."""
+        return Gemma3RMSNorm(config, param_dtype=param_dtype, dim=self.head_dim)
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use Gemma3RMSNorm instead of standard RMSNorm."""
+        return Gemma3RMSNorm(config, param_dtype=param_dtype, dim=self.head_dim)
+
+    def _create_attention_performer(self, config, rngs):
+        """Override to use custom softmax scale with query_pre_attn_scalar."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
-            softmax_scale=self.config.query_pre_attn_scalar**-0.5,
+            softmax_scale=config.query_pre_attn_scalar**-0.5,
             dropout_prob=config.attention_dropout,
         )
 
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Post-process Q/K/V after projection and reshape, before RoPE/sharding.
 
-    def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
+        **KEY METHOD**: Override this to apply Q/K normalization or other transformations.
+        By default, applies Q/K norm if configured, otherwise returns unchanged.
 
-        Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-        Returns:
-            chex.Array: The hidden states with merged head dimensions.
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
-
-    def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the attention module.
+        Pattern for Q/K normalization:
+            >>> def _postprocess_qkv(self, q, k, v):
+            ...     if hasattr(self, 'q_norm'):
+            ...         q = self.q_norm(q)
+            ...         k = self.k_norm(k)
+            ...     return q, k, v
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            query_states: Query tensor [batch, seq_len, num_heads, head_dim]
+            key_states: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value_states: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            Tuple of (processed_query, processed_key, processed_value)
         """
-        _batch_size, _sequence_length = hidden_states.shape[:2]
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        (query_states, key_states, value_states) = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(*hidden_shape)
-        key_states = key_states.reshape(*hidden_shape)
-        value_states = value_states.reshape(*hidden_shape)
-
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+        return self.q_norm(query_states), self.k_norm(key_states), value_states
 
 
 class Gemma3MLP(nn.Module):
@@ -745,13 +655,12 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma3TextConfig, model_type="gemma3_text")
-class Gemma3ForCausalLM(EasyDeLBaseModule):
-    """Gemma3 model with a language modeling head for causal language modeling tasks.
+class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
+    """Gemma3 model with a language modeling head for causal language modeling tasks."""
 
-    This model extends the base Gemma3TextModel by incorporating a linear language modeling head on top
-    of the base model, designed for generative tasks and text generation. The model can optionally apply
-    softcapping to logits based on configuration settings.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gemma3_text"
+    _config_class = Gemma3TextConfig
 
     def __init__(
         self,
@@ -762,42 +671,20 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
         if param_dtype == jnp.float16 or param_dtype == "f2":
             logger.error(
                 "Gemma-3's recommended dtype is bfloat16, but you are using float16. "
                 "This may result in junk responses or incorrect predictions."
             )
-        self.model = Gemma3TextModel(
+        super().__init__(
             config=config,
+            base_model_class=Gemma3TextModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
 
     def __call__(

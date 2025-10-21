@@ -29,14 +29,15 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -201,25 +202,13 @@ class Qwen2MoeMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen2MoeAttention(AttentionModule):
-    """Qwen2 MoE Attention module.
+class Qwen2MoeAttention(UnifiedAttention):
+    """Qwen2 MoE Attention module with sliding window support.
 
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        hidden_size (int): Dimensionality of the hidden states.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_groups (int): Number of groups for key/value heads (for GQA).
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for output projection.
-        attention_performer (FlexibleAttentionModule): Module for performing attention computation.
-        resid_dropout (nn.Dropout): Dropout layer for residual connections.
-        rotary (RotaryEmbedding): Rotary positional embedding module.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Inherits from UnifiedAttention with Qwen2Moe-specific customizations:
+    - Sliding window attention
+    - Custom bias configuration (Q/K/V use qkv_bias, O doesn't)
+    - Attention dropout
     """
 
     def __init__(
@@ -240,157 +229,92 @@ class Qwen2MoeAttention(AttentionModule):
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
             rngs (nn.Rngs): Random number generators.
         """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+        # Set sliding window before super().__init__ so it's available during network definition
+        self.sliding_window = config.sliding_window if config.use_sliding_window else None
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
+
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for query projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.k_proj = column_parallel_linear(
+
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for key projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.v_proj = column_parallel_linear(
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use qkv_bias for value projection (Qwen2Moe-specific)."""
+        return ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             rngs=rngs,
             use_bias=config.qkv_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.o_proj = row_parallel_linear(
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Override to use bias=False for output projection (Qwen2Moe-specific)."""
+        from easydel.layers.linear import RowParallelLinear
+
+        return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             rngs=rngs,
             use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        self.sliding_window = config.sliding_window if config.use_sliding_window else None
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
-        self.resid_dropout = nn.Dropout(rate=config.attention_dropout, rngs=rngs)
-        self.rotary = self.config.get_basic_rope(
+
+    def _create_rotary(self, config: Qwen2MoeConfig, dtype: jnp.dtype):
+        """Create Qwen2Moe-specific rotary embedding layer."""
+        return config.get_basic_rope(
             head_size=config.hidden_size // config.num_attention_heads,
             rotary_dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
-            dtype=self.dtype,
+            dtype=dtype,
         )
 
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        attn_output = self.resid_dropout(attn_output)
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+    def _create_attention_performer(self, config: Qwen2MoeConfig, rngs: nn.Rngs):
+        """Create attention performer with Qwen2Moe's attention dropout."""
+        return FlexibleAttentionModule(
+            rngs=rngs,
+            base_config=config,
+            softmax_scale=self.head_dim**-0.5,
+            dropout_prob=config.attention_dropout,
         )
 
 
@@ -929,21 +853,12 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen2MoeConfig, model_type="qwen2_moe")
-class Qwen2MoeForCausalLM(EasyDeLBaseModule):
-    """Qwen2 MoE model with a Causal Language Modeling (CLM) head.
+class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):
+    """Qwen2 MoE model with a Causal Language Modeling head."""
 
-    This class wraps the base `Qwen2MoeModel` and adds a linear layer (language model head)
-    to predict the next token logits.
-
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        model (Qwen2MoeModel): The base Qwen2 MoE model.
-        lm_head (ParallelLinear): The language model head (linear layer).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "qwen2_moe"
+    _config_class = Qwen2MoeConfig
 
     def __init__(
         self,
@@ -954,47 +869,16 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeForCausalLM module.
-
-        Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=Qwen2MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen2MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
@@ -1011,96 +895,33 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass of the Qwen2 MoE model for Causal Language Modeling.
-
-        Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive
-                with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually
-                exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
-            output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]): Precomputed key/value states
-                for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged
-                attention (optional).
-
-        Returns:
-            MoeCausalLMOutput: The model output, including logits, hidden states, attentions, and router logits.
-        """
-        if output_router_logits is None:
-            output_router_logits = self.config.output_router_logits
-        if output_hidden_states is None:
-            output_hidden_states = self.config.output_hidden_states
-        if output_attentions is None:
-            output_attentions = self.config.output_attentions
-        outputs = self.model(
+        """Forward pass of the Qwen2MoeForCausalLM model."""
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-        )
-        hidden_states = outputs.last_hidden_state
-
-        logits = None
-        if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.num_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
-
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss from router logits."""
+        if outputs.router_logits is None:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
+        )
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2MoeConfig, model_type="qwen2_moe")

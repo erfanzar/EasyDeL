@@ -65,7 +65,7 @@ from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
@@ -113,10 +113,19 @@ def _sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp
         >>> sorted_inputs = _sort_activations(inputs, sort_indices)
         >>> # sorted_inputs will be [[5, 6], [1, 2], [3, 4]]
     """
-    assert inputs.shape[0] == sort_indices.shape[0]
+    inputs_first_dim: int = inputs.shape[0]
+    indices_first_dim: int = sort_indices.shape[0]
+    dims_match: bool = inputs_first_dim == indices_first_dim
+    assert dims_match
+
+    result: jax.Array
     if use_custom_vjp:
-        return _sort_activations_custom(inputs, sort_indices)
-    return inputs[sort_indices, ...]
+        sorted_custom: jax.Array = _sort_activations_custom(inputs, sort_indices)
+        result = sorted_custom
+    else:
+        sorted_direct: jax.Array = inputs[sort_indices, ...]
+        result = sorted_direct
+    return result
 
 
 @jax.custom_vjp
@@ -143,7 +152,7 @@ def _sort_activations_custom(inputs: jax.Array, sort_indices: jax.Array) -> jax.
     return inputs[sort_indices, ...]
 
 
-def _sort_activations_custom_fwd(inputs, sort_indices):
+def _sort_activations_custom_fwd(inputs: jax.Array, sort_indices: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Forward pass for custom VJP sorting.
 
     Computes the sorted output and stores the sort indices as residuals for the
@@ -157,10 +166,13 @@ def _sort_activations_custom_fwd(inputs, sort_indices):
         Tuple of (sorted_output, residuals) where residuals contains the sort_indices
         needed for the backward pass.
     """
-    return _sort_activations_custom(inputs, sort_indices), sort_indices
+    sorted_output: jax.Array = _sort_activations_custom(inputs, sort_indices)
+    residuals: jax.Array = sort_indices
+    result: tuple[jax.Array, jax.Array] = (sorted_output, residuals)
+    return result
 
 
-def _sort_activations_custom_bwd(residuals, grads):
+def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple[jax.Array, None]:
     """Backward pass for custom VJP sorting.
 
     Applies the inverse permutation to gradients to route them back to their
@@ -175,8 +187,12 @@ def _sort_activations_custom_bwd(residuals, grads):
         respect to the original unsorted inputs, and None indicates no gradient
         for sort_indices.
     """
-    sort_indices = residuals
-    return _sort_activations_custom(grads, jnp.argsort(sort_indices)), None
+    sort_indices: jax.Array = residuals
+    inverse_indices: jax.Array = jnp.argsort(sort_indices)
+    input_grads: jax.Array = _sort_activations_custom(grads, inverse_indices)
+    indices_grad: None = None
+    result: tuple[jax.Array, None] = (input_grads, indices_grad)
+    return result
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
@@ -520,7 +536,7 @@ class BaseMoeModule(nn.Module, ABC):
             in_specs = pmag.resolve(axes=[EMPTY], mode=MODE_TRAIN)
             out_specs = (in_specs, in_specs)
 
-        @partial(shard_map, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
+        @partial(shard_map, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
         def sharded_route(router_probs_):
             return self._route_local(router_probs_, strategy)
 
@@ -639,7 +655,7 @@ class BaseMoeModule(nn.Module, ABC):
             mesh=mesh,
             in_specs=(x_in_specs, gs_in_specs, se_in_specs),
             out_specs=out_specs,
-            check_rep=False,
+            check_vma=False,
         )
         def ep_wrapper(x_sorted, g_sizes, s_experts):
             shard_id = jax.lax.axis_index(expert_axis_name)
@@ -959,7 +975,7 @@ class BaseMoeModule(nn.Module, ABC):
             mesh=self.mesh,
             in_specs=(x_in_specs, idx_in_specs),
             out_specs=(x_out_specs, gs_out_specs, sortidx_out_specs),
-            check_rep=False,
+            check_vma=False,
         )
         def permute_sharded(x_flat_: jax.Array, topk_idx_flat_: jax.Array):
             x_repeat_sort, group_sizes_local, sort_idx = self._permute_local(x_flat_, topk_idx_flat_)
@@ -1038,7 +1054,7 @@ class BaseMoeModule(nn.Module, ABC):
             mesh=self.mesh,
             in_specs=(out_in_specs, idx_in_specs),
             out_specs=out_specs,
-            check_rep=False,
+            check_vma=False,
         )
         def unpermute_sharded(out_repeat_sort_: jax.Array, sort_idx_: jax.Array):
             return self._unpermute_local(out_repeat_sort_, sort_idx_, original_shape)
@@ -1734,7 +1750,7 @@ class ParallelMoELinear(nn.Module):
                     resolve(axes=[None], mode=MODE_TRAIN, shape=group_sizes.shape),
                 ),
                 out_specs=resolve(axes=out_axes, mode=MODE_TRAIN, shape=(inputs.shape[0], self.out_features)),
-                check_rep=False,
+                check_vma=False,
             )
 
         output = fn(inputs, weight, group_sizes)

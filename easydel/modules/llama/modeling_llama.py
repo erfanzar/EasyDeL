@@ -29,12 +29,11 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     BaseModelOutput,
-    CausalLMOutput,
     DecoderLayerOutput,
-    SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -592,7 +591,7 @@ class LlamaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=LlamaConfig, model_type="llama")
-class LlamaForCausalLM(EasyDeLBaseModule):
+class LlamaForCausalLM(BaseCausalLMModule[LlamaModel, LlamaConfig]):
     """Llama model with a language modeling head for causal language modeling tasks.
 
     This model is a transformer-based language model with causal attention masks
@@ -600,10 +599,14 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 
     Attributes:
             config (LlamaConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations (default is jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default is jnp.float32).
-            precision (tp.Optional[tp.Union[str, jax.lax.Precision]]): Precision setting for JAX operations.
+            dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+            precision: Precision setting for JAX operations.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "llama"
+    _config_class = LlamaConfig
 
     def __init__(
         self,
@@ -616,129 +619,18 @@ class LlamaForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=LlamaModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
         )
-        self.model = LlamaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:
-        """Forward pass through the Llama model for causal language modeling.
-
-        Args:
-                input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-                inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-                position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-                segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-                past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                    precomputed key/value states.
-                cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-                output_attentions (bool, optional): Whether to return attention weights.
-                output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-                Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=LlamaConfig, model_type="llama")
-class LlamaForSequenceClassification(EasyDeLBaseModule):
+class LlamaForSequenceClassification(BaseSequenceClassificationModule[LlamaModel, LlamaConfig]):
     """Llama model for sequence classification tasks.
 
     This class extends the base Llama model by adding a linear classification head
@@ -751,6 +643,10 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
             precision: Precision setting for JAX operations.
     """
 
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "llama"
+    _config_class = LlamaConfig
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -762,134 +658,12 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=LlamaModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
-        self.model = LlamaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        score_block = ColumnParallelLinear
-        score_block = auto_remat(
-            score_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.score = score_block(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        """Forward pass through the Llama model for sequence classification.
-
-        This method processes input sequences through the Llama model and applies
-        a classification head to the output.
-
-        Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-            Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
-        """
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
-        """
-        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()

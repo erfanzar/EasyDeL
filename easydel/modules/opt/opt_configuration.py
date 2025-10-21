@@ -79,6 +79,7 @@ class OPTConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "opt"
+    attribute_map: typing.ClassVar = {"intermediate_size": "ffn_dim"}
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(

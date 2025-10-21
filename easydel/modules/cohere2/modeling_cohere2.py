@@ -28,14 +28,15 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -116,17 +117,12 @@ class Cohere2LayerNorm(nn.Module):
         return output * weight
 
 
-class Cohere2Attention(AttentionModule):
-    """
-    Cohere2 Attention module, incorporating features like RoPE and sliding window attention.
+class Cohere2Attention(UnifiedAttention):
+    """Cohere2 Attention with layer-specific sliding window and conditional RoPE.
 
-    Attributes:
-      config (Cohere2Config): Configuration object.
-      layer_idx (int): The index of the current layer.
-      dtype (jnp.dtype): Data type for computation.
-      param_dtype (jnp.dtype): Data type for parameters.
-      precision (jax.lax.PrecisionLike): JAX precision level.
-      rngs (nn.Rngs): Random number generators.
+    Inherits from UnifiedAttention with Cohere2-specific customizations:
+    - Layer-specific sliding window (only applies to sliding_attention layers)
+    - Conditional RoPE application (only when sliding window is enabled)
     """
 
     def __init__(
@@ -139,155 +135,52 @@ class Cohere2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        """Initialize Cohere2Attention with layer-specific configuration.
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size)
+        Args:
+            config: Model configuration
+            layer_idx: Layer index for determining sliding window usage
+            dtype: Data type for computations
+            param_dtype: Data type for parameters
+            precision: JAX precision setting
+            rngs: Random number generators
+        """
+        # Set layer index and sliding window before super().__init__
         self.layer_idx = layer_idx
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, False)
-        self.attention_performer = FlexibleAttentionModule(
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+        )
+
+    def _create_rotary(self, config: Cohere2Config, dtype: jnp.dtype):
+        """Create Cohere2-specific rotary embedding layer."""
+        return config.get_basic_rope(dtype, self.head_dim, self.head_dim, False)
+
+    def _create_attention_performer(self, config: Cohere2Config, rngs: nn.Rngs):
+        """Create attention performer with Cohere2's attention dropout."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attention_dropout,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
         )
 
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass for the Cohere2 attention module.
-
-        Args:
-          hidden_states (chex.Array): Input hidden states.
-          attention_mask (chex.Array): Attention mask.
-          position_ids (chex.Array): Position IDs for RoPE.
-          causal_mask (Optional[chex.Array | bool]): Causal mask.
-          cache_view (Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for kv-caching.
-          cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-          segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-          output_attentions (bool): Whether to output attention weights.
-          fcm_mask (Optional[chex.Array]): FCM mask (if applicable).
-          frequencies (Optional[chex.Array]): Precomputed RoPE frequencies.
-
-        Returns:
-          Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
+    def _apply_rotary(self, query_states, key_states, position_ids, frequencies):
+        """Override to apply RoPE only when sliding window is enabled (Cohere2-specific)."""
         if self.sliding_window is not None:
-            query_states, key_states = self.rotary(
+            return self.rotary(
                 query=query_states,
                 key=key_states,
                 positions=position_ids,
                 frequencies=frequencies,
             )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), name="attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+        return query_states, key_states
 
 
 class Cohere2MLP(nn.Module):
@@ -528,11 +421,11 @@ class Cohere2Model(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -639,7 +532,13 @@ class Cohere2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Cohere2Config, model_type="cohere2")
-class Cohere2ForCausalLM(EasyDeLBaseModule):
+class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
+    """Cohere2 model with a Causal Language Modeling head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "cohere2"
+    _config_class = Cohere2Config
+
     def __init__(
         self,
         config: Cohere2Config,
@@ -651,36 +550,13 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Cohere2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Cohere2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
         self.logit_scale = self.config.logit_scale
 
@@ -690,12 +566,12 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere module.
@@ -790,7 +666,13 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Cohere2Config, model_type="cohere2")
-class Cohere2ForSequenceClassification(EasyDeLBaseModule):
+class Cohere2ForSequenceClassification(BaseSequenceClassificationModule[Cohere2Model, Cohere2Config]):
+    """Cohere2 model for sequence classification."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "cohere2"
+    _config_class = Cohere2Config
+
     def __init__(
         self,
         config: Cohere2Config,
@@ -802,32 +684,14 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Cohere2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Cohere2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
         )
 
     def __call__(

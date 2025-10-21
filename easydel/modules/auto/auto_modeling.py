@@ -437,6 +437,9 @@ class BaseAutoEasyModel:
         if epath.is_dir():
             if (epath / subfolder / SAFETENSOR_INDEX_NAME).exists():
                 return True
+            if oo := (epath / subfolder).glob("run-*"):
+                if len(list(oo)) != 0:
+                    return True
             if (epath / subfolder / MULTI_PART_NAME).exists():
                 return True
             if not (epath / subfolder / FLAX_WEIGHTS_NAME).is_file():
