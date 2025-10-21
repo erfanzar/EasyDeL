@@ -1259,7 +1259,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             max_position=self.granted_freq_max_position_embedding,
             base=base or self.rope_theta,
             rope_scaling=rope_config.to_dict(),
-        )
+        ).astype(jnp.bfloat16)
 
         return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
 

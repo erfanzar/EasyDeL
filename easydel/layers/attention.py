@@ -200,7 +200,7 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
             result_dtype_v4: jnp.dtype = jnp.bfloat16
             return result_mechanism_v4, result_dtype_v4
         case "gpu":
-            gpu_mechanism: AttentionMechanisms = AttentionMechanisms.FLASH_ATTN2
+            gpu_mechanism: AttentionMechanisms = AttentionMechanisms.SDPA
             gpu_dtype: jnp.dtype = jnp.bfloat16
             return (gpu_mechanism, gpu_dtype)
         case _:

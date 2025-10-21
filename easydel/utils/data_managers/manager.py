@@ -242,6 +242,7 @@ class FastDataManager:
                             try:
                                 dataset_loaded = load_dataset(
                                     path="arrow",
+                                    name=inform.dataset_split_name,
                                     data_files=f"{data_file_path}/**/*.arrow",
                                     split=inform.split,
                                     cache_dir=mixture.cache_dir,
@@ -251,6 +252,7 @@ class FastDataManager:
                             except Exception:
                                 dataset_loaded = load_dataset(
                                     path="arrow",
+                                    name=inform.dataset_split_name,
                                     data_files=data_file_path,
                                     split=inform.split,
                                     cache_dir=mixture.cache_dir,
@@ -270,6 +272,7 @@ class FastDataManager:
 
                         dataset_loaded = load_dataset(
                             path=inferred_type or "arrow",
+                            name=inform.dataset_split_name,
                             data_files=inform.data_files,
                             split=inform.split,
                             cache_dir=mixture.cache_dir,
@@ -279,6 +282,7 @@ class FastDataManager:
                 else:
                     dataset_loaded = load_dataset(
                         path=data_file_path,
+                        name=inform.dataset_split_name,
                         split=inform.split,
                         cache_dir=mixture.cache_dir,
                         streaming=mixture.streaming,
@@ -287,6 +291,7 @@ class FastDataManager:
             else:
                 dataset_loaded = load_dataset(
                     path=dataset_type,
+                    name=inform.dataset_split_name,
                     data_files=inform.data_files,
                     split=inform.split,
                     cache_dir=mixture.cache_dir,
@@ -436,6 +441,7 @@ class FastDataManager:
 
             return load_dataset(
                 path=file_type,
+                name=inform.dataset_split_name,
                 data_files=data_files,
                 split=inform.split,
                 cache_dir=mixture.cache_dir,

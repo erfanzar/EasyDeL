@@ -737,11 +737,11 @@ def apply_basic_rope(
         query = jnp.concatenate((query_rot, query[..., rotary_dim:]), axis=-1)
         key_rot = _apply_rotary_emb(key[..., :rotary_dim], cos, sin, is_neox_style)
         key = jnp.concatenate((key_rot, key[..., rotary_dim:]), axis=-1)
-        return query.astype(dtype), key.astype(dtype)
+        return query, key
     else:
         query = _apply_rotary_emb(query, cos, sin, is_neox_style)
         key = _apply_rotary_emb(key, cos, sin, is_neox_style)
-        return query.astype(dtype), key.astype(dtype)
+        return query, key
 
 
 @jax.named_scope("easydel-rotary-apply-phi3-rope")
