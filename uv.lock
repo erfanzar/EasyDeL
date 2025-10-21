@@ -641,7 +641,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = ">=0.0.81" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = ">=0.0.1" },
+    { name = "ejkernel", specifier = ">=0.0.2" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -715,7 +715,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.1"
+version = "0.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -727,9 +727,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9e/cf/ca673ef046cddc959f1275ae7eb86b7ffa7c41a2cfa064c5650c876452b9/ejkernel-0.0.1.tar.gz", hash = "sha256:686e809178fc2d694ed857a2645bfb8a16117130d70a37fb3cddbcaa56512220", size = 374828, upload-time = "2025-10-21T15:31:32.04Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/4f/ca260be0be710caa6fe6f38ca3bdc095c826bdf47c8f7b604be322377aec/ejkernel-0.0.2.tar.gz", hash = "sha256:b58b3e9ef0d8b38a12f0c2f6fa342a6e5c08fe4bcec27b4193d7102d22ae3734", size = 374778, upload-time = "2025-10-21T18:38:55.15Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/18/43/cf189d8a5ca5a170de7ed6b1f0024e37b0e1e10293bb90f514507ec4329b/ejkernel-0.0.1-py3-none-any.whl", hash = "sha256:08983cada99e85415c299fb75fe54056d59d92e6fcff7317faed4b450efb4b2f", size = 556686, upload-time = "2025-10-21T15:31:29.906Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/2f/ab1ef45119ba016f3d96de7b8a07b53d974c74b1e1f7996a79d13ecfce04/ejkernel-0.0.2-py3-none-any.whl", hash = "sha256:6b5af9c4f07e14e64ba5725a0e36a1c76b93fb5953bd7fc9fd9545d8b93da199", size = 556624, upload-time = "2025-10-21T18:38:53.402Z" },
 ]
 
 [[package]]

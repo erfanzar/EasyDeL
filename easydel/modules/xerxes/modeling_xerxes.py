@@ -482,7 +482,7 @@ class XerxesModel(EasyDeLBaseModule):
             max_position=self.config.granted_freq_max_position_embedding,
             base=10000,
             rope_scaling=None,
-        )
+        ).astype(jnp.bfloat16)
 
         return ModuleCaches(frequencies)
 

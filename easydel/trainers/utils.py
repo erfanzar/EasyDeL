@@ -24,6 +24,7 @@ This module provides essential utilities for training, including:
 """
 
 import logging
+import os
 import random
 import typing as tp
 import warnings
@@ -1373,6 +1374,10 @@ class HFDataSource(pygrain.RandomAccessDataSource):
         try:
             return next(self.data_iters[worker_idx])
         except StopIteration as e:
+            if os.getenv("HFDATASOURCE_NONSTOP", "1") == "1":
+                self.data_iters = [iter(ds) for ds in self.datasets]
+                logger.info("reseting data-iters index to rebatch point.")
+            return next(self.data_iters[worker_idx])
             raise IndexError(f"Iterator for worker {worker_idx} is exhausted.") from e
 
 
