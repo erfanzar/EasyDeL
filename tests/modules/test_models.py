@@ -1278,6 +1278,16 @@ class TestAllModels:
         )
         assert res, f"Cohere2 model Failed [ERROR {err}]"
 
+    def test_smollm3(self, small_model_config):
+        """Test smollm3 model."""
+        res, err = self.create_test_for_models(
+            "smollm3",
+            transformers.SmolLM3ForCausalLM,
+            ed.TaskType.CAUSAL_LM,
+            small_model_config,
+        )
+        assert res, f"smollm3 model Failed [ERROR {err}]"
+
     def test_qwen2_moe(self, small_model_config):
         """Test Qwen2-MoE model."""
         res, err = self.create_test_for_models(

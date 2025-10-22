@@ -510,6 +510,12 @@ _import_structure = {
         "SiglipVisionConfig",
         "SiglipVisionModel",
     ],
+    "modules.smollm3": [
+        "SmolLM3Config",
+        "SmolLM3ForCausalLM",
+        "SmolLM3ForSequenceClassification",
+        "SmolLM3Model",
+    ],
     "modules.stablelm": [
         "StableLmConfig",
         "StableLmForCausalLM",
@@ -748,6 +754,7 @@ if _tp.TYPE_CHECKING:
         SiglipVisionConfig,
         SiglipVisionModel,
     )
+    from .modules.smollm3 import SmolLM3Config, SmolLM3ForCausalLM, SmolLM3ForSequenceClassification, SmolLM3Model
     from .modules.stablelm import StableLmConfig, StableLmForCausalLM, StableLmModel
     from .modules.whisper import (
         WhisperConfig,
