@@ -117,6 +117,7 @@ class BaseDatasetInform:
     type: DatasetType | str | None = None
     data_files: os.PathLike | str = None
     num_rows: int | None = None
+    dataset_split_name: str | None = None
     split: str = "train"
     format_callback: tp.Callable[[dict], dict] | None = None
     format_fields: dict[str, str] | None = None

@@ -326,7 +326,9 @@ def create_sampling_step(
             SampleState: The updated generation state after one sampling step.
         """
         model = nn.merge(graphdef, graphstate, graphother)
-        model_outputs = model(input_ids=state.running_token, **state.model_kwargs)
+
+        call_kwargs = {k: v for k, v in state.model_kwargs.items() if k not in ("mask_info_base", "kv_lengths")}
+        model_outputs = model(input_ids=state.running_token, **call_kwargs)
 
         logits = model_outputs.logits[:, -1]
 

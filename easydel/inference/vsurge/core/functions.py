@@ -23,7 +23,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.utils.compiling_utils import ejit
 
 from ...sampling_funcs import dynamic_sample_tokens
@@ -134,8 +134,8 @@ def continuous_prefill(
     sampling_params: JitableSamplingParams,
     max_length: int,
     samples_per_slot: int,
-    cache: TransformerCache | PagesCache | None,
-    attn_metadata: TransformerMetadata | PagesMetadata | None,
+    cache: TransformerCache | RaggedPagesCache | None,
+    attn_metadata: TransformerMetadata | RaggedPagesMetadata | None,
     rngs: jax.random.PRNGKey,
 ) -> tuple[GenerationState, ResultTokens]:
     batch_size, sequence_length = tokens.shape
@@ -219,7 +219,7 @@ def continuous_decode(
     graphstate: nn.GraphState,
     graphothers: nn.GraphState,
     state: GenerationState,
-    cache_metadata: TransformerMetadata | PagesMetadata | None,
+    cache_metadata: TransformerMetadata | RaggedPagesMetadata | None,
     samples_per_slot: int,
     rngs: jax.random.PRNGKey,
 ):

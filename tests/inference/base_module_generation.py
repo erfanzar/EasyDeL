@@ -28,9 +28,9 @@ def main():
             freq_max_position_embeddings=max_model_len,
             mask_max_position_embeddings=max_model_len,
             kvdtype=jnp.bfloat16,
-            attn_mechanism=ed.AttentionMechanisms.SDPA,
+            attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
             decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),
         quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         precision=jax.lax.Precision.DEFAULT,

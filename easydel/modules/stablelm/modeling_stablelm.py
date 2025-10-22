@@ -14,11 +14,13 @@
 
 
 from functools import cached_property, partial
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -27,11 +29,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -201,34 +204,20 @@ class StableLmLayerNormPerHead(nn.Module):
         )
 
 
-class StableLmAttention(AttentionModule):
-    """StableLM Attention module with Rotary Position Embeddings and optional LayerNorm on QK.
+class StableLmAttention(UnifiedAttention):
+    """StableLM Attention with Q/K normalization.
 
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of key/value heads (for GQA).
-        num_key_value_groups (int): Number of query heads per key/value head.
-        max_position_embeddings (int): Maximum sequence length.
-        rope_theta (float): Base value for RoPE.
-        partial_rotary_factor (float): Factor determining the portion of head dimension subject to RoPE.
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for output projection.
-        rotary_emb_dim (int): Dimensionality of the rotary embeddings.
-        attention_performer (FlexibleAttentionModule): Module for performing attention computation.
-        qk_layernorm (bool): Whether to apply LayerNorm to query and key states.
-        q_layernorm (StableLmLayerNormPerHead): LayerNorm for query states (if qk_layernorm is True).
-        k_layernorm (StableLmLayerNormPerHead): LayerNorm for key states (if qk_layernorm is True).
-        rotary (RotaryEmbedding): Rotary positional embedding module.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Inherits Q/K normalization from QKNormAttention.
+    Features:
+    - Uses LayerNorm instead of RMSNorm
+    - Per-head normalization (StableLmLayerNormPerHead)
+    - Partial RoPE (partial_rotary_factor)
     """
+
+    norms_mapping: ClassVar = {
+        "query_normalization": "q_layernorm",
+        "key_normalization": "k_layernorm",
+    }
 
     def __init__(
         self,
@@ -239,102 +228,53 @@ class StableLmAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmAttention module.
-
-        Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
-        """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.qk_layernorm = config.qk_layernorm
         self.partial_rotary_factor = config.partial_rotary_factor
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.rotary_emb_dim = int(config.partial_rotary_factor * self.head_dim)
 
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+            use_qk_norm=config.qk_layernorm,
+        )
+
+    def _create_q_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use per-head LayerNorm if qk_layernorm is enabled."""
+        if not self.qk_layernorm:
+            return None
+        return StableLmLayerNormPerHead(
+            head_dim=self.head_dim,
+            num_heads=config.num_attention_heads,
+            eps=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            rngs=rngs,
         )
-        row_parallel_linear = partial(
-            RowParallelLinear,
+
+    def _create_k_norm(self, config, dtype, param_dtype, rngs):
+        """Override to use per-head LayerNorm if qk_layernorm is enabled."""
+        if not self.qk_layernorm:
+            return None
+        return StableLmLayerNormPerHead(
+            head_dim=self.head_dim,
+            num_heads=config.num_key_value_heads,
+            eps=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.k_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.v_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            use_bias=self.config.use_qkv_bias,
-            rngs=rngs,
-        )
-        self.o_proj = row_parallel_linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            use_bias=False,
             rngs=rngs,
         )
 
-        self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
-
-        self.qk_layernorm = config.qk_layernorm
-        if self.qk_layernorm:
-            self.q_layernorm = StableLmLayerNormPerHead(
-                head_dim=self.head_dim,
-                num_heads=config.num_attention_heads,
-                eps=config.layer_norm_eps,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                rngs=rngs,
-            )
-            self.k_layernorm = StableLmLayerNormPerHead(
-                head_dim=self.head_dim,
-                num_heads=config.num_key_value_heads,
-                eps=config.layer_norm_eps,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                rngs=rngs,
-            )
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
+    def _create_rotary(self, config, dtype):
+        """Override for partial RoPE."""
+        return config.get_basic_rope(
+            dtype,
             head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
             rotary_dim=self.rotary_emb_dim,
             base=config.rope_theta,
@@ -343,45 +283,25 @@ class StableLmAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (chex.Array): Mask to apply on the attention scores (batch, 1, seq_len, kv_seq_len).
-            position_ids (chex.Array): Position indices for the tokens (batch, seq_len).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
-                Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
-                Metadata for paged attention (optional).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states (default: False).
-            fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
-
-        Returns:
-            tp.Tuple[chex.Array, chex.Array | None]: A tuple containing the attention output
-                (batch, seq_len, hidden_size)
-                and optionally the attention weights (batch, num_heads, seq_len, kv_seq_len).
-        """
+        """Forward pass with per-head LayerNorm requiring transpose operations."""
         batch_size, sequence_length = hidden_states.shape[:2]
+
+        # Project to Q/K/V
         query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
+            checkpoint_name(self.query_projection(hidden_states), "attn_query"),
+            checkpoint_name(self.key_projection(hidden_states), "attn_key"),
+            checkpoint_name(self.value_projection(hidden_states), "attn_value"),
         )
 
+        # Reshape to multi-head format
         query_states = query_states.reshape(
             batch_size,
             sequence_length,
@@ -402,21 +322,15 @@ class StableLmAttention(AttentionModule):
         )
 
         if self.qk_layernorm:
-            query_states = self.q_layernorm(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
-            key_states = self.k_layernorm(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+            query_states = self.query_normalization(query_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
+            key_states = self.key_normalization(key_states.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -426,9 +340,7 @@ class StableLmAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
         )
 
         attentions = self.attention_performer.forward(
@@ -440,13 +352,13 @@ class StableLmAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
         )
 
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
+
         return AttentionLayerOutput(
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
@@ -539,15 +451,12 @@ class StableLmDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the decoder layer.
@@ -557,9 +466,9 @@ class StableLmDecoderLayer(nn.Module):
             attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
             position_ids (chex.Array): Position IDs (batch, seq_len).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]):
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]):
                 Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to output attention weights (default: False).
@@ -582,15 +491,12 @@ class StableLmDecoderLayer(nn.Module):
         )
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -723,14 +629,13 @@ class StableLmModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> BaseModelOutput:
         """Forward pass of the StableLM model.
 
@@ -745,9 +650,9 @@ class StableLmModel(EasyDeLBaseModule):
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
                 (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
 
         Returns:
@@ -770,18 +675,18 @@ class StableLmModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+
         hidden_states = inputs_embeds
 
         if mode is None:
@@ -804,14 +709,12 @@ class StableLmModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -861,21 +764,12 @@ class StableLmModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=StableLmConfig, model_type="stablelm")
-class StableLmForCausalLM(EasyDeLBaseModule):
-    """StableLM model with a Causal Language Modeling (CLM) head.
+class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
+    """StableLM model with a Causal Language Modeling (CLM) head."""
 
-    This class wraps the base `StableLmModel` and adds a linear layer (language model head)
-    to predict the next token logits.
-
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        model (StableLmModel): The base StableLM model.
-        lm_head (ParallelLinear): The language model head (linear layer).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "stablelm"
+    _config_class = StableLmConfig
 
     def __init__(
         self,
@@ -886,46 +780,15 @@ class StableLmForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmForCausalLM module.
-
-        Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=StableLmModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = StableLmModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = self.config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
@@ -933,13 +796,13 @@ class StableLmForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """Forward pass of the StableLM model for Causal Language Modeling.
@@ -955,9 +818,9 @@ class StableLmForCausalLM(EasyDeLBaseModule):
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all
                 layers (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]):
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
 
         Returns:
@@ -966,6 +829,7 @@ class StableLmForCausalLM(EasyDeLBaseModule):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -973,7 +837,6 @@ class StableLmForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
         hidden_states = outputs.last_hidden_state
 

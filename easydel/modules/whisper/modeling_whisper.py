@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -202,7 +203,6 @@ class WhisperAttention(AttentionModule):
         cache_view: TransformerCacheView | None = None,
         cache_metadata: TransformerMetadata | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
     ) -> tuple[tp.Any, tp.Any]:
         """Forward pass of the attention module.
 
@@ -240,7 +240,7 @@ class WhisperAttention(AttentionModule):
             (
                 key_states,
                 value_states,
-                attention_mask,
+                mask_info,
                 init_attention_bias,
                 cache_view,
                 cache_metadata,
@@ -268,8 +268,7 @@ class WhisperAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=None,
+            mask_info=mask_info,
             causal=self.causal,
         )
 
@@ -377,8 +376,7 @@ class WhisperEncoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        mask_info: MaskInfo,
         output_attentions: bool = True,
     ) -> tuple[jnp.ndarray]:
         """Forward pass of the encoder layer.
@@ -543,8 +541,7 @@ class WhisperDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
+        mask_info: MaskInfo,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -779,7 +776,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                 layer_outputs = encoder_layer(
                     hidden_states=hidden_states,
                     causal_mask=None,
-                    attention_mask=None,
+                    mask_info=None,
                     output_attentions=output_attentions,
                 )
             hidden_states = layer_outputs[0]
@@ -898,7 +895,7 @@ class WhisperDecoder(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -972,7 +969,6 @@ class WhisperDecoder(EasyDeLBaseModule):
                 layer_outputs = decoder_layer(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    causal_mask=self.causal_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     mode=mode,

@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -29,7 +30,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import RowParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
@@ -157,7 +158,7 @@ class Mistral3MultiModalProjector(nn.Module):
         self.rngs = rngs
         self.norm = RMSNorm(
             config.vision_config.hidden_size,
-            eps=config.text_config.rms_norm_eps,
+            eps=config.get_text_config().rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -172,7 +173,7 @@ class Mistral3MultiModalProjector(nn.Module):
         num_feature_layers = 1 if isinstance(config.vision_feature_layer, int) else len(config.vision_feature_layer)
         self.linear_1 = RowParallelLinear(
             config.vision_config.hidden_size * num_feature_layers,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
             kernel_init=nn.initializers.normal(0.02),
             param_dtype=param_dtype,
@@ -183,8 +184,8 @@ class Mistral3MultiModalProjector(nn.Module):
 
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = RowParallelLinear(
-            config.text_config.hidden_size,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=config.multimodal_projector_bias,
             kernel_init=nn.initializers.normal(0.02),
             param_dtype=param_dtype,
@@ -234,9 +235,9 @@ class Mistral3Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.vocab_size = config.text_config.vocab_size
+        self.vocab_size = config.get_text_config().vocab_size
         self.language_model = AutoEasyDeLModel.from_config(
-            config=config.text_config,
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -261,11 +262,11 @@ class Mistral3Model(EasyDeLBaseModule):
         pixel_values: chex.Array = None,
         image_sizes: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -302,6 +303,7 @@ class Mistral3Model(EasyDeLBaseModule):
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -309,7 +311,6 @@ class Mistral3Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             **lm_kwargs,
         )
 
@@ -459,8 +460,8 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             exclude_names=config.gradient_checkpointing_targets,
         )
         self.lm_head = lm_head_block(
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
+            config.get_text_config().hidden_size,
+            config.get_text_config().vocab_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -537,11 +538,11 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
         pixel_values: chex.Array = None,
         image_sizes: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
@@ -557,6 +558,7 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             input_ids=input_ids,
             pixel_values=pixel_values,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -565,7 +567,6 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             image_sizes=image_sizes,
             cache_metadata=cache_metadata,
             mode=mode,
-            segment_ids=segment_ids,
             **lm_kwargs,
         )
         logits = None

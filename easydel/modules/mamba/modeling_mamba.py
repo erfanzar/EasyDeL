@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 from einops import repeat
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -497,9 +498,17 @@ class MambaModel(EasyDeLBaseModule):
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=None,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
         if cache is None:
@@ -640,6 +649,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             cache=cache,
             output_hidden_states=output_hidden_states,

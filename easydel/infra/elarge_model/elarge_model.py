@@ -40,7 +40,7 @@ from typing import Any, NotRequired, Unpack
 
 import jax
 from eformer.loggings import get_logger
-from eformer.paths import ePathLike
+from eformer.paths import ePath, ePathLike
 from transformers import AutoTokenizer
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -1567,8 +1567,7 @@ class eLargeModel:
             )
 
             if output_path:
-                with open(output_path, "w") as f:
-                    json.dump(results, f, indent=2)
+                ePath(output_path).write_text(json.dumps(results, indent=2))
                 logger.info(f"eval results saved to: {output_path}")
 
             logger.info("evaluation summary:")

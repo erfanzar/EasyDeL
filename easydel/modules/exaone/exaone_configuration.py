@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import ClassVar
+
 from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -82,6 +84,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
     """
 
     model_type: str = "exaone"
+    attribute_map: ClassVar = {"num_hidden_layers": "num_layers"}
 
     def __init__(
         self,

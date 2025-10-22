@@ -18,6 +18,7 @@ from .modeling_roberta import (
     RobertaForQuestionAnswering,
     RobertaForSequenceClassification,
     RobertaForTokenClassification,
+    RobertaModel,
 )
 from .roberta_configuration import RobertaConfig
 
@@ -28,4 +29,5 @@ __all__ = (
     "RobertaForQuestionAnswering",
     "RobertaForSequenceClassification",
     "RobertaForTokenClassification",
+    "RobertaModel",
 )

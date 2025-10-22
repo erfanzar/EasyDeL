@@ -33,7 +33,9 @@ from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
+from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
+from optax import GradientTransformation
 
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
@@ -305,6 +307,10 @@ class TrainingArguments:
         default=5,
         metadata={"help": "Report metrics every X steps."},
     )
+    save_interval_minutes: float | None = field(
+        default=None,
+        metadata={"help": "Interval Minutes to save the checkpoint for state."},
+    )
     save_directory: str = field(
         default="EasyDeL-Checkpoints",
         metadata={"help": "The directory to save checkpoints to."},
@@ -319,7 +325,10 @@ class TrainingArguments:
     )
     save_total_limit: int | None = field(
         default=None,
-        metadata={"help": "The maximum number of checkpoints to keep."},
+        metadata={
+            "help": "Maximum number of permanent checkpoints to keep. Older checkpoints are deleted. "
+            "Note: Temporary checkpoints (time-based) are managed separately by Checkpointer."
+        },
     )
     scheduler: AVAILABLE_SCHEDULERS = field(
         default=EasyDeLSchedulers.NONE,
@@ -427,6 +436,7 @@ class TrainingArguments:
     )
 
     _can_log_metrics: bool | None = None
+    _im_a_hidden_checkpoint_manager: Checkpointer | None = None
 
     @property
     def can_log_metrics(self):
@@ -645,6 +655,11 @@ class TrainingArguments:
         path = self.get_path()
         path.mkdir(parents=True, exist_ok=True)
 
+    def get_tx_template(self, possible_max: int | None = None) -> GradientTransformation:
+        if possible_max is None:
+            possible_max = 2**63 - 1
+        return self.get_optimizer_and_scheduler(possible_max)[0]
+
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         """
         Create and return the optimizer and learning rate scheduler.
@@ -707,10 +722,49 @@ class TrainingArguments:
             The AsyncCheckpointManager allows non-blocking checkpoint
             saves during training, improving training efficiency.
         """
+        if self._im_a_hidden_checkpoint_manager is not None:
+            return self._im_a_hidden_checkpoint_manager
 
-        from eformer.serialization import AsyncCheckpointManager
+        self._im_a_hidden_checkpoint_manager = Checkpointer(
+            base_path=str(self._get_save_directory()),
+            save_interval=self.get_save_interval_timedelta(),
+            step_policies=self.get_checkpoint_policies(),
+        )
 
-        return AsyncCheckpointManager()
+        return self._im_a_hidden_checkpoint_manager
+
+    def get_checkpoint_policies(self):
+        """Convert save_steps configuration to CheckpointInterval policies.
+
+        Returns:
+            list[CheckpointInterval]: List of checkpoint interval policies.
+                Returns empty list if save_steps is None.
+
+        Example:
+            >>> args = TrainingArguments(save_steps=1000)
+            >>> policies = args.get_checkpoint_policies()
+            >>> # Returns: [CheckpointInterval(every=1000, until=None)]
+        """
+        from eformer.serialization.checkpointer import CheckpointInterval
+
+        if self.save_steps is None:
+            return []
+        return [CheckpointInterval(every=self.save_steps, until=None)]
+
+    def get_save_interval_timedelta(self):
+        """Get time-based checkpoint save interval as timedelta.
+
+        Returns:
+            timedelta | None: Time interval for temporary checkpoints,
+                or None if no time-based saving is configured.
+
+        Note:
+            Currently returns None. Can be extended to support
+            time-based checkpoint saving via new TrainingArguments field.
+        """
+        if self.save_interval_minutes is not None:
+            return datetime.timedelta(minutes=self.save_interval_minutes)
+        return None
 
     @functools.cached_property
     def _tensorboard(self):

@@ -20,6 +20,7 @@ import jax.lax
 from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -32,9 +33,9 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits, with_sharding_constraint
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -253,15 +254,12 @@ class PhiMoEAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the PhiMoEAttention module.
@@ -271,8 +269,8 @@ class PhiMoEAttention(AttentionModule):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
             fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
@@ -306,7 +304,7 @@ class PhiMoEAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -316,9 +314,7 @@ class PhiMoEAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
             sliding_window=self.sliding_window,
         )
 
@@ -331,8 +327,7 @@ class PhiMoEAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=True,
             sliding_window=self.sliding_window,
         )
@@ -570,16 +565,13 @@ class PhiMoeDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the PhiMoeDecoderLayer module.
@@ -590,8 +582,8 @@ class PhiMoeDecoderLayer(nn.Module):
             position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Default is False.
             output_router_logits (bool): Whether to return router logits from the MoE layer. Default is False.
             fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
@@ -615,15 +607,12 @@ class PhiMoeDecoderLayer(nn.Module):
 
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
         hidden_states, self_attn_weights = (
@@ -739,14 +728,13 @@ class PhiMoeModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> BaseModelOutput:
         """Forward pass of the PhiMoeModel.
 
@@ -763,9 +751,9 @@ class PhiMoeModel(EasyDeLBaseModule):
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
 
         Returns:
             BaseModelOutput: The model's output.
@@ -790,18 +778,18 @@ class PhiMoeModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -823,14 +811,12 @@ class PhiMoeModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -955,13 +941,13 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """Forward pass of the PhiMoeForCausalLM model.
@@ -979,9 +965,9 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
 
 
         Returns:
@@ -992,6 +978,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -999,7 +986,6 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
         hidden_states = outputs.last_hidden_state
         lm_logits = None

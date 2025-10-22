@@ -180,10 +180,18 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
-    "layers.attention_operator._attention_impl": [
-        "AttentionMetadata",
-        "AttentionRegistry",
-        "AttentionImpl",
+    "layers.operations": [
+        "AttentionOutput",
+        "AutoRegressiveDecodeAttn",
+        "BlockSparseAttn",
+        "FlashAttn",
+        "OperationImpl",
+        "OperationMetadata",
+        "OperationRegistry",
+        "RaggedPageAttn",
+        "RingAttn",
+        "ScaledDotProductAttn",
+        "VanillaAttn",
     ],
     "layers.attention": [
         "AttentionMechanisms",
@@ -267,6 +275,12 @@ _import_structure = {
         "ExaoneForCausalLM",
         "ExaoneForSequenceClassification",
         "ExaoneModel",
+    ],
+    "modules.exaone4": [
+        "Exaone4Config",
+        "Exaone4ForCausalLM",
+        "Exaone4ForSequenceClassification",
+        "Exaone4Model",
     ],
     "modules.falcon": [
         "FalconConfig",
@@ -415,6 +429,12 @@ _import_structure = {
         "Olmo2ForSequenceClassification",
         "Olmo2Model",
     ],
+    "modules.olmo3": [
+        "Olmo3Config",
+        "Olmo3ForCausalLM",
+        "Olmo3ForSequenceClassification",
+        "Olmo3Model",
+    ],
     "modules.openelm": [
         "OpenELMConfig",
         "OpenELMForCausalLM",
@@ -489,6 +509,12 @@ _import_structure = {
         "SiglipTextModel",
         "SiglipVisionConfig",
         "SiglipVisionModel",
+    ],
+    "modules.smollm3": [
+        "SmolLM3Config",
+        "SmolLM3ForCausalLM",
+        "SmolLM3ForSequenceClassification",
+        "SmolLM3Model",
     ],
     "modules.stablelm": [
         "StableLmConfig",
@@ -592,7 +618,19 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.attention_operator._attention_impl import AttentionImpl, AttentionMetadata, AttentionRegistry
+    from .layers.operations import (
+        AttentionOutput,
+        AutoRegressiveDecodeAttn,
+        BlockSparseAttn,
+        FlashAttn,
+        OperationImpl,
+        OperationMetadata,
+        OperationRegistry,
+        RaggedPageAttn,
+        RingAttn,
+        ScaledDotProductAttn,
+        VanillaAttn,
+    )
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,
@@ -639,6 +677,7 @@ if _tp.TYPE_CHECKING:
     from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
     from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
+    from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
     from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
     from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
@@ -686,6 +725,7 @@ if _tp.TYPE_CHECKING:
     from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
     from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
     from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2ForSequenceClassification, Olmo2Model
+    from .modules.olmo3 import Olmo3Config, Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model
     from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
     from .modules.opt import OPTConfig, OPTForCausalLM, OPTModel
     from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
@@ -714,6 +754,7 @@ if _tp.TYPE_CHECKING:
         SiglipVisionConfig,
         SiglipVisionModel,
     )
+    from .modules.smollm3 import SmolLM3Config, SmolLM3ForCausalLM, SmolLM3ForSequenceClassification, SmolLM3Model
     from .modules.stablelm import StableLmConfig, StableLmForCausalLM, StableLmModel
     from .modules.whisper import (
         WhisperConfig,
@@ -770,13 +811,24 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_versions = ["0.0.76"]
+    _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
+    _targeted_ejkernel_versions = ["0.0.3"]
+
 
     from eformer import __version__ as _eform_version
+    from ejkernel import __version__ as _ejker_version
 
-    assert _version(_eform_version) in [_version(_targeted_version) for _targeted_version in _targeted_versions], (
-        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
+    assert _version(_eform_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_eformer_versions
+    ], (
+        f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_eformer_versions)},"
         f" but found eformer {_eform_version}"
+    )
+    assert _version(_ejker_version) in [
+        _version(_targeted_version) for _targeted_version in _targeted_ejkernel_versions
+    ], (
+        f"this version of EasyDeL is only compatible with ejkernel {', '.join(_targeted_ejkernel_versions)},"
+        f" but found ejkernel {_ejker_version}"
     )
 
     if not _is_package_available("torch"):

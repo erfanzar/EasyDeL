@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -26,18 +27,18 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -143,31 +144,11 @@ class Olmo2MLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Olmo2Attention(AttentionModule):
-    """OLMo-2 Attention module.
+class Olmo2Attention(UnifiedAttention):
+    """OLMo-2 Attention with Q/K normalization.
 
-    This module implements the multi-head attention mechanism with rotary position embeddings
-    and Grouped Query Attention (GQA) used in the OLMo-2 model. It includes RMSNorm applied
-    to query and key projections before the attention calculation.
-
-    Attributes:
-        config (Olmo2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for the output projection.
-        q_norm (RMSNorm): RMS Normalization applied to the query projection.
-        k_norm (RMSNorm): RMS Normalization applied to the key projection.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        rotary (RoPE): Rotary position embedding module.
+    Uses RMSNorm for Q/K normalization to improve training stability.
+    Standard RoPE-based attention without sliding window.
     """
 
     def __init__(
@@ -179,171 +160,38 @@ class Olmo2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Olmo2Attention module.
-
-        Args:
-            config (Olmo2Config): The configuration object for the OLMo-2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.hidden_size = config.hidden_size
-        self.num_heads = self.config.num_attention_heads
-        self.head_dim = self.config.hidden_size // self.num_heads
-        self.num_key_value_groups = self.num_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.num_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
-        self.q_norm = RMSNorm(
-            self.num_heads * self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
+        """Initialize OLMo-2 attention with Q/K normalization."""
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-        )
-        self.k_norm = RMSNorm(
-            self.config.num_key_value_heads * self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            rngs=rngs,
-        )
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            dropout_prob=config.attention_dropout,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-        )
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=self.config.hidden_size // self.config.num_attention_heads,
-            rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-            base=self.config.rope_theta,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the Olmo2Attention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_norm(self.q_proj(hidden_states)), "attn_query"),
-            checkpoint_name(self.k_norm(self.k_proj(hidden_states)), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            attention_type="standard",
             causal=True,
+            use_qk_norm=True,  # Enable Q/K normalization
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+    def _create_k_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+        """Create Q/K normalization layers (RMSNorm)."""
+        return RMSNorm(
+            dim=self.config.num_attention_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=param_dtype,
+            rngs=rngs,
         )
+
+    def _create_q_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+        """Create Q/K normalization layers (RMSNorm)."""
+        return RMSNorm(
+            dim=self.config.num_key_value_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def _preprocess_qkv(self, query_states, key_states, value_states):
+        return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Olmo2DecoderLayer(nn.Module):
@@ -430,15 +278,12 @@ class Olmo2DecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the Olmo2DecoderLayer module.
@@ -448,8 +293,8 @@ class Olmo2DecoderLayer(nn.Module):
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
             fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
@@ -462,15 +307,12 @@ class Olmo2DecoderLayer(nn.Module):
         residual = hidden_states
         attention_output = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -581,12 +423,11 @@ class Olmo2Model(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -601,9 +442,9 @@ class Olmo2Model(EasyDeLBaseModule):
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -631,14 +472,15 @@ class Olmo2Model(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
@@ -663,14 +505,12 @@ class Olmo2Model(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -720,22 +560,12 @@ class Olmo2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Olmo2Config, model_type="olmo2")
-class Olmo2ForCausalLM(EasyDeLBaseModule):
-    """OLMo-2 model with a Causal Language Modeling head.
+class Olmo2ForCausalLM(BaseCausalLMModule[Olmo2Model, Olmo2Config]):
+    """OLMo-2 model with a Causal Language Modeling head."""
 
-    This model consists of the base OLMo-2 transformer (`Olmo2Model`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-
-    Attributes:
-        config (Olmo2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (Olmo2Model): The core OLMo-2 transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "olmo2"
+    _config_class = Olmo2Config
 
     def __init__(
         self,
@@ -746,47 +576,15 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Olmo2ForCausalLM model.
-
-        Args:
-            config (Olmo2Config): The configuration object for the OLMo-2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
         super().__init__(
             config=config,
+            base_model_class=Olmo2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Olmo2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
 
     def __call__(
@@ -794,11 +592,11 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -814,9 +612,9 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -831,12 +629,12 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
@@ -888,22 +686,12 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Olmo2Config, model_type="olmo2")
-class Olmo2ForSequenceClassification(EasyDeLBaseModule):
-    """OLMo-2 model with a Sequence Classification head.
+class Olmo2ForSequenceClassification(BaseSequenceClassificationModule[Olmo2Model, Olmo2Config]):
+    """OLMo-2 model with a Sequence Classification head."""
 
-    This model consists of the base OLMo-2 transformer (`Olmo2Model`) followed by a
-    linear layer (`score`) that projects the transformer's output hidden states
-    (typically the hidden state of the last token) to the number of classes for classification.
-
-    Attributes:
-        config (Olmo2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (Olmo2Model): The core OLMo-2 transformer model.
-        score (ParallelLinear): The linear layer for classification.
-    """
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "olmo2"
+    _config_class = Olmo2Config
 
     def __init__(
         self,
@@ -914,46 +702,16 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Olmo2ForSequenceClassification model.
-
-        Args:
-            config (Olmo2Config): The configuration object for the OLMo-2 model.
-                Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            AssertionError: If `config.num_labels` is not defined.
-        """
         super().__init__(
             config=config,
+            base_model_class=Olmo2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Olmo2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
         )
 
     def __call__(
@@ -961,11 +719,11 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -981,9 +739,9 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
             position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | PagesCache]):
+            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -1001,6 +759,7 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -1008,7 +767,6 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state

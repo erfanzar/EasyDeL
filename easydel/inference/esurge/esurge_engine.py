@@ -328,13 +328,11 @@ class eSurge:
         from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
 
-        if jax.default_backend() != "tpu" and page_size <= 128:
-            logger.warning(
-                "for better performance and to utilize GPUs kernels (or even just on CPUs) "
-                "better it's recommended to use `page_size>=256`."
-            )
+        if page_size < 256 and jax.default_backend() != "tpu":
+            logger.warn("PageSize less than 256 is inefficient for gpu/cpu so we will automatically use 256 for you!")
+            page_size = 256
         if reserve_tokens is None:
-            reserve_tokens = max_model_len // 10
+            reserve_tokens = max_model_len // 12
 
         if max_model_len <= reserve_tokens:
             raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
@@ -1635,7 +1633,7 @@ class eSurge:
         return self._monitoring_initialized
 
     def __del__(self):
-        if self._scheduler_running:
+        if getattr(self, "_scheduler_running", False):
             try:
                 self.terminate()
             except Exception:

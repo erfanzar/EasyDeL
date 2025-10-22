@@ -19,6 +19,7 @@ import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -27,18 +28,18 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -135,8 +136,13 @@ class MistralMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class MistralAttention(AttentionModule):
-    """Multi-head attention layer with RoPE embeddings for Mistral models."""
+class MistralAttention(UnifiedAttention):
+    """Multi-head attention layer with RoPE embeddings for Mistral models.
+
+    Inherits from UnifiedAttention with Mistral-specific customizations:
+    - Sliding window attention support
+    - Custom RoPE configuration
+    """
 
     def __init__(
         self,
@@ -147,128 +153,22 @@ class MistralAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize attention layer with config."""
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.head_dim
-
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
+        """Initialize Mistral attention with sliding window configuration."""
+        # Set sliding window before super().__init__ so it's available during network definition
         self.sliding_window = config.sliding_window
-        self.attention_performer = FlexibleAttentionModule(
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-            dropout_prob=config.attention_dropout,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-        )
-
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim)
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> AttentionLayerOutput:
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            attention_type="standard",
             causal=True,
-            sliding_window=self.sliding_window,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+    def _create_rotary(self, config: MistralConfig, dtype: jnp.dtype):
+        """Create Mistral-specific rotary embedding layer."""
+        return config.get_basic_rope(dtype, self.head_dim)
 
 
 class MistralDecoderLayer(nn.Module):
@@ -333,29 +233,23 @@ class MistralDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
         residual = hidden_states
         attention_output = self.self_attn(
             self.input_layernorm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -444,11 +338,11 @@ class MistralModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -459,10 +353,9 @@ class MistralModel(EasyDeLBaseModule):
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional):
+            past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -487,20 +380,18 @@ class MistralModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -523,14 +414,12 @@ class MistralModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -581,18 +470,12 @@ class MistralModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MistralConfig, model_type="mistral")
-class MistralForCausalLM(EasyDeLBaseModule):
-    """Mistral model with a language modeling head for causal language modeling tasks.
+class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
+    """Mistral model with a language modeling head for causal language modeling tasks."""
 
-    This model is a transformer-based language model with sliding window attention
-    applied to perform autoregressive language generation.
-
-    Attributes:
-            config (MistralConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision: Precision setting for JAX operations.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mistral"
+    _config_class = MistralConfig
 
     def __init__(
         self,
@@ -605,36 +488,13 @@ class MistralForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=MistralModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = MistralModel(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
 
     def __call__(
@@ -642,11 +502,11 @@ class MistralForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -658,10 +518,9 @@ class MistralForCausalLM(EasyDeLBaseModule):
                 inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
                 attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
                 position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-                segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-                past_key_values (TransformerCache | PagesCache, optional):
+                past_key_values (TransformerCache | RaggedPagesCache, optional):
                     Cache containing precomputed key/value states.
-                cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+                cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
                 output_attentions (bool, optional): Whether to return attention weights.
                 output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -672,6 +531,7 @@ class MistralForCausalLM(EasyDeLBaseModule):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -679,7 +539,6 @@ class MistralForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -729,18 +588,12 @@ class MistralForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MistralConfig, model_type="mistral")
-class MistralForSequenceClassification(EasyDeLBaseModule):
-    """Mistral model for sequence classification tasks.
+class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralModel, MistralConfig]):
+    """Mistral model for sequence classification tasks."""
 
-    This class extends the base Mistral model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
-
-    Attributes:
-            config (MistralConfig): Configuration for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision: Precision setting for JAX operations.
-    """
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "mistral"
+    _config_class = MistralConfig
 
     def __init__(
         self,
@@ -753,31 +606,14 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=MistralModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = MistralModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            classifier_name="score",  # Mistral uses 'score' not 'classifier'
+            classifier_bias=False,
         )
 
     def __call__(
@@ -785,11 +621,11 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
         input_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -803,10 +639,9 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | PagesCache, optional):
+            past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -817,6 +652,7 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -824,7 +660,6 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state

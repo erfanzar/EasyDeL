@@ -14,6 +14,7 @@
 
 
 import functools
+from typing import ClassVar
 
 import chex
 import jax
@@ -21,6 +22,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -29,18 +31,19 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheMetaData,
     TransformerCacheView,
@@ -55,13 +58,31 @@ from easydel.layers.moe import (
     RowParallelMoELinear,
 )
 from easydel.layers.norms import RMSNorm
+from easydel.layers.rotary_embedding import yarn_get_mscale
 
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
 
 
-class Xerxes2Attention(AttentionModule):
+class Xerxes2Attention(UnifiedAttention):
+    """Xerxes2 Multi-head Latent Attention.
+
+    Inherits MLA implementation from UnifiedAttention base class.
+    Uses a compressed KV representation with LoRA and separate nope/rope dimensions.
+    """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+        "output_projection": "o_proj",
+    }
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -71,197 +92,169 @@ class Xerxes2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.qhead_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.vhead_dim = config.vhead_dim
-
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        # Set MLA-specific dimensions before calling super().__init__()
+        # so they're available in define_network
+        self.config = config
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.vhead_dim
+        self.kv_lora_rank = config.kv_lora_dim
 
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            attention_type="mla",
+            causal=True,
+            use_mla_lora=config.q_lora_dim is not None,
         )
 
-        if self.config.q_lora_dim is not None:
-            self.qa_proj = column_parallel_linear(config.hidden_size, config.q_lora_dim)
-            self.qa_norm = nn.LayerNorm(
-                config.q_lora_dim,
+        # Override head_dim for MLA - use value head dimension for output merging
+        self.head_dim = self.v_head_dim
+
+    def define_network(
+        self,
+        config: Xerxes2Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.Precision,
+        rngs: nn.Rngs,
+    ):
+        """Define MLA-specific network structure for Xerxes2."""
+
+        if not self.use_mla_lora:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
+            )
+        else:
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_proj"],
+                ColumnParallelLinear(
+                    config.hidden_size,
+                    config.q_lora_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_a_layernorm"],
+                nn.LayerNorm(
+                    config.q_lora_dim,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                ),
+            )
+            setattr(
+                self,
+                self.projection_mapping["mla_q_b_proj"],
+                ColumnParallelLinear(
+                    config.q_lora_dim,
+                    config.num_attention_heads * self.q_head_dim,
+                    rngs=rngs,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                    precision=precision,
+                    **get_dot_general_by_bits(config.bits, config.easy_method),
+                ),
+            )
+
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_proj_with_mqa"],
+            ColumnParallelLinear(
+                config.hidden_size,
+                config.kv_lora_dim + config.qk_rope_head_dim,
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
+        )
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_a_layernorm"],
+            nn.LayerNorm(
+                config.kv_lora_dim,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
-            )
-            self.qb_proj = column_parallel_linear(config.q_lora_dim, self.num_heads * self.qhead_dim)
-        else:
-            self.qc_proj = column_parallel_linear(config.hidden_size, self.num_heads * self.qhead_dim)
-        self.kv_mqa_proj = column_parallel_linear(
-            config.hidden_size,
-            config.kv_lora_dim + config.qk_rope_head_dim,
+            ),
         )
-        self.kv_norm = nn.LayerNorm(
-            config.kv_lora_dim,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
+        setattr(
+            self,
+            self.projection_mapping["mla_kv_b_proj"],
+            ColumnParallelLinear(
+                config.kv_lora_dim,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.vhead_dim),
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
         )
-        self.kvi_proj = column_parallel_linear(
-            config.kv_lora_dim,
-            self.num_heads * (self.qhead_dim - self.qk_rope_head_dim + self.vhead_dim),
+        setattr(
+            self,
+            self.projection_mapping["output_projection"],
+            RowParallelLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
+                rngs=rngs,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+                precision=precision,
+                **get_dot_general_by_bits(config.bits, config.easy_method),
+            ),
         )
-        self.o_proj = row_parallel_linear(
-            self.num_heads * self.vhead_dim,
-            self.config.hidden_size,
-        )
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_attention_performer(self, config, rngs):
+        """Create attention performer module."""
+        softmax_scale = self.q_head_dim**-0.5
+        if self.config.rope_scaling is not None:
+            mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_scaling["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                softmax_scale = softmax_scale * mscale * mscale
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
-            softmax_scale=self.qhead_dim**-0.5,
+            softmax_scale=softmax_scale,
             dropout_prob=0.0,
-        )
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            self.qk_rope_head_dim,
-            self.qk_rope_head_dim,
-            config.rope_theta,
-        )
-
-    def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
-        frequencies: tuple[chex.Array, chex.Array],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-    ):
-        """Forward pass of the attention module."""
-        batch_size, sequence_length = hidden_states.shape[:2]
-        if self.config.q_lora_dim is None:
-            query_states = self.qc_proj(hidden_states)
-        else:
-            query_states = self.qb_proj(self.qa_norm(self.qa_proj(hidden_states)))
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.num_heads,
-            self.qhead_dim,
-        )
-        compressed_kv = self.kv_mqa_proj(hidden_states)
-        compressed_kv = compressed_kv.reshape(
-            batch_size,
-            sequence_length,
-            1,
-            self.config.kv_lora_dim + self.config.qk_rope_head_dim,
-        )
-
-        q_nope, q_pe = (
-            query_states[..., : self.qk_nope_head_dim],
-            query_states[..., self.qk_nope_head_dim :],
-        )
-        k_pe = compressed_kv[..., self.config.kv_lora_dim :]
-        compressed_kv = compressed_kv[..., : self.config.kv_lora_dim]
-        kv = self.kvi_proj(self.kv_norm(compressed_kv))
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.vhead_dim]
-        k_nope = kv[..., : self.qk_nope_head_dim]
-
-        q_pe, k_pe = self.rotary(
-            positions=position_ids,
-            query=q_pe,
-            key=k_pe,
-            frequencies=frequencies,
-        )
-
-        query_states = (
-            jnp.zeros(
-                (batch_size, sequence_length, self.num_heads, self.qhead_dim),
-                dtype=q_pe.dtype,
-            )
-            .at[..., : self.qk_nope_head_dim]
-            .set(q_nope)
-            .at[..., self.qk_nope_head_dim :]
-            .set(q_pe)
-        )
-        key_states = (
-            jnp.zeros(
-                (batch_size, sequence_length, 1, self.qhead_dim),
-                dtype=q_pe.dtype,
-            )
-            .at[..., : self.qk_nope_head_dim]
-            .set(k_nope)
-            .at[..., self.qk_nope_head_dim :]
-            .set(k_pe)
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-        )
-
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
-        )
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
@@ -539,14 +532,12 @@ class Xerxes2DecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         frequencies: tuple[chex.Array, chex.Array],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
     ):
@@ -569,15 +560,14 @@ class Xerxes2DecoderLayer(nn.Module):
         )
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
-            frequencies,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
+            frequencies,
+            None,
         )
         hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
         hidden_states = residual + hidden_states
@@ -665,11 +655,11 @@ class Xerxes2Model(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -694,14 +684,15 @@ class Xerxes2Model(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
@@ -726,15 +717,13 @@ class Xerxes2Model(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -786,8 +775,19 @@ class Xerxes2Model(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-@register_module(TaskType.CAUSAL_LM, config=Xerxes2Config, model_type="xerxes2")
-class Xerxes2ForCausalLM(EasyDeLBaseModule):
+class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
+    """
+    Xerxes2 model with a language modeling head for causal language modeling tasks.
+
+    This model extends the base Xerxes2Model by adding a linear language modeling head
+    on top of the transformer model. It incorporates Mixture of Experts (MoE) architecture
+    and is designed for generative tasks and text generation.
+    """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "xerxes2"
+    _config_class = Xerxes2Config
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -797,37 +797,26 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Xerxes2ForCausalLM model.
+
+        Args:
+            config (Xerxes2Config): The model configuration.
+            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
+                Defaults to None.
+            rngs (nn.Rngs): The random number generators.
+        """
         super().__init__(
             config=config,
+            base_model_class=Xerxes2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Xerxes2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            self.config.hidden_size,
-            self.config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
+            router_aux_loss_coef=getattr(config, "router_aux_loss_coef", None),
         )
 
     def __call__(
@@ -835,59 +824,66 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeCausalLMOutput:
-        outputs = self.model(
+        """
+        Forward pass of the causal language model.
+
+        Args:
+            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
+            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+            mode (Optional[common_types.RUNTIME_MODE_TYPES], optional): Runtime mode. Defaults to None.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
+                Defaults to None.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
+                Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the LM head. Defaults to True.
+            output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
+            output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
+            output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
+
+        Returns:
+            MoeCausalLMOutput: The model outputs with router logits and aux loss.
+        """
+        return self.forward_moe(
             input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
 
-        hidden_states = outputs.last_hidden_state
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss for load balancing."""
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
 
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=outputs.router_logits,
+            num_experts=self.config.num_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
         )
 
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.num_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
-
-        return MoeCausalLMOutput(
-            logits=lm_logits,
-            aux_loss=aux_loss,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
+        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
     def create_cache_metadata(
         self,
@@ -943,28 +939,3 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
             starts=starts,
             mask_type_details=self.config.get_mask_details(),
         )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()

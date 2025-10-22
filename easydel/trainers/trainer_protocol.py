@@ -561,13 +561,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _manage_checkpoint_limit(self, checkpoint_dir):
-        """
-        Manages the checkpoint limit by deleting old checkpoints.
-        """
-        ...
-
-    @abstractmethod
     def _save_readme(self, checkpoint_dir):
         """
         Saves a README file with model and training information.
@@ -678,23 +671,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         Note:
             Checks for NaN losses and training time limits based on
             configuration in training arguments.
-        """
-        ...
-
-    @abstractmethod
-    def _should_save_checkpoint(self, current_step):
-        """
-        Determine if checkpoint should be saved at current step.
-
-        Args:
-            current_step: The current training step number.
-
-        Returns:
-            bool: True if checkpoint should be saved, False otherwise.
-
-        Note:
-            Based on save_steps configuration in training arguments.
-            Only saves if current_step > 0 and divisible by save_steps.
         """
         ...
 
@@ -1188,58 +1164,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def _try_resume_from_checkpoint(self, current_state: EasyDeLState) -> EasyDeLState | None:
-        """
-        Try to resume from the latest checkpoint if available.
-
-        Args:
-            current_state: The current model state (used as fallback if no checkpoint found)
-
-        Returns:
-            The resumed state if a checkpoint was found and loaded, None otherwise
-        """
-        ...
-
-    @abstractmethod
     def calculate_number_total_flops(self, params, is_training=True):
         """Calculate total FLOPs for the model."""
-        ...
-
-    @classmethod
-    @abstractmethod
-    def load_trainer_state(
-        cls,
-        load_directory: str | os.PathLike,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
-        data_collator: tp.Callable | None = None,
-        device: tp.Any | None = "cpu",
-        dtype: tp.Any = None,
-        param_dtype: tp.Any = None,
-        precision: tp.Any | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: tp.Any | None = None,
-        shard_attention_computation: bool = True,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
-        backend: tp.Any | None = None,
-        platform: tp.Any | None = None,
-        config_kwargs: tp.Any | None = None,
-        model_task: tp.Any = None,
-        auto_shard_model: bool = True,
-        partition_rules: tuple[tuple[str, tp.Any], ...] | None = None,
-        quantization_platform: tp.Any | None = None,
-        quantization_method: tp.Any | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
-        quantize_tensors: bool = True,
-        verbose: bool = True,
-        base_state: type[EasyDeLState] | None = None,
-        trainer_init_arguments: dict[str, tp.Any] | None = None,
-        **kwargs,
-    ):
-        """
-        Load a trainer state from a saved checkpoint.
-        """
         ...
