@@ -351,7 +351,7 @@ class vEngine:
 
         vocab_size = getattr(self.model.config, "vocab_size", None)
         if vocab_size is None and hasattr(self.model.config, "text_config"):
-            vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
+            vocab_size = getattr(self.model.config.get_text_config(), "vocab_size", None)
         assert vocab_size is not None, "couldn't find `vocab_size` in model config"
 
         cache = self.model.init_cache(concurrent_decode, self.max_length)

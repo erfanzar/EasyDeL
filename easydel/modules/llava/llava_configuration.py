@@ -42,7 +42,7 @@ class LlavaConfig(EasyDeLBaseConfig):
             The config object or dictionary of the vision backbone.
         text_config (`Union[AutoConfig, dict]`, *optional*, defaults to `LlamaConfig`):
             The config object or dictionary of the text backbone.
-        image_token_index (`int`, *optional*, defaults to 32000):
+        image_token_id (`int`, *optional*, defaults to 32000):
             The image token index to encode the image prompt.
         projector_hidden_act (`str`, *optional*, defaults to `"gelu"`):
             The activation function used by the multimodal projector.
@@ -66,7 +66,7 @@ class LlavaConfig(EasyDeLBaseConfig):
         self,
         vision_config=None,
         text_config=None,
-        image_token_index=32000,
+        image_token_id=32000,
         projector_hidden_act="gelu",
         vision_feature_select_strategy="default",
         vision_feature_layer=-2,
@@ -74,7 +74,7 @@ class LlavaConfig(EasyDeLBaseConfig):
         multimodal_projector_bias=True,
         **kwargs,
     ):
-        self.image_token_index = image_token_index
+        self.image_token_id = image_token_id
         self.projector_hidden_act = projector_hidden_act
         self.image_seq_length = image_seq_length
 

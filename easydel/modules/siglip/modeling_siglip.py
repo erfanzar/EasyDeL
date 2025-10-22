@@ -644,6 +644,7 @@ class SiglipTextModel(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -651,6 +652,7 @@ class SiglipTextModel(EasyDeLBaseModule):
         return self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -995,10 +997,10 @@ class SiglipModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        if not isinstance(config.text_config, SiglipTextConfig):
+        if not isinstance(config.get_text_config(), SiglipTextConfig):
             raise TypeError(
-                "config.text_config is expected to be of type SiglipTextConfig but is of type"
-                f" {type(config.text_config)}."
+                "config.get_text_config() is expected to be of type SiglipTextConfig but is of type"
+                f" {type(config.get_text_config())}."
             )
 
         if not isinstance(config.vision_config, SiglipVisionConfig):
@@ -1007,7 +1009,7 @@ class SiglipModel(EasyDeLBaseModule):
                 f" {type(config.vision_config)}."
             )
 
-        text_config = config.text_config
+        text_config = config.get_text_config()
         vision_config = config.vision_config
 
         text_model = SiglipTextModel(
@@ -1035,6 +1037,7 @@ class SiglipModel(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1047,6 +1050,7 @@ class SiglipModel(EasyDeLBaseModule):
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1084,6 +1088,7 @@ class SiglipModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         pixel_values: chex.Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         return_loss: bool | None = None,
         output_attentions: bool | None = None,
@@ -1105,6 +1110,7 @@ class SiglipModel(EasyDeLBaseModule):
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

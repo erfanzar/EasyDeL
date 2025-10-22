@@ -274,7 +274,8 @@ class vInferenceApiServer(BaseInferenceApiServer):
             adapter = self._get_adapter(request.model)
 
             # Check if this is a function calling request
-            is_function_request = self.enable_function_calling and request.get_tools()
+
+            is_function_request = False
 
             ids = await self._prepare_tokenized_input_async(request, adapter)
 

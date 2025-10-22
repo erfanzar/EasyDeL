@@ -12,22 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_roberta import (
-    RobertaForCausalLM,
-    RobertaForMultipleChoice,
-    RobertaForQuestionAnswering,
-    RobertaForSequenceClassification,
-    RobertaForTokenClassification,
-    RobertaModel,
-)
-from .roberta_configuration import RobertaConfig
+from .modeling_olmo3 import Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model
+from .olmo3_configuration import Olmo3Config
 
-__all__ = (
-    "RobertaConfig",
-    "RobertaForCausalLM",
-    "RobertaForMultipleChoice",
-    "RobertaForQuestionAnswering",
-    "RobertaForSequenceClassification",
-    "RobertaForTokenClassification",
-    "RobertaModel",
-)
+__all__ = ("Olmo3Config", "Olmo3ForCausalLM", "Olmo3ForSequenceClassification", "Olmo3Model")

@@ -276,6 +276,12 @@ _import_structure = {
         "ExaoneForSequenceClassification",
         "ExaoneModel",
     ],
+    "modules.exaone4": [
+        "Exaone4Config",
+        "Exaone4ForCausalLM",
+        "Exaone4ForSequenceClassification",
+        "Exaone4Model",
+    ],
     "modules.falcon": [
         "FalconConfig",
         "FalconForCausalLM",
@@ -422,6 +428,12 @@ _import_structure = {
         "Olmo2ForCausalLM",
         "Olmo2ForSequenceClassification",
         "Olmo2Model",
+    ],
+    "modules.olmo3": [
+        "Olmo3Config",
+        "Olmo3ForCausalLM",
+        "Olmo3ForSequenceClassification",
+        "Olmo3Model",
     ],
     "modules.openelm": [
         "OpenELMConfig",
@@ -659,6 +671,7 @@ if _tp.TYPE_CHECKING:
     from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
     from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
+    from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
     from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
     from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
@@ -706,6 +719,7 @@ if _tp.TYPE_CHECKING:
     from .modules.mosaic_mpt import MptAttentionConfig, MptConfig, MptForCausalLM, MptModel
     from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
     from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2ForSequenceClassification, Olmo2Model
+    from .modules.olmo3 import Olmo3Config, Olmo3ForCausalLM, Olmo3ForSequenceClassification, Olmo3Model
     from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
     from .modules.opt import OPTConfig, OPTForCausalLM, OPTModel
     from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
@@ -791,7 +805,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.2"]
+    _targeted_ejkernel_versions = ["0.0.3"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
