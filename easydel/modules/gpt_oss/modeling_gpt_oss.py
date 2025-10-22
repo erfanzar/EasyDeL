@@ -119,7 +119,7 @@ class GptOssExperts(nn.Module):
                 gate = gate_up[..., ::2]
                 up = gate_up[..., 1::2]
                 gate = jnp.clip(gate, a_max=self.limit)
-                up = jnp.clip(up, a_min=-self.limit, a_max=self.limit)
+                up = jnp.clip(up, min=-self.limit, a_max=self.limit)
                 glu = gate * jax.nn.sigmoid(gate * self.alpha)
                 gated_output = (up + 1) * glu
                 out = gated_output @ self.down_proj.value[expert_idx] + self.down_proj_bias.value[expert_idx]
@@ -133,7 +133,7 @@ class GptOssExperts(nn.Module):
             gate = gate_up[..., ::2]
             up = gate_up[..., 1::2]
             gate = jnp.clip(gate, a_max=self.limit)
-            up = jnp.clip(up, a_min=-self.limit, a_max=self.limit)
+            up = jnp.clip(up, min=-self.limit, a_max=self.limit)
             glu = gate * jax.nn.sigmoid(gate * self.alpha)
             next_states = jnp.matmul((up + 1) * glu, self.down_proj.value)
             next_states = next_states + self.down_proj_bias.value[:, None, :]
@@ -534,6 +534,7 @@ class GptOssModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -599,24 +600,18 @@ class GptOssModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
-        if attention_mask.ndim == 2:
-            mask_info = MaskInfo.from_segments(attention_mask)
-        else:
-            mask_info = MaskInfo.from_attention_mask(attention_mask)
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -747,6 +742,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -790,6 +786,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -879,6 +876,7 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -921,6 +919,7 @@ class GptOssForSequenceClassification(EasyDeLBaseModule):
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,

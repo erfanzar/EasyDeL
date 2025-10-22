@@ -641,7 +641,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = ">=0.0.81" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = ">=0.0.2" },
+    { name = "ejkernel", specifier = ">=0.0.3" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -715,7 +715,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.2"
+version = "0.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -727,9 +727,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/4f/ca260be0be710caa6fe6f38ca3bdc095c826bdf47c8f7b604be322377aec/ejkernel-0.0.2.tar.gz", hash = "sha256:b58b3e9ef0d8b38a12f0c2f6fa342a6e5c08fe4bcec27b4193d7102d22ae3734", size = 374778, upload-time = "2025-10-21T18:38:55.15Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/92/81/25c535300515d4e591c765ac8fbb8fe6509c3f1a321c1eb050c6e18f44c4/ejkernel-0.0.3.tar.gz", hash = "sha256:7ecc53d59ec962b7f70c4404e7f561fe5608cc3bfd4051b4004d4d3f0896f081", size = 377909, upload-time = "2025-10-22T17:12:12.092Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a4/2f/ab1ef45119ba016f3d96de7b8a07b53d974c74b1e1f7996a79d13ecfce04/ejkernel-0.0.2-py3-none-any.whl", hash = "sha256:6b5af9c4f07e14e64ba5725a0e36a1c76b93fb5953bd7fc9fd9545d8b93da199", size = 556624, upload-time = "2025-10-21T18:38:53.402Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/c5/9f4de9ab2cfb87b0430a78040947aa410347c938b7c5226d55ff359144c2/ejkernel-0.0.3-py3-none-any.whl", hash = "sha256:f1a8449d9249a4d39f54fe1fc44cd48700f2ae434a482dc3ecfe4886664f87e9", size = 559887, upload-time = "2025-10-22T17:12:10.229Z" },
 ]
 
 [[package]]
@@ -4422,7 +4422,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/89/57/813732d1cf9dc6fe334b0b1e8baaa6469aa5fcae4d66d22cf0ca05ffd6a2/xprof-2.20.6-cp313-none-macosx_12_0_arm64.whl", hash = "sha256:472ddadb29e281f8c5be62531da4d98e052cb6f4a26a0470b97949ad1cfb6ee2", size = 13355049, upload-time = "2025-08-20T02:39:03.932Z" },
     { url = "https://files.pythonhosted.org/packages/fd/c4/75728d1b3150809b2240d0a84af32cf7e229889721be0f950dc3603927fe/xprof-2.20.6-cp313-none-manylinux2014_x86_64.whl", hash = "sha256:020ddfaff6ce3f5f63fb3ce1a2fe0287b9bc22b48ef8ebab81ebfd77bb164510", size = 14673017, upload-time = "2025-08-20T03:20:17.014Z" },
     { url = "https://files.pythonhosted.org/packages/d3/e3/f374ef14a5a80d7e115607a9dd3cbf6eccdc140d3dcee2eca2a48478e9d8/xprof-2.20.6-cp313-none-win_amd64.whl", hash = "sha256:afe872cedb276846e752de3914d3d20c802393ba562cbde7bacbbf82c77e1625", size = 13267059, upload-time = "2025-08-20T02:55:54.121Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/79/2305feeefda12dd89ce6ca479fba09ed001b5a159568f2856321b4d9ccee/xprof-2.20.6-py3-none-any.whl", hash = "sha256:afbe24715d2888e16f899ba6232c0aec476fddc7115fd495a09f1e24ea301a03", size = 6246872, upload-time = "2025-08-20T03:21:35.194Z" },
 ]
 
 [[package]]

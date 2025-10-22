@@ -23,6 +23,7 @@ from collections.abc import Callable
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -145,6 +146,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         # Decoder inputs for encoder-decoder models
         decoder_input_ids: Int[Array, "batch dec_seq_len"] | None = None,
@@ -187,6 +189,7 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,

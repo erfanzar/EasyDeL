@@ -13,9 +13,8 @@
 # limitations under the License.
 
 
-from functools import partial
+import functools
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -34,7 +33,6 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
@@ -46,52 +44,51 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm as RMSNorm
+from easydel.layers.norms import RMSNorm
 
-from .qwen_configuration import Qwen2Config
+from .olmo3_configuration import Olmo3Config
 
 
-class Qwen2MLP(nn.Module):
-    """Qwen2 MLP module.
+class Olmo3MLP(nn.Module):
+    """OLMo-3 MLP module.
 
-    This module implements the feed-forward network (MLP) used in the Qwen2 model.
-    It uses a Gated Linear Unit (GLU) structure with SiLU activation and includes dropout.
+    This module implements the feed-forward network (MLP) used in the OLMo-3 model.
+    It consists of gate, up, and down projections with a SiLU activation.
 
     Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        gate_proj (ParallelLinear): Linear layer for the GLU gate.
-        down_proj (ParallelLinear): Linear layer for the down projection.
-        up_proj (ParallelLinear): Linear layer for the GLU value.
-        dropout (nn.Dropout): Dropout layer applied to the output.
-        act_fn (callable): Activation function (SiLU).
+            config (Olmo3Config): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            gate_proj (ParallelLinear): Linear layer for the gate projection.
+            down_proj (ParallelLinear): Linear layer for the down projection.
+            up_proj (ParallelLinear): Linear layer for the up projection.
+            act_fn (callable): Activation function (SiLU).
     """
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MLP module.
+        """Initializes the Olmo3MLP module.
 
         Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+                config (Olmo3Config): The configuration object for the OLMo-3 model.
+                dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+                param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+                precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+                rngs (nn.Rngs): Random number generators.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        column_parallel_linear = partial(
+        column_parallel_linear = functools.partial(
             ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -101,7 +98,7 @@ class Qwen2MLP(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        row_parallel_linear = partial(
+        row_parallel_linear = functools.partial(
             RowParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -126,20 +123,11 @@ class Qwen2MLP(nn.Module):
             config.intermediate_size,
             rngs=rngs,
         )
-        self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the Qwen2MLP module.
-
-        Args:
-            hidden_states (jnp.ndarray): Input hidden states.
-
-        Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
-        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -148,7 +136,6 @@ class Qwen2MLP(nn.Module):
         gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
-        hidden_states = self.dropout(hidden_states)
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -157,18 +144,16 @@ class Qwen2MLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen2Attention(UnifiedAttention):
-    """Qwen2 Attention module with sliding window support.
+class Olmo3Attention(UnifiedAttention):
+    """OLMo-3 Attention with Q/K normalization and per-layer attention types.
 
-    Inherits from UnifiedAttention with Qwen2-specific customizations:
-    - Sliding window attention (layer-specific)
-    - Custom bias configuration (Q/K/V use bias, O doesn't)
-    - Residual dropout
+    Uses RMSNorm for Q/K normalization to improve training stability.
+    Supports both sliding window and full attention based on layer configuration.
     """
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -176,18 +161,24 @@ class Qwen2Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize Qwen2Attention with sliding window configuration.
+        """Initialize OLMo-3 attention with Q/K normalization and per-layer attention type.
 
         Args:
-            config: Model configuration
-            layer_idx: Layer index for determining sliding window usage
-            dtype: Data type for computations
-            param_dtype: Data type for parameters
-            precision: JAX precision setting
-            rngs: Random number generators
+                config: Model configuration
+                layer_idx: Index of this layer (used to determine attention type)
+                dtype: Data type for computations
+                param_dtype: Data type for parameters
+                precision: JAX precision setting
+                rngs: Random number generators
         """
-        # Set sliding window before super().__init__ so it's available during network definition
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.layer_idx = layer_idx
+        attention_type_name = config.layer_types[layer_idx]
+        self.attention_type_name = attention_type_name
+
+        if attention_type_name == "sliding_attention":
+            self.sliding_window = config.sliding_window
+        else:
+            self.sliding_window = None
         super().__init__(
             config,
             dtype,
@@ -196,107 +187,59 @@ class Qwen2Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
+            use_qk_norm=True,  # Enable Q/K normalization
         )
 
-    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for query projection (Qwen2-specific)."""
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=True,
-            dtype=dtype,
+    def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+        """Create Q normalization layer (RMSNorm)."""
+        return RMSNorm(
+            dim=config.num_attention_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=param_dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            rngs=rngs,
         )
 
-    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for key projection (Qwen2-specific)."""
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=True,
-            dtype=dtype,
+    def _create_k_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
+        """Create K normalization layer (RMSNorm)."""
+        return RMSNorm(
+            dim=config.num_key_value_heads * self.head_dim,
+            eps=config.rms_norm_eps,
+            dtype=param_dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=True for value projection (Qwen2-specific)."""
-        return ColumnParallelLinear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
             rngs=rngs,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Override to use bias=False for output projection (Qwen2-specific)."""
-        from easydel.layers.linear import RowParallelLinear
-
-        return RowParallelLinear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def _create_rotary(self, config: Qwen2Config, dtype: jnp.dtype):
-        """Create Qwen2-specific rotary embedding layer."""
-        return config.get_basic_rope(
-            head_size=config.hidden_size // config.num_attention_heads,
-            rotary_dim=config.hidden_size // config.num_attention_heads,
-            base=config.rope_theta,
-            dtype=dtype,
-        )
-
-    def _create_attention_performer(self, config: Qwen2Config, rngs: nn.Rngs):
-        """Create attention performer with Qwen2's attention dropout."""
-        return FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
+    def _preprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization before reshaping to multi-head format."""
+        query_states = self.query_normalization(query_states)
+        key_states = self.key_normalization(key_states)
+        return query_states, key_states, value_states
 
 
-class Qwen2DecoderLayer(nn.Module):
-    """Qwen2 Transformer Decoder Layer.
+class Olmo3DecoderLayer(nn.Module):
+    """OLMo-3 Transformer Decoder Layer.
 
-    This module represents a single decoder layer in the Qwen2 model,
+    This module represents a single decoder layer in the OLMo-3 model,
     combining self-attention and MLP sub-layers with residual connections
-    and RMS normalization.
+    and layer normalization applied after each sub-layer (post-norm).
 
     Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        input_layernorm (RMSNorm): RMS normalization applied before the attention layer.
-        self_attn (Qwen2Attention): The self-attention module.
-        mlp (Qwen2MLP): The feed-forward (MLP) module.
-        post_attention_layernorm (RMSNorm): RMS normalization applied after the attention layer and before the MLP layer.
+            config (Olmo3Config): Configuration object for the model.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            rngs (nn.Rngs): Random number generators.
+            self_attn (Olmo3Attention): The self-attention module.
+            mlp (Olmo3MLP): The feed-forward (MLP) module.
+            post_attention_layernorm (RMSNorm): Layer normalization after the attention layer.
+            post_feedforward_layernorm (RMSNorm): Layer normalization after the MLP layer.
     """
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -304,21 +247,24 @@ class Qwen2DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2DecoderLayer.
+        """Initializes the Olmo3DecoderLayer.
 
         Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+                config (Olmo3Config): The configuration object for the OLMo-3 model.
+                layer_idx (int): Index of this layer in the model.
+                dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+                param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+                precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+                rngs (nn.Rngs): Random number generators.
         """
         self.config = config
+        self.layer_idx = layer_idx
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Qwen2Attention
-        mlp_block = Qwen2MLP
+        attn_block = Olmo3Attention
+        mlp_block = Olmo3MLP
+
         attn_block, mlp_block = auto_remat(
             attn_block,
             mlp_block,
@@ -326,7 +272,6 @@ class Qwen2DecoderLayer(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-
         self.self_attn = attn_block(
             config=config,
             layer_idx=layer_idx,
@@ -335,7 +280,6 @@ class Qwen2DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-
         self.mlp = mlp_block(
             config=config,
             dtype=dtype,
@@ -343,16 +287,17 @@ class Qwen2DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = RMSNorm(
+
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size,
-            eps=self.config.rms_norm_eps,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
@@ -368,28 +313,26 @@ class Qwen2DecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> DecoderLayerOutput:
-        """Forward pass of the Qwen2DecoderLayer module.
+    ):
+        """Forward pass of the Olmo3DecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+                hidden_states (chex.Array): Input hidden states.
+                mask_info (MaskInfo): Mask information for attention.
+                position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+                mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (train/eval/infer).
+                cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
+                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                output_attentions (bool): Whether to return attention weights. Default is False.
+                frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+                DecoderLayerOutput: Output containing hidden states and optional attention weights.
         """
-
-        attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
+        # Post-norm architecture: residual + norm(sublayer(x))
+        residual = hidden_states
+        attention_output = self.self_attn(
+            hidden_states,
             mask_info,
             position_ids,
             mode,
@@ -398,73 +341,67 @@ class Qwen2DecoderLayer(nn.Module):
             output_attentions,
             frequencies,
         )
-        hidden_states = checkpoint_name(hidden_states + attn_outputs.attention_output, "residual")
 
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        hidden_states = attention_output.attention_output
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
+        residual = hidden_states
         if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
+            hidden_states = block_wise_ffn(
                 self.mlp,
-                feed_forward_input,
+                hidden_states,
                 self.config.scan_mlp_chunk_size,
             )
         else:
-            feed_forward_hidden_states = self.mlp(
-                feed_forward_input,
-            )
+            hidden_states = self.mlp(hidden_states)
 
-        hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        hidden_states = checkpoint_name(hidden_states, "layer_output")
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = checkpoint_name(residual + hidden_states, "layer_output")
         return DecoderLayerOutput(
             hidden_states=hidden_states,
-            attention_weight=attn_outputs.attention_weight,
-            cache_view=attn_outputs.cache_view,
+            attention_weight=attention_output.attention_weight,
+            cache_view=attention_output.cache_view,
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=Qwen2Config, model_type="qwen2")
-class Qwen2Model(EasyDeLBaseModule):
-    """The base Qwen2 model transformer.
+@register_module(TaskType.BASE_MODULE, config=Olmo3Config, model_type="olmo3")
+class Olmo3Model(EasyDeLBaseModule):
+    """The base OLMo-3 model transformer.
 
-    This class represents the core transformer architecture of the Qwen2 model,
-    consisting of an embedding layer, multiple Qwen2DecoderLayer layers,
+    This class represents the core transformer architecture of the OLMo-3 model,
+    consisting of an embedding layer, multiple Olmo3DecoderLayer layers,
     and a final RMS normalization layer.
 
     Attributes:
-        config (Qwen2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.List[Qwen2DecoderLayer]): List of decoder layers.
-        norm (RMSNorm): Final layer normalization.
-        dropout (nn.Dropout): Dropout layer applied after embeddings.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+            config (Olmo3Config): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+            rngs (nn.Rngs): Random number generators.
+            embed_tokens (nn.Embed): Embedding layer for input tokens.
+            layers (tp.List[Olmo3DecoderLayer]): List of decoder layers.
+            norm (RMSNorm): Final layer normalization.
+            gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2Model.
+        """Initializes the Olmo3Model.
 
         Args:
-            config (Qwen2Config): The configuration object for the Qwen2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+                config (Olmo3Config): The configuration object for the OLMo-3 model.
+                dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+                param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+                precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+                rngs (nn.Rngs): Random number generators.
         """
         super().__init__(
             config=config,
@@ -488,9 +425,9 @@ class Qwen2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.dropout = nn.Dropout(rate=config.embd_pdrop)
+
         self.layers = [
-            Qwen2DecoderLayer(
+            Olmo3DecoderLayer(
                 config=config,
                 layer_idx=i,
                 dtype=dtype,
@@ -498,7 +435,7 @@ class Qwen2Model(EasyDeLBaseModule):
                 precision=precision,
                 rngs=rngs,
             )
-            for i in range(config.num_hidden_layers)
+            for i in range(self.config.num_hidden_layers)
         ]
         self.norm = RMSNorm(
             config.hidden_size,
@@ -521,32 +458,33 @@ class Qwen2Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the Qwen2Model.
+        """Forward pass of the Olmo3Model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                        Either `input_ids` or `inputs_embeds` must be provided.
+                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                        Shape: (batch_size, sequence_length).
+                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
+                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                        Shape: (batch_size, sequence_length).
+                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
+                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
+                        Precomputed key/value states for attention.
+                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                output_attentions (tp.Optional[bool]): Whether to return attention weights.
+                        Defaults to `config.output_attentions`.
+                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+                        Defaults to `config.output_hidden_states`.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+                BaseModelOutput: The model's output.
+                        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+                        and `attentions` (optional).
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+                ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -574,7 +512,7 @@ class Qwen2Model(EasyDeLBaseModule):
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
-        hidden_states = self.dropout(inputs_embeds)
+        hidden_states = inputs_embeds
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -610,8 +548,7 @@ class Qwen2Model(EasyDeLBaseModule):
 
             past_key_values[idx] = layer_outputs.cache_view
 
-        hidden_states = self.norm(hidden_states)
-        hidden_states = checkpoint_name(hidden_states, "model_output")
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -650,17 +587,17 @@ class Qwen2Model(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-@register_module(TaskType.CAUSAL_LM, config=Qwen2Config, model_type="qwen2")
-class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
-    """Qwen2 model with a Causal Language Modeling head."""
+@register_module(TaskType.CAUSAL_LM, config=Olmo3Config, model_type="olmo3")
+class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
+    """OLMo-3 model with a Causal Language Modeling head."""
 
     _task_type = TaskType.CAUSAL_LM
-    _model_type = "qwen2"
-    _config_class = Qwen2Config
+    _model_type = "olmo3"
+    _config_class = Olmo3Config
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -669,7 +606,7 @@ class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
     ):
         super().__init__(
             config=config,
-            base_model_class=Qwen2Model,
+            base_model_class=Olmo3Model,
             base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
@@ -685,49 +622,51 @@ class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass of the Qwen2ForCausalLM model.
+        """Forward pass of the Olmo3ForCausalLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                        Either `input_ids` or `inputs_embeds` must be provided.
+                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                        Shape: (batch_size, sequence_length).
+                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
+                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                        Shape: (batch_size, sequence_length).
+                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
+                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
+                        Precomputed key/value states for attention.
+                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
+                output_attentions (tp.Optional[bool]): Whether to return attention weights.
+                        Defaults to `config.output_attentions`.
+                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+                        Defaults to `config.output_hidden_states`.
 
 
         Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
+                CausalLMOutput: The model's output.
+                        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
+                        and `attentions` (optional).
         """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             mode=mode,
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -776,17 +715,17 @@ class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
         return self.model.get_embedding()
 
 
-@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2Config, model_type="qwen2")
-class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model, Qwen2Config]):
-    """Qwen2 model with a Sequence Classification head."""
+@register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Olmo3Config, model_type="olmo3")
+class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model, Olmo3Config]):
+    """OLMo-3 model with a Sequence Classification head."""
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
-    _model_type = "qwen2"
-    _config_class = Qwen2Config
+    _model_type = "olmo3"
+    _config_class = Olmo3Config
 
     def __init__(
         self,
-        config: Qwen2Config,
+        config: Olmo3Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -795,24 +734,23 @@ class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model
     ):
         super().__init__(
             config=config,
-            base_model_class=Qwen2Model,
+            base_model_class=Olmo3Model,
             base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            classifier_name="score",
-            classifier_bias=False,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
@@ -820,33 +758,35 @@ class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
-        """Forward pass of the Qwen2ForSequenceClassification model.
+        """Forward pass of the Olmo3ForSequenceClassification model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
+                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                        Either `input_ids` or `inputs_embeds` must be provided.
+                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                        Shape: (batch_size, sequence_length).
+                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
+                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                        Shape: (batch_size, sequence_length).
+                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
+                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
+                        Precomputed key/value states for attention.
+                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+                apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
+                output_attentions (tp.Optional[bool]): Whether to return attention weights.
+                        Defaults to `config.output_attentions`.
+                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+                        Defaults to `config.output_hidden_states`.
 
 
         Returns:
-            SequenceClassifierOutput: The model's output,
-                returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
+                SequenceClassifierOutput: The model's output,
+                        returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
+                        and `attentions` (optional).
 
         Raises:
-            ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
+                ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,

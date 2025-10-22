@@ -686,6 +686,7 @@ class Llama4TextModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
@@ -725,18 +726,15 @@ class Llama4TextModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
-        if attention_mask.ndim == 2:
-            mask_info = MaskInfo.from_segments(attention_mask)
-        else:
-            mask_info = MaskInfo.from_attention_mask(attention_mask)
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
         hidden_states = inputs_embeds
@@ -948,7 +946,7 @@ class Llama4MultiModalProjector(nn.Module):
         self.rngs = rngs
         self.linear_1 = RowParallelLinear(
             config.vision_config.vision_output_dim,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1645,13 +1643,13 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.language_model = Llama4ForCausalLM(
-            config=config.text_config,
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        self.vocab_size = config.text_config.vocab_size
+        self.vocab_size = config.get_text_config().vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
     def get_image_features(self, pixel_values: chex.Array, **kwargs) -> chex.Array:
@@ -1677,6 +1675,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
@@ -1722,6 +1721,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             inputs_embeds = inputs_embeds_updated_flat.reshape(orgshape)
         outputs = self.language_model(
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

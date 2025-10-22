@@ -377,20 +377,20 @@ def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
     _miss_count: int = 0
     _state_rngs: jax.random.PRNGKey = jax.random.PRNGKey(42)
     for key, value in missings.items():
-        if isinstance(value.type, nnx.Param) or issubclass(value.type, nnx.Param):
+        if isinstance(type(value), nnx.Param) or issubclass(type(value), nnx.Param):
             assert value.value is None, "there's missing parameter in state which can't be None."
             state[key] = value
-        elif isinstance(value.type, nnx.RngCount) or issubclass(value.type, nnx.RngCount):
+        elif isinstance(type(value), nnx.RngCount) or issubclass(type(value), nnx.RngCount):
             state[key] = nnx.VariableState(
                 nnx.RngCount,
                 jax.numpy.array(_miss_count, dtype=jax.numpy.uint32),
             )
             _miss_count += 1
-        elif isinstance(value.type, nnx.RngKey) or issubclass(value.type, nnx.RngKey):
+        elif isinstance(type(value), nnx.RngKey) or issubclass(type(value), nnx.RngKey):
             state[key] = nnx.VariableState(nnx.RngKey, _state_rngs)
             _state_rngs = jax.random.split(_state_rngs)[0]
         else:
-            raise AttributeError(f"Unexcepted type({value.type}) found which cannot be redefined.")
+            raise AttributeError(f"Unexcepted type({type(value)}) found which cannot be redefined.")
     return state
 
 
@@ -432,12 +432,12 @@ def recreate_meta_values(values: dict[str, tp.Any], seed: int | None = None) -> 
 
     try:
         for key, value in values.items():
-            if isinstance(value.type, nnx.RngCount | type) and issubclass(value.type, nnx.RngCount):
+            if isinstance(type(value), nnx.RngCount | type) and issubclass(type(value), nnx.RngCount):
                 values[key].value = recreator.get_count()
-            elif isinstance(value.type, nnx.RngKey | type) and issubclass(value.type, nnx.RngKey):
+            elif isinstance(type(value), nnx.RngKey | type) and issubclass(type(value), nnx.RngKey):
                 values[key].value = recreator.get_rng()
             else:
-                raise TypeError(f"Unexpected type {value.type} for key {key}")
+                raise TypeError(f"Unexpected type {type(value)} for key {key}")
     except Exception as e:
         raise ValueError(f"Failed to recreate meta values: {e!s}") from e
 
@@ -466,7 +466,7 @@ def refine_graphs(*graphs: dict) -> nnx.State:
             if is_flatten(graph):
                 graph = traversals.unflatten_mapping(graph)
             _state_creators += (nnx.State(graph),)
-    return nnx.State.merge(*_state_creators)
+    return nnx.merge_state(*_state_creators)
 
 
 def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
@@ -492,7 +492,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
     Returns:
         nnx.State: The updated nnx state with the attached parameter tree.
     """
-    params, others = nnx.State.split(state, nnx.Param, ...)
+    params, others = nnx.split_state(state, nnx.Param, ...)
     lost_data = False
     if not is_flatten(params):
         params = flatten_dict(params)

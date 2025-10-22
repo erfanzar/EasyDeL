@@ -16,6 +16,7 @@
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
@@ -192,7 +193,7 @@ class RobertaSelfAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         layer_head_mask: Bool[Array, "num_heads"] | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
@@ -213,6 +214,8 @@ class RobertaSelfAttention(AttentionModule):
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
         (
             key_states,
             value_states,
@@ -226,10 +229,7 @@ class RobertaSelfAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask if self.causal else None,
-            fcm_mask=None,
-            sliding_window=None,
+            mask_info=mask_info,
         )
 
         if layer_head_mask is None:
@@ -238,9 +238,11 @@ class RobertaSelfAttention(AttentionModule):
                 key_states=key_states,
                 value_states=value_states,
                 mode=mode,
-                causal=True,
+                causal=self.causal,
                 init_bias=init_attention_bias,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
             )
             attn_weights = out.attention_weights
             attn_output = out.attention_outputs
@@ -344,7 +346,7 @@ class RobertaAttention(nn.Module):
     def __call__(
         self,
         hidden_states,
-        attention_mask,
+        mask_info: MaskInfo | None,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
@@ -354,9 +356,8 @@ class RobertaAttention(nn.Module):
     ):
         attn_outputs = self.self(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             mode=mode,
-            causal_mask=causal_mask if self.causal else None,
             layer_head_mask=layer_head_mask,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
@@ -383,9 +384,9 @@ class RobertaIntermediate(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.dense = RowParallelLinear(
-            self.config.intermediate_size,
+        self.dense = ColumnParallelLinear(
             self.config.hidden_size,
+            self.config.intermediate_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=dtype,
             param_dtype=param_dtype,
@@ -418,8 +419,8 @@ class RobertaOutput(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.dense = RowParallelLinear(
-            self.config.hidden_size,
             self.config.intermediate_size,
+            self.config.hidden_size,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             dtype=dtype,
             precision=precision,
@@ -432,7 +433,7 @@ class RobertaOutput(nn.Module):
             rngs=rngs,
         )
         self.LayerNorm = nn.LayerNorm(
-            self.config.intermediate_size,
+            self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -495,20 +496,19 @@ class RobertaLayer(nn.Module):
     def __call__(
         self,
         hidden_states,
-        attention_mask,
+        mask_info: MaskInfo | None,
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        encoder_mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
         # Self Attention
         attention_outputs = self.attention(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
+            mask_info=mask_info,
             layer_head_mask=layer_head_mask,
             cache_view=cache_view,
             mode=mode,
@@ -522,12 +522,13 @@ class RobertaLayer(nn.Module):
         if encoder_hidden_states is not None:
             cross_attention_outputs = self.crossattention(
                 hidden_states=attention_output,
-                attention_mask=encoder_attention_mask,
+                mask_info=encoder_mask_info,
                 layer_head_mask=layer_head_mask,
-                cache_view=cache_view,
+                cache_view=None,  # Cross-attention typically doesn't use cache
+                mode=mode,
+                cache_metadata=None,
                 key_value_states=encoder_hidden_states,
                 output_attentions=output_attentions,
-                causal_mask=causal_mask,
             )
             cross_attention = cross_attention_outputs.attention_output
 
@@ -536,8 +537,9 @@ class RobertaLayer(nn.Module):
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,
+            attention_weight=attention_outputs.attention_weight if output_attentions else None,
             cross_attention=cross_attention,
-            cache_view=attention_output.cache_view,
+            cache_view=attention_outputs.cache_view,
         )
 
 
@@ -576,17 +578,19 @@ class RobertaEncoder(nn.Module):
     def __call__(
         self,
         hidden_states,
-        attention_mask,
+        mask_info: MaskInfo | None,
         head_mask,
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCacheView | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+        past_key_values: TransformerCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
+        all_cross_attentions = () if encoder_hidden_states is not None else None
 
         # Check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
@@ -597,18 +601,19 @@ class RobertaEncoder(nn.Module):
                 )
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.layer))
-        for i, (layer, cache_view) in enumerate(zip(self.layer, past_key_values.views, strict=False)):
+        for i, layer in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 layer_head_mask=head_mask[i] if head_mask is not None else None,
-                cache_view=cache_view,
-                causal_mask=causal_mask,
+                mode=mode,
+                cache_view=past_key_values.views[i],
+                cache_metadata=cache_metadata,
                 encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
+                encoder_mask_info=encoder_mask_info,
                 output_attentions=output_attentions,
             )
 
@@ -699,8 +704,8 @@ class RobertaLMHead(nn.Module):
             rngs=rngs,
         )
         self.decoder = RowParallelLinear(
-            self.config.vocab_size,
             self.config.hidden_size,
+            self.config.vocab_size,
             dtype=dtype,
             use_bias=False,
             param_dtype=param_dtype,
@@ -724,10 +729,7 @@ class RobertaLMHead(nn.Module):
 
         if shared_embedding is not None:
             self.decoder.kernel.value = shared_embedding.T
-            self.decoder.bias.value = None
-            hidden_states = self.decoder(hidden_states)
-        else:
-            hidden_states = self.decoder(hidden_states)
+        hidden_states = self.decoder(hidden_states)
 
         bias = self.bias.astype(self.dtype)
         hidden_states += bias
@@ -768,8 +770,8 @@ class RobertaClassificationHead(nn.Module):
             rngs=rngs,
         )
         self.out_proj = RowParallelLinear(
-            self.config.num_labels,
             self.config.hidden_size,
+            self.config.num_labels,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -865,12 +867,45 @@ class RobertaModel(EasyDeLBaseModule):
             position_ids=position_ids,
             attention_mask=attention_mask,
         )
+
+        # Initialize MaskInfo
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=None,
+            input_ids=input_ids,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+        )
+
+        # Initialize encoder MaskInfo for cross-attention if encoder_hidden_states provided
+        encoder_mask_info = None
+        if encoder_hidden_states is not None:
+            batch_size = hidden_states.shape[0]
+            decoder_seq_len = hidden_states.shape[1]
+            encoder_seq_len = encoder_hidden_states.shape[1]
+
+            # Create cross-attention mask: [batch, decoder_seq, encoder_seq]
+            if encoder_attention_mask is not None:
+                # Broadcast encoder mask to match decoder queries
+                # encoder_attention_mask: [batch, encoder_seq] -> [batch, decoder_seq, encoder_seq]
+                cross_attn_mask = jnp.broadcast_to(
+                    encoder_attention_mask[:, None, :], (batch_size, decoder_seq_len, encoder_seq_len)
+                )
+            else:
+                # No padding - all ones
+                cross_attn_mask = jnp.ones((batch_size, decoder_seq_len, encoder_seq_len), dtype=jnp.bool_)
+
+            # Create MaskInfo from cross-attention mask [batch, 1, decoder_seq, encoder_seq]
+            encoder_mask_info = MaskInfo.from_attention_mask(
+                attention_mask=cross_attn_mask[:, None, :, :],
+            )
+
         outputs = self.encoder(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             head_mask=head_mask,
+            mode=common_types.MODE_TRAIN,  # Default mode, can be parameterized if needed
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+            encoder_mask_info=encoder_mask_info,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1040,8 +1075,8 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.classifier = ColumnParallelLinear(
-            1,
             self.config.hidden_size,
+            1,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -1150,8 +1185,8 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.classifier = ColumnParallelLinear(
-            self.config.num_labels,
             self.config.hidden_size,
+            self.config.num_labels,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -1250,8 +1285,8 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.qa_outputs = ColumnParallelLinear(
-            self.config.num_labels,
             self.config.hidden_size,
+            self.config.num_labels,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -1289,7 +1324,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
         )
 
         logits = self.qa_outputs(hidden_states)
-        start_logits, end_logits = logits.split(self.config.num_labels, axis=-1)
+        start_logits, end_logits = jnp.split(logits, self.config.num_labels, axis=-1)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
 
@@ -1372,6 +1407,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         token_type_ids: Int[Array, "batch seq_len"] | None = None,
         head_mask: Bool[Array, "num_heads"] | None = None,

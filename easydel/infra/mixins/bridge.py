@@ -675,7 +675,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 return None, None
 
             if is_local:
-                # Local directory: look for index -> safetensors -> msgpack
                 raise_errors_on_him = True
                 root = ePath(pretrained_model_name_or_path) / subfolder
                 archive_file, _ = _pick_first_existing(root)
@@ -871,7 +870,6 @@ class EasyBridgeMixin(PushToHubMixin):
         config_class = config_class.from_pretrained(pretrained_model_name_or_path)
         state_dict = hf_model.state_dict()
 
-        # Clear and collect memory after deleting the hf_model
         del hf_model
         _clear()
 

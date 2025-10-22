@@ -24,6 +24,7 @@ from collections.abc import Callable
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -171,6 +172,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
@@ -201,6 +203,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         base_model_kwargs = {
             "attention_mask": attention_mask,
             "position_ids": position_ids,
+            "mask_info": mask_info,
             "mode": mode,
             "past_key_values": past_key_values,
             "cache_metadata": cache_metadata,
@@ -262,6 +265,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values=None,
@@ -305,6 +309,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,

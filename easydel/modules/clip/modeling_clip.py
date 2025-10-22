@@ -683,15 +683,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         )
 
         hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
-        if attention_mask.ndim == 2:
-            mask_info = MaskInfo.from_segments(attention_mask)
-        else:
-            mask_info = MaskInfo.from_attention_mask(attention_mask)
+        mask_info = MaskInfo.dynamic_init(mask_info=mask_info, input_ids=input_ids)
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             mask_info=mask_info,
@@ -936,7 +928,7 @@ class CLIPTextModel(EasyDeLBaseModule):
 
         return self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1037,7 +1029,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         """
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1290,7 +1282,7 @@ class CLIPModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        text_config = self.config.text_config
+        text_config = self.config.get_text_config()
         vision_config = self.config.vision_config
 
         self.projection_dim = self.config.projection_dim
@@ -1320,7 +1312,7 @@ class CLIPModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.visual_projection = linear_class(config.vision_config.hidden_size, self.projection_dim)
-        self.text_projection = linear_class(config.text_config.hidden_size, self.projection_dim)
+        self.text_projection = linear_class(config.get_text_config().hidden_size, self.projection_dim)
 
         self.logit_scale = nn.Param(jnp.ones([]) * self.config.logit_scale_init_value)
 
@@ -1329,6 +1321,7 @@ class CLIPModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"],
         pixel_values: chex.Array,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions=None,
         output_hidden_states=None,
@@ -1347,6 +1340,7 @@ class CLIPModel(EasyDeLBaseModule):
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1378,11 +1372,13 @@ class CLIPModel(EasyDeLBaseModule):
         self,
         input_ids: Int[Array, "batch seq_len"],
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
     ):
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
         )
         pooled_output = text_outputs[1]

@@ -22,6 +22,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -116,7 +117,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         self.alignment_intermediate_size = getattr(
             config,
             "alignment_intermediate_size",
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
         )
 
         self.layernorm = nn.LayerNorm(
@@ -141,7 +142,7 @@ class AyaVisionMultiModalProjector(nn.Module):
         self.act = ACT2FN["silu"]
         self.linear_2 = RowParallelLinear(
             self.alignment_intermediate_size // 2,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=True,
             kernel_init=nn.initializers.normal(0.02),
             param_dtype=param_dtype,
@@ -249,7 +250,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.language_model = AutoEasyDeLModel.from_config(
-            config=config.text_config,
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -284,6 +285,7 @@ class AyaVisionModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
@@ -319,7 +321,7 @@ class AyaVisionModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_index >= self.config.text_config.vocab_size:
+        if input_ids is not None and self.config.image_token_index >= self.config.get_text_config().vocab_size:
             special_image_mask = input_ids == self.config.image_token_index
             llm_input_ids = input_ids
             llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
@@ -343,6 +345,7 @@ class AyaVisionModel(EasyDeLBaseModule):
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -551,14 +554,14 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             exclude_names=config.gradient_checkpointing_targets,
         )
         self.lm_head = lm_head_block(
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
+            config.get_text_config().hidden_size,
+            config.get_text_config().vocab_size,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             use_bias=False,
             rngs=rngs,
-            kernel_init=nn.initializers.normal(config.text_config.initializer_range),
+            kernel_init=nn.initializers.normal(config.get_text_config().initializer_range),
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
@@ -567,6 +570,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
@@ -607,6 +611,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

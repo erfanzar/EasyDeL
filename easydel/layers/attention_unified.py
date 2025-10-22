@@ -787,85 +787,54 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         # 1. Project Q/K/V
         if self.use_fused_qkv:
-            qkv: Float[Array, "batch_size seq_len qkv_dim"] = checkpoint_name(
-                self.query_key_value_projection(hidden_states), "attn_qkv"
-            )
+            qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
             if self.use_gqa:
-                qkv_states: Float[Array, "batch_size seq_len num_kv_heads num_groups_plus_2 head_dim"] = rearrange(
+                qkv_states = rearrange(
                     qkv,
                     "b q (h gs d) -> b q h gs d",
                     gs=2 + self.num_key_value_groups,
                     d=self.head_dim,
                 )
-                query_states: Float[Array, "batch_size seq_len num_heads_times_head_dim"] = rearrange(
-                    qkv_states[..., : self.num_key_value_groups, :], "b q h gs d -> b q (h gs) d"
-                )
-                key_states: Float[Array, "batch_size seq_len num_kv_heads head_dim"] = qkv_states[..., -2, :]
-                value_states: Float[Array, "batch_size seq_len num_kv_heads head_dim"] = qkv_states[..., -1, :]
+                query_states = rearrange(qkv_states[..., : self.num_key_value_groups, :], "b q h gs d -> b q (h gs) d")
+                key_states: Float[Array, "batch_size kvseq_len num_kv_heads head_dim"] = qkv_states[..., -2, :]
+                value_states: Float[Array, "batch_size kvseq_len num_kv_heads head_dim"] = qkv_states[..., -1, :]
             else:
-                q_proj: Float[Array, "batch_size seq_len num_heads_times_head_dim"]
-                k_proj: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"]
-                v_proj: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"]
-                q_proj, k_proj, v_proj = jnp.split(qkv, indices_or_sections=3, axis=-1)
-                query_states = q_proj
-                key_states = k_proj
-                value_states = v_proj
+                query_states, key_states, value_states = jnp.split(qkv, indices_or_sections=3, axis=-1)
         else:
-            query_states: Float[Array, "batch_size seq_len num_heads_times_head_dim"] = checkpoint_name(
-                self.query_projection(hidden_states), "attn_query"
-            )
-            key_states: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"] = checkpoint_name(
-                self.key_projection(hidden_states), "attn_key"
-            )
-            value_states: Float[Array, "batch_size seq_len num_kv_heads_times_head_dim"] = checkpoint_name(
-                self.value_projection(hidden_states), "attn_value"
-            )
+            query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
+            key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
+            value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
 
-        # 3. PRE-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._preprocess_qkv(query_states, key_states, value_states)
 
-        query_states_reshaped: Float[Array, "batch_size seq_len num_heads head_dim"] = query_states.reshape(
-            batch_size, sequence_length, self.num_heads, self.head_dim
+        query_states: Float[Array, "batch_size seq_len num_heads head_dim"] = query_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_heads,
+            self.head_dim,
         )
-        key_states_reshaped: Float[Array, "batch_size seq_len num_kv_heads head_dim"] = key_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+        key_states: Float[Array, "batch_size kvseq_len num_kv_heads head_dim"] = key_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
-        value_states_reshaped: Float[Array, "batch_size seq_len num_kv_heads head_dim"] = value_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+        value_states: Float[Array, "batch_size kvseq_len num_kv_heads vhead_dim"] = value_states.reshape(
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
-        query_states = query_states_reshaped
-        key_states = key_states_reshaped
-        value_states = value_states_reshaped
-
         # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
 
-        # 4. Apply sharding
-        query_states_sharded: Float[Array, "batch_size seq_len num_heads head_dim"]
-        key_states_sharded: Float[Array, "batch_size seq_len num_kv_heads head_dim"]
-        value_states_sharded: Float[Array, "batch_size seq_len num_kv_heads head_dim"]
-        query_states_sharded, key_states_sharded, value_states_sharded = self.apply_qkv_shardings(
-            query_states, key_states, value_states
-        )
-        query_states = query_states_sharded
-        key_states = key_states_sharded
-        value_states = value_states_sharded
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # 5. Apply RoPE
-        query_states_rotated: Float[Array, "batch_size seq_len num_heads head_dim"]
-        key_states_rotated: Float[Array, "batch_size seq_len num_kv_heads head_dim"]
-        query_states_rotated, key_states_rotated = self._apply_rotary(
-            query_states, key_states, position_ids, frequencies
-        )
-        query_states = query_states_rotated
-        key_states = key_states_rotated
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
-        # 6. KV cache concatenation
-        key_states_cached: Float[Array, "batch_size kv_seq_len num_kv_heads head_dim"]
-        value_states_cached: Float[Array, "batch_size kv_seq_len num_kv_heads head_dim"]
         (
-            key_states_cached,
-            value_states_cached,
+            key_states,
+            value_states,
             mask_info,
             init_attention_bias,
             cache_view,
@@ -879,8 +848,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mask_info=mask_info,
             sliding_window=getattr(self, "sliding_window", None),
         )
-        key_states = key_states_cached
-        value_states = value_states_cached
 
         # 7. Compute attention
         attentions: AttentionLayerOutput = self.attention_performer.forward(

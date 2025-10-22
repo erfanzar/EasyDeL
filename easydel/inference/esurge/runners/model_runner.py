@@ -209,7 +209,7 @@ class eSurgeRunner:
         self.executor_manager = ExecutionManager(
             model=model,
             mesh=model.mesh,
-            kv_pages=model.init_pages(self.metadata),
+            kv_pages=model.init_ragged_pages(self.metadata),
             use_combined_forward=False,
             use_aot_forward=True,
             use_fused_step=True,
