@@ -67,7 +67,8 @@ import jax
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from eformer.serialization import AsyncCheckpointManager
+from eformer.serialization import Checkpointer
+from eformer.serialization.checkpointer import find_latest_checkpoint
 from flax import nnx as nn
 from huggingface_hub import CommitOperationAdd, create_branch, create_commit
 from huggingface_hub.utils import HfHubHTTPError
@@ -162,6 +163,8 @@ class EasyBridgeMixin(PushToHubMixin):
         save_directory: ePathLike,
         gather_fns: dict[tp.Callable] | None = None,
         float_dtype=None,
+        *,
+        step: int | None = None,
     ):
         """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -185,12 +188,17 @@ class EasyBridgeMixin(PushToHubMixin):
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
             gather_fns = self._gather_fns
-        output_model_file = AsyncCheckpointManager().save(
+        output_model_file = Checkpointer(
+            base_path=str(save_directory),
+            save_interval=None,
+            step_policies=[],
+        ).save_pytree(
             tree=state.to_pure_dict(),
-            path=str(save_directory),
-            mesh=self.mesh,
-            float_dtype=float_dtype,
             prefix="model",
+            mesh=self.mesh,
+            dtype=float_dtype,
+            # Don't pass step here - save_directory is already the checkpoint directory
+            # Passing step would create duplicate run-{step}/run-{step} structure
         )
 
         logger.info(f"Model weights saved in {output_model_file}")
@@ -202,6 +210,7 @@ class EasyBridgeMixin(PushToHubMixin):
         token: str | bool | None = None,
         gather_fns: dict[tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
+        step: int | None = None,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -230,6 +239,7 @@ class EasyBridgeMixin(PushToHubMixin):
             save_directory=easy_directory,
             gather_fns=gather_fns,
             float_dtype=float_dtype,
+            step=step,
         )
         readme_path = easy_directory / "README.md"
         readme_path.write_text(self._model_card(repo_id, repo_id))
@@ -474,12 +484,18 @@ class EasyBridgeMixin(PushToHubMixin):
                 resolved_archive_file = str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
             else:
                 extraargs["callback"] = callback
-            state, _ = AsyncCheckpointManager().load(
-                path=ePath(resolved_archive_file),
+            state, _ = Checkpointer(
+                base_path=str(resolved_archive_file),
+                save_interval=None,
+                step_policies=[],
+            ).load_pytree(
                 mesh=mesh,
                 dtype=param_dtype,
                 partition_rules=model.config.get_partition_rules(),
                 prefix="model",
+                discover_latest=True,
+                discover_raise=False,
+                load_treedef=False,
                 **extraargs,
             )
             params = state.get("params", None)
@@ -659,13 +675,20 @@ class EasyBridgeMixin(PushToHubMixin):
                 return None, None
 
             if is_local:
-                # Local directory: look for index -> safetensors -> msgpack
+                raise_errors_on_him = True
                 root = ePath(pretrained_model_name_or_path) / subfolder
                 archive_file, _ = _pick_first_existing(root)
                 if not archive_file:
-                    raise FileNotFoundError(
-                        f"No model weights found in '{root}'. Tried: {', '.join(CANDIDATE_FILENAMES)}"
-                    )
+                    latest = find_latest_checkpoint(str(root))
+                    if latest is not None:
+                        archive_file, _ = _pick_first_existing(ePath(latest))
+                        if archive_file:
+                            raise_errors_on_him = False
+                    if raise_errors_on_him:
+                        raise FileNotFoundError(
+                            f"No model weights found in '{root}'. Tried: {', '.join(CANDIDATE_FILENAMES)} "
+                            "we also tried to find latest checkpoint but there was nothing ;/"
+                        )
                 is_local = True
             else:
                 # Sometimes the path is nested under subfolder
@@ -841,13 +864,12 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
         if "torch_dtype" not in kwargs.keys():
             kwargs["torch_dtype"] = torch.float16
-
-        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        torch_dtype = kwargs.pop("torch_dtype")
+        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, dtype=torch_dtype, **kwargs)
         generation_config = getattr(hf_model, "generation_config", None)
         config_class = config_class.from_pretrained(pretrained_model_name_or_path)
         state_dict = hf_model.state_dict()
 
-        # Clear and collect memory after deleting the hf_model
         del hf_model
         _clear()
 

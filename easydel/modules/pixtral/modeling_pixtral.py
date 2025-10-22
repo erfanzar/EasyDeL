@@ -19,6 +19,7 @@ import chex
 import jax.lax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -358,7 +359,7 @@ class PixtralAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -415,7 +416,7 @@ class PixtralAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             _cache_metadata,
@@ -438,7 +439,6 @@ class PixtralAttention(AttentionModule):
             cache_metadata=None,
             init_bias=init_attention_bias,
             attention_mask=attention_mask,
-            segment_ids=None,
             causal=True,
         )
 
@@ -535,7 +535,7 @@ class PixtralBlock(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -556,7 +556,7 @@ class PixtralBlock(nn.Module):
         residual = hidden_states
         attention_output = self.attention(
             self.attention_norm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
             output_attentions,
             frequencies,
@@ -634,6 +634,7 @@ class PixtralTransformer(nn.Module):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
         position_embeddings: chex.Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -666,20 +667,18 @@ class PixtralTransformer(nn.Module):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
         hidden_states = inputs_embeds
         for _idx, block in enumerate(self.layers):
@@ -688,7 +687,7 @@ class PixtralTransformer(nn.Module):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 position_embeddings=position_embeddings,

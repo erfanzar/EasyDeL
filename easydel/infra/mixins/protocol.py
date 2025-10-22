@@ -20,7 +20,9 @@ methods and properties for model implementations, along with utility functions f
 module representation and formatting.
 
 The protocol ensures consistency across different model implementations and provides
-type hints for better IDE support and type checking.
+type hints for better IDE support and type checking. It combines interfaces from the
+base module, bridge functionality (EasyBridgeMixin), and generation capabilities
+(EasyGenerationMixin).
 
 Classes:
     BaseModuleProtocol: Abstract base class defining the interface for EasyDeL modules
@@ -35,7 +37,15 @@ Type Aliases:
     PartitionLike: Type for partition rule specifications
     Self: Type variable for self-referencing types
 
-The protocol includes overloaded methods for different model types:
+The protocol includes methods for:
+- Model forward passes and loss computation (overloaded for different model types)
+- Parameter management (sharding, gathering, quantization, LoRA)
+- Model I/O (saving, loading, HuggingFace Hub integration)
+- Text generation (greedy search, sampling, beam search)
+- Cache management (standard and paged attention)
+- Framework conversion (PyTorch ↔ JAX/Flax)
+
+Supported model types:
 - Causal Language Models
 - Sequence Classification
 - Mixture of Experts (MoE)
@@ -54,17 +64,24 @@ Example:
     ...     def compute_loss(self, input_ids, labels, ...):
     ...         # Loss computation
     ...         pass
+    ...
+    ...     def generate(self, input_ids, ...):
+    ...         # Generation implementation
+    ...         pass
 """
 
 from __future__ import annotations
 
+import os
 import typing as tp
 from abc import ABCMeta, abstractmethod
 from mimetypes import common_types
 
 import chex
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
-from jax.sharding import Mesh
+from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 
 from easydel.layers.linear import ParallelLinear
 
@@ -90,7 +107,7 @@ if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
     from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.caching import PagesCache, PagesMetadata, TransformerCache, TransformerMetadata
+    from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 
 
 def return_type_adjuster(
@@ -261,11 +278,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         input_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -296,6 +314,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         input_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
@@ -324,14 +343,15 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         input_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """
@@ -361,14 +381,15 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         input_ids: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """
@@ -430,12 +451,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
                 attention mask for padding tokens.
             position_ids: Array of shape (batch_size, sequence_length) containing position
                 indices for tokens.
-            output_attentions: Wheth
-            def __call__(er to return attention weights. Defaults to False.
+            output_attentions: Whether to return attention weights. Defaults to False.
             output_hidden_states: Whether to return all hidden states. Defaults to False.
 
         Returns:
-            Either a CLIPTextModelOutput containing the model outputs.
+            CLIPTextModelOutput containing the model outputs.
         """
         ...
 
@@ -445,6 +465,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         input_ids: chex.Array | None = None,
         pixel_values: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         output_attentions=None,
         output_hidden_states=None,
@@ -480,10 +501,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         labels: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         loss_config: LossConfig | None = None,
@@ -516,6 +538,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         labels: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
@@ -549,13 +572,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         labels: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeModelOutput, LossMetrics]:
@@ -587,13 +611,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         labels: chex.Array | None = None,
         inputs_embeds: chex.Array | None = None,
         attention_mask: chex.Array | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeCausalLMOutput, LossMetrics]:
@@ -830,6 +855,281 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def _flop(self, *args, **kwargs) -> float | None:
         """Calculates the FLOP (Floating Point Operations) from JaxPr."""
+        ...
+
+    @abstractmethod
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        push_to_hub: bool = False,
+        token: str | bool | None = None,
+        gather_fns: dict[tp.Callable] | None = None,
+        float_dtype: jnp.dtype | None = None,
+        step: int | None = None,
+        **kwargs,
+    ):
+        """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
+
+        Args:
+            save_directory: Directory where to save the model.
+            push_to_hub: If True, pushes the model to the Hugging Face Hub.
+            token: The Hugging Face Hub token.
+            gather_fns: Custom gather functions for checkpoint saving.
+            float_dtype: Data type for saving weights.
+            step: Optional step number for checkpoint naming.
+            **kwargs: Additional keyword arguments for Hugging Face Hub.
+        """
+        ...
+
+    @abstractmethod
+    def push_to_hub(
+        self,
+        repo_id: str,
+        use_temp_dir: bool | None = None,
+        commit_message: str | None = None,
+        private: bool | None = None,
+        token: bool | str | None = None,
+        create_pr: bool = False,
+        gather_fns: dict[tp.Callable] | None = None,
+        float_dtype: jnp.dtype | None = None,
+        verbose: bool = True,
+        mismatch_allowed: bool = True,
+        revision: str | None = None,
+        commit_description: str | None = None,
+    ) -> str:
+        """Pushes the model to the Hugging Face Hub.
+
+        Args:
+            repo_id: The repository ID on Hugging Face Hub.
+            use_temp_dir: If True, uses a temporary directory.
+            commit_message: The commit message for the push.
+            private: If True, creates a private repository.
+            token: The Hugging Face Hub token.
+            create_pr: If True, creates a pull request.
+            gather_fns: Custom gather functions for checkpoint saving.
+            float_dtype: Data type for saving weights.
+            verbose: Whether to print verbose messages.
+            mismatch_allowed: If True, allows mismatch in parameters while loading.
+            revision: The revision to push to.
+            commit_description: The commit description for the push.
+
+        Returns:
+            The URL of the created repository.
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike | None,
+        **kwargs,
+    ):
+        """Loads an EasyDeL model from a pretrained model or path.
+
+        Args:
+            pretrained_model_name_or_path: The name or path of the pretrained model.
+            **kwargs: Additional keyword arguments for loading configuration.
+
+        Returns:
+            The loaded EasyDeL model.
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def can_generate(cls) -> bool:
+        """Checks if the model can generate sequences with `.generate()`.
+
+        Returns:
+            True if the model can generate, False otherwise.
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def get_torch_loader(cls):
+        """Gets the appropriate PyTorch AutoModel loader for this model type.
+
+        Returns:
+            The PyTorch AutoModel class for loading this model type.
+        """
+        ...
+
+    @abstractmethod
+    def generate(
+        self,
+        input_ids: chex.Array,
+        generation_config: tp.Any | None = None,
+        prng_key: chex.Array | None = None,
+        trace: bool = True,
+        logits_processor: tp.Any | None = None,
+        **kwargs,
+    ):
+        """Generates sequences of token ids for models with a language modeling head.
+
+        Args:
+            input_ids: The sequence used as a prompt for the generation.
+            generation_config: The generation configuration to be used as base parametrization.
+            prng_key: Random key for sampling-based generation.
+            trace: Whether to trace generation for better performance.
+            logits_processor: Custom logits processors.
+            **kwargs: Additional generation parameters.
+
+        Returns:
+            Generated sequences and optionally scores.
+        """
+        ...
+
+    @abstractmethod
+    def init_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: dict | None = None,
+        pad_token_id: int | None = None,
+    ):
+        """Initializes and returns a standard (non-paged) Key-Value cache.
+
+        Args:
+            batch_size: The batch size for the cache.
+            max_length: The maximum sequence length the cache needs to support.
+            starts: Optional starting positions for the cache sequences.
+            shardings: Optional dictionary specifying sharding configurations.
+            pad_token_id: The ID of the padding token.
+
+        Returns:
+            An initialized standard TransformerCache object.
+        """
+        ...
+
+    @abstractmethod
+    def init_ragged_pages(
+        self,
+        metadata: tp.Any | None = None,
+        page_size: int | None = None,
+        hbm_utilization: float | None = None,
+        max_model_length: int | None = None,
+    ):
+        """Initializes and returns the actual Paged Attention KV Cache tensors.
+
+        Args:
+            metadata: An optional pre-configured metadata object.
+            page_size: Number of tokens per page. Required if metadata is None.
+            hbm_utilization: Target HBM usage. Required if metadata is None.
+            max_model_length: Maximum model sequence length. Required if metadata is None.
+
+        Returns:
+            An initialized RaggedPagesCache object containing the allocated cache tensors.
+        """
+        ...
+
+    @abstractmethod
+    def create_cache_metadata(
+        self,
+        batch_size: int,
+        max_length: int,
+        pad_token_id: int | None = None,
+    ):
+        """Creates the metadata required for initializing a standard (non-paged) KV Cache.
+
+        Args:
+            batch_size: The batch size for which the cache is being configured.
+            max_length: The maximum sequence length the cache needs to support.
+            pad_token_id: The ID of the padding token. If None, it's inferred.
+
+        Returns:
+            An initialized metadata object for a standard KV cache.
+        """
+        ...
+
+    @abstractmethod
+    def create_paged_metadata(
+        self,
+        hbm_utilization: float,
+        page_size: int,
+        max_model_length: int,
+    ):
+        """Creates the static configuration metadata required for initializing a Paged KV Cache.
+
+        Args:
+            hbm_utilization: Target HBM memory utilization fraction.
+            page_size: Number of tokens per page in the paged cache.
+            max_model_length: Maximum sequence length the model will handle.
+
+        Returns:
+            An initialized metadata object containing the static configuration for the paged cache.
+        """
+        ...
+
+    @abstractmethod
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: chex.Array,
+        max_length: int,
+        pad_token_id: int,
+        starts: int | None = None,
+        shardings: int | None = None,
+        attention_mask: chex.Array | None = None,
+        token_type_ids: chex.Array | None = None,
+        mask_info: tp.Any | None = None,
+    ) -> dict[str, tp.Any]:
+        """Sets up the initial inputs required for starting autoregressive generation.
+
+        Args:
+            input_ids: The initial sequence of token IDs.
+            max_length: The maximum sequence length that the KV cache should support.
+            pad_token_id: The ID used for padding tokens.
+            starts: Optional pre-calculated starting positions.
+            shardings: Optional sharding configuration passed to init_cache.
+            attention_mask: An optional mask indicating which tokens should be attended to.
+            token_type_ids: Optional segment IDs for models that use them.
+            mask_info: Optional pre-constructed MaskInfo object.
+
+        Returns:
+            A dictionary containing the prepared inputs for generation.
+        """
+        ...
+
+    @abstractmethod
+    def update_inputs_for_generation(
+        self,
+        model_outputs: tp.Any,
+        model_kwargs: dict[str, tp.Any],
+    ) -> dict[str, tp.Any]:
+        """Updates the keyword arguments for the next generation step.
+
+        Args:
+            model_outputs: The output object from the model's forward pass in the previous step.
+            model_kwargs: The dictionary of keyword arguments used for the model call.
+
+        Returns:
+            The updated model_kwargs dictionary ready for the next generation step.
+        """
+        ...
+
+    @abstractmethod
+    def create_vinference(
+        self,
+        processor: tp.Any,
+        generation_config: tp.Any,
+        compile_config: tp.Any | None = None,
+        input_partition_spec: PartitionSpec | None = None,
+        seed: int | None = None,
+    ):
+        """Creates a vInference instance for optimized inference.
+
+        Args:
+            processor: The processor class for handling inputs/outputs.
+            generation_config: Configuration for generation behavior.
+            compile_config: Optional pre-compilation configuration.
+            input_partition_spec: Optional sharding specification for inputs.
+            seed: Optional random seed for reproducibility.
+
+        Returns:
+            A configured vInference instance ready for inference.
+        """
         ...
 
     def __str__(self):

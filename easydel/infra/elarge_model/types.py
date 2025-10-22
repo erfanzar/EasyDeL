@@ -205,6 +205,7 @@ class TextDatasetInformCfg(TypedDict, total=False):
 
     type: NotRequired[DatasetTypeLike | str]
     data_files: Required[str | list[str]]
+    dataset_split_name: NotRequired[str | None]
     split: NotRequired[str]
     content_field: NotRequired[str]
     additional_fields: NotRequired[list[str]]
@@ -228,6 +229,7 @@ class VisualDatasetInformCfg(TypedDict, total=False):
 
     type: NotRequired[DatasetTypeLike | str]
     data_files: Required[str | list[str]]
+    dataset_split_name: NotRequired[str | None]
     split: NotRequired[str]
     pixel_field: NotRequired[str]
     content_field: NotRequired[str | None]

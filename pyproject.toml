@@ -30,15 +30,16 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax>=0.7.2",
-	"jaxlib>=0.7.2",
+	"jax>=0.8.0",
+	"jaxlib>=0.8.0",
 	"ray[default]==2.34.0",
-	"eformer==0.0.76",
+	"eformer>=0.0.81",
+	"ejkernel>=0.0.3",
 	"einops~=0.8.0",
 	"transformers>=4.53.1",
 	"flax==0.11.2",
 	"fastapi>=0.115.2",
-	"wandb>=0.18.5",
+	"wandb>=0.22.2",
 	"uvloop==0.21.0",
 	"uvicorn[standard]>=0.32.0",
 	"jinja2>=3.1.5",
@@ -57,6 +58,8 @@ dependencies = [
 "Repository" = "https://github.com/erfanzar/EasyDeL"
 "Documentation" = "https://easydel.readthedocs.io/en/latest/"
 
+
+
 [tool.uv.build-backend]
 module-name = "easydel"
 module-root = "."
@@ -71,9 +74,9 @@ where = ["."]
 "easydel" = ["py.typed"]
 
 [project.optional-dependencies]
-torch = ["torch==2.6.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]>=0.7.0", "torch==2.6.0", "tensorboard>=2.19.0"]
-tpu = ["jax[tpu]>=0.7.0", "tensorboard>=2.19.0"]
+torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
+gpu = ["jax[cuda12]>=0.8.0", "torch==2.8.0", "tensorboard>=2.19.0"]
+tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
 profile = [
@@ -97,7 +100,7 @@ ignore = [
     "B008",  # Do not perform function calls in argument defaults
     "UP015", # Unnecessary open mode
     "A005",  # Module-level shadowing
-    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals 
+    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
     "E501",  # Line too long (handled by formatter)
 ]
 

@@ -47,6 +47,8 @@ Example:
     >>> output = layer(input_tensor)
 """
 
+from __future__ import annotations
+
 import typing as tp
 
 import jax.numpy as jnp
@@ -55,17 +57,9 @@ from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
-from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Shaped
-
-from easydel.kernels.collective_matmul import (
-    MatrixMultiplyMethod,
-    create_distributed_matmul,
-    prepare_matrix_for_all_gather,
-    prepare_matrix_for_reduce_scatter,
-)
 
 Dtype = jnp.dtype
 Initializer = nn.initializers.Initializer
@@ -89,16 +83,21 @@ def get_sharding(arr: Shaped[Array, "..."]) -> Ps | None:
     Returns:
         PartitionSpec of the array, or None if not sharded.
     """
-    sharding = getattr(arr, "sharding", None)
-    if sharding is not None:
-        return sharding.spec
-    return None
+    sharding: tp.Any | None = getattr(arr, "sharding", None)
+    has_sharding: bool = sharding is not None
+    result: Ps | None
+    if has_sharding:
+        spec: Ps = sharding.spec
+        result = spec
+    else:
+        result = None
+    return result
 
 
 def get_output_partition_spec(
     lhs: Shaped[Array, "..."],
     rhs: Shaped[Array, "..."],
-    method: MatrixMultiplyMethod,
+    method: "MatrixMultiplyMethod",  # noqa #type:ignore
     axis_name: str,
 ) -> Ps | None:
     """Calculate output partition spec for matrix multiplication.
@@ -117,19 +116,32 @@ def get_output_partition_spec(
     """
     from jax.sharding import PartitionSpec as P
 
-    lhs_spec = get_sharding(lhs)
-    rhs_spec = get_sharding(rhs)
+    lhs_spec: Ps | None = get_sharding(lhs)
+    rhs_spec: Ps | None = get_sharding(rhs)
 
-    if lhs_spec is None or rhs_spec is None:
+    lhs_is_none: bool = lhs_spec is None
+    rhs_is_none: bool = rhs_spec is None
+    either_none: bool = lhs_is_none or rhs_is_none
+    if either_none:
         return None
 
-    if lhs.ndim == 2:
-        return P(rhs_spec[1], rhs_spec[0])
+    lhs_ndim: int = lhs.ndim
+    is_2d: bool = lhs_ndim == 2
+    result: Ps
+    if is_2d:
+        rhs_spec_1: str | None = rhs_spec[1]
+        rhs_spec_0: str | None = rhs_spec[0]
+        result = P(rhs_spec_1, rhs_spec_0)
     else:
-        return P(*(None,) * (lhs.ndim - 1) + (axis_name,))
+        num_none: int = lhs_ndim - 1
+        none_tuple: tuple[None, ...] = (None,) * num_none
+        axis_tuple: tuple[str] = (axis_name,)
+        combined_tuple: tuple[None | str, ...] = none_tuple + axis_tuple
+        result = P(*combined_tuple)
+    return result
 
 
-def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
+def get_matmul_output_sharding(lhs_pspec: Ps | None, rhs_pspec: Ps | None) -> Ps:
     """Determine output sharding for matrix multiplication.
 
     Calculates the output PartitionSpec based on input partition specs,
@@ -156,49 +168,92 @@ def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
     Returns:
         PartitionSpec for the output of X @ W
     """
-    if lhs_pspec is None or rhs_pspec is None:
-        return Ps()
-    lhs_output_dims = lhs_pspec[:-1] if len(lhs_pspec) > 1 else ()
-    if len(rhs_pspec) >= 2:
-        rhs_output_dims = (rhs_pspec[-1],)
-    else:
-        rhs_output_dims = (rhs_pspec[-1],) if rhs_pspec else ()
+    lhs_is_none: bool = lhs_pspec is None
+    rhs_is_none: bool = rhs_pspec is None
+    either_none: bool = lhs_is_none or rhs_is_none
+    if either_none:
+        empty_spec: Ps = Ps()
+        return empty_spec
 
-    all_shard_dims = set()
-    output_dims = []
+    lhs_length: int = len(lhs_pspec)
+    lhs_gt_one: bool = lhs_length > 1
+    lhs_output_dims: tuple
+    if lhs_gt_one:
+        lhs_output_dims = lhs_pspec[:-1]
+    else:
+        lhs_output_dims = ()
+
+    rhs_length: int = len(rhs_pspec)
+    rhs_ge_two: bool = rhs_length >= 2
+    rhs_output_dims: tuple
+    if rhs_ge_two:
+        rhs_last: str | None = rhs_pspec[-1]
+        rhs_output_dims = (rhs_last,)
+    else:
+        rhs_is_empty: bool = not rhs_pspec
+        if rhs_is_empty:
+            rhs_output_dims = ()
+        else:
+            rhs_last_item: str | None = rhs_pspec[-1]
+            rhs_output_dims = (rhs_last_item,)
+
+    all_shard_dims: set[str] = set()
+    output_dims: list[str | None | tuple] = []
+
+    # Process LHS dimensions
     for dim in lhs_output_dims:
-        if isinstance(dim, tuple):
-            filtered_tuple = tuple(d for d in dim if d not in all_shard_dims)
+        dim_is_tuple: bool = isinstance(dim, tuple)
+        if dim_is_tuple:
+            filtered_tuple: tuple = tuple(d for d in dim if d not in all_shard_dims)
             for d in dim:
                 all_shard_dims.add(d)
-            if filtered_tuple:
+            filtered_is_nonempty: bool = bool(filtered_tuple)
+            dim_is_nonempty: bool = bool(dim)
+            if filtered_is_nonempty:
                 output_dims.append(filtered_tuple)
-            elif dim:
+            elif dim_is_nonempty:
                 output_dims.append(None)
         else:
-            if dim not in all_shard_dims:
+            dim_not_in_set: bool = dim not in all_shard_dims
+            if dim_not_in_set:
                 output_dims.append(dim)
                 all_shard_dims.add(dim)
             else:
                 output_dims.append(None)
+
+    # Process RHS dimensions
     for dim in rhs_output_dims:
-        if isinstance(dim, tuple):
-            filtered_tuple = tuple(d for d in dim if d not in all_shard_dims)
+        dim_is_tuple_rhs: bool = isinstance(dim, tuple)
+        if dim_is_tuple_rhs:
+            filtered_tuple_rhs: tuple = tuple(d for d in dim if d not in all_shard_dims)
             for d in dim:
                 all_shard_dims.add(d)
-            if filtered_tuple:
-                output_dims.append(filtered_tuple)
-            elif dim:
+            filtered_rhs_nonempty: bool = bool(filtered_tuple_rhs)
+            dim_rhs_nonempty: bool = bool(dim)
+            if filtered_rhs_nonempty:
+                output_dims.append(filtered_tuple_rhs)
+            elif dim_rhs_nonempty:
                 output_dims.append(None)
         else:
-            if dim not in all_shard_dims:
+            dim_rhs_not_in_set: bool = dim not in all_shard_dims
+            if dim_rhs_not_in_set:
                 output_dims.append(dim)
                 all_shard_dims.add(dim)
             else:
                 output_dims.append(None)
-    while len(output_dims) < (len(lhs_pspec) - 1 + 1):
+
+    # Pad with None to match expected dimensionality
+    output_dims_length: int = len(output_dims)
+    lhs_pspec_length: int = len(lhs_pspec)
+    target_length: int = lhs_pspec_length - 1 + 1
+    needs_padding: bool = output_dims_length < target_length
+    while needs_padding:
         output_dims.append(None)
-    return Ps(*output_dims)
+        output_dims_length = len(output_dims)
+        needs_padding = output_dims_length < target_length
+
+    result_spec: Ps = Ps(*output_dims)
+    return result_spec
 
 
 @auto_pytree
@@ -217,18 +272,25 @@ class TensorParallelConfig:
 
     mesh: Mesh = None
     axis_name: str = "tp"
-    matmul_method: MatrixMultiplyMethod | None = None
+    matmul_method: None = None
     reduce_output: bool = False
     reduce_scatter_output: bool = False
 
     def __post_init__(self):
-        msg = None
-        if self.matmul_method is not None:
-            if self.mesh is None:
+        msg: str | None = None
+        has_matmul_method: bool = self.matmul_method is not None
+        if has_matmul_method:
+            mesh_is_none: bool = self.mesh is None
+            if mesh_is_none:
                 self.mesh = es.get_incontext_mesh()
-            if self.axis_name not in self.mesh.axis_names:
-                msg = f"axis_name '{self.axis_name}' not found in mesh axis names: {self.mesh.axis_names}"
-        if msg is not None:
+            axis_names: tuple[str, ...] = self.mesh.axis_names
+            axis_not_in_mesh: bool = self.axis_name not in axis_names
+            if axis_not_in_mesh:
+                axis_name_str: str = self.axis_name
+                axis_names_str: str = str(axis_names)
+                msg = f"axis_name '{axis_name_str}' not found in mesh axis names: {axis_names_str}"
+        has_error: bool = msg is not None
+        if has_error:
             raise ValueError(msg)
 
 
@@ -268,111 +330,137 @@ class ParallelLinear(nn.Module):
         parallel_config: TensorParallelConfig | None = None,
         rngs: nn.Rngs | None = None,
     ):
+        rngs_computed: nn.Rngs
         if rngs is None:
-            rngs = nn.Rngs(0)
+            rngs_computed = nn.Rngs(0)
+        else:
+            rngs_computed = rngs
 
-        if scale == "fan_in":
-            scale = in_features**-0.5
-        elif scale == "fan_out":
-            scale = out_features**-0.5
+        scale_computed: float
+        scale_is_fan_in: bool = scale == "fan_in"
+        scale_is_fan_out: bool = scale == "fan_out"
+        if scale_is_fan_in:
+            scale_computed = in_features**-0.5
+        elif scale_is_fan_out:
+            scale_computed = out_features**-0.5
+        else:
+            scale_computed = scale
 
-        if scale != 1.0:
+        scale_is_one: bool = scale_computed != 1.0
+        if scale_is_one:
 
-            def _scale_operator(x):
-                return x * scale
+            def _scale_operator(x: Array) -> Array:
+                scaled: Array = x * scale_computed
+                return scaled
         else:
 
-            def _scale_operator(x):
+            def _scale_operator(x: Array) -> Array:
                 return x
 
-        self._scale_operator = _scale_operator
-        self.in_features = in_features
-        self.out_features = out_features
+        self._scale_operator: tp.Callable[[Array], Array] = _scale_operator
+        self.in_features: int = in_features
+        self.out_features: int = out_features
 
-        self.use_bias = use_bias
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.kernel_init = kernel_init
-        self.bias_init = bias_init
-        self.parallel_config = parallel_config
-        self.rngs = rngs
+        self.use_bias: bool = use_bias
+        self.dtype: Dtype | None = dtype
+        self.param_dtype: Dtype = param_dtype
+        self.precision: PrecisionLike = precision
+        self.kernel_init: Initializer = kernel_init
+        self.bias_init: Initializer = bias_init
+        self.parallel_config: TensorParallelConfig | None = parallel_config
+        self.rngs: nn.Rngs = rngs_computed
 
-        self.tp_merged = len(out_features) if isinstance(out_features, tp.Sequence) else 1
-        out_features_sum = sum(out_features) if self.tp_merged > 1 else out_features
-        kernel_key = rngs.params()
-        kernel_shape = (in_features, out_features_sum)
-        self.kernel = nn.Param(kernel_init(kernel_key, kernel_shape, param_dtype))
+        out_features_is_sequence: bool = isinstance(out_features, tp.Sequence)
+        tp_merged: int
+        if out_features_is_sequence:
+            tp_merged = len(out_features)
+        else:
+            tp_merged = 1
+        self.tp_merged: int = tp_merged
+
+        tp_merged_gt_one: bool = self.tp_merged > 1
+        out_features_sum: int
+        if tp_merged_gt_one:
+            out_features_sum = sum(out_features)
+        else:
+            out_features_sum = out_features
+
+        kernel_key: tp.Any = rngs_computed.params()
+        kernel_shape: tuple[int, int] = (in_features, out_features_sum)
+        kernel_initialized: Array = kernel_init(kernel_key, kernel_shape, param_dtype)
+        self.kernel: nn.Param = nn.Param(kernel_initialized)
 
         if use_bias:
-            bias_key = rngs.params()
-            bias_shape = (out_features,)
-            self.bias = nn.Param(bias_init(bias_key, bias_shape, param_dtype))
+            bias_key: tp.Any = rngs_computed.params()
+            bias_shape: tuple[int] = (out_features,)
+            bias_initialized: Array = bias_init(bias_key, bias_shape, param_dtype)
+            self.bias: nn.Param | None = nn.Param(bias_initialized)
         else:
             self.bias = None
-        self.distributed_matmul = None
-        if parallel_config is not None and parallel_config.matmul_method is not None:
-            self.distributed_matmul = create_distributed_matmul(
-                parallel_config.matmul_method,
-                parallel_config.axis_name,
-            )
+        self.distributed_matmul: tp.Any | None = None
 
-    def collective_forward(
-        self,
-        inputs: Shaped[Array, "... in_features"],
-        w: Array | None = None,
-    ) -> Shaped[Array, "... out_features"]:
-        kernel = self.kernel.value if w is None else w
-        bias = self.bias.value if self.use_bias else None
+    #     if parallel_config is not None and parallel_config.matmul_method is not None:
+    #         self.distributed_matmul = create_distributed_matmul(
+    #             parallel_config.matmul_method,
+    #             parallel_config.axis_name,
+    #         )
 
-        if bias is not None:
-            inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
-        else:
-            inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
+    # def collective_forward(
+    #     self,
+    #     inputs: Shaped[Array, "... in_features"],
+    #     w: Array | None = None,
+    # ) -> Shaped[Array, "... out_features"]:
+    #     kernel = self.kernel.value if w is None else w
+    #     bias = self.bias.value if self.use_bias else None
 
-        # Ensure inputs are 2D
-        orig_shape = inputs.shape
-        inputs_2d = inputs.reshape(-1, inputs.shape[-1])
+    #     if bias is not None:
+    #         inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
+    #     else:
+    #         inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
 
-        # Get partition specs
-        input_spec = get_sharding(inputs_2d)
-        kernel_spec = get_sharding(kernel)
-        output_spec = get_output_partition_spec(
-            inputs_2d,
-            kernel,
-            self.parallel_config.matmul_method,
-            self.parallel_config.axis_name,
-        )
+    #     # Ensure inputs are 2D
+    #     orig_shape = inputs.shape
+    #     inputs_2d = inputs.reshape(-1, inputs.shape[-1])
 
-        if self.parallel_config.matmul_method == MatrixMultiplyMethod.REDUCE_SCATTER:
-            kernel = prepare_matrix_for_reduce_scatter(
-                kernel,
-                self.parallel_config.mesh,
-                self.parallel_config.axis_name,
-            )
-        elif self.parallel_config.matmul_method == MatrixMultiplyMethod.ALL_GATHER:
-            kernel = prepare_matrix_for_all_gather(
-                kernel,
-                self.parallel_config.mesh,
-                self.parallel_config.axis_name,
-            )
+    #     # Get partition specs
+    #     input_spec = get_sharding(inputs_2d)
+    #     kernel_spec = get_sharding(kernel)
+    #     output_spec = get_output_partition_spec(
+    #         inputs_2d,
+    #         kernel,
+    #         self.parallel_config.matmul_method,
+    #         self.parallel_config.axis_name,
+    #     )
 
-        output_2d = shard_map(
-            self.distributed_matmul,
-            mesh=self.parallel_config.mesh,
-            in_specs=(input_spec, kernel_spec),
-            out_specs=output_spec,
-            check_rep=False,
-        )(inputs_2d, kernel)
+    #     if self.parallel_config.matmul_method == MatrixMultiplyMethod.REDUCE_SCATTER:
+    #         kernel = prepare_matrix_for_reduce_scatter(
+    #             kernel,
+    #             self.parallel_config.mesh,
+    #             self.parallel_config.axis_name,
+    #         )
+    #     elif self.parallel_config.matmul_method == MatrixMultiplyMethod.ALL_GATHER:
+    #         kernel = prepare_matrix_for_all_gather(
+    #             kernel,
+    #             self.parallel_config.mesh,
+    #             self.parallel_config.axis_name,
+    #         )
 
-        output = output_2d.reshape((*orig_shape[:-1], self.out_features))
+    #     output_2d = shard_map(
+    #         self.distributed_matmul,
+    #         mesh=self.parallel_config.mesh,
+    #         in_specs=(input_spec, kernel_spec),
+    #         out_specs=output_spec,
+    #         check_vma=False,
+    #     )(inputs_2d, kernel)
 
-        output = self._scale_operator(output)
+    #     output = output_2d.reshape((*orig_shape[:-1], self.out_features))
 
-        if bias is not None:
-            output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
+    #     output = self._scale_operator(output)
 
-        return output
+    #     if bias is not None:
+    #         output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
+
+    #     return output
 
     def native_forward(
         self,
@@ -392,39 +480,70 @@ class ParallelLinear(nn.Module):
             Output is sharded for COLUMN parallelism if `reduce_scatter_output` is True.
             Otherwise, output is fully replicated.
         """
-        kernel = self.kernel.value if w is None else w
-        bias = self.bias.value if self.use_bias else None
-
-        if bias is not None:
-            inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
+        w_is_none: bool = w is None
+        kernel: Array
+        if w_is_none:
+            kernel = self.kernel.value
         else:
-            inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
+            kernel = w
 
-        subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
+        has_bias: bool = self.use_bias
+        bias: Array | None
+        if has_bias:
+            bias = self.bias.value
+        else:
+            bias = None
 
-        y = jnp.einsum(
+        bias_is_not_none: bool = bias is not None
+        inputs_promoted: Array
+        kernel_promoted: Array
+        bias_promoted: Array | None
+        if bias_is_not_none:
+            inputs_promoted, kernel_promoted, bias_promoted = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
+        else:
+            inputs_promoted, kernel_promoted = promote_dtype((inputs, kernel), dtype=self.dtype)
+            bias_promoted = None
+
+        inputs_ndim: int = inputs_promoted.ndim
+        inputs_gt_one_dim: bool = inputs_ndim > 1
+        subscript: str
+        if inputs_gt_one_dim:
+            subscript = "...ik,...kj->...ij"
+        else:
+            subscript = "...k,...kj->...j"
+
+        y: Shaped[Array, "... out_features"] = jnp.einsum(
             subscript,
-            inputs,
-            kernel,
+            inputs_promoted,
+            kernel_promoted,
             precision=self.precision,
             optimize=True,
         )
 
-        y = self._scale_operator(y)
+        y_scaled: Shaped[Array, "... out_features"] = self._scale_operator(y)
 
-        if bias is not None:
-            y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
+        y_final: Shaped[Array, "... out_features"]
+        if bias_promoted is not None:
+            y_ndim: int = y_scaled.ndim
+            num_ones: int = y_ndim - 1
+            ones_tuple: tuple[int, ...] = (1,) * num_ones
+            final_dim: tuple[int] = (-1,)
+            reshape_spec: tuple[int, ...] = ones_tuple + final_dim
+            bias_reshaped: Array = jnp.reshape(bias_promoted, reshape_spec)
+            y_final = y_scaled + bias_reshaped
+        else:
+            y_final = y_scaled
 
-        return y
+        return y_final
 
     def __call__(
         self,
         inputs: Shaped[Array, "... in_features"],
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
-        if self.distributed_matmul is None:
-            return self.native_forward(inputs=inputs, w=w)
-        return self.collective_forward(inputs=inputs, w=w)
+        # if self.distributed_matmul is None:
+        return self.native_forward(inputs=inputs, w=w)
+        # return self.collective_forward(inputs=inputs, w=w)
 
 
 class RowParallelLinear(ParallelLinear):

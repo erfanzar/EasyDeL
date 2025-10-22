@@ -57,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
+import traceback
 import typing as tp
 from typing import Self
 
@@ -66,7 +67,7 @@ from eformer import escale as es
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from eformer.serialization import AsyncCheckpointManager
+from eformer.serialization import AsyncCheckpointManager, Checkpointer
 from flax import nnx as nn
 from flax import struct
 from jax import numpy as jnp
@@ -84,6 +85,7 @@ if tp.TYPE_CHECKING:
 
     from .base_module import EasyDeLBaseModule, PartitionLike
 
+AM = AsyncCheckpointManager  # anti-mage hehehe
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
 OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
@@ -408,7 +410,12 @@ class EasyDeLState(struct.PyTreeNode):
         graphstate_size = calculate_size(self.graphstate)
         return opt_state_size + graphstate_size
 
-    def load_optimizer(self: Self, load_directory: str | ePathLike):
+    def load_optimizer(
+        self: Self,
+        load_directory: str | ePathLike,
+        checkpointer: Checkpointer | None = None,
+        tx_template: None | optax.GradientTransformation = None,
+    ):
         """Loads the optimizer state from saved files.
 
         Reads the optimizer state structure from a pickle file (`OPTIMIZER_STRUCT_NAME`)
@@ -427,13 +434,44 @@ class EasyDeLState(struct.PyTreeNode):
             Exception: If any error occurs during loading or deserialization.
         """
         load_directory = ePath(load_directory)
-        optim_path = (
-            load_directory if AsyncCheckpointManager.is_tensorstore(load_directory) else load_directory / OPTIMIZER_NAME
-        )
+
+        if checkpointer is None:
+            checkpointer = Checkpointer(
+                base_path=load_directory,
+                save_interval=None,
+                step_policies=[],
+            )
+        org_path = load_directory
+        optim_path = load_directory if AM.is_tensorstore(load_directory) else load_directory / OPTIMIZER_NAME
         struct_path = load_directory / OPTIMIZER_STRUCT_NAME
         tx_struct_path = load_directory / TX_STRUCT_JSON
-        if not struct_path.exists() and not tx_struct_path.exists():
-            raise FileNotFoundError(f"Optimizer files are missing at {load_directory}")
+
+        def new_method(tx_template):
+            path = str(AsyncCheckpointManager.safe_loadpath(org_path))
+            tx_template = tx_template if tx_template is not None else self.tx
+            if tx_template is not None:
+                template = jax.eval_shape(tx_template.init, self.graphstate)
+            opt_state, metadata = checkpointer.load_pytree(
+                mesh=self.model.mesh,
+                path=path,
+                partition_rules=self.model.config.get_partition_rules(),
+                prefix="tx",
+                load_treedef=True,
+                discover_latest=True,
+                discover_raise=False,
+                template=template,
+            )
+            step = metadata.get("step", 0)
+            return opt_state, step
+
+        if not tx_struct_path.exists() or not struct_path.exists():
+            try:
+                opt_state, step = new_method(tx_template)
+                logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
+                return self.replace(opt_state=opt_state, step=jnp.asarray(step))
+            except Exception:
+                traceback.print_exc()
+
         try:
             if not AsyncCheckpointManager.is_tensorstore(optim_path):
                 treedef, step = pickle.loads(struct_path.read_bytes())
@@ -452,21 +490,27 @@ class EasyDeLState(struct.PyTreeNode):
 
                 opt_state = jax.tree_util.tree_unflatten(treedef, recreated)
             else:
-                opt_state, metadata = AsyncCheckpointManager().load_pytree(
-                    path=AsyncCheckpointManager.safe_loadpath(optim_path),
-                    mesh=self.model.mesh,
-                    partition_rules=self.model.config.get_partition_rules(),
-                    prefix="tx",
-                )
-                step = metadata.get("step", 0)
+                opt_state, step = new_method(tx_template)
 
             logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
             return self.replace(opt_state=opt_state, step=jnp.asarray(step))
         except Exception as e:
+            if "Too many leaves for PyTreeDef" in str(e):
+                try:
+                    opt_state, step = new_method(tx_template)
+                    return self.replace(opt_state=opt_state, step=jnp.asarray(step))
+                except Exception:
+                    ...
             logger.error(f"Optimizer load failed: {e!s}")
             raise e
 
-    def save_optimizer(self, save_directory: str | ePathLike, float_dtype: jnp.dtype | None = None):
+    def save_optimizer(
+        self,
+        save_directory: str | ePathLike,
+        float_dtype: jnp.dtype | None = None,
+        checkpointer: Checkpointer | None = None,
+        step: int | None = None,
+    ):
         """Saves the optimizer state to a directory.
 
         Saves optimizer state using AsyncCheckpointManager with optional dtype conversion.
@@ -478,19 +522,25 @@ class EasyDeLState(struct.PyTreeNode):
                         Useful for reducing checkpoint size.
         """
         save_directory = ePath(save_directory)
+        if checkpointer is None:
+            checkpointer = Checkpointer(
+                base_path=save_directory,
+                save_interval=None,
+                step_policies=[],
+            )
         if self.opt_state is not None:
             save_directory.mkdir(parents=True, exist_ok=True)
             optim_path = save_directory
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
                 with self.model.mesh:
-                    AsyncCheckpointManager().save_pytree(
-                        pytree=self.opt_state,
-                        path=optim_path,
+                    checkpointer.save_pytree(
+                        tree=self.opt_state,
                         mesh=self.model.mesh,
                         dtype=float_dtype,
                         prefix="tx",
-                        extras={"step": self.step.item() if isinstance(self.step, jnp.ndarray) else self.step},
+                        # Don't pass step here - save_directory is already the checkpoint directory
+                        # Passing step would create duplicate run-{step}/run-{step} structure
                     )
             except Exception as e:
                 logger.error(f"Optimizer save failed: {e!s}")
@@ -503,6 +553,7 @@ class EasyDeLState(struct.PyTreeNode):
         save_directory: str | os.PathLike | ePathLike,
         float_dtype: jnp.dtype | None = None,
         save_optimizer: bool = True,
+        step: int | None = None,
     ):
         """Saves the entire `EasyDeLState` to a directory.
 
@@ -523,8 +574,10 @@ class EasyDeLState(struct.PyTreeNode):
                 If True, saves the optimizer state. Defaults to True.
         """
         save_directory = ePath(save_directory)
+        if step is None:
+            step = self.step.item() if isinstance(self.step, jnp.ndarray) else self.step
         if save_optimizer:
-            self.save_optimizer(save_directory=save_directory, float_dtype=float_dtype)
+            self.save_optimizer(save_directory=save_directory, float_dtype=float_dtype, step=step)
         else:
             logger.info("Skipping optimizer saving as requested.")
 
@@ -532,6 +585,7 @@ class EasyDeLState(struct.PyTreeNode):
             save_directory=save_directory,
             gather_fns=self.model._gather_fns,
             float_dtype=float_dtype,
+            step=step,
         )
 
     @classmethod
@@ -560,6 +614,7 @@ class EasyDeLState(struct.PyTreeNode):
         quantization_pattern: str | None = None,
         quantize_tensors: bool = True,
         verbose: bool = True,
+        tx_template: optax.GradientTransformation | None = None,
         **kwargs,
     ):
         """Loads an EasyDeLState from a saved checkpoint directory.
@@ -682,12 +737,12 @@ class EasyDeLState(struct.PyTreeNode):
         )
 
         state = cls.create(step=jnp.array(0), model=model)
-        optimizer_path = ePath(load_directory) / OPTIMIZER_STRUCT_NAME
-        tx_struct_path = ePath(load_directory) / TX_STRUCT_JSON
-        if optimizer_path.exists() or tx_struct_path.exists():
+        try:
             cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
             with cmg:
-                state = state.load_optimizer(load_directory=load_directory)
+                state = state.load_optimizer(load_directory=load_directory, tx_template=tx_template)
+        except Exception:
+            logger.info("EasyDeLState couldn't restore the optimizer/tx (maybe there wasn't any!).")
         if auto_shard_model:
             state = state.shard_state()
         return state

@@ -15,11 +15,11 @@
 
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -27,18 +27,18 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     BaseModelOutput,
     CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -48,7 +48,9 @@ from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from .cohere_configuration import CohereConfig as CohereConfig
 
 
-def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
+def repeat_kv(
+    x: Float[Array, "batch seq_len num_kv_heads head_dim"], n_rep: int
+) -> Float[Array, "batch seq_len num_heads head_dim"]:
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -114,7 +116,14 @@ class RMSNorm(nn.Module):
         return output * weight
 
 
-class CohereAttention(AttentionModule):
+class CohereAttention(UnifiedAttention):
+    """Multi-head attention layer with RoPE embeddings for Cohere models.
+
+    Inherits from UnifiedAttention with Cohere-specific customizations:
+    - Optional Q/K normalization (use_qk_norm)
+    - Custom RoPE configuration
+    """
+
     def __init__(
         self,
         config: CohereConfig,
@@ -124,19 +133,18 @@ class CohereAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        self.hidden_size = config.hidden_size
-        self.head_dim = self.config.head_dim
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        """Initialize Cohere attention with optional Q/K normalization."""
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
+        )
 
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
+        # Add Q/K normalization if configured
         if config.use_qk_norm:
             self.q_norm = RMSNorm(
                 dim=(self.head_dim, self.config.num_attention_heads),
@@ -155,131 +163,17 @@ class CohereAttention(AttentionModule):
                 param_dtype=self.param_dtype,
                 do_t=True,
             )
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size)
 
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            dropout_prob=config.attention_dropout,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-        )
+    def _create_rotary(self, config: CohereConfig, dtype: jnp.dtype):
+        """Create Cohere-specific rotary embedding layer."""
+        return config.get_basic_rope(dtype, self.head_dim, self.head_dim, True)
 
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization if configured."""
         if self.config.use_qk_norm:
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-        )
-
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.o_proj(attn_output), name="attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+        return query_states, key_states, value_states
 
 
 class CohereMLP(nn.Module):
@@ -403,15 +297,12 @@ class CohereBlock(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """
@@ -439,15 +330,12 @@ class CohereBlock(nn.Module):
         )
         attn_outputs = self.self_attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -532,13 +420,13 @@ class CohereModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
     ) -> BaseModelOutput:
         """Forward pass through the core Cohere model.
 
@@ -550,8 +438,8 @@ class CohereModel(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs.
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | PagesCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Cache metadata.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Cache metadata.
 
 
         Returns:
@@ -571,14 +459,15 @@ class CohereModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
         hidden_states = inputs_embeds
@@ -602,14 +491,12 @@ class CohereModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -660,7 +547,13 @@ class CohereModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=CohereConfig, model_type="cohere")
-class CohereForCausalLM(EasyDeLBaseModule):
+class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
+    """Cohere model with a Causal Language Modeling head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "cohere"
+    _config_class = CohereConfig
+
     def __init__(
         self,
         config: CohereConfig,
@@ -672,36 +565,13 @@ class CohereForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=CohereModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = CohereModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
         self.logit_scale = self.config.logit_scale
 
@@ -710,14 +580,14 @@ class CohereForCausalLM(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """
         Forward pass through the Cohere model for Causal Language Modeling.
@@ -730,26 +600,16 @@ class CohereForCausalLM(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
-            past_key_values (Optional[TransformerCache | PagesCache]): KV cache for faster generation.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Metadata for paged attention.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache for faster generation.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
 
         Returns:
             Union[CausalLMOutput, Tuple]: Model output, including logits.
         """
-        batch_size, sequence_length = input_ids.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, sequence_length),
-            )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -757,7 +617,6 @@ class CohereForCausalLM(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -811,17 +670,12 @@ class CohereForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=CohereConfig, model_type="cohere")
-class CohereForSequenceClassification(EasyDeLBaseModule):
-    """
-    Cohere model for sequence classification.
+class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereModel, CohereConfig]):
+    """Cohere model for sequence classification."""
 
-    Attributes:
-        config (CohereConfig): Configuration object (must include num_labels).
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
-    """
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "cohere"
+    _config_class = CohereConfig
 
     def __init__(
         self,
@@ -832,35 +686,16 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the CohereForSequenceClassification model."""
         super().__init__(
             config=config,
+            base_model_class=CohereModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = CohereModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=precision,
-            rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
         )
 
     def __call__(
@@ -868,13 +703,13 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """
         Forward pass for sequence classification.
@@ -887,8 +722,8 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
             segment_ids (Optional[chex.Array]): Segment IDs.
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | PagesCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | PagesMetadata]): Cache metadata.
+            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.
+            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Cache metadata.
 
 
         Returns:
@@ -897,6 +732,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             mode=mode,
             past_key_values=past_key_values,
@@ -904,7 +740,6 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
         )
 
         hidden_states = transformer_outputs.last_hidden_state

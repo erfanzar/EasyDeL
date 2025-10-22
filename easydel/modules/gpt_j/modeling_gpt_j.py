@@ -13,27 +13,30 @@
 # limitations under the License.
 
 
-from functools import cached_property, partial
+from functools import cached_property
+from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -45,21 +48,27 @@ from .gpt_j_configuration import GPTJConfig as GPTJConfig
 logger = get_logger(__name__)
 
 
-class GPTJAttention(AttentionModule):
-    """GPT-J Attention module.
+class GPTJAttention(UnifiedAttention):
+    """GPT-J Attention with partial RoPE.
 
-    This module implements the attention mechanism used in the GPT-J model,
-    including rotary position embeddings.
-
-    Attributes:
-            config (GPTJConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            causal (bool): Whether the attention is causal.
-            is_cross_attention (bool): Whether the attention is cross-attention.
-            rngs (nn.Rngs): Random number generators.
+    Inherits from UnifiedAttention.
+    Uses separate Q/K/V projections with partial rotary embeddings.
     """
+
+    projection_mapping: ClassVar[dict[str, str]] = {
+        "query_projection": "q_proj",
+        "key_projection": "k_proj",
+        "value_projection": "v_proj",
+        "output_projection": "out_proj",
+        "qkv_projection": "qkv_proj",
+        "mla_q_proj": "q_proj",
+        "mla_q_a_proj": "q_a_proj",
+        "mla_q_a_layernorm": "q_a_layernorm",
+        "mla_q_b_proj": "q_b_proj",
+        "mla_kv_a_proj_with_mqa": "kv_a_proj_with_mqa",
+        "mla_kv_a_layernorm": "kv_a_layernorm",
+        "mla_kv_b_proj": "kv_b_proj",
+    }
 
     def __init__(
         self,
@@ -67,151 +76,134 @@ class GPTJAttention(AttentionModule):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
-        causal: bool = True,
-        is_cross_attention: bool = False,
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
-
-        self.precision = precision
-        self.dtype = dtype
-        self.rngs = rngs
-        self.is_cross_attention = is_cross_attention
-        self.causal = causal
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-
-        self.rotary_dim = config.rotary_dim
-
-        linear = partial(
-            ColumnParallelLinear,
-            self.embed_dim,
-            self.embed_dim,
-            use_bias=False,
-            dtype=dtype,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            param_dtype=param_dtype,
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+        """Initialize GPT-J attention."""
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            attention_type="standard",
+            causal=True,
         )
 
-        self.q_proj, self.k_proj, self.v_proj = (
-            linear(rngs=rngs),
-            linear(rngs=rngs),
-            linear(rngs=rngs),
-        )
-        self.out_proj = linear(rngs=rngs)
-
-        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=self.embed_dim,
-            rotary_dim=self.rotary_dim,
+    def _create_rotary(self, config: GPTJConfig, dtype: jnp.dtype):
+        """Create GPT-J-specific rotary embedding with partial RoPE."""
+        return config.get_basic_rope(
+            dtype,
+            head_size=self.head_dim,
+            rotary_dim=config.rotary_dim,  # Partial RoPE
             base=10000,
             is_neox_style=False,
         )
 
-        self.attention_performer = FlexibleAttentionModule(
+    def _create_attention_performer(self, config: GPTJConfig, rngs: nn.Rngs):
+        """Create attention performer with config dropout."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attn_pdrop,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
         )
 
-    def _split_heads(self, hidden_states):
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
+    def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create query projection with checkpointing."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
 
-    def __call__(
+    def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create key projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+
+    def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create value projection."""
+        return ColumnParallelLinear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+
+    def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
+        """Create output projection (named out_proj for GPT-J)."""
+        self.out_proj = ColumnParallelLinear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+        return self.out_proj
+
+    def define_network(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        causal_mask: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        config: GPTJConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
     ):
-        """Forward pass of the GPTJAttention module.
+        """Define GPT-J-specific network with residual dropout."""
+        # Call parent to create standard Q/K/V/O projections
+        super().define_network(config, dtype, param_dtype, precision, rngs)
 
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional): Cache
-                view for key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional):
-                Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
+        # GPT-J has residual dropout
+        self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
-        Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output
-                and optionally the attention weights.
-        """
+    def _split_heads(self, hidden_states):
+        """Split hidden states into attention heads."""
+        return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
+
+    def _get_query_proj(self, hidden_states: Array) -> Array:
+        """Apply query projection with checkpoint naming and head splitting."""
         query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
+        return self._split_heads(query_states)
+
+    def _get_key_proj(self, hidden_states: Array) -> Array:
+        """Apply key projection with checkpoint naming and head splitting."""
         key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
+        return self._split_heads(key_states)
+
+    def _get_value_proj(self, hidden_states: Array) -> Array:
+        """Apply value projection with checkpoint naming and head splitting."""
         value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
+        return self._split_heads(value_states)
 
-        query_states = self._split_heads(query_states)
-        key_states = self._split_heads(key_states)
-        value_states = self._split_heads(value_states)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=None,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-        )
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+    def _get_output_proj(self, attn_output: Array) -> Array:
+        """Apply output projection with checkpoint naming and residual dropout."""
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
-        attn_output = self.resid_dropout(attn_output)
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
-        )
+        return self.resid_dropout(attn_output)
 
 
 class GPTJMLP(nn.Module):
@@ -270,7 +262,9 @@ class GPTJMLP(nn.Module):
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(rate=config.resid_pdrop)
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
         """Forward pass of the GPTJMLP module.
 
         Args:
@@ -352,17 +346,15 @@ class GPTJBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        causal_mask: chex.Array | None = None,
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+    ) -> DecoderLayerOutput:
         """Forward pass of the GPTJBlock module.
 
         Args:
@@ -371,9 +363,9 @@ class GPTJBlock(nn.Module):
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
             segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | PagesCacheView], optional): Cache view for
+            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache view for
                 key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | PagesMetadata], optional): Metadata for
+            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for
                 cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
             frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
@@ -387,13 +379,11 @@ class GPTJBlock(nn.Module):
 
         attn_outputs = self.attn(
             hidden_states,
-            attention_mask,
+            mask_info,
             position_ids,
             mode,
             cache_view,
             cache_metadata,
-            causal_mask,
-            segment_ids,
             output_attentions,
             frequencies,
         )
@@ -406,7 +396,6 @@ class GPTJBlock(nn.Module):
             )
         else:
             feed_forward_hidden_states = self.mlp(hidden_states)
-        # residual connection
         hidden_states = checkpoint_name(attn_output + feed_forward_hidden_states + residual, "residual")
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -497,15 +486,15 @@ class GPTJModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        inputs_embeds: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        extra_embedding: chex.Array | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        extra_embedding: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -515,9 +504,9 @@ class GPTJModel(EasyDeLBaseModule):
             input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
             attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
             position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed
+            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
                 key_states/value_states states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
             inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
             segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
             extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
@@ -538,14 +527,15 @@ class GPTJModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
         batch_size, sequence_length, _ = inputs_embeds.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
@@ -571,15 +561,13 @@ class GPTJModel(EasyDeLBaseModule):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
-                causal_mask=self.causal_mask,
             )
             hidden_states = layer_outputs.hidden_states
             if output_attentions:
@@ -625,20 +613,12 @@ class GPTJModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GPTJConfig, model_type="gptj")
-class GPTJForCausalLM(EasyDeLBaseModule):
-    """GPT-J model with a language modeling head.
+class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):
+    """GPT-J model with a language modeling head."""
 
-    This model extends the base GPTJModel by adding a linear layer on top to
-    predict the next token in a sequence, making it suitable for causal language
-    modeling tasks.
-
-    Attributes:
-            config (GPTJConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
-    """
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "gptj"
+    _config_class = GPTJConfig
 
     def __init__(
         self,
@@ -651,125 +631,11 @@ class GPTJForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=GPTJModel,
+            base_model_name="transformer",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
         )
-        self.transformer = GPTJModel(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.dtype,
-            precision=self.precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            rngs=rngs,
-            dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            param_dtype=self.dtype,
-            precision=self.precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        inputs_embeds: chex.Array | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        extra_embedding: chex.Array | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        """Forward pass through the GPTJForCausalLM model.
-
-        Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | PagesCache, optional): Cache containing precomputed
-                key_states/value_states states.
-            cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-            Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
-        """
-        outputs = self.transformer(
-            input_ids=input_ids,
-            extra_embedding=extra_embedding,
-            segment_ids=segment_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.transformer.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.transformer.get_embedding()

@@ -14,31 +14,28 @@
 
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
-    MoeCausalLMOutput,
     MoeModelOutput,
-    SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -161,7 +158,7 @@ class Glm4MoeMLPStack(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+    def __call__(self, x: Array, group_sizes: Array) -> Array:
         """Forward pass through MoE MLP."""
         hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes), name="moe_gate"))
         hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes), name="moe_up")
@@ -292,7 +289,7 @@ class Glm4MoeMoE(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -310,7 +307,7 @@ class Glm4MoeMoE(BaseMoeModule):
         return final_hidden_states, router_logits
 
 
-class Glm4MoeAttention(AttentionModule):
+class Glm4MoeAttention(UnifiedAttention):
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -321,153 +318,14 @@ class Glm4MoeAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
         self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.hidden_size = config.hidden_size
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.head_dim = head_dim
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.use_qk_norm = config.use_qk_norm
-
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        super().__init__(
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
-
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(
-                dim=self.head_dim,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
-            self.k_norm = RMSNorm(
-                dim=self.head_dim,
-                eps=config.rms_norm_eps,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
-
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-        self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
-            base_config=self.config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=self.config.attention_dropout,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
-        position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), name="attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
-        )
-        qshape = (
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        kv_shape = (
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        query_states = query_states.reshape(qshape)
-        key_states = key_states.reshape(kv_shape)
-        value_states = value_states.reshape(kv_shape)
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        # Apply QK normalization if enabled
-        if self.use_qk_norm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-        (
-            key_states,
-            value_states,
-            attention_mask,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            value=value_states,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
-        )
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            causal=True,
-        )
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
-            name="attn_output",
-        )
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+            use_qk_norm=config.use_qk_norm,
         )
 
 
@@ -530,32 +388,26 @@ class Glm4MoeDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
+
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
-            causal_mask=causal_mask,
             mode=mode,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            segment_ids=segment_ids,
             output_attentions=output_attentions,
-            fcm_mask=fcm_mask,
             frequencies=frequencies,
         )
         hidden_states = residual + attn_outputs.attention_output
@@ -640,11 +492,11 @@ class Glm4MoeModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -665,15 +517,16 @@ class Glm4MoeModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
 
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
 
@@ -701,15 +554,13 @@ class Glm4MoeModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=self.causal_mask,
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
-                segment_ids=segment_ids,
                 frequencies=self.frequencies,
             )
 
@@ -750,8 +601,12 @@ class Glm4MoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeConfig, model_type="glm4_moe")
-class Glm4MoeForCausalLM(EasyDeLBaseModule):
+class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
     """GLM4 MoE model with a language modeling head for causal language modeling tasks."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "glm4_moe"
+    _config_class = Glm4MoeConfig
 
     def __init__(
         self,
@@ -764,114 +619,24 @@ class Glm4MoeForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Glm4MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
+            router_aux_loss_coef=None,  # NOTE: we dont use aux loss for Glm4Moe
         )
-        self.model = Glm4MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        output_router_logits: bool | None = None,
-    ) -> MoeCausalLMOutput:
-        output_router_logits = False  # NOTE: we dont use aux loss for Glm4Moe
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = outputs.last_hidden_state
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-
-        aux_loss = 0
-        if output_router_logits and outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=outputs.router_logits,
-                num_experts=self.config.n_routed_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        return self.lm_head
-
-    def get_embedding(self):
-        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Glm4MoeConfig, model_type="glm4_moe")
-class Glm4MoeForSequenceClassification(EasyDeLBaseModule):
+class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeModel, Glm4MoeConfig]):
     """GLM4 MoE model for sequence classification tasks."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "glm4_moe"
+    _config_class = Glm4MoeConfig
 
     def __init__(
         self,
@@ -884,109 +649,11 @@ class Glm4MoeForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Glm4MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            score_bias=False,
         )
-        self.model = Glm4MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        output_router_logits: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        aux_loss = None
-        if output_router_logits and transformer_outputs.router_logits is not None:
-            aux_loss = auxiliary_load_balancing_loss_func(
-                gate_logits=transformer_outputs.router_logits,
-                num_experts=self.config.n_routed_experts,
-                top_k=self.config.num_experts_per_tok,
-                attention_mask=attention_mask,
-            )
-            aux_loss = aux_loss * self.config.router_aux_loss_coef
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            aux_loss=aux_loss,
-        )
-
-    def get_encoder(self):
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
-
-    def get_embedding(self):
-        return self.model.get_embedding()

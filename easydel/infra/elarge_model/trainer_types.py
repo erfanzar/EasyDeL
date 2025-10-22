@@ -105,7 +105,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     resume_if_possible: NotRequired[bool]
     truncation_mode: NotRequired[Literal["keep_end", "keep_start"]]
     max_sequence_length: NotRequired[int | None]
-
+    save_interval_minutes: NotRequired[float | None]
     save_steps: NotRequired[int | None]
     save_total_limit: NotRequired[int | None]
     save_directory: NotRequired[str]

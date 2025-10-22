@@ -17,6 +17,7 @@ from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseA
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers.rotary_embedding import RopeConfig
 
 
 @register_config("xerxes2")
@@ -107,6 +108,7 @@ class Xerxes2Config(EasyDeLBaseConfig):
         vhead_dim: int = 128,
         mlp_only_layers: list[int] | None = None,
         hidden_act: str | None = None,
+        rope_scaling: dict | None = None,
         **kwargs,
     ):
         self.bits = bits
@@ -135,6 +137,7 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.vhead_dim = vhead_dim
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
+        self.rope_scaling = rope_scaling
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -188,3 +191,26 @@ class Xerxes2Config(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
+
+    def _get_rope_config(self) -> RopeConfig:
+        """Get RoPE configuration from the instance attributes."""
+        if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+            config = RopeConfig.from_dict(
+                dict(
+                    rope_type="yarn",
+                    base=10000,
+                    scaling_factor=1.0,
+                    original_max_position_embeddings=4096,
+                    beta_fast=32,
+                    beta_slow=1,
+                    mscale=1,
+                    mscale_all_dim=0,
+                )
+            )
+        else:
+            config = RopeConfig.from_dict(self.rope_scaling)
+
+            if config.original_max_position_embeddings is None:
+                config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        return config

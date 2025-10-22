@@ -56,6 +56,7 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -74,7 +75,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import PagesCache, PagesCacheMetaData
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheMetaData
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -176,17 +177,17 @@ class EasyGenerationMixin:
         hbm_utilization: float,
         page_size: int,
         max_model_length: int,
-    ) -> PagesCacheMetaData:
+    ) -> RaggedPagesCacheMetaData:
         """
         Creates the static configuration metadata required for initializing a Paged KV Cache.
 
         This method gathers necessary parameters from the model's configuration
         (like number of layers, heads, dimensions) and combines them with the provided
-        arguments to instantiate and return a `PagesCacheMetaData` object.
+        arguments to instantiate and return a `RaggedPagesCacheMetaData` object.
         This metadata object defines the structure and allocation parameters for the paged cache.
 
         Returns:
-            PagesCacheMetaData: An initialized metadata object containing the
+            RaggedPagesCacheMetaData: An initialized metadata object containing the
                 static configuration for the paged cache.
         """
         num_hidden_layers = _safepick(self.config, "num_hidden_layers")
@@ -203,7 +204,7 @@ class EasyGenerationMixin:
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
 
-        return PagesCacheMetaData.create(
+        return RaggedPagesCacheMetaData.create(
             mesh=self.mesh,
             partition_manager=self.config.partition_manager,
             kvdtype=self.config.kvdtype,
@@ -264,35 +265,35 @@ class EasyGenerationMixin:
             head_dim=head_dim,
         )
 
-    def init_pages(
+    def init_ragged_pages(
         self,
-        metadata: PagesCacheMetaData | None = None,
+        metadata: RaggedPagesCacheMetaData | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
-    ) -> PagesCache:
+    ) -> RaggedPagesCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
-        This method orchestrates the creation of the `PagesCache`. It either uses
-        a pre-existing `PagesCacheMetaData` object passed via the `metadata`
+        This method orchestrates the creation of the `RaggedPagesCache`. It either uses
+        a pre-existing `RaggedPagesCacheMetaData` object passed via the `metadata`
         argument, or if `metadata` is None, it first creates the metadata by calling
         `self.create_paged_metadata` using the other provided arguments (page_size,
         batch_size, etc.).
 
-        Finally, it calls `PagesCache.init_cache` to allocate the necessary
+        Finally, it calls `RaggedPagesCache.init_cache` to allocate the necessary
         paged tensors (`key_pages`, `value_pages` for each layer) based on the
         metadata, model's mesh, dtype, partition manager, and quantization settings.
 
         Args:
-            metadata (tp.Optional[PagesCacheMetaData]): An optional pre-configured
+            metadata (tp.Optional[RaggedPagesCacheMetaData]): An optional pre-configured
                 metadata object. If provided, other arguments like page_size, batch_size etc.,
                 are ignored for metadata creation.
             page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
             hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
 
         Returns:
-            PagesCache: An initialized PagesCache object containing the allocated
+            RaggedPagesCache: An initialized RaggedPagesCache object containing the allocated
                 cache tensors (views) for all layers.
 
         Raises:
@@ -309,7 +310,7 @@ class EasyGenerationMixin:
                 page_size=page_size,
                 max_model_length=max_model_length,
             )
-        return PagesCache.init_cache(
+        return RaggedPagesCache.init_cache(
             mesh=self.config.mesh,
             metadata=metadata,
             partition_manager=self.config.partition_manager,
@@ -399,7 +400,8 @@ class EasyGenerationMixin:
             chex.Array: An array of shape (batch_size,) containing the number of leading
                 padding tokens for each sequence in the batch.
         """
-        return jnp.sum(jnp.cumsum(array == padding_id, axis=-1) == 0, axis=-1)
+        valid = array != padding_id
+        return jnp.sum(jnp.cumsum(valid, axis=-1) == 0, axis=-1)
 
     @staticmethod
     def compute_prefill_length_from_mask(mask) -> chex.Array:
@@ -415,6 +417,30 @@ class EasyGenerationMixin:
         """
         return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
 
+    def _make_mask_info(
+        self,
+        attention_mask: jax.Array | None,
+        q_segment_ids: jax.Array | None,
+        kv_segment_ids: jax.Array | None,
+        q_positions: jax.Array | None,
+        kv_positions: jax.Array | None,
+        is_self_attn: bool = True,
+    ) -> MaskInfo:
+        # Prefer explicit segment IDs over masks
+        if q_segment_ids is not None:
+            return MaskInfo.from_segments(
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids
+                if kv_segment_ids is not None
+                else (q_segment_ids if is_self_attn else None),
+                q_positions=q_positions,
+                kv_positions=kv_positions,
+            )
+        if attention_mask is not None:
+            # Works for (B,1,1,L), (B,1,Q,K) etc. Your MaskInfo handles 3D/4D gracefully.
+            return MaskInfo.from_attention_mask(attention_mask, q_positions=q_positions, kv_positions=kv_positions)
+        raise ValueError("Need either segment_ids (preferred) or attention_mask to build MaskInfo.")
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -422,8 +448,9 @@ class EasyGenerationMixin:
         pad_token_id: int,
         starts: int | None = None,
         shardings: int | None = None,
-        attention_mask: chex.Array | None = None,
-        token_type_ids: chex.Array | None = None,
+        attention_mask: jax.Array | None = None,
+        token_type_ids: jax.Array | None = None,
+        mask_info: MaskInfo | None = None,  # NEW
     ) -> dict[str, tp.Any]:
         """
         Sets up the initial inputs required for starting autoregressive generation.
@@ -455,45 +482,92 @@ class EasyGenerationMixin:
         batch_size, seq_length = input_ids.shape
         if starts is None:
             if attention_mask is not None:
-                starts = self.compute_prefill_length_from_mask(attention_mask)
+                starts = self.compute_prefill_length_from_mask(attention_mask.astype(jnp.bool_))
             else:
                 starts = self.compute_prefill_length(input_ids, pad_token_id)
+
         past_key_values = self.init_cache(
-            batch_size,
-            max_length,
-            starts,
-            shardings,
-            pad_token_id,
+            batch_size=batch_size,
+            max_length=max_length,
+            starts=starts,
+            pad_token_id=pad_token_id,
         )
-        sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
+
+        if mask_info is None:
+            if attention_mask is None:
+                if hasattr(self, "generation_config") and self.generation_config.pad_token_id is not None:
+                    pad_id = self.generation_config.pad_token_id
+                else:
+                    pad_id = pad_token_id
+                valid = input_ids != pad_id
+                seg = jnp.where(valid, jnp.int32(0), jnp.int32(-1))
+                mask_info = MaskInfo.from_segments(seg)
+            else:
+                mask_info = MaskInfo.from_attention_mask(attention_mask)
+
+        base_mask_info = self._pad_maskinfo_to_maxlen(
+            mask_info,
+            max_length=max_length,
+            make_causal=not self.config.is_encoder_decoder,
+        )
         if attention_mask is not None:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = attention_mask.astype("b1")
-            position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask,
-                attention_mask,
-                (0, 0),
-            )
+            position_ids = attention_mask.astype(jnp.bool_).cumsum(axis=-1) - 1
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype=jnp.int32)[None, :], (batch_size, seq_length))
+
+        calldict = dict(
+            past_key_values=past_key_values,
+            mask_info=base_mask_info,  # store padded + causal; slice per step at call-time
+            position_ids=position_ids,
+        )
         if token_type_ids is not None:
-            token_type_ids = lax.dynamic_update_slice(
-                jnp.zeros((batch_size, max_length), dtype="i4"),
-                token_type_ids,
-                (0, 0),
-            )
-            token_type_ids = jax.device_put(token_type_ids, device=sharding)
-        calldict = {
-            "past_key_values": past_key_values,
-            "attention_mask": jax.device_put(extended_attention_mask, device=sharding),
-            "position_ids": jax.device_put(position_ids, device=sharding),
-        }
-        if token_type_ids is not None:
-            calldict.update({"token_type_ids": token_type_ids})
+            calldict["token_type_ids"] = token_type_ids
 
         return self.prepare_inputs_for_call(**calldict)
+
+    def _pad_maskinfo_to_maxlen(
+        self,
+        mask_info: MaskInfo,
+        max_length: int,
+        make_causal: bool,
+    ) -> MaskInfo:
+        # Ensure we have segment ids; prefer seg-ids to avoid stale masks
+        if mask_info.q_segment_ids is None or mask_info.kv_segment_ids is None:
+            mask_info = mask_info.materialize_segment_ids()
+
+        q_ids = jnp.asarray(mask_info.q_segment_ids, jnp.int32)  # (B, Q0)
+        kv_ids = jnp.asarray(mask_info.kv_segment_ids, jnp.int32)  # (B, K0)
+        _B, Q0 = q_ids.shape
+        K0 = kv_ids.shape[-1]
+
+        def _last_seg(ids):
+            valid = ids >= 0
+            has_any = valid.any(axis=-1, keepdims=True)
+            rev = jnp.flip(valid, axis=-1)
+            last_from_end = jnp.argmax(rev, axis=-1)  # idx from end
+            last_idx = (ids.shape[-1] - 1) - last_from_end
+            last_val = jnp.take_along_axis(ids, last_idx[:, None], axis=-1).squeeze(-1)
+            return jnp.where(has_any.squeeze(-1), last_val, jnp.int32(0))
+
+        last_q = _last_seg(q_ids)
+        last_kv = _last_seg(kv_ids)
+
+        if Q0 < max_length:
+            q_pad = jnp.tile(last_q[:, None], (1, max_length - Q0))
+            q_ids = jnp.concatenate([q_ids, q_pad], axis=-1)
+        if K0 < max_length:
+            kv_pad = jnp.tile(last_kv[:, None], (1, max_length - K0))
+            kv_ids = jnp.concatenate([kv_ids, kv_pad], axis=-1)
+
+        base = MaskInfo.from_segments(q_ids, kv_ids)
+
+        if make_causal:
+            base = base.apply_causal(offset=0)
+
+        base = base.materialize_attention_mask(dtype=jnp.bool_)
+        if base.attention_mask.ndim == 3:
+            base = base.replace(attention_mask=base.attention_mask[:, None, :, :])
+        return base
 
     def update_inputs_for_generation(
         self,
@@ -516,7 +590,6 @@ class EasyGenerationMixin:
         Returns:
             dict: The updated `model_kwargs` dictionary ready for the next generation step.
         """
-
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
@@ -728,7 +801,7 @@ class EasyGenerationMixin:
             if decoder_input_ids is not None:
                 return decoder_input_ids
         decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
-        return jnp.array(decoder_start_token_id, dtype="i4").reshape(1, -1).repeat(batch_size, axis=0)
+        return jnp.array(decoder_start_token_id, dtype=jnp.int32).reshape(1, -1).repeat(batch_size, axis=0)
 
     def _get_decoder_start_token_id(
         self,
@@ -797,14 +870,34 @@ class EasyGenerationMixin:
         return jnp.broadcast_to(tensor[:, None], (tensor.shape[0], num_beams, *tensor.shape[1:]))
 
     def _adapt_logits_for_beam_search(self, logits):
-        """
-        This function can be overwritten in the specific modeling_flax_<model-name>.py classes to allow for custom beam
-        search behavior. Note that the only model that overwrites this method is [`~transformes.FlaxMarianMTModel`].
+        """Adapts logits for beam search, allowing model-specific customization.
+
+        This hook can be overridden in specific model classes to implement custom
+        beam search behavior. The base implementation returns logits unchanged.
+
+        Args:
+            logits: The raw logits from the model.
+
+        Returns:
+            The adapted logits for beam search.
+
+        Note:
+            Currently only FlaxMarianMTModel overrides this method.
         """
         return logits
 
     def _validate_model_kwargs(self, model_kwargs: dict[str, tp.Any]):
-        """Validates model kwargs for generation. Generate argument typos will also be caught here."""
+        """Validates model kwargs for generation.
+
+        Checks that all provided kwargs are recognized by the model's generation
+        methods. This helps catch typos in generation arguments.
+
+        Args:
+            model_kwargs: Dictionary of keyword arguments to validate.
+
+        Raises:
+            ValueError: If any kwargs are not recognized by the model.
+        """
         unused_model_args = []
         model_args = set(inspect.signature(self.prepare_inputs_for_generation).parameters)
 
@@ -1043,7 +1136,13 @@ class EasyGenerationMixin:
                 model_kwargs=model_kwargs,
             )
         elif not generation_config.do_sample and generation_config.num_beams > 1:
-            # broadcast input_ids & encoder_outputs
+
+            def _repeat_mask_info(mi: MaskInfo, repeats: int) -> MaskInfo:
+                return jax.tree_util.tree_map(
+                    lambda x: jnp.repeat(x, repeats=repeats, axis=0) if isinstance(x, jax.Array) else x,
+                    mi,
+                )
+
             input_ids = self._expand_to_num_beams(input_ids, num_beams=generation_config.num_beams)
 
             if "encoder_outputs" in model_kwargs:
@@ -1052,11 +1151,8 @@ class EasyGenerationMixin:
                     num_beams=generation_config.num_beams,
                 )
 
-            for kwarg in ["attention_mask", "decoder_attention_mask"]:
-                if kwarg in model_kwargs:
-                    model_kwargs[kwarg] = self._expand_to_num_beams(
-                        model_kwargs[kwarg], num_beams=generation_config.num_beams
-                    )
+            if "mask_info" in model_kwargs:
+                model_kwargs["mask_info"] = _repeat_mask_info(model_kwargs["mask_info"], generation_config.num_beams)
 
             return self._beam_search(
                 input_ids,
@@ -1180,8 +1276,7 @@ class EasyGenerationMixin:
 
         batch_size, cur_len = input_ids.shape
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
 
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
@@ -1215,17 +1310,23 @@ class EasyGenerationMixin:
 
         def greedy_search_body_fn(state):
             """state update fn."""
-            model_outputs = model(state.running_token, **state.model_kwargs)
+            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            model_outputs = model(state.running_token, **call_kwargs)
             logits = model_outputs.logits[:, -1]
 
             logits = logits_processor(state.sequences, logits, state.cur_len)
 
             next_token = jnp.argmax(logits, axis=-1)
             next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-            next_is_sent_finished = state.is_sent_finished | jnp.isin(
-                next_token,
-                eos_token_id,
-            )
+            if eos_token_id is not None:
+                eos_arr = jnp.atleast_1d(jnp.array(eos_token_id, jnp.int32))
+            else:
+                eos_arr = None
+            if eos_arr is not None:
+                next_is_sent_finished = state.is_sent_finished | jnp.isin(next_token, eos_arr)
+            else:
+                next_is_sent_finished = state.is_sent_finished
+
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
                 state.sequences,
@@ -1270,15 +1371,9 @@ class EasyGenerationMixin:
         prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
-
-        eos_token_id = jnp.array(
-            eos_token_id,
-            dtype=jnp.int32 if eos_token_id is not None else None,
-        )
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
 
-        # per batch-item holding current token in loop.
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
@@ -1310,18 +1405,26 @@ class EasyGenerationMixin:
         def sample_search_body_fn(state):
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            model_outputs = model(state.running_token, **state.model_kwargs)
+
+            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            model_outputs = model(state.running_token, **call_kwargs)
+
             logits = model_outputs.logits[:, -1]
             logits = logits_processor(state.sequences, logits, state.cur_len)
-            logits = logits_warper(logits, logits, state.cur_len)
+            logits = logits_warper(state.sequences, logits, state.cur_len)
             next_token = (
                 jax.random.categorical(prng_key, logits, axis=-1) * ~state.is_sent_finished
                 + pad_token_id * state.is_sent_finished
             )
-            next_is_sent_finished = state.is_sent_finished | jnp.isin(
-                next_token,
-                eos_token_id,
-            )
+            if eos_token_id is not None:
+                eos_arr = jnp.atleast_1d(jnp.array(eos_token_id, jnp.int32))
+            else:
+                eos_arr = None
+            if eos_arr is not None:
+                next_is_sent_finished = state.is_sent_finished | jnp.isin(next_token, eos_arr)
+            else:
+                next_is_sent_finished = state.is_sent_finished
+
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
                 state.sequences,
@@ -1381,6 +1484,14 @@ class EasyGenerationMixin:
                 return tensor
             return tensor.reshape((tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]))
 
+        def flatten_mask_info(mi: MaskInfo, batch_size, num_beams):
+            return jax.tree_util.tree_map(
+                lambda t: t.reshape((batch_size * num_beams, *t.shape[2:]))
+                if isinstance(t, jax.Array) and t.ndim >= 2
+                else t,
+                mi,
+            )
+
         def unflatten_beam_dim(tensor, batch_size, num_beams):
             """Unflattens the first, flat batch*beam dimension of a non-scalar array."""
             # ignore scalars (e.g. cache index)
@@ -1418,11 +1529,8 @@ class EasyGenerationMixin:
 
         batch_size, num_beams, cur_len = input_ids.shape
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+        pad_token_id = jnp.array(pad_token_id, jnp.int32)
         cur_len = jnp.array(cur_len)
-
-        # record the prompt length of decoder
         decoder_prompt_len = input_ids.shape[-1]
 
         # per batch,beam-item holding current token in loop.
@@ -1450,7 +1558,6 @@ class EasyGenerationMixin:
             if kwarg in model_kwargs:
                 model_kwargs[kwarg] = flatten_beam_dim(model_kwargs[kwarg])
 
-        # initialize model specific kwargs
         model_kwargs = self.prepare_inputs_for_generation(
             flatten_beam_dim(input_ids),
             max_length=max_length,
@@ -1477,9 +1584,9 @@ class EasyGenerationMixin:
             if early_stopping == "never" and length_penalty > 0.0:
                 best_running_score = state.running_scores[:, :1] / ((max_length - decoder_prompt_len) ** length_penalty)
             else:
-                best_running_score = state.running_scores[:, :1] / (
-                    (state.cur_len - decoder_prompt_len) ** length_penalty
-                )
+                denom = jnp.maximum(state.cur_len - decoder_prompt_len, 1)
+                best_running_score = state.running_scores[:, :1] / (denom**length_penalty)
+
             worst_finished_score = jnp.where(
                 state.is_sent_finished,
                 jnp.min(state.scores, axis=1, keepdims=True),
@@ -1529,8 +1636,10 @@ class EasyGenerationMixin:
             topk_running_sequences = gather_beams(state.running_sequences, topk_beam_indices, batch_size, beams_to_keep)
             topk_ids = jnp.expand_dims(topk_indices % vocab_size, axis=2)
             topk_sequences = lax.dynamic_update_slice(topk_running_sequences, topk_ids, (0, 0, state.cur_len))
-
-            did_topk_just_finished = topk_sequences[:, :, state.cur_len] == eos_token_id
+            if eos_token_id is None:
+                did_topk_just_finished = jnp.zeros_like(topk_sequences[:, :, state.cur_len], dtype=jnp.bool_)
+            else:
+                did_topk_just_finished = jnp.isin(topk_sequences[:, :, state.cur_len], eos_token_id)
             running_topk_log_probs = topk_log_probs + did_topk_just_finished * np.array(-1.0e7)
 
             next_topk_indices = lax.top_k(running_topk_log_probs, k=num_beams)[1]

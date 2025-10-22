@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
+from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -32,18 +33,17 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     AttentionLayerOutput,
     BaseModelOutput,
-    CausalLMOutput,
     DecoderLayerOutput,
     EncoderLayerOutput,
     ModelOutput,
-    SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
-    PagesCache,
-    PagesCacheView,
-    PagesMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -424,15 +424,12 @@ class Llama4TextAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
         batch_size, sequence_length = hidden_states.shape[:2]
@@ -476,7 +473,7 @@ class Llama4TextAttention(AttentionModule):
         (
             key_states,
             value_states,
-            attention_mask,
+            mask_info,
             init_attention_bias,
             cache_view,
             cache_metadata,
@@ -486,9 +483,7 @@ class Llama4TextAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            fcm_mask=fcm_mask,
+            mask_info=mask_info,
         )
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -499,8 +494,7 @@ class Llama4TextAttention(AttentionModule):
             cache_metadata=cache_metadata,
             cache_view=cache_view,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
+            mask_info=mask_info,
             causal=False,
         )
         attn_output = self._merge_heads(attentions.attention_outputs)
@@ -589,29 +583,23 @@ class Llama4TextDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"],
+        mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        causal_mask: Bool[Array, "batch seq_len seq_len"] | bool | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | PagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask: Bool[Array, "batch seq_len seq_len"] | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
-            attention_mask,
+            mask_info,
             position_ids,
-            causal_mask,
             mode,
             cache_view,
             cache_metadata,
-            segment_ids,
             output_attentions,
-            fcm_mask,
             frequencies,
         )
 
@@ -698,11 +686,11 @@ class Llama4TextModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -714,9 +702,9 @@ class Llama4TextModel(EasyDeLBaseModule):
           attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
           position_ids (chex.Array, optional): Indices of positions of each input sequence token.
           segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-          past_key_values (TransformerCache | PagesCache, optional):
+          past_key_values (TransformerCache | RaggedPagesCache, optional):
             Cache containing precomputed key/value states.
-          cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
+          cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
           output_attentions (bool, optional): Whether to return attention weights.
           output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 
@@ -738,14 +726,15 @@ class Llama4TextModel(EasyDeLBaseModule):
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
-        if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-        else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
                 (batch_size, sequence_length),
             ).astype(jnp.int32)
         hidden_states = inputs_embeds
@@ -763,14 +752,15 @@ class Llama4TextModel(EasyDeLBaseModule):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        causal_mask = jnp.expand_dims(
-            _create_chunked_attention_mask(
-                self.config.attention_chunk_size,
-                0,
-                sequence_length,
-            ),
-            (0, 1),
-        )
+        mask_info = mask_info.apply_chunked(self.config.attention_chunk_size)
+        # causal_mask = jnp.expand_dims(
+        #     _create_chunked_attention_mask(
+        #         self.config.attention_chunk_size,
+        #         0,
+        #         sequence_length,
+        #     ),
+        #     (0, 1),
+        # )
         frequencies = self.compute_complex_rotary(position_ids)
 
         for idx, block in enumerate(self.layers):
@@ -779,14 +769,12 @@ class Llama4TextModel(EasyDeLBaseModule):
 
             layer_outputs = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
-                causal_mask=causal_mask,
                 output_attentions=output_attentions,
-                segment_ids=segment_ids,
                 frequencies=frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -836,7 +824,13 @@ class Llama4TextModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Llama4TextConfig, model_type="llama4_text")
-class Llama4ForCausalLM(EasyDeLBaseModule):
+class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
+    """Llama4 model with a Causal Language Modeling head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "llama4_text"
+    _config_class = Llama4TextConfig
+
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -848,142 +842,23 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Llama4TextModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_bias=False,
         )
-        self.model = Llama4TextModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        apply_lm_head: bool = True,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:
-        """Forward pass through the Llama model for causal language modeling.
-
-        Args:
-          input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-          inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-          attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-          position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-          segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-          past_key_values (TransformerCache | PagesCache, optional):
-            Cache containing precomputed key/value states.
-          cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-          output_attentions (bool, optional): Whether to return attention weights.
-          output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-          Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Llama4TextConfig, model_type="llama4_text")
-class Llama4ForSequenceClassification(EasyDeLBaseModule):
-    """Llama model for sequence classification tasks.
+class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4TextModel, Llama4TextConfig]):
+    """Llama4 model for sequence classification tasks."""
 
-    This class extends the base Llama model by adding a linear classification head
-    to perform sequence classification tasks such as sentiment analysis or text classification.
-
-    Attributes:
-      config (LlamaConfig): Configuration for the model.
-      dtype (jnp.dtype): Data type for computations.
-      param_dtype (jnp.dtype): Data type for parameters.
-      precision: Precision setting for JAX operations.
-    """
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "llama4_text"
+    _config_class = Llama4TextConfig
 
     def __init__(
         self,
@@ -996,133 +871,15 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Llama4TextModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            classifier_name="score",
+            classifier_bias=False,
         )
-        self.model = Llama4TextModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        """Forward pass through the Llama model for sequence classification.
-
-        This method processes input sequences through the Llama model and applies
-        a classification head to the output.
-
-        Args:
-          input_ids (chex.Array, optional): Input token IDs,
-            shape (batch_size, sequence_length).
-          inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-          attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-          position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-          segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-          past_key_values (TransformerCache | PagesCache, optional):
-            Cache containing precomputed key/value states.
-          cache_metadata (TransformerMetadata | PagesMetadata, optional): Metadata for cache handling.
-          output_attentions (bool, optional): Whether to return attention weights.
-          output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
-
-        Returns:
-          Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
-        """
-        transformer_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-        return SequenceClassifierOutput(
-            logits=pooled_logits,
-            past_key_values=past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        Decoder-Only models don't have an encoder.
-        """
-        raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
-        """
-        raise NotImplementedError("This model has a sequence classification head, not a language model head.")
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.get_embedding()
 
 
 class Llama4VisionMLP2(nn.Module):
@@ -1189,7 +946,7 @@ class Llama4MultiModalProjector(nn.Module):
         self.rngs = rngs
         self.linear_1 = RowParallelLinear(
             config.vision_config.vision_output_dim,
-            config.text_config.hidden_size,
+            config.get_text_config().hidden_size,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1375,8 +1132,7 @@ class Llama4VisionAttention(AttentionModule):
             cache_metadata=None,
             cache_view=None,
             init_bias=None,
-            attention_mask=None,
-            segment_ids=None,
+            mask_info=None,
             causal=False,
         )
         attn_output = attentions.attention_outputs.reshape(*input_shape, -1)
@@ -1887,13 +1643,13 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.language_model = Llama4ForCausalLM(
-            config=config.text_config,
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        self.vocab_size = config.text_config.vocab_size
+        self.vocab_size = config.get_text_config().vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
     def get_image_features(self, pixel_values: chex.Array, **kwargs) -> chex.Array:
@@ -1919,11 +1675,11 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] = None,
         pixel_values: chex.Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        segment_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | PagesCache | None = None,
-        cache_metadata: TransformerMetadata | PagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1965,6 +1721,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             inputs_embeds = inputs_embeds_updated_flat.reshape(orgshape)
         outputs = self.language_model(
             attention_mask=attention_mask,
+            mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1972,7 +1729,6 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             past_key_values=past_key_values,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
-            segment_ids=segment_ids,
             **lm_kwargs,
         )
 

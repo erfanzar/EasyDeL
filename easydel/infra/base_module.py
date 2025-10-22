@@ -144,7 +144,7 @@ class ParameterTransformRule:
     consolidate_experts: bool = False
 
 
-class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin):
+class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseModuleProtocol):
     """
     Base class for EasyDeL modules, providing common functionalities for model initialization,
     parameter handling, and integration with the EasyDeL ecosystem.
@@ -187,7 +187,6 @@ class EasyDeLBaseModule(nn.Module, BaseModuleProtocol, EasyBridgeMixin, EasyGene
         self.precision: lax.PrecisionLike = precision
         self.rngs: nn.Rngs = rngs
 
-        # these useless call's are just here to init values in graphdef
         _ = self.graphtree_shape
         _ = self.graphtree_params_shape
         _ = self.mesh
