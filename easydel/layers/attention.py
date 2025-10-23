@@ -723,25 +723,18 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         if cache_is_none:
             return key, value, mask_info, None, None
 
-        key_cached: Float[JArray, "batch seq_k heads dim"]
-        value_cached: Float[JArray, "batch seq_v heads dim"]
-        mask_info_updated: MaskInfo
-        cache_view_updated: TransformerCacheView
-        masking_details: AttnMaskDetail | None
-        key_cached, value_cached, mask_info_updated, cache_view_updated, masking_details = (
-            cache_view.concatenate_to_cache(
-                query=query,
-                key=key,
-                value=value,
-                mode=mode,
-                quantizer=self.quantizer,
-                mask_info=mask_info,
-                cache_metadata=cache_metadata,
-                partition_manager=self.config.partition_manager,
-            )
+        key, value, mask_info, cache_view, masking_details = cache_view.concatenate_to_cache(
+            query=query,
+            key=key,
+            value=value,
+            mode=mode,
+            quantizer=self.quantizer,
+            mask_info=mask_info,
+            cache_metadata=cache_metadata,
+            partition_manager=self.config.partition_manager,
         )
 
-        return key_cached, value_cached, mask_info_updated, cache_view_updated, masking_details
+        return key, value, mask_info, cache_view, masking_details
 
     def _apply_sliding_window(
         self,
@@ -858,8 +851,6 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         Raises:
             ValueError: If shapes are mismatched.
         """
-        # TODO:MOVEIT
-        # assert mask_info.shape[-1] >= key.shape[1], "Attention mask length must match KV sequence length."
 
         query_length: int = query.shape[1]
         initial_key_length: int = key.shape[1]
@@ -878,9 +869,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         is_ragged_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
         if is_ragged_cache:
-            cache_view_updated_ragged: RaggedPagesCacheView = cache_view.concatenate_to_cache(
-                key=key, value=value, cache_metadata=cache_metadata
-            )
+            cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             batch_size: int = query.shape[0]
             dtype_for_bias: jnp.dtype = self.dtype
@@ -891,7 +880,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                 )
                 return bias
 
-            return key, value, mask_info, init_attention_bias, cache_view_updated_ragged, cache_metadata
+            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
 
         cache_exists: bool = cache_view is not None
         if cache_exists:
@@ -900,12 +889,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             batches_match: bool = query_batch == cache_batch
             assert batches_match, "Batch size mismatch between query and cache."
 
-        key_cached: Array
-        value_cached: Array
-        mask_info_cached: MaskInfo
-        cache_view_cached: TransformerCacheView | None
-        masking_details: AttnMaskDetail | None
-        key_cached, value_cached, mask_info_cached, cache_view_cached, masking_details = self._handle_cache_concat(
+        key, value, mask_info, cache_view, _masking_details = self._handle_cache_concat(
             query=query,
             key=key,
             value=value,
@@ -916,32 +900,27 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         )
 
         metadata_is_none: bool = cache_metadata is None
-        cache_view_exists: bool = cache_view_cached is not None
+        cache_view_exists: bool = cache_view is not None
         should_create_metadata: bool = metadata_is_none and cache_view_exists
-        cache_metadata_computed: TransformerMetadata | RaggedPagesMetadata | None
+
         if should_create_metadata:
-            starts = cache_view_cached.starts
-            indexs = cache_view_cached.indexs
-            cache_metadata_computed = TransformerMetadata(starts=starts, indexs=indexs)
+            starts = cache_view.starts
+            indexs = cache_view.indexs
+            cache_metadata = TransformerMetadata(starts=starts, indexs=indexs)
         else:
-            cache_metadata_computed = cache_metadata
+            cache_metadata = cache_metadata
 
         sliding_window_provided: bool = sliding_window is not None
         has_cache_sliding: bool = (
-            cache_view_cached is not None
-            and cache_view_cached.masking_details is not None
-            and cache_view_cached.masking_details.mask_type == AttnMaskType.SLIDING
+            cache_view is not None
+            and cache_view.masking_details is not None
+            and cache_view.masking_details.mask_type == AttnMaskType.SLIDING
         )
         should_apply_sliding: bool = sliding_window_provided or has_cache_sliding
-        key_final: Array
-        value_final: Array
-        mask_info_final: MaskInfo
-        cache_metadata_final: TransformerMetadata | RaggedPagesMetadata | None
+
         if should_apply_sliding:
-            is_transformer_cache: bool = isinstance(cache_view_cached, TransformerCacheView)
-            masking_details_final: AttnMaskDetail | None = (
-                cache_view_cached.masking_details if is_transformer_cache else None
-            )
+            is_transformer_cache: bool = isinstance(cache_view, TransformerCacheView)
+            masking_details_final: AttnMaskDetail | None = cache_view.masking_details if is_transformer_cache else None
             has_masking_details: bool = masking_details_final is not None
             is_sliding_type: bool = has_masking_details and masking_details_final.mask_type == AttnMaskType.SLIDING
             sliding_window_computed: int
@@ -950,30 +929,25 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             else:
                 sliding_window_computed = sliding_window
 
-            key_final, value_final, mask_info_final, cache_metadata_final = self._apply_sliding_window(
-                key=key_cached,
-                value=value_cached,
-                mask_info=mask_info_cached,
+            key, value, mask_info, cache_metadata = self._apply_sliding_window(
+                key=key,
+                value=value,
+                mask_info=mask_info,
                 mode=mode_computed,
-                cache_view=cache_view_cached,
+                cache_view=cache_view,
                 sliding_window=sliding_window_computed,
                 query_length=query_length,
                 masking_details=masking_details_final,
-                cache_metadata=cache_metadata_computed,
+                cache_metadata=cache_metadata,
             )
-        else:
-            key_final = key_cached
-            value_final = value_cached
-            mask_info_final = mask_info_cached
-            cache_metadata_final = cache_metadata_computed
 
         dtype_self: jnp.dtype = self.dtype
 
         def init_attention_bias() -> Array:
-            bias: Array = mask_info_final.create_bias(dtype_self)
+            bias: Array = mask_info.create_bias(dtype_self)
             return bias
 
-        return key_final, value_final, mask_info_final, init_attention_bias, cache_view_cached, cache_metadata_final
+        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]
