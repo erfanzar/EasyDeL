@@ -665,7 +665,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'gpu' and extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'gpu' and extra != 'torch'", specifier = "==2.8.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "transformers", specifier = ">=4.53.1" },
+    { name = "transformers", specifier = ">=4.53.1,<5.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "uvloop", specifier = "==0.21.0" },
     { name = "wandb", specifier = ">=0.22.2" },

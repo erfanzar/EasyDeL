@@ -51,6 +51,7 @@ import warnings
 from typing import NotRequired
 
 import chex
+import huggingface_hub
 import jax
 import jax.extend
 import jax.tree_util
@@ -954,9 +955,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         kwargs["force_download"] = force_download
         kwargs["local_files_only"] = local_files_only
         kwargs["revision"] = revision
-
-        cls._set_token_in_kwargs(kwargs, token)
-
+        if hasattr(cls, "_set_token_in_kwargs"):
+            cls._set_token_in_kwargs(kwargs, token)
+        else:
+            if "token" not in kwargs:
+                kwargs["token"] = huggingface_hub.get_token()
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
 
         return cls.from_dict(config_dict, **kwargs)
