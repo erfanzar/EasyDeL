@@ -197,10 +197,13 @@ class TextDatasetInformCfg(TypedDict, total=False):
     Attributes:
         type: Dataset type (json, parquet, csv, etc.) or HuggingFace dataset ID
         data_files: Path(s) to data files (string, list, or glob pattern)
+        dataset_split_name: Name of the dataset split (for HuggingFace datasets)
         split: Dataset split to use (default: "train")
         content_field: Field name containing text content (default: "content")
         additional_fields: Additional fields to preserve from dataset
         num_rows: Optional limit on number of rows to load
+        format_callback: Optional function to transform dataset examples
+        format_fields: Optional mapping for renaming fields {'old_name': 'new_name'}
     """
 
     type: NotRequired[DatasetTypeLike | str]
@@ -220,11 +223,14 @@ class VisualDatasetInformCfg(TypedDict, total=False):
     Attributes:
         type: Dataset type (json, parquet, csv, etc.) or HuggingFace dataset ID
         data_files: Path(s) to data files (string, list, or glob pattern)
+        dataset_split_name: Name of the dataset split (for HuggingFace datasets)
         split: Dataset split to use (default: "train")
         pixel_field: Field name containing image data (default: "images")
         content_field: Optional field name containing text descriptions
         image_size: Target image size as (width, height) tuple
         num_rows: Optional limit on number of rows to load
+        format_callback: Optional function to transform dataset examples
+        format_fields: Optional mapping for renaming fields {'old_name': 'new_name'}
     """
 
     type: NotRequired[DatasetTypeLike | str]
@@ -249,12 +255,33 @@ class DataMixtureCfg(TypedDict, total=False):
         text_target_field: Target field name for text in unified dataset (default: "text")
         image_target_field: Target field name for images in unified dataset (default: "image")
         batch_size: Batch size for data loading (default: 1)
-        shuffle_buffer_size: Buffer size for shuffling in streaming mode (default: 1000)
+        shuffle_buffer_size: Buffer size for shuffling in streaming mode (default: None)
         seed: Random seed for shuffling and sampling (default: 42)
-        use_fast_loader: Enable fast data loading with fsspec (default: True)
-        num_workers: Number of parallel workers for data loading (default: 4)
-        prefetch_size: Number of batches to prefetch (default: 10)
-        enable_caching: Enable dataset caching for faster reloads (default: True)
+
+        # Token packing configuration
+        pack_tokens: Enable pre-tokenized sequence packing (default: False)
+        tokens_field_name: Field name containing token IDs (default: "tokens")
+        pack_seq_length: Target sequence length for packing (default: None)
+        pack_eos_token_id: EOS token ID for padding/separation (default: 0)
+        pack_shuffle: Shuffle packed sequences (default: True)
+        pack_shuffle_buffer_factor: Buffer size multiplier for shuffle (default: 16)
+        dask_storage_options: Storage options for dask/remote files (default: None)
+
+        # On-the-fly tokenization and packing
+        pack_on_the_fly: Enable on-the-fly tokenization and packing (default: False)
+        tokenize_callback: Function to tokenize examples, returns token IDs (default: None)
+
+        # Block-deterministic mixture configuration
+        block_mixture: Use deterministic block mixing instead of standard interleave (default: True)
+        mixture_block_size: Number of examples per block (default: 2048)
+        stop_strategy: Strategy when dataset exhausted - "restart" or "first_exhausted" (default: "restart")
+        mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None)
+
+        # Legacy/deprecated attributes (kept for compatibility)
+        use_fast_loader: Enable fast data loading with fsspec (deprecated)
+        num_workers: Number of parallel workers for data loading (deprecated)
+        prefetch_size: Number of batches to prefetch (deprecated)
+        enable_caching: Enable dataset caching for faster reloads (deprecated)
     """
 
     informs: Required[list[TextDatasetInformCfg | VisualDatasetInformCfg]]
@@ -265,6 +292,27 @@ class DataMixtureCfg(TypedDict, total=False):
     batch_size: NotRequired[int]
     shuffle_buffer_size: NotRequired[int | None]
     seed: NotRequired[int | None]
+
+    # Token packing configuration
+    pack_tokens: NotRequired[bool]
+    tokens_field_name: NotRequired[str]
+    pack_seq_length: NotRequired[int | None]
+    pack_eos_token_id: NotRequired[int]
+    pack_shuffle: NotRequired[bool]
+    pack_shuffle_buffer_factor: NotRequired[int]
+    dask_storage_options: NotRequired[dict | None]
+
+    # On-the-fly tokenization and packing
+    pack_on_the_fly: NotRequired[bool]
+    tokenize_callback: NotRequired[tp.Callable[[dict], list[int]] | None]
+
+    # Block-deterministic mixture configuration
+    block_mixture: NotRequired[bool]
+    mixture_block_size: NotRequired[int]
+    stop_strategy: NotRequired[str]
+    mixture_weights: NotRequired[dict[str, float] | None]
+
+    # Legacy/deprecated (kept for compatibility)
     use_fast_loader: NotRequired[bool]
     num_workers: NotRequired[int]
     prefetch_size: NotRequired[int]
@@ -339,10 +387,9 @@ class ELMConfig(TypedDict, total=False):
         eval: Evaluation configuration for lm-evaluation-harness
 
     Example:
+        >>> # Basic configuration
         >>> config: ELMConfig = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "teacher_model": {"name_or_path": "meta-llama/Llama-2-13b"},  # For distillation
-        ...     "reference_model": {"name_or_path": "meta-llama/Llama-2-7b-instruct"},  # For DPO
         ...     "loader": {"dtype": "bf16"},
         ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)},
         ...     "mixture": {
@@ -350,10 +397,30 @@ class ELMConfig(TypedDict, total=False):
         ...             {"type": "json", "data_files": "train.json", "content_field": "text"},
         ...             {"type": "parquet", "data_files": "valid/*.parquet", "content_field": "content"}
         ...         ],
+        ...         "batch_size": 32
+        ...     }
+        ... }
+        >>>
+        >>> # Advanced configuration with distillation, DPO, and token packing
+        >>> config: ELMConfig = {
+        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
+        ...     "teacher_model": {"name_or_path": "meta-llama/Llama-2-13b"},  # For distillation
+        ...     "reference_model": {"name_or_path": "meta-llama/Llama-2-7b-instruct"},  # For DPO
+        ...     "loader": {"dtype": "bf16", "param_dtype": "fp32"},
+        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1), "shard_attention_computation": True},
+        ...     "mixture": {
+        ...         "informs": [
+        ...             {"type": "json", "data_files": "train/*.json", "format_fields": {"prompt": "text"}},
+        ...             {"type": "parquet", "data_files": "valid/*.parquet"}
+        ...         ],
         ...         "batch_size": 32,
-        ...         "use_fast_loader": True
+        ...         "block_mixture": True,  # Use deterministic block mixing
+        ...         "mixture_weights": {"train": 0.8, "valid": 0.2},
+        ...         "pack_tokens": True,  # Enable token packing
+        ...         "pack_seq_length": 2048,
+        ...         "pack_eos_token_id": 2
         ...     },
-        ...     "esurge": {"max_model_len": 4096},
+        ...     "esurge": {"max_model_len": 4096, "enable_prefix_caching": True},
         ...     "eval": {"max_new_tokens": 1024, "temperature": 0.0}
         ... }
     """

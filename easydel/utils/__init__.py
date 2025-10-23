@@ -63,32 +63,25 @@ from eformer.paths import ePath, ePathLike
 from . import analyze_memory, compiling_utils, traversals
 from .compiling_utils import ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
 from .data_managers import (
-    ArrayCache,
-    DataCache,
-    DataManager,
     DatasetLoadError,
     DatasetMixture,
     DatasetType,
-    DataStreamOptimizer,
-    FastDataLoader,
-    FastDataManager,
     TextDatasetInform,
     VisualDatasetInform,
+    block_mixture_interleave,
+    build_dataset,
+    create_data_iterator,
+    pack_constant_length,
+    pack_pre_tokenized,
 )
 from .helpers import Timer, Timers, capture_time, check_bool_flag, get_cache_dir
 from .lazy_import import LazyModule, is_package_available
 from .registery import Registry
 
 __all__ = (
-    "ArrayCache",
-    "DataCache",
-    "DataManager",
-    "DataStreamOptimizer",
     "DatasetLoadError",
     "DatasetMixture",
     "DatasetType",
-    "FastDataLoader",
-    "FastDataManager",
     "LazyModule",
     "Registry",
     "TextDatasetInform",
@@ -96,9 +89,12 @@ __all__ = (
     "Timers",
     "VisualDatasetInform",
     "analyze_memory",
+    "block_mixture_interleave",
+    "build_dataset",
     "capture_time",
     "check_bool_flag",
     "compiling_utils",
+    "create_data_iterator",
     "ePath",
     "ePathLike",
     "ejit",
@@ -106,6 +102,8 @@ __all__ = (
     "is_package_available",
     "load_cached_functions",
     "load_compiled_fn",
+    "pack_constant_length",
+    "pack_pre_tokenized",
     "save_compiled_fn",
     "traversals",
 )

@@ -274,7 +274,8 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
     """Convert ELM configuration to kwargs for DatasetMixture creation.
 
     Transforms the mixture configuration section into the format expected
-    by the DatasetMixture and DataManager classes.
+    by the DatasetMixture and DataManager classes. Supports all modern
+    features including token packing and block-deterministic mixing.
 
     Args:
         cfg_like: ELM configuration dictionary or mapping
@@ -288,7 +289,10 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
         ...         "informs": [
         ...             {"type": "json", "data_files": "train.json", "content_field": "text"}
         ...         ],
-        ...         "batch_size": 32
+        ...         "batch_size": 32,
+        ...         "block_mixture": True,
+        ...         "pack_tokens": True,
+        ...         "pack_seq_length": 2048
         ...     }
         ... }
         >>> kwargs = to_data_mixture_kwargs(cfg)
@@ -331,29 +335,61 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
             )
         informs.append(inform)
 
-    return dict(
+    kwargs = dict(
         informs=informs,
         cache_dir=mixture_cfg.get("cache_dir", f"{pathlib.Path.home()}/.cache/easydel"),
         streaming=mixture_cfg.get("streaming", True),
         text_target_field=mixture_cfg.get("text_target_field", "text"),
         image_target_field=mixture_cfg.get("image_target_field", "image"),
         batch_size=mixture_cfg.get("batch_size", 1),
-        shuffle_buffer_size=mixture_cfg.get("shuffle_buffer_size", 1000),
+        shuffle_buffer_size=mixture_cfg.get("shuffle_buffer_size"),
         seed=mixture_cfg.get("seed", 42),
     )
+
+    if "pack_tokens" in mixture_cfg:
+        kwargs["pack_tokens"] = mixture_cfg["pack_tokens"]
+    if "tokens_field_name" in mixture_cfg:
+        kwargs["tokens_field_name"] = mixture_cfg["tokens_field_name"]
+    if "pack_seq_length" in mixture_cfg:
+        kwargs["pack_seq_length"] = mixture_cfg["pack_seq_length"]
+    if "pack_eos_token_id" in mixture_cfg:
+        kwargs["pack_eos_token_id"] = mixture_cfg["pack_eos_token_id"]
+    if "pack_shuffle" in mixture_cfg:
+        kwargs["pack_shuffle"] = mixture_cfg["pack_shuffle"]
+    if "pack_shuffle_buffer_factor" in mixture_cfg:
+        kwargs["pack_shuffle_buffer_factor"] = mixture_cfg["pack_shuffle_buffer_factor"]
+    if "dask_storage_options" in mixture_cfg:
+        kwargs["dask_storage_options"] = mixture_cfg["dask_storage_options"]
+
+    if "pack_on_the_fly" in mixture_cfg:
+        kwargs["pack_on_the_fly"] = mixture_cfg["pack_on_the_fly"]
+    if "tokenize_callback" in mixture_cfg:
+        kwargs["tokenize_callback"] = mixture_cfg["tokenize_callback"]
+
+    if "block_mixture" in mixture_cfg:
+        kwargs["block_mixture"] = mixture_cfg["block_mixture"]
+    if "mixture_block_size" in mixture_cfg:
+        kwargs["mixture_block_size"] = mixture_cfg["mixture_block_size"]
+    if "stop_strategy" in mixture_cfg:
+        kwargs["stop_strategy"] = mixture_cfg["stop_strategy"]
+    if "mixture_weights" in mixture_cfg:
+        kwargs["mixture_weights"] = mixture_cfg["mixture_weights"]
+
+    return kwargs
 
 
 def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
     """Build a dataset from ELM configuration with data mixture.
 
-    Creates a unified dataset from the mixture configuration, optionally
-    using fast data loading with fsspec.
+    Creates a unified dataset from the mixture configuration using the
+    new DatasetMixture.build() method. Supports all modern features including
+    token packing, block-deterministic mixing, and streaming.
 
     Args:
         cfg_like: ELM configuration dictionary or mapping
 
     Returns:
-        Dataset: The loaded and processed dataset
+        Dataset or IterableDataset: The loaded and processed dataset
 
     Example:
         >>> cfg = {
@@ -361,12 +397,14 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
         ...         "informs": [
         ...             {"type": "json", "data_files": "data.json", "content_field": "text"}
         ...         ],
-        ...         "use_fast_loader": True
+        ...         "block_mixture": True,
+        ...         "pack_tokens": True,
+        ...         "pack_seq_length": 2048
         ...     }
         ... }
         >>> dataset = build_dataset(cfg)
     """
-    from easydel.utils.data_managers import DatasetMixture, FastDataManager
+    from easydel.utils.data_managers import DatasetMixture
 
     cfg = normalize(cfg_like)
     mixture_cfg = cfg.get("mixture", {})
@@ -376,19 +414,7 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
 
     mixture_kwargs = to_data_mixture_kwargs(cfg)
     mixture = DatasetMixture(**mixture_kwargs)
-
-    use_fast = mixture_cfg.get("use_fast_loader", True)
-
-    if use_fast:
-        return FastDataManager.create_dataset_from_mixture(
-            mixture,
-            fast_mode=True,
-            parallel_load=mixture_cfg.get("num_workers", 4) > 1,
-        )
-    else:
-        from easydel.utils.data_managers import DataManager
-
-        return DataManager.create_dataset_from_mixture(mixture)
+    return mixture.build()
 
 
 def build_vsurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):

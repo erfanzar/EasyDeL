@@ -40,10 +40,10 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("jax._src.xla_bridge").setLevel(30)
     _getlogger("jax._src.mesh_utils").setLevel(30)
     _getlogger("jax._src.distributed").setLevel(30)
+    _getlogger("datasets").setLevel(30)
     # these people talk too much
     _getlogger("eray-executor").setLevel(30)
     _getlogger("absl").setLevel(30)
-    _getlogger("datasets").setLevel(30)
 
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     _os.environ["KMP_AFFINITY"] = "noverbose"
@@ -106,17 +106,16 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
-        "ArrayCache",
-        "DataCache",
-        "DataManager",
         "DatasetLoadError",
         "DatasetMixture",
         "DatasetType",
-        "DataStreamOptimizer",
-        "FastDataLoader",
-        "FastDataManager",
         "TextDatasetInform",
         "VisualDatasetInform",
+        "block_mixture_interleave",
+        "build_dataset",
+        "create_data_iterator",
+        "pack_constant_length",
+        "pack_pre_tokenized",
         "ejit",
         "ePath",
         "ePathLike",
@@ -784,20 +783,19 @@ if _tp.TYPE_CHECKING:
         pack_sequences,
     )
     from .utils import (
-        ArrayCache,
-        DataCache,
-        DataManager,
         DatasetLoadError,
         DatasetMixture,
         DatasetType,
-        DataStreamOptimizer,
-        FastDataLoader,
-        FastDataManager,
         TextDatasetInform,
         VisualDatasetInform,
+        block_mixture_interleave,
+        build_dataset,
+        create_data_iterator,
         ejit,
         ePath,
         ePathLike,
+        pack_constant_length,
+        pack_pre_tokenized,
         traversals,
     )
     from .utils.parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
@@ -813,7 +811,6 @@ else:
 
     _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
     _targeted_ejkernel_versions = ["0.0.3"]
-
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

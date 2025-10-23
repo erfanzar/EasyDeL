@@ -14,13 +14,9 @@
 
 """Type definitions and configuration classes for data management.
 
-Provides:
-- DatasetType: Enum for supported dataset formats
-- BaseDatasetInform: Base configuration for dataset information
-- TextDatasetInform: Configuration for text datasets
-- VisualDatasetInform: Configuration for visual/multimodal datasets
-- DatasetMixture: Configuration for mixing multiple datasets
-- DatasetLoadError: Exception for dataset loading failures
+This module defines the core data structures and configurations used throughout
+the data management system, including dataset types, mixing configurations,
+and dataset information containers.
 """
 
 from __future__ import annotations
@@ -39,14 +35,8 @@ from ..helpers import get_cache_dir
 class DatasetType(str, Enum):
     """Enumeration of supported dataset file formats.
 
-    Attributes:
-        JSON: JSON/JSONL format
-        PARQUET: Apache Parquet format
-        CSV: Comma-separated values
-        ARROW: Apache Arrow format
-        HF: HuggingFace dataset
-        TSV: Tab-separated values
-        TXT: Plain text files
+    This enum defines all the file formats that can be automatically
+    detected and loaded by the data management system.
     """
 
     JSON = "json"
@@ -62,10 +52,10 @@ class DatasetType(str, Enum):
         """Convert string to DatasetType enum value.
 
         Args:
-            value: String representation of dataset type
+            value: String representation of dataset type.
 
         Returns:
-            DatasetType enum or original string if not found
+            DatasetType enum or original string if not found.
         """
         try:
             return cls(value.lower())
@@ -77,10 +67,10 @@ class DatasetType(str, Enum):
         """Infer dataset type from file path extension.
 
         Args:
-            path: File path to analyze
+            path: File path to analyze.
 
         Returns:
-            Inferred DatasetType or None if cannot be determined
+            Inferred DatasetType or None if cannot be determined.
         """
         mapping = {
             (".json", ".jsonl", ".json.gz", ".jsonl.gz", ".json.zst", ".jsonl.zst"): cls.JSON,
@@ -100,18 +90,17 @@ class DatasetType(str, Enum):
 class BaseDatasetInform:
     """Base configuration class for dataset information.
 
-    Stores common dataset metadata and handles automatic type inference.
+    This class provides the common configuration options for all dataset types.
+    It handles automatic format detection and field normalization.
 
     Attributes:
-        type: Dataset format type (auto-inferred if None)
-        data_files: Path to dataset files
-        num_rows: Optional row limit for loading
-        split: Dataset split name (default: "train")
-        format_callback: Optional function to normalize dataset schema for interleaving.
-            Should take a dataset example dict and return a normalized dict with
-            consistent field names and types across all datasets.
-        format_fields: Optional dict mapping to rename fields {'old_name': 'new_name'}.
-            Simpler alternative to format_callback for basic field renaming.
+        type: Dataset format type (auto-inferred from file extension if None).
+        data_files: Path or paths to dataset files.
+        num_rows: Optional limit on number of rows to load.
+        dataset_split_name: Name of the dataset split (for HuggingFace datasets).
+        split: Which split to load (default: "train").
+        format_callback: Optional function to transform dataset examples.
+        format_fields: Optional mapping for renaming fields.
     """
 
     type: DatasetType | str | None = None
@@ -137,11 +126,20 @@ class BaseDatasetInform:
             except ValueError:
                 pass
 
+        if self.dataset_split_name and str(self.type) not in {"huggingface", "hf"}:
+            import warnings
+
+            warnings.warn(
+                "dataset_split_name is ignored for file-based dataset types; it will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
     def get_str_type(self):
         """Get string representation of dataset type.
 
         Returns:
-            Lowercase string representation of type
+            Lowercase string representation of the dataset type.
         """
         try:
             return self.type.value.lower()
@@ -153,10 +151,12 @@ class BaseDatasetInform:
 class TextDatasetInform(BaseDatasetInform):
     """Configuration for text-only datasets.
 
+    Extends BaseDatasetInform with text-specific configuration options.
+
     Attributes:
-        content_field: Field name containing text content (default: "content")
-        additional_fields: Optional list of additional fields to include
-        preprocessing_fn: Optional preprocessing function to apply
+        content_field: Name of the field containing text content (default: "content").
+        additional_fields: Optional list of additional fields to preserve.
+        preprocessing_fn: Optional function to preprocess text data.
     """
 
     content_field: str = "content"
@@ -168,11 +168,13 @@ class TextDatasetInform(BaseDatasetInform):
 class VisualDatasetInform(BaseDatasetInform):
     """Configuration for visual/multimodal datasets.
 
+    Extends BaseDatasetInform with image-specific configuration options.
+
     Attributes:
-        pixel_field: Field name containing image data (default: "images")
-        content_field: Optional field name for text content
-        image_size: Optional target image size as (width, height)
-        preprocessing_fn: Optional preprocessing function to apply
+        pixel_field: Name of the field containing image data (default: "images").
+        content_field: Optional field name for accompanying text content.
+        image_size: Optional target image size as (width, height) tuple.
+        preprocessing_fn: Optional function to preprocess image data.
     """
 
     pixel_field: str = "images"
@@ -186,20 +188,41 @@ class DatasetMixture:
     """Configuration for mixing multiple datasets with various strategies.
 
     Supports combining text and visual datasets with configurable sampling,
-    shuffling, and batching strategies.
+    shuffling, batching, and token packing strategies.
 
     Attributes:
-        informs: List of dataset configurations to mix
-        cache_dir: Directory for caching datasets
-        streaming: Enable streaming mode (default: True)
-        text_target_field: Target field name for text content (default: "text")
-        image_target_field: Target field name for images (default: "image")
-        batch_size: Batch size for data loading (default: 1)
-        shuffle_buffer_size: Buffer size for shuffling (default: None, disabled)
-        seed: Random seed for reproducibility (default: 42)
+        informs: List of dataset configurations to mix.
+        cache_dir: Directory for caching datasets.
+        streaming: Enable streaming mode (default: True).
+        text_target_field: Target field name for text content (default: "text").
+        image_target_field: Target field name for images (default: "image").
+        batch_size: Batch size for data loading (default: 1).
+        shuffle_buffer_size: Buffer size for shuffling (default: None, disabled).
+        seed: Random seed for reproducibility (default: 42).
+
+        # Token packing configuration (optional)
+        pack_tokens: Enable pre-tokenized sequence packing (default: False).
+        tokens_field_name: Field name containing token IDs (default: "tokens").
+        pack_seq_length: Target sequence length for packing (default: None).
+        pack_eos_token_id: EOS token ID for padding (default: 0).
+        pack_shuffle: Shuffle packed sequences (default: True).
+        pack_shuffle_buffer_factor: Buffer size multiplier for shuffle (default: 16).
+        dask_storage_options: Storage options for dask/remote files (default: None).
+
+        # On-the-fly tokenization and packing (optional)
+        pack_on_the_fly: Enable on-the-fly tokenization and packing (default: False).
+        tokenize_callback: Function to tokenize examples, returns token IDs (default: None).
+
+        # Block-deterministic mixture configuration (optional)
+        block_mixture: Use deterministic block mixing instead of standard interleave (default: True).
+        mixture_block_size: Number of examples per block (default: 2048).
+        stop_strategy: Strategy when dataset exhausted - "restart" or "first_exhausted" (default: "restart").
+        mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None).
 
     Example:
         >>> from easydel.utils.data_managers import DatasetMixture, TextDatasetInform
+        >>>
+        >>> # Simple mixture
         >>> mixture = DatasetMixture(
         ...     informs=[
         ...         TextDatasetInform(type="json", data_files="data1.json"),
@@ -207,6 +230,16 @@ class DatasetMixture:
         ...     ],
         ...     batch_size=32,
         ...     shuffle_buffer_size=10000,
+        ... )
+        >>>
+        >>> # Advanced mixture with block mixing and token packing
+        >>> mixture = DatasetMixture(
+        ...     informs=[...],
+        ...     block_mixture=True,
+        ...     mixture_weights={"dataset1": 0.7, "dataset2": 0.3},
+        ...     pack_tokens=True,
+        ...     pack_seq_length=2048,
+        ...     pack_eos_token_id=0,
         ... )
     """
 
@@ -219,6 +252,23 @@ class DatasetMixture:
     shuffle_buffer_size: int | None = None
     seed: int | None = 42
 
+    pack_tokens: bool = False
+    tokens_field_name: str = "tokens"
+    pack_seq_length: int | None = None
+    pack_eos_token_id: int = 0
+    pack_shuffle: bool = True
+    pack_shuffle_buffer_factor: int = 16
+    dask_storage_options: dict | None = None
+
+    pack_on_the_fly: bool = False
+    tokenize_callback: tp.Callable[[dict], list[int]] | None = None
+
+    block_mixture: bool = True
+    mixture_block_size: int = 2048
+    stop_strategy: str = "restart"
+
+    mixture_weights: dict[str, float] | None = None
+
     def __post_init__(self):
         if isinstance(self.cache_dir, str):
             self.cache_dir = ePath(self.cache_dir)
@@ -229,10 +279,10 @@ class DatasetMixture:
         """Load dictionary from JSON file.
 
         Args:
-            json_file: Path to JSON file
+            json_file: Path to JSON file.
 
         Returns:
-            Parsed dictionary from JSON
+            Parsed dictionary from JSON.
         """
         with open(json_file, encoding="utf-8") as reader:
             text = reader.read()
@@ -242,7 +292,7 @@ class DatasetMixture:
         """Serialize configuration to JSON string.
 
         Returns:
-            JSON string representation of this configuration
+            JSON string representation of this configuration.
         """
         config_dict = self.to_dict()
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
@@ -252,34 +302,62 @@ class DatasetMixture:
         """Load DatasetMixture configuration from JSON file.
 
         Args:
-            json_file: Path to JSON file containing mixture configuration
+            json_file: Path to JSON file containing mixture configuration.
 
         Returns:
-            DatasetMixture instance loaded from file
+            DatasetMixture instance loaded from file.
         """
+
         config_dict = cls._dict_from_json_file(json_file)
         mixture = cls(**config_dict)
-        mixture.informs = [TextDatasetInform(**inform) for inform in mixture.informs]
+        informs = []
+        for inform in mixture.informs:
+            if isinstance(inform, dict) and "pixel_field" in inform:
+                informs.append(VisualDatasetInform(**inform))
+            else:
+                informs.append(TextDatasetInform(**inform))
+        mixture.informs = informs
         return mixture
 
     def save_mixture(self, json_file_path: str | os.PathLike):
         """Save DatasetMixture configuration to JSON file.
 
         Args:
-            json_file_path: Path where JSON file will be saved
+            json_file_path: Path where JSON file will be saved.
         """
         with open(json_file_path, "w", encoding="utf-8") as writer:
             writer.write(self.to_json_string())
+
+    def build(self):
+        """Build the dataset using this mixture configuration.
+
+        Convenience method that builds a dataset from the current mixture
+        configuration by calling the pipeline's build_dataset function.
+
+        Returns:
+            Dataset or IterableDataset configured according to this mixture's
+            settings, with all transformations and mixing strategies applied.
+
+        Example:
+            >>> mixture = DatasetMixture(
+            ...     informs=[TextDatasetInform(type="json", data_files="data.json")],
+            ...     batch_size=32,
+            ...     shuffle_buffer_size=10000
+            ... )
+            >>> dataset = mixture.build()
+            >>> for batch in dataset:
+            ...     process(batch)
+        """
+        from .pipeline import build_dataset
+
+        return build_dataset(self)
 
 
 class DatasetLoadError(Exception):
     """Exception raised when dataset loading fails.
 
-    Used to signal errors during dataset loading operations such as:
-    - File not found
-    - Invalid format
-    - Parsing errors
-    - Remote storage access failures
+    This exception is raised for various dataset loading failures including
+    file not found, invalid format, parsing errors, or storage access issues.
     """
 
     pass

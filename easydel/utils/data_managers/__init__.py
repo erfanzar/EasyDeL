@@ -14,63 +14,61 @@
 
 """Data management utilities for EasyDeL.
 
-Provides tools for loading, mixing, and managing datasets for training
-and evaluation. Supports both text and visual datasets with flexible
-mixing strategies.
-
-Classes:
-    DataManager: Main dataset management class
-    DatasetMixture: Dataset mixing configuration
-    DatasetType: Enum for dataset types
-    TextDatasetInform: Text dataset information
-    VisualDatasetInform: Visual dataset information
-    DatasetLoadError: Dataset loading exception
+This module provides comprehensive tools for loading, mixing, and managing datasets
+for training and evaluation. It supports both text and visual datasets with flexible
+mixing strategies, streaming capabilities, and efficient data processing pipelines.
 
 Key Features:
-    - Flexible dataset loading from HuggingFace
-    - Dataset mixing with custom ratios
-    - Support for text and visual modalities
+    - Flexible dataset loading from HuggingFace Hub and local files
+    - Multiple dataset formats support (JSON, Parquet, CSV, Arrow, TSV, TXT)
+    - Dataset mixing with custom ratios and strategies
     - Streaming and non-streaming modes
+    - Token packing for efficient training
     - Automatic preprocessing and tokenization
+    - Block-deterministic mixing for reproducible training
 
 Example:
-    >>> from easydel.utils.data_managers import DataManager, DatasetMixture
+    >>> from easydel.utils.data_managers import DatasetMixture, TextDatasetInform
+    >>> from easydel.utils.data_managers import build_dataset
     >>>
-    >>> # Single dataset
-    >>> manager = DataManager(
-    ...     dataset_name="squad",
-    ...     tokenizer=tokenizer
+    >>> # Single dataset from HuggingFace Hub
+    >>> inform = TextDatasetInform(
+    ...     type="huggingface",
+    ...     data_files="squad",
+    ...     content_field="context"
     ... )
     >>>
-    >>> # Mixed datasets
+    >>> # Mixed datasets with custom ratios
     >>> mixture = DatasetMixture(
-    ...     datasets=["dataset1", "dataset2"],
-    ...     ratios=[0.7, 0.3]
+    ...     informs=[
+    ...         TextDatasetInform(type="json", data_files="data1.json"),
+    ...         TextDatasetInform(type="parquet", data_files="data2.parquet"),
+    ...     ],
+    ...     batch_size=32,
+    ...     shuffle_buffer_size=10000,
     ... )
-    >>> manager = DataManager(mixture=mixture)
-    >>>
-    >>> # Load and iterate
-    >>> dataloader = manager.get_dataloader(batch_size=32)
-    >>> for batch in dataloader:
-    ...     process(batch)
+    >>> dataset = build_dataset(mixture)
 """
 
-from .cache import ArrayCache, DataCache, TokenCache
-from .fast_loader import DataStreamOptimizer, FastDataLoader
-from .manager import DataManager, FastDataManager
+from . import sources, utils
+from .loader import create_data_iterator
+from .mixture import block_mixture_interleave
+from .pack import pack_constant_length, pack_pre_tokenized
+from .pipeline import build_dataset
 from .types import DatasetLoadError, DatasetMixture, DatasetType, TextDatasetInform, VisualDatasetInform
 
-__all__ = (
-    "ArrayCache",
-    "DataCache",
-    "DataManager",
-    "DataStreamOptimizer",
+__all__ = [
     "DatasetLoadError",
     "DatasetMixture",
     "DatasetType",
-    "FastDataLoader",
-    "FastDataManager",
     "TextDatasetInform",
-    "TokenCache",
     "VisualDatasetInform",
-)
+    "block_mixture_interleave",
+    "build_dataset",
+    "create_data_iterator",
+    "pack_constant_length",
+    "pack_pre_tokenized",
+    "sources",
+    "utils",
+]
+
