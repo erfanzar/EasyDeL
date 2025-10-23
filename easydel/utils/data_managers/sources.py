@@ -150,7 +150,23 @@ def load_for_inform(inform, mixture) -> DS:
     Raises:
         ValueError: If data_files is not a string or list of strings.
     """
-    from datasets import load_dataset
+    from datasets import IterableDataset, load_dataset
+
+    def _iter_parquet_rows(files: list[str]):
+        import fsspec
+        import pyarrow.parquet as pq
+
+        for path in files:
+            with fsspec.open(path, "rb") as fh:
+                pf = pq.ParquetFile(fh)
+                for rg in range(pf.num_row_groups):
+                    table = pf.read_row_group(rg)
+                    cols = table.to_pydict()
+                    if not cols:
+                        continue
+                    n = len(next(iter(cols.values()), []))
+                    for i in range(n):
+                        yield {k: v[i] for k, v in cols.items()}
 
     t = str(inform.get_str_type())
     df = inform.data_files
@@ -158,14 +174,6 @@ def load_for_inform(inform, mixture) -> DS:
     if t in {"huggingface", "hf"}:
         if isinstance(df, str) and _is_pathlike(df):
             builder, files = _detect_builder_and_files(df)
-            return load_dataset(
-                path=builder,
-                data_files=files,
-                split=inform.split or "train",
-                cache_dir=mixture.cache_dir,
-                streaming=mixture.streaming,
-                num_proc=None if mixture.streaming else 1,
-            )
         else:
             return load_dataset(
                 path=df,
@@ -175,25 +183,28 @@ def load_for_inform(inform, mixture) -> DS:
                 streaming=mixture.streaming,
                 num_proc=None if mixture.streaming else 1,
             )
-
-    if isinstance(df, str):
-        if any(ch in df for ch in ("*", "?", "[")) or _is_pathlike(df):
+    else:
+        if isinstance(df, str):
+            builder, files = _detect_builder_and_files(df)
+        elif isinstance(df, list):
             builder, files = _detect_builder_and_files(df)
         else:
-            builder, files = _detect_builder_and_files(df)
-    elif isinstance(df, list):
-        builder, files = _detect_builder_and_files(df)
-    else:
-        raise ValueError("data_files must be str or list[str]")
+            raise ValueError("data_files must be str or list[str]")
 
     specified_builder = t if t in {"json", "jsonl", "csv", "parquet", "arrow"} else None
     builder = specified_builder or builder
 
-    return load_dataset(
-        path="json" if builder in {"json", "jsonl"} else builder,
-        data_files=files,
-        split=inform.split or "train",
-        cache_dir=mixture.cache_dir,
-        streaming=mixture.streaming,
-        num_proc=None if mixture.streaming else 1,
-    )
+    try:
+        return load_dataset(
+            path="json" if builder in {"json", "jsonl"} else builder,
+            data_files=files,
+            split=inform.split or "train",
+            cache_dir=mixture.cache_dir,
+            streaming=mixture.streaming,
+            num_proc=None if mixture.streaming else 1,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if builder == "parquet" and ("Feature type 'List' not found" in msg or "from_dict" in msg):
+            return IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+        raise
