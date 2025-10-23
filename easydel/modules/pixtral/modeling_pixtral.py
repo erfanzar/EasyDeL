@@ -425,7 +425,7 @@ class PixtralAttention(AttentionModule):
             key=key_states,
             cache_view=None,
             value=value_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             causal_mask=None,
             fcm_mask=None,
         )
@@ -438,7 +438,7 @@ class PixtralAttention(AttentionModule):
             bias=None,
             cache_metadata=None,
             init_bias=init_attention_bias,
-            attention_mask=attention_mask,
+            attention_mask=mask_info,
             causal=True,
         )
 

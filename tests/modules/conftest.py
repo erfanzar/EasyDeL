@@ -62,7 +62,7 @@ def small_model_config():
         "rotary_dim": 32,
         "dtype": jnp.float32,
         "precision": jax.lax.Precision.HIGHEST,
-        "attn_mechanism": "flash_attn2",
+        "attn_mechanism": "vanilla" if jax.default_backend() == "tpu" else "flash_attn2",
         "blocksize_k": 128,
         "blocksize_q": 128,
         "sequence_length": 128,

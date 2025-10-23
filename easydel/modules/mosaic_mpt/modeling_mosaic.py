@@ -591,7 +591,7 @@ class MptModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        _batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
