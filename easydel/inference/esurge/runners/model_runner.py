@@ -282,20 +282,38 @@ class eSurgeRunner:
             max_num_batched_tokens=self.max_num_tokens,
             vocab_size=self.model.config.get_text_config().vocab_size,
             page_sizes=[self.metadata.page_size],
+            sharding=self._empty_sharding,
         )
 
         self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
         self.arange_np = jnp.arange(self.max_num_reqs, dtype=jnp.int32)
 
-        self.input_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32)
-        self.position_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32)
-        self.query_start_loc_buf = jnp.zeros((self.max_num_reqs + 1,), dtype=jnp.int32)
-        self.seq_lens_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
+        self.input_ids_buf = jnp.zeros(
+            (self.max_num_tokens,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.position_ids_buf = jnp.zeros(
+            (self.max_num_tokens,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.query_start_loc_buf = jnp.zeros(
+            (self.max_num_reqs + 1,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.seq_lens_buf = jnp.zeros(
+            (self.max_num_reqs,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
 
         self.pages_tables_buf = jnp.full(
             (self.num_reqs_max_model_len, self.max_pages_per_req),
             fill_value=PAGE_TABLE_PADDING_VAL,
             dtype=jnp.int32,
+            device=self._empty_sharding,
         )
 
         self.max_padded_slices = int(self.metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
@@ -303,19 +321,41 @@ class eSurgeRunner:
             (3, self.max_padded_slices),
             fill_value=SLOT_MAPPING_PADDING_VAL,
             dtype=jnp.int32,
+            device=self._empty_sharding,
         )
 
         self.page_table_flat_buf = jnp.zeros(
             (self.num_reqs_max_model_len * self.max_pages_per_req,),
             dtype=jnp.int32,
+            device=self._empty_sharding,
         )
 
-        self.slot_mapping_scratch_buf = jnp.zeros((self.max_padded_slices, 3), dtype=jnp.int32)
-        self.num_tokens_paddings_arr = jnp.array(self.num_tokens_paddings, dtype=jnp.int32)
+        self.slot_mapping_scratch_buf = jnp.zeros(
+            (self.max_padded_slices, 3),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.num_tokens_paddings_arr = jnp.array(
+            self.num_tokens_paddings,
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
 
-        self.scheduled_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
-        self.req_num_tokens_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
-        self.active_mask_full_buf = jnp.zeros((self.max_num_reqs,), dtype=bool)
+        self.scheduled_full_buf = jnp.zeros(
+            (self.max_num_reqs,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.req_num_tokens_full_buf = jnp.zeros(
+            (self.max_num_reqs,),
+            dtype=jnp.int32,
+            device=self._empty_sharding,
+        )
+        self.active_mask_full_buf = jnp.zeros(
+            (self.max_num_reqs,),
+            dtype=bool,
+            device=self._empty_sharding,
+        )
 
         logger.debug(f"Allocated buffers: max_padded_slices={self.max_padded_slices}")
 
@@ -659,15 +699,20 @@ class eSurgeRunner:
                         if rs:
                             req_num_tokens_np[i] = rs.num_tokens
                         active_mask_np[i] = True
-                self.scheduled_full_buf = jnp.asarray(scheduled_np, dtype=jnp.int32)
+                arr = jnp.asarray(scheduled_np, dtype=jnp.int32)
                 if len(scheduled_np) < self.max_num_reqs:
-                    self.scheduled_full_buf = jnp.pad(
-                        self.scheduled_full_buf,
-                        (0, self.max_num_reqs - len(scheduled_np)),
-                        constant_values=0,
-                    )
-                self.req_num_tokens_full_buf = jnp.asarray(req_num_tokens_np, dtype=jnp.int32)
-                self.active_mask_full_buf = jnp.asarray(active_mask_np, dtype=bool)
+                    arr = jnp.pad(arr, (0, self.max_num_reqs - len(scheduled_np)), constant_values=0)
+                self.scheduled_full_buf = jax.device_put(arr, self._empty_sharding)
+
+                self.req_num_tokens_full_buf = jax.device_put(
+                    jnp.asarray(req_num_tokens_np, dtype=jnp.int32),
+                    self._empty_sharding,
+                )
+
+                self.active_mask_full_buf = jax.device_put(
+                    jnp.asarray(active_mask_np, dtype=bool),
+                    self._empty_sharding,
+                )
 
             nr_safe = max(num_reqs, 1)
             next_pow2 = 1 << (nr_safe - 1).bit_length()

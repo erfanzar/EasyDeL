@@ -283,6 +283,7 @@ class SequenceBuffer:
         max_num_batched_tokens: int,
         vocab_size: int,
         page_sizes: list[int],
+        sharding: jax.sharding.Sharding | None = None,
     ) -> SequenceBuffer:
         """Create a new SequenceBuffer with initialized arrays.
 
@@ -329,6 +330,26 @@ class SequenceBuffer:
             page_sizes=page_sizes,
         )
 
+        if sharding is not None:
+
+            def put(a):
+                return jax.device_put(a, sharding)
+
+            page_table = jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, page_table)
+
+            token_ids = put(token_ids)
+            num_tokens = put(num_tokens)
+            num_tokens_no_spec = put(num_tokens_no_spec)
+            num_prompt_tokens = put(num_prompt_tokens)
+            num_computed_tokens = put(num_computed_tokens)
+
+            temperature = put(temperature)
+            top_p = put(top_p)
+            top_k = put(top_k)
+            min_p = put(min_p)
+            frequency_penalties = put(frequency_penalties)
+            presence_penalties = put(presence_penalties)
+            repetition_penalties = put(repetition_penalties)
         return cls(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
@@ -1154,6 +1175,32 @@ class SequenceBuffer:
             repetition_penalties=dev.repetition_penalties,
             page_table=dev.page_table,
             allowed_token_ids_mask=dev.allowed_token_ids_mask,
+        )
+
+    def attach_sharding(self, sharding: jax.sharding.Sharding) -> "SequenceBuffer":
+        """Return a copy with all arrays (and page table) device_put to the given sharding."""
+
+        def put(a):
+            return jax.device_put(a, sharding)
+
+        return replace(
+            self,
+            token_ids=put(self.token_ids),
+            num_tokens=put(self.num_tokens),
+            num_tokens_no_spec=put(self.num_tokens_no_spec),
+            num_prompt_tokens=put(self.num_prompt_tokens),
+            num_computed_tokens=put(self.num_computed_tokens),
+            temperature=put(self.temperature),
+            top_p=put(self.top_p),
+            top_k=put(self.top_k),
+            min_p=put(self.min_p),
+            frequency_penalties=put(self.frequency_penalties),
+            presence_penalties=put(self.presence_penalties),
+            repetition_penalties=put(self.repetition_penalties),
+            page_table=jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table),
+            allowed_token_ids_mask=(
+                put(self.allowed_token_ids_mask) if self.allowed_token_ids_mask is not None else None
+            ),
         )
 
 
