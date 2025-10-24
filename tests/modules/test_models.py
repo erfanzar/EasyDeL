@@ -3,14 +3,6 @@
 This module tests all models with forward pass correctness verification.
 Migrated from unittest to pytest while keeping all original test logic.
 
-Test Coverage:
-- 43 original models (migrated from unittest) - ALL WORKING
-- 2 newly added models (mistral3, grok_1) - WORKING
-- Total: 45 comprehensive model tests
-
-Note: Some models (xerxes, xerxes2, gidd, minimax, pixtral, llava, aya_vision,
-clip, siglip, whisper) have implementation issues or are not yet fully registered.
-These are commented out and can be uncommented when fixed.
 """
 
 import copy

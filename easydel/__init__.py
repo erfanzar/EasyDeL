@@ -810,7 +810,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.5"]
+    _targeted_ejkernel_versions = ["0.0.6"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
