@@ -662,22 +662,18 @@ class ExecutionManager:
         Args:
             num_tokens: Number of tokens in the input batch.
             padded_num_reqs: Padded number of requests for batching (unused in fused mode).
-            compargs: Compilation arguments tuple where compargs[2] contains fused step args.
+            compargs: Compilation arguments tuple where compargs contains fused step args.
         """
         fused_key = (num_tokens, "fused")
 
         if fused_key not in self._lowerd_history:
-            logger.info(f"Compiling for num_tokens={num_tokens}, padded_num_reqs={padded_num_reqs}")
-            logger.info(f"  use_aot_forward={self.use_aot_forward}")
-
             if self.use_aot_forward:
-                lowered = self._step_fn.lower(num_tokens, *compargs[2])
-                compiled = lowered.compile()
+                compiled = self._step_fn.lower(num_tokens, *compargs).compile()
                 self._cache_put(fused_key, compiled)
             else:
                 partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
 
-                result = partial_fn(self.graphstate, self.graphother, *compargs[2][3:])
+                result = partial_fn(self.graphstate, self.graphother, *compargs[3:])
                 (
                     _dev_state,
                     self.kv_pages,
@@ -762,9 +758,6 @@ class ExecutionManager:
         dev_state = temp_buffer.to_device_state()
 
         max_padded_slices = metadata.get_padded_num_slices(self.max_num_tokens, max_num_reqs)
-        logger.info(
-            f"  get_compile_configurations: num_tokens={num_tokens}, using max_num_tokens={self.max_num_tokens} for slot_mapping, max_padded_slices={max_padded_slices}"
-        )
 
         fused_args = [
             self.graphdef,
@@ -780,4 +773,4 @@ class ExecutionManager:
             jnp.full((3, max_padded_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
             rng_key,
         ]
-        return (None, None, fused_args)
+        return fused_args
