@@ -625,10 +625,7 @@ class MetricsHistogram:
 
 
 @ejit(static_argnums=(1,))
-def compute_weight_stats(
-    params: dict[str, tp.Any],
-    repattern: str,
-) -> dict[str, MetricsHistogram]:
+def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 
     Analyzes model parameters matching the given pattern and computes
