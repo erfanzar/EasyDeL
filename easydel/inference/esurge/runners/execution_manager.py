@@ -41,7 +41,6 @@ Example:
 
 from __future__ import annotations
 
-import pprint
 import typing
 from collections import OrderedDict
 from functools import partial
@@ -190,6 +189,7 @@ class ExecutionManager:
         self._step_fn: None | pjit.JitWrapped = None
         self._cache_capacity = 64
         self._lowerd_history = OrderedDict()
+        self._debug_baselines = {}
 
         self.init_fns()
 
@@ -282,34 +282,19 @@ class ExecutionManager:
         #         self.rng_key,
         #     ),
         # )
-        if self.use_aot_forward:
-            result = fn(
-                self.graphstate,
-                self.graphother,
-                dev_state,
-                self.kv_pages,
-                scheduled_full,
-                req_num_tokens_full,
-                active_mask_full,
-                input_ids_buf,
-                position_ids_buf,
-                slot_mapping_buf,
-                self.rng_key,
-            )
-        else:
-            result = fn(
-                self.graphstate,
-                self.graphother,
-                dev_state,
-                self.kv_pages,
-                scheduled_full,
-                req_num_tokens_full,
-                active_mask_full,
-                input_ids_buf,
-                position_ids_buf,
-                slot_mapping_buf,
-                self.rng_key,
-            )
+        result = fn(
+            self.graphstate,
+            self.graphother,
+            dev_state,
+            self.kv_pages,
+            scheduled_full,
+            req_num_tokens_full,
+            active_mask_full,
+            input_ids_buf,
+            position_ids_buf,
+            slot_mapping_buf,
+            self.rng_key,
+        )
 
         (
             dev_state,
@@ -499,7 +484,7 @@ class ExecutionManager:
                 self._empty_sharding,  # input_ids_buf
                 self._empty_sharding,  # position_ids_buf
                 self._empty_sharding,  # slot_mapping_buf
-                self._empty_sharding,  # rng_key
+                None,  # rng_key
             ),
             out_shardings=(
                 self._empty_sharding,  # dev_state (updated)
@@ -510,7 +495,7 @@ class ExecutionManager:
                 self._empty_sharding,  # seq_lens_buf
                 self._empty_sharding,  # pages_tables_buf
                 self._empty_sharding,  # slot_mapping_buf
-                self._empty_sharding,  # rng_key
+                None,  # rng_key
                 self._empty_sharding,  # out_tokens (full-size, masked)
                 self._empty_sharding,  # valid_mask (full-size)
                 self._empty_sharding,  # hidden_states
@@ -532,91 +517,95 @@ class ExecutionManager:
             slot_mapping_buf: jax.Array,  # [3, max_padded_slices]
             rng_key: jax.Array,
         ):
-            nr = jnp.minimum(jnp.int32(jnp.sum(active_mask_full)), jnp.int32(max_num_reqs))
-            mask_reqs = i_reqs < nr
-            scheduled = jnp.where(mask_reqs, scheduled_full, 0)
+            with self.model.mesh:
+                nr = jnp.minimum(jnp.int32(jnp.sum(active_mask_full)), jnp.int32(max_num_reqs))
+                mask_reqs = i_reqs < nr
+                scheduled = jnp.where(mask_reqs, scheduled_full, 0)
 
-            cum = jnp.cumsum(scheduled)
-            total = cum[-1]
+                cum = jnp.cumsum(scheduled)
+                total = cum[-1]
 
-            it = jnp.arange(num_tokens_static, dtype=jnp.int32)
-            valid_tok = it < total
-            req_for_tok = jnp.searchsorted(cum, it, side="right")
-            req_for_tok = jnp.where(valid_tok, req_for_tok, 0)
-            cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), cum[:-1]])
-            base_pos = dev_state.num_computed_tokens[req_for_tok]
-            off_in_req = it - cum_prev[req_for_tok]
-            positions = base_pos + off_in_req
-            positions = jnp.where(valid_tok, positions, 0)
+                it = jnp.arange(num_tokens_static, dtype=jnp.int32)
+                valid_tok = it < total
+                req_for_tok = jnp.searchsorted(cum, it, side="right")
+                req_for_tok = jnp.where(valid_tok, req_for_tok, 0)
+                cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), cum[:-1]])
+                base_pos = dev_state.num_computed_tokens[req_for_tok]
+                off_in_req = it - cum_prev[req_for_tok]
+                positions = base_pos + off_in_req
+                positions = jnp.where(valid_tok, positions, 0)
 
-            in_ids = dev_state.token_ids[req_for_tok, positions]
-            in_ids = jnp.where(valid_tok, in_ids, 0)
-            input_ids_buf = input_ids_buf.at[:num_tokens_static].set(in_ids)
-            position_ids_buf = position_ids_buf.at[:num_tokens_static].set(positions)
-            qsl = jnp.zeros((max_num_reqs + 1,), dtype=jnp.int32).at[1:].set(cum)
-            seq_lens = jnp.where(mask_reqs, dev_state.num_computed_tokens + scheduled, 0)
+                in_ids = dev_state.token_ids[req_for_tok, positions]
+                in_ids = jnp.where(valid_tok, in_ids, 0)
+                input_ids_buf = input_ids_buf.at[:num_tokens_static].set(in_ids)
+                position_ids_buf = position_ids_buf.at[:num_tokens_static].set(positions)
+                qsl = jnp.zeros((max_num_reqs + 1,), dtype=jnp.int32).at[1:].set(cum)
+                seq_lens = jnp.where(mask_reqs, dev_state.num_computed_tokens + scheduled, 0)
 
-            pt_array = dev_state.page_table[0].get_array()
-            pt_src = pt_array[: min(pt_array.shape[0], num_reqs_max_model_len), :]
-            mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
-            pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
+                pt_array = dev_state.page_table[0].get_array()
+                pt_src = pt_array[: min(pt_array.shape[0], num_reqs_max_model_len), :]
+                mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
+                pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
 
-            s = dev_state.num_computed_tokens
-            e = s + scheduled
-            lps = s // page_size
-            lpe = (jnp.maximum(e, 1) - 1) // page_size
-            page_lens = jnp.where(scheduled > 0, lpe - lps + 1, 0)
-            page_cum = jnp.cumsum(page_lens)
-            total_pages = page_cum[-1]
-            sp = jnp.int32(slices_per_page)
-            padded_num_slices = jnp.minimum(((total_pages + sp - 1) // sp) * sp, jnp.int32(max_padded_slices))
+                s = dev_state.num_computed_tokens
+                e = s + scheduled
+                lps = s // page_size
+                lpe = (jnp.maximum(e, 1) - 1) // page_size
+                page_lens = jnp.where(scheduled > 0, lpe - lps + 1, 0)
+                page_cum = jnp.cumsum(page_lens)
+                total_pages = page_cum[-1]
+                sp = jnp.int32(slices_per_page)
+                padded_num_slices = jnp.minimum(((total_pages + sp - 1) // sp) * sp, jnp.int32(max_padded_slices))
 
-            valid_slice = i_slices < total_pages
-            within_pad = i_slices < padded_num_slices
-            slice_active = valid_slice & within_pad
+                valid_slice = i_slices < total_pages
+                within_pad = i_slices < padded_num_slices
+                slice_active = valid_slice & within_pad
 
-            page_cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), page_cum[:-1]])
-            req_for_slice = jnp.searchsorted(page_cum, i_slices, side="right")
-            req_for_slice = jnp.where(slice_active, req_for_slice, 0)
-            local_off = i_slices - page_cum_prev[req_for_slice]
-            pt_full = pt.reshape((-1,))
-            gpi = req_for_slice * jnp.int32(max_pages_per_req) + lps[req_for_slice] + local_off
-            gpi_safe = jnp.clip(gpi, 0, jnp.int32(pt_full.size - 1))
-            page_numbers = jnp.where(slice_active, pt_full[gpi_safe], 0)
+                page_cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), page_cum[:-1]])
+                req_for_slice = jnp.searchsorted(page_cum, i_slices, side="right")
+                req_for_slice = jnp.where(slice_active, req_for_slice, 0)
+                local_off = i_slices - page_cum_prev[req_for_slice]
+                pt_full = pt.reshape((-1,))
+                gpi = req_for_slice * jnp.int32(max_pages_per_req) + lps[req_for_slice] + local_off
+                gpi_safe = jnp.clip(gpi, 0, jnp.int32(pt_full.size - 1))
+                page_numbers = jnp.where(slice_active, pt_full[gpi_safe], 0)
 
-            s_mod = s % page_size
-            e_mod = ((jnp.maximum(e, 1) - 1) % page_size) + 1
-            lens_rep = page_lens[req_for_slice]
+                s_mod = s % page_size
+                e_mod = ((jnp.maximum(e, 1) - 1) % page_size) + 1
+                lens_rep = page_lens[req_for_slice]
 
-            is_first = local_off == 0
-            is_last = local_off == (lens_rep - 1)
+                is_first = local_off == 0
+                is_last = local_off == (lens_rep - 1)
 
-            kv_local_st = jnp.where(is_first, s_mod[req_for_slice], 0)
-            kv_local_en = jnp.where(is_last, e_mod[req_for_slice], jnp.int32(page_size))
-            slice_lens = jnp.maximum(kv_local_en - kv_local_st, 0)
-            kv_cache_start = kv_local_st + page_numbers * page_size
+                kv_local_st = jnp.where(is_first, s_mod[req_for_slice], 0)
+                kv_local_en = jnp.where(is_last, e_mod[req_for_slice], jnp.int32(page_size))
+                slice_lens = jnp.maximum(kv_local_en - kv_local_st, 0)
+                kv_cache_start = kv_local_st + page_numbers * page_size
 
-            slice_lens_masked = jnp.where(slice_active, slice_lens, 0)
-            csl = jnp.cumsum(slice_lens_masked)
-            new_kv_start = jnp.where(slice_active, jnp.roll(csl, 1).at[0].set(0), 0)
-            slot_mapping_buf = slot_mapping_buf.at[0, :].set(jnp.where(slice_active, kv_cache_start, slot_mapping_pad))
-            slot_mapping_buf = slot_mapping_buf.at[1, :].set(jnp.where(slice_active, new_kv_start, slot_mapping_pad))
-            slot_mapping_buf = slot_mapping_buf.at[2, :].set(jnp.where(slice_active, slice_lens, slot_mapping_pad))
+                slice_lens_masked = jnp.where(slice_active, slice_lens, 0)
+                csl = jnp.cumsum(slice_lens_masked)
+                new_kv_start = jnp.where(slice_active, jnp.roll(csl, 1).at[0].set(0), 0)
+                slot_mapping_buf = slot_mapping_buf.at[0, :].set(
+                    jnp.where(slice_active, kv_cache_start, slot_mapping_pad)
+                )
+                slot_mapping_buf = slot_mapping_buf.at[1, :].set(jnp.where(slice_active, new_kv_start, slot_mapping_pad))
+                slot_mapping_buf = slot_mapping_buf.at[2, :].set(jnp.where(slice_active, slice_lens, slot_mapping_pad))
 
-            nr_safe = jnp.maximum(nr, 1)
-            next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
-            padded_num_reqs = jnp.where(nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2)
-            padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
+                nr_safe = jnp.maximum(nr, 1)
+                next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
+                padded_num_reqs = jnp.where(
+                    nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2
+                )
+                padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
 
-            tmp_logits = cum - 1
-            mask_logits = i_reqs < padded_num_reqs
-            logits_indices = jnp.where(mask_logits, tmp_logits, 0)
+                tmp_logits = cum - 1
+                mask_logits = i_reqs < padded_num_reqs
+                logits_indices = jnp.where(mask_logits, tmp_logits, 0)
 
-            input_ids_view = input_ids_buf[:num_tokens_static]
-            position_ids_view = position_ids_buf[:num_tokens_static]
+                input_ids_view = input_ids_buf[:num_tokens_static]
+                position_ids_view = position_ids_buf[:num_tokens_static]
 
-            model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
-            with model.mesh:
+                model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
                 output = model(
                     input_ids=jnp.expand_dims(input_ids_view, 0),
                     position_ids=jnp.expand_dims(position_ids_view, 0),
@@ -636,54 +625,54 @@ class ExecutionManager:
                 hs = output.last_hidden_state.squeeze(0)
                 logits = model.apply_lm_head(hs[logits_indices])
 
-            temp = dev_state.temperature[:max_num_reqs].astype(logits.dtype)
-            topp = dev_state.top_p[:max_num_reqs].astype(logits.dtype)
+                temp = dev_state.temperature[:max_num_reqs].astype(logits.dtype)
+                topp = dev_state.top_p[:max_num_reqs].astype(logits.dtype)
 
-            is_all_greedy = jnp.all(temp <= 0.0)
+                is_all_greedy = jnp.all(temp <= 0.0)
 
-            def do_greedy(_):
-                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                def do_greedy(_):
+                    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
-            def do_sample(_):
-                B = logits.shape[0]
-                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
-                samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
-                    logits, topp, temp, row_keys, 64
+                def do_sample(_):
+                    B = logits.shape[0]
+                    row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
+                    samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
+                        logits, topp, temp, row_keys, 64
+                    )
+                    return samples.reshape(-1)
+
+                sampled_flat = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None).reshape(-1)
+                rng_key = jax.random.fold_in(rng_key, jnp.int32(num_tokens_static))
+
+                seq_lens_now_full = dev_state.num_computed_tokens + scheduled
+                meets_len_full = seq_lens_now_full >= req_num_tokens_full
+                valid_mask_full = (i_reqs < nr) & active_mask_full & (scheduled > 0) & meets_len_full
+
+                j_pos_full = jnp.clip(seq_lens_now_full, 0, self.max_model_len - 1)
+                curr_vals_full = dev_state.token_ids[i_reqs, j_pos_full]
+                delta_full = jnp.where(valid_mask_full, sampled_flat - curr_vals_full, 0)
+
+                token_ids = dev_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
+                num_tokens = dev_state.num_tokens + valid_mask_full.astype(dev_state.num_tokens.dtype)
+
+                dev_state = dev_state.with_updates(token_ids=token_ids, num_tokens=num_tokens)
+
+                out_tokens_full = jnp.where(valid_mask_full, sampled_flat, -1)
+                return (
+                    dev_state,
+                    output.past_key_values,
+                    input_ids_buf,
+                    position_ids_buf,
+                    qsl,
+                    seq_lens,
+                    pt,
+                    slot_mapping_buf,
+                    rng_key,
+                    out_tokens_full,
+                    valid_mask_full,
+                    hs,
+                    logits,
                 )
-                return samples.reshape(-1)
-
-            sampled_flat = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None).reshape(-1)
-            rng_key = jax.random.fold_in(rng_key, jnp.int32(num_tokens_static))
-
-            seq_lens_now_full = dev_state.num_computed_tokens + scheduled
-            meets_len_full = seq_lens_now_full >= req_num_tokens_full
-            valid_mask_full = (i_reqs < nr) & active_mask_full & (scheduled > 0) & meets_len_full
-
-            j_pos_full = jnp.clip(seq_lens_now_full, 0, self.max_model_len - 1)
-            curr_vals_full = dev_state.token_ids[i_reqs, j_pos_full]
-            delta_full = jnp.where(valid_mask_full, sampled_flat - curr_vals_full, 0)
-
-            token_ids = dev_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
-            num_tokens = dev_state.num_tokens + valid_mask_full.astype(dev_state.num_tokens.dtype)
-
-            dev_state = dev_state.with_updates(token_ids=token_ids, num_tokens=num_tokens)
-
-            out_tokens_full = jnp.where(valid_mask_full, sampled_flat, -1)
-            return (
-                dev_state,
-                output.past_key_values,
-                input_ids_buf,
-                position_ids_buf,
-                qsl,
-                seq_lens,
-                pt,
-                slot_mapping_buf,
-                rng_key,
-                out_tokens_full,
-                valid_mask_full,
-                hs,
-                logits,
-            )
 
         return _fn
 
@@ -704,33 +693,37 @@ class ExecutionManager:
         fused_key = (num_tokens, "fused", mode)
 
         if fused_key not in self._lowerd_history:
-            # if self.use_aot_forward:
-            #     baseline_args = {
-            #         "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
-            #         "scheduled_full": self._leaf_summary(compargs[5]),
-            #         "req_num_tokens_full": self._leaf_summary(compargs[6]),
-            #         "active_mask_full": self._leaf_summary(compargs[7]),
-            #         "input_ids_buf": self._leaf_summary(compargs[8]),
-            #         "position_ids_buf": self._leaf_summary(compargs[9]),
-            #         "slot_mapping_buf": self._leaf_summary(compargs[10]),
-            #         "rng_key": self._leaf_summary(compargs[11]),
-            #     }
-            #     self._record_or_diff(num_tokens, baseline_args)
-            # else:
-            #     baseline_args = {
-            #         "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
-            #         "scheduled_full": self._leaf_summary(compargs[5]),
-            #         "req_num_tokens_full": self._leaf_summary(compargs[6]),
-            #         "active_mask_full": self._leaf_summary(compargs[7]),
-            #         "input_ids_buf": self._leaf_summary(compargs[8]),
-            #         "position_ids_buf": self._leaf_summary(compargs[9]),
-            #         "slot_mapping_buf": self._leaf_summary(compargs[10]),
-            #         "rng_key": self._leaf_summary(compargs[11]),
-            #     }
-            #     self._record_or_diff(num_tokens, baseline_args)
+            # baseline_args = {
+            #     "graphstate": self._snapshot_pytree("graphstate", compargs[1]),
+            #     "graphother": self._snapshot_pytree("graphother", compargs[2]),
+            #     "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
+            #     "kv_pages": self._snapshot_pytree("kv_pages", compargs[4]),
+            #     "scheduled_full": self._leaf_summary(compargs[5]),
+            #     "req_num_tokens_full": self._leaf_summary(compargs[6]),
+            #     "active_mask_full": self._leaf_summary(compargs[7]),
+            #     "input_ids_buf": self._leaf_summary(compargs[8]),
+            #     "position_ids_buf": self._leaf_summary(compargs[9]),
+            #     "slot_mapping_buf": self._leaf_summary(compargs[10]),
+            #     "rng_key": self._leaf_summary(compargs[11]),
+            # }
+            # self._record_or_diff(num_tokens, baseline_args)
             if self.use_aot_forward:
                 compiled = self._step_fn.lower(num_tokens, *compargs).compile()
                 self._cache_put(fused_key, compiled)
+                warm_args = (
+                    compargs[1],  # graphstate
+                    compargs[2],  # graphother
+                    compargs[3],  # dev_state (PartitionSpec())
+                    compargs[4],  # kv_pages   (per-leaf sharding)
+                    compargs[5],  # scheduled_full (PartitionSpec())
+                    compargs[6],  # req_num_tokens_full (PartitionSpec())
+                    compargs[7],  # active_mask_full (PartitionSpec())
+                    compargs[8],  # input_ids_buf (PartitionSpec())
+                    compargs[9],  # position_ids_buf (PartitionSpec())
+                    compargs[10],  # slot_mapping_buf (PartitionSpec())
+                    compargs[11],  # rng_key (None)
+                )
+                _, self.kv_pages, *_ = compiled(*warm_args)
             else:
                 partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
 
@@ -821,7 +814,7 @@ class ExecutionManager:
         ]
 
         fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
-        for idx in (7, 8, 9, 10, 11):
+        for idx in (5, 6, 7, 8, 9, 10):
             if hasattr(fused_args[idx], "dtype"):
                 fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
 
@@ -868,7 +861,10 @@ class ExecutionManager:
     ):
         # Note: graphdef is static and omitted at runtime (AOT)
         return {
+            "graphstate": self._snapshot_pytree("graphstate", graphstate),
+            "graphother": self._snapshot_pytree("graphother", graphother),
             "dev_state": self._snapshot_pytree("dev_state", dev_state),
+            "kv_pages": self._snapshot_pytree("kv_pages", kv_pages),
             "scheduled_full": self._leaf_summary(scheduled_full),
             "req_num_tokens_full": self._leaf_summary(req_num_tokens_full),
             "active_mask_full": self._leaf_summary(active_mask_full),
@@ -900,7 +896,12 @@ class ExecutionManager:
         diffs = []
 
         # Compare pytrees (graphstate, graphother, dev_state, kv_pages)
-        for key in ["graphstate", "graphother", "dev_state", "kv_pages"]:
+        for key in [
+            "graphstate",
+            "graphother",
+            "dev_state",
+            "kv_pages",
+        ]:
             b = baseline[key]
             n = current[key]
             if b["treedef"] != n["treedef"]:
@@ -931,23 +932,17 @@ class ExecutionManager:
     def _mode_key(self):
         return "aot" if self.use_aot_forward else "jit"
 
-    @property
-    def _debug_baselines(self):
-        if not hasattr(self, "__debug_baselines"):
-            self.__debug_baselines = {}
-        return self.__debug_baselines
-
     def _record_or_diff(self, num_tokens, args_dict):
         key = (int(num_tokens), "fused", self._mode_key())
         if key not in self._debug_baselines:
             self._debug_baselines[key] = args_dict
-            logger.info(f"[debug-diff] Recorded baseline for key={key}")
-            pprint.pprint(args_dict)
+            logger.info(f"[debug-diff] Recorded baseline for key={key} | {self._debug_baselines.keys()}")
             return
+
         diffs = self._compare_snapshots(self._debug_baselines[key], args_dict)
         if diffs:
             logger.warning(f"[debug-diff] Mismatches vs baseline for key={key}:")
             for d in diffs:
                 logger.warning(f"  - {d}")
         else:
-            logger.debug(f"[debug-diff] No mismatches vs baseline for key={key}")
+            logger.warning(f"[debug-diff] No mismatches vs baseline for key={key}")
