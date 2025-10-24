@@ -259,6 +259,7 @@ class eSurge:
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
+        use_aot_forward: bool = True,
         enable_prefix_caching: bool = True,
         auto_shard_model: bool = True,
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
@@ -392,6 +393,7 @@ class eSurge:
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
+            use_aot_forward=use_aot_forward,
             verbose=runner_verbose,
         )
         if compile_runner:

@@ -160,6 +160,7 @@ class eSurgeCfg(TypedDict, total=False):
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]
     enable_prefix_caching: NotRequired[bool]
+    use_aot_forward: NotRequired[bool]
     verbose: NotRequired[bool]
 
 
