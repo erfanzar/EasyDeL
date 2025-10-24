@@ -930,33 +930,37 @@ class TrainingArguments:
             - Computes statistics across all processes in distributed training
             - Logs both histograms and scalar statistics for each parameter
         """
-        if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
-            stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+        try:
+            if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
+                stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
 
-            stats = jax.experimental.multihost_utils.process_allgather(stats)
+                stats = jax.experimental.multihost_utils.process_allgather(stats, tiled=True)
 
-            metrics = {}
-            for key, histogram in stats.items():
-                try:
-                    if isinstance(histogram, MetricsHistogram):
-                        path = key.replace("/", ".")
-                        metrics[f"weights-histogram/{path}"] = (
-                            histogram.bin_counts.tolist(),
-                            histogram.bin_edges.tolist(),
-                        )
+                metrics = {}
+                for key, histogram in stats.items():
+                    try:
+                        if isinstance(histogram, MetricsHistogram):
+                            path = key.replace("/", ".")
+                            metrics[f"weights-histogram/{path}"] = (
+                                histogram.bin_counts.tolist(),
+                                histogram.bin_edges.tolist(),
+                            )
 
-                        base_path = path.replace("/histogram", "")
-                        metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
-                        metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
-                        metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
-                        metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
-                    else:
-                        path = key.replace("/", ".")
-                        metrics[f"weights-information/{path}"] = histogram
-                except Exception as e:
-                    traceback.print_exc()
-                    raise e
+                            base_path = path.replace("/histogram", "")
+                            metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
+                            metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
+                            metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
+                            metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
+                        else:
+                            path = key.replace("/", ".")
+                            metrics[f"weights-information/{path}"] = histogram
+                    except Exception as e:
+                        traceback.print_exc()
+                        raise e
             self.log_metrics(metrics, step)
+
+        except Exception:
+            logger.warn("Failed to log weight distribution...")
 
     def _log_to_wandb(
         self,
