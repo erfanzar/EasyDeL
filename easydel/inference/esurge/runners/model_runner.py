@@ -179,6 +179,7 @@ class eSurgeRunner:
         max_model_len: int = 2**13,
         min_input_pad: int = 256,
         max_num_seqs: int = 16,
+        use_aot_forward: bool = True,
         verbose: bool = False,
     ):
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
@@ -210,9 +211,7 @@ class eSurgeRunner:
             model=model,
             mesh=model.mesh,
             kv_pages=model.init_ragged_pages(self.metadata),
-            use_combined_forward=False,
-            use_aot_forward=True,
-            use_fused_step=True,
+            use_aot_forward=use_aot_forward,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,
             max_num_reqs=self.max_num_reqs,
@@ -314,7 +313,6 @@ class eSurgeRunner:
         self.slot_mapping_scratch_buf = jnp.zeros((self.max_padded_slices, 3), dtype=jnp.int32)
         self.num_tokens_paddings_arr = jnp.array(self.num_tokens_paddings, dtype=jnp.int32)
 
-        # Pre-allocated buffers for fused execution to avoid repeated allocations
         self.scheduled_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
         self.req_num_tokens_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32)
         self.active_mask_full_buf = jnp.zeros((self.max_num_reqs,), dtype=bool)
@@ -691,7 +689,7 @@ class eSurgeRunner:
                 self.slot_mapping_buf,
                 _hidden_states,
                 _logits,
-            ) = self.executor_manager.execute_fused(
+            ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 dev_state=dev_state,
                 scheduled_full=self.scheduled_full_buf,

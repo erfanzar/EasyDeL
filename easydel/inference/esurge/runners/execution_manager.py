@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Execution manager for efficient model inference with precompiled functions.
+"""Execution manager for efficient model inference with precompiled fused step functions.
 
 This module provides the ExecutionManager class that handles compilation and caching
-of model execution functions for different batch sizes and token counts. It supports
-both AOT (Ahead-of-Time) and JIT (Just-In-Time) compilation strategies for optimal
-performance in production and development environments.
+of fused step execution functions for different batch sizes and token counts. It uses
+AOT (Ahead-of-Time) compilation for optimal performance in production environments.
 
-The manager supports three execution modes:
-    - Combined forward: Single function for both hidden states and token generation
-    - Separate functions: Separate functions for hidden states and token generation
-    - Fused step: Single function combining prepare_inputs, forward, sampling, and apply_token
+The manager uses a fused execution mode where a single function combines:
+    - Input preparation (prepare_inputs)
+    - Model forward pass
+    - Token sampling
+    - State updates (apply_token)
+
+This provides maximum performance by minimizing host-device communication and
+maximizing kernel fusion opportunities.
 
 Example:
     >>> from easydel.inference.esurge.runners import ExecutionManager
@@ -30,16 +33,14 @@ Example:
     ...     model=my_model,
     ...     mesh=device_mesh,
     ...     kv_pages=cache_pages,
-    ...     use_combined_forward=True,
-    ...     use_aot_forward=True
+    ...     use_aot_forward=True,
     ... )
     >>> executor.compile(token_paddings, ...)
-    >>> tokens = executor.execute(inputs, ...)
+    >>> result = executor.execute(...)
 """
 
 from __future__ import annotations
 
-import time
 import typing
 from collections import OrderedDict
 from functools import partial
@@ -56,7 +57,7 @@ from easydel.utils import ejit
 
 from ...sampling_funcs import sample_top_p_efficient
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
-from .sequence_buffer import DeviceSequenceState, ModelRunnerSamplingMetadata
+from .sequence_buffer import DeviceSequenceState
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -93,30 +94,27 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pa
 
 
 class ExecutionManager:
-    """Manages precompiled execution functions for efficient model inference.
+    """Manages precompiled fused step execution functions for efficient model inference.
 
-    This class handles the compilation and caching of model execution functions
-    for different batch sizes and token counts. It supports two execution modes:
-    - Combined forward: Single function for both hidden states and token generation
-    - Separate functions: Separate functions for hidden states and token generation
+    This class handles the compilation and caching of fused step execution functions
+    for different token counts. The fused step combines input preparation, model
+    forward pass, token sampling, and state updates into a single compiled function
+    for maximum performance.
 
-    The manager supports both AOT (Ahead-of-Time) and JIT (Just-In-Time) compilation:
-    - AOT mode (default): Pre-compiles functions using JAX's lower/compile API for
-      optimal performance in production
-    - JIT mode: Compiles functions on first use with graph definition as static
-      argument, more flexible for development
+    The manager uses AOT (Ahead-of-Time) compilation, pre-compiling functions using
+    JAX's lower/compile API for optimal performance in production environments.
 
-    The manager pre-compiles functions for various configurations to avoid
+    The manager pre-compiles functions for various token count configurations to avoid
     runtime compilation overhead, enabling seamless switching between different
-    batch sizes and sequence lengths.
+    batch sizes during inference.
 
     Attributes:
         model: The EasyDeL model being managed.
         mesh: JAX sharding mesh for distributed execution.
         kv_pages: KV cache pages for attention.
-        use_combined_forward: Whether to use combined or separate functions.
         use_aot_forward: Whether to use AOT compilation (default: True).
         graphdef, graphstate, graphother: Split model components for JAX.
+        _step_fn: The compiled fused step function.
         _lowerd_history: Cache of compiled functions.
 
     Example:
@@ -124,11 +122,10 @@ class ExecutionManager:
         ...     model=my_model,
         ...     mesh=device_mesh,
         ...     kv_pages=cache_pages,
-        ...     use_combined_forward=True,
-        ...     use_aot_forward=True  # Use AOT compilation
+        ...     use_aot_forward=True,
         ... )
         >>> executor.compile(token_paddings, ...)
-        >>> tokens = executor.execute(inputs, ...)
+        >>> result = executor.execute(...)
     """
 
     def __init__(
@@ -136,9 +133,7 @@ class ExecutionManager:
         model: EasyDeLBaseModule,
         mesh: jax.sharding.Mesh,
         kv_pages: RaggedPagesCache,
-        use_combined_forward: bool = False,
         use_aot_forward: bool = True,
-        use_fused_step: bool = False,
         min_input_pad: int = 8,
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
@@ -151,49 +146,37 @@ class ExecutionManager:
             model: The EasyDeL model instance.
             mesh: JAX sharding mesh for distributed execution.
             kv_pages: Pages cache for KV cache management.
-            use_combined_forward: Whether to use combined forward pass for model and token
-                generation in a single function call. Default is False.
             use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
                 execution. When True (default), functions are pre-compiled for better
                 performance. When False, uses Just-In-Time (JIT) compilation with
                 the graph definition passed as a static argument.
-            use_fused_step: Whether to use fused step that combines prepare_inputs, forward,
-                sampling, and apply_token in a single function. Default is False.
             min_input_pad: Minimum padding for inputs.
             max_model_len: Maximum model sequence length.
             max_num_reqs: Maximum number of requests.
             max_num_tokens: Maximum number of tokens for batching.
             metadata: Pages cache metadata.
         """
-        logger.info(f"Initializing ExecutionManager with {use_combined_forward=}, {use_fused_step=}")
+        logger.info("Initializing ExecutionManager")
         self.model = model
         self.mesh = mesh
         self.kv_pages = kv_pages
-        self.use_combined_forward = use_combined_forward
         self.use_aot_forward = use_aot_forward
-        self.use_fused_step = use_fused_step
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens if max_num_tokens is not None else max_model_len
         self.metadata = metadata
-        logger.debug("Splitting model module for graph-based execution")
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
         self.rng_key = jax.random.PRNGKey(0)
 
         self._empty_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-        self._main_fn: None | pjit.JitWrapped = None
-        self._compute_hidden_states_fn: None | pjit.JitWrapped = None
-        self._compute_tokens_fn: None | pjit.JitWrapped = None
-        self._fused_step_fn: None | pjit.JitWrapped = None
+        self._step_fn: None | pjit.JitWrapped = None
         self._cache_capacity = 64
         self._lowerd_history = OrderedDict()
 
-        logger.debug("Initializing execution functions")
         self.init_fns()
-        logger.debug("ExecutionManager initialization complete")
 
     def _cache_put(self, key, value):
         self._lowerd_history[key] = value
@@ -206,7 +189,7 @@ class ExecutionManager:
         self._lowerd_history.move_to_end(key)
         return value
 
-    def execute_fused(
+    def execute(
         self,
         num_tokens: int,
         dev_state: DeviceSequenceState,
@@ -263,12 +246,10 @@ class ExecutionManager:
         Raises:
             KeyError: If no compiled function exists for the given configuration.
 
-        Note:
-            This method requires use_fused_step=True during initialization.
         """
         fn = self.get_compiled_key(num_tokens, padded_num_reqs)
+
         if self.use_aot_forward:
-            # AOT: function is already compiled, no static arguments needed
             result = fn(
                 self.graphstate,
                 self.graphother,
@@ -283,10 +264,7 @@ class ExecutionManager:
                 self.rng_key,
             )
         else:
-            # JIT: pass num_tokens and graphdef as static arguments
             result = fn(
-                num_tokens,
-                self.graphdef,
                 self.graphstate,
                 self.graphother,
                 dev_state,
@@ -330,78 +308,6 @@ class ExecutionManager:
             logits,
         )
 
-    def execute(
-        self,
-        input_ids_view: jax.Array,
-        position_ids_view: jax.Array,
-        cache_metadata: RaggedPagesMetadata,
-        logits_indices: jax.Array,
-        sampling_metadata: ModelRunnerSamplingMetadata,
-        padded_num_reqs: int,
-    ) -> tuple[jax.Array, jax.Array | None]:
-        """Execute the model on prepared inputs.
-
-        Selects and runs the appropriate pre-compiled function based on
-        input shapes. Handles both combined and separate execution modes.
-
-        When AOT compilation is disabled (use_aot_forward=False), the graph
-        definition is passed as a static argument during execution for JIT
-        compilation. When enabled (default), pre-compiled functions are used
-        for better performance.
-
-        Args:
-            input_ids_view: Token IDs to process [num_tokens].
-            position_ids_view: Position IDs for tokens [num_tokens].
-            cache_metadata: Paged attention metadata.
-            logits_indices: Indices for logit extraction.
-            sampling_metadata: Parameters for token sampling.
-            padded_num_reqs: Padded number of requests.
-
-        Returns:
-            tuple: (sampled_token_ids, logits or None)
-                - sampled_token_ids: Generated token IDs.
-                - logits: Raw logits (only in separate mode).
-        """
-        if self.use_fused_step:
-            raise ValueError("Use execute_fused for fused step execution")
-        static_arguments = (self.graphdef,) if not self.use_aot_forward else ()
-        if self.use_combined_forward:
-            fn = self.get_compiled_key(input_ids_view.shape[0], padded_num_reqs)
-            token_ids, self.kv_pages, self.rng_key = fn(
-                *static_arguments,
-                self.graphstate,
-                self.graphother,
-                input_ids_view,
-                position_ids_view,
-                self.kv_pages,
-                cache_metadata,
-                logits_indices,
-                sampling_metadata,
-                self.rng_key,
-            )
-            return token_ids, None
-        else:
-            hfn, tfn = self.get_compiled_key(input_ids_view.shape[0], padded_num_reqs)
-            hidden_states, self.kv_pages = hfn(
-                *static_arguments,
-                self.graphstate,
-                self.graphother,
-                input_ids_view,
-                position_ids_view,
-                self.kv_pages,
-                cache_metadata,
-            )
-            token_ids, self.rng_key = tfn(
-                *static_arguments,
-                self.graphstate,
-                self.graphother,
-                hidden_states,
-                logits_indices,
-                sampling_metadata,
-                self.rng_key,
-            )
-            return token_ids, None
-
     def compile(
         self,
         num_tokens_paddings: list[int],
@@ -437,9 +343,6 @@ class ExecutionManager:
             ...     metadata=cache_metadata
             ... )
         """
-        logger.debug(f"Starting compilation for {len(num_tokens_paddings)} token padding sizes")
-        logger.debug(f"Token paddings: {num_tokens_paddings}")
-        logger.debug(f"Max pages per request: {max_pages_per_req}, Max requests: {max_num_reqs}")
         ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
         reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
         total_compilations = len(num_tokens_paddings) * len(reqs_padds)
@@ -447,7 +350,6 @@ class ExecutionManager:
         progress = ProgressLogger("eSurge", logger)
         for num_tokens in num_tokens_paddings:
             for reqs_padd in reqs_padds:
-                compile_start = time.time()
                 progress.update(
                     compilation_count,
                     total_compilations,
@@ -462,7 +364,6 @@ class ExecutionManager:
                     padded_num_reqs=reqs_padd,
                     metadata=metadata,
                 )
-                logger.debug(f"Step completed in {time.time() - compile_start:.2f}s")
                 compilation_count += 1
         progress.complete(f"All {total_compilations} compilations completed")
 
@@ -504,131 +405,19 @@ class ExecutionManager:
         self.compile_key(num_tokens, padded_num_reqs, compargs)
 
     def init_fns(self) -> None:
-        """Initialize all execution functions based on configuration.
+        """Initialize the fused step execution function.
 
-        Creates the appropriate execution functions based on the execution mode
-        (combined, separate, or fused). Functions are wrapped with ejit for
-        efficient execution.
+        Creates the fused execution function that combines input preparation,
+        model forward pass, token sampling, and state updates. The function
+        is wrapped with ejit for efficient execution.
 
         Note:
             Called automatically during initialization. Should not be called
             directly by users.
         """
-        self._main_fn = self.get_fn()
-        self._compute_hidden_states_fn = self.get_compute_hidden_states_fn()
-        self._compute_tokens_fn = self.get_compute_tokens_fn()
-        self._fused_step_fn = self.get_fused_step_fn()
+        self._step_fn = self.get_step_fn()
 
-    def get_compute_hidden_states_fn(self) -> typing.Callable:
-        """Create function for computing model hidden states.
-
-        Returns:
-            A callable that computes hidden states from input tokens without
-            applying the language model head. The function is wrapped with ejit
-            for efficient execution.
-
-        Note:
-            This function is used in separate execution mode where hidden states
-            and token generation are computed in two steps.
-        """
-
-        @ejit(
-            static_argnums=(0,),
-            donate_argnames=["input_ids", "position_ids", "kv_pages"],
-            in_shardings=(
-                es.extract_shardings(self.graphstate, self.mesh),
-                es.extract_shardings(self.graphother, self.mesh),
-                self._empty_sharding,  # input_ids
-                self._empty_sharding,  # position_ids
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # cache_metadata
-            ),
-            out_shardings=(self._empty_sharding, es.extract_shardings(self.kv_pages, self.mesh)),
-        )
-        def _fn(
-            graphdef,
-            graphstate,
-            graphother,
-            input_ids: jax.Array,
-            position_ids: jax.Array,
-            kv_pages: RaggedPagesCache,
-            cache_metadata: RaggedPagesMetadata,
-        ):
-            model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
-            with model.mesh:
-                output = model(
-                    input_ids=jnp.expand_dims(input_ids, 0),
-                    position_ids=jnp.expand_dims(position_ids, 0),
-                    past_key_values=kv_pages,
-                    cache_metadata=cache_metadata,
-                    apply_lm_head=False,
-                )
-                return output.last_hidden_state.squeeze(0), output.past_key_values
-
-        return _fn
-
-    def get_compute_tokens_fn(self) -> typing.Callable:
-        """Create function for generating tokens from hidden states.
-
-        Returns:
-            A callable that applies the language model head to hidden states
-            and performs token sampling. The function is wrapped with ejit
-            for efficient execution.
-
-        Note:
-            This function is used in separate execution mode where hidden states
-            and token generation are computed in two steps.
-        """
-
-        @ejit(
-            static_argnums=(0,),
-            in_shardings=(
-                es.extract_shardings(self.graphstate, self.mesh),
-                es.extract_shardings(self.graphother, self.mesh),
-                self._empty_sharding,  # hidden_states
-                self._empty_sharding,  # logits_indices
-                self._empty_sharding,  # sampling_params
-                self._empty_sharding,  # rng_key
-            ),
-            out_shardings=(self._empty_sharding, self._empty_sharding),
-        )
-        def _fn(
-            graphdef,
-            graphstate,
-            graphother,
-            hidden_states: jax.Array,
-            logits_indices: jax.Array,
-            sampling_params: ModelRunnerSamplingMetadata,
-            rng_key: jax.random.PRNGKey,
-        ):
-            model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
-            with model.mesh:
-                logits = model.apply_lm_head(hidden_states[logits_indices])
-
-            is_all_greedy = jnp.all(sampling_params.temperature <= 0.0)
-
-            def do_greedy(_):
-                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
-
-            def do_sample(_):
-                B = logits.shape[0]
-                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
-                samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
-                    logits,
-                    sampling_params.top_p.astype(logits.dtype),
-                    sampling_params.temperature.astype(logits.dtype),
-                    row_keys,
-                    64,
-                )
-                return samples.reshape(-1)
-
-            sampled = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None)
-            next_key = jax.random.fold_in(rng_key, jnp.int32(logits.shape[0]))
-            return sampled.reshape(-1, 1), next_key
-
-        return _fn
-
-    def get_fused_step_fn(self) -> typing.Callable:
+    def get_step_fn(self) -> typing.Callable:
         """Create the fused step function.
 
         Creates a single function that combines input preparation, model forward pass,
@@ -639,9 +428,6 @@ class ExecutionManager:
             A callable that performs a complete inference step. The function is
             wrapped with ejit for efficient execution.
 
-        Note:
-            This function is only created when use_fused_step=True. It provides
-            the most efficient execution path for production inference.
         """
         max_num_reqs = int(self.max_num_reqs)
         page_size = int(self.metadata.page_size)
@@ -650,7 +436,7 @@ class ExecutionManager:
         slices_per_page = int(self.metadata.num_slices_per_kv_cache_update_page)
         page_table_pad = jnp.int32(PAGE_TABLE_PADDING_VAL)
         slot_mapping_pad = jnp.int32(SLOT_MAPPING_PADDING_VAL)
-        max_num_tokens = int(self.max_model_len)
+        max_num_tokens = int(self.max_num_tokens)
         max_padded_slices = int(self.metadata.get_padded_num_slices(max_num_tokens, max_num_reqs))
 
         i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
@@ -865,306 +651,133 @@ class ExecutionManager:
 
         return _fn
 
-    def get_fn(self) -> typing.Callable:
-        """Create the combined forward pass and token generation function.
-
-        Returns:
-            A callable that performs both forward pass and token generation
-            in a single function call. The function is wrapped with ejit
-            for efficient execution.
-
-        Note:
-            This function is used when use_combined_forward=True and
-            use_fused_step=False.
-        """
-
-        @ejit(
-            static_argnums=(0,),
-            donate_argnames=["input_ids", "position_ids", "kv_pages"],
-            in_shardings=(
-                es.extract_shardings(self.graphstate, self.mesh),
-                es.extract_shardings(self.graphother, self.mesh),
-                self._empty_sharding,  # input_ids
-                self._empty_sharding,  # position_ids
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # cache_metadata
-                self._empty_sharding,  # logits_indices
-                self._empty_sharding,  # sampling_params
-                self._empty_sharding,  # rng_key
-            ),
-            out_shardings=(
-                self._empty_sharding,
-                es.extract_shardings(self.kv_pages, self.mesh),
-                self._empty_sharding,
-            ),
-        )
-        def _fn(
-            graphdef,
-            graphstate,
-            graphother,
-            input_ids: jax.Array,
-            position_ids: jax.Array,
-            kv_pages: RaggedPagesCache,
-            cache_metadata: RaggedPagesMetadata,
-            logits_indices: jax.Array,
-            sampling_params: ModelRunnerSamplingMetadata,
-            rng_key: jax.random.PRNGKey,
-        ):
-            model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
-            with model.mesh:
-                output = model(
-                    input_ids=jnp.expand_dims(input_ids, 0),
-                    position_ids=jnp.expand_dims(position_ids, 0),
-                    past_key_values=kv_pages,
-                    cache_metadata=cache_metadata,
-                    apply_lm_head=False,
-                )
-                logits = model.apply_lm_head(output.last_hidden_state.squeeze(0)[logits_indices])
-
-            is_all_greedy = jnp.all(sampling_params.temperature <= 0.0)
-
-            def do_greedy(_):
-                return jnp.argmax(logits, axis=-1).astype(jnp.int32)
-
-            def do_sample(_):
-                B = logits.shape[0]
-                row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
-                samples = jax.vmap(
-                    sample_top_p_efficient,
-                    in_axes=(0, 0, 0, 0, None),
-                    out_axes=0,
-                )(
-                    logits,
-                    sampling_params.top_p.astype(logits.dtype),
-                    sampling_params.temperature.astype(logits.dtype),
-                    row_keys,
-                    64,  # tuned chunk size
-                )
-                return samples.reshape(-1)
-
-            sampled = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None)
-            next_key = jax.random.fold_in(rng_key, jnp.int32(logits.shape[0]))
-            return sampled.reshape(-1, 1), output.past_key_values, next_key
-
-        return _fn
-
     def compile_key(self, num_tokens: int, padded_num_reqs: int, compargs):
-        """Compile model execution functions for specific input dimensions.
+        """Compile fused step execution function for specific input dimensions.
 
         Handles both AOT and JIT compilation modes based on use_aot_forward flag.
         For AOT mode (default), pre-compiles functions using JAX's lower/compile API.
-        For JIT mode, executes functions once to trigger JIT compilation and caches
-        the wrapped functions.
+        For JIT mode, executes the function once to trigger JIT compilation and caches
+        the wrapped function.
 
         Args:
             num_tokens: Number of tokens in the input batch.
-            padded_num_reqs: Padded number of requests for batching.
-            compargs: Compilation arguments for the model functions.
+            padded_num_reqs: Padded number of requests for batching (unused in fused mode).
+            compargs: Compilation arguments tuple where compargs[2] contains fused step args.
         """
-        if self.use_fused_step:
-            fused_key = (num_tokens, "fused")
+        fused_key = (num_tokens, "fused")
 
-            if fused_key not in self._lowerd_history:
-                lowered = self._fused_step_fn.lower(num_tokens, *compargs[2])
+        if fused_key not in self._lowerd_history:
+            logger.info(f"Compiling for num_tokens={num_tokens}, padded_num_reqs={padded_num_reqs}")
+            logger.info(f"  use_aot_forward={self.use_aot_forward}")
+
+            if self.use_aot_forward:
+                lowered = self._step_fn.lower(num_tokens, *compargs[2])
                 compiled = lowered.compile()
                 self._cache_put(fused_key, compiled)
-        elif self.use_aot_forward:
-            if self.use_combined_forward:
-                key = (num_tokens, padded_num_reqs)
-                if key not in self._lowerd_history:
-                    lowered = self._main_fn.lower(*compargs)
-                    compiled = lowered.compile()
-                    self._cache_put(key, compiled)
             else:
-                hskey = (num_tokens, padded_num_reqs, "hidden_states")
-                tskey = (num_tokens, padded_num_reqs, "tokens")
-                if hskey not in self._lowerd_history:
-                    hidden_states_lowered = self._compute_hidden_states_fn.lower(*compargs[0])
-                    hidden_states_compiled = hidden_states_lowered.compile()
-                    self._cache_put(hskey, hidden_states_compiled)
-                if tskey not in self._lowerd_history:
-                    tokens_lowered = self._compute_tokens_fn.lower(*compargs[1])
-                    tokens_compiled = tokens_lowered.compile()
-                    self._cache_put(tskey, tokens_compiled)
-        else:
-            # JIT-on-first-use (dev mode)
-            if self.use_combined_forward:
-                key = (num_tokens, padded_num_reqs)
-                _, self.kv_pages, _ = self._main_fn(*compargs)
-                self._cache_put(key, self._main_fn)
-            else:
-                hskey = (num_tokens, padded_num_reqs, "hidden_states")
-                tskey = (num_tokens, padded_num_reqs, "tokens")
-                _, self.kv_pages = self._compute_hidden_states_fn(*compargs[0])
-                self._cache_put(hskey, self._compute_hidden_states_fn)
-                _ = self._compute_tokens_fn(*compargs[1])
-                self._cache_put(tskey, self._compute_tokens_fn)
+                partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
+
+                result = partial_fn(self.graphstate, self.graphother, *compargs[2][3:])
+                (
+                    _dev_state,
+                    self.kv_pages,
+                    _input_ids_buf,
+                    _position_ids_buf,
+                    _query_start_loc_buf,
+                    _seq_lens_buf,
+                    _pages_tables_buf,
+                    _slot_mapping_buf,
+                    _rng_key,
+                    _out_tokens_full,
+                    _valid_mask_full,
+                    _hidden_states,
+                    _logits,
+                ) = result
+
+                self._cache_put(fused_key, partial_fn)
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
-        """Retrieve pre-compiled functions for given input dimensions.
+        """Retrieve pre-compiled fused step function for given input dimensions.
 
         Args:
             num_tokens: Number of tokens in the input batch.
-            padded_num_reqs: Padded number of requests for batching.
+            padded_num_reqs: Padded number of requests for batching (unused in fused mode).
 
         Returns:
-            Compiled function(s) for the specified dimensions. Returns a single
-            function for combined forward mode, fused step mode, or a tuple of
-            (hidden_states_fn, tokens_fn) for separate mode.
+            Compiled fused step function for the specified number of tokens.
         """
-
-        if self.use_fused_step:
-            return self._cache_get((num_tokens, "fused"))
-        elif self.use_combined_forward:
-            return self._cache_get((num_tokens, padded_num_reqs))
+        key = (num_tokens, "fused")
+        if key in self._lowerd_history:
+            ...
         else:
-            hskey = (num_tokens, padded_num_reqs, "hidden_states")
-            tskey = (num_tokens, padded_num_reqs, "tokens")
-            return self._cache_get(hskey), self._cache_get(tskey)
+            logger.warning(f"Cache miss for key={key}! Will trigger recompilation")
+            logger.warning(f"Available keys in cache: {list(self._lowerd_history.keys())}")
+        return self._cache_get(key)
 
     def get_compile_configurations(
         self,
         kv_pages: RaggedPagesCache,
         rng_key: jax.random.PRNGKey,
-        num_tokens: int,
-        num_reqs_max_model_len: int,
-        max_pages_per_req: int,
+        num_tokens: int,  # unused - kept for API compatibility
+        num_reqs_max_model_len: int,  # unused - kept for API compatibility
+        max_pages_per_req: int,  # unused - kept for API compatibility
         max_num_reqs: int,
-        padded_num_reqs: int,
+        padded_num_reqs: int,  # unused - kept for API compatibility
         metadata: RaggedPagesCacheView,
     ) -> tuple:
-        """Generate example arguments for function compilation.
+        """Generate example arguments for fused step function compilation.
 
         Creates mock input arguments with the correct shapes and types for
-        compiling the execution functions. These arguments are used to trace
-        through the functions during compilation.
+        compiling the fused step execution function. These arguments are used
+        to trace through the function during compilation.
 
         Args:
             kv_pages: KV cache pages to use in compilation.
             rng_key: Random key for sampling operations.
-            num_tokens: Number of tokens in this configuration.
-            num_reqs_max_model_len: Number of requests for max model length.
-            max_pages_per_req: Maximum pages per request.
+            num_tokens: Unused in fused mode, kept for API compatibility.
+            num_reqs_max_model_len: Unused in fused mode, kept for API compatibility.
+            max_pages_per_req: Unused in fused mode, kept for API compatibility.
             max_num_reqs: Maximum number of requests.
-            padded_num_reqs: Padded number of requests for this configuration.
+            padded_num_reqs: Unused in fused mode, kept for API compatibility.
             metadata: Pages cache metadata.
 
         Returns:
-            A tuple of example arguments appropriate for the execution mode:
-                - For fused mode: (None, None, fused_args)
-                - For combined mode: Single tuple of arguments
-                - For separate mode: (hidden_states_args, tokens_args)
+            A tuple (None, None, fused_args) where fused_args contains the example
+            arguments for the fused step function.
 
         Note:
             The returned arguments contain zeros/ones as placeholder data since
             only shapes and types matter for compilation.
         """
-        actual_num_reqs = min(num_tokens, num_reqs_max_model_len)
-        padded_num_slices = metadata.get_padded_num_slices(num_tokens, max_num_reqs)
-        query_lens = [1] * num_reqs_max_model_len
+        from .sequence_buffer import SequenceBuffer
 
-        if self.use_fused_step:
-            from .sequence_buffer import SequenceBuffer
+        temp_buffer = SequenceBuffer.create(
+            max_num_reqs=max_num_reqs,
+            max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+            vocab_size=self.model.config.get_text_config().vocab_size,
+            page_sizes=[metadata.page_size],
+        )
 
-            temp_buffer = SequenceBuffer.create(
-                max_num_reqs=max_num_reqs,
-                max_model_len=self.max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,  # Use the same value as eSurgeRunner
-                vocab_size=self.model.config.get_text_config().vocab_size,
-                page_sizes=[metadata.page_size],
-            )
+        dev_state = temp_buffer.to_device_state()
 
-            # Get the DeviceSequenceState from the buffer
-            dev_state = temp_buffer.to_device_state()
+        max_padded_slices = metadata.get_padded_num_slices(self.max_num_tokens, max_num_reqs)
+        logger.info(
+            f"  get_compile_configurations: num_tokens={num_tokens}, using max_num_tokens={self.max_num_tokens} for slot_mapping, max_padded_slices={max_padded_slices}"
+        )
 
-            max_padded_slices = metadata.get_padded_num_slices(self.max_model_len, max_num_reqs)
-
-            fused_args = [
-                self.graphdef,
-                self.graphstate,
-                self.graphother,
-                dev_state,
-                kv_pages,
-                jnp.ones((max_num_reqs,), dtype=jnp.int32),  # scheduled_full
-                jnp.full((max_num_reqs,), 10, dtype=jnp.int32),  # req_num_tokens_full
-                jnp.ones((max_num_reqs,), dtype=bool),  # active_mask_full
-                jnp.zeros((self.max_model_len,), dtype=jnp.int32),  # input_ids_buf
-                jnp.zeros((self.max_model_len,), dtype=jnp.int32),  # position_ids_buf
-                jnp.full((3, max_padded_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
-                rng_key,
-            ]
-
-            example_args = [None, None, fused_args]  # (hidden_states_args, tokens_args, fused_args)
-        elif self.use_combined_forward:
-            example_args = (
-                self.graphdef,
-                self.graphstate,
-                self.graphother,
-                jnp.zeros((num_tokens,), dtype=jnp.int32),
-                jnp.zeros(num_tokens, dtype=jnp.int32),
-                kv_pages,
-                RaggedPagesMetadata(
-                    pages_tables=jnp.full(
-                        (num_reqs_max_model_len, max_pages_per_req), fill_value=PAGE_TABLE_PADDING_VAL, dtype=jnp.int32
-                    ),
-                    context_lens=jnp.ones((num_reqs_max_model_len,), dtype=jnp.int32),
-                    query_start_loc=jnp.cumsum(jnp.array([0, *query_lens], dtype=jnp.int32), axis=0, dtype=jnp.int32),
-                    num_seqs=jnp.array([actual_num_reqs], dtype=jnp.int32),
-                    slot_mapping=jnp.full((3, padded_num_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
-                    num_kv_update_slices=jnp.array([padded_num_slices], dtype=jnp.int32),
-                    num_slices_per_kv_cache_update_page=metadata.num_slices_per_kv_cache_update_page,
-                    page_size=metadata.page_size,
-                ),
-                jnp.arange(padded_num_reqs, dtype=jnp.int32),
-                ModelRunnerSamplingMetadata(
-                    top_p=jnp.ones((padded_num_reqs,), dtype=jnp.float32),
-                    temperature=jnp.ones((padded_num_reqs,), dtype=jnp.float32),
-                    min_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
-                    top_k=jnp.zeros((padded_num_reqs,), dtype=jnp.int32),
-                ),
-                rng_key,
-            )
-        else:
-            example_args = (
-                (
-                    self.graphdef,
-                    self.graphstate,
-                    self.graphother,
-                    jnp.zeros((num_tokens,), dtype=jnp.int32),
-                    jnp.zeros(num_tokens, dtype=jnp.int32),
-                    kv_pages,
-                    RaggedPagesMetadata(
-                        pages_tables=jnp.full(
-                            (num_reqs_max_model_len, max_pages_per_req),
-                            fill_value=PAGE_TABLE_PADDING_VAL,
-                            dtype=jnp.int32,
-                        ),
-                        context_lens=jnp.ones((num_reqs_max_model_len,), dtype=jnp.int32),
-                        query_start_loc=jnp.cumsum(
-                            jnp.array([0, *query_lens], dtype=jnp.int32), axis=0, dtype=jnp.int32
-                        ),
-                        num_seqs=jnp.array([actual_num_reqs], dtype=jnp.int32),
-                        slot_mapping=jnp.full(
-                            (3, padded_num_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32
-                        ),
-                        num_kv_update_slices=jnp.array([padded_num_slices], dtype=jnp.int32),
-                        num_slices_per_kv_cache_update_page=metadata.num_slices_per_kv_cache_update_page,
-                        page_size=metadata.page_size,
-                    ),
-                ),
-                (
-                    self.graphdef,
-                    self.graphstate,
-                    self.graphother,
-                    jnp.ones((num_tokens, self.model.config.get_text_config().hidden_size), self.model.dtype),
-                    jnp.arange(padded_num_reqs, dtype=jnp.int32),
-                    ModelRunnerSamplingMetadata(
-                        top_p=jnp.ones((padded_num_reqs,), dtype=jnp.float32),
-                        temperature=jnp.ones((padded_num_reqs,), dtype=jnp.float32),
-                        min_p=jnp.zeros((padded_num_reqs,), dtype=jnp.float32),
-                        top_k=jnp.zeros((padded_num_reqs,), dtype=jnp.int32),
-                    ),
-                    rng_key,
-                ),
-            )
-        return example_args
+        fused_args = [
+            self.graphdef,
+            self.graphstate,
+            self.graphother,
+            dev_state,
+            kv_pages,
+            jnp.ones((max_num_reqs,), dtype=jnp.int32),
+            jnp.full((max_num_reqs,), 10, dtype=jnp.int32),
+            jnp.ones((max_num_reqs,), dtype=bool),
+            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
+            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
+            jnp.full((3, max_padded_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
+            rng_key,
+        ]
+        return (None, None, fused_args)

@@ -179,6 +179,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         hbm_utilization=float(es.get("hbm_utilization", 0.85)),
         page_size=int(es.get("page_size", 128)),
         enable_prefix_caching=bool(es.get("enable_prefix_caching", True)),
+        use_aot_forward=bool(es.get("use_aot_forward", True)),
         runner_verbose=bool(es.get("verbose", False)),
     )
 
