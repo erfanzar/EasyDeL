@@ -41,6 +41,7 @@ Example:
 
 from __future__ import annotations
 
+import pprint
 import typing
 from collections import OrderedDict
 from functools import partial
@@ -57,7 +58,7 @@ from easydel.utils import ejit
 
 from ...sampling_funcs import sample_top_p_efficient
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
-from .sequence_buffer import DeviceSequenceState
+from .sequence_buffer import DeviceSequenceState, SequenceBuffer
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -91,6 +92,20 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pa
     """
     res = min_input_pad if x <= min_input_pad else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
+
+
+def _device_put_tree_with_shardings(tree, shardings_tree):
+    return jax.tree_util.tree_map(
+        lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x,
+        tree,
+        shardings_tree,
+    )
+
+
+def _device_put_tree_uniform(tree, sharding):
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    shardings_tree = jax.tree_util.tree_unflatten(treedef, [sharding] * len(leaves))
+    return _device_put_tree_with_shardings(tree, shardings_tree)
 
 
 class ExecutionManager:
@@ -189,6 +204,9 @@ class ExecutionManager:
         self._lowerd_history.move_to_end(key)
         return value
 
+    def clear_cache(self):
+        self._lowerd_history.clear()
+
     def execute(
         self,
         num_tokens: int,
@@ -248,7 +266,22 @@ class ExecutionManager:
 
         """
         fn = self.get_compiled_key(num_tokens, padded_num_reqs)
-
+        # self._record_or_diff(
+        #     num_tokens,
+        #     self._snapshot_args_runtime(
+        #         self.graphstate,
+        #         self.graphother,
+        #         dev_state,
+        #         self.kv_pages,
+        #         scheduled_full,
+        #         req_num_tokens_full,
+        #         active_mask_full,
+        #         input_ids_buf,
+        #         position_ids_buf,
+        #         slot_mapping_buf,
+        #         self.rng_key,
+        #     ),
+        # )
         if self.use_aot_forward:
             result = fn(
                 self.graphstate,
@@ -343,6 +376,9 @@ class ExecutionManager:
             ...     metadata=cache_metadata
             ... )
         """
+
+        if self.use_aot_forward:
+            self.clear_cache()
         ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
         reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
         total_compilations = len(num_tokens_paddings) * len(reqs_padds)
@@ -664,9 +700,34 @@ class ExecutionManager:
             padded_num_reqs: Padded number of requests for batching (unused in fused mode).
             compargs: Compilation arguments tuple where compargs contains fused step args.
         """
-        fused_key = (num_tokens, "fused")
+        mode = "aot" if self.use_aot_forward else "jit"
+        fused_key = (num_tokens, "fused", mode)
 
         if fused_key not in self._lowerd_history:
+            # if self.use_aot_forward:
+            #     baseline_args = {
+            #         "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
+            #         "scheduled_full": self._leaf_summary(compargs[5]),
+            #         "req_num_tokens_full": self._leaf_summary(compargs[6]),
+            #         "active_mask_full": self._leaf_summary(compargs[7]),
+            #         "input_ids_buf": self._leaf_summary(compargs[8]),
+            #         "position_ids_buf": self._leaf_summary(compargs[9]),
+            #         "slot_mapping_buf": self._leaf_summary(compargs[10]),
+            #         "rng_key": self._leaf_summary(compargs[11]),
+            #     }
+            #     self._record_or_diff(num_tokens, baseline_args)
+            # else:
+            #     baseline_args = {
+            #         "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
+            #         "scheduled_full": self._leaf_summary(compargs[5]),
+            #         "req_num_tokens_full": self._leaf_summary(compargs[6]),
+            #         "active_mask_full": self._leaf_summary(compargs[7]),
+            #         "input_ids_buf": self._leaf_summary(compargs[8]),
+            #         "position_ids_buf": self._leaf_summary(compargs[9]),
+            #         "slot_mapping_buf": self._leaf_summary(compargs[10]),
+            #         "rng_key": self._leaf_summary(compargs[11]),
+            #     }
+            #     self._record_or_diff(num_tokens, baseline_args)
             if self.use_aot_forward:
                 compiled = self._step_fn.lower(num_tokens, *compargs).compile()
                 self._cache_put(fused_key, compiled)
@@ -702,7 +763,10 @@ class ExecutionManager:
         Returns:
             Compiled fused step function for the specified number of tokens.
         """
-        key = (num_tokens, "fused")
+
+        mode = "aot" if self.use_aot_forward else "jit"
+        key = (num_tokens, "fused", mode)
+
         if key in self._lowerd_history:
             ...
         else:
@@ -720,32 +784,15 @@ class ExecutionManager:
         max_num_reqs: int,
         padded_num_reqs: int,  # unused - kept for API compatibility
         metadata: RaggedPagesCacheView,
-    ) -> tuple:
+    ):
         """Generate example arguments for fused step function compilation.
 
         Creates mock input arguments with the correct shapes and types for
         compiling the fused step execution function. These arguments are used
-        to trace through the function during compilation.
-
-        Args:
-            kv_pages: KV cache pages to use in compilation.
-            rng_key: Random key for sampling operations.
-            num_tokens: Unused in fused mode, kept for API compatibility.
-            num_reqs_max_model_len: Unused in fused mode, kept for API compatibility.
-            max_pages_per_req: Unused in fused mode, kept for API compatibility.
-            max_num_reqs: Maximum number of requests.
-            padded_num_reqs: Unused in fused mode, kept for API compatibility.
-            metadata: Pages cache metadata.
-
-        Returns:
-            A tuple (None, None, fused_args) where fused_args contains the example
-            arguments for the fused step function.
-
-        Note:
-            The returned arguments contain zeros/ones as placeholder data since
-            only shapes and types matter for compilation.
+        to trace through the function during compilation. All arrays are
+        device_put to the exact shardings used at runtime to prevent AOT
+        variant recompiles.
         """
-        from .sequence_buffer import SequenceBuffer
 
         temp_buffer = SequenceBuffer.create(
             max_num_reqs=max_num_reqs,
@@ -754,7 +801,6 @@ class ExecutionManager:
             vocab_size=self.model.config.get_text_config().vocab_size,
             page_sizes=[metadata.page_size],
         )
-
         dev_state = temp_buffer.to_device_state()
 
         max_padded_slices = metadata.get_padded_num_slices(self.max_num_tokens, max_num_reqs)
@@ -770,7 +816,138 @@ class ExecutionManager:
             jnp.ones((max_num_reqs,), dtype=bool),
             jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
             jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            jnp.full((3, max_padded_slices), fill_value=SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
+            jnp.full((3, max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
             rng_key,
         ]
+
+        fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
+        for idx in (7, 8, 9, 10, 11):
+            if hasattr(fused_args[idx], "dtype"):
+                fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
+
         return fused_args
+
+    def _sharding_spec_str(self, x):
+        try:
+            sh = getattr(x, "sharding", None)
+            spec = getattr(sh, "spec", None)
+            return str(spec) if spec is not None else "None"
+        except Exception:
+            return "NA"
+
+    def _leaf_summary(self, x):
+        # Summarize an array-like or scalar-like leaf
+        if hasattr(x, "shape") and hasattr(x, "dtype"):
+            return ("array", tuple(x.shape), str(x.dtype), self._sharding_spec_str(x))
+        # For non-array leaves (scalars/objects), record type only
+        return (type(x).__name__, None, None, None)
+
+    def _snapshot_pytree(self, name, tree):
+        import jax
+
+        leaves, treedef = jax.tree_util.tree_flatten(tree)
+        return {
+            "name": name,
+            "treedef": str(treedef),
+            "leaves": [self._leaf_summary(le) for le in leaves],
+        }
+
+    def _snapshot_args_runtime(
+        self,
+        graphstate,
+        graphother,
+        dev_state,
+        kv_pages,
+        scheduled_full,
+        req_num_tokens_full,
+        active_mask_full,
+        input_ids_buf,
+        position_ids_buf,
+        slot_mapping_buf,
+        rng_key,
+    ):
+        # Note: graphdef is static and omitted at runtime (AOT)
+        return {
+            "dev_state": self._snapshot_pytree("dev_state", dev_state),
+            "scheduled_full": self._leaf_summary(scheduled_full),
+            "req_num_tokens_full": self._leaf_summary(req_num_tokens_full),
+            "active_mask_full": self._leaf_summary(active_mask_full),
+            "input_ids_buf": self._leaf_summary(input_ids_buf),
+            "position_ids_buf": self._leaf_summary(position_ids_buf),
+            "slot_mapping_buf": self._leaf_summary(slot_mapping_buf),
+            "rng_key": self._leaf_summary(rng_key),
+        }
+
+    def _compare_leaf(self, name, base_leaf, now_leaf, diffs):
+        b_kind, b_shape, b_dtype, b_shard = base_leaf
+        n_kind, n_shape, n_dtype, n_shard = now_leaf
+        if b_kind != n_kind:
+            diffs.append(f"{name}: kind {b_kind} -> {n_kind}")
+            return
+        if b_kind == "array":
+            if b_shape != n_shape:
+                diffs.append(f"{name}: shape {b_shape} -> {n_shape}")
+            if b_dtype != n_dtype:
+                diffs.append(f"{name}: dtype {b_dtype} -> {n_dtype}")
+            if b_shard != n_shard:
+                diffs.append(f"{name}: sharding {b_shard} -> {n_shard}")
+        else:
+            # Non-array leaf: just type differences matter
+            if b_kind != n_kind:
+                diffs.append(f"{name}: type {b_kind} -> {n_kind}")
+
+    def _compare_snapshots(self, baseline, current):
+        diffs = []
+
+        # Compare pytrees (graphstate, graphother, dev_state, kv_pages)
+        for key in ["graphstate", "graphother", "dev_state", "kv_pages"]:
+            b = baseline[key]
+            n = current[key]
+            if b["treedef"] != n["treedef"]:
+                diffs.append(f"{key}: treedef changed:\n  base={b['treedef']}\n  now ={n['treedef']}")
+                continue
+            # Compare leaves
+            bl = b["leaves"]
+            nl = n["leaves"]
+            if len(bl) != len(nl):
+                diffs.append(f"{key}: num leaves {len(bl)} -> {len(nl)}")
+            for i in range(min(len(bl), len(nl))):
+                self._compare_leaf(f"{key}.leaf[{i}]", bl[i], nl[i], diffs)
+
+        # Compare flat arrays/buffers
+        for key in [
+            "scheduled_full",
+            "req_num_tokens_full",
+            "active_mask_full",
+            "input_ids_buf",
+            "position_ids_buf",
+            "slot_mapping_buf",
+            "rng_key",
+        ]:
+            self._compare_leaf(key, baseline[key], current[key], diffs)
+
+        return diffs
+
+    def _mode_key(self):
+        return "aot" if self.use_aot_forward else "jit"
+
+    @property
+    def _debug_baselines(self):
+        if not hasattr(self, "__debug_baselines"):
+            self.__debug_baselines = {}
+        return self.__debug_baselines
+
+    def _record_or_diff(self, num_tokens, args_dict):
+        key = (int(num_tokens), "fused", self._mode_key())
+        if key not in self._debug_baselines:
+            self._debug_baselines[key] = args_dict
+            logger.info(f"[debug-diff] Recorded baseline for key={key}")
+            pprint.pprint(args_dict)
+            return
+        diffs = self._compare_snapshots(self._debug_baselines[key], args_dict)
+        if diffs:
+            logger.warning(f"[debug-diff] Mismatches vs baseline for key={key}:")
+            for d in diffs:
+                logger.warning(f"  - {d}")
+        else:
+            logger.debug(f"[debug-diff] No mismatches vs baseline for key={key}")
