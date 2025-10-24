@@ -933,8 +933,7 @@ class TrainingArguments:
         try:
             if self.weight_distribution_log_steps > 0 and ((step % self.weight_distribution_log_steps) == 0):
                 stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
-
-                stats = jax.experimental.multihost_utils.process_allgather(stats, tiled=True)
+                stats = jax.device_get(stats)
 
                 metrics = {}
                 for key, histogram in stats.items():
@@ -957,10 +956,11 @@ class TrainingArguments:
                     except Exception as e:
                         traceback.print_exc()
                         raise e
-            self.log_metrics(metrics, step)
 
-        except Exception:
-            logger.warn("Failed to log weight distribution...")
+                self.log_metrics(metrics, step)
+
+        except Exception as e:
+            logger.warn(f"Failed to log weight distribution {e}...")
 
     def _log_to_wandb(
         self,
