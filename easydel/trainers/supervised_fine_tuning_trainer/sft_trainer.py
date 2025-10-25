@@ -360,7 +360,7 @@ class SFTTrainer(Trainer):
             partial(
                 keep_arrays_map,
                 array_fields=["input_ids", "attention_mask", "position_ids", "assistant_masks", "completion_mask"],
-                drop_fields=["seq_lengths"],
+                drop_fields=["seq_lengths", "messages"],
             ),
             remove_columns=columns_names,
         )
