@@ -333,7 +333,7 @@ class eSurge:
             logger.warn("PageSize less than 256 is inefficient for gpu/cpu so we will automatically use 256 for you!")
             page_size = 256
         if reserve_tokens is None:
-            reserve_tokens = max_model_len // 12
+            reserve_tokens = max_model_len - max_num_seqs
 
         if max_model_len <= reserve_tokens:
             raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
@@ -343,8 +343,6 @@ class eSurge:
         self.page_size = page_size
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
-        if kwargs.pop("use_aot_forward", None) is not None:
-            logger.warning("`use_aot_forward` is deprecated (the fused step will be used now).")
         if isinstance(model, str):
             self.model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
