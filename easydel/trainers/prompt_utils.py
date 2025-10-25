@@ -674,6 +674,13 @@ def keep_arrays_map(
         if k in drop_fields:
             continue
         elif isinstance(v, list | np.ndarray | jax.Array):
+            if isinstance(v, list):
+                try:
+                    el = v[0]
+                    if isinstance(el, dict):
+                        continue
+                except Exception:
+                    ...
             results[k] = np.asarray(v)
     return results
 
