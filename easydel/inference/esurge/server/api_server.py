@@ -957,6 +957,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                     "object": "model",
                     "created": int(self.metrics.start_time),
                     "owned_by": "easydel",
+                    "max_model_len": adapter.esurge.max_model_len,
                     "metadata": {
                         **model_info,
                         "supports_chat": hasattr(adapter.processor, "apply_chat_template"),
