@@ -52,6 +52,7 @@ import jax
 from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
+from eformer.pytree import field as pytree_field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
@@ -121,18 +122,18 @@ class GuidedDecodingParams:
         ValueError: If multiple guided decoding modes are specified
     """
 
-    json: str | dict | None = None
-    regex: str | None = None
-    choice: list[str] | None = None
-    grammar: str | None = None
-    json_object: bool | None = None
-    backend: str | None = None
-    backend_was_auto: bool = False
-    disable_fallback: bool = False
-    disable_any_whitespace: bool = False
-    disable_additional_properties: bool = False
-    whitespace_pattern: str | None = None
-    structural_tag: str | None = None
+    json: str | dict | None = pytree_field(pytree_node=False, default=None)
+    regex: str | None = pytree_field(pytree_node=False, default=None)
+    choice: list[str] | None = pytree_field(pytree_node=False, default=None)
+    grammar: str | None = pytree_field(pytree_node=False, default=None)
+    json_object: bool | None = pytree_field(pytree_node=False, default=None)
+    backend: str | None = pytree_field(pytree_node=False, default=None)
+    backend_was_auto: bool = pytree_field(pytree_node=False, default=False)
+    disable_fallback: bool = pytree_field(pytree_node=False, default=False)
+    disable_any_whitespace: bool = pytree_field(pytree_node=False, default=False)
+    disable_additional_properties: bool = pytree_field(pytree_node=False, default=False)
+    whitespace_pattern: str | None = pytree_field(pytree_node=False, default=None)
+    structural_tag: str | None = pytree_field(pytree_node=False, default=None)
 
     def __post_init__(self):
         """Validates that only one guided decoding mode is specified.

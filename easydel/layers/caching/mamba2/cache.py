@@ -59,7 +59,7 @@ from __future__ import annotations
 
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
@@ -87,15 +87,15 @@ class Mamba2CacheMetaData(BaseCacheMetadata):
         n_groups (int): Number of groups for group operations.
     """
 
-    partition_axis: PartitionAxis
-    num_hidden_layers: int
-    batch_size: int
-    intermediate_size: int
-    num_heads: int
-    head_dim: int
-    state_size: int
-    conv_kernel_size: int
-    n_groups: int
+    partition_axis: PartitionAxis = field(pytree_node=False)
+    num_hidden_layers: int = field(pytree_node=False)
+    batch_size: int = field(pytree_node=False)
+    intermediate_size: int = field(pytree_node=False)
+    num_heads: int = field(pytree_node=False)
+    head_dim: int = field(pytree_node=False)
+    state_size: int = field(pytree_node=False)
+    conv_kernel_size: int = field(pytree_node=False)
+    n_groups: int = field(pytree_node=False)
 
     @classmethod
     def create(
@@ -184,9 +184,9 @@ class Mamba2CacheView(BaseCacheView):
     conv_states: Float[Array, "batch extended_size conv_kernel_size"] | ImplicitArray
     ssm_states: Float[Array, "batch num_heads head_dim state_size"] | ImplicitArray
     positions: Int[Array, "batch"]  # noqa: F821
-    seqlen_offset: int
+    seqlen_offset: int = field(pytree_node=False)
     metadata: Mamba2CacheMetaData
-    layer_index: int | None = None
+    layer_index: int | None = field(pytree_node=False, default=None)
 
     @classmethod
     def init(

@@ -124,16 +124,16 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
     It inherits from `BaseCacheMetadata`.
     """
 
-    num_hidden_layers: int
-    max_model_length: int
-    num_kv_heads: int
-    k_headdim: int
-    v_headdim: int
-    hbm_utilization: float = 0.9
-    page_size: int = 128
-    num_pages: int = -1
-    max_num_pages_per_req: int = -1
-    num_slices_per_kv_cache_update_page: int = -1
+    num_hidden_layers: int = field(pytree_node=False)
+    max_model_length: int = field(pytree_node=False)
+    num_kv_heads: int = field(pytree_node=False)
+    k_headdim: int = field(pytree_node=False)
+    v_headdim: int = field(pytree_node=False)
+    hbm_utilization: float = field(pytree_node=False, default=0.9)
+    page_size: int = field(pytree_node=False, default=128)
+    num_pages: int = field(pytree_node=False, default=-1)
+    max_num_pages_per_req: int = field(pytree_node=False, default=-1)
+    num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
     _kvdtype_str: str = field(pytree_node=False, default="bf16")
 
     @staticmethod
@@ -241,7 +241,7 @@ class RaggedPagesCacheView(BaseCacheView):
     """
 
     metadata: RaggedPagesCacheMetaData
-    layer_index: int
+    layer_index: int = field(pytree_node=False)
 
     kv_pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"] | ImplicitArray
     partition_manager: PartitionManager = field(
