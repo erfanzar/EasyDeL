@@ -333,7 +333,7 @@ class eSurge:
             logger.warn("PageSize less than 256 is inefficient for gpu/cpu so we will automatically use 256 for you!")
             page_size = 256
         if reserve_tokens is None:
-            reserve_tokens = max_model_len - max_num_seqs
+            reserve_tokens = max_num_seqs
 
         if max_model_len <= reserve_tokens:
             raise ValueError(f"Configuration error: max_model_len={max_model_len} <= reserve_tokens={reserve_tokens}")
