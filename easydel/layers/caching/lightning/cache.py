@@ -51,7 +51,7 @@ import typing as tp
 import jax
 from eformer import escale as es
 from eformer.jaximus import ImplicitArray
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
@@ -91,14 +91,14 @@ class LightningCacheMetaData(BaseCacheMetadata):
             Can differ from head_dim for asymmetric attention.
     """
 
-    partition_axis: es.PartitionAxis
-    batch_size: int | None
-    num_heads: int | None
-    head_dim: int | None
-    key_heads: int | None
-    value_heads: int | None
-    key_dim: int | None
-    value_dim: int | None
+    partition_axis: es.PartitionAxis = field(pytree_node=False)
+    batch_size: int | None = field(pytree_node=False)
+    num_heads: int | None = field(pytree_node=False)
+    head_dim: int | None = field(pytree_node=False)
+    key_heads: int | None = field(pytree_node=False)
+    value_heads: int | None = field(pytree_node=False)
+    key_dim: int | None = field(pytree_node=False)
+    value_dim: int | None = field(pytree_node=False)
 
     @classmethod
     def create(
@@ -175,7 +175,7 @@ class LightningCacheView(BaseCacheView):
 
     key_value: Float[Array, "batch seq_len num_heads head_dim"] | ImplicitArray | None
     metadata: LightningCacheMetaData
-    layer_index: int | None = None
+    layer_index: int | None = field(pytree_node=False, default=None)
 
     @classmethod
     def init(cls, metadata: LightningCacheMetaData, layer_index: int | None = None) -> LightningCacheView:

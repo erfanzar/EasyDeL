@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import jax
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 
 from ...sampling_params import SamplingParams
 
@@ -27,9 +27,9 @@ class CachedRequestState:
     sampling_params: SamplingParams
     generator: jax.random.PRNGKey
     page_ids: tuple[list[int], ...]
-    num_computed_tokens: int
+    num_computed_tokens: int = field(pytree_node=False)
     output_token_ids: list[int]
-    num_prompt_tokens: int = -1
+    num_prompt_tokens: int = field(pytree_node=False, default=-1)
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)

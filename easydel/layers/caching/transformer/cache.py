@@ -112,11 +112,11 @@ class AttnMaskDetail:
         bricks (int | None): Number of bricks for blocked attention patterns.
     """
 
-    mask_type: Enum
-    size: int
-    offset: int | None = None
-    chunks: int | None = None
-    bricks: int | None = None
+    mask_type: Enum = field(pytree_node=False)
+    size: int = field(pytree_node=False)
+    offset: int | None = field(pytree_node=False, default=None)
+    chunks: int | None = field(pytree_node=False, default=None)
+    bricks: int | None = field(pytree_node=False, default=None)
 
 
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -215,22 +215,22 @@ class TransformerCacheMetaData(BaseCacheMetadata):
         create_attention_bias (bool): Whether to create attention bias terms.
     """
 
-    batch_size: int
-    sequence_length: int
-    num_hidden_layers: int
-    pad_token_id: int
+    batch_size: int = field(pytree_node=False)
+    sequence_length: int = field(pytree_node=False)
+    num_hidden_layers: int = field(pytree_node=False)
+    pad_token_id: int = field(pytree_node=False)
     # Optional attention-related fields
-    num_heads: int | None
-    head_dim: int | None
-    key_heads: int | None
-    value_heads: int | None
-    key_dim: int | None
-    value_dim: int | None
-    sliding_window: int | None
+    num_heads: int | None = field(pytree_node=False)
+    head_dim: int | None = field(pytree_node=False)
+    key_heads: int | None = field(pytree_node=False)
+    value_heads: int | None = field(pytree_node=False)
+    key_dim: int | None = field(pytree_node=False)
+    value_dim: int | None = field(pytree_node=False)
+    sliding_window: int | None = field(pytree_node=False)
 
     # Configuration flags
-    update_causal_mask: bool
-    create_attention_bias: bool
+    update_causal_mask: bool = field(pytree_node=False)
+    create_attention_bias: bool = field(pytree_node=False)
 
     @classmethod
     def create(
@@ -347,8 +347,8 @@ class TransformerCacheView(BaseCacheView):
 
     maximum_sequence_length: int = field(pytree_node=False)
 
-    layer_index: int | None = None
-    masking_details: AttnMaskDetail | None = None
+    layer_index: int | None = field(pytree_node=False, default=None)
+    masking_details: AttnMaskDetail | None = field(pytree_node=False, default=None)
 
     @classmethod
     def init(
@@ -811,6 +811,6 @@ class TransformerMetadata(BaseRunTimeMetadata):
             Tracks generation progress per sequence.
     """
 
-    postpadded: bool = False
+    postpadded: bool = field(pytree_node=False, default=False)
     starts: Int[JAXArray, "batch"] | None = None  # noqa: F821
     indexs: Int[JAXArray, "batch"] | None = None  # noqa: F821

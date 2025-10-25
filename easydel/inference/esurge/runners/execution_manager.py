@@ -41,13 +41,16 @@ Example:
 
 from __future__ import annotations
 
+import hashlib
 import typing
 from collections import OrderedDict
 from functools import partial
 
 import jax
+import numpy
 from eformer import escale as es
 from eformer.loggings import ProgressLogger, get_logger
+from eformer.pytree import key_path_to_str
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src import pjit
@@ -105,6 +108,49 @@ def _device_put_tree_uniform(tree, sharding):
     leaves, treedef = jax.tree_util.tree_flatten(tree)
     shardings_tree = jax.tree_util.tree_unflatten(treedef, [sharding] * len(leaves))
     return _device_put_tree_with_shardings(tree, shardings_tree)
+
+
+def _tree_hash(tree):
+    def _map(p, x):
+        p = key_path_to_str(p)
+        maybe_info = (
+            f"-{type(x)}"
+            + "-"
+            + str(getattr(x, "shape", "None"))
+            + "-"
+            + str(getattr(x, "dtype", "None"))
+            + "-"
+            + str(getattr(x, "sharding", "None"))
+        )
+        if isinstance(x, int | float | bool):
+            maybe_info = f"-{x}"
+        return (
+            hashlib.md5(
+                str(
+                    p
+                    + str(type(x))
+                    + str(getattr(x, "shape", "None"))
+                    + str(getattr(x, "dtype", "None"))
+                    + str(getattr(x, "sharding", "None"))
+                ).encode()
+            ).hexdigest()
+            + maybe_info
+        )
+
+    return jax.tree_util.tree_map_with_path(
+        _map, tree, is_leaf=lambda x: isinstance(x, jax.Array | numpy.ndarray | int | float | bool)
+    )
+
+
+def _tree_hash_diff(tree_hash1, tree_hash2):
+    def _map(p, t1, t2):
+        p = key_path_to_str(p)
+        oo = t1 == t2
+        if not oo:
+            print(f"p : {p} oo : {oo} t1 : {t1} t2 : {t2}")
+        return oo
+
+    return jax.tree_util.tree_map_with_path(_map, tree_hash1, tree_hash2, is_leaf=lambda x: isinstance(x, str))
 
 
 class ExecutionManager:
@@ -182,9 +228,9 @@ class ExecutionManager:
         self.metadata = metadata
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
-        self.rng_key = jax.random.PRNGKey(0)
-
         self._empty_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+        self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
 
         self._step_fn: None | pjit.JitWrapped = None
         self._cache_capacity = 64
@@ -266,9 +312,10 @@ class ExecutionManager:
 
         """
         fn = self.get_compiled_key(num_tokens, padded_num_reqs)
-        # self._record_or_diff(
-        #     num_tokens,
-        #     self._snapshot_args_runtime(
+
+        # comp_hash = self._debug_baselines[f"{num_tokens}_hash_in"]
+        # new_hash = _tree_hash(
+        #     (
         #         self.graphstate,
         #         self.graphother,
         #         dev_state,
@@ -280,8 +327,9 @@ class ExecutionManager:
         #         position_ids_buf,
         #         slot_mapping_buf,
         #         self.rng_key,
-        #     ),
+        #     )
         # )
+        # _ = _tree_hash_diff(comp_hash, new_hash)
         result = fn(
             self.graphstate,
             self.graphother,
@@ -484,7 +532,7 @@ class ExecutionManager:
                 self._empty_sharding,  # input_ids_buf
                 self._empty_sharding,  # position_ids_buf
                 self._empty_sharding,  # slot_mapping_buf
-                None,  # rng_key
+                self._empty_sharding,  # rng_key
             ),
             out_shardings=(
                 self._empty_sharding,  # dev_state (updated)
@@ -495,7 +543,7 @@ class ExecutionManager:
                 self._empty_sharding,  # seq_lens_buf
                 self._empty_sharding,  # pages_tables_buf
                 self._empty_sharding,  # slot_mapping_buf
-                None,  # rng_key
+                self._empty_sharding,  # rng_key
                 self._empty_sharding,  # out_tokens (full-size, masked)
                 self._empty_sharding,  # valid_mask (full-size)
                 self._empty_sharding,  # hidden_states
@@ -693,20 +741,6 @@ class ExecutionManager:
         fused_key = (num_tokens, "fused", mode)
 
         if fused_key not in self._lowerd_history:
-            # baseline_args = {
-            #     "graphstate": self._snapshot_pytree("graphstate", compargs[1]),
-            #     "graphother": self._snapshot_pytree("graphother", compargs[2]),
-            #     "dev_state": self._snapshot_pytree("dev_state", compargs[3]),
-            #     "kv_pages": self._snapshot_pytree("kv_pages", compargs[4]),
-            #     "scheduled_full": self._leaf_summary(compargs[5]),
-            #     "req_num_tokens_full": self._leaf_summary(compargs[6]),
-            #     "active_mask_full": self._leaf_summary(compargs[7]),
-            #     "input_ids_buf": self._leaf_summary(compargs[8]),
-            #     "position_ids_buf": self._leaf_summary(compargs[9]),
-            #     "slot_mapping_buf": self._leaf_summary(compargs[10]),
-            #     "rng_key": self._leaf_summary(compargs[11]),
-            # }
-            # self._record_or_diff(num_tokens, baseline_args)
             if self.use_aot_forward:
                 compiled = self._step_fn.lower(num_tokens, *compargs).compile()
                 self._cache_put(fused_key, compiled)
@@ -723,7 +757,7 @@ class ExecutionManager:
                     compargs[10],  # slot_mapping_buf (PartitionSpec())
                     compargs[11],  # rng_key (None)
                 )
-                _, self.kv_pages, *_ = compiled(*warm_args)
+                self._debug_baselines[f"{num_tokens}_hash_in"] = _tree_hash(warm_args)
             else:
                 partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
 
@@ -814,135 +848,8 @@ class ExecutionManager:
         ]
 
         fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
-        for idx in (5, 6, 7, 8, 9, 10):
+        for idx in (5, 6, 7, 8, 9, 10, 11):
             if hasattr(fused_args[idx], "dtype"):
                 fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
 
         return fused_args
-
-    def _sharding_spec_str(self, x):
-        try:
-            sh = getattr(x, "sharding", None)
-            spec = getattr(sh, "spec", None)
-            return str(spec) if spec is not None else "None"
-        except Exception:
-            return "NA"
-
-    def _leaf_summary(self, x):
-        # Summarize an array-like or scalar-like leaf
-        if hasattr(x, "shape") and hasattr(x, "dtype"):
-            return ("array", tuple(x.shape), str(x.dtype), self._sharding_spec_str(x))
-        # For non-array leaves (scalars/objects), record type only
-        return (type(x).__name__, None, None, None)
-
-    def _snapshot_pytree(self, name, tree):
-        import jax
-
-        leaves, treedef = jax.tree_util.tree_flatten(tree)
-        return {
-            "name": name,
-            "treedef": str(treedef),
-            "leaves": [self._leaf_summary(le) for le in leaves],
-        }
-
-    def _snapshot_args_runtime(
-        self,
-        graphstate,
-        graphother,
-        dev_state,
-        kv_pages,
-        scheduled_full,
-        req_num_tokens_full,
-        active_mask_full,
-        input_ids_buf,
-        position_ids_buf,
-        slot_mapping_buf,
-        rng_key,
-    ):
-        # Note: graphdef is static and omitted at runtime (AOT)
-        return {
-            "graphstate": self._snapshot_pytree("graphstate", graphstate),
-            "graphother": self._snapshot_pytree("graphother", graphother),
-            "dev_state": self._snapshot_pytree("dev_state", dev_state),
-            "kv_pages": self._snapshot_pytree("kv_pages", kv_pages),
-            "scheduled_full": self._leaf_summary(scheduled_full),
-            "req_num_tokens_full": self._leaf_summary(req_num_tokens_full),
-            "active_mask_full": self._leaf_summary(active_mask_full),
-            "input_ids_buf": self._leaf_summary(input_ids_buf),
-            "position_ids_buf": self._leaf_summary(position_ids_buf),
-            "slot_mapping_buf": self._leaf_summary(slot_mapping_buf),
-            "rng_key": self._leaf_summary(rng_key),
-        }
-
-    def _compare_leaf(self, name, base_leaf, now_leaf, diffs):
-        b_kind, b_shape, b_dtype, b_shard = base_leaf
-        n_kind, n_shape, n_dtype, n_shard = now_leaf
-        if b_kind != n_kind:
-            diffs.append(f"{name}: kind {b_kind} -> {n_kind}")
-            return
-        if b_kind == "array":
-            if b_shape != n_shape:
-                diffs.append(f"{name}: shape {b_shape} -> {n_shape}")
-            if b_dtype != n_dtype:
-                diffs.append(f"{name}: dtype {b_dtype} -> {n_dtype}")
-            if b_shard != n_shard:
-                diffs.append(f"{name}: sharding {b_shard} -> {n_shard}")
-        else:
-            # Non-array leaf: just type differences matter
-            if b_kind != n_kind:
-                diffs.append(f"{name}: type {b_kind} -> {n_kind}")
-
-    def _compare_snapshots(self, baseline, current):
-        diffs = []
-
-        # Compare pytrees (graphstate, graphother, dev_state, kv_pages)
-        for key in [
-            "graphstate",
-            "graphother",
-            "dev_state",
-            "kv_pages",
-        ]:
-            b = baseline[key]
-            n = current[key]
-            if b["treedef"] != n["treedef"]:
-                diffs.append(f"{key}: treedef changed:\n  base={b['treedef']}\n  now ={n['treedef']}")
-                continue
-            # Compare leaves
-            bl = b["leaves"]
-            nl = n["leaves"]
-            if len(bl) != len(nl):
-                diffs.append(f"{key}: num leaves {len(bl)} -> {len(nl)}")
-            for i in range(min(len(bl), len(nl))):
-                self._compare_leaf(f"{key}.leaf[{i}]", bl[i], nl[i], diffs)
-
-        # Compare flat arrays/buffers
-        for key in [
-            "scheduled_full",
-            "req_num_tokens_full",
-            "active_mask_full",
-            "input_ids_buf",
-            "position_ids_buf",
-            "slot_mapping_buf",
-            "rng_key",
-        ]:
-            self._compare_leaf(key, baseline[key], current[key], diffs)
-
-        return diffs
-
-    def _mode_key(self):
-        return "aot" if self.use_aot_forward else "jit"
-
-    def _record_or_diff(self, num_tokens, args_dict):
-        key = (int(num_tokens), "fused", self._mode_key())
-        if key not in self._debug_baselines:
-            self._debug_baselines[key] = args_dict
-            logger.info(f"[debug-diff] Recorded baseline for key={key} | {self._debug_baselines.keys()}")
-            return
-
-        diffs = self._compare_snapshots(self._debug_baselines[key], args_dict)
-        if diffs:
-            logger.warning(f"[debug-diff] Mismatches vs baseline for key={key}:")
-            for d in diffs:
-                logger.warning(f"  - {d}")
-        else:
-            logger.warning(f"[debug-diff] No mismatches vs baseline for key={key}")

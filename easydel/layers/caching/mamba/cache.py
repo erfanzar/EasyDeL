@@ -61,7 +61,7 @@ from __future__ import annotations
 from eformer import escale as es
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
-from eformer.pytree import auto_pytree
+from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
@@ -92,12 +92,12 @@ class MambaCacheMetaData(BaseCacheMetadata):
     """
 
     # Required fields
-    num_hidden_layers: int
-    partition_axis: es.PartitionAxis
-    batch_size: int
-    intermediate_size: int
-    ssm_state_size: int
-    conv_kernel_size: int
+    num_hidden_layers: int = field(pytree_node=False)
+    partition_axis: es.PartitionAxis = field(pytree_node=False)
+    batch_size: int = field(pytree_node=False)
+    intermediate_size: int = field(pytree_node=False)
+    ssm_state_size: int = field(pytree_node=False)
+    conv_kernel_size: int = field(pytree_node=False)
 
     @classmethod
     def create(
@@ -170,7 +170,7 @@ class MambaCacheView(BaseCacheView):
     ssm_states: Float[Array, "batch intermediate_size ssm_state_size"] | ImplicitArray
     positions: Int[Array, "batch"]  # noqa: F821
     metadata: MambaCacheMetaData
-    layer_index: int | None = None
+    layer_index: int | None = field(pytree_node=False, default=None)
 
     @classmethod
     def init(
