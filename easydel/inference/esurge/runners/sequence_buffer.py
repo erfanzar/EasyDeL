@@ -255,7 +255,7 @@ class SequenceBuffer:
     _req_ids: list[str | None] = field(default_factory=list, pytree_node=False)
     req_id_to_index: dict[str, int] = field(default_factory=dict, pytree_node=False)
     req_output_token_ids: list[list[int] | None] = field(default_factory=list, pytree_node=False)
-
+    request_distribution: list[int] = field(default_factory=lambda: [0, 0, 0], pytree_node=False)
     greedy_reqs: set[str] = field(default_factory=set, pytree_node=False)
     random_reqs: set[str] = field(default_factory=set, pytree_node=False)
     top_p_reqs: set[str] = field(default_factory=set, pytree_node=False)
