@@ -30,10 +30,10 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
 
+from easydel.layers.caching.ragged_page.utils import kv_cache_update, kv_cache_update_jax
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
-from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -47,6 +47,7 @@ MODE_PREFILL = common_types.MODE_PREFILL
 logger = get_logger(__name__)
 
 PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
+USE_V2 = check_bool_flag("USE_RAGGED_PAGEV2")
 
 
 def cdiv(a: int, b: int) -> int:
@@ -280,8 +281,20 @@ class RaggedPagesCacheView(BaseCacheView):
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-        kv_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads * 2, metadata.k_headdim)
-        axes = [common_types.EMPTY, common_types.EMPTY, common_types.KV_HEAD, common_types.EMPTY]
+        if USE_V2:
+            kv_pages_shape = (metadata.num_pages, metadata.page_size, metadata.num_kv_heads * 2, metadata.k_headdim)
+            axes = [common_types.EMPTY, common_types.EMPTY, common_types.KV_HEAD, common_types.EMPTY]
+        else:
+            packing = get_dtype_packing(metadata.kvdtype)
+            aligned_heads = cdiv(metadata.num_kv_heads * 2, packing) * packing
+            kv_pages_shape = (
+                metadata.num_pages,
+                metadata.page_size,
+                aligned_heads // packing,
+                packing,
+                metadata.k_headdim,
+            )
+            axes = [common_types.EMPTY, common_types.EMPTY, common_types.KV_HEAD, common_types.EMPTY, common_types.EMPTY]
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
@@ -295,58 +308,60 @@ class RaggedPagesCacheView(BaseCacheView):
         value: Float[Array, "batch seq_len num_value_heads head_dim"],
         cache_metadata: RaggedPagesMetadata,
     ) -> RaggedPagesCacheView:
-        num_kv_heads = key.shape[2]
-        head_size = key.shape[3]
-        key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
-        value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
-        use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
-        use_shardmap = use_kernel
+        if USE_V2:
+            num_kv_heads = key.shape[2]
+            head_size = key.shape[3]
+            key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+            value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+            use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
+            use_shardmap = use_kernel
 
-        def _update_fn(
-            kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
-            slots: Int[Array, "num_tokens"],  # noqa: F821
-            pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"],
-            num_update_slices: Int[Array, ""],
-        ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
-            orgshape = pages.shape
-            pages = pages.reshape(-1, *orgshape[2:])
-            if use_kernel:
-                pages = kv_cache_update(
-                    kv,
-                    slots,
-                    pages,
-                    num_update_slices,
-                    page_size=cache_metadata.page_size,
-                    slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
+            def _update_fn(
+                kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
+                slots: Int[Array, "num_tokens"],  # noqa: F821
+                pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"],
+                num_update_slices: Int[Array, ""],
+            ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+                orgshape = pages.shape
+                pages = pages.reshape(-1, *orgshape[2:])
+                if use_kernel:
+                    pages = kv_cache_update(
+                        kv,
+                        slots,
+                        pages,
+                        num_update_slices,
+                        page_size=cache_metadata.page_size,
+                        slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
+                    )
+                else:
+                    pages = kv_cache_update_jax(
+                        kv,
+                        slots,
+                        pages,
+                        num_update_slices,
+                        page_size=cache_metadata.page_size,
+                    )
+                return pages.reshape(*orgshape)
+
+            if use_shardmap:
+                resolve = self.partition_manager.resolve
+                _update_fn = jax.shard_map(
+                    _update_fn,
+                    in_specs=(
+                        resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY], mode=MODE_PREFILL),
+                    ),
+                    out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
+                    mesh=es.get_incontext_mesh(),
+                    check_vma=False,
                 )
-            else:
-                pages = kv_cache_update_jax(
-                    kv,
-                    slots,
-                    pages,
-                    num_update_slices,
-                    page_size=cache_metadata.page_size,
-                )
-            return pages.reshape(*orgshape)
 
-        if use_shardmap:
-            resolve = self.partition_manager.resolve
-            _update_fn = jax.shard_map(
-                _update_fn,
-                in_specs=(
-                    resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-                    resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
-                    resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-                    resolve([EMPTY], mode=MODE_PREFILL),
-                ),
-                out_specs=resolve([EMPTY, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL),
-                mesh=es.get_incontext_mesh(),
-                check_vma=False,
-            )
-
-        kvs = jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size)
-        kv_pages = _update_fn(kvs, cache_metadata.slot_mapping, self.kv_pages, cache_metadata.num_kv_update_slices)
-        return self.replace(kv_pages=kv_pages)
+            kvs = jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size)
+            kv_pages = _update_fn(kvs, cache_metadata.slot_mapping, self.kv_pages, cache_metadata.num_kv_update_slices)
+            return self.replace(kv_pages=kv_pages)
+        return self
 
     @property
     def key_pages(self) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
