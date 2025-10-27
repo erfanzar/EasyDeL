@@ -60,7 +60,7 @@ from functools import partial
 
 import jax
 from eformer import common_types
-from eformer.escale import PartitionManager, get_incontext_mesh
+from eformer.escale import PartitionManager
 from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
@@ -1698,9 +1698,8 @@ class ParallelMoELinear(nn.Module):
         """
         weight = self.kernel.value
         weight_axes = self.alt_sharding_axis
-        fn = partial(self._ragged_dot, out_first=self.out_first)
 
-        if self.use_pallas_group_matmul and self.out_first:
+        if self.out_first:
             weight = jnp.transpose(weight, (0, 2, 1))
             if weight_axes is not None:
                 weight_axes = [weight_axes[0], weight_axes[2], weight_axes[1]]
@@ -1716,162 +1715,12 @@ class ParallelMoELinear(nn.Module):
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
 
-        if self.can_use_shard_map and self.use_pallas_group_matmul:
-            resolve = self.partition_manager.resolve
-            mesh = get_incontext_mesh() or self.partition_manager.mesh
-            in_axis_logical = weight_axes[1]
-            out_axis_logical = weight_axes[2]
-            axis_name = self.partition_manager.paxis.resolve_axis(axes=[in_axis_logical], mode=MODE_TRAIN)[0]
-            need_tp_psum = (self.direction == "row") and isinstance(axis_name, str) and (axis_name in mesh.axis_names)
-            group_sizes = group_sizes.astype(jnp.int32)
-            if isinstance(axis_name, str):
-                need_tp_psum &= mesh.shape[axis_name] > 1
-
-            def mapped_fn(
-                x: Float[Array, "tokens hidden"],
-                w: Float[Array, "experts in_dim out_dim"],
-                gs: Int[Array, "groups"],  # noqa
-            ) -> Float[Array, "tokens out_dim"]:
-                y = self._grouped_matmul(x, w, gs)
-                if need_tp_psum:
-                    y = jax.lax.psum(y, axis_name=axis_name)
-                return y
-
-            inputs_axes = [None, in_axis_logical]
-
-            out_axes = [None, out_axis_logical]
-
-            fn = shard_map(
-                mapped_fn,
-                mesh=mesh,
-                in_specs=(
-                    resolve(axes=inputs_axes, mode=MODE_TRAIN, shape=inputs.shape),
-                    resolve(axes=weight_axes, mode=MODE_TRAIN, shape=weight.shape),
-                    resolve(axes=[None], mode=MODE_TRAIN, shape=group_sizes.shape),
-                ),
-                out_specs=resolve(axes=out_axes, mode=MODE_TRAIN, shape=(inputs.shape[0], self.out_features)),
-                check_vma=False,
-            )
-
-        output = fn(inputs, weight, group_sizes)
+        output = grouped_matmul(inputs, weight, group_sizes, platform="xla", preferred_element_type=jnp.bfloat16)
 
         if self.bias is not None:
             output += self._expand_bias_ragged(group_sizes)
 
         return output
-
-    @staticmethod
-    def _ragged_dot(
-        inputs: Float[Array, "tokens_ragged in_dim"],
-        weight: Float[Array, "num_experts in_dim out_dim"],
-        group_sizes: Int[Array, "num_groups"],  # noqa
-        *,
-        out_first: bool,
-    ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Performs ragged dot product using `jax.lax.ragged_dot_general`.
-
-        This method handles matrix multiplication where different experts process
-        different numbers of tokens (ragged batches). It's more flexible than
-        standard batched matrix multiplication and handles variable-length groups
-        efficiently.
-
-        Args:
-            inputs: The input array containing all tokens concatenated.
-                Shape: (total_tokens, in_features).
-            weight: The weight matrices for all experts.
-                Shape: (num_experts, in_features, out_features) if out_first=False,
-                or (num_experts, out_features, in_features) if out_first=True.
-            group_sizes: Number of tokens assigned to each expert.
-                Shape: (num_experts,). Sum should equal total_tokens.
-            out_first: If True, weight shape is (experts, out, in) and the
-                contraction happens on the last dimension. If False, weight
-                shape is (experts, in, out) and contraction is on dimension 1.
-
-        Returns:
-            The result of the ragged dot product where each token has been
-            transformed by its assigned expert's weights.
-            Shape: (total_tokens, out_features).
-
-        Example:
-            >>> # 10 tokens split among 3 experts: [3, 4, 3]
-            >>> inputs = jnp.ones((10, 64))  # 10 tokens, 64 input features
-            >>> weights = jnp.ones((3, 64, 128))  # 3 experts, 64->128 transform
-            >>> group_sizes = jnp.array([3, 4, 3])
-            >>> output = ParallelMoELinear._ragged_dot(
-            ...     inputs, weights, group_sizes, out_first=False)
-            >>> # output shape: (10, 128)
-        """
-        return jax.lax.ragged_dot_general(
-            lhs=inputs,
-            rhs=weight,
-            group_sizes=group_sizes,
-            ragged_dot_dimension_numbers=jax.lax.RaggedDotDimensionNumbers(
-                dot_dimension_numbers=(((1,), (2,)) if out_first else ((1,), (1,)), ((), ())),
-                lhs_ragged_dimensions=(0,),
-                rhs_group_dimensions=(0,),
-            ),
-        )
-
-    @staticmethod
-    def _grouped_matmul(
-        inputs: Float[Array, "tokens_ragged in_dim"],
-        weight: Float[Array, "num_experts in_dim out_dim"],
-        group_sizes: Int[Array, "num_groups"],  # noqa
-    ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Performs grouped matrix multiplication using the Pallas kernel.
-
-        This method uses a highly optimized Pallas kernel (grouped_matmul) specifically
-        designed for TPUs. It provides significant speedup over standard ragged
-        operations by leveraging TPU-specific matrix units and tiling strategies.
-
-        Args:
-            inputs: The input array containing all tokens concatenated.
-                Shape: (total_tokens, in_features). May be padded to multiple
-                of 512 for optimal TPU performance.
-            weight: The weight matrices for all experts.
-                Shape: (num_experts, in_features, out_features).
-            group_sizes: Number of tokens assigned to each expert.
-                Shape: (num_experts,). Determines how inputs are grouped.
-
-        Returns:
-            The result of grouped matrix multiplication where each group of
-            tokens has been transformed by its corresponding expert weights.
-            Shape: (total_tokens, out_features).
-
-        Note:
-            - Input is automatically padded to multiple of 512 if needed
-            - Uses optimized tiling: (512, 1024, 1024) for (M, K, N) dimensions
-            - Falls back to interpreter mode on non-TPU backends
-            - Padding is removed from output to match original batch size
-
-        Example:
-            >>> # Optimized grouped matmul for TPU
-            >>> inputs = jnp.ones((1000, 768))  # Will be padded to 1024
-            >>> weights = jnp.ones((8, 768, 3072))  # 8 experts
-            >>> group_sizes = jnp.array([125, 125, 125, 125, 125, 125, 125, 125])
-            >>> output = ParallelMoELinear._grouped_matmul(inputs, weights, group_sizes)
-        """
-        group_sizes = group_sizes.astype(jnp.int32)
-
-        padding_amount = 0
-        pad_length = 512
-        input_shape = inputs.shape
-
-        if input_shape[0] % pad_length:
-            padding_amount = pad_length - input_shape[0] % pad_length
-            inputs = jax.lax.pad(inputs, jnp.array(0.0, dtype=inputs.dtype), [(0, padding_amount, 0), (0, 0, 0)])
-
-        out = grouped_matmul(
-            inputs,
-            weight,
-            group_sizes,
-            preferred_element_type=jnp.bfloat16 if jax.default_backend() == "tpu" else inputs.dtype,
-            tiling=(min(inputs.shape[0], 512), min(inputs.shape[1], 1024), min(weight.shape[2], 1024)),
-            interpret=jax.default_backend() != "tpu",
-        )
-        if padding_amount > 0:
-            out = out[: input_shape[0]]
-        return out
 
     def _expand_bias_ragged(self, group_sizes: Int[Array, "num_groups"]) -> Float[Array, "tokens_ragged out_dim"]:  # noqa
         """Expands the bias to match the ragged batch structure.
