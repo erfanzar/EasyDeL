@@ -1697,12 +1697,6 @@ class ParallelMoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
-        weight_axes = self.alt_sharding_axis
-
-        if self.out_first:
-            weight = jnp.transpose(weight, (0, 2, 1))
-            if weight_axes is not None:
-                weight_axes = [weight_axes[0], weight_axes[2], weight_axes[1]]
 
         if weight.dtype in (
             jnp.float8_e4m3b11fnuz,
@@ -1715,7 +1709,14 @@ class ParallelMoELinear(nn.Module):
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
 
-        output = grouped_matmul(inputs, weight, group_sizes, platform="xla", preferred_element_type=jnp.bfloat16)
+        output = grouped_matmul(
+            inputs,
+            weight,
+            group_sizes,
+            platform="xla",
+            preferred_element_type=jnp.bfloat16,
+            transpose_rhs=self.out_first,
+        )
 
         if self.bias is not None:
             output += self._expand_bias_ragged(group_sizes)
