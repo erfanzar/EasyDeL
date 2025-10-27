@@ -507,8 +507,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                 finish_reason = completion.finish_reason
             else:
                 finish_reason = finish_reason_extracted
-            if finish_reason == "finished":
-                finish_reason = "stop"
             choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
 
         usage = UsageInfo(

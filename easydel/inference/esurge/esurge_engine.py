@@ -1360,7 +1360,7 @@ class eSurge:
                         comp = ro.outputs[0]
                         ro.finished = True
                         comp.finish_reason = (
-                            str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
+                            str(engine_output.finish_reason) if engine_output.finish_reason else "stop"
                         )
 
                         num_generated = len(rd["generated_tokens"])
