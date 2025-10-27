@@ -572,10 +572,19 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                     current_tps = output.tokens_per_second
                     elapsed_time = output.processing_time
 
+                    current_text = output.accumulated_text or ""
+                    # Prefer computing delta from accumulated_text to recover skipped chunks.
+                    if current_text.startswith(previous_text):
+                        delta_text = current_text[len(previous_text) :]
+                        if not delta_text:
+                            delta_text = output.delta_text or ""
+                    else:
+                        delta_text = output.delta_text or current_text
+                    if not delta_text and not previous_text:
+                        delta_text = current_text
+
                     # Get delta message from tool parser if available
                     if tool_parser:
-                        current_text = output.accumulated_text
-                        delta_text = output.delta_text
                         current_token_ids = output.outputs[0].token_ids if output.outputs else []
                         delta_token_ids = (
                             current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
@@ -604,10 +613,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                             continue  # Skip this chunk entirely
                         else:
                             # No special parsing needed for this chunk
-                            delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+                            delta_message = DeltaMessage(content=delta_text, role="assistant")
                     else:
+                        previous_text = current_text
+                        current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                        previous_token_ids = current_token_ids
                         # No tool parsing, regular streaming
-                        delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+                        delta_message = DeltaMessage(content=delta_text, role="assistant")
 
                     chunk = ChatCompletionStreamResponse(
                         model=request.model,
@@ -805,18 +817,30 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         async def generate_stream():
             prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
             sampling_params = self._create_sampling_params(request)
+            previous_text = ""
             try:
                 for output in esurge.stream(prompt, sampling_params):
                     current_completion_tokens = output.num_generated_tokens
                     current_tps = output.tokens_per_second
                     elapsed_time = output.processing_time
 
+                    current_text = output.accumulated_text or ""
+                    if current_text.startswith(previous_text):
+                        delta_text = current_text[len(previous_text) :]
+                        if not delta_text:
+                            delta_text = output.delta_text or ""
+                    else:
+                        delta_text = output.delta_text or current_text
+                    if not delta_text and not previous_text:
+                        delta_text = current_text
+                    previous_text = current_text
+
                     chunk = ChatCompletionStreamResponse(
                         model=request.model,
                         choices=[
                             ChatCompletionStreamResponseChoice(
                                 index=0,
-                                delta=DeltaMessage(content=output.delta_text, role="assistant"),
+                                delta=DeltaMessage(content=delta_text, role="assistant"),
                                 finish_reason=None,
                             )
                         ],
