@@ -290,21 +290,18 @@ class Glm4MoeMoE(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        hidden_states = apply_logical_sharding(
+        out, router_logits = self._moe_call_fused_shard_map(
             hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        final_hidden_states, router_logits = self._moe_call(
-            gate_layer=self.gate,
-            expert_layer=self.experts,
-            hidden_state=hidden_states,
-            output_metrics=False,
-            validate_inputs=True,
+            self.gate.kernel.value,
+            self.experts.gate_proj.kernel.value,
+            self.experts.up_proj.kernel.value,
+            self.experts.down_proj.kernel.value,
+            self.experts.act_fn,
         )
         shared_output, _ = self.shared_experts(hidden_states)
-        final_hidden_states = final_hidden_states + shared_output
-        return final_hidden_states, router_logits
+        out = out + shared_output
+
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Glm4MoeAttention(UnifiedAttention):

@@ -55,6 +55,7 @@ from __future__ import annotations
 import enum
 import typing
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -64,24 +65,183 @@ from eformer.escale import PartitionManager
 from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
+from jax import lax, shard_map
 from jax import numpy as jnp
-from jax import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
+
+if typing.TYPE_CHECKING:
+    from easydel.infra.base_config import EasyDeLBaseConfig
 
 BATCH = common_types.BATCH
 EMPTY = common_types.EMPTY
 EMBED = common_types.EMBED
 EXPERT = common_types.EXPERT
 MODE_TRAIN = common_types.MODE_TRAIN
+EP = common_types.EP
+DP = common_types.DP
 FSDP = common_types.FSDP
 TP = common_types.TP
 SP = common_types.SP
+
 ExpertColumnWiseAlt = common_types.ExpertColumnWiseAlt
 ExpertRowWiseAlt = common_types.ExpertRowWiseAlt
 DynamicShardingAxes = common_types.DynamicShardingAxes
-if typing.TYPE_CHECKING:
-    from easydel.infra.base_config import EasyDeLBaseConfig
+
+
+GMM_PLATFORM = None
+
+
+def _psum32(x: jax.Array, axes: str | tuple[str, ...]) -> jax.Array:
+    """Performs precision-safe parallel sum across specified axes using float32 accumulation.
+
+    This function temporarily casts the input to float32 for the reduction operation
+    to avoid numerical precision issues, then casts back to the original dtype.
+    This is particularly important for bfloat16 and float16 reductions which can
+    suffer from accumulation errors.
+
+    Args:
+        x: Input array to be reduced across devices.
+        axes: Name(s) of the mesh axes to reduce over. Can be a single axis name
+            or a tuple of axis names.
+
+    Returns:
+        Array with the same shape and dtype as input, containing the sum across
+        specified device axes.
+
+    Example:
+        >>> # Sum gradients across data-parallel devices
+        >>> reduced_grads = _psum32(grads, axes="dp")
+        >>> # Sum across multiple axes
+        >>> reduced = _psum32(x, axes=("dp", "fsdp"))
+    """
+    return lax.psum(x.astype(jnp.float32), axes).astype(x.dtype)
+
+
+def _rsum_scatter32(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
+    """Performs reduce-scatter operation with float32 accumulation for precision.
+
+    This function combines a reduction across devices with a scatter operation that
+    splits the result. It uses float32 accumulation to maintain numerical precision,
+    then converts back to the original dtype.
+
+    Args:
+        x: Input array to be reduced and scattered.
+        axis_name: Name of the mesh axis along which to reduce-scatter.
+        scatter_dimension: Dimension along which to split the reduced result.
+        tiled: If True, the scatter dimension is divided by the axis size.
+            Defaults to True.
+
+    Returns:
+        Array containing the local shard of the reduced-scattered result,
+        in the original dtype.
+
+    Example:
+        >>> # Reduce-scatter along TP axis, splitting the last dimension
+        >>> result = _rsum_scatter32(x, axis_name="tp", scatter_dimension=-1)
+    """
+    return lax.psum_scatter(
+        x.astype(jnp.float32),
+        axis_name,
+        scatter_dimension=scatter_dimension,
+        tiled=tiled,
+    ).astype(x.dtype)
+
+
+def _argsort(x: jax.Array) -> jax.Array:
+    """Returns indices that would sort the array along the last axis.
+
+    Args:
+        x: Input array to compute sorting indices for.
+
+    Returns:
+        Array of integer indices that would sort x along axis=-1.
+
+    Example:
+        >>> x = jnp.array([3, 1, 2])
+        >>> indices = _argsort(x)  # Returns [1, 2, 0]
+    """
+    return jnp.argsort(x, axis=-1)
+
+
+def _take1d(x: jax.Array, idx: jax.Array) -> jax.Array:
+    """Extracts elements from array using indices along axis 0.
+
+    Args:
+        x: Input array to index into.
+        idx: Integer indices specifying which elements to extract.
+
+    Returns:
+        Array containing the selected elements.
+
+    Example:
+        >>> x = jnp.array([[1, 2], [3, 4], [5, 6]])
+        >>> idx = jnp.array([2, 0])
+        >>> result = _take1d(x, idx)  # Returns [[5, 6], [1, 2]]
+    """
+    return jnp.take(x, idx, axis=0)
+
+
+def _repeat_take_sorted(x: jax.Array, sort_idx: jax.Array, k: int) -> jax.Array:
+    """Repeats and reorders array elements based on sorted indices divided by k.
+
+    This is used in MoE to map tokens to their corresponding experts when each
+    token is replicated k times (once for each of its top-k experts).
+
+    Args:
+        x: Input array to be indexed.
+        sort_idx: Sorted indices representing flattened token-expert pairs.
+        k: Number of experts per token (num_experts_per_tok).
+
+    Returns:
+        Array where each element x[i] appears k times, reordered according
+        to sort_idx // k.
+
+    Example:
+        >>> tokens = jnp.array([[1, 2], [3, 4]])  # 2 tokens
+        >>> sort_idx = jnp.array([0, 2, 1, 3])  # sorted expert indices
+        >>> result = _repeat_take_sorted(tokens, sort_idx, k=2)
+    """
+    return jnp.take(x, sort_idx // k, axis=0)
+
+
+def _bincount(x: jax.Array, length: int) -> jax.Array:
+    """Counts occurrences of each integer value in the array.
+
+    Args:
+        x: Input integer array to count values in.
+        length: Number of bins (maximum value + 1). All values in x should
+            be less than length.
+
+    Returns:
+        Array of counts where result[i] is the number of times i appears in x.
+        Shape: (length,).
+
+    Example:
+        >>> x = jnp.array([0, 1, 1, 2, 2, 2])
+        >>> counts = _bincount(x, length=4)  # Returns [1, 2, 3, 0]
+    """
+    return jnp.bincount(x, length=length)
+
+
+def _all_i32(*xs: jax.Array) -> tuple[jax.Array, ...]:
+    """Casts all input arrays to int32 dtype.
+
+    This is commonly used before calling operations that require int32 inputs,
+    such as dynamic slicing or indexing operations.
+
+    Args:
+        *xs: Variable number of arrays to cast to int32.
+
+    Returns:
+        Tuple containing all input arrays cast to int32.
+
+    Example:
+        >>> a = jnp.array([1, 2, 3], dtype=jnp.int64)
+        >>> b = jnp.array([4, 5], dtype=jnp.float32)
+        >>> a_i32, b_i32 = _all_i32(a, b)  # Both are now int32
+    """
+    return tuple(z.astype(jnp.int32) for z in xs)
 
 
 def _sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
@@ -196,6 +356,340 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
+
+
+@dataclass(frozen=True)
+class MoeFusedPolicy:
+    """Configuration policy for fused MoE operations with advanced sharding strategies.
+
+    This dataclass defines the execution policy for fused MoE implementations, controlling
+    how computations are distributed across different parallelism dimensions and which
+    optimizations are applied. It enables fine-grained control over tensor parallel (TP),
+    sequence parallel (SP), and fully-sharded data parallel (FSDP) strategies.
+
+    Attributes:
+        gate_slice_k_axes: Tuple of axis names that shard the contracting dimension (K/hidden)
+            for the gate/router computation. Order matters as it's linearized row-major.
+            Defaults to ("sp", "fsdp") to split the hidden dimension across SP and FSDP.
+        wiwu_slice_k_axes: Tuple of axis names that shard the contracting dimension for
+            the expert wi (input) and wu (up) projections. Defaults to ("sp", "fsdp").
+        combine_axes: Axes to reduce over (psum) after gate/wi/wu computations to combine
+            results from split-K or parameter shards. Defaults to ("sp", "fsdp").
+        tp_axis: Name of the tensor parallel axis. Defaults to "tp".
+        rs_dim: Dimension for reduce-scatter operation. Defaults to -1 (last axis).
+        rs_enabled: Whether reduce-scatter is enabled for TP. Defaults to True.
+        gather_gate_on_tp: If True, gather activations along the hidden dimension before
+            gate computation. This ensures full precision routing at the cost of
+            communication. Defaults to True.
+        gather_logits_on_tp: If True, gather router logits across TP before top-k selection.
+            This ensures consistent routing across TP shards. Defaults to True.
+        gmm_platform: Backend platform for grouped matrix multiplication. Options are:
+            None (automatic), 'xla' (XLA default), 'pallas' (TPU-optimized kernel),
+            'cuda' (GPU-optimized), or 'auto'. Defaults to None.
+        reduce_dtype: Data type for reduction accumulators to balance precision and
+            performance. Defaults to jnp.bfloat16.
+
+    Example:
+        >>> # Custom policy for aggressive TP sharding
+        >>> policy = MoeFusedPolicy(
+        ...     tp_axis="tp",
+        ...     gather_gate_on_tp=False,  # Skip gather for speed
+        ...     gmm_platform="pallas",  # Use TPU kernel
+        ...     reduce_dtype=jnp.float32  # Higher precision
+        ... )
+    """
+
+    # Which axes shard the contracting K (hidden) dim; order matters (row-major linearized)
+    gate_slice_k_axes: tuple[str, ...] = ("sp", "fsdp")
+    wiwu_slice_k_axes: tuple[str, ...] = ("sp", "fsdp")
+
+    # Axes to psum (combine split-K/param shards) after gate/wi/wu
+    combine_axes: tuple[str, ...] = ("sp", "fsdp")
+
+    # TP reduce-scatter
+    tp_axis: str = "tp"
+    rs_dim: int = -1  # last axis by default
+    rs_enabled: bool = True
+
+    # Gather controls
+    gather_gate_on_tp: bool = True  # gather activations on H before gate
+    gather_logits_on_tp: bool = True  # gather logits on E across TP for top-k
+
+    # GMM backend choice for grouped_matmul
+    gmm_platform: str | None = None  # None|'xla'|'pallas'|'cuda'|'auto'
+
+    # Reduction accumulator dtype
+    reduce_dtype = jnp.bfloat16
+
+
+@dataclass(frozen=True)
+class MoeFusedHooks:
+    """Hook system for custom interventions during fused MoE execution.
+
+    This dataclass provides a comprehensive set of hook points throughout the fused
+    MoE forward pass, allowing users to inject custom logic, apply transformations,
+    or collect debugging information at specific stages of execution. Each hook is
+    an optional callable that receives relevant tensors and context as input and
+    returns modified tensors.
+
+    The hooks are called in the following order during MoE execution:
+        1. before_gate: Before router computation
+        2. after_gate: After router logits computation
+        3. before_topk: Before top-k expert selection
+        4. after_topk: After expert selection
+        5. before_ep_dispatch: Before expert-parallel all-to-all
+        6. after_ep_receive: After receiving from expert-parallel communication
+        7. before_wiwu: Before wi/wu expert projections
+        8. after_wiwu: After wi/wu, typically for activation function
+        9. before_wo: Before output projection
+        10. after_wo: After output projection
+        11. before_combine: Before combining expert outputs with routing weights
+        12. finalize_output: Final processing before returning output
+
+    Attributes:
+        before_gate: Called before router computation. Receives activations and gate weights.
+        after_gate: Called after router logits computation. Receives and returns router logits.
+        before_topk: Called before top-k selection. Receives router probabilities.
+        after_topk: Called after expert selection. Receives and returns (weights, expert_ids).
+        before_ep_dispatch: Called before expert-parallel dispatch. Receives sorted activations.
+        after_ep_receive: Called after EP communication. Receives local expert inputs.
+        before_wiwu: Called before wi/wu projections. Can modify inputs and weights.
+        after_wiwu: Called after wi/wu, typically to apply custom activation. Receives (y0, y1).
+        before_wo: Called before output projection. Receives intermediate activations.
+        after_wo: Called after output projection. Receives expert outputs.
+        before_combine: Called before combining expert outputs. Receives outputs and weights.
+        finalize_output: Called as final step. Receives and returns (output, router_logits).
+
+    Example:
+        >>> def debug_router(logits, ctx):
+        ...     print(f"Router logits stats: mean={jnp.mean(logits)}, std={jnp.std(logits)}")
+        ...     return logits
+        >>>
+        >>> def custom_activation(y0, y1, ctx):
+        ...     # Custom gating beyond standard GLU
+        ...     return jax.nn.silu(y0) * jax.nn.sigmoid(y1)
+        >>>
+        >>> hooks = MoeFusedHooks(
+        ...     after_gate=debug_router,
+        ...     after_wiwu=custom_activation
+        ... )
+
+    Note:
+        All hooks receive a MoeContext object as their last parameter, providing
+        access to mesh information, batch size, and other execution details.
+    """
+
+    before_gate: Callable | None = None
+    after_gate: Callable | None = None
+    before_topk: Callable | None = None
+    after_topk: Callable | None = None
+    before_ep_dispatch: Callable | None = None
+    after_ep_receive: Callable | None = None
+    before_wiwu: Callable | None = None
+    after_wiwu: Callable | None = None
+    before_wo: Callable | None = None
+    after_wo: Callable | None = None
+    before_combine: Callable | None = None
+    finalize_output: Callable | None = None
+
+    def __hash__(self) -> int:
+        """Makes the hooks dataclass hashable for NNX graph hashing.
+
+        Returns:
+            Hash value based on the identity of all hook callables.
+
+        Note:
+            Uses id() of callables rather than hashing the functions themselves,
+            which works correctly for functions, lambdas, and partials.
+        """
+        # Use identities of callables (works for functions, lambdas, partials).
+        return hash(
+            (
+                id(self.before_gate),
+                id(self.after_gate),
+                id(self.before_topk),
+                id(self.after_topk),
+                id(self.before_ep_dispatch),
+                id(self.after_ep_receive),
+                id(self.before_wiwu),
+                id(self.after_wiwu),
+                id(self.before_wo),
+                id(self.after_wo),
+                id(self.before_combine),
+                id(self.finalize_output),
+            )
+        )
+
+
+@dataclass
+class MoeContext:
+    """Read-only runtime context information passed to MoE hooks during execution.
+
+    This dataclass encapsulates the execution environment and tensor dimensions
+    available during MoE forward pass. It provides hooks with essential information
+    about the distributed mesh configuration and tensor shapes, enabling context-aware
+    custom logic.
+
+    Attributes:
+        mesh: JAX device mesh defining the multi-device topology for distributed
+            execution. Contains device assignments and axis names for parallelism.
+        axis_names: Tuple of axis names present in the mesh (e.g., ('dp', 'tp', 'ep')).
+            Used for identifying available parallelism dimensions.
+        axis_sizes: Dictionary mapping axis names to their sizes (number of devices).
+            Example: {'dp': 4, 'tp': 2, 'ep': 8} indicates 4-way data parallel,
+            2-way tensor parallel, and 8-way expert parallel.
+        B_loc: Local batch size on this device/shard. The actual batch size seen
+            by computations after batch-dimension sharding.
+        S_loc: Local sequence length on this device/shard. The sequence length
+            after sequence-parallel sharding, if applied.
+        H_full: Full hidden dimension size before any tensor-parallel sharding.
+            This is the complete hidden size of the model.
+        K: Number of experts per token (num_experts_per_tok). Typically 1-2 for
+            top-k routing.
+        E: Total number of experts in the MoE layer.
+
+    Example:
+        >>> def custom_hook(logits, ctx):
+        ...     print(f"Running on mesh with axes: {ctx.axis_names}")
+        ...     print(f"Local batch size: {ctx.B_loc}, sequence length: {ctx.S_loc}")
+        ...     print(f"Processing {ctx.K} experts per token from {ctx.E} total experts")
+        ...     return logits
+
+    Note:
+        This context is immutable (frozen=False but intended for read-only use)
+        and should not be modified by hooks. It provides a consistent view of
+        the execution environment across all hook invocations.
+    """
+
+    # Read-only runtime info passed to hooks
+    mesh: jax.sharding.Mesh
+    axis_names: tuple[str, ...]
+    axis_sizes: dict
+    B_loc: int
+    S_loc: int
+    H_full: int
+    K: int
+    E: int
+
+
+# Helpers
+def _canon_dim(ndim: int, dim: int) -> int:
+    """Canonicalizes a dimension index to be non-negative.
+
+    Converts negative dimension indices (counting from the end) to their
+    equivalent positive indices.
+
+    Args:
+        ndim: Total number of dimensions in the array.
+        dim: Dimension index to canonicalize. Can be negative.
+
+    Returns:
+        Non-negative dimension index in range [0, ndim).
+
+    Example:
+        >>> _canon_dim(ndim=3, dim=-1)  # Returns 2
+        >>> _canon_dim(ndim=3, dim=1)   # Returns 1
+    """
+    return dim if dim >= 0 else (ndim + dim)
+
+
+def _psum_maybe(
+    x: jax.Array, axes: tuple[str, ...], mesh: jax.sharding.Mesh, dtype: jnp.dtype = jnp.float32
+) -> jax.Array:
+    """Conditionally performs parallel sum across specified axes if they exist in mesh.
+
+    This function filters the requested axes to only include those that exist in
+    the mesh and have size > 1, then performs a psum reduction. If no valid axes
+    are found, returns the input unchanged.
+
+    Args:
+        x: Input array to reduce.
+        axes: Tuple of axis names to potentially reduce over.
+        mesh: JAX device mesh containing available axes.
+        dtype: Data type for accumulation during reduction. Defaults to float32
+            for numerical stability.
+
+    Returns:
+        Reduced array if valid axes exist, otherwise the original array.
+        Always returns in the original dtype of x.
+
+    Example:
+        >>> # Only reduces if 'sp' and 'fsdp' exist in mesh
+        >>> result = _psum_maybe(x, axes=("sp", "fsdp"), mesh=mesh)
+    """
+    names = tuple(a for a in axes if a in mesh.axis_names and mesh.shape.get(a, 1) > 1)
+    return lax.psum(x.astype(dtype), names).astype(x.dtype) if names else x
+
+
+def _rsum_scatter_maybe(
+    x: jax.Array, axis_name: str, dim: int, mesh: jax.sharding.Mesh, dtype: jnp.dtype = jnp.float32
+) -> jax.Array:
+    """Conditionally performs reduce-scatter if the axis exists and has size > 1.
+
+    This function checks if the specified axis exists in the mesh with size > 1,
+    and if so, performs a reduce-scatter operation. Otherwise, returns input unchanged.
+
+    Args:
+        x: Input array to reduce-scatter.
+        axis_name: Name of the axis to reduce-scatter along.
+        dim: Dimension of x to split during scatter. Can be negative.
+        mesh: JAX device mesh containing available axes.
+        dtype: Data type for accumulation during reduction. Defaults to float32.
+
+    Returns:
+        Reduce-scattered array with the scatter dimension divided by axis size,
+        or the original array if the axis doesn't exist or has size 1.
+
+    Example:
+        >>> # Reduce-scatter on last dim if 'tp' axis exists
+        >>> result = _rsum_scatter_maybe(x, axis_name="tp", dim=-1, mesh=mesh)
+    """
+    if axis_name not in mesh.axis_names or mesh.shape.get(axis_name, 1) == 1:
+        return x
+    dim = _canon_dim(x.ndim, dim)
+    return lax.psum_scatter(x.astype(dtype), axis_name, scatter_dimension=dim, tiled=True).astype(x.dtype)
+
+
+def _slice_k_for_param_shards(
+    x_mat: jax.Array, chunk: int, axes: tuple[str, ...], mesh: jax.sharding.Mesh, axis: int = 1
+) -> jax.Array:
+    """Slices activation tensor to match the chunk size of parameter shards.
+
+    When parameters are sharded across multiple axes (e.g., sequence parallel + FSDP),
+    this function computes which chunk of the activation tensor should be used by
+    each device based on its multi-dimensional position in the mesh. The axes are
+    linearized in row-major order to compute a single index.
+
+    Args:
+        x_mat: Activation tensor to slice.
+        chunk: Size of each parameter chunk (local size after sharding).
+        axes: Tuple of axis names that shard the parameter dimension, in row-major
+            order. For example, ("sp", "fsdp") means SP varies faster than FSDP.
+        mesh: JAX device mesh.
+        axis: Dimension of x_mat to slice. Defaults to 1 (typically the hidden dimension).
+
+    Returns:
+        Sliced tensor of size chunk along the specified axis, or the original tensor
+        if no sharding is needed (stride=1 or chunk matches full size).
+
+    Example:
+        >>> # Slice hidden dim for device at position (sp=1, fsdp=0)
+        >>> # With sp_size=2, fsdp_size=4: linear_idx = 1*1 + 0*2 = 1
+        >>> x_sliced = _slice_k_for_param_shards(
+        ...     x, chunk=256, axes=("sp", "fsdp"), mesh=mesh, axis=1)
+    """
+    # Compute linear index across provided axes in row-major order
+    idx = 0
+    stride = 1
+    for ax in axes:
+        size = mesh.shape.get(ax, 1)
+        if size > 1:
+            idx = idx + lax.axis_index(ax) * stride
+            stride *= size
+    if stride == 1 or chunk == x_mat.shape[axis]:
+        return x_mat
+    start = idx * chunk
+    return lax.dynamic_slice_in_dim(x_mat, start_index=start, slice_size=chunk, axis=axis)
 
 
 class _Transform(enum.Enum):
@@ -462,6 +956,8 @@ class BaseMoeModule(nn.Module, ABC):
         rzl_coef: float | None = None,
         routing_strategy: MoeRoutingStrategy = MoeRoutingStrategy.TOP_K,
         load_balancing_strategy: MoeLoadBalancingStrategy = MoeLoadBalancingStrategy.STANDARD,
+        moe_policy: MoeFusedPolicy | None = None,
+        moe_hooks: MoeFusedHooks | None = None,
     ):
         """Initializes the BaseMoeModule.
 
@@ -489,6 +985,8 @@ class BaseMoeModule(nn.Module, ABC):
         self.rzl_coef = rzl_coef
         self.routing_strategy = routing_strategy
         self.load_balancing_strategy = load_balancing_strategy
+        self.moe_policy = MoeFusedPolicy() if moe_policy is None else moe_policy
+        self.moe_hooks = MoeFusedHooks() if moe_hooks is None else moe_hooks
 
     def _route(
         self,
@@ -1414,6 +1912,275 @@ class BaseMoeModule(nn.Module, ABC):
             possible), it will still only appear once in the mask.
         """
         return jnp.any(selected_experts == expert_id, axis=-1)
+
+    def _moe_call_fused_shard_map(
+        self,
+        hidden_state: jax.Array,  # [B, S, H]
+        gate_kernel: jax.Array,  # [H, E]
+        wi_kernel: jax.Array,  # [E, H, M]
+        wu_kernel: jax.Array,  # [E, H, M]
+        wd_kernel: jax.Array,  # [E, M, H]
+        act_fn: Callable[[jax.Array], jax.Array],
+        *,
+        output_metrics: bool = False,
+        batch_sharded_by_expert: bool = False,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Executes a fully-fused MoE forward pass with advanced sharding and hook support.
+
+        This is the most optimized MoE implementation in EasyDeL, combining router computation,
+        expert-parallel communication, expert computation, and output combination into a single
+        fused operation with shard_map. It supports:
+        - Split-K contracting dimension across SP/FSDP axes
+        - Tensor-parallel (TP) sharding with reduce-scatter
+        - Expert-parallel (EP) distribution with ragged all-to-all
+        - Custom hook injection at every execution stage
+        - Configurable grouped matrix multiplication backends
+
+        The execution flow:
+        1. Compute router logits with optional K-dimension splitting and TP gathering
+        2. Apply softmax and perform top-k expert selection
+        3. Replicate tokens by k, sort by expert ID, compute group sizes
+        4. Dispatch tokens to expert-owning devices via ragged all-to-all (EP)
+        5. Locally permute tokens to group by expert
+        6. Execute expert wi/wu projections with split-K and GLU activation
+        7. Execute expert output projection (wo) with TP reduce-scatter
+        8. Reverse all-to-all to return expert outputs to original devices
+        9. Unsort and combine expert outputs with routing weights
+
+        Args:
+            hidden_state: Input activations. Shape: [batch, seq_len, hidden_size].
+            gate_kernel: Router weight matrix. Shape: [hidden_size, num_experts].
+            wi_kernel: Expert input projection weights. Shape: [num_experts, hidden_size, intermediate_size].
+            wu_kernel: Expert up projection weights for GLU. Shape: [num_experts, hidden_size, intermediate_size].
+            wd_kernel: Expert output projection weights. Shape: [num_experts, intermediate_size, hidden_size].
+            act_fn: Activation function to apply in the expert FFN (e.g., jax.nn.silu).
+                Takes a single array and returns the activated array.
+            output_metrics: If True, returns MoeMetrics with detailed statistics.
+                If False, returns router logits for auxiliary loss computation.
+            batch_sharded_by_expert: Currently unused in this implementation.
+                Reserved for future batch-sharded EP strategies.
+
+        Returns:
+            A tuple containing:
+                - output: Processed hidden states. Shape: [batch, seq_len, hidden_size].
+                - metrics_or_logits: Either router logits [batch, seq_len, num_experts]
+                    or the full logits reshaped to [batch, seq_len, num_experts].
+
+        Note:
+            This method requires:
+            - An 'ep' or 'expert' axis in the mesh for expert parallelism
+            - Properly configured moe_policy and moe_hooks (optional)
+            - Compatible sharding specifications in partition_manager
+
+        Example:
+            >>> # Execute fused MoE with custom policy and hooks
+            >>> output, logits = self._moe_call_fused_shard_map(
+            ...     hidden_state=inputs,
+            ...     gate_kernel=self.gate.kernel.value,
+            ...     wi_kernel=self.experts.wi.kernel.value,
+            ...     wu_kernel=self.experts.wu.kernel.value,
+            ...     wd_kernel=self.experts.wo.kernel.value,
+            ...     act_fn=jax.nn.silu,
+            ...     output_metrics=False
+            ... )
+
+        Raises:
+            AssertionError: If num_experts is not evenly divisible by EP size.
+        """
+        mesh = self.mesh
+        E = wi_kernel.shape[0]
+        K = self.num_experts_per_tok
+
+        policy = getattr(self, "moe_policy", MoeFusedPolicy())
+        hooks = getattr(self, "moe_hooks", MoeFusedHooks())
+
+        pm = self.partition_manager
+        x_spec = pm.resolve([DP, EMPTY, TP], mode=MODE_TRAIN)  # [B, S, H]
+        w_gate_sp = pm.resolve([[SP, FSDP], TP], mode=MODE_TRAIN)  # [H, E_shard]
+        wi_sp = pm.resolve([EP, [SP, FSDP], TP], mode=MODE_TRAIN)  # [E, H, M_shard]
+        wu_sp = pm.resolve([EP, [SP, FSDP], TP], mode=MODE_TRAIN)  # [E, H, M_shard]
+        wd_sp = pm.resolve([EP, TP, EMPTY], mode=MODE_TRAIN)  # [E, M_shard, H]
+        out_spec = pm.resolve([DP, EMPTY, TP], mode=MODE_TRAIN)  # [B, S, H_shard]
+        rx = pm.paxis.resolve_axis
+
+        def _as_tuple_axes(ax):
+            if isinstance(ax, tuple | list):
+                return tuple(ax)
+            elif ax is None:
+                return ()
+            else:
+                return (ax,)
+
+        @partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=(x_spec, w_gate_sp, wi_sp, wu_sp, wd_sp),
+            out_specs=(out_spec, pm.resolve([DP, EMPTY, EMPTY], mode=MODE_TRAIN)),
+            check_vma=False,
+        )
+        def _fused(x, w_gate, w0, w1, w2):
+            # Local dynamic sizes (handles nnx micro-batching)
+            B_loc, S_loc, H_shard = x.shape
+            bs = B_loc * S_loc
+
+            # Axis names/sizes
+            axis_sizes = {n: mesh.shape[n] for n in mesh.axis_names}
+            tp_axis = policy.tp_axis
+            combine_axes = _as_tuple_axes(policy.combine_axes)
+            gate_k_axes = _as_tuple_axes(policy.gate_slice_k_axes)
+            wiwu_k_axes = _as_tuple_axes(policy.wiwu_slice_k_axes)
+
+            # 1) Router logits on full H/E
+            x = x.astype(self.dtype)
+            x_flat = x.reshape(bs, H_shard)  # [bs, H/tp]
+            x_fullH = lax.all_gather(x_flat, tp_axis, axis=-1, tiled=True) if policy.gather_gate_on_tp else x_flat
+            H_full = x_fullH.shape[1]
+
+            ctx = MoeContext(
+                mesh=mesh,
+                axis_names=mesh.axis_names,
+                axis_sizes=axis_sizes,
+                B_loc=B_loc,
+                S_loc=S_loc,
+                H_full=H_full,
+                K=K,
+                E=E,
+            )
+            if hooks.before_gate:
+                x_fullH, w_gate = hooks.before_gate(x_fullH, w_gate, ctx)
+
+            # Slice activations to local K-chunk if gate weight shards K across (sp,fsdp)
+            k_chunk_gate = w_gate.shape[0]
+            x_gate_k = (
+                _slice_k_for_param_shards(x_fullH, k_chunk_gate, gate_k_axes, mesh, axis=1)
+                if k_chunk_gate != H_full
+                else x_fullH
+            )
+
+            logits_partial = x_gate_k @ w_gate  # [bs, E_shard]
+            logits_full = _psum_maybe(logits_partial, combine_axes, mesh, dtype=policy.reduce_dtype)
+            if policy.gather_logits_on_tp:
+                logits_full = lax.all_gather(logits_full, tp_axis, axis=-1, tiled=True)  # [bs, E]
+            router_logits = logits_full.astype(jnp.float32)
+            if hooks.after_gate:
+                router_logits = hooks.after_gate(router_logits, ctx)
+
+            # 2) Routing (top-k)
+            router_probs = jax.nn.softmax(router_logits, axis=-1).astype(self.dtype)
+            if hooks.before_topk:
+                router_probs = hooks.before_topk(router_probs, ctx)
+            topk_weights, topk_idx = lax.top_k(router_probs, K)
+            if getattr(self.config, "norm_topk_prob", False):
+                topk_weights = topk_weights / jnp.sum(topk_weights, axis=-1, keepdims=True)
+            if hooks.after_topk:
+                topk_weights, topk_idx = hooks.after_topk(topk_weights, topk_idx, ctx)
+
+            # 3) Replicate and sort by expert, compute global group sizes
+            flat_idx = topk_idx.reshape(-1)  # [bs*K]
+            sort_idx = jnp.argsort(flat_idx)  # [bs*K]
+            x_rep_sorted = jnp.take(x_fullH, sort_idx // K, axis=0)  # [bs*K, H]
+            group_sizes = jnp.bincount(flat_idx, length=E)  # [E]
+            if hooks.before_ep_dispatch:
+                x_rep_sorted, group_sizes = hooks.before_ep_dispatch(x_rep_sorted, group_sizes, ctx)
+
+            # 4) Dispatch to EP via ragged_all_to_all
+            ep_axis = rx([EP], mode=MODE_TRAIN)[0]
+            ep_size = axis_sizes[ep_axis]
+            assert E % ep_size == 0
+            local_E = E // ep_size
+            ep_idx = lax.axis_index(ep_axis)
+
+            reshaped_gs = jnp.sum(group_sizes.reshape(-1, local_E), axis=1)  # [ep_size]
+            in_off, send_sz, out_off, recv_sz = _get_all_to_all_params(
+                reshaped_gs, ep_idx, ep_size, is_batch_sharded=False
+            )
+            in_off = in_off.astype(jnp.int32)
+            send_sz = send_sz.astype(jnp.int32)
+            out_off = out_off.astype(jnp.int32)
+            recv_sz = recv_sz.astype(jnp.int32)
+
+            buf_len = int(ep_size * bs * K)  # conservative buffer per call
+            x_buf = jnp.zeros((buf_len, H_full), dtype=x_rep_sorted.dtype)
+            x_local = lax.ragged_all_to_all(x_rep_sorted, x_buf, in_off, send_sz, out_off, recv_sz, axis_name=ep_axis)
+
+            # 5) Local permute: derive local ids from local sizes (no global offsets)
+            x_local, local_sorted_idx, local_group_sizes, _ = _local_permute(
+                x_local,
+                group_sizes[None, :],  # [1, E]
+                local_E,
+                shard_index=ep_idx,
+                is_offset=False,
+                global_sorted_experts=None,
+                use_custom_sort_vjp=True,
+            )
+            local_group_sizes = local_group_sizes.astype(jnp.int32)
+            if hooks.after_ep_receive:
+                x_local, local_group_sizes = hooks.after_ep_receive(x_local, local_group_sizes, ctx)
+
+            # 6) Experts: wi/up with psum over combine_axes; slice activations to local k-chunk if needed
+            k_chunk_w = w0.shape[1]  # local k per device for w0/w1 across (sp,fsdp)
+            x_k = (
+                x_local
+                if k_chunk_w == x_local.shape[1]
+                else _slice_k_for_param_shards(x_local, k_chunk_w, wiwu_k_axes, mesh, axis=1)
+            )
+            if hooks.before_wiwu:
+                x_k, w0, w1, local_group_sizes = hooks.before_wiwu(x_k, w0, w1, local_group_sizes, ctx)
+
+            y0 = grouped_matmul(
+                x_k, w0, local_group_sizes, preferred_element_type=jnp.bfloat16, platform=policy.gmm_platform
+            )
+            y0 = _psum_maybe(y0, combine_axes, mesh, dtype=policy.reduce_dtype)
+            y1 = grouped_matmul(
+                x_k, w1, local_group_sizes, preferred_element_type=jnp.bfloat16, platform=policy.gmm_platform
+            )
+            y1 = _psum_maybe(y1, combine_axes, mesh, dtype=policy.reduce_dtype)
+            inter = hooks.after_wiwu(y0, y1, ctx) if hooks.after_wiwu else (act_fn(y0) * y1)  # default: GLU
+
+            # 7) wo: reduce-scatter over TP on the last axis
+            if hooks.before_wo:
+                inter, w2 = hooks.before_wo(inter, w2, ctx)
+            y2 = grouped_matmul(
+                inter,
+                w2,
+                local_group_sizes,
+                preferred_element_type=jnp.bfloat16,
+                platform=policy.gmm_platform,
+            )
+            if policy.rs_enabled:
+                y2 = _rsum_scatter_maybe(y2, policy.tp_axis, policy.rs_dim, mesh, dtype=policy.reduce_dtype)
+            if hooks.after_wo:
+                y2 = hooks.after_wo(y2, ctx)
+
+            # Undo local sort
+            y_local_unsorted = _sort_activations(y2, jnp.argsort(local_sorted_idx), use_custom_vjp=True)
+
+            # 8) Return from EP (inverse ragged_all_to_all)
+            y_back = lax.ragged_all_to_all(
+                y_local_unsorted,
+                jnp.zeros((x_rep_sorted.shape[0], y_local_unsorted.shape[-1]), dtype=y_local_unsorted.dtype),
+                in_off,
+                send_sz,
+                out_off,
+                recv_sz,
+                axis_name=ep_axis,
+            )  # [bs*K, H/tp]
+
+            # 9) Unsort to token order and combine with weights
+            y_unsorted = _sort_activations(y_back, jnp.argsort(sort_idx), use_custom_vjp=True)  # [bs*K, H/tp]
+            y_unflat = y_unsorted.reshape(bs, K, -1)  # [bs, K, H/tp]
+            if hooks.before_combine:
+                y_unflat, topk_weights = hooks.before_combine(y_unflat, topk_weights, ctx)
+            out = jnp.sum(y_unflat * topk_weights[..., None].astype(y_unflat.dtype), axis=1)  # [bs, H/tp]
+            out = out.reshape(B_loc, S_loc, -1)  # [B_loc, S_loc, H/tp]
+
+            # Finalize
+            logits_bsh = router_logits.reshape(B_loc, S_loc, -1)
+            if hooks.finalize_output:
+                out, logits_bsh = hooks.finalize_output(out, logits_bsh, ctx)
+            return out, logits_bsh
+
+        return _fused(hidden_state, gate_kernel, wi_kernel, wu_kernel, wd_kernel)
 
     def _moe_call(
         self,

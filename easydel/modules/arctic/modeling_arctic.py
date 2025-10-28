@@ -404,16 +404,15 @@ class ArcticMoeBlock(BaseMoeModule):
                     hidden state and router logits (or 0.0 if not MoE).
         """
         if self.is_moe_layer:
-            expert_output, router_logits = self._moe_call(
-                gate_layer=self.gate,
-                expert_layer=self.experts,
-                hidden_state=hidden_states,
-                output_metrics=False,
-                validate_inputs=True,
+            out, router_logits = self._moe_call_fused_shard_map(
+                hidden_states,
+                self.gate.kernel,
+                self.experts.w1.kernel.value,
+                self.experts.w3.kernel.value,
+                self.experts.w2.kernel.value,
+                self.experts.act_fn,
             )
-            return checkpoint_name(expert_output, "moe_expert_output"), checkpoint_name(
-                router_logits, "moe_router_logits"
-            )
+            return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
         return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)
 
 

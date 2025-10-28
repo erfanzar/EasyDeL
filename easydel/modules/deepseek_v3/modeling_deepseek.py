@@ -327,24 +327,17 @@ class DeepseekV3MoE(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: chex.Array):
-        hidden_states = apply_logical_sharding(
+        out, router_logits = self._moe_call_fused_shard_map(
             hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
+            self.gate.kernel.value,
+            self.experts.gate_proj.kernel.value,
+            self.experts.up_proj.kernel.value,
+            self.experts.down_proj.kernel.value,
+            self.experts.act_fn,
         )
-        identity = hidden_states
-        y, router_logits = self._moe_call(
-            gate_layer=self.gate,
-            expert_layer=self.experts,
-            hidden_state=hidden_states,
-            output_metrics=False,
-            validate_inputs=False,
-        )
-        router_logits = checkpoint_name(router_logits, "moe_router_logits")
-        y = checkpoint_name(y, "moe_expert_output")
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        return y, router_logits
+            out = out + self.shared_experts(hidden_states)
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class DeepseekV3Attention(UnifiedAttention):

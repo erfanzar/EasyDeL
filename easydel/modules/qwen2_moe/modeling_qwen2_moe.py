@@ -50,6 +50,8 @@ from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
+    MoeFusedHooks,
+    MoeFusedPolicy,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RowParallelMoELinear,
@@ -402,25 +404,17 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-
-    def _moe_call(
-        self,
-        hidden_state_flat: jax.Array,
-        batch_size: int,
-        seq_len: int,
-        hidden_size: int,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Forward pass of the MoE block."""
-
-        router_logits = self.gate(hidden_state_flat).astype(jnp.float32)
-        routing_weights = jax.nn.softmax(router_logits, axis=-1)
-        selected_weights, selected_experts = self._route(routing_weights)
-        x_repeat_sort, group_sizes, sort_idx = self._permute(hidden_state_flat, selected_experts.reshape(-1))
-        out_repeat_sort = self.experts(x_repeat_sort, group_sizes)
-        out_repeat_unflat = self._unpermute(out_repeat_sort, sort_idx, (batch_size, seq_len, hidden_size))
-        output = jnp.sum(out_repeat_unflat * selected_weights[:, :, None], axis=1)
-
-        return output, router_logits
+        self.moe_policy = MoeFusedPolicy(
+            gate_slice_k_axes=("sp", "fsdp"),
+            wiwu_slice_k_axes=("sp", "fsdp"),
+            combine_axes=("sp", "fsdp"),
+            tp_axis="tp",
+            rs_dim=-1,
+            rs_enabled=True,
+            gather_gate_on_tp=True,
+            gather_logits_on_tp=True,
+        )
+        self.moe_hooks = MoeFusedHooks()
 
     def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the Sparse MoE block.
@@ -433,28 +427,25 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - final_hidden_states (chex.Array): The output hidden states after MoE processing.
                 - router_logits (chex.Array): The logits output by the gating network.
         """
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-
-        out, router_logits = self._moe_call(
-            hidden_state_flat=hidden_states,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
+        B, S, H = hidden_states.shape
+        out, router_logits = self._moe_call_fused_shard_map(
+            hidden_state=hidden_states,
+            gate_kernel=self.gate.kernel.value,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
+            output_metrics=False,
         )
 
-        shared_expert_output = self.shared_expert(hidden_states)
-        shared_expert_output = jax.nn.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
-        out = out + shared_expert_output
+        hs_flat = hidden_states.reshape(-1, H)
+        shared_out = self.shared_expert(hs_flat)
+        shared_gate = jax.nn.sigmoid(self.shared_expert_gate(hs_flat))
+        shared_out = shared_gate * shared_out
+        shared_out = shared_out.reshape(B, S, H)
+        out = out + shared_out
 
-        return checkpoint_name(out.reshape(batch_size, seq_len, hidden_size), "moe_expert_output"), checkpoint_name(
-            router_logits, "moe_router_logits"
-        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
