@@ -37,8 +37,12 @@ class TestHelper:
         torch_time: float | None = None,
     ):
         """Compare HuggingFace and EasyDeL outputs with tabulated results."""
-        jux = getattr(ed_out, "aux_loss", 0) or 0
-        tux = getattr(hf_out, "aux_loss", 0) or 0
+        jux = getattr(ed_out, "aux_loss", 0)
+        tux = getattr(hf_out, "aux_loss", 0)
+        if jux is None:
+            jux = 0
+        if tux is None:
+            tux = 0
         to = hf_out.logits.cpu().detach().numpy()
         jo = ed_out.logits
 

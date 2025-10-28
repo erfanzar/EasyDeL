@@ -198,14 +198,15 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
     def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
-        expert_output, router_logits = self._moe_call(
-            gate_layer=self.gate,
-            expert_layer=self.experts,
-            hidden_state=hidden_state,
-            output_metrics=False,
-            validate_inputs=True,
+        out, router_logits = self._moe_call_fused_shard_map(
+            hidden_state,
+            self.gate.kernel.value,
+            self.experts.w1.kernel.value,
+            self.experts.w3.kernel.value,
+            self.experts.w2.kernel.value,
+            self.experts.act_fn,
         )
-        return checkpoint_name(expert_output, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class MixtralDecoderLayer(nn.Module):

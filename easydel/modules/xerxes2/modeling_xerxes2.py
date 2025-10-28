@@ -455,15 +455,15 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
                 - final_hidden_states (chex.Array): The output hidden states after MoE processing.
                 - router_logits (chex.Array): The logits output by the gating network.
         """
-        out, router_logits = self._moe_call(
-            gate_layer=self.gate,
-            expert_layer=self.experts,
-            hidden_state=hidden_states,
-            output_metrics=False,
-            validate_inputs=True,
-            apply_capacity_constraint=False,
+        out, router_logits = self._moe_call_fused_shard_map(
+            hidden_states,
+            self.gate.kernel.value,
+            self.experts.gate_proj.kernel.value,
+            self.experts.up_proj.kernel.value,
+            self.experts.down_proj.kernel.value,
+            self.experts.act_fn,
         )
-        return out, router_logits
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Xerxes2DecoderLayer(nn.Module):
