@@ -356,7 +356,9 @@ class Trainer(BaseTrainer):
                 state = state.replace(step=jnp.array(skipped_steps, dtype=jnp.int32))
             else:
                 self._skip_first_steps = initial_step
-                state = state.replace(step=jnp.array(0, dtype=jnp.int32))
+                self.current_step = initial_step
+                pbar.update(initial_step)
+                # state = state.replace(step=jnp.array(0, dtype=jnp.int32))
                 logger.info(
                     f"Resuming training from step {initial_step} (non-seekable dataset, skipping first {self._skip_first_steps} steps)"
                 )
