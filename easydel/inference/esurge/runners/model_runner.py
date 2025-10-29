@@ -194,13 +194,13 @@ class eSurgeRunner:
         self.max_num_reqs = max_num_seqs
 
         self.max_model_len = max_model_len
-        self.min_input_pad = min(min_input_pad, max_num_seqs)
+        self.min_input_pad = max(min_input_pad, max_num_seqs)
 
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
         self.num_tokens_paddings = self._get_token_paddings(
-            min_token_size=16,
+            min_token_size=self.min_input_pad,
             max_token_size=self.max_model_len,
             padding_gap=0,
         )

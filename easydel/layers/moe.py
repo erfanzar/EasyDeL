@@ -53,15 +53,18 @@ Example:
 from __future__ import annotations
 
 import enum
+import os
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from typing import Literal
 
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager
+from eformer.pytree import auto_pytree, field
 from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
@@ -88,37 +91,12 @@ ExpertColumnWiseAlt = common_types.ExpertColumnWiseAlt
 ExpertRowWiseAlt = common_types.ExpertRowWiseAlt
 DynamicShardingAxes = common_types.DynamicShardingAxes
 
-
+EP_DISPATCH = os.getenv("EP_DISPATCH", "auto")
+EP_AUTO_TRESHOLD = int(os.getenv("EP_AUTO_TRESHOLD", 8192))
 GMM_PLATFORM = None
 
 
-def _psum32(x: jax.Array, axes: str | tuple[str, ...]) -> jax.Array:
-    """Performs precision-safe parallel sum across specified axes using float32 accumulation.
-
-    This function temporarily casts the input to float32 for the reduction operation
-    to avoid numerical precision issues, then casts back to the original dtype.
-    This is particularly important for bfloat16 and float16 reductions which can
-    suffer from accumulation errors.
-
-    Args:
-        x: Input array to be reduced across devices.
-        axes: Name(s) of the mesh axes to reduce over. Can be a single axis name
-            or a tuple of axis names.
-
-    Returns:
-        Array with the same shape and dtype as input, containing the sum across
-        specified device axes.
-
-    Example:
-        >>> # Sum gradients across data-parallel devices
-        >>> reduced_grads = _psum32(grads, axes="dp")
-        >>> # Sum across multiple axes
-        >>> reduced = _psum32(x, axes=("dp", "fsdp"))
-    """
-    return lax.psum(x.astype(jnp.float32), axes).astype(x.dtype)
-
-
-def _rsum_scatter32(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
+def _rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
     """Performs reduce-scatter operation with float32 accumulation for precision.
 
     This function combines a reduction across devices with a scatter operation that
@@ -138,14 +116,9 @@ def _rsum_scatter32(x: jax.Array, axis_name: str, scatter_dimension: int, tiled:
 
     Example:
         >>> # Reduce-scatter along TP axis, splitting the last dimension
-        >>> result = _rsum_scatter32(x, axis_name="tp", scatter_dimension=-1)
+        >>> result = _rsum_scatter(x, axis_name="tp", scatter_dimension=-1)
     """
-    return lax.psum_scatter(
-        x.astype(jnp.float32),
-        axis_name,
-        scatter_dimension=scatter_dimension,
-        tiled=tiled,
-    ).astype(x.dtype)
+    return lax.psum_scatter(x, axis_name, scatter_dimension=scatter_dimension, tiled=tiled)
 
 
 def _argsort(x: jax.Array) -> jax.Array:
@@ -273,19 +246,12 @@ def _sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp
         >>> sorted_inputs = _sort_activations(inputs, sort_indices)
         >>> # sorted_inputs will be [[5, 6], [1, 2], [3, 4]]
     """
-    inputs_first_dim: int = inputs.shape[0]
-    indices_first_dim: int = sort_indices.shape[0]
-    dims_match: bool = inputs_first_dim == indices_first_dim
-    assert dims_match
+    assert inputs.shape[0] == sort_indices.shape[0], "Input and indices dimensions must match"
 
-    result: jax.Array
     if use_custom_vjp:
-        sorted_custom: jax.Array = _sort_activations_custom(inputs, sort_indices)
-        result = sorted_custom
+        return _sort_activations_custom(inputs, sort_indices)
     else:
-        sorted_direct: jax.Array = inputs[sort_indices, ...]
-        result = sorted_direct
-    return result
+        return inputs[sort_indices, ...]
 
 
 @jax.custom_vjp
@@ -326,10 +292,9 @@ def _sort_activations_custom_fwd(inputs: jax.Array, sort_indices: jax.Array) -> 
         Tuple of (sorted_output, residuals) where residuals contains the sort_indices
         needed for the backward pass.
     """
-    sorted_output: jax.Array = _sort_activations_custom(inputs, sort_indices)
+    sorted_output: jax.Array = inputs[sort_indices, ...]
     residuals: jax.Array = sort_indices
-    result: tuple[jax.Array, jax.Array] = (sorted_output, residuals)
-    return result
+    return sorted_output, residuals
 
 
 def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple[jax.Array, None]:
@@ -349,16 +314,14 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
     """
     sort_indices: jax.Array = residuals
     inverse_indices: jax.Array = jnp.argsort(sort_indices)
-    input_grads: jax.Array = _sort_activations_custom(grads, inverse_indices)
-    indices_grad: None = None
-    result: tuple[jax.Array, None] = (input_grads, indices_grad)
-    return result
+    input_grads: jax.Array = grads[inverse_indices, ...]
+    return input_grads, None
 
 
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
 
 
-@dataclass(frozen=True)
+@auto_pytree
 class MoeFusedPolicy:
     """Configuration policy for fused MoE operations with advanced sharding strategies.
 
@@ -399,27 +362,19 @@ class MoeFusedPolicy:
         ... )
     """
 
-    # Which axes shard the contracting K (hidden) dim; order matters (row-major linearized)
-    gate_slice_k_axes: tuple[str, ...] = ("sp", "fsdp")
-    wiwu_slice_k_axes: tuple[str, ...] = ("sp", "fsdp")
-
-    # Axes to psum (combine split-K/param shards) after gate/wi/wu
-    combine_axes: tuple[str, ...] = ("sp", "fsdp")
-
-    # TP reduce-scatter
-    tp_axis: str = "tp"
-    rs_dim: int = -1  # last axis by default
-    rs_enabled: bool = True
-
-    # Gather controls
-    gather_gate_on_tp: bool = True  # gather activations on H before gate
-    gather_logits_on_tp: bool = True  # gather logits on E across TP for top-k
-
-    # GMM backend choice for grouped_matmul
-    gmm_platform: str | None = None  # None|'xla'|'pallas'|'cuda'|'auto'
-
-    # Reduction accumulator dtype
-    reduce_dtype = jnp.bfloat16
+    gate_slice_k_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
+    wiwu_slice_k_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
+    combine_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
+    tp_axis: str = field(pytree_node=False, default="tp")
+    rs_dim: int = field(pytree_node=False, default=-1)
+    rs_enabled: bool = field(pytree_node=False, default=True)
+    ep_dispatch: Literal["all_to_all", "replicate", "auto"] = field(pytree_node=False, default=EP_DISPATCH)
+    ep_auto_threshold: int = field(pytree_node=False, default=EP_AUTO_TRESHOLD)
+    tokens_per_ep_threshold: int = field(pytree_node=False, default=8192)
+    gather_gate_on_tp: bool = field(pytree_node=False, default=True)
+    gather_logits_on_tp: bool = field(pytree_node=False, default=False)
+    gmm_platform: Literal["xla", "pallas", "cuda", "auto"] | None = field(pytree_node=False, default=None)
+    reduce_dtype: jnp.dtype = field(pytree_node=False, default=jnp.bfloat16)
 
 
 @dataclass(frozen=True)
@@ -556,15 +511,14 @@ class MoeContext:
         ...     return logits
 
     Note:
-        This context is immutable (frozen=False but intended for read-only use)
-        and should not be modified by hooks. It provides a consistent view of
-        the execution environment across all hook invocations.
+        This context should be treated as read-only and not modified by hooks.
+        It provides a consistent view of the execution environment across all
+        hook invocations.
     """
 
-    # Read-only runtime info passed to hooks
     mesh: jax.sharding.Mesh
     axis_names: tuple[str, ...]
-    axis_sizes: dict
+    axis_sizes: dict[str, int]
     B_loc: int
     S_loc: int
     H_full: int
@@ -572,7 +526,6 @@ class MoeContext:
     E: int
 
 
-# Helpers
 def _canon_dim(ndim: int, dim: int) -> int:
     """Canonicalizes a dimension index to be non-negative.
 
@@ -780,6 +733,45 @@ def _get_all_to_all_params(
     return in_off, send, out_off, recv
 
 
+def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.Array, jax.Array]:
+    """Computes global top-k selection across tensor-parallel shards.
+
+    This function performs top-k selection across multiple tensor-parallel shards by:
+    1. Computing local top-k on each shard's expert subset
+    2. Gathering local top-k results from all shards
+    3. Computing global top-k from the gathered results
+
+    This is more communication-efficient than gathering all logits and then computing top-k,
+    as it only communicates k*tp values instead of E values per token.
+
+    Args:
+        logits_shard: Local router logits for experts on this shard.
+            Shape: (batch_size, E_local) where E_local = total_experts / tp_size.
+        k: Number of top experts to select globally.
+        tp_axis: Name of the tensor parallel mesh axis.
+
+    Returns:
+        A tuple of (values, indices) where:
+            - values: Top-k router logit values. Shape: (batch_size, k).
+            - indices: Global expert indices for top-k experts. Shape: (batch_size, k).
+
+    Example:
+        >>> logits_shard = jnp.array([[0.1, 0.3], [0.5, 0.2]])  # 2 tokens, 2 local experts
+        >>> vals, idx = tp_global_topk(logits_shard, k=1, tp_axis="tp")
+    """
+    vals_l, idx_l = jax.lax.top_k(logits_shard, k)
+    shard = jax.lax.axis_index(tp_axis)
+    E_local = logits_shard.shape[-1]
+    idx_l = idx_l + shard * E_local
+
+    vals_all = jax.lax.all_gather(vals_l, tp_axis, axis=-1, tiled=True)
+    idx_all = jax.lax.all_gather(idx_l, tp_axis, axis=-1, tiled=True)
+
+    vals_g, pos = jax.lax.top_k(vals_all, k)
+    idx_g = jnp.take_along_axis(idx_all, pos, axis=-1)
+    return vals_g, idx_g
+
+
 def _local_permute(
     inputs: jax.Array,
     global_group_sizes: jax.Array,
@@ -929,7 +921,6 @@ class BaseMoeModule(nn.Module, ABC):
     implementing various MoE architectures. It includes methods for token routing,
     data permutation for efficient expert computation, load balancing loss
     calculation, and sharding for distributed environments. Subclasses are
-
     expected to implement the `__call__` method to define the specific MoE forward
     pass.
 
@@ -973,6 +964,10 @@ class BaseMoeModule(nn.Module, ABC):
             rzl_coef: The coefficient for the router z-loss.
             routing_strategy: The strategy for routing tokens to experts.
             load_balancing_strategy: The strategy for load balancing.
+            moe_policy: Configuration policy for fused MoE operations. If None,
+                uses default MoeFusedPolicy.
+            moe_hooks: Hook system for custom interventions during MoE execution.
+                If None, uses default MoeFusedHooks with no custom hooks.
         """
         super().__init__()
         self.config = config
@@ -1017,8 +1012,27 @@ class BaseMoeModule(nn.Module, ABC):
     ) -> tuple[Float[Array, "batch_seq k"], Int[Array, "batch_seq k"]]:
         """Performs sharded routing of tokens to experts with improved partitioning.
 
-        Router probs shape: (batch * seq_len, num_experts)
-        Partitioned as: ((dp, fsdp), sp) for batch dimension
+        This method wraps the local routing implementation with shard_map to enable
+        efficient distributed routing across multiple devices. It automatically handles
+        partitioning based on the input tensor dimensions and ensures correct sharding
+        specifications for both inputs and outputs.
+
+        Args:
+            router_probs: Router probability distribution over experts for each token.
+                Shape: (batch_size * seq_len, num_experts) or (batch, seq, num_experts).
+                Partitioned as ((dp, fsdp), sp) for the batch dimension.
+            strategy: The routing strategy to use (e.g., TOP_K, EXPERT_CHOICE).
+
+        Returns:
+            A tuple of (routing_weights, selected_experts) where:
+                - routing_weights: Normalized weights for selected experts.
+                  Shape: (batch_size * seq_len, k).
+                - selected_experts: Indices of selected experts for each token.
+                  Shape: (batch_size * seq_len, k).
+
+        Example:
+            >>> router_probs = jnp.array([[0.1, 0.3, 0.6], [0.5, 0.2, 0.3]])
+            >>> weights, experts = module._route_sharded(router_probs, MoeRoutingStrategy.TOP_K)
         """
         pmag = self.partition_manager
 
@@ -1446,8 +1460,32 @@ class BaseMoeModule(nn.Module, ABC):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Performs a sharded permutation of tokens with improved partitioning.
 
-        Hidden states: (batch * seq_len, hidden_size)
-        Partitioned as: ((dp, fsdp), sp) for batch/seq, tp for hidden dimension
+        This method reorders tokens so that all tokens assigned to the same expert
+        are grouped together, enabling efficient batched computation across experts.
+        It handles distributed execution via shard_map and properly manages partitioning
+        across batch, sequence, and hidden dimensions.
+
+        Args:
+            hidden_states_flat: Token representations to be permuted.
+                Shape: (batch_size * seq_len * k, hidden_size) where k is num_experts_per_tok.
+                Partitioned as ((dp, fsdp), sp) for batch/seq, tp for hidden dimension.
+            topk_idx_flat: Flattened expert indices for each token-expert pair.
+                Shape: (batch_size * seq_len * k,).
+                Partitioned as ((dp, fsdp), sp) for batch dimension.
+
+        Returns:
+            A tuple of (sorted_tokens, group_sizes, sort_indices) where:
+                - sorted_tokens: Tokens sorted by expert assignment.
+                  Shape: (batch_size * seq_len * k, hidden_size).
+                - group_sizes: Number of tokens assigned to each expert.
+                  Shape: (num_experts,).
+                - sort_indices: Indices used for sorting, needed for unpermutation.
+                  Shape: (batch_size * seq_len * k,).
+
+        Example:
+            >>> hidden = jnp.ones((100, 512))  # 100 tokens, 512 hidden dim
+            >>> expert_ids = jnp.array([2, 0, 1, 2, ...])  # expert assignments
+            >>> sorted_h, sizes, idx = module._permute_sharded(hidden, expert_ids)
         """
         pmag = self.partition_manager
 
@@ -1531,7 +1569,30 @@ class BaseMoeModule(nn.Module, ABC):
         sort_idx: jax.Array,
         original_shape: tuple[int, ...],
     ) -> jax.Array:
-        """Performs a sharded un-permutation of tokens with auto-sharding."""
+        """Performs a sharded un-permutation of tokens with auto-sharding.
+
+        This method reverses the permutation applied by _permute_sharded, restoring
+        tokens to their original order after expert processing. It handles distributed
+        execution and properly manages output reshaping to match the expected format.
+
+        Args:
+            out_repeat_sort: Expert outputs in sorted order (by expert assignment).
+                Shape: (batch_size * seq_len * k, hidden_size).
+                Partitioned as ((dp, fsdp), sp) for batch, tp for hidden dimension.
+            sort_idx: The sorting indices from _permute_sharded used to restore
+                original token order. Shape: (batch_size * seq_len * k,).
+            original_shape: The original shape (batch_size, seq_len, hidden_size)
+                before flattening and permutation.
+
+        Returns:
+            Tokens restored to original order and reshaped.
+            Shape: (batch_size * seq_len, k, hidden_size) where k is num_experts_per_tok.
+
+        Example:
+            >>> sorted_outputs = jnp.ones((100, 512))  # Expert outputs
+            >>> sort_idx = jnp.array([...])  # From _permute_sharded
+            >>> restored = module._unpermute_sharded(sorted_outputs, sort_idx, (10, 10, 512))
+        """
         pmag = self.partition_manager
 
         if out_repeat_sort.ndim == 2:
@@ -1644,7 +1705,7 @@ class BaseMoeModule(nn.Module, ABC):
         if self.rzl_coef is None:
             return None
 
-        log_z = jax.nn.logsumexp(router_logits, axis=-1)
+        log_z = jax.nn.logsumexp(router_logits.astype(jnp.float32), axis=-1)
         return self.rzl_coef * jnp.mean(log_z**2)
 
     def _compute_metrics(
@@ -1884,8 +1945,10 @@ class BaseMoeModule(nn.Module, ABC):
         return selected_experts, constrained_weights
 
     def _create_expert_mask(
-        self, selected_experts: Int[Array, "batch_seq k"], expert_id: int
-    ) -> Bool[Array, "batch_seq k"]:
+        self,
+        selected_experts: Int[Array, "batch_seq k"],
+        expert_id: int,
+    ) -> Bool[Array, "batch_seq"]:  # type: ignore #noqa
         """Creates a boolean mask for tokens assigned to a specific expert.
 
         This utility method is useful for analyzing expert assignment patterns
@@ -1989,7 +2052,6 @@ class BaseMoeModule(nn.Module, ABC):
         """
         mesh = self.mesh
         E = wi_kernel.shape[0]
-        K = self.num_experts_per_tok
 
         policy = getattr(self, "moe_policy", MoeFusedPolicy())
         hooks = getattr(self, "moe_hooks", MoeFusedHooks())
@@ -2022,6 +2084,8 @@ class BaseMoeModule(nn.Module, ABC):
             # Local dynamic sizes (handles nnx micro-batching)
             B_loc, S_loc, H_shard = x.shape
             bs = B_loc * S_loc
+            K = self.num_experts_per_tok
+            cap_tokens = bs * K
 
             # Axis names/sizes
             axis_sizes = {n: mesh.shape[n] for n in mesh.axis_names}
@@ -2043,7 +2107,7 @@ class BaseMoeModule(nn.Module, ABC):
                 B_loc=B_loc,
                 S_loc=S_loc,
                 H_full=H_full,
-                K=K,
+                K=self.num_experts_per_tok,
                 E=E,
             )
             if hooks.before_gate:
@@ -2061,17 +2125,42 @@ class BaseMoeModule(nn.Module, ABC):
             logits_full = _psum_maybe(logits_partial, combine_axes, mesh, dtype=policy.reduce_dtype)
             if policy.gather_logits_on_tp:
                 logits_full = lax.all_gather(logits_full, tp_axis, axis=-1, tiled=True)  # [bs, E]
-            router_logits = logits_full.astype(jnp.float32)
+            router_logits = logits_full  # keep dtype; only cast for metrics later if needed
             if hooks.after_gate:
                 router_logits = hooks.after_gate(router_logits, ctx)
 
-            # 2) Routing (top-k)
-            router_probs = jax.nn.softmax(router_logits, axis=-1).astype(self.dtype)
-            if hooks.before_topk:
-                router_probs = hooks.before_topk(router_probs, ctx)
-            topk_weights, topk_idx = lax.top_k(router_probs, K)
-            if getattr(self.config, "norm_topk_prob", False):
-                topk_weights = topk_weights / jnp.sum(topk_weights, axis=-1, keepdims=True)
+            K = self.num_experts_per_tok
+            tp_axis = policy.tp_axis
+
+            if not policy.gather_logits_on_tp:
+                # Two-stage global top-k across TP shards (works for any K, including K=1)
+                topk_vals, topk_idx = tp_global_topk(router_logits, K, tp_axis)  # [bs, K], [bs, K]
+                if K == 1:
+                    # Weight 1.0 for the single chosen expert
+                    topk_weights = jnp.ones_like(topk_idx, dtype=self.dtype)
+                else:
+                    # Normalize over the selected logits for stability
+                    if getattr(self.config, "norm_topk_prob", True):
+                        topk_weights = jax.nn.softmax(topk_vals, axis=-1).astype(self.dtype)
+                    else:
+                        topk_weights = jax.nn.softmax(topk_vals, axis=-1).astype(self.dtype)
+            else:
+                # Original path: full-E softmax (requires TP gather)
+                logits_full_g = jax.lax.all_gather(router_logits, tp_axis, axis=-1, tiled=True)
+                router_probs = jax.nn.softmax(logits_full_g, axis=-1).astype(self.dtype)
+                if hooks.before_topk:
+                    router_probs = hooks.before_topk(router_probs, ctx)
+
+                if K == 1:
+                    topk_idx = jnp.argmax(router_probs, axis=-1, keepdims=True)
+                    topk_weights = jnp.take_along_axis(router_probs, topk_idx, axis=-1)
+                    if getattr(self.config, "norm_topk_prob", False):
+                        topk_weights = jnp.ones_like(topk_weights, dtype=self.dtype)
+                else:
+                    topk_weights, topk_idx = jax.lax.top_k(router_probs, K)
+                    if getattr(self.config, "norm_topk_prob", False):
+                        topk_weights = topk_weights / jnp.sum(topk_weights, axis=-1, keepdims=True)
+
             if hooks.after_topk:
                 topk_weights, topk_idx = hooks.after_topk(topk_weights, topk_idx, ctx)
 
@@ -2080,6 +2169,7 @@ class BaseMoeModule(nn.Module, ABC):
             sort_idx = jnp.argsort(flat_idx)  # [bs*K]
             x_rep_sorted = jnp.take(x_fullH, sort_idx // K, axis=0)  # [bs*K, H]
             group_sizes = jnp.bincount(flat_idx, length=E)  # [E]
+            sorted_experts = jnp.take(flat_idx, sort_idx)  # [bs*K]  # for replicate EP branch
             if hooks.before_ep_dispatch:
                 x_rep_sorted, group_sizes = hooks.before_ep_dispatch(x_rep_sorted, group_sizes, ctx)
 
@@ -2089,33 +2179,65 @@ class BaseMoeModule(nn.Module, ABC):
             assert E % ep_size == 0
             local_E = E // ep_size
             ep_idx = lax.axis_index(ep_axis)
-
-            reshaped_gs = jnp.sum(group_sizes.reshape(-1, local_E), axis=1)  # [ep_size]
-            in_off, send_sz, out_off, recv_sz = _get_all_to_all_params(
-                reshaped_gs, ep_idx, ep_size, is_batch_sharded=False
+            bs = B_loc * S_loc
+            tokens_per_ep_shard = (bs * K + ep_size - 1) // ep_size
+            use_all_to_all = (policy.ep_dispatch == "all_to_all") | (
+                (policy.ep_dispatch == "auto") & (tokens_per_ep_shard >= policy.tokens_per_ep_threshold)
             )
-            in_off = in_off.astype(jnp.int32)
-            send_sz = send_sz.astype(jnp.int32)
-            out_off = out_off.astype(jnp.int32)
-            recv_sz = recv_sz.astype(jnp.int32)
 
-            buf_len = int(ep_size * bs * K)  # conservative buffer per call
-            x_buf = jnp.zeros((buf_len, H_full), dtype=x_rep_sorted.dtype)
-            x_local = lax.ragged_all_to_all(x_rep_sorted, x_buf, in_off, send_sz, out_off, recv_sz, axis_name=ep_axis)
+            def ep_all_to_all():
+                reshaped_gs = jnp.sum(group_sizes.reshape(-1, local_E), axis=1)  # [ep_size]
+                in_off, send_sz, out_off, recv_sz = _get_all_to_all_params(
+                    reshaped_gs, ep_idx, ep_size, is_batch_sharded=False
+                )
+                in_off = in_off.astype(jnp.int32)
+                send_sz = send_sz.astype(jnp.int32)
+                out_off = out_off.astype(jnp.int32)
+                recv_sz = recv_sz.astype(jnp.int32)
+                x_buf = jnp.zeros((cap_tokens, H_full), dtype=x_rep_sorted.dtype)
+                x_local = lax.ragged_all_to_all(
+                    x_rep_sorted, x_buf, in_off, send_sz, out_off, recv_sz, axis_name=ep_axis
+                )
 
-            # 5) Local permute: derive local ids from local sizes (no global offsets)
-            x_local, local_sorted_idx, local_group_sizes, _ = _local_permute(
-                x_local,
-                group_sizes[None, :],  # [1, E]
-                local_E,
-                shard_index=ep_idx,
-                is_offset=False,
-                global_sorted_experts=None,
-                use_custom_sort_vjp=True,
+                # local permute
+                x_local, local_sorted_idx, local_group_sizes, _ = _local_permute(
+                    x_local,
+                    group_sizes[None, :],  # [1, E]
+                    local_E,
+                    shard_index=ep_idx,
+                    is_offset=False,
+                    global_sorted_experts=None,
+                    use_custom_sort_vjp=True,
+                )
+                local_group_sizes = local_group_sizes.astype(jnp.int32)
+                if hooks.after_ep_receive:
+                    x_local, local_group_sizes = hooks.after_ep_receive(x_local, local_group_sizes, ctx)
+
+                return (x_local, local_sorted_idx, local_group_sizes, (in_off, send_sz, out_off, recv_sz))
+
+            def ep_replicate():
+                x_local, local_sorted_idx, local_group_sizes, _ = _local_permute(
+                    x_rep_sorted,
+                    group_sizes[None, :],
+                    local_E,
+                    shard_index=ep_idx,
+                    is_offset=True,
+                    global_sorted_experts=sorted_experts,
+                    use_custom_sort_vjp=True,
+                )
+                local_group_sizes = local_group_sizes.astype(jnp.int32)
+                if hooks.after_ep_receive:
+                    x_local, local_group_sizes = hooks.after_ep_receive(x_local, local_group_sizes, ctx)
+
+                local_sorted_idx = local_sorted_idx.astype(jnp.int32)
+
+                # dummy comm params for symmetry
+                comm = (jnp.zeros((ep_size,), jnp.int32),) * 4
+                return (x_local, local_sorted_idx, local_group_sizes, comm)
+
+            x_local, local_sorted_idx, local_group_sizes, comm = jax.lax.cond(
+                use_all_to_all, ep_all_to_all, ep_replicate
             )
-            local_group_sizes = local_group_sizes.astype(jnp.int32)
-            if hooks.after_ep_receive:
-                x_local, local_group_sizes = hooks.after_ep_receive(x_local, local_group_sizes, ctx)
 
             # 6) Experts: wi/up with psum over combine_axes; slice activations to local k-chunk if needed
             k_chunk_w = w0.shape[1]  # local k per device for w0/w1 across (sp,fsdp)
@@ -2141,37 +2263,43 @@ class BaseMoeModule(nn.Module, ABC):
             if hooks.before_wo:
                 inter, w2 = hooks.before_wo(inter, w2, ctx)
             y2 = grouped_matmul(
-                inter,
-                w2,
-                local_group_sizes,
-                preferred_element_type=jnp.bfloat16,
-                platform=policy.gmm_platform,
+                inter, w2, local_group_sizes, preferred_element_type=jnp.bfloat16, platform=policy.gmm_platform
             )
             if policy.rs_enabled:
                 y2 = _rsum_scatter_maybe(y2, policy.tp_axis, policy.rs_dim, mesh, dtype=policy.reduce_dtype)
             if hooks.after_wo:
                 y2 = hooks.after_wo(y2, ctx)
 
-            # Undo local sort
+            y2_pad = jnp.zeros((cap_tokens, y2.shape[-1]), dtype=y2.dtype)
+            y2 = lax.dynamic_update_slice_in_dim(y2_pad, y2, 0, axis=0)
+
             y_local_unsorted = _sort_activations(y2, jnp.argsort(local_sorted_idx), use_custom_vjp=True)
-
-            # 8) Return from EP (inverse ragged_all_to_all)
-            y_back = lax.ragged_all_to_all(
-                y_local_unsorted,
-                jnp.zeros((x_rep_sorted.shape[0], y_local_unsorted.shape[-1]), dtype=y_local_unsorted.dtype),
-                in_off,
-                send_sz,
-                out_off,
-                recv_sz,
-                axis_name=ep_axis,
-            )  # [bs*K, H/tp]
-
+            # 8) Gather back tokens for all_to_all path; replicate path uses identity
+            if use_all_to_all:
+                in_off, send_sz, out_off, recv_sz = comm
+                # return buffer must match original bs*K tokens
+                y_back = lax.ragged_all_to_all(
+                    y_local_unsorted,
+                    jnp.zeros((x_rep_sorted.shape[0], y_local_unsorted.shape[-1]), dtype=y_local_unsorted.dtype),
+                    in_off,
+                    send_sz,
+                    out_off,
+                    recv_sz,
+                    axis_name=ep_axis,
+                )  # [bs*K, H/tp]
+            else:
+                # slice off the padding before the global un-permute
+                y_back = y_local_unsorted[: (bs * K)]
             # 9) Unsort to token order and combine with weights
-            y_unsorted = _sort_activations(y_back, jnp.argsort(sort_idx), use_custom_vjp=True)  # [bs*K, H/tp]
+            y_unsorted = _sort_activations(
+                y_back[: (bs * K)], jnp.argsort(sort_idx), use_custom_vjp=True
+            )  # [bs*K, H/tp]
             y_unflat = y_unsorted.reshape(bs, K, -1)  # [bs, K, H/tp]
             if hooks.before_combine:
                 y_unflat, topk_weights = hooks.before_combine(y_unflat, topk_weights, ctx)
             out = jnp.sum(y_unflat * topk_weights[..., None].astype(y_unflat.dtype), axis=1)  # [bs, H/tp]
+            if policy.ep_dispatch != "all_to_all":
+                out = lax.psum(out.astype(policy.reduce_dtype), ep_axis).astype(out.dtype)
             out = out.reshape(B_loc, S_loc, -1)  # [B_loc, S_loc, H/tp]
 
             # Finalize
@@ -2314,18 +2442,23 @@ class ParallelMoELinear(nn.Module):
     use `shard_map` for distributed execution.
 
     Attributes:
-        num_experts (int): Number of experts.
-        in_features (int): Input feature dimension.
-        out_features (int): Output feature dimension.
-        use_pallas_group_matmul (bool): Whether to use the optimized GMM kernel (TPU-optimized).
-        out_first (bool): If True, kernel shape is `(num_experts, out_features, in_features)`;
+        num_experts: Number of experts.
+        in_features: Input feature dimension.
+        out_features: Output feature dimension.
+        use_pallas_group_matmul: Whether to use the optimized GMM kernel (TPU-optimized).
+        out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
             otherwise `(num_experts, in_features, out_features)`.
-        dtype (jax.numpy.dtype | None): Data type for computation.
-        param_dtype (jax.numpy.dtype): Data type for parameters.
-        kernel (nn.Param): Weight matrix parameter for the transformation.
-        bias (nn.Param | None): Optional bias parameter.
-        partition_manager (PartitionManager | None): Handles sharding of parameters.
-        _direction (Literal["row", "column"] | None): Sharding direction for ALT sharding.
+        dtype: Data type for computation. None means inherits from inputs.
+        param_dtype: Data type for parameters (weights, biases).
+        kernel_init: Initializer function for the kernel weights.
+        bias_init: Initializer function for the bias.
+        kernel: Weight matrix parameter for the transformation.
+            Shape: (num_experts, out_features, in_features) if out_first else
+            (num_experts, in_features, out_features).
+        bias: Optional bias parameter. Shape: (num_experts, out_features) if out_first
+            else (num_experts, in_features). None if use_bias=False.
+        partition_manager: Handles sharding of parameters for distributed execution.
+        _direction: Sharding direction for ALT sharding ("row", "column", or None).
     """
 
     _direction: typing.Literal["row", "column"] | None = None
@@ -2480,7 +2613,6 @@ class ParallelMoELinear(nn.Module):
             inputs,
             weight,
             group_sizes,
-            platform="xla",
             preferred_element_type=jnp.bfloat16,
             transpose_rhs=self.out_first,
         )
