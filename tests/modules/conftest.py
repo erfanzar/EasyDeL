@@ -68,7 +68,7 @@ def small_model_config():
         "sequence_length": 128,
         "sliding_window": 64,
         "use_sliding_window": True,
-        "sharding_axis_dims": (1, 1, -1, 1, 1),
+        "sharding_axis_dims": (1, 1, 1, -1, 1),
         "head_dim": 32,
         "use_parallel_residual": True,
         "qk_layernorm": True,
