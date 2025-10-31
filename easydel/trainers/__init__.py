@@ -16,10 +16,12 @@ from .base_trainer import BaseTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
+from .image_diffusion_trainer import ImageDiffusionConfig, ImageDiffusionTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .packer import pack_sequences
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
+from .stable_diffusion_trainer import StableDiffusionConfig, StableDiffusionTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
@@ -32,11 +34,15 @@ __all__ = (
     "DistillationTrainer",
     "GRPOConfig",
     "GRPOTrainer",
+    "ImageDiffusionConfig",
+    "ImageDiffusionTrainer",
     "ORPOConfig",
     "ORPOTrainer",
     "RayDistributedTrainer",
     "RewardConfig",
     "RewardTrainer",
+    "StableDiffusionConfig",
+    "StableDiffusionTrainer",
     "SFTConfig",
     "SFTTrainer",
     "Trainer",
