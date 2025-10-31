@@ -40,6 +40,16 @@ grpo_config = GRPOConfig(
 )
 ```
 
+### Advanced Reinforcement-Learning Controls
+
+EasyDeL's GRPO trainer now exposes several knobs collected from ProRL, DAPO, and VinePPO:
+
+- `epsilon_low` / `epsilon_high` let you widen or tighten the asymmetric PPO clip window to preserve entropy on promising trajectories while damping bad ones.
+- `adv_estimator` toggles between group-normalised z-scores (`"group"`), Monte-Carlo advantages (`"gae"`), and discounted truncated returns (`"truncated"`).
+- `length_shaping` enables DAPO-style reward shaping for overlong answers with either the original linear schedule or a stronger punitive variant.
+- `kl_target`, `reference_reset_style`, and `reference_reset_steps` automatically refresh the reference policy when KL or entropy drift beyond your targets.
+- `per_token_weighting` balances gradients by scaling each completion with the inverse of its length, mirroring the dynamic token loss in DAPO.
+
 ## Basic Usage
 
 Here's how to set up and use the GRPOTrainer for fine-tuning a language model:
