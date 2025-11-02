@@ -71,6 +71,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseConfig
 
 from .utils import (
+    DEBUG_MOE,
     MoeFusedHooks,
     MoeFusedPolicy,
     MoeLoadBalancingStrategy,
@@ -484,8 +485,8 @@ class BaseMoeModule(nn.Module, ABC):
             second element is a placeholder for parity with other call paths.
         """
         BS, SQLN, HD = hidden_state.shape
-        gate_logits = gate_layer(hidden_state)
-        gate_logits = jax.nn.softmax(gate_logits.astype("f4"), axis=-1).astype(gate_logits.dtype)
+        prein_gate_logits = gate_layer(hidden_state.reshape(-1, HD))
+        gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
 
         partition_manager = self.partition_manager
         expert_axis_name = resolve_eformer_axis(EP, partition_manager)
@@ -499,11 +500,7 @@ class BaseMoeModule(nn.Module, ABC):
         comb_size = fsdp_size * sp_size
         input_ps = partition_manager.resolve(axes=[DP, EMPTY, EMPTY], mode=MODE_TRAIN, shape=hidden_state.shape)
         output_ps = partition_manager.resolve(axes=[DP, EMPTY, TP], mode=MODE_TRAIN, shape=(BS, SQLN, HD))
-        glps = partition_manager.resolve(
-            axes=[DP, EMPTY, EMPTY],
-            mode=MODE_TRAIN,
-            shape=(BS, SQLN, self.n_routed_experts),
-        )
+        glps = partition_manager.resolve(axes=[DP, EMPTY], mode=MODE_TRAIN, shape=(BS * SQLN, self.n_routed_experts))
 
         if ffn_activation is None:
 
@@ -522,18 +519,19 @@ class BaseMoeModule(nn.Module, ABC):
         wibps = None
         wubps = None
         wdbps = None
+
         if wi_bias is not None:
             wibps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wi_bias.shape)
         if wu_bias is not None:
             wubps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wu_bias.shape)
         if wd_bias is not None:
-            wdbps = partition_manager.resolve(axes=[EP, EMPTY], mode=MODE_TRAIN, shape=wd_bias.shape)
+            wdbps = partition_manager.resolve(axes=[EP, EMPTY], mode=MODE_TRAIN, s_hape=wd_bias.shape)
 
         @partial(
             shard_map,
             mesh=self.mesh,
             in_specs=(input_ps, glps, wikps, wukps, wdkps, wibps, wubps, wdbps),
-            out_specs=(output_ps, None),
+            out_specs=output_ps,
             check_vma=False,
         )
         def _sparse_call(
@@ -693,6 +691,8 @@ class BaseMoeModule(nn.Module, ABC):
                         axis_name=expert_axis_name,
                     )
 
+                if DEBUG_MOE:
+                    jax.debug.print("Fused    {}", intermediate_output[-1, -5:])
                 output = unpermute(
                     intermediate_output,
                     sorted_selected_experts,
@@ -703,9 +703,12 @@ class BaseMoeModule(nn.Module, ABC):
                     num_experts_per_tok=self.num_experts_per_tok,
                     dtype=self.dtype,
                 )
-            return output, None
 
-        output, logits = _sparse_call(
+                if DEBUG_MOE:
+                    jax.debug.print("Fused    Out {}", output[-1, -1, -5:])
+            return output
+
+        output = _sparse_call(
             hidden_state,
             gate_logits,
             wi_kernel,
@@ -715,7 +718,7 @@ class BaseMoeModule(nn.Module, ABC):
             wu_bias,
             wd_bias,
         )
-        return output, logits
+        return output, prein_gate_logits
 
     def _moe_call_fused(
         self,
@@ -739,7 +742,7 @@ class BaseMoeModule(nn.Module, ABC):
     ):
         """Wrapper for fused MoE call with shard_map for training/inference."""
         if self.config.moe_method == "standard_moe":
-            return self._moe_call_standard(
+            self._moe_call_standard(
                 gate_layer=gate_layer,
                 expert_layer=expert_layer,
                 hidden_state=hidden_state,
@@ -781,6 +784,9 @@ class BaseMoeModule(nn.Module, ABC):
         router_logits = gate_layer(hidden_state_flat).astype(jnp.promote_types(self.dtype, jnp.float32))
         router_probs = jax.nn.softmax(router_logits, axis=-1)
 
+        if DEBUG_MOE:
+            jax.debug.print("Standard In Gatelogits {}", router_probs[-1, -5:])
+
         if reform_router_probs_fn is not None:
             router_probs = reform_router_probs_fn(router_probs)
 
@@ -788,14 +794,25 @@ class BaseMoeModule(nn.Module, ABC):
             self._validate_routing_inputs(hidden_state, router_logits)
 
         selected_weights, selected_experts = self._route_local(router_probs, self.routing_strategy)
+        if DEBUG_MOE:
+            jax.debug.print(
+                "Standard Top-k weights stats: min={:.6f}, max={:.6f}, mean={:.6f}",
+                jnp.min(selected_weights),
+                jnp.max(selected_weights),
+                jnp.mean(selected_weights),
+            )
         if apply_capacity_constraint:
             selected_experts, selected_weights = self._apply_capacity_constraint(selected_experts, selected_weights)
 
         sorted_inputs, sort_order, group_sizes, _ = self._replicate_and_sort_tokens(hidden_state_flat, selected_experts)
         out_sorted = expert_layer(sorted_inputs, group_sizes)
+        if DEBUG_MOE:
+            jax.debug.print("Standard {}", out_sorted[-1, -5:])
         out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order))
         out_unflat = out_unsorted.reshape(batch_size * seq_len, self.num_experts_per_tok, hidden_size)
         output = jnp.sum(out_unflat * selected_weights[..., None], axis=1).reshape(batch_size, seq_len, hidden_size)
+        if DEBUG_MOE:
+            jax.debug.print("Standard Out {}", output[-1, -1, -5:])
         if output_metrics:
             metrics = self._compute_metrics(
                 router_logits,
