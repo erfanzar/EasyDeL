@@ -183,7 +183,10 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
             (r"self_attn/norm/scale", pmag.resolve(Replicated)),
             (r"self_attn/norm/bias", pmag.resolve(Replicated)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
+            (
+                r"block_sparse_moe/gate/kernel",
+                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
+            ),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
             (r"block_sparse_moe/experts/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/experts/w2/kernel", pmag.resolve(RowWise)),

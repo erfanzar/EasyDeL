@@ -110,9 +110,12 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
-
+DEFAULT_MOE_METHOD = "fused_moe"
+EXPERT_TP_MODE = False
+RING_EXPERTS = False
 ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
+
 
 if ED_DEFAULT_HARDWARE_ABSTRACTION:
     DEFAULT_HARDWARE_ABSTRACTION = True
@@ -241,6 +244,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     pallas_m_block_size: NotRequired[int]
     pallas_k_block_size: NotRequired[int]
     pallas_n_block_size: NotRequired[int]
+    use_expert_tensor_mode: NotRequired[bool]
+    moe_method: NotRequired[tp.Literal["fused_moe", "standard_moe"]]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
@@ -358,6 +363,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
         pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
         pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
+        moe_method: tp.Literal["fused_moe", "standard_moe"] = DEFAULT_MOE_METHOD,
+        use_expert_tensor_mode: bool = EXPERT_TP_MODE,
+        use_ring_of_experts: bool = RING_EXPERTS,
         **kwargs,
     ):
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
@@ -422,6 +430,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.pallas_m_block_size = getattr(self, "pallas_m_block_size", pallas_m_block_size)
         self.pallas_k_block_size = getattr(self, "pallas_k_block_size", pallas_k_block_size)
         self.pallas_n_block_size = getattr(self, "pallas_n_block_size", pallas_n_block_size)
+        self.moe_method = getattr(self, "moe_method", moe_method)
+        self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
+        self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
 
         self.pretraining_tp = 1  # it's for pytorch models.
         if self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE and self.use_sharded_kv_caching:
@@ -630,6 +641,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "pallas_m_block_size",
             "pallas_k_block_size",
             "pallas_n_block_size",
+            "moe_method",
+            "use_ring_of_experts",
+            "use_expert_tensor_mode",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -679,6 +693,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pallas_m_block_size: int = NOT_GIVEN,
         pallas_k_block_size: int = NOT_GIVEN,
         pallas_n_block_size: int = NOT_GIVEN,
+        moe_method: tp.Literal["fused_moe", "standard_moe"] = NOT_GIVEN,
+        use_ring_of_experts: bool = NOT_GIVEN,
+        use_expert_tensor_mode: bool = NOT_GIVEN,
         **kwargs,
     ):
         """
@@ -797,6 +814,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
         set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
         set_attrs_smartly(self, "pallas_n_block_size", DEFAULT_PALLAS_N_BLOCK_SIZE, pallas_n_block_size)
+        set_attrs_smartly(self, "moe_method", DEFAULT_MOE_METHOD, moe_method)
+        set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
+        set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
 
         for key_, value_ in kwargs.items():
             setattr(self, key_, value_)

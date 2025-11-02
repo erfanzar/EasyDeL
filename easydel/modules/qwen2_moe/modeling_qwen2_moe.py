@@ -84,7 +84,6 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.down_proj = RowParallelMoELinear(
@@ -94,7 +93,6 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.up_proj = ColumnParallelMoELinear(
@@ -104,7 +102,6 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.act_fn = nn.silu
@@ -428,8 +425,10 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - router_logits (chex.Array): The logits output by the gating network.
         """
         B, S, H = hidden_states.shape
-        out, router_logits = self._moe_call_fused_shard_map(
+        out, router_logits = self._moe_call_fused(
             hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
             gate_kernel=self.gate.kernel.value,
             wi_kernel=self.experts.gate_proj.kernel.value,
             wu_kernel=self.experts.up_proj.kernel.value,

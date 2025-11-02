@@ -115,7 +115,6 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.w2 = RowParallelMoELinear(
@@ -125,7 +124,6 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.w3 = ColumnParallelMoELinear(
@@ -135,7 +133,6 @@ class MixtralMoEMlp(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -198,8 +195,10 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
     def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
-        out, router_logits = self._moe_call_fused_shard_map(
+        out, router_logits = self._moe_call_fused(
             hidden_state,
+            self.gate,
+            self.experts,
             self.gate.kernel.value,
             self.experts.w1.kernel.value,
             self.experts.w3.kernel.value,

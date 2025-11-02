@@ -176,7 +176,7 @@ class XerxesConfig(EasyDeLBaseConfig):
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"mlp/gate/bias", pmag.resolve(Replicated)),
             (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/experts/down_proj/kernel", pmag.resolve(RowWise)),

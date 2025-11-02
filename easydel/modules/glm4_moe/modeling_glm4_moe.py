@@ -133,7 +133,6 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.down_proj = RowParallelMoELinear(
@@ -143,7 +142,6 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.up_proj = ColumnParallelMoELinear(
@@ -153,7 +151,6 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -290,8 +287,10 @@ class Glm4MoeMoE(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        out, router_logits = self._moe_call_fused_shard_map(
+        out, router_logits = self._moe_call_fused(
             hidden_states,
+            self.gate,
+            self.experts,
             self.gate.kernel.value,
             self.experts.gate_proj.kernel.value,
             self.experts.up_proj.kernel.value,

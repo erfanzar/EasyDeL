@@ -86,7 +86,6 @@ class DeepseekV2MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -98,7 +97,6 @@ class DeepseekV2MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -110,7 +108,6 @@ class DeepseekV2MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -315,8 +312,10 @@ class DeepseekV2MoE(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: chex.Array):
-        out, router_logits = self._moe_call_fused_shard_map(
+        out, router_logits = self._moe_call_fused(
             hidden_states,
+            self.gate,
+            self.experts,
             self.gate.kernel.value,
             self.experts.gate_proj.kernel.value,
             self.experts.up_proj.kernel.value,
