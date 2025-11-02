@@ -13,12 +13,31 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+import typing as tp
+
+from eformer.common_types import (
+    EMPTY,
+    MODE_TRAIN,
+    TP,
+    ColumnWise,
+    DynamicShardingAxes,
+    ExpertColumnWiseAlt,
+    ExpertRowWiseAlt,
+    Replicated,
+    RowWise,
+)
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+
+class ExpertTensorParallel(DynamicShardingAxes):
+    """Expert Tensor Parallelism (EPxTP) sharding axes."""
+
+    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("arctic")
@@ -205,9 +224,18 @@ class ArcticConfig(EasyDeLBaseConfig):
             (r"model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/experts/.*/(w1|w3)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"block_sparse_moe/experts/.*/w2/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            (
+                r"block_sparse_moe/gate/kernel",
+                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
+            ),
+            (
+                r"block_sparse_moe/experts/.*/(w1|w3)/kernel",
+                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertColumnWiseAlt),
+            ),
+            (
+                r"block_sparse_moe/experts/.*/w2/kernel",
+                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertRowWiseAlt),
+            ),
             (r"block_sparse_moe/mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/mlp/w2/kernel", pmag.resolve(RowWise)),
             (r"residual_mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),

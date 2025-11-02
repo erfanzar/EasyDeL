@@ -82,7 +82,6 @@ class Qwen3MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.down_proj = RowParallelMoELinear(
@@ -92,7 +91,6 @@ class Qwen3MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.up_proj = ColumnParallelMoELinear(
@@ -102,7 +100,6 @@ class Qwen3MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
         )
         self.act_fn = ACT2FN[config.hidden_act]
@@ -285,13 +282,19 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
                 - final_hidden_states (chex.Array): The output hidden states after MoE processing.
                 - router_logits (chex.Array): The logits output by the gating network.
         """
-        out, router_logits = self._moe_call_fused_shard_map(
+
+        def wmodif_fn(logits: jax.Array) -> jax.Array:
+            return logits / logits.sum(axis=-1, keepdims=True)
+
+        out, router_logits = self._moe_call_fused(
             hidden_states,
-            self.gate.kernel,
+            self.gate,
+            self.experts,
             self.experts.gate_proj.kernel.value,
             self.experts.up_proj.kernel.value,
             self.experts.down_proj.kernel.value,
-            self.experts.act_fn,
+            act_fn=self.experts.act_fn,
+            wmodif_fn=wmodif_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

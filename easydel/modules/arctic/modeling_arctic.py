@@ -206,7 +206,6 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -218,7 +217,6 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -230,7 +228,6 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
             rngs=rngs,
         )
@@ -404,8 +401,10 @@ class ArcticMoeBlock(BaseMoeModule):
                     hidden state and router logits (or 0.0 if not MoE).
         """
         if self.is_moe_layer:
-            out, router_logits = self._moe_call_fused_shard_map(
+            out, router_logits = self._moe_call_fused(
                 hidden_states,
+                self.gate,
+                self.experts,
                 self.gate.kernel,
                 self.experts.w1.kernel.value,
                 self.experts.w3.kernel.value,

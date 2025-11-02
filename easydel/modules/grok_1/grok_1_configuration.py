@@ -181,7 +181,7 @@ class Grok1Config(EasyDeLBaseConfig):
             (r"attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"gate/kernel", pmag.resolve(ColumnWise)),
+            (r"gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"gate/bias", pmag.resolve(Replicated)),
             (r"experts/(linear|linear_v)/kernel", pmag.resolve(ColumnWise)),
             (r"experts/linear_1/kernel", pmag.resolve(RowWise)),
