@@ -51,6 +51,7 @@ SP = common_types.SP
 EP_DISPATCH = os.getenv("EP_DISPATCH", "auto")
 EP_AUTO_TRESHOLD = int(os.getenv("EP_AUTO_TRESHOLD", 0))
 GMM_PLATFORM = None
+DEBUG_MOE = False
 
 
 def rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
@@ -518,7 +519,8 @@ def get_topk(
         top_k_weights, top_k_indices = top_kfn(gate_logits, pre_bias_logits, num_experts_per_tok)
     else:
         top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, num_experts_per_tok)
-
+    if DEBUG_MOE:
+        jax.debug.print("Fused In Gatelogits {}", gate_logits[-1, -5:])
     if wmodif_fn:
         top_k_weights = wmodif_fn(top_k_weights)
 
@@ -584,7 +586,13 @@ def permute(
         wmodif_fn=wmodif_fn,
         num_experts_per_tok=num_experts_per_tok,
     )
-
+    if DEBUG_MOE:
+        jax.debug.print(
+            "Fuesed Top-k weights stats: min={:.6f}, max={:.6f}, mean={:.6f}",
+            jnp.min(weights),
+            jnp.max(weights),
+            jnp.mean(weights),
+        )
     if refine_idsfn:
         inputs_2d = refine_idsfn(inputs_2d, weights, inputs_shape)
 
