@@ -425,15 +425,21 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - router_logits (chex.Array): The logits output by the gating network.
         """
         B, S, H = hidden_states.shape
+
+        def wmodif_fn(logits: jax.Array) -> jax.Array:
+            if self.config.norm_topk_prob:
+                logits /= logits.sum(axis=-1, keepdims=True)
+            return logits
+
         out, router_logits = self._moe_call_fused(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,
-            gate_kernel=self.gate.kernel.value,
             wi_kernel=self.experts.gate_proj.kernel.value,
             wu_kernel=self.experts.up_proj.kernel.value,
             wd_kernel=self.experts.down_proj.kernel.value,
             act_fn=self.experts.act_fn,
+            wmodif_fn=wmodif_fn,
             output_metrics=False,
         )
 

@@ -284,7 +284,9 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
         """
 
         def wmodif_fn(logits: jax.Array) -> jax.Array:
-            return logits / logits.sum(axis=-1, keepdims=True)
+            if self.config.norm_topk_prob:
+                logits /= logits.sum(axis=-1, keepdims=True)
+            return logits
 
         out, router_logits = self._moe_call_fused(
             hidden_states,
