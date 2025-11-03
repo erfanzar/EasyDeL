@@ -26,13 +26,11 @@ import enum
 import os
 import typing
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
 
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager
-from eformer.pytree import auto_pytree, field
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
@@ -160,48 +158,75 @@ def sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tuple
 sort_activations_custom.defvjp(sort_activations_custom_fwd, sort_activations_custom_bwd)
 
 
-@auto_pytree
-class MoeFusedPolicy:
-    """Execution policy for fused MoE kernels.
-
-    The policy captures which mesh axes participate in split-K contractions, how
-    reduce-scatter is applied, and which grouped matmul backend to use. It also
-    controls whether router activations or logits should be gathered across tensor
-    parallel shards before routing.
-    """
-
-    gate_slice_k_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
-    wiwu_slice_k_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
-    combine_axes: tuple[str, ...] = field(pytree_node=False, default=("sp", "fsdp"))
-    tp_axis: str = field(pytree_node=False, default="tp")
-    rs_dim: int = field(pytree_node=False, default=-1)
-    rs_enabled: bool = field(pytree_node=False, default=True)
-    ep_dispatch: Literal["all_to_all", "replicate", "auto"] = field(pytree_node=False, default=EP_DISPATCH)
-    ep_auto_threshold: int = field(pytree_node=False, default=EP_AUTO_TRESHOLD)
-    tokens_per_ep_threshold: int = field(pytree_node=False, default=2048)
-    gather_gate_on_tp: bool = field(pytree_node=False, default=True)
-    gather_logits_on_tp: bool = field(pytree_node=False, default=False)
-    gmm_platform: Literal["xla", "pallas", "cuda", "auto"] | None = field(pytree_node=False, default="xla")
-    reduce_dtype: jnp.dtype = field(pytree_node=False, default=jnp.bfloat16)
-    expert_axis_include_tp: bool = field(pytree_node=False, default=False)
-
-
 @dataclass(frozen=True)
 class MoeFusedHooks:
     """Optional callbacks executed at key points of the fused MoE pipeline.
 
-    Each hook receives the tensors for that stage plus a `MoeContext`, and may
-    return modified tensors. Hooks default to `None`, in which case the pipeline
-    proceeds without intervention.
+    Hooks allow fine-grained customization of the MoE execution flow without modifying
+    core logic. Each hook is invoked at a specific stage of the pipeline and can
+    inspect/modify tensors.
+
+    **Routing & Selection Hooks:**
+        before_gate: Invoked before gate/router layer. Can preprocess hidden states.
+            Signature: (hidden_states: Array) -> Array
+
+        after_gate: Invoked after gate/router logits are computed. Can postprocess logits.
+            Signature: (gate_logits: Array) -> Array
+
+        before_topk: Invoked before top-k expert selection. Can modify logits before selection.
+            Signature: (gate_logits: Array) -> Array
+
+        select_hook: Invoked after top-k selection to refine expert weights/scores.
+            Used for custom routing logic or weight normalization.
+            Signature: (selected_weights: Array, selected_experts: Array) -> (weights: Array, experts: Array)
+
+            Default for TOP_K routing: Normalizes weights by their sum (softmax-like normalization).
+
+    **Expert Processing Hooks:**
+        refine_weights_hook: Invoked before W_i and W_u (gate/up) projections.
+            Can refine expert weights before linear transformations.
+            Signature: (weights: Array) -> Array
+
+        after_wiwu: Invoked after W_i and W_u (gate/up) projections.
+            Can post-process expert intermediate activations.
+            Signature: (intermediate: Array) -> Array
+
+        before_wo: Invoked before W_o (output) projection.
+            Can modify combined expert outputs before final projection.
+            Signature: (combined_output: Array) -> Array
+
+        after_wo: Invoked after W_o (output) projection.
+            Can post-process final expert layer outputs.
+            Signature: (output: Array) -> Array
+
+    **Distributed Execution Hooks:**
+        refine_inputs_hook: Invoked before expert-parallel all-to-all communication.
+            Can refine token representations or route them to specific experts.
+            Signature: (inputs: Array, weights: Array, shape: Tuple) -> Array
+
+        after_ep_receive: Invoked after receiving tokens from other expert shards.
+            Can refine received token representations before expert computation.
+            Signature: (received_tokens: Array) -> Array
+
+    **Output Combination Hooks:**
+        before_combine: Invoked before combining outputs from multiple experts per token.
+            Can adjust expert weights or outputs before weighted sum.
+            Signature: (outputs: Array, weights: Array) -> (outputs: Array, weights: Array)
+
+        finalize_output: Invoked at the very end of MoE computation.
+            Can apply final normalization, residual connections, etc.
+            Signature: (final_output: Array) -> Array
+
+    Default behavior: All hooks are `None`, so the pipeline proceeds without intervention.
     """
 
     before_gate: Callable | None = None
     after_gate: Callable | None = None
     before_topk: Callable | None = None
-    after_topk: Callable | None = None
-    before_ep_dispatch: Callable | None = None
+    select_hook: Callable | None = None
+    refine_inputs_hook: Callable | None = None
     after_ep_receive: Callable | None = None
-    before_wiwu: Callable | None = None
+    refine_weights_hook: Callable | None = None
     after_wiwu: Callable | None = None
     before_wo: Callable | None = None
     after_wo: Callable | None = None
@@ -222,10 +247,10 @@ class MoeFusedHooks:
                 id(self.before_gate),
                 id(self.after_gate),
                 id(self.before_topk),
-                id(self.after_topk),
-                id(self.before_ep_dispatch),
+                id(self.select_hook),
+                id(self.refine_inputs_hook),
                 id(self.after_ep_receive),
-                id(self.before_wiwu),
+                id(self.refine_weights_hook),
                 id(self.after_wiwu),
                 id(self.before_wo),
                 id(self.after_wo),
@@ -234,30 +259,8 @@ class MoeFusedHooks:
             )
         )
 
-
-@dataclass
-class MoeContext:
-    """Read-only execution metadata provided to MoE hooks.
-
-    Attributes:
-        mesh: Device mesh describing axis names and device layout.
-        axis_names: Tuple of axis labels available on the mesh.
-        axis_sizes: Mapping from axis name to device count.
-        B_loc: Local batch size after sharding.
-        S_loc: Local sequence length after sharding.
-        H_full: Hidden size before tensor-parallel partitioning.
-        K: Number of experts per token selected by the router.
-        E: Total number of experts across the mesh.
-    """
-
-    mesh: jax.sharding.Mesh
-    axis_names: tuple[str, ...]
-    axis_sizes: dict[str, int]
-    B_loc: int
-    S_loc: int
-    H_full: int
-    K: int
-    E: int
+    def replace(self, **kws) -> MoeFusedHooks:
+        return replace(self, **kws)
 
 
 def canon_dim(ndim: int, dim: int) -> int:
@@ -488,26 +491,26 @@ def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.A
 def get_topk(
     gate_logits,
     pre_bias_logits,
-    top_kfn: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
-    wmodif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
+    select_hook: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
+    refine_weights_hook: typing.Callable[[jax.Array], jax.Array] | None = None,
     *,
     num_experts_per_tok: int,
 ):
     """Compute top-k experts and weights with optional overrides.
 
-    If a custom `top_kfn` is provided, it is used to compute the top-k selection
+    If a custom `select_hook` is provided, it is used to compute the top-k selection
     from the provided logits. Otherwise, `jax.lax.top_k` is used on
-    `gate_logits`. After selection, an optional `wmodif_fn` can adjust the raw
+    `gate_logits`. After selection, an optional `refine_weights_hook` can adjust the raw
     weights (e.g., apply softmax, temperature scaling, or masking).
 
     Args:
         gate_logits: Router logits used for expert selection, typically after any
             preprocessing. Shape: (tokens, num_experts).
-        pre_bias_logits: Optional pre-bias logits that some custom `top_kfn`
+        pre_bias_logits: Optional pre-bias logits that some custom `select_hook`
             might consume. Shape should align with `gate_logits` if used.
-        top_kfn: Optional function `(gate_logits, pre_bias_logits, k) -> (vals, idx)`
+        select_hook: Optional function `(gate_logits, pre_bias_logits, k) -> (vals, idx)`
             to compute the top-k scores and indices.
-        wmodif_fn: Optional function to modify the selected weights after top-k.
+        refine_weights_hook: Optional function to modify the selected weights after top-k.
         num_experts_per_tok: Number of experts to select per token (k).
 
     Returns:
@@ -515,14 +518,14 @@ def get_topk(
         - `top_k_weights`: Selected weights per token. Shape: (tokens, k).
         - `top_k_indices`: Expert indices per token. Shape: (tokens, k).
     """
-    if top_kfn:
-        top_k_weights, top_k_indices = top_kfn(gate_logits, pre_bias_logits, num_experts_per_tok)
+    if select_hook:
+        top_k_weights, top_k_indices = select_hook(gate_logits, pre_bias_logits, num_experts_per_tok)
     else:
         top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, num_experts_per_tok)
     if DEBUG_MOE:
         jax.debug.print("Fused In Gatelogits {}", gate_logits[-1, -5:])
-    if wmodif_fn:
-        top_k_weights = wmodif_fn(top_k_weights)
+    if refine_weights_hook:
+        top_k_weights = refine_weights_hook(top_k_weights)
 
     return top_k_weights, top_k_indices
 
@@ -533,13 +536,13 @@ def permute(
     pre_bias_logits: jax.Array | None = None,
     use_custom_sort_vjp: bool = True,
     roll_to_expert_id=None,
-    top_kfn: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
-    wmodif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
-    refine_idsfn: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
     *,
     num_experts_per_tok: int,
     num_experts: int,
     dtype: jnp.dtype,
+    select_hook: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
+    refine_weights_hook: typing.Callable[[jax.Array], jax.Array] | None = None,
+    refine_inputs_hook: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
 ):
     """Permute tokens by expert assignment for grouped matmul.
 
@@ -552,17 +555,17 @@ def permute(
         inputs: Token representations. Shape: (batch, seq, hidden).
         gate_logits: Router logits for expert selection. Shape: (batch*seq, E)
             if flattened, or broadcastable to that shape.
-        pre_bias_logits: Optional alternate logits for custom `top_kfn`.
+        pre_bias_logits: Optional alternate logits for custom `select_hook`.
         use_custom_sort_vjp: Whether to use the custom VJP sorter for efficiency.
         roll_to_expert_id: Optional expert ID offset to rotate indices (e.g., when
             each shard processes a subset of experts in ring-of-experts setups).
-        top_kfn: Optional function for top-k selection; otherwise `lax.top_k`.
-        wmodif_fn: Optional function to modify selected weights.
-        refine_idsfn: Optional function to refine or modify token IDs/inputs based
-            on the selected weights and original input shape.
         num_experts_per_tok: Number of experts selected per token (k).
         num_experts: Total number of experts (E).
         dtype: Output dtype for the sorted inputs.
+        select_hook: Optional function for top-k selection; otherwise `lax.top_k`.
+        refine_weights_hook: Optional function to modify selected weights.
+        refine_inputs_hook: Optional function to refine or modify token representations based
+            on the selected weights and original input shape.
 
     Returns:
         A 5-tuple `(sorted_inputs, sorted_selected_experts, weights, group_size, sorted_experts)`
@@ -582,8 +585,8 @@ def permute(
     weights, selected_experts = get_topk(
         gate_logits=gate_logits,
         pre_bias_logits=pre_bias_logits,
-        top_kfn=top_kfn,
-        wmodif_fn=wmodif_fn,
+        select_hook=select_hook,
+        refine_weights_hook=refine_weights_hook,
         num_experts_per_tok=num_experts_per_tok,
     )
     if DEBUG_MOE:
@@ -593,8 +596,8 @@ def permute(
             jnp.max(weights),
             jnp.mean(weights),
         )
-    if refine_idsfn:
-        inputs_2d = refine_idsfn(inputs_2d, weights, inputs_shape)
+    if refine_inputs_hook:
+        inputs_2d = refine_inputs_hook(inputs_2d, weights, inputs_shape)
 
     flatten_selected_experts = jnp.ravel(selected_experts)
 
@@ -731,15 +734,54 @@ def local_permute(
 class MoeRoutingStrategy(enum.Enum):
     """Defines the available strategies for routing tokens to experts in an MoE layer.
 
-    Attributes:
-        TOP_K: Standard top-k routing, where each token is routed to the k experts
-            with the highest router scores.
-        TOP_K_NDIV: Top-k routing without dividing the weights by their sum.
-        SWITCH: Switch Transformer-style routing, where each token is routed to
-            only the top-1 expert.
-        EMPTY_CHOICE: Expert Choice routing, where each expert selects the top-k
-            tokens with the highest scores for that expert.
-        HASH: A simple hashing-based routing for debugging or baseline comparison.
+    Each strategy determines how tokens are assigned to experts and how expert weights
+    are computed. When using fused MoE, hooks are automatically configured based on
+    the routing strategy to ensure correct behavior.
+
+    **Attributes:**
+
+        TOP_K: Standard top-k routing with weight normalization (softmax).
+            - Each token is routed to the k experts with the highest router logits.
+            - Expert weights are normalized by their sum (softmax normalization).
+            - Default hook: `select_hook` normalizes weights so they sum to 1.0.
+            - Use case: Most common approach, works well for balanced expert utilization.
+
+        TOP_K_NDIV: Top-k routing WITHOUT weight normalization.
+            - Each token is routed to the k experts with the highest router logits.
+            - Expert weights are NOT normalized (raw logit values used as weights).
+            - Default hook: `select_hook` passes weights through unchanged.
+            - Use case: When you want to use raw logits directly for expert combination.
+
+        SWITCH: Switch Transformer-style routing (token -> 1 expert only).
+            - Each token is routed to ONLY the single top-1 expert.
+            - Expert weight is enforced as exactly 1.0 (hard assignment).
+            - Default hook: `select_hook` sets weights to 1.0 (hard gating).
+            - Use case: Sparse, efficient routing with reduced computational cost.
+
+        EMPTY_CHOICE: Expert Choice routing (expert -> k tokens).
+            - INVERTED routing: each expert selects its top-k tokens.
+            - Better load balancing compared to top-k token routing.
+            - Default hook: `select_hook` uses uniform weights (1/k per expert).
+            - Use case: Scenarios requiring strict expert load balancing.
+
+        HASH: Hash-based routing (token -> expert by token_id % num_experts).
+            - Simple deterministic routing based on token IDs.
+            - All experts receive equal number of tokens.
+            - Default hook: `select_hook` uses uniform weights (1/k per expert).
+            - Use case: Debugging, baseline comparisons, or fully deterministic execution.
+
+    **Hook Auto-Configuration:**
+        When using `MoeFusedHooks` with fused MoE execution, the `select_hook` is
+        automatically configured based on the routing strategy if not explicitly set:
+
+        - TOP_K: Normalize weights → sum to 1.0 (probability distribution)
+        - TOP_K_NDIV: Passthrough → raw weights unchanged
+        - SWITCH: Hard gating → weights = 1.0
+        - EMPTY_CHOICE: Uniform → weights = 1/k
+        - HASH: Uniform → weights = 1/k
+
+        Custom hooks can override the defaults by setting them on `self.moe_hooks`
+        before calling the MoE layer.
     """
 
     TOP_K = "top_k"

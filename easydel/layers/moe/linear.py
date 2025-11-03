@@ -56,6 +56,13 @@ default_bias_init = nn.initializers.zeros
 Initializer = nn.initializers.Initializer
 
 
+class ExpertTensorParallel(DynamicShardingAxes):
+    """Expert Tensor Parallelism sharding (experts distributed over TP axis)."""
+
+    axes: typing.ClassVar = [TP, EMPTY, EMPTY]
+    mode: typing.ClassVar = MODE_TRAIN
+
+
 class ParallelMoELinear(nn.Module):
     """A batched linear transformation layer for Mixture of Experts (MoE) models.
 
@@ -105,6 +112,7 @@ class ParallelMoELinear(nn.Module):
         param_dtype: jnp.dtype = jnp.float32,
         partition_manager: PartitionManager | None = None,
         direction: typing.Literal["row", "column"] | None = None,
+        use_expert_tensor_mode: bool = False,
         rngs: nn.Rngs,
     ):
         """Initializes a `ParallelMoELinear` layer.
@@ -133,6 +141,7 @@ class ParallelMoELinear(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.partition_manager = partition_manager
+        self.use_expert_tensor_mode = use_expert_tensor_mode
 
         self.kernel_init = kernel_init
         self.bias_init = bias_init
@@ -186,6 +195,8 @@ class ParallelMoELinear(nn.Module):
         """
         if self.direction is None:
             return None
+        if self.use_expert_tensor_mode:
+            return ExpertTensorParallel
         elif self.direction == "row":
             return ExpertRowWiseAlt
         elif self.direction == "column":
@@ -206,10 +217,38 @@ class ParallelMoELinear(nn.Module):
             return None
         return self.alt_sharding.axes
 
+    @property
+    def expert_axis(self) -> str:
+        """Semantic axis name representing the expert dimension."""
+        return TP if self.use_expert_tensor_mode else EP
+
+    def _group_axes(self) -> list[str | None]:
+        """Sharding axes for group sizes."""
+        return [EMPTY]
+
+    def _input_axes(self) -> list[str | None]:
+        """Sharding axes for inputs based on parallelism direction."""
+        if self.direction == "row":
+            return [DP, TP]
+        if self.direction == "column":
+            return [DP, EMPTY]
+        return [DP, EMPTY]
+
+    def _output_axes(self) -> list[str | None]:
+        """Sharding axes for outputs based on parallelism direction."""
+        if self.direction == "row":
+            return [DP, EMPTY]
+        if self.direction == "column":
+            if self.use_expert_tensor_mode:
+                return [DP, TP]
+            return [DP, [EP, TP]]
+        return [DP, EMPTY]
+
     def __call__(
         self,
         inputs: Float[Array, "tokens_ragged hidden_dim"],
         group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
     ) -> Float[Array, "tokens_ragged out_dim"]:
         """Applies the batched linear transformation.
 
@@ -218,6 +257,8 @@ class ParallelMoELinear(nn.Module):
                 by expert. Shape: `(total_tokens, in_features)`.
             group_sizes: An array indicating the number of tokens assigned to each
                 expert. Shape: `(num_experts,)`.
+            sorted_experts: Optional expert ids aligned with `inputs`. Required when
+                `use_expert_tensor_mode` so tokens can be localized per shard.
 
         Returns:
             The output array after the linear transformation.
@@ -235,7 +276,6 @@ class ParallelMoELinear(nn.Module):
             weight = weight.astype("f4")
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
-
         output = grouped_matmul(
             inputs,
             weight,
@@ -244,13 +284,16 @@ class ParallelMoELinear(nn.Module):
             transpose_rhs=self.out_first,
             platform="xla",
         )
-
         if self.bias is not None:
-            output += self._expand_bias_ragged(group_sizes)
+            output += self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts)
 
         return output
 
-    def _expand_bias_ragged(self, group_sizes: Int[Array, "num_groups"]) -> Float[Array, "tokens_ragged out_dim"]:  # noqa
+    def _expand_bias_ragged(
+        self,
+        group_sizes: Int[Array, "num_groups"],  # noqa
+        sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
+    ) -> Float[Array, "tokens_ragged out_dim"]:
         """Expands the bias to match the ragged batch structure.
 
         This method repeats the bias for each expert according to the number of
@@ -270,7 +313,12 @@ class ParallelMoELinear(nn.Module):
             If expert 0 has 3 tokens, expert 1 has 2 tokens, and expert 2 has 4 tokens,
             this will repeat bias[0] 3 times, bias[1] 2 times, and bias[2] 4 times.
         """
-        return self.bias.value[jnp.repeat(jnp.arange(self.num_experts), group_sizes)]
+        if sorted_experts is not None:
+            indices = sorted_experts
+        else:
+            bias_rows = self.bias.value.shape[0]
+            indices = jnp.repeat(jnp.arange(bias_rows), group_sizes)
+        return self.bias.value[indices]
 
 
 class RowParallelMoELinear(ParallelMoELinear):

@@ -74,7 +74,6 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from .utils import (
     DEBUG_MOE,
     MoeFusedHooks,
-    MoeFusedPolicy,
     MoeLoadBalancingStrategy,
     MoeMetrics,
     MoeRoutingStrategy,
@@ -141,7 +140,6 @@ class BaseMoeModule(nn.Module, ABC):
         rzl_coef: float | None = None,
         routing_strategy: MoeRoutingStrategy = MoeRoutingStrategy.TOP_K,
         load_balancing_strategy: MoeLoadBalancingStrategy = MoeLoadBalancingStrategy.STANDARD,
-        moe_policy: MoeFusedPolicy | None = None,
         moe_hooks: MoeFusedHooks | None = None,
     ):
         """Initializes the BaseMoeModule.
@@ -158,8 +156,6 @@ class BaseMoeModule(nn.Module, ABC):
             rzl_coef: The coefficient for the router z-loss.
             routing_strategy: The strategy for routing tokens to experts.
             load_balancing_strategy: The strategy for load balancing.
-            moe_policy: Configuration policy for fused MoE operations. If None,
-                uses default MoeFusedPolicy.
             moe_hooks: Hook system for custom interventions during MoE execution.
                 If None, uses default MoeFusedHooks with no custom hooks.
         """
@@ -174,7 +170,6 @@ class BaseMoeModule(nn.Module, ABC):
         self.rzl_coef = rzl_coef
         self.routing_strategy = routing_strategy
         self.load_balancing_strategy = load_balancing_strategy
-        self.moe_policy = MoeFusedPolicy() if moe_policy is None else moe_policy
         self.moe_hooks = MoeFusedHooks() if moe_hooks is None else moe_hooks
         self.dtype = getattr(self, "dtype", jnp.bfloat16)
 
@@ -452,19 +447,30 @@ class BaseMoeModule(nn.Module, ABC):
         wu_bias: jax.Array | None = None,  # [E, H]
         wd_bias: jax.Array | None = None,  # [E, M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
-        top_kfn: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
-        wmodif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
-        refine_idsfn: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
         *,
         act_fn: Callable[[jax.Array], jax.Array],
     ):
         """Fused MoE path using grouped matmul and shard_map.
 
-        This implementation routes tokens to experts, permutes them to an
-        expert-grouped layout, applies expert FFNs via grouped matmul kernels,
-        and then unpermutes/combines outputs. It supports both ring-of-experts
-        and all-to-all expert-parallel communication depending on configuration
-        and mesh sizes.
+        This is the core fused MoE implementation that routes tokens to experts,
+        permutes them to an expert-grouped layout, applies expert FFNs via grouped
+        matmul kernels, and unpermutes/combines outputs. It supports both
+        ring-of-experts and all-to-all expert-parallel communication depending on
+        configuration and mesh sizes.
+
+        **Hook Integration:**
+            This method reads hooks from `self.moe_hooks` (automatically configured
+            by `_moe_call_fused()` based on routing strategy). The following hooks
+            are used at specific points:
+
+            - `select_hook`: Refines expert selection weights. For TOP_K routing,
+              this defaults to weight normalization (softmax). Called during permutation.
+            - `refine_weights_hook`: Refines weights before W_i and W_u projections.
+            - `refine_inputs_hook`: Refines token representations before expert-parallel
+              all-to-all communication in distributed settings.
+
+            Other hooks in `MoeFusedHooks` are not used in this path but could be
+            added in future extensions.
 
         Args:
             hidden_state: Input tensor. Shape: [B, S, H].
@@ -475,33 +481,48 @@ class BaseMoeModule(nn.Module, ABC):
             wi_bias: Optional bias for W_i. Shape: [E, H].
             wu_bias: Optional bias for W_u. Shape: [E, H].
             wd_bias: Optional bias for W_d. Shape: [E, M].
-            ffn_activation: Optional fused activation taking (w0, w1) -> act.
-            top_kfn: Optional custom top-k selector `(gate_logits, pre_bias_logits, k)`.
-            wmodif_fn: Optional weight post-processing function.
-            refine_idsfn: Optional function to refine token IDs/inputs before routing.
+            ffn_activation: Optional custom activation combining (w0, w1) -> output.
             act_fn: Activation used when `ffn_activation` is not provided.
 
         Returns:
-            Tuple `(output, None)` where `output` has shape [B, S, H] and the
-            second element is a placeholder for parity with other call paths.
+            Tuple `(output, router_logits)` where:
+            - output: MoE layer output. Shape: [B, S, H].
+            - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
         """
+
+        select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
+        refine_weights_hook = self.moe_hooks.refine_weights_hook if self.moe_hooks else None
+        refine_inputs_hook = self.moe_hooks.refine_inputs_hook if self.moe_hooks else None
         BS, SQLN, HD = hidden_state.shape
         prein_gate_logits = gate_layer(hidden_state.reshape(-1, HD))
         gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
 
         partition_manager = self.partition_manager
-        expert_axis_name = resolve_eformer_axis(EP, partition_manager)
-        tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
+
+        if self.config.use_expert_tensor_mode:
+            expert_axis_name = resolve_eformer_axis(TP, partition_manager)
+            tensor_axis_name = resolve_eformer_axis(EP, partition_manager)
+        else:
+            expert_axis_name = resolve_eformer_axis(EP, partition_manager)
+            tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
+
         fsdp_axis_name = resolve_eformer_axis(FSDP, partition_manager)
         sp_axis_name = resolve_eformer_axis(SP, partition_manager)
+
         ep_size = self.mesh.shape.get(expert_axis_name, 1)
         tp_size = self.mesh.shape.get(tensor_axis_name, 1)
         fsdp_size = self.mesh.shape.get(fsdp_axis_name, 1)
         sp_size = self.mesh.shape.get(sp_axis_name, 1)
+
         comb_size = fsdp_size * sp_size
         input_ps = partition_manager.resolve(axes=[DP, EMPTY, EMPTY], mode=MODE_TRAIN, shape=hidden_state.shape)
-        output_ps = partition_manager.resolve(axes=[DP, EMPTY, TP], mode=MODE_TRAIN, shape=(BS, SQLN, HD))
         glps = partition_manager.resolve(axes=[DP, EMPTY], mode=MODE_TRAIN, shape=(BS * SQLN, self.n_routed_experts))
+
+        if self.config.use_expert_tensor_mode:
+            assert tp_size == 1, "if using `ExpertTensorMode` Expert Parallel size shoule be 1."
+            output_ps = partition_manager.resolve(axes=[DP, EMPTY, EMPTY], mode=MODE_TRAIN, shape=hidden_state.shape)
+        else:
+            output_ps = partition_manager.resolve(axes=[DP, EMPTY, TP], mode=MODE_TRAIN, shape=hidden_state.shape)
 
         if ffn_activation is None:
 
@@ -560,12 +581,12 @@ class BaseMoeModule(nn.Module, ABC):
                     pre_bias_logits=None,
                     use_custom_sort_vjp=True,
                     roll_to_expert_id=experts_per_shard * expert_shard_id,
-                    top_kfn=top_kfn,
-                    wmodif_fn=wmodif_fn,
-                    refine_idsfn=refine_idsfn,
                     num_experts_per_tok=self.num_experts_per_tok,
                     num_experts=self.n_routed_experts,
                     dtype=self.dtype,
+                    select_hook=select_hook,
+                    refine_weights_hook=refine_weights_hook,
+                    refine_inputs_hook=refine_inputs_hook,
                 )
 
                 group_sizes = group_sizes[:experts_per_shard]  # only the local experts
@@ -578,12 +599,12 @@ class BaseMoeModule(nn.Module, ABC):
                     pre_bias_logits=None,
                     use_custom_sort_vjp=True,
                     roll_to_expert_id=None,
-                    top_kfn=top_kfn,
-                    wmodif_fn=wmodif_fn,
-                    refine_idsfn=refine_idsfn,
                     num_experts_per_tok=self.num_experts_per_tok,
                     num_experts=self.n_routed_experts,
                     dtype=self.dtype,
+                    select_hook=select_hook,
+                    refine_weights_hook=refine_weights_hook,
+                    refine_inputs_hook=refine_inputs_hook,
                 )
 
                 if ep_size > 1:
@@ -736,14 +757,51 @@ class BaseMoeModule(nn.Module, ABC):
         wd_bias: jax.Array | None = None,  # [E, M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
         reform_router_probs_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
-        top_kfn: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
-        wmodif_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
-        refine_idsfn: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
         *,
         act_fn: Callable[[jax.Array], jax.Array],
         output_metrics: bool = False,
     ):
-        """Wrapper for fused MoE call with shard_map for training/inference."""
+        """Wrapper for fused MoE call with automatic hook configuration.
+
+        This method dispatches to either standard or fused MoE based on config, and
+        automatically configures hooks based on the routing strategy to ensure correct
+        expert weight handling.
+
+        **Hook Auto-Configuration:**
+            Before calling the fused MoE path, this method automatically configures
+            default hooks for the routing strategy if they're not already set by the user:
+
+            - **TOP_K**: Normalizes weights by their sum (softmax-like distribution).
+            - **TOP_K_NDIV**: Passes weights through unchanged (raw logit values).
+            - **SWITCH**: Enforces hard assignment with weight = 1.0.
+            - **EMPTY_CHOICE**: Uniform weights across expert selections.
+            - **HASH**: Uniform weights for deterministic assignments.
+
+            Each strategy gets an appropriate default `select_hook` that ensures
+            correct weight handling without requiring manual setup. Users can override
+            defaults by setting custom hooks on `self.moe_hooks` before calling the layer.
+
+        Args:
+            hidden_state: Input tensor. Shape: [B, S, H].
+            gate_layer: Router/gate module mapping H -> E (produces logits).
+            expert_layer: Expert layer module.
+            wi_kernel: Expert W_i (down/first) kernel. Shape: [E, H, M].
+            wu_kernel: Expert W_u (up/second) kernel. Shape: [E, H, M].
+            wd_kernel: Expert W_d (output/down) kernel. Shape: [E, M, H].
+            wi_bias: Optional bias for W_i. Shape: [E, H].
+            wu_bias: Optional bias for W_u. Shape: [E, H].
+            wd_bias: Optional bias for W_d. Shape: [E, M].
+            ffn_activation: Optional custom activation combining (w0, w1) -> output.
+            reform_router_probs_fn: Optional function to modify router probabilities
+                (used in standard MoE mode only).
+            act_fn: Activation function used when `ffn_activation` is not provided.
+            output_metrics: Whether to return metrics in standard MoE mode.
+
+        Returns:
+            Tuple of (output, logits) where:
+            - output: MoE layer output. Shape: [B, S, H].
+            - logits: Router logits for auxiliary loss computation. Shape: [B*S, E].
+        """
         if self.config.moe_method == "standard_moe":
             return self._moe_call_standard(
                 gate_layer=gate_layer,
@@ -755,12 +813,8 @@ class BaseMoeModule(nn.Module, ABC):
                 reform_router_probs_fn=reform_router_probs_fn,
             )
         elif self.config.moe_method == "fused_moe":
-            if wmodif_fn is None:
-                if self.routing_strategy == MoeRoutingStrategy.TOP_K:
-
-                    def wmodif_fn(logits: jax.Array) -> jax.Array:
-                        logits /= logits.sum(axis=-1, keepdims=True)
-                        return logits
+            # Auto-configure hooks based on routing strategy if not already set
+            self._configure_hooks_for_routing_strategy()
 
             return self._sparse_moe_call(
                 hidden_state=hidden_state,
@@ -772,11 +826,108 @@ class BaseMoeModule(nn.Module, ABC):
                 wu_bias=wu_bias,
                 wd_bias=wd_bias,
                 act_fn=act_fn,
-                top_kfn=top_kfn,
-                wmodif_fn=wmodif_fn,
-                refine_idsfn=refine_idsfn,
                 ffn_activation=ffn_activation,
             )
+
+    def _configure_hooks_for_routing_strategy(self) -> None:
+        """Configure default hooks based on the current routing strategy.
+
+        This method ensures each routing strategy has appropriate hook configuration
+        without requiring manual setup. Only sets hooks if they haven't been explicitly
+        configured by the user.
+
+        **Hook Configuration by Strategy:**
+
+            TOP_K: Sets `select_hook` to normalize weights by their sum.
+                Ensures expert weights sum to 1.0 for proper weighted combination.
+
+            TOP_K_NDIV: Sets `select_hook` to pass through weights unchanged.
+                Uses raw logit values without normalization.
+
+            SWITCH: Sets `select_hook` to enforce hard assignment (weight = 1.0).
+                Only one expert gets non-zero weight.
+
+            EMPTY_CHOICE: Sets `select_hook` to normalize per-expert selections.
+                Each expert receives equal contribution from selected tokens.
+
+            HASH: Sets `select_hook` to uniform weight distribution.
+                All assigned experts get equal weight (1/k).
+        """
+        if self.routing_strategy == MoeRoutingStrategy.TOP_K:
+            # TOP_K: Normalize weights by their sum (softmax-like)
+            if self.moe_hooks.select_hook is None:
+
+                def normalize_topk_weights(weights: jax.Array) -> jax.Array:
+                    """Normalize top-k expert weights by their sum.
+
+                    Ensures weights for each token sum to 1.0, creating a proper
+                    probability distribution over selected experts.
+                    """
+                    return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
+
+                self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=normalize_topk_weights)
+
+        elif self.routing_strategy == MoeRoutingStrategy.TOP_K_NDIV:
+            # TOP_K_NDIV: Use weights as-is (raw logits, no normalization)
+            if self.moe_hooks.select_hook is None:
+
+                def passthrough_weights(weights: jax.Array) -> jax.Array:
+                    """Pass through weights unchanged.
+
+                    For TOP_K_NDIV routing, weights are used as raw logit values
+                    without normalization. This allows unnormalized combinations.
+                    """
+                    return weights
+
+                self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=passthrough_weights)
+
+        elif self.routing_strategy == MoeRoutingStrategy.SWITCH:
+            # SWITCH: Hard assignment - single expert gets weight 1.0, others 0.0
+            if self.moe_hooks.select_hook is None:
+
+                def hard_assignment_weights(weights: jax.Array) -> jax.Array:
+                    """Enforce hard assignment for SWITCH routing.
+
+                    Only one expert per token is selected (top-1). This hook ensures
+                    the weight is exactly 1.0, creating a hard (non-differentiable)
+                    expert assignment.
+                    """
+                    return jnp.ones_like(weights)
+
+                self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=hard_assignment_weights)
+
+        elif self.routing_strategy == MoeRoutingStrategy.EMPTY_CHOICE:
+            # EMPTY_CHOICE: Expert-driven selection - normalize per expert
+            if self.moe_hooks.select_hook is None:
+
+                def expert_choice_weights(weights: jax.Array) -> jax.Array:
+                    """Normalize weights for Expert Choice routing.
+
+                    In Expert Choice routing, each expert selects its own top-k tokens.
+                    This hook ensures proper weight distribution across the selected
+                    tokens for each expert.
+                    """
+                    # For expert choice, normalize differently - each expert's selections
+                    # should have equal contribution
+                    num_experts_selected = weights.shape[-1]
+                    return jnp.ones_like(weights) / jnp.maximum(num_experts_selected, 1)
+
+                self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=expert_choice_weights)
+
+        elif self.routing_strategy == MoeRoutingStrategy.HASH:
+            # HASH: Deterministic routing - uniform weights for all assigned experts
+            if self.moe_hooks.select_hook is None:
+
+                def uniform_weights(weights: jax.Array) -> jax.Array:
+                    """Uniform weights for hash-based routing.
+
+                    In hash-based routing, tokens are deterministically assigned to experts
+                    based on token ID. Each expert in the assignment group gets equal weight.
+                    """
+                    num_experts_per_token = weights.shape[-1]
+                    return jnp.ones_like(weights) / jnp.maximum(num_experts_per_token, 1)
+
+                self.moe_hooks = self.moe_hooks.replace(refine_weights_hook=uniform_weights)
 
     def _moe_call_standard(
         self,
@@ -838,9 +989,7 @@ class BaseMoeModule(nn.Module, ABC):
 
     @abstractmethod
     def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq hidden_dim"],
-        **kwargs,
+        self, hidden_states: Float[Array, "batch seq hidden_dim"], **kwargs
     ) -> tuple[Float[Array, "batch seq hidden_dim"], MoeMetrics]:
         """Performs the forward pass of the MoE module.
 
