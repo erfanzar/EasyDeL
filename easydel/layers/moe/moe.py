@@ -529,25 +529,30 @@ class BaseMoeModule(nn.Module, ABC):
             def ffn_activation(x0: jax.Array, x1: jax.Array) -> jax.Array:
                 return act_fn(x0) * x1
 
-        if self.config.use_expert_tensor_mode:
-            wikps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wi_kernel.shape)
-            wukps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wu_kernel.shape)
-            wdkps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wd_kernel.shape)
-        else:
-            wikps = partition_manager.resolve(axes=[EP, [SP, FSDP], TP], mode=MODE_TRAIN, shape=wi_kernel.shape)
-            wukps = partition_manager.resolve(axes=[EP, [SP, FSDP], TP], mode=MODE_TRAIN, shape=wu_kernel.shape)
-            wdkps = partition_manager.resolve(axes=[EP, TP, [SP, FSDP]], mode=MODE_TRAIN, shape=wd_kernel.shape)
-
         wibps = None
         wubps = None
         wdbps = None
 
-        if wi_bias is not None:
-            wibps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wi_bias.shape)
-        if wu_bias is not None:
-            wubps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wu_bias.shape)
-        if wd_bias is not None:
-            wdbps = partition_manager.resolve(axes=[EP, EMPTY], mode=MODE_TRAIN, s_hape=wd_bias.shape)
+        if self.config.use_expert_tensor_mode:
+            wikps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wi_kernel.shape)
+            wukps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wu_kernel.shape)
+            wdkps = partition_manager.resolve(dynamic_axes=ExpertTensorParallel, shape=wd_kernel.shape)
+            if wi_bias is not None:
+                wibps = partition_manager.resolve(axes=[TP, EMPTY], mode=MODE_TRAIN, shape=wi_bias.shape)
+            if wu_bias is not None:
+                wubps = partition_manager.resolve(axes=[TP, EMPTY], mode=MODE_TRAIN, shape=wu_bias.shape)
+            if wd_bias is not None:
+                wdbps = partition_manager.resolve(axes=[TP, EMPTY], mode=MODE_TRAIN, s_hape=wd_bias.shape)
+        else:
+            wikps = partition_manager.resolve(axes=[EP, [SP, FSDP], TP], mode=MODE_TRAIN, shape=wi_kernel.shape)
+            wukps = partition_manager.resolve(axes=[EP, [SP, FSDP], TP], mode=MODE_TRAIN, shape=wu_kernel.shape)
+            wdkps = partition_manager.resolve(axes=[EP, TP, [SP, FSDP]], mode=MODE_TRAIN, shape=wd_kernel.shape)
+            if wi_bias is not None:
+                wibps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wi_bias.shape)
+            if wu_bias is not None:
+                wubps = partition_manager.resolve(axes=[EP, [SP, FSDP]], mode=MODE_TRAIN, shape=wu_bias.shape)
+            if wd_bias is not None:
+                wdbps = partition_manager.resolve(axes=[EP, EMPTY], mode=MODE_TRAIN, s_hape=wd_bias.shape)
 
         @partial(
             shard_map,
