@@ -134,6 +134,7 @@ class Glm4MoeMLPStack(nn.Module):
             kernel_init=nn.initializers.normal(),
             use_bias=False,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.n_routed_experts,
@@ -143,6 +144,7 @@ class Glm4MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
@@ -152,14 +154,20 @@ class Glm4MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, x: Array, group_sizes: Array) -> Array:
+    def __call__(
+        self,
+        x: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
-        hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes), name="moe_gate"))
-        hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes), name="moe_up")
-        outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes), name="moe_expert_output")
+        hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes, sorted_experts), name="moe_gate"))
+        hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes, sorted_experts), name="moe_up")
+        outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes, sorted_experts), name="moe_expert_output")
         return outputs
 
 
@@ -288,14 +296,13 @@ class Glm4MoeMoE(BaseMoeModule):
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         out, router_logits = self._moe_call_fused(
-            hidden_states,
-            self.gate,
-            self.experts,
-            self.gate.kernel.value,
-            self.experts.gate_proj.kernel.value,
-            self.experts.up_proj.kernel.value,
-            self.experts.down_proj.kernel.value,
-            self.experts.act_fn,
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
         )
         shared_output, _ = self.shared_experts(hidden_states)
         out = out + shared_output

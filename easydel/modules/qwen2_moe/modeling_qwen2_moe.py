@@ -51,7 +51,6 @@ from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
     MoeFusedHooks,
-    MoeFusedPolicy,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RowParallelMoELinear,
@@ -406,16 +405,6 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-        self.moe_policy = MoeFusedPolicy(
-            gate_slice_k_axes=("sp", "fsdp"),
-            wiwu_slice_k_axes=("sp", "fsdp"),
-            combine_axes=("sp", "fsdp"),
-            tp_axis="tp",
-            rs_dim=-1,
-            rs_enabled=True,
-            gather_gate_on_tp=True,
-            gather_logits_on_tp=True,
-        )
         self.moe_hooks = MoeFusedHooks()
 
     def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
@@ -431,11 +420,6 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         """
         B, S, H = hidden_states.shape
 
-        def wmodif_fn(logits: jax.Array) -> jax.Array:
-            if self.config.norm_topk_prob:
-                logits /= logits.sum(axis=-1, keepdims=True)
-            return logits
-
         out, router_logits = self._moe_call_fused(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -444,7 +428,6 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             wu_kernel=self.experts.up_proj.kernel.value,
             wd_kernel=self.experts.down_proj.kernel.value,
             act_fn=self.experts.act_fn,
-            wmodif_fn=wmodif_fn,
             output_metrics=False,
         )
 

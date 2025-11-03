@@ -27,9 +27,7 @@ expert/tensor/data parallelism.
 from .linear import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear
 from .moe import BaseMoeModule
 from .utils import (
-    MoeContext,
     MoeFusedHooks,
-    MoeFusedPolicy,
     MoeLoadBalancingStrategy,
     MoeMetrics,
     MoeRoutingStrategy,
@@ -38,9 +36,7 @@ from .utils import (
 __all__ = (
     "BaseMoeModule",
     "ColumnParallelMoELinear",
-    "MoeContext",
     "MoeFusedHooks",
-    "MoeFusedPolicy",
     "MoeLoadBalancingStrategy",
     "MoeMetrics",
     "MoeRoutingStrategy",

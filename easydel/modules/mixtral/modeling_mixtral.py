@@ -116,6 +116,7 @@ class MixtralMoEMlp(nn.Module):
             kernel_init=nn.initializers.normal(),
             use_bias=False,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.w2 = RowParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -125,6 +126,7 @@ class MixtralMoEMlp(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.w3 = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -134,14 +136,20 @@ class MixtralMoEMlp(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+    def __call__(
+        self,
+        x: chex.Array,
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ) -> chex.Array:
         """Forward pass through MoE MLP."""
-        hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes)), "mlp_gate")
-        hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes), "mlp_up")
-        outputs = checkpoint_name(self.w2(hidden_states, group_sizes), "mlp_down")
+        hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes, sorted_experts)), "mlp_gate")
+        hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes, sorted_experts), "mlp_up")
+        outputs = checkpoint_name(self.w2(hidden_states, group_sizes, sorted_experts), "mlp_down")
         return checkpoint_name(outputs, "mlp_output")
 
 
@@ -196,14 +204,13 @@ class MixtralSparseMoeBlock(BaseMoeModule):
     def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
         out, router_logits = self._moe_call_fused(
-            hidden_state,
-            self.gate,
-            self.experts,
-            self.gate.kernel.value,
-            self.experts.w1.kernel.value,
-            self.experts.w3.kernel.value,
-            self.experts.w2.kernel.value,
-            self.experts.act_fn,
+            hidden_state=hidden_state,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.w1.kernel.value,
+            wu_kernel=self.experts.w3.kernel.value,
+            wd_kernel=self.experts.w2.kernel.value,
+            act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

@@ -154,6 +154,7 @@ class TestAllModels:
                 multi_query=True,
                 num_ln_in_parallel_attn=1,
                 parallel_attn=True,
+                use_expert_tensor_mode=small_model_config.get("use_expert_tensor_mode", False),
                 use_parallel_residual=small_model_config.get("use_parallel_residual", True),
                 qk_layernorm=small_model_config.get("qk_layernorm", False),
                 rope_scaling=small_model_config.get("rope_scaling"),
