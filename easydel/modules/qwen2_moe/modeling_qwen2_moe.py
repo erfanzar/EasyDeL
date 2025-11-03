@@ -85,6 +85,7 @@ class Qwen2MoeMLPStack(nn.Module):
             kernel_init=nn.initializers.normal(),
             use_bias=False,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
@@ -94,6 +95,7 @@ class Qwen2MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -103,12 +105,15 @@ class Qwen2MoeMLPStack(nn.Module):
             use_bias=False,
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = nn.silu
 
-    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+    def __call__(self, x: chex.Array, group_sizes: chex.Array, sorted_experts: chex.Array | None = None) -> chex.Array:
         """Forward pass through MoE MLP."""
-        return self.down_proj(self.act_fn(self.gate_proj(x, group_sizes)) * self.up_proj(x, group_sizes), group_sizes)
+        gate = self.gate_proj(x, group_sizes, sorted_experts)
+        up = self.up_proj(x, group_sizes, sorted_experts)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen2MoeMLP(nn.Module):
