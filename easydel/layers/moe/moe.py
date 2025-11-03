@@ -65,6 +65,7 @@ from ejkernel.modules import grouped_matmul
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax import shard_map
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
@@ -605,10 +606,12 @@ class BaseMoeModule(nn.Module, ABC):
                 wi_kernel,
                 group_sizes,
                 preferred_element_type=jnp.bfloat16,
-                platform="xla",
             )
+
             if comb_size > 1:
                 layer_w0 = jax.lax.psum(layer_w0, (fsdp_axis_name, sp_axis_name))
+
+            layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
 
             if wi_bias is not None:
                 layer_w0 = layer_w0 + wi_bias[selected_experts]
@@ -618,12 +621,12 @@ class BaseMoeModule(nn.Module, ABC):
                 wu_kernel,
                 group_sizes,
                 preferred_element_type=jnp.bfloat16,
-                platform="xla",
             )
 
             if comb_size > 1:
                 layer_w1 = jax.lax.psum(layer_w1, (fsdp_axis_name, sp_axis_name))
 
+            layer_w1 = checkpoint_name(layer_w1, "mlp_up")
             if wu_bias is not None:
                 layer_w1 = layer_w1 + wu_bias[selected_experts]
 
@@ -634,8 +637,8 @@ class BaseMoeModule(nn.Module, ABC):
                 wd_kernel,
                 group_sizes,
                 preferred_element_type=jnp.bfloat16,
-                platform="xla",
             )
+            intermediate_output = checkpoint_name(intermediate_output, "mlp_down")
 
             if tp_size > 1:
                 intermediate_output = jax.lax.psum_scatter(
@@ -742,7 +745,7 @@ class BaseMoeModule(nn.Module, ABC):
     ):
         """Wrapper for fused MoE call with shard_map for training/inference."""
         if self.config.moe_method == "standard_moe":
-            self._moe_call_standard(
+            return self._moe_call_standard(
                 gate_layer=gate_layer,
                 expert_layer=expert_layer,
                 hidden_state=hidden_state,
@@ -752,6 +755,13 @@ class BaseMoeModule(nn.Module, ABC):
                 reform_router_probs_fn=reform_router_probs_fn,
             )
         elif self.config.moe_method == "fused_moe":
+            if wmodif_fn is None:
+                if self.routing_strategy == MoeRoutingStrategy.TOP_K:
+
+                    def wmodif_fn(logits: jax.Array) -> jax.Array:
+                        logits /= logits.sum(axis=-1, keepdims=True)
+                        return logits
+
             return self._sparse_moe_call(
                 hidden_state=hidden_state,
                 gate_layer=gate_layer,
@@ -804,8 +814,10 @@ class BaseMoeModule(nn.Module, ABC):
         if apply_capacity_constraint:
             selected_experts, selected_weights = self._apply_capacity_constraint(selected_experts, selected_weights)
 
-        sorted_inputs, sort_order, group_sizes, _ = self._replicate_and_sort_tokens(hidden_state_flat, selected_experts)
-        out_sorted = expert_layer(sorted_inputs, group_sizes)
+        sorted_inputs, sort_order, group_sizes, sorted_experts = self._replicate_and_sort_tokens(
+            hidden_state_flat, selected_experts
+        )
+        out_sorted = expert_layer(sorted_inputs, group_sizes, sorted_experts)
         if DEBUG_MOE:
             jax.debug.print("Standard {}", out_sorted[-1, -5:])
         out_unsorted = sort_activations(out_sorted, jnp.argsort(sort_order))
