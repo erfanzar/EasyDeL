@@ -93,6 +93,7 @@ class Grok1Config(EasyDeLBaseConfig):
         max_position_embeddings=4096,
         embedding_multiplier_scale: float = 1.0,
         output_multiplier_scale: float = 1.0,
+        initializer_range=0.02,
         rms_norm_eps=1e-5,
         use_cache=True,
         pad_token_id=None,
@@ -146,7 +147,7 @@ class Grok1Config(EasyDeLBaseConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-
+        self.initializer_range = initializer_range
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
