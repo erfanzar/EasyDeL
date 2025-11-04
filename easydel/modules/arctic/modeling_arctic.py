@@ -206,8 +206,8 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.w3 = ColumnParallelMoELinear(
@@ -218,8 +218,8 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.w2 = RowParallelMoELinear(
@@ -230,20 +230,30 @@ class ArcticMLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"], group_sizes: chex.Array):
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
         return apply_logical_sharding(
-            self.w2(self.act_fn(self.w1(hidden_states, group_sizes)) * self.w3(hidden_states, group_sizes), group_sizes),
+            self.w2(
+                self.act_fn(self.w1(hidden_states, group_sizes, sorted_experts))
+                * self.w3(hidden_states, group_sizes, sorted_experts),
+                group_sizes,
+                sorted_experts,
+            ),
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
@@ -404,13 +414,14 @@ class ArcticMoeBlock(BaseMoeModule):
                     hidden state and router logits (or 0.0 if not MoE).
         """
         if self.is_moe_layer:
-            out, router_logits = self._moe_call_fused_shard_map(
-                hidden_states,
-                self.gate.kernel,
-                self.experts.w1.kernel.value,
-                self.experts.w3.kernel.value,
-                self.experts.w2.kernel.value,
-                self.experts.act_fn,
+            out, router_logits = self.moe_call(
+                hidden_state=hidden_states,
+                gate_layer=self.gate,
+                expert_layer=self.experts,
+                wi_kernel=self.experts.w1.kernel.value,
+                wu_kernel=self.experts.w3.kernel.value,
+                wd_kernel=self.experts.w2.kernel.value,
+                act_fn=self.experts.act_fn,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
         return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)

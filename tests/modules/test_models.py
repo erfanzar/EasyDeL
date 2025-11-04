@@ -4,7 +4,6 @@ This module tests all models with forward pass correctness verification.
 Migrated from unittest to pytest while keeping all original test logic.
 
 """
-
 import copy
 import gc
 
@@ -155,6 +154,7 @@ class TestAllModels:
                 multi_query=True,
                 num_ln_in_parallel_attn=1,
                 parallel_attn=True,
+                use_expert_tensor_mode=small_model_config.get("use_expert_tensor_mode", False),
                 use_parallel_residual=small_model_config.get("use_parallel_residual", True),
                 qk_layernorm=small_model_config.get("qk_layernorm", False),
                 rope_scaling=small_model_config.get("rope_scaling"),
@@ -162,6 +162,7 @@ class TestAllModels:
                 use_scan_mlp=small_model_config.get("use_scan_mlp", False),
                 scan_mlp=small_model_config.get("use_scan_mlp", False),
                 use_pallas_group_matmul=small_model_config.get("use_pallas_group_matmul", True),
+                moe_method=small_model_config.get("moe_method", "standard_moe"),
             )
         else:
             config = header_config

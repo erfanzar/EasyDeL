@@ -341,8 +341,8 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
@@ -351,8 +351,8 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -361,17 +361,24 @@ class Xerxes2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"], group_sizes: chex.Array) -> chex.Array:
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ) -> chex.Array:
         """Forward pass through MoE MLP."""
         return checkpoint_name(
             self.down_proj(
-                self.act_fn(self.gate_proj(hidden_states, group_sizes)) * self.up_proj(hidden_states, group_sizes),
+                self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
+                * self.up_proj(hidden_states, group_sizes, sorted_experts),
                 group_sizes,
+                sorted_experts,
             ),
             "moe_output",
         )
@@ -455,13 +462,14 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
                 - final_hidden_states (chex.Array): The output hidden states after MoE processing.
                 - router_logits (chex.Array): The logits output by the gating network.
         """
-        out, router_logits = self._moe_call_fused_shard_map(
-            hidden_states,
-            self.gate.kernel.value,
-            self.experts.gate_proj.kernel.value,
-            self.experts.up_proj.kernel.value,
-            self.experts.down_proj.kernel.value,
-            self.experts.act_fn,
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
         )
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 

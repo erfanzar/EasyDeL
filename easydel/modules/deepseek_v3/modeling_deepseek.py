@@ -223,8 +223,8 @@ class DeepseekV3MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.up_proj = ColumnParallelMoELinear(
@@ -235,8 +235,8 @@ class DeepseekV3MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.down_proj = RowParallelMoELinear(
@@ -247,22 +247,27 @@ class DeepseekV3MLPMoE(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
             rngs=rngs,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array, group_sizes: chex.Array):
+    def __call__(
+        self,
+        hidden_states: chex.Array,
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ):
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states, group_sizes)), "mlp_gate")
-        up = checkpoint_name(self.up_proj(hidden_states, group_sizes), "mlp_up")
-        down = checkpoint_name(self.down_proj(gate * up, group_sizes), "mlp_down")
+        gate = checkpoint_name(self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts)), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states, group_sizes, sorted_experts), "mlp_up")
+        down = checkpoint_name(self.down_proj(gate * up, group_sizes, sorted_experts), "mlp_down")
         return checkpoint_name(
             apply_logical_sharding(
                 down,
@@ -327,13 +332,14 @@ class DeepseekV3MoE(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: chex.Array):
-        out, router_logits = self._moe_call_fused_shard_map(
-            hidden_states,
-            self.gate.kernel.value,
-            self.experts.gate_proj.kernel.value,
-            self.experts.up_proj.kernel.value,
-            self.experts.down_proj.kernel.value,
-            self.experts.act_fn,
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
         )
         if self.config.n_shared_experts is not None:
             out = out + self.shared_experts(hidden_states)
