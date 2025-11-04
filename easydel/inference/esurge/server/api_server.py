@@ -313,6 +313,60 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         adapter = next(iter(self.adapters.values()))
         return adapter.count_tokens(content)
 
+    @staticmethod
+    def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
+        """Compute delta text by comparing accumulated text.
+
+        Prevents token loss under concurrent streaming by computing delta from
+        full accumulated text rather than relying on potentially incomplete
+        delta_text field.
+
+        This handles three cases:
+        1. Normal incremental streaming - extract new suffix from accumulated text
+        2. Empty delta despite accumulation - fallback to provided delta
+        3. Text doesn't build incrementally - possible reset or state corruption
+
+        Args:
+            current_text: Current accumulated text from the output.
+            previous_text: Previously accumulated text from last iteration.
+            fallback_delta: Fallback delta text from output.delta_text.
+
+        Returns:
+            The computed delta text to send to the client.
+
+        Example:
+            >>> delta = _compute_delta_text(
+            ...     current_text="Hello world",
+            ...     previous_text="Hello",
+            ...     fallback_delta=" world"
+            ... )
+            >>> # Returns " world" (extracted from accumulation)
+        """
+        current_text = current_text or ""
+
+        # Case 1: Normal incremental streaming - extract new suffix
+        if current_text.startswith(previous_text):
+            delta_text = current_text[len(previous_text) :]
+            if not delta_text:
+                # Empty delta, fallback to output's delta (might be empty too)
+                delta_text = fallback_delta or ""
+        # Case 2: Text doesn't build on previous (reset/error) - use fallback
+        else:
+            if previous_text:
+                # Log warning only if we had previous text (not first chunk)
+                logger.warning(
+                    f"Accumulated text doesn't start with previous text. "
+                    f"prev_len={len(previous_text)}, curr_len={len(current_text)}. "
+                    f"This may indicate state corruption or generation reset."
+                )
+            delta_text = fallback_delta or current_text
+
+        # Case 3: First chunk - send full current text
+        if not delta_text and not previous_text:
+            delta_text = current_text
+
+        return delta_text
+
     def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
         """Create sampling parameters from request.
 
@@ -572,10 +626,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                     current_tps = output.tokens_per_second
                     elapsed_time = output.processing_time
 
+                    current_text = output.accumulated_text or ""
+                    # Compute delta from accumulated text to prevent token loss in concurrent scenarios
+                    delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
+
                     # Get delta message from tool parser if available
                     if tool_parser:
-                        current_text = output.accumulated_text
-                        delta_text = output.delta_text
                         current_token_ids = output.outputs[0].token_ids if output.outputs else []
                         delta_token_ids = (
                             current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
@@ -604,10 +660,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                             continue  # Skip this chunk entirely
                         else:
                             # No special parsing needed for this chunk
-                            delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+                            delta_message = DeltaMessage(content=delta_text, role="assistant")
                     else:
+                        previous_text = current_text
+                        current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                        previous_token_ids = current_token_ids
                         # No tool parsing, regular streaming
-                        delta_message = DeltaMessage(content=output.delta_text, role="assistant")
+                        delta_message = DeltaMessage(content=delta_text, role="assistant")
 
                     chunk = ChatCompletionStreamResponse(
                         model=request.model,
@@ -805,18 +864,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         async def generate_stream():
             prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
             sampling_params = self._create_sampling_params(request)
+            previous_text = ""
             try:
                 for output in esurge.stream(prompt, sampling_params):
                     current_completion_tokens = output.num_generated_tokens
                     current_tps = output.tokens_per_second
                     elapsed_time = output.processing_time
 
+                    current_text = output.accumulated_text or ""
+                    # Compute delta from accumulated text to prevent token loss in concurrent scenarios
+                    delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
+                    previous_text = current_text
+
                     chunk = ChatCompletionStreamResponse(
                         model=request.model,
                         choices=[
                             ChatCompletionStreamResponseChoice(
                                 index=0,
-                                delta=DeltaMessage(content=output.delta_text, role="assistant"),
+                                delta=DeltaMessage(content=delta_text, role="assistant"),
                                 finish_reason=None,
                             )
                         ],
