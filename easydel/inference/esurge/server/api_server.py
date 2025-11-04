@@ -313,6 +313,60 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         adapter = next(iter(self.adapters.values()))
         return adapter.count_tokens(content)
 
+    @staticmethod
+    def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
+        """Compute delta text by comparing accumulated text.
+
+        Prevents token loss under concurrent streaming by computing delta from
+        full accumulated text rather than relying on potentially incomplete
+        delta_text field.
+
+        This handles three cases:
+        1. Normal incremental streaming - extract new suffix from accumulated text
+        2. Empty delta despite accumulation - fallback to provided delta
+        3. Text doesn't build incrementally - possible reset or state corruption
+
+        Args:
+            current_text: Current accumulated text from the output.
+            previous_text: Previously accumulated text from last iteration.
+            fallback_delta: Fallback delta text from output.delta_text.
+
+        Returns:
+            The computed delta text to send to the client.
+
+        Example:
+            >>> delta = _compute_delta_text(
+            ...     current_text="Hello world",
+            ...     previous_text="Hello",
+            ...     fallback_delta=" world"
+            ... )
+            >>> # Returns " world" (extracted from accumulation)
+        """
+        current_text = current_text or ""
+
+        # Case 1: Normal incremental streaming - extract new suffix
+        if current_text.startswith(previous_text):
+            delta_text = current_text[len(previous_text) :]
+            if not delta_text:
+                # Empty delta, fallback to output's delta (might be empty too)
+                delta_text = fallback_delta or ""
+        # Case 2: Text doesn't build on previous (reset/error) - use fallback
+        else:
+            if previous_text:
+                # Log warning only if we had previous text (not first chunk)
+                logger.warning(
+                    f"Accumulated text doesn't start with previous text. "
+                    f"prev_len={len(previous_text)}, curr_len={len(current_text)}. "
+                    f"This may indicate state corruption or generation reset."
+                )
+            delta_text = fallback_delta or current_text
+
+        # Case 3: First chunk - send full current text
+        if not delta_text and not previous_text:
+            delta_text = current_text
+
+        return delta_text
+
     def _create_sampling_params(self, request: ChatCompletionRequest | CompletionRequest) -> SamplingParams:
         """Create sampling parameters from request.
 
@@ -573,15 +627,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                     elapsed_time = output.processing_time
 
                     current_text = output.accumulated_text or ""
-                    # Prefer computing delta from accumulated_text to recover skipped chunks.
-                    if current_text.startswith(previous_text):
-                        delta_text = current_text[len(previous_text) :]
-                        if not delta_text:
-                            delta_text = output.delta_text or ""
-                    else:
-                        delta_text = output.delta_text or current_text
-                    if not delta_text and not previous_text:
-                        delta_text = current_text
+                    # Compute delta from accumulated text to prevent token loss in concurrent scenarios
+                    delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
 
                     # Get delta message from tool parser if available
                     if tool_parser:
@@ -825,14 +872,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                     elapsed_time = output.processing_time
 
                     current_text = output.accumulated_text or ""
-                    if current_text.startswith(previous_text):
-                        delta_text = current_text[len(previous_text) :]
-                        if not delta_text:
-                            delta_text = output.delta_text or ""
-                    else:
-                        delta_text = output.delta_text or current_text
-                    if not delta_text and not previous_text:
-                        delta_text = current_text
+                    # Compute delta from accumulated text to prevent token loss in concurrent scenarios
+                    delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
                     previous_text = current_text
 
                     chunk = ChatCompletionStreamResponse(
