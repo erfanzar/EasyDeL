@@ -51,7 +51,6 @@ from easydel.layers.moe import (
     BaseMoeModule,
     ColumnParallelMoELinear,
     MoeFusedHooks,
-    MoeFusedPolicy,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RowParallelMoELinear,
@@ -84,8 +83,8 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_experts,
@@ -94,8 +93,8 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -104,14 +103,16 @@ class Qwen2MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = nn.silu
 
-    def __call__(self, x: chex.Array, group_sizes: chex.Array) -> chex.Array:
+    def __call__(self, x: chex.Array, group_sizes: chex.Array, sorted_experts: chex.Array | None = None) -> chex.Array:
         """Forward pass through MoE MLP."""
-        return self.down_proj(self.act_fn(self.gate_proj(x, group_sizes)) * self.up_proj(x, group_sizes), group_sizes)
+        gate = self.gate_proj(x, group_sizes, sorted_experts)
+        up = self.up_proj(x, group_sizes, sorted_experts)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -404,16 +405,6 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
         )
-        self.moe_policy = MoeFusedPolicy(
-            gate_slice_k_axes=("sp", "fsdp"),
-            wiwu_slice_k_axes=("sp", "fsdp"),
-            combine_axes=("sp", "fsdp"),
-            tp_axis="tp",
-            rs_dim=-1,
-            rs_enabled=True,
-            gather_gate_on_tp=True,
-            gather_logits_on_tp=True,
-        )
         self.moe_hooks = MoeFusedHooks()
 
     def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
@@ -428,9 +419,11 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
                 - router_logits (chex.Array): The logits output by the gating network.
         """
         B, S, H = hidden_states.shape
-        out, router_logits = self._moe_call_fused_shard_map(
+
+        out, router_logits = self.moe_call(
             hidden_state=hidden_states,
-            gate_kernel=self.gate.kernel.value,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
             wi_kernel=self.experts.gate_proj.kernel.value,
             wu_kernel=self.experts.up_proj.kernel.value,
             wd_kernel=self.experts.down_proj.kernel.value,

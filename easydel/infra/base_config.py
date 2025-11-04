@@ -76,6 +76,7 @@ from .etils import (
     AVAILABLE_ATTENTION_MECHANISMS,
     AVAILABLE_GRADIENT_CHECKPOINT_TARGETS,
     AVAILABLE_GRADIENT_CHECKPOINTS,
+    AVAILABLE_MOE_METHODS,
     AVAILABLE_QUANTIZATION_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
     EasyDeLBackends,
@@ -110,9 +111,12 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
-
+DEFAULT_MOE_METHOD = "standard_moe"
+EXPERT_TP_MODE = False
+RING_EXPERTS = False
 ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
+
 
 if ED_DEFAULT_HARDWARE_ABSTRACTION:
     DEFAULT_HARDWARE_ABSTRACTION = True
@@ -123,17 +127,28 @@ if DEFAULT_HARDWARE_ABSTRACTION:
 
 
 def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
-    """Extract the commit hash from a resolved cache filename.
+    """Extracts the git commit hash from a HuggingFace cache file path.
 
-    Parses the resolved file path to extract the git commit hash
-    if not already provided.
+    When models are downloaded from HuggingFace Hub, they're cached locally with paths
+    containing the commit hash in the format: `.../snapshots/<commit_hash>/...`.
+    This function extracts that hash for tracking model versions.
 
     Args:
-        resolved_file: Path to the resolved cache file.
-        commit_hash: Existing commit hash if available.
+        resolved_file: Path to the resolved cache file. If None or if commit_hash
+            is already provided, returns the existing commit_hash immediately.
+        commit_hash: Existing commit hash if already known. If provided, this
+            function returns it without parsing the file path.
 
     Returns:
-        The commit hash string or None if not found.
+        The extracted commit hash string (40-character hex), or None if:
+        - No file path is provided
+        - The path doesn't contain a snapshots directory
+        - The extracted string doesn't match git commit hash format
+
+    Example:
+        >>> path = "/cache/snapshots/abc123def456.../model.safetensors"
+        >>> commit_hash = extract_commit_hash(path, None)
+        >>> # commit_hash = "abc123def456..." if valid
     """
     if resolved_file is None or commit_hash is not None:
         return commit_hash
@@ -146,15 +161,29 @@ def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> s
 
 
 def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
-    """Set attributes intelligently with default values.
+    """Sets attributes intelligently with default values and optional updates.
 
-    Sets an attribute if it doesn't exist, and updates it if a new
-    non-NOT_GIVEN value is provided.
+    This helper function provides smart attribute management:
+    1. If the attribute doesn't exist, sets it to the default value
+    2. If new_attr is provided (not NOT_GIVEN sentinel), updates the attribute
+
+    This pattern allows configuration classes to have default values while
+    supporting explicit overrides through constructor parameters.
 
     Args:
-        attr_name: Name of the attribute to set.
-        default: Default value if attribute doesn't exist.
-        new_attr: New value to set (if not NOT_GIVEN).
+        self: The object to set the attribute on.
+        attr_name: Name of the attribute to set/update.
+        default: Default value to use if the attribute doesn't exist yet.
+        new_attr: New value to set if provided. If equal to NOT_GIVEN sentinel,
+            the existing value (or default) is preserved.
+
+    Example:
+        >>> config = SomeConfig()
+        >>> set_attrs_smartly(config, "hidden_size", 768, 1024)
+        >>> # config.hidden_size = 1024 (updated)
+        >>>
+        >>> set_attrs_smartly(config, "num_layers", 12, NOT_GIVEN)
+        >>> # config.num_layers = 12 (default, since NOT_GIVEN)
     """
     if not hasattr(self, attr_name):
         setattr(self, attr_name, default)
@@ -241,6 +270,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     pallas_m_block_size: NotRequired[int]
     pallas_k_block_size: NotRequired[int]
     pallas_n_block_size: NotRequired[int]
+    use_expert_tensor_mode: NotRequired[bool]
+    moe_method: NotRequired[AVAILABLE_MOE_METHODS]
+    moe_force_xla_gmm: NotRequired[bool]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
@@ -358,6 +390,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
         pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
         pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
+        moe_method: AVAILABLE_MOE_METHODS = DEFAULT_MOE_METHOD,
+        moe_force_xla_gmm: bool = False,
+        use_expert_tensor_mode: bool = EXPERT_TP_MODE,
+        use_ring_of_experts: bool = RING_EXPERTS,
         **kwargs,
     ):
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
@@ -422,6 +458,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.pallas_m_block_size = getattr(self, "pallas_m_block_size", pallas_m_block_size)
         self.pallas_k_block_size = getattr(self, "pallas_k_block_size", pallas_k_block_size)
         self.pallas_n_block_size = getattr(self, "pallas_n_block_size", pallas_n_block_size)
+        self.moe_method = getattr(self, "moe_method", moe_method)
+        self.moe_force_xla_gmm = getattr(self, "moe_force_xla_gmm", moe_force_xla_gmm)
+        self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
+        self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
 
         self.pretraining_tp = 1  # it's for pytorch models.
         if self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE and self.use_sharded_kv_caching:
@@ -443,11 +483,45 @@ class EasyDeLBaseConfig(PretrainedConfig):
         allow_split_physical_axes: bool = True,
         backend: str | None = None,
     ):
-        """
-        The create_mesh function creates a mesh object that can be used to shard arrays.
+        """Creates a JAX device mesh for distributed model execution.
+
+        This function constructs a multi-dimensional mesh of devices that defines how
+        model parameters and computations are distributed across hardware. The mesh axes
+        correspond to different parallelism strategies:
+
+        - dp (data parallel): Replicate model across data batches
+        - fsdp (fully sharded data parallel): Shard parameters and optimizer states
+        - ep (expert parallel): Distribute experts in MoE models
+        - tp (tensor parallel): Partition individual weight matrices
+        - sp (sequence parallel): Split sequence dimension across devices
+
+        Args:
+            sharding_axis_dims: Size of each parallelism dimension. Use -1 to automatically
+                fill remaining devices. Default: (1, -1, 1, 1, 1) means all devices go
+                to FSDP axis.
+            sharding_axis_names: Names for each mesh axis. Must match length of
+                sharding_axis_dims. Default: ("dp", "fsdp", "ep", "tp", "sp").
+            sharding_dcn_axis_dims: Dimensions for data center network (DCN) sharding.
+                Used for multi-host/multi-slice setups. Default: None.
+            process_is_granule: Deprecated parameter, not used.
+            should_sort_granules_by_key: Whether to sort device granules by key for
+                deterministic ordering. Default: True.
+            allow_split_physical_axes: Whether to allow splitting physical device axes
+                when mapping to logical mesh axes. Default: True.
+            backend: Backend platform to create mesh for ('gpu', 'tpu', etc.).
+                If None or empty string, uses default backend.
 
         Returns:
-            A mesh object
+            A JAX Mesh object configured for distributed execution with the specified
+            parallelism dimensions.
+
+        Example:
+            >>> # Create mesh with DP=4, TP=2 on 8 GPUs
+            >>> mesh = EasyDeLBaseConfig.create_mesh(
+            ...     sharding_axis_dims=(4, 1, 1, 2, 1),
+            ...     sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
+            ... )
+            >>> # mesh.shape = {'dp': 4, 'fsdp': 1, 'ep': 1, 'tp': 2, 'sp': 1}
         """
         from eformer.escale import create_mesh
 
@@ -466,16 +540,33 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def mesh(self):
-        """
-        The mesh property is a helper property that creates a Mesh object from the
-        sharding_axis_dims and sharding_axis_names attributes of an object, which are assumed to be lists of integers
-        and strings, respectively, The platform attribute is also used if it exists.
+        """Gets or creates the JAX device mesh for this configuration.
 
-        Args:
-            self: Refer to the object itself
+        This property lazily constructs a device mesh from the configuration's sharding
+        parameters. Once created, the mesh is cached for reuse. The mesh can be explicitly
+        set using `set_model_mesh()` to override the auto-generated one.
+
+        The mesh is constructed from:
+        - sharding_axis_dims: Device counts per axis
+        - sharding_axis_names: Logical names for each axis
+        - sharding_dcn_axis_dims: Multi-host configuration (if applicable)
+        - Various granule sorting and axis splitting options
 
         Returns:
-            A jaxMesh
+            JAX Mesh object defining the device topology for distributed execution.
+            The mesh axes correspond to parallelism strategies (dp, fsdp, ep, tp, sp).
+
+        Note:
+            If a custom mesh was set via `set_model_mesh()`, that mesh is returned
+            instead of creating a new one.
+
+        Example:
+            >>> config = EasyDeLBaseConfig(
+            ...     sharding_axis_dims=(2, 1, 1, 4, 1),
+            ...     sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
+            ... )
+            >>> mesh = config.mesh
+            >>> # mesh.shape = {'dp': 2, 'fsdp': 1, 'ep': 1, 'tp': 4, 'sp': 1}
         """
         if self._hidden_mesh is not None:
             return self._hidden_mesh
@@ -537,44 +628,85 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return self.get_mesh()
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+        """Gets the parameter sharding partition rules for the model.
+
+        Partition rules define how model parameters should be sharded across the device mesh.
+        Each rule maps a parameter name pattern (regex) to a PartitionSpec that specifies
+        which mesh axes the parameter dimensions should be distributed across.
+
+        This method must be implemented by model-specific configuration classes.
+
+        Args:
+            *args: Positional arguments (model-specific).
+            **kwargs: Keyword arguments (model-specific).
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Tuple of (pattern, PartitionSpec) pairs defining how to shard parameters.
+            For example: (("model/embed.*", PartitionSpec("tp", None)),
+                         ("model/layers/\\d+/attn/.*", PartitionSpec(None, "tp")))
+
+        Raises:
+            NotImplementedError: This base class does not provide default partition rules.
+                Subclasses must implement this method.
+
+        Example:
+            >>> class MyModelConfig(EasyDeLBaseConfig):
+            ...     def get_partition_rules(self):
+            ...         return (
+            ...             ("embed.*", PartitionSpec("tp", None)),
+            ...             ("attn.*", PartitionSpec(None, "tp", None)),
+            ...             ("mlp.*", PartitionSpec(None, "tp")),
+            ...         )
         """
         raise NotImplementedError("`get_partition_rules` is not implemented.")
 
     def get_axis_dims(self) -> tp.Sequence[int]:
-        """The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.
-
-        Args:
-            self: Represent the instance of the class
+        """Returns the device mesh axis dimensions for parallelism.
 
         Returns:
-            The dimensions of the axes
+            Sequence of integers specifying the size of each parallelism axis.
+            Typically (dp_size, fsdp_size, ep_size, tp_size, sp_size).
+            Value of -1 means "use all remaining devices for this axis".
+
+        Example:
+            >>> config.sharding_axis_dims = (2, 4, 1, 1, 1)
+            >>> dims = config.get_axis_dims()
+            >>> # dims = (2, 4, 1, 1, 1) - 2 data parallel, 4 FSDP, rest replicated
         """
         return self.sharding_axis_dims
 
     def get_axis_names(self) -> tp.Sequence[str]:
-        """The get_axis_names function returns a list of the names of the axes.
-
-        Args:
-            self: Represent the instance of the class
+        """Returns the logical names for each device mesh axis.
 
         Returns:
-            A list of the names of all axes
+            Sequence of strings naming each parallelism axis.
+            Typically ("dp", "fsdp", "ep", "tp", "sp") for data parallel,
+            fully sharded data parallel, expert parallel, tensor parallel,
+            and sequence parallel respectively.
+
+        Example:
+            >>> names = config.get_axis_names()
+            >>> # names = ('dp', 'fsdp', 'ep', 'tp', 'sp')
         """
         return self.sharding_axis_names
 
     def get_backend(self) -> str:
-        """The get_backend function returns the backend that is currently being used.
-        If no backend has been set, it will return the default JAX backend.
+        """Returns the JAX backend platform being used.
 
-        Args:
-            self: Bind the method to an object
+        Retrieves the configured backend (e.g., 'gpu', 'tpu', 'cpu'), or falls back
+        to the default JAX backend if not explicitly set.
 
         Returns:
-            The backend platform
+            Backend platform string. Common values: 'gpu', 'tpu', 'cpu'.
+
+        Example:
+            >>> config = EasyDeLBaseConfig(backend='gpu')
+            >>> config.get_backend()
+            'gpu'
+            >>>
+            >>> # With no backend set, returns JAX default
+            >>> config = EasyDeLBaseConfig(backend='')
+            >>> config.get_backend()  # Might return 'gpu', 'tpu', etc.
         """
         return self.backend if not self.backend == "" else jax.extend.backend.get_backend().platform
 
@@ -630,6 +762,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "pallas_m_block_size",
             "pallas_k_block_size",
             "pallas_n_block_size",
+            "moe_method",
+            "moe_force_xla_gmm",
+            "use_ring_of_experts",
+            "use_expert_tensor_mode",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -679,6 +815,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pallas_m_block_size: int = NOT_GIVEN,
         pallas_k_block_size: int = NOT_GIVEN,
         pallas_n_block_size: int = NOT_GIVEN,
+        moe_method: AVAILABLE_MOE_METHODS = NOT_GIVEN,
+        moe_force_xla_gmm: bool = NOT_GIVEN,
+        use_ring_of_experts: bool = NOT_GIVEN,
+        use_expert_tensor_mode: bool = NOT_GIVEN,
         **kwargs,
     ):
         """
@@ -797,6 +937,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
         set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
         set_attrs_smartly(self, "pallas_n_block_size", DEFAULT_PALLAS_N_BLOCK_SIZE, pallas_n_block_size)
+        set_attrs_smartly(self, "moe_method", DEFAULT_MOE_METHOD, moe_method)
+        set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)
+        set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
+        set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
 
         for key_, value_ in kwargs.items():
             setattr(self, key_, value_)
@@ -1360,6 +1504,22 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def partition_manager(self) -> PartitionManager:
+        """Gets the partition manager for this configuration.
+
+        The PartitionManager handles translation between logical axis names (like 'dp', 'tp')
+        and their actual configurations in the device mesh. It provides utilities for
+        resolving partition specifications and managing distributed execution.
+
+        Returns:
+            PartitionManager instance configured with this config's partition_axis.
+            If partition_axis is None, creates a default PartitionAxis() first.
+
+        Example:
+            >>> config = EasyDeLBaseConfig()
+            >>> pm = config.partition_manager
+            >>> # Use partition manager to resolve sharding specs
+            >>> spec = pm.resolve(axes=["dp", "tp"], mode="train", shape=(8, 1024))
+        """
         if self.partition_axis is None:
             self.partition_axis = PartitionAxis()
         return PartitionManager(self.partition_axis)

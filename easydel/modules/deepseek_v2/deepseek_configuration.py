@@ -13,12 +13,31 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, ExpertColumnWiseAlt, ExpertRowWiseAlt, Replicated, RowWise
+import typing as tp
+
+from eformer.common_types import (
+    EMPTY,
+    MODE_TRAIN,
+    TP,
+    ColumnWise,
+    DynamicShardingAxes,
+    ExpertColumnWiseAlt,
+    ExpertRowWiseAlt,
+    Replicated,
+    RowWise,
+)
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.layers.rotary_embedding import RopeConfig
+
+
+class ExpertTensorParallel(DynamicShardingAxes):
+    """Expert Tensor Parallelism (EPxTP) sharding axes."""
+
+    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
+    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("deepseek_v2")
@@ -293,9 +312,15 @@ class DeepseekV2Config(EasyDeLBaseConfig):
             (r"self_attn/(q_a_layernorm|kv_a_layernorm)/kernel", pmag.resolve(Replicated)),
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ExpertColumnWiseAlt)),
-            (r"mlp/experts/down_proj/kernel", pmag.resolve(ExpertRowWiseAlt)),
+            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
+            (
+                r"mlp/experts/(gate_proj|up_proj)/kernel",
+                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertColumnWiseAlt),
+            ),
+            (
+                r"mlp/experts/down_proj/kernel",
+                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertRowWiseAlt),
+            ),
             (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r".*bias", pmag.resolve(Replicated)),

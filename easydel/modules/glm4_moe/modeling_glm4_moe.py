@@ -133,8 +133,8 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.n_routed_experts,
@@ -143,8 +143,8 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
@@ -153,16 +153,21 @@ class Glm4MoeMLPStack(nn.Module):
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
-            use_pallas_group_matmul=config.use_pallas_group_matmul,
             partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, x: Array, group_sizes: Array) -> Array:
+    def __call__(
+        self,
+        x: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
-        hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes), name="moe_gate"))
-        hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes), name="moe_up")
-        outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes), name="moe_expert_output")
+        hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes, sorted_experts), name="moe_gate"))
+        hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes, sorted_experts), name="moe_up")
+        outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes, sorted_experts), name="moe_expert_output")
         return outputs
 
 
@@ -196,7 +201,7 @@ class Glm4MoeTopKRouter(nn.Module):
         )
         self.e_score_correction_bias = nn.Param(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
 
-    def get_topk_indices(self, scores):
+    def get_selected_experts(self, scores):
         scores_for_choice = scores + self.e_score_correction_bias.value
         batch_size = scores_for_choice.shape[0]
         group_scores = scores_for_choice.reshape(batch_size, self.n_group, self.n_routed_experts // self.n_group)
@@ -216,9 +221,9 @@ class Glm4MoeTopKRouter(nn.Module):
             scores_for_choice,
             0.0,
         )
-        _, topk_indices = jax.lax.top_k(scores_for_choice, k=self.top_k)
+        _, selected_experts = jax.lax.top_k(scores_for_choice, k=self.top_k)
 
-        return topk_indices
+        return selected_experts
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -229,15 +234,15 @@ class Glm4MoeTopKRouter(nn.Module):
             name="moe_router_logits",
         )
         scores = jax.nn.sigmoid(router_logits)
-        topk_indices = self.get_topk_indices(scores)
+        selected_experts = self.get_selected_experts(scores)
         batch_size = scores.shape[0]
         batch_indices = jnp.arange(batch_size)[:, None]
-        topk_weights = scores[batch_indices, topk_indices]
+        selected_weights = scores[batch_indices, selected_experts]
         if self.norm_topk_prob:
-            denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            topk_weights = topk_weights / denominator
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights
+            denominator = jnp.sum(selected_weights, axis=-1, keepdims=True) + 1e-20
+            selected_weights = selected_weights / denominator
+        selected_weights = selected_weights * self.routed_scaling_factor
+        return selected_weights
 
 
 class Glm4MoeMoE(BaseMoeModule):
@@ -290,13 +295,14 @@ class Glm4MoeMoE(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        out, router_logits = self._moe_call_fused_shard_map(
-            hidden_states,
-            self.gate.kernel.value,
-            self.experts.gate_proj.kernel.value,
-            self.experts.up_proj.kernel.value,
-            self.experts.down_proj.kernel.value,
-            self.experts.act_fn,
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
         )
         shared_output, _ = self.shared_experts(hidden_states)
         out = out + shared_output
