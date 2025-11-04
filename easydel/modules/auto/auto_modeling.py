@@ -28,8 +28,10 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
 from easydel.infra.factory import TaskType, registry
+from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
 
 SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
+MODEL_INDEX_NAME = "model_structure.json"
 
 
 class BaseAutoEasyModel:
@@ -433,25 +435,26 @@ class BaseAutoEasyModel:
         commit_hash = None
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
         epath = ePath(pretrained_model_name_or_path)
-
         if epath.is_dir():
             if (epath / subfolder / SAFETENSOR_INDEX_NAME).exists():
                 return True
-            if oo := (epath / subfolder).glob("run-*"):
-                if len(list(oo)) != 0:
-                    return True
+            if (epath / subfolder / MODEL_INDEX_NAME).exists():
+                return True
             if (epath / subfolder / MULTI_PART_NAME).exists():
                 return True
             if not (epath / subfolder / FLAX_WEIGHTS_NAME).is_file():
                 raise OSError(
                     f"Error no file named {FLAX_WEIGHTS_NAME} found in directory {pretrained_model_name_or_path}"
                 )
+            if oo := (epath / subfolder).glob("run-*"):
+                if len(list(oo)) != 0:
+                    return True
+
         elif (ePath(subfolder) / epath).is_file():
             ...
         elif _is_remote_url(pretrained_model_name_or_path):
             ...
         else:
-            filename = FLAX_WEIGHTS_NAME
             try:
                 cached_file_kwargs = {
                     "cache_dir": cache_dir,
@@ -459,23 +462,17 @@ class BaseAutoEasyModel:
                     "proxies": proxies,
                     "local_files_only": local_files_only,
                     "token": token,
-                    "user_agent": {
-                        "file_type": "model",
-                        "framework": "flax",
-                        "from_auto_class": False,
-                    },
+                    "user_agent": {"file_type": "model", "from_auto_class": False},
                     "revision": revision,
                     "subfolder": subfolder,
                     "_raise_exceptions_for_gated_repo": False,
                     "_raise_exceptions_for_missing_entries": False,
                     "_commit_hash": commit_hash,
                 }
-                resolved_archive_file = _cached_file(
-                    pretrained_model_name_or_path,
-                    filename,
-                    **cached_file_kwargs,
-                )
-
+                for filename in [FLAX_WEIGHTS_NAME, MULTI_PART_NAME, TENSORSTORE_INDEX_NAME, MODEL_INDEX_NAME]:
+                    resolved_archive_file = _cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
+                    if resolved_archive_file is not None:
+                        break
                 if resolved_archive_file is None:
                     resolved_archive_file = _cached_file(
                         pretrained_model_name_or_path,
