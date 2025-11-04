@@ -856,7 +856,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         initial_key_length: int = key.shape[1]
 
         mode_is_empty: bool = isinstance(mode, common_types.EMPTY_VAL)
-        mode_computed: common_types.RUNTIME_MODE_TYPES
+        mode_computed: common_types.RUNTIME_MODE_TYPES  # type:ignore
         if mode_is_empty:
             cache_view_is_none: bool = cache_view is None
             if cache_view_is_none:

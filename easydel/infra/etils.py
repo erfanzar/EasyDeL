@@ -201,7 +201,7 @@ AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
 AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
 
-
+AVAILABLE_MOE_METHODS = tp.Literal["fused_moe", "standard_moe", "dense_moe"]
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "auto",
     "vanilla",

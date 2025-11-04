@@ -201,7 +201,7 @@ class Glm4MoeTopKRouter(nn.Module):
         )
         self.e_score_correction_bias = nn.Param(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
 
-    def get_topk_indices(self, scores):
+    def get_selected_experts(self, scores):
         scores_for_choice = scores + self.e_score_correction_bias.value
         batch_size = scores_for_choice.shape[0]
         group_scores = scores_for_choice.reshape(batch_size, self.n_group, self.n_routed_experts // self.n_group)
@@ -221,9 +221,9 @@ class Glm4MoeTopKRouter(nn.Module):
             scores_for_choice,
             0.0,
         )
-        _, topk_indices = jax.lax.top_k(scores_for_choice, k=self.top_k)
+        _, selected_experts = jax.lax.top_k(scores_for_choice, k=self.top_k)
 
-        return topk_indices
+        return selected_experts
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -234,15 +234,15 @@ class Glm4MoeTopKRouter(nn.Module):
             name="moe_router_logits",
         )
         scores = jax.nn.sigmoid(router_logits)
-        topk_indices = self.get_topk_indices(scores)
+        selected_experts = self.get_selected_experts(scores)
         batch_size = scores.shape[0]
         batch_indices = jnp.arange(batch_size)[:, None]
-        topk_weights = scores[batch_indices, topk_indices]
+        selected_weights = scores[batch_indices, selected_experts]
         if self.norm_topk_prob:
-            denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            topk_weights = topk_weights / denominator
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights
+            denominator = jnp.sum(selected_weights, axis=-1, keepdims=True) + 1e-20
+            selected_weights = selected_weights / denominator
+        selected_weights = selected_weights * self.routed_scaling_factor
+        return selected_weights
 
 
 class Glm4MoeMoE(BaseMoeModule):
@@ -295,7 +295,7 @@ class Glm4MoeMoE(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        out, router_logits = self._moe_call_fused(
+        out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,

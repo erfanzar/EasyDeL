@@ -49,41 +49,213 @@ SP = common_types.SP
 EP_DISPATCH = os.getenv("EP_DISPATCH", "auto")
 EP_AUTO_TRESHOLD = int(os.getenv("EP_AUTO_TRESHOLD", 0))
 GMM_PLATFORM = None
-DEBUG_MOE = False
+
+
+class MoEMethods(str, enum.Enum):
+    """Enumeration of available MoE execution methods.
+
+    This enum defines different strategies for executing Mixture of Experts layers,
+    each optimized for different use cases and hardware configurations.
+
+    Attributes:
+        FUSED_MOE: Fused execution path using grouped matrix multiplication and shard_map.
+            Optimal for distributed training with expert parallelism on TPUs/GPUs.
+            Uses ragged tensor operations and custom kernels for maximum efficiency.
+            Automatically falls back to STANDARD_MOE when FSDP*SP axis size > 1.
+
+        STANDARD_MOE: Standard token-by-token execution path.
+            More flexible and easier to debug. Uses traditional permutation,
+            expert computation, and unpermutation steps. Supports all sharding
+            configurations and is the fallback when fused path is unavailable.
+
+        DENSE_MOE: Dense batched execution using per-token matrix multiplications.
+            Instead of ragged/grouped operations, uses dense einsum operations
+            with expert selection via indexing. Useful for debugging or when
+            grouped matmul kernels are not available.
+
+    Example:
+        >>> from easydel.layers.moe import MoEMethods
+        >>> # Configure in model config
+        >>> config.moe_method = MoEMethods.FUSED_MOE
+    """
+
+    FUSED_MOE = "fused_moe"
+    STANDARD_MOE = "standard_moe"
+    DENSE_MOE = "dense_moe"
 
 
 def rsum_scatter(x: jax.Array, axis_name: str, scatter_dimension: int, tiled: bool = True) -> jax.Array:
-    """Reduce-scatter with float32 accumulation for numerical stability."""
+    """Performs reduce-scatter collective operation with float32 accumulation.
+
+    This function wraps `jax.lax.psum_scatter` to provide a reduce-scatter operation,
+    which combines reduction (sum) across devices with scattering of results. Each
+    device receives a different slice of the reduced result.
+
+    Args:
+        x: Input array to reduce and scatter.
+        axis_name: Name of the mesh axis to reduce-scatter along (e.g., "dp", "tp", "ep").
+        scatter_dimension: Dimension of `x` along which to scatter the result.
+            Each device receives a slice of size `x.shape[scatter_dimension] / num_devices`.
+        tiled: If True, the output is tiled (concatenated) across devices in the
+            scatter dimension. Defaults to True.
+
+    Returns:
+        Reduced and scattered array. Shape is the same as input, but the
+        scatter_dimension is divided by the number of devices in the axis.
+
+    Example:
+        >>> # Reduce-scatter across data parallel axis
+        >>> x = jnp.ones((8, 1024))  # On each device
+        >>> result = rsum_scatter(x, "dp", scatter_dimension=0)
+        >>> # result.shape = (8 // dp_size, 1024) with summed values
+    """
     return lax.psum_scatter(x, axis_name, scatter_dimension=scatter_dimension, tiled=tiled)
 
 
 def argsort(x: jax.Array) -> jax.Array:
-    """Return indices that sort `x` along the last axis."""
+    """Returns indices that would sort the input array along its last axis.
+
+    Convenience wrapper around `jnp.argsort` for sorting along the last dimension,
+    commonly used in MoE routing to sort tokens by expert assignment.
+
+    Args:
+        x: Input array to sort. Can have any number of dimensions.
+
+    Returns:
+        Integer array of indices that would sort `x` along axis=-1.
+        Has the same shape as `x`.
+
+    Example:
+        >>> x = jnp.array([[3, 1, 2], [6, 4, 5]])
+        >>> indices = argsort(x)
+        >>> # indices = [[1, 2, 0], [1, 2, 0]]
+        >>> sorted_x = jnp.take_along_axis(x, indices, axis=-1)
+    """
     return jnp.argsort(x, axis=-1)
 
 
 def take1d(x: jax.Array, idx: jax.Array) -> jax.Array:
-    """Index along axis 0 using `idx`."""
+    """Indexes an array along axis 0 using the provided indices.
+
+    Convenience wrapper for extracting rows from a 2D array or elements from a 1D array.
+
+    Args:
+        x: Input array to index. Shape: (N, ...).
+        idx: Integer array of indices to extract. Shape: (M,).
+            Values should be in range [0, N).
+
+    Returns:
+        Array with selected elements. Shape: (M, ...) where ... matches
+        the trailing dimensions of `x`.
+
+    Example:
+        >>> x = jnp.array([[10, 20], [30, 40], [50, 60]])
+        >>> idx = jnp.array([2, 0, 1])
+        >>> result = take1d(x, idx)
+        >>> # result = [[50, 60], [10, 20], [30, 40]]
+    """
     return jnp.take(x, idx, axis=0)
 
 
 def repeat_take_sorted(x: jax.Array, sort_idx: jax.Array, k: int) -> jax.Array:
-    """Repeat rows of `x` and reorder them using `sort_idx // k`."""
+    """Repeats and reorders rows of an array based on sorted indices.
+
+    This function is used in MoE to replicate token representations k times
+    (once per selected expert) and then sort them by expert assignment.
+    The sort indices are assumed to be for a k-times-repeated array, where
+    `sort_idx // k` maps back to the original row indices.
+
+    Args:
+        x: Input array to repeat and sort. Shape: (N, ...).
+        sort_idx: Sorted indices for the repeated array. Shape: (N*k,).
+            Each group of k consecutive original indices can map to any position.
+        k: Repetition factor (typically `num_experts_per_tok`).
+
+    Returns:
+        Sorted and implicitly repeated array. Shape: (N*k, ...) where each
+        original row appears k times, reordered according to `sort_idx`.
+
+    Example:
+        >>> x = jnp.array([[1, 2], [3, 4]])  # 2 tokens
+        >>> sort_idx = jnp.array([2, 0, 3, 1])  # Sorted for 2*2=4 entries
+        >>> result = repeat_take_sorted(x, sort_idx, k=2)
+        >>> # Maps indices [2,0,3,1] -> [1,0,1,0] -> rows [3,4], [1,2], [3,4], [1,2]
+    """
     return jnp.take(x, sort_idx // k, axis=0)
 
 
 def bincount(x: jax.Array, length: int) -> jax.Array:
-    """Count occurrences of integers in `x` with explicit output length."""
+    """Counts occurrences of non-negative integers in an array.
+
+    Wrapper around `jnp.bincount` with explicit output length specification.
+    Used in MoE to count how many tokens are assigned to each expert.
+
+    Args:
+        x: Integer array to count. Shape: (N,). Values should be in range [0, length).
+            Negative values are ignored.
+        length: Length of the output array. Determines the number of bins.
+
+    Returns:
+        Count array where result[i] = number of times i appears in x.
+        Shape: (length,).
+
+    Example:
+        >>> expert_ids = jnp.array([0, 2, 1, 0, 2, 2])
+        >>> counts = bincount(expert_ids, length=4)
+        >>> # counts = [2, 1, 3, 0] - expert 0: 2 tokens, expert 1: 1 token, etc.
+    """
     return jnp.bincount(x, length=length)
 
 
 def all_i32(*xs: jax.Array) -> tuple[jax.Array, ...]:
-    """Cast all inputs to int32."""
+    """Casts all input arrays to int32 dtype.
+
+    Utility function for ensuring integer arrays use consistent int32 type,
+    which is often required for indexing operations and compatibility with
+    certain XLA operations.
+
+    Args:
+        *xs: Variable number of JAX arrays to cast.
+
+    Returns:
+        Tuple of arrays with all elements cast to jnp.int32.
+
+    Example:
+        >>> a = jnp.array([1, 2, 3], dtype=jnp.int64)
+        >>> b = jnp.array([4, 5], dtype=jnp.int16)
+        >>> a32, b32 = all_i32(a, b)
+        >>> # Both are now int32
+    """
     return tuple(z.astype(jnp.int32) for z in xs)
 
 
 def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp: bool = True) -> jax.Array:
-    """Reorder activations using `sort_indices`, optionally relying on a custom VJP."""
+    """Reorders activations using provided sort indices with optional custom gradient.
+
+    This function permutes the first dimension of `inputs` according to `sort_indices`.
+    When `use_custom_vjp=True`, it uses a memory-efficient custom VJP that avoids
+    materializing the full permutation matrix during backpropagation.
+
+    Args:
+        inputs: Input activations to sort. Shape: (N, ...).
+        sort_indices: Integer array of indices defining the permutation. Shape: (N,).
+            Must be a valid permutation of range(N).
+        use_custom_vjp: If True, uses custom VJP for memory-efficient gradients.
+            If False, uses standard JAX autodiff. Defaults to True.
+
+    Returns:
+        Sorted activations where output[i] = inputs[sort_indices[i]].
+        Shape: same as `inputs`.
+
+    Raises:
+        AssertionError: If inputs.shape[0] != sort_indices.shape[0].
+
+    Example:
+        >>> x = jnp.array([[1, 2], [3, 4], [5, 6]])
+        >>> indices = jnp.array([2, 0, 1])
+        >>> sorted_x = sort_activations(x, indices)
+        >>> # sorted_x = [[5, 6], [1, 2], [3, 4]]
+    """
     assert inputs.shape[0] == sort_indices.shape[0], "Input and indices dimensions must match"
 
     if use_custom_vjp:
@@ -267,15 +439,24 @@ def canon_dim(ndim: int, dim: int) -> int:
     """Canonicalizes a dimension index to be non-negative.
 
     Converts negative dimension indices (counting from the end) to their
-    equivalent positive indices.
+    equivalent positive indices, following NumPy/JAX conventions where
+    -1 refers to the last dimension, -2 to second-to-last, etc.
 
     Args:
         ndim: Total number of dimensions in the array.
         dim: Dimension index to canonicalize. Can be negative.
+            Must be in range [-ndim, ndim).
 
     Returns:
         Non-negative dimension index in range [0, ndim).
 
+    Example:
+        >>> canon_dim(3, -1)  # Last dimension of 3D array
+        2
+        >>> canon_dim(3, 1)   # Already positive
+        1
+        >>> canon_dim(4, -2)  # Second to last
+        2
     """
     return dim if dim >= 0 else (ndim + dim)
 
@@ -374,13 +555,30 @@ class _Transform(enum.Enum):
     """Enumeration of transformation strategies for all-to-all communication parameters.
 
     This enum defines different strategies for computing offsets and sizes used in
-    ragged all-to-all communication patterns during expert parallel execution.
+    ragged all-to-all communication patterns during expert parallel execution. Each
+    strategy corresponds to a different parameter needed for `jax.lax.ragged_all_to_all`.
+
+    Ragged all-to-all is used when different devices need to exchange variable-sized
+    chunks of data, which is common in MoE when tokens are redistributed across expert
+    shards based on routing decisions.
 
     Attributes:
         INPUT_OFFSET: Strategy for computing input buffer offsets.
+            Determines where to read from in the local input buffer when sending
+            data to each destination device.
+
         SEND_SIZE: Strategy for computing send buffer sizes.
+            Specifies how many elements to send to each destination device.
+
         OUTPUT_OFFSET: Strategy for computing output buffer offsets.
+            Determines where to write received data in the local output buffer.
+
         RECV_SIZE: Strategy for computing receive buffer sizes.
+            Specifies how many elements to receive from each source device.
+
+    Note:
+        This enum is used internally by `get_all_to_all_params` to compute
+        the communication parameters for expert-parallel token redistribution.
     """
 
     INPUT_OFFSET = enum.auto()
@@ -488,7 +686,7 @@ def tp_global_topk(logits_shard: jax.Array, k: int, tp_axis: str) -> tuple[jax.A
     return vals_g, idx_g
 
 
-def get_topk(
+def get_experts_location(
     gate_logits,
     pre_bias_logits,
     select_hook: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
@@ -522,8 +720,6 @@ def get_topk(
         top_k_weights, top_k_indices = select_hook(gate_logits, pre_bias_logits, num_experts_per_tok)
     else:
         top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, num_experts_per_tok)
-    if DEBUG_MOE:
-        jax.debug.print("Fused In Gatelogits {}", gate_logits[-1, -5:])
     if refine_weights_hook:
         top_k_weights = refine_weights_hook(top_k_weights)
 
@@ -582,20 +778,13 @@ def permute(
     inputs_shape = inputs.shape
     bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
     inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[2]))
-    weights, selected_experts = get_topk(
+    weights, selected_experts = get_experts_location(
         gate_logits=gate_logits,
         pre_bias_logits=pre_bias_logits,
         select_hook=select_hook,
         refine_weights_hook=refine_weights_hook,
         num_experts_per_tok=num_experts_per_tok,
     )
-    if DEBUG_MOE:
-        jax.debug.print(
-            "Fuesed Top-k weights stats: min={:.6f}, max={:.6f}, mean={:.6f}",
-            jnp.min(weights),
-            jnp.max(weights),
-            jnp.mean(weights),
-        )
     if refine_inputs_hook:
         inputs_2d = refine_inputs_hook(inputs_2d, weights, inputs_shape)
 
@@ -844,21 +1033,34 @@ class MoeMetrics:
 
 
 def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
-    """Resolve axis name(s) via the provided `PartitionManager`.
+    """Resolves logical axis name(s) to physical mesh axis names.
 
-    This is a small convenience wrapper that accepts a single axis or a list of
-    axes and returns the resolved axis name(s) used by the EFormer partition
-    manager in MODE_TRAIN. It mirrors the manager's `paxis.resolve_axis` API but
-    preserves the input cardinality for convenience.
+    This convenience wrapper resolves symbolic axis names (like "tp", "ep", "fsdp")
+    to their actual names in the device mesh for training mode. This is necessary
+    because EFormer's PartitionManager may map logical parallelism axes to different
+    physical mesh axes depending on configuration.
 
     Args:
-        axis: A single axis name or a list of axis names to resolve (e.g., "tp",
-            "ep", "fsdp", "sp").
-        manager: The `PartitionManager` instance providing axis resolution.
+        axis: A single axis name or list of axis names to resolve. Common values:
+            - "tp": Tensor parallel axis
+            - "ep": Expert parallel axis
+            - "dp": Data parallel axis
+            - "fsdp": Fully sharded data parallel axis
+            - "sp": Sequence parallel axis
+        manager: The `PartitionManager` instance providing axis resolution configuration.
 
     Returns:
-        The resolved axis name if `axis` was a string, otherwise a list of
-        resolved axis names corresponding to the input order.
+        If input was a string, returns a single resolved axis name (str).
+        If input was a list/tuple, returns a list of resolved axis names preserving order.
+
+    Example:
+        >>> # Single axis
+        >>> resolved = resolve_eformer_axis("tp", partition_manager)
+        >>> # resolved might be "tensor" or "model" depending on config
+        >>>
+        >>> # Multiple axes
+        >>> resolved = resolve_eformer_axis(["tp", "ep"], partition_manager)
+        >>> # resolved might be ["tensor", "expert"]
     """
     was_list = isinstance(axis, list | tuple)
     if not was_list:
