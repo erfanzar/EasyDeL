@@ -203,7 +203,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
     def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
         """Forward pass of the MoE block."""
-        out, router_logits = self._moe_call_fused(
+        out, router_logits = self.moe_call(
             hidden_state=hidden_state,
             gate_layer=self.gate,
             expert_layer=self.experts,

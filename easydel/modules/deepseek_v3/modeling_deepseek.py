@@ -332,7 +332,7 @@ class DeepseekV3MoE(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: chex.Array):
-        out, router_logits = self._moe_call_fused(
+        out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,

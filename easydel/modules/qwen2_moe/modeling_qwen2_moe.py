@@ -420,7 +420,7 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         """
         B, S, H = hidden_states.shape
 
-        out, router_logits = self._moe_call_fused(
+        out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
             expert_layer=self.experts,

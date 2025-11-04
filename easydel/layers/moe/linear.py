@@ -26,7 +26,7 @@ import typing
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager
-from ejkernel.modules import grouped_matmul
+from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
@@ -57,7 +57,29 @@ Initializer = nn.initializers.Initializer
 
 
 class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism sharding (experts distributed over TP axis)."""
+    """Expert Tensor Parallelism sharding configuration for MoE linear layers.
+
+    This sharding strategy distributes expert parameters across the Tensor Parallel (TP)
+    axis instead of the traditional Expert Parallel (EP) axis. This mode is enabled when
+    `use_expert_tensor_mode=True` in the layer configuration.
+
+    The sharding pattern [TP, EMPTY, EMPTY] means:
+    - First dimension (experts) is sharded across TP devices
+    - Second dimension (input features) is replicated
+    - Third dimension (output features) is replicated
+
+    This allows alternative parallelism strategies where tensor parallel and expert
+    parallel roles are swapped, which can be beneficial for certain hardware
+    configurations or memory constraints.
+
+    Attributes:
+        axes: Sharding pattern [TP, EMPTY, EMPTY] for expert tensor parallelism.
+        mode: Training mode constant (MODE_TRAIN).
+
+    See Also:
+        ExpertColumnWiseAlt: Column-wise expert parallelism (standard mode)
+        ExpertRowWiseAlt: Row-wise expert parallelism (standard mode)
+    """
 
     axes: typing.ClassVar = [TP, EMPTY, EMPTY]
     mode: typing.ClassVar = MODE_TRAIN
@@ -223,11 +245,31 @@ class ParallelMoELinear(nn.Module):
         return TP if self.use_expert_tensor_mode else EP
 
     def _group_axes(self) -> list[str | None]:
-        """Sharding axes for group sizes."""
+        """Returns sharding axes for expert group sizes array.
+
+        Group sizes specify how many tokens are assigned to each expert and are
+        typically replicated across all devices.
+
+        Returns:
+            List containing [EMPTY], indicating group_sizes are replicated.
+        """
         return [EMPTY]
 
     def _input_axes(self) -> list[str | None]:
-        """Sharding axes for inputs based on parallelism direction."""
+        """Returns sharding axes for input activations based on parallelism direction.
+
+        The input sharding depends on whether this is a row-parallel or column-parallel layer:
+        - Row-parallel: Inputs are sharded on the feature dimension [DP, TP]
+            because different devices hold different input features
+        - Column-parallel: Inputs are replicated on the feature dimension [DP, EMPTY]
+            because all devices need the full input to compute their output slice
+
+        Returns:
+            List of axis names defining input sharding pattern:
+            - Row direction: [DP, TP] - data parallel and tensor parallel sharded
+            - Column direction: [DP, EMPTY] - only data parallel sharded
+            - No direction: [DP, EMPTY] - default to replicated features
+        """
         if self.direction == "row":
             return [DP, TP]
         if self.direction == "column":
@@ -235,7 +277,22 @@ class ParallelMoELinear(nn.Module):
         return [DP, EMPTY]
 
     def _output_axes(self) -> list[str | None]:
-        """Sharding axes for outputs based on parallelism direction."""
+        """Returns sharding axes for output activations based on parallelism direction.
+
+        The output sharding depends on the parallelism strategy:
+        - Row-parallel: Outputs are fully reduced and replicated [DP, EMPTY]
+            because all devices contribute partial results that are summed
+        - Column-parallel: Outputs are sharded on the feature dimension
+            because each device produces a different slice of the output
+            - In expert tensor mode: [DP, TP]
+            - In standard mode: [DP, [EP, TP]] (combined expert+tensor parallel)
+
+        Returns:
+            List of axis names defining output sharding pattern:
+            - Row direction: [DP, EMPTY] - replicated after all-reduce
+            - Column direction: [DP, TP] or [DP, [EP, TP]] - sharded features
+            - No direction: [DP, EMPTY] - default to replicated
+        """
         if self.direction == "row":
             return [DP, EMPTY]
         if self.direction == "column":
@@ -276,6 +333,7 @@ class ParallelMoELinear(nn.Module):
             weight = weight.astype("f4")
 
         inputs, weight = promote_dtype((inputs, weight), dtype=self.dtype)
+
         output = grouped_matmul(
             inputs,
             weight,
@@ -283,7 +341,9 @@ class ParallelMoELinear(nn.Module):
             preferred_element_type=jnp.bfloat16,
             transpose_rhs=self.out_first,
             platform="xla",
+            cfg=GroupedMatmulConfig(bypass_xla_tiling=True),
         )
+
         if self.bias is not None:
             output += self._expand_bias_ragged(group_sizes, sorted_experts=sorted_experts)
 
@@ -294,24 +354,45 @@ class ParallelMoELinear(nn.Module):
         group_sizes: Int[Array, "num_groups"],  # noqa
         sorted_experts: Int[Array, "tokens_ragged"] | None = None,  # noqa
     ) -> Float[Array, "tokens_ragged out_dim"]:
-        """Expands the bias to match the ragged batch structure.
+        """Expands bias to match the ragged token batch structure.
 
-        This method repeats the bias for each expert according to the number of
-        tokens assigned to it. This is necessary because tokens are grouped by
-        expert, and each group needs its corresponding expert's bias.
+        This method aligns the per-expert bias with the ragged token layout by
+        repeating each expert's bias according to how many tokens are assigned to it.
+        This is necessary because tokens are sorted and grouped by expert, and each
+        token needs its assigned expert's bias added to the output.
+
+        Two modes of operation:
+        1. If `sorted_experts` is provided (expert tensor mode): Uses the expert IDs
+           directly to index into the bias array, handling cases where not all experts
+           on a shard receive tokens.
+        2. If `sorted_experts` is None (standard mode): Generates expert indices by
+           repeating each expert ID according to its group size.
 
         Args:
-            group_sizes: The sizes of token groups for each expert.
-                Shape: (num_experts,). Each element indicates how many tokens
-                are assigned to that expert.
+            group_sizes: The number of tokens assigned to each expert on this shard.
+                Shape: (num_local_experts,). Each element indicates how many tokens
+                were routed to that expert.
+            sorted_experts: Optional pre-computed expert IDs for each token. Shape:
+                (total_tokens,). Required in expert tensor mode where expert distribution
+                may be sparse. If None, expert indices are generated from group_sizes.
 
         Returns:
-            The expanded bias array where each expert's bias is repeated
-            according to its group size. Shape: (total_tokens, out_features).
+            Expanded bias array aligned with sorted tokens. Shape: (total_tokens, out_features).
+            Each row contains the bias for the expert assigned to that token.
 
         Example:
-            If expert 0 has 3 tokens, expert 1 has 2 tokens, and expert 2 has 4 tokens,
-            this will repeat bias[0] 3 times, bias[1] 2 times, and bias[2] 4 times.
+            >>> # Standard mode: 3 experts with [3, 2, 4] tokens respectively
+            >>> bias = jnp.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])  # (3, 2)
+            >>> group_sizes = jnp.array([3, 2, 4])
+            >>> expanded = _expand_bias_ragged(group_sizes, sorted_experts=None)
+            >>> # expanded = [[0.1, 0.2], [0.1, 0.2], [0.1, 0.2],  # expert 0 repeated 3 times
+            >>> #              [0.3, 0.4], [0.3, 0.4],              # expert 1 repeated 2 times
+            >>> #              [0.5, 0.6], [0.5, 0.6], [0.5, 0.6], [0.5, 0.6]]  # expert 2 repeated 4 times
+            >>>
+            >>> # Expert tensor mode: sparse expert assignment
+            >>> sorted_experts = jnp.array([0, 0, 2, 2, 2])  # 5 tokens, only experts 0 and 2
+            >>> expanded = _expand_bias_ragged(None, sorted_experts=sorted_experts)
+            >>> # expanded = [[0.1, 0.2], [0.1, 0.2], [0.5, 0.6], [0.5, 0.6], [0.5, 0.6]]
         """
         if sorted_experts is not None:
             indices = sorted_experts
