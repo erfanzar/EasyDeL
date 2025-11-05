@@ -8,18 +8,18 @@ import easydel as ed
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
     from _common import (  # type: ignore
-        build_reward_dataset,
+        build_lm_dataset,
         get_logger,
         get_tokenizer,
-        load_sequence_classifier_model,
+        load_causal_lm_model,
         make_config,
     )
 else:
     from ._common import (
-        build_reward_dataset,
+        build_lm_dataset,
         get_logger,
         get_tokenizer,
-        load_sequence_classifier_model,
+        load_causal_lm_model,
         make_config,
     )
 
@@ -27,26 +27,23 @@ else:
 def main():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
-    model = load_sequence_classifier_model()
+    model = load_causal_lm_model()
 
     trainer_args = make_config(
-        ed.RewardConfig,
-        "reward-modeling",
-        overrides={"total_batch_size": 1},
+        ed.TrainingArguments,
+        "base-trainer",
     )
 
-    dataset = build_reward_dataset()
+    dataset = build_lm_dataset(tokenizer)
 
-    logger.info("Initializing RewardTrainer.")
-    trainer = ed.RewardTrainer(
-        model=model,
-        processing_class=tokenizer,
+    logger.info("Running base Trainer smoke test.")
+    trainer = ed.Trainer(
         arguments=trainer_args,
-        train_dataset=dataset,
+        model=model,
+        dataset_train=dataset,
     )
-    logger.info("Starting reward model training.")
     trainer.train()
-    logger.info("Reward training complete.")
+    logger.info("Trainer smoke test completed.")
 
 
 if __name__ == "__main__":

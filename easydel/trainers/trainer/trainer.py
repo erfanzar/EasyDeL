@@ -36,8 +36,7 @@ import typing as tp
 import jax
 import jax.experimental
 import jax.lib
-from eformer.escale import with_sharding_constraint
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
@@ -254,30 +253,6 @@ class Trainer(BaseTrainer):
             mesh=mesh,
             checkpoint_manager=checkpoint_manager,
         )
-
-    def _all_gather(self, arr: jax.Array) -> jax.Array:
-        """Gather array from all devices to a single replicated array.
-
-        Args:
-            arr: Array to gather across devices.
-
-        Returns:
-            Array replicated across all devices.
-        """
-        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
-
-    def _one_to_all(self, arr: jax.Array) -> jax.Array:
-        """Distribute array from one device to all devices.
-
-        Args:
-            arr: Array to distribute.
-
-        Returns:
-            Array distributed across devices.
-        """
-        with self.mesh:
-            arr = with_sharding_constraint(arr, PartitionSpec(None))
-        return arr
 
     def _run_training_loop(
         self,
@@ -551,6 +526,10 @@ class Trainer(BaseTrainer):
                     mode="train",
                 )
                 self.log_weight_distribution(state=state, step=current_step)
+                try:
+                    self.maybe_generate(state=state, step=current_step, metrics=metrics)
+                except Exception as exc:  # pragma: no cover - preview must not interrupt training
+                    logger.debug(f"Preview generation hook failed: {exc}")
                 # Save checkpoint if needed (handled by checkpointer policies)
 
                 def checkpoint_callback(dest, mesh, meta, s=state):

@@ -259,6 +259,74 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Metrics to display in the rich progress bar."},
     )
+    generation_top_p: float | None = field(
+        default=None,
+        metadata={"help": "Default nucleus sampling threshold used for preview generations."},
+    )
+    generation_top_k: int | None = field(
+        default=None,
+        metadata={"help": "Default top-k sampling threshold used for preview generations."},
+    )
+    generation_temperature: float | None = field(
+        default=None,
+        metadata={"help": "Default sampling temperature for preview generations."},
+    )
+    generation_do_sample: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to enable sampling when generating previews (auto-inferred when None)."},
+    )
+    generation_num_return_sequences: int | None = field(
+        default=None,
+        metadata={"help": "Number of completions to sample per prompt for preview generations."},
+    )
+    generation_max_new_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Maximum number of newly generated tokens for previews."},
+    )
+    generation_max_length: int | None = field(
+        default=None,
+        metadata={"help": "Total maximum length (prompt + completion) for preview generations."},
+    )
+    generation_shard_inputs: bool = field(
+        default=True,
+        metadata={"help": "Whether generation previews should reuse the model's sharding plan."},
+    )
+    generation_interval: int | None = field(
+        default=None,
+        metadata={"help": "Run preview generation every X training steps (disabled when None)."},
+    )
+    generation_prompts: list[str | dict[str, tp.Any]] = field(
+        default_factory=list,
+        metadata={"help": "Static prompts (text or tokenized dicts) to sample during preview generation."},
+    )
+    generation_use_train_prompts: bool = field(
+        default=False,
+        metadata={"help": "When True, sample additional prompts from the training dataset for previews."},
+    )
+    generation_num_prompts: int = field(
+        default=1,
+        metadata={"help": "Number of prompts to use per preview generation call."},
+    )
+    generation_dataset_prompt_field: str | None = field(
+        default="prompt",
+        metadata={"help": "Dataset field to treat as prompt text when sampling from the training set."},
+    )
+    generation_extra_kwargs: dict[str, tp.Any] | None = field(
+        default=None,
+        metadata={"help": "Additional kwargs forwarded to `model.generate` for previews."},
+    )
+    generation_config_overrides: dict[str, tp.Any] | None = field(
+        default=None,
+        metadata={"help": "Attribute overrides applied to the copied generation config for previews."},
+    )
+    generation_seed: int | None = field(
+        default=None,
+        metadata={"help": "Seed for preview prompt sampling (None uses a random seed)."},
+    )
+    generation_log_to_wandb: bool = field(
+        default=True,
+        metadata={"help": "Whether to log preview generations to WandB when available."},
+    )
     num_train_epochs: int = field(
         default=10,
         metadata={"help": "The number of training epochs."},
@@ -589,6 +657,48 @@ class TrainingArguments:
             self.loss_config = LossConfig()
         if isinstance(self.loss_config, dict):
             self.loss_config = LossConfig(**self.loss_config)
+        if getattr(self, "generation_interval", None) is not None and self.generation_interval <= 0:
+            logger.warning("`generation_interval` must be positive; disabling preview generation.")
+            self.generation_interval = None
+        if getattr(self, "generation_num_prompts", None) is not None:
+            self.generation_num_prompts = max(1, int(self.generation_num_prompts))
+
+        def _inherit_generation_attr(attr, fallback_name):
+            current = getattr(self, attr, None)
+            if current is None and hasattr(self, fallback_name):
+                fallback_value = getattr(self, fallback_name)
+                if fallback_value not in (None, False):
+                    setattr(self, attr, fallback_value)
+
+        _inherit_generation_attr("generation_top_p", "top_p")
+        _inherit_generation_attr("generation_top_k", "top_k")
+        _inherit_generation_attr("generation_temperature", "temperature")
+        _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
+        _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
+        _inherit_generation_attr("generation_max_length", "max_sequence_length")
+
+        if self.generation_max_length is None:
+            max_prompt_length = getattr(self, "max_prompt_length", None)
+            max_completion_length = getattr(self, "max_completion_length", None)
+            if max_prompt_length is not None and max_completion_length is not None:
+                self.generation_max_length = max_prompt_length + max_completion_length
+
+        if self.generation_num_return_sequences is not None:
+            try:
+                self.generation_num_return_sequences = int(self.generation_num_return_sequences)
+            except (TypeError, ValueError):  # pragma: no cover - keep original value if conversion fails
+                ...
+
+        if self.generation_do_sample is None:
+            if any(
+                getattr(self, name, None) is not None
+                for name in ("generation_top_p", "generation_top_k", "generation_temperature")
+            ):
+                self.generation_do_sample = True
+        if self.generation_do_sample is None and hasattr(self, "do_sample"):
+            do_sample = getattr(self, "do_sample", None)
+            if do_sample is not None:
+                self.generation_do_sample = do_sample
 
     @staticmethod
     def _time_to_seconds(time_str: str) -> int:

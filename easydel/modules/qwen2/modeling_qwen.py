@@ -29,7 +29,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
-    CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
@@ -676,78 +675,6 @@ class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
-        """Forward pass of the Qwen2ForCausalLM model.
-
-        Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
-
-        Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
         )
 
     def get_encoder(self):

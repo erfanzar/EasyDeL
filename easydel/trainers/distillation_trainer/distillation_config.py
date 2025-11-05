@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
+import typing as tp
 from dataclasses import field
 
 from eformer.pytree import auto_pytree
@@ -78,4 +81,62 @@ class DistillationConfig(TrainingArguments):
             "1.0 = pure distillation, 0.0 = pure supervised learning."
         },
     )
+    hidden_state_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Optional coefficient for matching student and teacher hidden states. "
+                "Set to 0 to disable hidden-state distillation."
+            )
+        },
+    )
+    hidden_state_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Indices of transformer layers whose hidden states should be distilled. "
+                "Negative indices follow Python semantics. Defaults to the final layer when omitted."
+            )
+        },
+    )
+    hidden_state_loss: tp.Literal["mse"] = field(
+        default="mse",
+        metadata={"help": "Distance function used for hidden-state distillation. Currently only 'mse' is supported."},
+    )
+    attention_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Optional coefficient for matching attention probability tensors. "
+                "Set to 0 to disable attention-head distillation."
+            )
+        },
+    )
+    attention_layers: tuple[int, ...] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Indices of attention layers whose probability matrices should be distilled. "
+                "Negative indices follow Python semantics. Defaults to all available layeatrs when omitted."
+            )
+        },
+    )
+    attention_normalize: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to L1-normalize attention matrices before computing the distillation loss. "
+                "Useful when working with models that emit un-normalized attention weights."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.hidden_state_layers is not None:
+            self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
+        if self.attention_layers is not None:
+            self.attention_layers = tuple(int(i) for i in self.attention_layers)
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+
     __hash__ = hash_fn
