@@ -8,18 +8,18 @@ import easydel as ed
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
     from _common import (  # type: ignore
-        build_reward_dataset,
+        build_sft_text_dataset,
         get_logger,
         get_tokenizer,
-        load_sequence_classifier_model,
+        load_causal_lm_model,
         make_config,
     )
 else:
     from ._common import (
-        build_reward_dataset,
+        build_sft_text_dataset,
         get_logger,
         get_tokenizer,
-        load_sequence_classifier_model,
+        load_causal_lm_model,
         make_config,
     )
 
@@ -27,26 +27,25 @@ else:
 def main():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
-    model = load_sequence_classifier_model()
+    model = load_causal_lm_model()
 
     trainer_args = make_config(
-        ed.RewardConfig,
-        "reward-modeling",
-        overrides={"total_batch_size": 1},
+        ed.SFTConfig,
+        "supervised-fine-tuning",
+        overrides={"dataset_text_field": "text", "packing": False},
     )
 
-    dataset = build_reward_dataset()
+    dataset = build_sft_text_dataset(tokenizer=tokenizer)
 
-    logger.info("Initializing RewardTrainer.")
-    trainer = ed.RewardTrainer(
-        model=model,
-        processing_class=tokenizer,
+    logger.info("Starting SFT run.")
+    trainer = ed.SFTTrainer(
         arguments=trainer_args,
+        model=model,
         train_dataset=dataset,
+        processing_class=tokenizer,
     )
-    logger.info("Starting reward model training.")
     trainer.train()
-    logger.info("Reward training complete.")
+    logger.info("SFT run finished.")
 
 
 if __name__ == "__main__":

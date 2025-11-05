@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import copy
 import os
 import pprint
 import time
@@ -27,12 +28,16 @@ import grain.python as grain
 import jax
 import jax.extend
 import numpy as np
+from eformer import common_types
+from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src.stages import Compiled
+from jax.sharding import NamedSharding, PartitionSpec
 from tqdm.autonotebook import tqdm
+from transformers import GenerationConfig
 
 from easydel import __version__
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -42,6 +47,7 @@ from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
 from easydel.utils import Timers, readme_generator
+from easydel.utils.compiling_utils import ejit
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -66,6 +72,8 @@ if tp.TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
 
@@ -371,6 +379,16 @@ class BaseTrainer(BaseTrainerProtocol):
             "_eval_shared_fn_extra_args_",
             (),
         )
+        self.generate_function = getattr(self, "generate_function", None)
+        self.latest_generation_samples = getattr(self, "latest_generation_samples", [])
+        rng = getattr(self, "_generation_rng", None)
+        seed = getattr(self.arguments, "generation_seed", None)
+        if rng is None:
+            if seed is None:
+                rng = np.random.default_rng()
+            else:
+                rng = np.random.default_rng(seed)
+        self._generation_rng = rng
 
     def _initialize_memory_tracking(self):
         """Initialize memory monitoring for tracking GPU/TPU memory usage.
@@ -503,6 +521,518 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         self.compile_aot()
 
+    def _configure_generation_function(self):
+        """Prepare a default generation function when the model supports generation."""
+        if getattr(self, "generate_function", None) is not None:
+            return
+        state = getattr(self, "model_state", None)
+        if state is None or not hasattr(state, "model"):
+            return
+        model = state.model
+        if not hasattr(model, "generate"):
+            return
+        try:
+            kwargs = self._default_generation_kwargs()
+            config_overrides = self._default_generation_config_overrides()
+            shard_inputs = getattr(self.arguments, "generation_shard_inputs", True)
+            self.generate_function = self.create_generate_function(
+                shard_inputs=shard_inputs,
+                config_overrides=config_overrides,
+                **kwargs,
+            )
+        except Exception as exc:  # pragma: no cover - generation is optional
+            logger.debug(f"Skipping default generation function setup due to: {exc}")
+
+    def _prepare_generation_config(
+        self,
+        generation_config: GenerationConfig | None,
+    ) -> GenerationConfig | None:
+        """Return a copy of the generation config to avoid mutating shared references."""
+        if GenerationConfig is None:
+            return generation_config
+        if generation_config is not None:
+            return copy.deepcopy(generation_config)
+        model = self.model_state.model
+        base_config = getattr(model, "generation_config", None)
+        if base_config is None:
+            return None
+        return copy.deepcopy(base_config)
+
+    def _default_generation_kwargs(self) -> dict[str, tp.Any]:
+        """Assemble default keyword arguments for `model.generate` based on training arguments."""
+        args = getattr(self, "arguments", None)
+        if args is None:
+            return {}
+
+        def _maybe_insert(target: dict[str, tp.Any], key: str, value: tp.Any) -> None:
+            if value is not None:
+                target[key] = value
+
+        kwargs: dict[str, tp.Any] = {}
+        _maybe_insert(kwargs, "top_p", getattr(args, "generation_top_p", None))
+        _maybe_insert(kwargs, "top_k", getattr(args, "generation_top_k", None))
+        _maybe_insert(kwargs, "temperature", getattr(args, "generation_temperature", None))
+        _maybe_insert(kwargs, "do_sample", getattr(args, "generation_do_sample", None))
+        _maybe_insert(kwargs, "num_return_sequences", getattr(args, "generation_num_return_sequences", None))
+        _maybe_insert(kwargs, "max_new_tokens", getattr(args, "generation_max_new_tokens", None))
+        _maybe_insert(kwargs, "max_length", getattr(args, "generation_max_length", None))
+
+        if "max_new_tokens" not in kwargs:
+            fallback = getattr(args, "max_completion_length", None)
+            if fallback is not None:
+                kwargs["max_new_tokens"] = fallback
+
+        if "max_length" not in kwargs:
+            fallback = getattr(args, "generation_max_length", None)
+            if fallback is None:
+                prompt_len = getattr(args, "max_prompt_length", None)
+                completion_len = getattr(args, "max_completion_length", None)
+                if prompt_len is not None and completion_len is not None:
+                    fallback = prompt_len + completion_len
+            if fallback is not None:
+                kwargs["max_length"] = fallback
+
+        if "num_return_sequences" not in kwargs:
+            fallback = getattr(args, "num_return_sequences", None)
+            if fallback is not None:
+                kwargs["num_return_sequences"] = fallback
+
+        if "do_sample" not in kwargs:
+            if any(key in kwargs for key in ("top_p", "top_k", "temperature")):
+                kwargs["do_sample"] = True
+
+        extra = getattr(args, "generation_extra_kwargs", None)
+        if extra:
+            kwargs.update(extra)
+
+        return kwargs
+
+    def _default_generation_config_overrides(self) -> dict[str, tp.Any] | None:
+        overrides = getattr(self.arguments, "generation_config_overrides", None)
+        if not overrides:
+            return None
+        return dict(overrides)
+
+    def create_generate_function(
+        self,
+        generation_config: GenerationConfig | None = None,
+        *,
+        shard_inputs: bool = True,
+        config_overrides: dict[str, tp.Any] | None = None,
+        **generate_kwargs,
+    ) -> tp.Callable[[EasyDeLState, jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+        """
+        Build and return a compiled generation function that mirrors the model's `generate`.
+
+        Parameters
+        ----------
+        generation_config:
+            Optional generation configuration. If omitted, the model's default configuration is used.
+        shard_inputs:
+            Whether to shard the prompt tensors using the model's partition manager before generation.
+        config_overrides:
+            Optional attribute overrides applied to the copied generation configuration.
+        generate_kwargs:
+            Extra keyword arguments forwarded to `module.generate`.
+        """
+        state = getattr(self, "model_state", None)
+        if state is None:
+            raise RuntimeError("Model state is not initialized; cannot create generation function.")
+        if not hasattr(state.model, "generate"):
+            raise NotImplementedError("Attached model does not provide a `generate` method.")
+
+        effective_generate_kwargs = dict(generate_kwargs)
+        config_copy = self._prepare_generation_config(generation_config)
+        if config_copy is not None and config_overrides:
+            for key, value in config_overrides.items():
+                setattr(config_copy, key, value)
+        if config_copy is not None:
+            for key, value in effective_generate_kwargs.items():
+                if hasattr(config_copy, key):
+                    setattr(config_copy, key, value)
+
+        mesh = self.model.mesh
+        empty_sharding = jax.sharding.NamedSharding(spec=jax.sharding.PartitionSpec(), mesh=mesh)
+
+        @ejit(
+            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+        )
+        def generate(state: EasyDeLState, input_ids: jax.Array, attention_mask: jax.Array):
+            module = state.model
+            with module.mesh:
+                shard_input_ids = input_ids
+                shard_attention_mask = attention_mask
+                if shard_inputs:
+                    partition_manager = getattr(module.config, "partition_manager", None)
+                    if partition_manager is not None:
+                        axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
+                        shard_input_ids = partition_manager.shard(
+                            shard_input_ids,
+                            axes=axes,
+                            mode=common_types.MODE_PREFILL,
+                        )
+                        shard_attention_mask = partition_manager.shard(
+                            shard_attention_mask,
+                            axes=axes,
+                            mode=common_types.MODE_PREFILL,
+                        )
+
+                if config_copy is None:
+                    outputs = module.generate(
+                        input_ids=shard_input_ids,
+                        attention_mask=shard_attention_mask,
+                        **effective_generate_kwargs,
+                    )
+                else:
+                    outputs = module.generate(
+                        input_ids=shard_input_ids,
+                        attention_mask=shard_attention_mask,
+                        generation_config=config_copy,
+                        **effective_generate_kwargs,
+                    )
+
+                sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
+                return sequences, shard_input_ids, shard_attention_mask
+
+        return generate
+
+    def generate(
+        self,
+        input_ids: jax.Array | np.ndarray,
+        attention_mask: jax.Array | np.ndarray | None = None,
+        *,
+        state: EasyDeLState | None = None,
+        generation_config: GenerationConfig | None = None,
+        shard_inputs: bool | None = None,
+        config_overrides: dict[str, tp.Any] | None = None,
+        return_metadata: bool = False,
+        all_gather: bool = False,
+        **generate_kwargs,
+    ):
+        """
+        Convenience wrapper around the compiled generation function.
+
+        Parameters
+        ----------
+        input_ids:
+            Prompt token ids.
+        attention_mask:
+            Optional attention mask; defaults to all ones.
+        state:
+            Optional model state; defaults to the trainer's current state.
+        generation_config:
+            Optional configuration applied for this invocation only.
+        shard_inputs:
+            Whether to shard inputs before generation (default True).
+        config_overrides:
+            Attribute overrides applied to the copied generation configuration.
+        return_metadata:
+            When True, returns `(sequences, prompt_ids, attention_mask)`; otherwise only sequences.
+        all_gather:
+            Gather results back to host replicas when `_all_gather` is available.
+        generate_kwargs:
+            Additional keyword arguments forwarded to `module.generate`.
+        """
+        if state is None:
+            state = self.model_state
+        if state is None:
+            raise RuntimeError("Model state is not initialized; call after trainer setup.")
+
+        if shard_inputs is None:
+            shard_inputs = getattr(self.arguments, "generation_shard_inputs", True)
+
+        input_ids = jnp.asarray(input_ids)
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids, dtype=jnp.int32)
+        else:
+            attention_mask = jnp.asarray(attention_mask)
+
+        needs_custom_fn = bool(generation_config or config_overrides or generate_kwargs)
+        if needs_custom_fn:
+            merged_kwargs = self._default_generation_kwargs()
+            merged_kwargs.update(generate_kwargs)
+            merged_overrides = self._default_generation_config_overrides() or {}
+            if config_overrides:
+                merged_overrides.update(config_overrides)
+            generate_fn = self.create_generate_function(
+                generation_config=generation_config,
+                shard_inputs=shard_inputs,
+                config_overrides=merged_overrides or None,
+                **merged_kwargs,
+            )
+        else:
+            if getattr(self, "generate_function", None) is None:
+                default_kwargs = self._default_generation_kwargs()
+                default_overrides = self._default_generation_config_overrides()
+                self.generate_function = self.create_generate_function(
+                    shard_inputs=shard_inputs,
+                    config_overrides=default_overrides,
+                    **default_kwargs,
+                )
+            generate_fn = self.generate_function
+
+        sequences, prompt_ids, prompt_mask = generate_fn(state, input_ids, attention_mask)
+
+        if all_gather:
+            sequences = self._all_gather(sequences)
+            prompt_ids = self._all_gather(prompt_ids)
+            prompt_mask = self._all_gather(prompt_mask)
+
+        if return_metadata:
+            return sequences, prompt_ids, prompt_mask
+        return sequences
+
+    def _get_processing_class(self):
+        proc = getattr(self, "processing_class", None)
+        if proc is not None:
+            return proc
+        state = getattr(self, "model_state", None)
+        if state is not None:
+            model = state.model
+            candidate = getattr(model, "processing_class", None)
+            if candidate is not None:
+                return candidate
+            candidate = getattr(model, "tokenizer", None)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _batch_decode_tokens(self, token_ids: tp.Any) -> list[str] | None:
+        processor = self._get_processing_class()
+        if processor is None or not hasattr(processor, "batch_decode"):
+            return None
+        array = np.asarray(token_ids)
+        if array.ndim == 1:
+            array = array[None, :]
+        try:
+            return processor.batch_decode(array, skip_special_tokens=True)
+        except Exception as exc:  # pragma: no cover - best effort decoding
+            logger.debug(f"Failed to decode generation tokens: {exc}")
+            return None
+
+    def _collect_generation_prompts(self) -> list[tp.Any]:
+        args = getattr(self, "arguments", None)
+        if args is None:
+            return []
+        configured_prompts = list(getattr(args, "generation_prompts", []))
+        target = getattr(args, "generation_num_prompts", len(configured_prompts) or 1)
+        prompts = configured_prompts[: target or len(configured_prompts)]
+        remaining = max(target - len(prompts), 0)
+        if remaining > 0 and getattr(args, "generation_use_train_prompts", False):
+            prompts.extend(self._sample_prompts_from_dataset(remaining))
+        return prompts
+
+    def _sample_prompts_from_dataset(self, expected: int) -> list[tp.Any]:
+        dataset = getattr(self, "dataset_train", None)
+        if dataset is None or expected <= 0:
+            return []
+        try:
+            dataset_len = len(dataset)
+        except Exception as exc:  # pragma: no cover - some datasets are not sized
+            logger.debug(f"Cannot sample prompts from training dataset: {exc}")
+            return []
+        if dataset_len == 0:
+            return []
+        count = min(expected, dataset_len)
+        indices = self._generation_rng.choice(dataset_len, size=count, replace=False)
+        prompts: list[tp.Any] = []
+        for idx in np.atleast_1d(indices):
+            try:
+                sample = dataset[int(idx)]
+            except Exception as exc:  # pragma: no cover - ignore invalid rows
+                logger.debug(f"Failed to sample dataset prompt at index {idx}: {exc}")
+                continue
+            prompts.append(sample)
+        return prompts
+
+    def _prepare_generation_input(self, prompt: tp.Any) -> dict[str, tp.Any] | None:
+        processor = self._get_processing_class()
+        prompt_text: str | None = None
+
+        if isinstance(prompt, dict):
+            if "input_ids" in prompt:
+                input_ids = prompt["input_ids"]
+                attention = prompt.get("attention_mask")
+                prompt_text = prompt.get("prompt") or prompt.get("text")
+            else:
+                field = getattr(self.arguments, "generation_dataset_prompt_field", None)
+                if field and field in prompt:
+                    return self._prepare_generation_input(prompt[field])
+                for key in ("prompt", "text"):
+                    if key in prompt:
+                        return self._prepare_generation_input(prompt[key])
+                logger.debug("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
+                return None
+        elif isinstance(prompt, str):
+            if processor is None:
+                logger.debug("No tokenizer/processor available; cannot tokenize prompt text.")
+                return None
+            prompt_text = prompt
+            encode_kwargs = dict(return_tensors="np", truncation=True)
+            max_length = getattr(self.arguments, "max_prompt_length", None)
+            if max_length is not None:
+                encode_kwargs["max_length"] = max_length
+            try:
+                encoded = processor(prompt, **encode_kwargs)
+            except Exception as exc:  # pragma: no cover - tokenizer issues
+                logger.debug(f"Failed to tokenize generation prompt: {exc}")
+                return None
+            input_ids = encoded["input_ids"]
+            attention = encoded.get("attention_mask")
+        else:
+            logger.debug(f"Unsupported prompt type for preview generation: {type(prompt)}")
+            return None
+
+        input_array = np.asarray(input_ids)
+        input_array = input_array.astype(np.int32, copy=False)
+        if input_array.ndim == 1:
+            input_array = input_array[None, :]
+        input_ids = jnp.asarray(input_array, dtype=jnp.int32)
+
+        if attention is None:
+            attention_array = np.ones_like(input_array, dtype=np.int32)
+        else:
+            attention_array = np.asarray(attention)
+            if attention_array.ndim == 1:
+                attention_array = attention_array[None, :]
+            attention_array = attention_array.astype(np.int32, copy=False)
+        attention_mask = jnp.asarray(attention_array, dtype=jnp.int32)
+
+        if prompt_text is None:
+            decoded = self._batch_decode_tokens(input_ids)
+            if decoded:
+                prompt_text = decoded[0]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "prompt_text": prompt_text,
+        }
+
+    def maybe_generate(
+        self,
+        state: EasyDeLState,
+        step: int,
+        metrics: MetricsType | None = None,
+    ) -> None:
+        """Optionally run preview generation to monitor training progress."""
+
+        args = getattr(self, "arguments", None)
+        if args is None:
+            return
+        interval = getattr(args, "generation_interval", None)
+        if interval is None:
+            return
+        if interval <= 0 or step % interval != 0:
+            return
+        if not (args.is_process_zero or args.log_all_workers):
+            return
+        if getattr(self, "generate_function", None) is None:
+            return
+
+        prompts = self._collect_generation_prompts()
+        if not prompts:
+            return
+
+        results: list[dict[str, tp.Any]] = []
+        for prompt in prompts:
+            prepared = self._prepare_generation_input(prompt)
+            if prepared is None:
+                continue
+            input_ids = prepared["input_ids"]
+            attention_mask = prepared["attention_mask"]
+            prompt_text = prepared.get("prompt_text")
+
+            try:
+                sequences = self.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    state=state,
+                    shard_inputs=args.generation_shard_inputs,
+                )
+            except Exception as exc:  # pragma: no cover - preview should not break training
+                logger.debug(f"Preview generation failed: {exc}")
+                continue
+
+            sequences = np.asarray(jax.device_get(sequences))
+            if sequences.ndim == 1:
+                sequences = sequences[None, :]
+
+            if attention_mask is not None:
+                attn_np = np.asarray(jax.device_get(attention_mask))
+                if attn_np.ndim == 1:
+                    attn_np = attn_np[None, :]
+                prompt_len = int(attn_np[0].sum())
+            else:
+                prompt_len = input_ids.shape[-1]
+
+            completion_tokens = sequences[:, prompt_len:]
+            completions = self._batch_decode_tokens(completion_tokens)
+            if completions is None:
+                completions = [completion_tokens[i].tolist() for i in range(completion_tokens.shape[0])]
+
+            if prompt_text is None:
+                decoded_prompt = self._batch_decode_tokens(input_ids)
+                if decoded_prompt:
+                    prompt_text = decoded_prompt[0]
+
+            results.append(
+                {
+                    "prompt": prompt_text,
+                    "completions": completions,
+                    "step": step,
+                }
+            )
+
+        if not results:
+            return
+
+        self.latest_generation_samples = results
+
+        for record in results:
+            prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+            logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+            for idx, completion in enumerate(record["completions"]):
+                logger.info(f"  completion[{idx}]: {completion}")
+
+        if (
+            wandb is not None
+            and getattr(args, "use_wandb", False)
+            and getattr(args, "can_log_metrics", False)
+            and getattr(args, "generation_log_to_wandb", True)
+        ):
+            table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
+            for record in results:
+                prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+                for idx, completion in enumerate(record["completions"]):
+                    table.add_data(step, prompt_repr, idx, completion)
+            wandb.log({"preview_generations": table}, step=step)
+
+    def _one_to_all(self, arr: jax.Array) -> jax.Array:
+        """Distribute array from one device to all devices.
+
+        Args:
+            arr: Array to distribute.
+
+        Returns:
+            Array distributed across devices.
+        """
+        with self.mesh:
+            arr = with_sharding_constraint(arr, PartitionSpec(None))
+        return arr
+
+    def _all_gather(self, arr: jax.Array) -> jax.Array:
+        """Gather array from all devices to a single replicated array.
+
+        Args:
+            arr: Array to gather across devices.
+
+        Returns:
+            Array replicated across all devices.
+        """
+        return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
+
     def initialize_trainer_utils(self):
         """
         Initializes various utilities used by the trainer.
@@ -612,6 +1142,7 @@ class BaseTrainer(BaseTrainerProtocol):
             self.checkpoint_manager = functions.checkpoint_manager
             self.checkpointer = self._create_checkpointer()
         self.timer.log("configure functions and sharding them")
+        self._configure_generation_function()
 
     def _configure_state(self):
         """

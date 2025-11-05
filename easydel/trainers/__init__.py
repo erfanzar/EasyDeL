@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from .base_trainer import BaseTrainer
+from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
+from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -25,7 +27,11 @@ from .trainer import Trainer
 from .training_configurations import TrainingArguments
 
 __all__ = (
+    "BCOConfig",
+    "BCOTrainer",
     "BaseTrainer",
+    "CPOConfig",
+    "CPOTrainer",
     "DPOConfig",
     "DPOTrainer",
     "DistillationConfig",

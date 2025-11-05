@@ -21,12 +21,11 @@ from functools import cached_property, partial
 import flax
 import flax.nnx
 import jax
-from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
-from transformers import AutoTokenizer, GenerationConfig, ProcessorMixin
+from transformers import AutoTokenizer, ProcessorMixin
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -120,9 +119,9 @@ class GRPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
-        assert (
-            arguments is not None
-        ), "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
+        assert arguments is not None, (
+            "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
+        )
         assert isinstance(arguments, GRPOConfig), f"arguments type must be `GRPOConfig` but got {type(arguments)}"
         assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
 
@@ -163,18 +162,11 @@ class GRPOTrainer(Trainer):
 
                     @ejit(
                         static_argnums=(0,),
-                        in_shardings=(
-                            sharding.graphstate,
-                            sharding.graphother,
-                            empty_sharding,
-                        ),
+                        in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
                         out_shardings=empty_sharding,
                     )
                     def apply_fn(gd, gs, gt, batch):
-                        batch = with_sharding_constraint(
-                            arr=batch,
-                            sharding=self.arguments.step_partition_spec,
-                        )
+                        batch = with_sharding_constraint(arr=batch, sharding=self.arguments.step_partition_spec)
                         return nn.merge(gd, gs, gt)(**batch)
 
                     reward_func = reward_func.replace(apply_fn=apply_fn)
@@ -283,16 +275,20 @@ class GRPOTrainer(Trainer):
             )
 
         def _tokenize(example):
+            tools = example.get("tools", None)
+            extra = {}
+            if tools is not None:
+                extra = dict(tools=tools)
             return processing_class(
                 example["prompt"],
                 return_tensors="np",
                 padding="max_length",
                 padding_side="left",
-                tools=example.get("tools", None),
                 max_length=arguments.max_prompt_length,
                 truncation=True,
                 add_special_tokens=False,
                 return_attention_mask=True,
+                **extra,
             )
 
         if isinstance(dataset, Dataset):
@@ -330,43 +326,6 @@ class GRPOTrainer(Trainer):
         mesh = self.model.mesh
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
-
-        @ejit(
-            in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
-            out_shardings=(empty_sharding, empty_sharding, empty_sharding),
-        )
-        def generate(state: EasyDeLState, input_ids, attention_mask):
-            module = state.model
-
-            with module.mesh:
-                input_ids = module.config.partition_manager.shard(
-                    input_ids,
-                    axes=[common_types.BATCH, common_types.SEQUENCE_PARALLEL],
-                    mode=common_types.MODE_PREFILL,
-                )
-                attention_mask = module.config.partition_manager.shard(
-                    attention_mask,
-                    axes=[common_types.BATCH, common_types.SEQUENCE_PARALLEL],
-                    mode=common_types.MODE_PREFILL,
-                )
-                sequences = module.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    generation_config=GenerationConfig(
-                        top_p=self.arguments.top_p,
-                        top_k=self.arguments.top_k,
-                        temperature=self.arguments.temperature,
-                        pad_token_id=self.pad_token_id,
-                        eos_token_id=self.eos_token_id,
-                        max_new_tokens=self.arguments.max_completion_length,
-                        max_length=self.arguments.max_completion_length + self.arguments.max_prompt_length,
-                        num_return_sequences=self.num_generations,
-                        do_sample=True,
-                    ),
-                ).sequences
-                return sequences, input_ids, attention_mask
-
-        self.generate_function = generate
 
         self._train_shared_fn_static_args = (
             self.num_generations,

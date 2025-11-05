@@ -539,6 +539,10 @@ _import_structure = {
     ],
     "trainers": [
         "BaseTrainer",
+        "BCOConfig",
+        "BCOTrainer",
+        "CPOConfig",
+        "CPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
         "DPOConfig",
@@ -767,6 +771,10 @@ if _tp.TYPE_CHECKING:
     from .modules.xerxes2 import Xerxes2Config, Xerxes2ForCausalLM, Xerxes2Model
     from .trainers import (
         BaseTrainer,
+        BCOConfig,
+        BCOTrainer,
+        CPOConfig,
+        CPOTrainer,
         DistillationConfig,
         DistillationTrainer,
         DPOConfig,

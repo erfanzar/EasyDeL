@@ -705,7 +705,7 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
             Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
             `"prompt"`.
         num_proc (`int`, *optional*):
-            Number of processes to use for processing the dataset.
+            Number of processes to use for processing the dataset. (Unused in the current implementation.)
         desc (`str`, *optional*):
             Meaningful description to be displayed alongside with the progress bar while mapping examples.
 
@@ -734,7 +734,22 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
     {'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
     ```
     """
-    return dataset.map(_unpair_row, batched=True, remove_columns=["chosen", "rejected"], num_proc=num_proc, desc=desc)
+
+    def _convert(split):
+        num_rows = len(split["chosen"])
+        completions = split["chosen"] + split["rejected"]
+        labels = [True] * num_rows + [False] * num_rows
+        payload: dict[str, tp.Any] = {
+            "completion": completions,
+            "label": labels,
+        }
+        if "prompt" in split.column_names:
+            payload["prompt"] = split["prompt"] + split["prompt"]
+        return Dataset.from_dict(payload)
+
+    if isinstance(dataset, DatasetDict):
+        return DatasetDict({key: _convert(ds) for key, ds in dataset.items()})
+    return _convert(dataset)
 
 
 def maybe_unpair_preference_dataset(

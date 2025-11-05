@@ -393,11 +393,10 @@ class TransformerCacheView(BaseCacheView):
             kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
             vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
             kv_sharding_axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
-
             if masking_details is not None:
                 if masking_details.mask_type == AttnMaskType.SLIDING:
-                    kshape = (mt.batch_size, masking_details.size, mt.key_heads, mt.key_dim)
-                    vshape = (mt.batch_size, masking_details.size, mt.value_heads, mt.value_dim)
+                    kshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.key_heads, mt.key_dim)
+                    vshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.value_heads, mt.value_dim)
 
             kshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape))
             vshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape))
