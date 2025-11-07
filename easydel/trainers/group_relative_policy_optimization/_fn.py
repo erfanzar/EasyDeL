@@ -105,10 +105,13 @@ def grpo_step(
     batch: tp.Mapping[str, jax.Array],
     num_generations: int,
     beta: float,
+    epsilon_low: float,
+    epsilon_high: float,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    per_token_weighting: bool = True,
     is_training: bool = True,
 ) -> tuple[EasyDeLState, LossMetrics]:
     # Determine batch size, minibatch size, and enforce partition spec.
@@ -128,12 +131,14 @@ def grpo_step(
             completion_ids,
             completion_mask,
             advantages,
+            token_weights,
         ) = (
             minibatch["prompt_ids"],
             minibatch["prompt_mask"],
             minibatch["completion_ids"],
             minibatch["completion_mask"],
             minibatch["advantages"],
+            minibatch.get("token_weights"),
         )
 
         input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
@@ -142,22 +147,55 @@ def grpo_step(
         per_token_logps = get_per_token_logps(module, input_ids, attention_mask, prompt_ids.shape[-1])
 
         ref_per_token_logps = minibatch["ref_per_token_logps"]
-        per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
-        per_token_loss = jnp.exp(per_token_logps - jax.lax.stop_gradient(per_token_logps)) * jnp.expand_dims(
-            advantages, 1
+        ratios = jnp.exp(per_token_logps - ref_per_token_logps)
+        clipped_ratios = jnp.where(
+            jnp.expand_dims(advantages, 1) > 0,
+            jnp.minimum(ratios, 1.0 + epsilon_high),
+            jnp.maximum(ratios, 1.0 - epsilon_low),
         )
-        per_token_loss = -(per_token_loss - beta * per_token_kl)
-        comps = jnp.sum(completion_mask, axis=1)
-        loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / comps)
-        mean_kl = jnp.mean(jnp.sum(per_token_kl * completion_mask, axis=1) / comps)
+
+        expanded_adv = jnp.expand_dims(advantages, 1)
+        if token_weights is None or not per_token_weighting:
+            weights = completion_mask
+        else:
+            weights = token_weights * completion_mask
+
+        weight_sums = jnp.maximum(jnp.sum(weights, axis=1), 1.0)
+        policy_terms = jnp.minimum(ratios * expanded_adv, clipped_ratios * expanded_adv)
+        policy_loss = -jnp.sum(weights * policy_terms, axis=1) / weight_sums
+
+        per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (
+            ref_per_token_logps - per_token_logps
+        ) - 1.0
+        kl_contrib = jnp.sum(weights * per_token_kl, axis=1) / weight_sums
+        mean_kl = jnp.mean(kl_contrib)
+
+        loss = policy_loss + beta * kl_contrib
+        loss = jnp.mean(loss)
+
+        entropy = -jnp.mean(jnp.sum(weights * per_token_logps, axis=1) / weight_sums)
+        weighted_total = jnp.sum(weights)
+        ratio_mean = jnp.where(
+            weighted_total > 0,
+            jnp.sum(ratios * weights) / weighted_total,
+            0.0,
+        )
+        clip_fraction = jnp.where(
+            weighted_total > 0,
+            jnp.sum(jnp.not_equal(ratios, clipped_ratios) * weights) / weighted_total,
+            0.0,
+        )
 
         return loss, LossMetrics(
             loss=loss,
             accuracy=1,
             other_metrics={
                 "mean_kl": mean_kl,
-                "ref_per_token_logps": jnp.mean(ref_per_token_logps),
+                "policy_loss": jnp.mean(policy_loss),
+                "entropy": entropy,
+                "ratio_mean": ratio_mean,
+                "clip_fraction": clip_fraction,
                 "advantages": jnp.mean(advantages),
             },
         )

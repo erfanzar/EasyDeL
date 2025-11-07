@@ -40,6 +40,7 @@ from ..prompt_utils import apply_chat_template, is_conversational, maybe_apply_c
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
+from ..training_utils import compute_group_advantages, compute_length_reward, update_ema
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
@@ -181,6 +182,10 @@ class GRPOTrainer(Trainer):
 
                 if reward_processing_class is None:
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.model.config._name_or_path)
+
+                # Type narrowing: at this point reward_processing_class is guaranteed to be non-None
+                assert reward_processing_class is not None
+
                 if reward_processing_class.pad_token_id is None:
                     reward_processing_class.pad_token = reward_processing_class.eos_token
 
@@ -214,6 +219,11 @@ class GRPOTrainer(Trainer):
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
             log_table = wandb.Table(columns=["generations", "took", "length", "step"])
         self.log_table = log_table
+
+        self._kl_ema: float | None = None
+        self._entropy_ema: float | None = None
+        self._last_reference_reset: int = 0
+
 
         super().__init__(
             model_state=model,
@@ -371,14 +381,17 @@ class GRPOTrainer(Trainer):
         self._train_shared_fn_static_args = (
             self.num_generations,
             self.arguments.beta,
+            self.arguments.epsilon_low,
+            self.arguments.epsilon_high,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            self.arguments.per_token_weighting,
             True,  # is_train
         )
 
-        static_argnames = (2, 3, 4, 5, 6, 7, 8)
+        static_argnames = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 
         sharded_training_step_function = ejit(
             grpo_step,
@@ -391,10 +404,13 @@ class GRPOTrainer(Trainer):
         self._eval_shared_fn_static_args = (
             self.num_generations,
             self.arguments.beta,
+            self.arguments.epsilon_low,
+            self.arguments.epsilon_high,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            self.arguments.per_token_weighting,
             False,  # is_train
         )
 
@@ -447,6 +463,32 @@ class GRPOTrainer(Trainer):
                 jnp.full((is_eos.shape[0],), is_eos.shape[1]),
             )[:, None]
         ).astype(jnp.int32)
+
+    def _refresh_reference_policy(self, state: EasyDeLState) -> None:
+        style = self.arguments.reference_reset_style
+        if style == "none" or self.ref_state is None:
+            return
+
+        if style == "hard":
+            self.ref_state = self.ref_state.replace(
+                graphstate=deepcopy_model(state.graphstate),
+                graphother=deepcopy_model(state.graphother),
+            )
+        elif style == "mix":
+            alpha = self.arguments.ref_model_mixup_alpha
+
+            def _mix(ref, cur):
+                return alpha * ref + (1.0 - alpha) * cur
+
+            mixed_graphstate = jax.tree_util.tree_map(_mix, self.ref_state.graphstate, state.graphstate)
+            if self.ref_state.graphother is not None and state.graphother is not None:
+                mixed_graphother = jax.tree_util.tree_map(_mix, self.ref_state.graphother, state.graphother)
+            else:
+                mixed_graphother = self.ref_state.graphother
+
+            self.ref_state = self.ref_state.replace(graphstate=mixed_graphstate, graphother=mixed_graphother)
+        else:
+            raise ValueError(f"Unknown reference reset style: {style}")
 
     def _preprocess_batch_input(
         self,
@@ -532,30 +574,80 @@ class GRPOTrainer(Trainer):
             rewarding_time = rewarding_time_fn()
             with capture_time() as grouped_comp_time_fn:
                 rewards = rewards_per_func.sum(axis=1)
-                advantages = (
-                    rewards
-                    - jnp.mean(
-                        rewards.reshape(-1, self.num_generations),
-                        axis=-1,
-                    ).repeat(self.num_generations, axis=0)
-                ) / (
-                    jnp.std(
-                        rewards.reshape(-1, self.num_generations),
-                        axis=-1,
-                    ).repeat(self.num_generations, axis=0)
-                    + 1e-4
+                completion_length = jnp.sum(completion_mask, axis=1)
+                length_bonus = compute_length_reward(
+                    completion_length,
+                    self.arguments.max_completion_length,
+                    self.arguments.length_cache_tokens,
+                    self.arguments.length_shaping,
+                    self.arguments.length_reward_scale,
                 )
+                total_rewards = rewards + length_bonus
+                (
+                    normalized_advantages,
+                    group_means,
+                    group_stds,
+                    collapsed_mask,
+                ) = compute_group_advantages(
+                    total_rewards,
+                    self.num_generations,
+                    epsilon=self.arguments.z_score_epsilon,
+                    enforce_mixed=self.arguments.enforce_mixed_sampling,
+                    jitter=self.arguments.dynamic_sampling_jitter,
+                )
+                raw_advantages = total_rewards - group_means
+
+                if self.arguments.adv_estimator == "group":
+                    advantages = normalized_advantages
+                elif self.arguments.adv_estimator == "gae":
+                    advantages = raw_advantages
+                elif self.arguments.adv_estimator == "truncated":
+                    decay = 1.0 - (self.arguments.gae_gamma ** self.arguments.truncated_return_k)
+                    decay = jnp.maximum(decay, self.arguments.z_score_epsilon)
+                    advantages = raw_advantages * decay
+                else:
+                    raise ValueError(f"Unsupported advantage estimator: {self.arguments.adv_estimator}")
+
+                if self.arguments.enforce_mixed_sampling:
+                    collapsed_repeated = jnp.repeat(collapsed_mask, self.num_generations)
+                    advantages = jnp.where(
+                        collapsed_repeated,
+                        normalized_advantages,
+                        advantages,
+                    )
+
+                value_targets = total_rewards.astype(jnp.float32)
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask.sum(-1), -1)
+        token_weights = completion_mask.astype(jnp.float32) / jnp.maximum(
+            completion_mask.sum(axis=1, keepdims=True).astype(jnp.float32),
+            1.0,
+        )
+        token_weights = token_weights.astype(jnp.float32)
+        positive_fraction = jnp.mean(
+            (total_rewards.reshape(-1, self.num_generations) > self.arguments.positive_reward_threshold).astype(
+                jnp.float32
+            )
+        )
+        residual = (total_rewards - group_means).astype(jnp.float32)
+        overall_var = jnp.var(total_rewards.astype(jnp.float32))
+        residual_var = jnp.var(residual)
+        explained_variance = jnp.where(overall_var > 1e-6, 1.0 - residual_var / overall_var, 0.0)
+        mae = jnp.mean(jnp.abs(residual))
         metrics_dict = {
             "rewards": jnp.mean(rewards, -1),
-            "completion_length": completion_length,
+            "completion_length": jnp.mean(completion_length),
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
+            "length_bonus": jnp.mean(length_bonus),
+            "collapsed_groups": jnp.asarray(jnp.sum(collapsed_mask), dtype=jnp.float32),
+            "positive_fraction": positive_fraction,
+            "value_explained_var": explained_variance,
+            "value_mae": mae,
         }
         for i, reward_func in enumerate(self.reward_funcs):
             _name = getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
@@ -577,6 +669,8 @@ class GRPOTrainer(Trainer):
                 "completion_mask": self._all_gather(completion_mask),
                 "ref_per_token_logps": self._all_gather(ref_per_token_logps),
                 "advantages": advantages,
+                "token_weights": self._all_gather(token_weights),
+                "value_targets": value_targets,
             },
             metrics_dict,
         )
@@ -588,11 +682,59 @@ class GRPOTrainer(Trainer):
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
         """hook process to call in start of the step."""
+        other_metrics = dict(metrics.other_metrics or {})
+
+        reset_triggered = False
+
+        mean_kl = other_metrics.get("mean_kl")
+        entropy = other_metrics.get("entropy")
+
+        if mean_kl is not None:
+            mean_kl_scalar = float(jax.device_get(mean_kl))
+            self._kl_ema = update_ema(self._kl_ema, mean_kl_scalar, self.arguments.kl_horizon)
+            other_metrics["kl_ema"] = jnp.asarray(self._kl_ema, dtype=jnp.float32)
+
+        if entropy is not None:
+            entropy_scalar = float(jax.device_get(entropy))
+            self._entropy_ema = update_ema(self._entropy_ema, entropy_scalar, self.arguments.kl_horizon)
+            other_metrics["entropy_ema"] = jnp.asarray(self._entropy_ema, dtype=jnp.float32)
+
+        should_reset = False
+        if self.arguments.reference_reset_style != "none" and self.ref_state is not None:
+            if self.arguments.reference_reset_steps and self.arguments.reference_reset_steps > 0:
+                if (step - self._last_reference_reset) >= self.arguments.reference_reset_steps:
+                    should_reset = True
+            if (
+                not should_reset
+                and self.arguments.kl_target is not None
+                and self._kl_ema is not None
+                and self._kl_ema > self.arguments.kl_target
+            ):
+                should_reset = True
+            if (
+                not should_reset
+                and self.arguments.entropy_floor is not None
+                and self._entropy_ema is not None
+                and self._entropy_ema < self.arguments.entropy_floor
+            ):
+                should_reset = True
+
+            if should_reset:
+                self._refresh_reference_policy(state)
+                self._last_reference_reset = step
+                reset_triggered = True
 
         if (
-            self.arguments.sync_ref_model
+            not reset_triggered
+            and self.arguments.sync_ref_model
             and self.ref_state is not None
             and (step % self.arguments.ref_model_sync_steps == 0)
         ):
             self.ref_state = self.ref_state.replace(graphstate=deepcopy_model(state.graphstate))
+            reset_triggered = True
+
+        if reset_triggered:
+            other_metrics["reference_reset"] = jnp.asarray(1.0, dtype=jnp.float32)
+
+        metrics = metrics.replace(other_metrics=other_metrics)
         return state, metrics
