@@ -188,32 +188,49 @@ class RingAttn(OperationImpl):
         )
 
         # Cast tensors to runtime dtype
-        query_casted: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype_runtime)
-        key_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype_runtime)
-        value_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype_runtime)
+        query: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype_runtime)
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype_runtime)
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype_runtime)
 
         # Create sharding specs
-        query_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.query, dep=query, tensor=query, preserved_indices=[0, 1, 2]
+        query_sharding = self.create_stable_sharding(
+            shardings.query,
+            dep=query,
+            tensor=query,
+            preserved_indices=[0, 1, 2],
         )
-        key_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.key, dep=key, tensor=key, preserved_indices=[0, 1, 2]
+        key_sharding = self.create_stable_sharding(
+            shardings.key,
+            dep=key,
+            tensor=key,
+            preserved_indices=[0, 1, 2],
         )
-        value_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.value, dep=value, tensor=value, preserved_indices=[0, 1, 2]
+        value_sharding = self.create_stable_sharding(
+            shardings.value,
+            dep=value,
+            tensor=value,
+            preserved_indices=[0, 1, 2],
         )
-        bias_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.bias, dep=bias, tensor=bias)
-        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        bias_sharding = self.create_stable_sharding(
+            shardings.bias,
+            dep=bias,
+            tensor=bias,
         )
-        output_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.output, tensor=query, preserved_indices=[0, 1, 2]
+        softmax_aux_sharding = self.create_stable_sharding(
+            shardings.softmax_aux,
+            dep=softmax_aux,
+            tensor=softmax_aux,
+        )
+        output_sharding = self.create_stable_sharding(
+            shardings.output,
+            tensor=query,
+            preserved_indices=[0, 1, 2],
         )
 
         outputs: Float[Array, "batch seq_len_q num_heads head_dim"] = ring_attention(
-            query_casted,
-            key_casted,
-            value_casted,
+            query,
+            key,
+            value,
             bias,
             softmax_aux,
             None,

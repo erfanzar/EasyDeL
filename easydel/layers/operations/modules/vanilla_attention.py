@@ -54,6 +54,7 @@ Example:
 import typing as tp
 
 import jax
+from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from ejkernel.modules import attention
 from ejkernel.types import MaskInfo
@@ -166,7 +167,8 @@ class VanillaAttn(OperationImpl):
             # Compute attention
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
-
+            is_decode_mode: bool = model_mode == common_types.MODE_DECODE
+            causal_computed: bool = causal if not is_decode_mode else False
             outputs, weights = attention(
                 query,
                 key,
@@ -182,7 +184,7 @@ class VanillaAttn(OperationImpl):
                 softmax_dtype=softmax_dtype,
                 softmax_scale=softmax_scale,
                 init_bias=None,
-                causal=causal,
+                causal=causal_computed,
                 logits_soft_cap=logits_soft_cap,
             )
 

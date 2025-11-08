@@ -179,51 +179,71 @@ class FlashAttn(OperationImpl):
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 
+        is_decode_mode = model_mode == common_types.MODE_DECODE
+        causal_computed: bool = causal if not is_decode_mode else False
+
         # Cast tensors to runtime dtype
-        query_casted: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype)
-        key_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype)
-        value_casted: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype)
-        bias_casted: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = (
+        query: Float[Array, "batch seq_len_q num_heads head_dim"] = query.astype(dtype)
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = key.astype(dtype)
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"] = value.astype(dtype)
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = (
             bias.astype(dtype) if bias is not None else None
         )
 
         # Create sharding specs
-        query_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.query, tensor=query, preserved_indices=[0, 2]
+        query_sharding = self.create_stable_sharding(
+            shardings.query,
+            tensor=query,
+            preserved_indices=[0, 2],
         )
-        key_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.key, tensor=key, preserved_indices=[0, 2]
+        key_sharding = self.create_stable_sharding(
+            shardings.key,
+            tensor=key,
+            preserved_indices=[0, 2],
         )
-        value_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.value, tensor=value, preserved_indices=[0, 2]
+        value_sharding = self.create_stable_sharding(
+            shardings.value,
+            tensor=value,
+            preserved_indices=[0, 2],
         )
-        bias_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.bias, dep=bias, tensor=bias, preserved_indices=[0, 1]
+        bias_sharding = self.create_stable_sharding(
+            shardings.bias,
+            dep=bias,
+            tensor=bias,
+            preserved_indices=[0, 1],
         )
-        cum_seqlens_q_sharding: PartitionSpec | None = self.create_stable_sharding(
-            PartitionSpec(None), dep=cum_seqlens_q, tensor=cum_seqlens_q
+        cum_seqlens_q_sharding = self.create_stable_sharding(
+            PartitionSpec(None),
+            dep=cum_seqlens_q,
+            tensor=cum_seqlens_q,
         )
-        cum_seqlens_k_sharding: PartitionSpec | None = self.create_stable_sharding(
-            PartitionSpec(None), dep=cum_seqlens_k, tensor=cum_seqlens_k
+        cum_seqlens_k_sharding = self.create_stable_sharding(
+            PartitionSpec(None),
+            dep=cum_seqlens_k,
+            tensor=cum_seqlens_k,
         )
-        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        softmax_aux_sharding = self.create_stable_sharding(
+            shardings.softmax_aux,
+            dep=softmax_aux,
+            tensor=softmax_aux,
         )
-        output_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.output, tensor=query, preserved_indices=[0, 2]
+        output_sharding = self.create_stable_sharding(
+            shardings.output,
+            tensor=query,
+            preserved_indices=[0, 2],
         )
 
         attn: Float[Array, "batch seq_len_q num_heads head_dim"] = flash_attention(
-            query_casted,
-            key_casted,
-            value_casted,
-            bias_casted,
+            query,
+            key,
+            value,
+            bias,
             cum_seqlens_q,
             cum_seqlens_k,
             softmax_aux,
             mask_info=mask_info,
             dropout_prob=dropout_prob,
-            causal=causal,
+            causal=causal_computed,
             dropout_seed=dropout_seed,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -246,10 +266,7 @@ class FlashAttn(OperationImpl):
         attn_sharded: Float[Array, "batch seq_len_q num_heads head_dim"] = with_sharding_constraint(
             arr=attn, sharding=shardings.output
         )
-        output: AttentionOutput = AttentionOutput(
-            attention_weights=None,
-            attention_outputs=attn_sharded,
-        )
+        output: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=attn_sharded)
         return output
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
