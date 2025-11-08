@@ -13,7 +13,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
 def main():
-    sharding_axis_dims = (-1, 1, 1, 1, 1)
+    sharding_axis_dims = (1, 1, 1, -1, 1)
     max_model_len = 2048
 
     pretrained_model_name_or_path = "Qwen/Qwen3-0.6B"
@@ -95,7 +95,7 @@ def main():
         model.generation_config,
     )
 
-    print(tokenizer.decode(output.sequences[0], skip_special_tokens=True))
+    print(tokenizer.decode(output.sequences[0][max_model_len // 2 :], skip_special_tokens=True))
     time_spent = time.time()
     output = generate(
         *model.split_module(),
@@ -105,8 +105,8 @@ def main():
     )
     time_spent = time.time() - time_spent
     tokens = jnp.sum(output.sequences[0][max_model_len // 2 :] != tokenizer.pad_token_id)
-    print(tokens / time_spent)
-    print(tokens)
+    print("TPS:", tokens / time_spent)
+    print("Num Tokens Generated", tokens)
 
 
 if __name__ == "__main__":
