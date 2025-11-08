@@ -239,12 +239,12 @@ class GptOssAttention(UnifiedAttention):
     def __init__(
         self,
         config: GptOssConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize GPT-OSS attention with sink tokens."""
         self.layer_idx = layer_idx
@@ -255,6 +255,7 @@ class GptOssAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
         )
@@ -355,12 +356,12 @@ class GptOssDecoderLayer(nn.Module):
     def __init__(
         self,
         config: GptOssConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.dtype = dtype
@@ -378,11 +379,11 @@ class GptOssDecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -593,7 +594,8 @@ class GptOssModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -608,10 +610,7 @@ class GptOssModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

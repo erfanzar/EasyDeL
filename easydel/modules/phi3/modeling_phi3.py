@@ -70,6 +70,7 @@ class Phi3MLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Phi3MLP module.
 
@@ -192,7 +193,6 @@ class Phi3Attention(UnifiedAttention):
         Raises:
             ValueError: If `hidden_size` is not divisible by `num_heads`.
         """
-        self.sliding_window = config.sliding_window
 
         super().__init__(
             config=config,
@@ -200,8 +200,10 @@ class Phi3Attention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window,
         )
 
     def define_network(
@@ -385,6 +387,7 @@ class Phi3DecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Phi3DecoderLayer.
 
@@ -414,6 +417,7 @@ class Phi3DecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = mlp_block(
             config=config,
@@ -588,6 +592,7 @@ class Phi3Model(EasyDeLBaseModule):
         self.layers = [
             Phi3DecoderLayer(
                 config=config,
+                layer_idx=idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -655,7 +660,7 @@ class Phi3Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -670,10 +675,7 @@ class Phi3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (

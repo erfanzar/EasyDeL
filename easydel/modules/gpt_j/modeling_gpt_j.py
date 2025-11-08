@@ -78,6 +78,7 @@ class GPTJAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize GPT-J attention."""
         super().__init__(
@@ -86,6 +87,7 @@ class GPTJAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
         )
@@ -296,6 +298,7 @@ class GPTJBlock(nn.Module):
     def __init__(
         self,
         config: GPTJConfig,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -329,6 +332,7 @@ class GPTJBlock(nn.Module):
 
         self.attn = attn_block(
             config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=dtype,
             precision=precision,
@@ -456,6 +460,7 @@ class GPTJModel(EasyDeLBaseModule):
         self.h = [
             GPTJBlock(
                 config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -526,7 +531,7 @@ class GPTJModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -534,10 +539,7 @@ class GPTJModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

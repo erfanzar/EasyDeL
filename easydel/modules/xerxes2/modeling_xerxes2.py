@@ -86,6 +86,7 @@ class Xerxes2Attention(UnifiedAttention):
     def __init__(
         self,
         config: Xerxes2Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -107,6 +108,7 @@ class Xerxes2Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="mla",
             causal=True,
             use_mla_lora=config.q_lora_dim is not None,
@@ -500,7 +502,8 @@ class Xerxes2DecoderLayer(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
         self.self_attn = attn_block(
-            self.config,
+            config=self.config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -680,7 +683,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(inputs=input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -699,10 +702,7 @@ class Xerxes2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

@@ -168,12 +168,12 @@ class Qwen2Attention(UnifiedAttention):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize Qwen2Attention with sliding window configuration.
 
@@ -186,7 +186,7 @@ class Qwen2Attention(UnifiedAttention):
             rngs: Random number generators
         """
         # Set sliding window before super().__init__ so it's available during network definition
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+
         super().__init__(
             config,
             dtype,
@@ -195,6 +195,8 @@ class Qwen2Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
+            layer_idx=layer_idx,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -296,12 +298,12 @@ class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen2DecoderLayer.
 
@@ -328,11 +330,11 @@ class Qwen2DecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -553,7 +555,7 @@ class Qwen2Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -568,10 +570,7 @@ class Qwen2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = self.dropout(inputs_embeds)
         if mode is None:

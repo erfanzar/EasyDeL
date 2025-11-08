@@ -31,7 +31,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput, ModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -426,10 +427,11 @@ class VisionMlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-class VisionAttention(AttentionModule):
+class VisionAttention(UnifiedAttention):
     def __init__(
         self,
         config,
+        layer_idx: int,
         dim: int,
         num_heads: int = 16,
         precision: jax.lax.PrecisionLike = None,
@@ -438,13 +440,33 @@ class VisionAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config)
-        self.rngs = rngs
+        self.embed_dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=False,
+            use_fused_qkv=True,
+            use_gqa=False,
+        )
+
+    def define_network(
+        self,
+        config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> None:
         self.qkv = ColumnParallelLinear(
-            dim,
-            dim * 3,
+            self.embed_dim,
+            self.embed_dim * 3,
             use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -452,14 +474,16 @@ class VisionAttention(AttentionModule):
             rngs=rngs,
         )
         self.proj = RowParallelLinear(
-            dim,
-            dim,
+            self.embed_dim,
+            self.embed_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        self.attention_performer = FlexibleAttentionModule(
+
+    def _create_attention_performer(self, config, rngs: nn.Rngs):
+        return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
@@ -473,34 +497,17 @@ class VisionAttention(AttentionModule):
         rotary_pos_emb: chex.Array = None,
     ) -> chex.Array:
         seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states)
         q, k, v = map(
             lambda x: x.squeeze(0),
             jnp.split(
-                self.qkv(hidden_states)
-                .reshape(seq_length, 3, self.num_heads, -1)
-                .transpose(1, 0, 2, 3),  # seq spl nhd fea -> spl seq nhd fea
+                qkv.reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3),
                 3,
                 0,
             ),
         )
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-
-        # q = jnp.expand_dims(q, 0)
-        # k = jnp.expand_dims(k, 0)
-        # v = jnp.expand_dims(v, 0)
-        # attention_mask = jnp.full(
-        # 	(1, seq_length, seq_length),
-        # 	jnp.finfo(q.dtype).min,
-        # 	dtype=q.dtype,
-        # )
-        # for i in range(1, len(cu_seqlens)):
-        # 	mask = attention_mask.at[
-        # 		...,
-        # 		cu_seqlens[i - 1] : cu_seqlens[i],
-        # 		cu_seqlens[i - 1] : cu_seqlens[i],
-        # 	].set(0)
-        # 	attention_mask = mask
         row_ids = jnp.arange(seq_length)[None, None, :]
         col_ids = jnp.arange(seq_length)[None, :, None]
         starts = cu_seqlens[:-1][:, None, None]
@@ -508,19 +515,14 @@ class VisionAttention(AttentionModule):
         is_valid = (row_ids >= starts) & (row_ids < ends) & (col_ids >= starts) & (col_ids < ends)
         combined_mask = jnp.any(is_valid, axis=0)
         attention_mask = jnp.where(combined_mask, 0.0, jnp.finfo(q.dtype).min)
-
         q = q.swapaxes(0, 1)
         k = k.swapaxes(0, 1)
         v = v.swapaxes(0, 1)
         attn_weights = jnp.matmul(q, k.swapaxes(1, 2)) / math.sqrt(self.head_dim)
         attn_weights = attn_weights + attention_mask
-        attn_weights = jax.nn.softmax(
-            attn_weights.astype(jnp.float32),
-            axis=-1,
-        ).astype(q.dtype)
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
         attn_output = jnp.matmul(attn_weights, v)
-        attn_output = attn_output.swapaxes(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = attn_output.swapaxes(0, 1).reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -529,6 +531,7 @@ class Qwen2VLVisionBlock(nn.Module):
     def __init__(
         self,
         config: Qwen2VLVisionConfig,
+        layer_idx: int,
         precision: jax.lax.PrecisionLike = None,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -554,6 +557,7 @@ class Qwen2VLVisionBlock(nn.Module):
 
         self.attn = VisionAttention(
             config=config,
+            layer_idx=layer_idx,
             dim=config.embed_dim,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -589,6 +593,7 @@ class Qwen2VLMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.dtype = dtype
@@ -649,7 +654,7 @@ class Qwen2VLMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen2VLAttention(AttentionModule):
+class Qwen2VLAttention(UnifiedAttention):
     def __init__(
         self,
         config: Qwen2VLConfig,
@@ -658,70 +663,18 @@ class Qwen2VLAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-
-        self.hidden_size = config.hidden_size
-        head_dim = config.hidden_size // config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", head_dim)
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-
-        column_parallel_linear = partial(
-            ColumnParallelLinear,
+        super().__init__(
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.q_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
             rngs=rngs,
-            use_bias=True,
-        )
-        self.k_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=True,
-        )
-        self.v_proj = column_parallel_linear(
-            config.hidden_size,
-            config.num_key_value_heads * self.head_dim,
-            rngs=rngs,
-            use_bias=True,
-        )
-        self.o_proj = row_parallel_linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            rngs=rngs,
-            use_bias=False,
-        )
-
-        self.sliding_window = config.sliding_window if config.use_sliding_window else None
-        self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
-
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+            sliding_window=config.sliding_window if config.use_sliding_window else None,
         )
 
     def __call__(
@@ -734,69 +687,18 @@ class Qwen2VLAttention(AttentionModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-        qshape = (batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        kv_shape = (batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        query_states = query_states.reshape(qshape)
-        key_states = key_states.reshape(kv_shape)
-        value_states = value_states.reshape(kv_shape)
-        if position_ids.ndim == 3:
+    ) -> AttentionLayerOutput:
+        if position_ids is not None and position_ids.ndim == 3:
             position_ids = position_ids[0]
-            # cond vision gen issue will be fixed with no mem issue.
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
+        return super().__call__(
+            hidden_states=hidden_states,
             mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
+            position_ids=position_ids,
             mode=mode,
-            bias=None,
+            cache_view=cache_view,
             cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = checkpoint_name(
-            self.o_proj(self.shard_attention_prod(attn_output=self._merge_heads(attentions.attention_outputs))),
-            "attn_output",
-        )
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+            output_attentions=output_attentions,
+            frequencies=frequencies,
         )
 
 
@@ -809,6 +711,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.dtype = dtype
@@ -830,6 +733,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -940,6 +844,7 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
         self.blocks = [
             Qwen2VLVisionBlock(
                 config=config,
+                layer_idx=idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -1098,6 +1003,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         self.layers = [
             Qwen2VLDecoderLayer(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -1133,7 +1039,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -1148,10 +1054,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -1351,7 +1254,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
                     vision_start_token_id=self.config.vision_start_token_id,
                 )
             else:
-                batch_size, sequence_length = inputs_embeds.shape[:2]
+                sequence_length = inputs_embeds.shape[1]
                 position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
                 position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
         outputs = self.model(

@@ -317,20 +317,20 @@ class Qwen3MoeAttention(UnifiedAttention):
     def __init__(
         self,
         config: Qwen3MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        self.sliding_window = config.sliding_window
+        sliding_window = config.sliding_window
         if not (
             config.use_sliding_window
             and getattr(config, "sliding_window", None) is not None
             and layer_idx >= config.max_window_layers
         ):
-            self.sliding_window = None
+            sliding_window = None
 
         super().__init__(
             config,
@@ -338,8 +338,10 @@ class Qwen3MoeAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=sliding_window,
             use_qk_norm=True,
         )
 
@@ -372,12 +374,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen3MoeDecoderLayer.
 
@@ -407,11 +409,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.is_moe = (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
@@ -633,7 +635,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
@@ -654,10 +656,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

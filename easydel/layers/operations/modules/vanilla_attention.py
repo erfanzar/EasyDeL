@@ -153,33 +153,25 @@ class VanillaAttn(OperationImpl):
                 bias_computed = bias
 
             # Apply sharding constraints to inputs
-            query_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
-                arr=query, sharding=shardings.query
-            )
-            key_sharded: Float[Array, "batch kv_len num_kv_heads head_dim"] = with_sharding_constraint(
-                arr=key, sharding=shardings.key
-            )
-            value_sharded: Float[Array, "batch kv_len num_kv_heads head_dim"] = with_sharding_constraint(
-                arr=value, sharding=shardings.value
-            )
+            query = with_sharding_constraint(arr=query, sharding=shardings.query)
+            key = with_sharding_constraint(arr=key, sharding=shardings.key)
+            value = with_sharding_constraint(arr=value, sharding=shardings.value)
 
-            bias_sharded: Float[Array, "batch num_heads seq_len kv_len"] | None
+            bias: Float[Array, "batch num_heads seq_len kv_len"] | None
             if bias_computed is not None:
-                bias_sharded = with_sharding_constraint(arr=bias_computed, sharding=shardings.bias)
+                bias = with_sharding_constraint(arr=bias_computed, sharding=shardings.bias)
             else:
-                bias_sharded = None
+                bias = None
 
             # Compute attention
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
 
-            outputs: Float[Array, "batch seq_len num_q_heads head_dim"]
-            weights: Float[Array, "batch num_heads seq_len kv_len"] | None
             outputs, weights = attention(
-                query_sharded,
-                key_sharded,
-                value_sharded,
-                bias_sharded,
+                query,
+                key,
+                value,
+                bias,
                 dropout_rng,
                 softmax_aux,
                 mask_info=mask_info,
@@ -195,15 +187,8 @@ class VanillaAttn(OperationImpl):
             )
 
             # Apply output sharding
-            outputs_sharded: Float[Array, "batch seq_len num_q_heads head_dim"] = with_sharding_constraint(
-                arr=outputs, sharding=shardings.output
-            )
-
-            result: AttentionOutput = AttentionOutput(
-                attention_weights=weights,
-                attention_outputs=outputs_sharded,
-            )
-            return result
+            outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output)
+            return AttentionOutput(attention_weights=weights, attention_outputs=outputs_sharded)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """GPU forward pass. Delegates to `forward_native`.

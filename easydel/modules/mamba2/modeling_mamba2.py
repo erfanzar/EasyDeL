@@ -603,11 +603,11 @@ class Mamba2Block(nn.Module):
         )
         self.mixer = block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
     def __call__(

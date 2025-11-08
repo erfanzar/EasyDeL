@@ -179,7 +179,6 @@ class Gemma3Attention(UnifiedAttention):
         rngs: nn.Rngs,
     ):
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        self.sliding_window = config.sliding_window if self.is_sliding else None
 
         super().__init__(
             config=config,
@@ -187,8 +186,10 @@ class Gemma3Attention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=True,
         )
 
@@ -551,7 +552,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings") * (
                 self.config.hidden_size**0.5
             )
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -562,10 +563,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         if token_type_ids is not None:
             mask_info = mask_info.apply_token_type_ids(token_type_ids)
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

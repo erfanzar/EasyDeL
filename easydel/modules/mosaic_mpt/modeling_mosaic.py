@@ -71,6 +71,7 @@ class MptMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the MptMLP module.
 
@@ -152,6 +153,7 @@ class MptAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize MPT attention with ALiBi support."""
         super().__init__(
@@ -160,6 +162,7 @@ class MptAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="alibi",
             causal=True,
         )
@@ -348,6 +351,7 @@ class MptBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the MptBlock module.
 
@@ -387,6 +391,7 @@ class MptBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.norm_2 = nn.LayerNorm(
@@ -403,6 +408,7 @@ class MptBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.dropout_rate = self.config.attn_config.attn_pdrop
@@ -546,6 +552,7 @@ class MptModel(EasyDeLBaseModule):
         self.blocks = [
             MptBlock(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -591,7 +598,7 @@ class MptModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
-        _batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

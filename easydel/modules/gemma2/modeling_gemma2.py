@@ -98,9 +98,7 @@ class Gemma2Attention(UnifiedAttention):
     ):
         """Initialize Gemma2 attention with sliding window configuration."""
         # Set layer-specific attributes before super().__init__
-        self.layer_idx = layer_idx
         self.is_cross_attention = is_cross_attention
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
         super().__init__(
             config,
@@ -108,8 +106,10 @@ class Gemma2Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=causal,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
 
         # Gemma2-specific attributes
@@ -434,7 +434,7 @@ class Gemma2Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -443,10 +443,7 @@ class Gemma2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

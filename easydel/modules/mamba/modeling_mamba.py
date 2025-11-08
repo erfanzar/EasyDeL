@@ -399,11 +399,11 @@ class MambaBlock(nn.Module):
         )
         self.mixer = block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
     def __call__(
@@ -492,7 +492,7 @@ class MambaModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
-        batch_size, sequence_length = inputs_embeds.shape[:2]
+        sequence_length = inputs_embeds.shape[1]
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), "b1")
         else:
@@ -507,10 +507,7 @@ class MambaModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
         if cache is None:
             cache = MambaCache.init_empty(len(self.layers))
 
@@ -649,7 +646,6 @@ class MambaForCausalLM(EasyDeLBaseModule):
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            mask_info=mask_info,
             position_ids=position_ids,
             cache=cache,
             output_hidden_states=output_hidden_states,

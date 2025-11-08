@@ -504,9 +504,12 @@ class TransformerCacheView(BaseCacheView):
 
             return lax.cond(total_tokens <= window_size, _fits_in_window, _overflow_window)
 
+        sliding_window = None
+
         if masking_details is not None and masking_details.mask_type == AttnMaskType.SLIDING:
             value_cache_updated = _update_kv_sliding(_maybe_materialize(self.value), value, indexs)
             key_cache_updated = _update_kv_sliding(_maybe_materialize(self.key), key, indexs)
+            sliding_window = masking_details.size
         else:
             value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexs)
             key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
@@ -515,8 +518,7 @@ class TransformerCacheView(BaseCacheView):
         mask_info = mask_info.apply_kv_lengths(
             kv_lengths=indexs,
             q_len=num_updated_cache_vectors,
-            end_index=indexs,
-            update_segment_ids=True,
+            sliding_window=sliding_window,
         )
 
         value_cache_updated = _kv_struct_shard(value_cache_updated).astype(runtime_dtype)

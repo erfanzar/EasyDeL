@@ -832,7 +832,7 @@ class GiddModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         # Initialize outputs
         all_attentions = () if output_attentions else None
@@ -854,10 +854,7 @@ class GiddModel(EasyDeLBaseModule):
 
         # Generate position IDs if not provided
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         # Start with input embeddings
         hidden_states = inputs_embeds
