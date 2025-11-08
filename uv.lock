@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -641,7 +641,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = ">=0.0.81" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = ">=0.0.11" },
+    { name = "ejkernel", specifier = "==0.0.13" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -715,7 +715,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.11"
+version = "0.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -727,9 +727,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/51/10/4cab3a6f409b6a1086431404db957daee461a6283a2e775410afbc3514ec/ejkernel-0.0.11.tar.gz", hash = "sha256:58bc11155703a9e185ece2a53b6db237c6ba8df789f035f75222b3d503a4afd6", size = 395432, upload-time = "2025-11-04T17:06:15.051Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/42/5a139565ad7b1ab320e236a9c33aff0f46d2f6fe76021596498995efdb6c/ejkernel-0.0.13.tar.gz", hash = "sha256:6cc16ed3172a0fac67f46acf10d32a0a6fe6c9aea479470dc7c3c1fbe13d8b82", size = 396783, upload-time = "2025-11-08T13:21:03.391Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c7/e9/c3b8ff6c9ba0c991f741d7c6bb0ec60f2c37224eaf6a18c43f5833b79472/ejkernel-0.0.11-py3-none-any.whl", hash = "sha256:1e5721beebb99ea8e6e81df48094d7a28572d95fa878b5ec50747df6b1cd377d", size = 588330, upload-time = "2025-11-04T17:06:12.691Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/bc/a1ec56edcb92e8fffefbcb62288a60c2e274493f5c0285be6bc88a399414/ejkernel-0.0.13-py3-none-any.whl", hash = "sha256:0d5c548559b8f2f222438b30b4cb66ed2a86d85251ea3e63d74cb058d46e5d30", size = 589751, upload-time = "2025-11-08T13:21:01.398Z" },
 ]
 
 [[package]]
@@ -3917,13 +3917,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "fsspec", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "jinja2", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "networkx", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "setuptools", marker = "(python_full_version >= '3.12' and sys_platform == 'darwin') or (python_full_version < '3.12' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (python_full_version < '3.12' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu') or (sys_platform != 'darwin' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (sys_platform != 'darwin' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "sympy", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "filelock", marker = "sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "sys_platform == 'darwin'" },
+    { name = "networkx", marker = "sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform == 'darwin'" },
+    { name = "sympy", marker = "sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torch-2.8.0-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:3d05017d19bc99741288e458888283a44b0ee881d53f05f72f8b1cfea8998122" },
@@ -3945,13 +3945,13 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "fsspec", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "jinja2", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "networkx", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "setuptools", marker = "(python_full_version >= '3.12' and sys_platform != 'darwin') or (python_full_version < '3.12' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (python_full_version < '3.12' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu') or (sys_platform == 'darwin' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (sys_platform == 'darwin' and extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "sympy", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin' or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+    { name = "filelock", marker = "sys_platform != 'darwin'" },
+    { name = "fsspec", marker = "sys_platform != 'darwin'" },
+    { name = "jinja2", marker = "sys_platform != 'darwin'" },
+    { name = "networkx", marker = "sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "python_full_version >= '3.12' and sys_platform != 'darwin'" },
+    { name = "sympy", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:2bfc013dd6efdc8f8223a0241d3529af9f315dffefb53ffa3bf14d3f10127da6" },

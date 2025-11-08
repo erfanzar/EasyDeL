@@ -15,6 +15,7 @@
 
 import functools
 import math
+import typing
 
 import chex
 import jax
@@ -28,9 +29,9 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
@@ -103,7 +104,17 @@ def dropout_add(
     return out
 
 
-class FalconAttention(AttentionModule):
+class FalconAttention(UnifiedAttention):
+    """Falcon attention built on top of the unified attention backend."""
+
+    projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
+    projection_mapping.update(
+        {
+            "query_key_value_projection": "query_key_value",
+            "output_projection": "dense",
+        }
+    )
+
     def __init__(
         self,
         config: FalconConfig,
@@ -112,226 +123,63 @@ class FalconAttention(AttentionModule):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        head_dim = config.hidden_size // config.num_attention_heads
-        if config.new_decoder_architecture:
-            qkv_out_dim = (config.num_kv_heads * 2 + config.num_attention_heads) * head_dim
-        elif config.multi_query:
-            qkv_out_dim = config.hidden_size + 2 * head_dim
-        else:
-            qkv_out_dim = 3 * config.hidden_size
-
-        self.head_dim = head_dim
-        assert self.head_dim * config.num_attention_heads == config.hidden_size
-        self.num_kv_heads = config.num_kv_heads if (config.new_decoder_architecture or not config.multi_query) else 1
-        self.new_decoder_architecture = config.new_decoder_architecture
-        self.num_heads = config.num_attention_heads
-        self.query_key_value = ColumnParallelLinear(
-            config.hidden_size,
-            qkv_out_dim,
-            rngs=rngs,
+        use_gqa = config.multi_query or (
+            config.num_attention_heads != getattr(config, "num_kv_heads", config.num_attention_heads)
+        )
+        super().__init__(
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            use_bias=config.bias,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.inv_norm_factor = 1 / math.sqrt(head_dim)
-        self.dense = RowParallelLinear(
-            qkv_out_dim,
-            config.hidden_size,
             rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="alibi" if config.alibi else "standard",
+            causal=True,
+            use_fused_qkv=True,
+            use_gqa=use_gqa,
+        )
+
+    def _create_fused_qkv_proj(
+        self,
+        config: FalconConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> ColumnParallelLinear:
+        return ColumnParallelLinear(
+            config.hidden_size,
+            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+            rngs=rngs,
+            use_bias=config.bias,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=config.bias,
-            precision=self.precision,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        if not self.config.alibi:
-            self.rotary = self.config.get_basic_rope(
-                rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-                head_size=self.config.hidden_size // self.config.num_attention_heads,
-                base=self.config.rope_theta,
-                is_neox_style=True,
-                dtype=self.dtype,
-            )
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
 
-    def _split_heads(self, qkv: chex.Array) -> tuple[chex.Array, chex.Array, chex.Array]:
-        """
-        Splits the query, key, and value tensors into separate heads.
-
-        Args:
-            qkv (chex.Array): Combined query, key, and value tensor.
-
-        Returns:
-            tp.Tuple[chex.Array, chex.Array, chex.Array]: A tuple containing the query, key,
-                and value tensors split into heads.
-        """
-        batch_size, sequence_length, _ = qkv.shape
-
-        if self.config.new_decoder_architecture:
-            qkv = qkv.reshape(
-                batch_size,
-                sequence_length,
-                -1,
-                self.num_heads // self.num_kv_heads + 2,
-                self.head_dim,
-            )
-            query_states = qkv[:, :, :, :-2]
-            key_states = qkv[:, :, :, [-2]]
-            value_states = qkv[:, :, :, [-1]]
-            key_states = jnp.broadcast_to(key_states, query_states.shape)
-            value_states = jnp.broadcast_to(value_states, query_states.shape)
-
-            query_states, key_states, value_states = (
-                x.reshape((*x.shape[:-2], x.shape[-2] * x.shape[-1])) for x in (query_states, key_states, value_states)
-            )
-
-            return query_states, key_states, value_states
-        if self.config.multi_query:
-            qkv = qkv.reshape(batch_size, sequence_length, self.config.num_attention_heads + 2, -1)
-            query_states, key_states, value_states = (
-                qkv[..., :-2, :],
-                qkv[..., [-2], :],
-                qkv[..., [-1], :],
-            )
-
-        else:
-            query_states, key_states, value_states = jnp.split(qkv, 3, -1)
-        return query_states, key_states, value_states
-
-    def _merge_heads(self, x: chex.Array) -> chex.Array:
-        """
-        Merges the attention heads into a single tensor.
-
-        Args:
-            x (chex.Array): Tensor with separate attention heads.
-
-        Returns:
-            chex.Array: Tensor with merged attention heads.
-        """
-        batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // self.num_heads
-        x = x.reshape(batch_size, self.config.num_attention_heads, seq_length, self.head_dim)
-        return x.reshape(batch_size, seq_length, self.config.num_attention_heads * self.head_dim)
-
-    def __call__(
+    def _create_o_proj(
         self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: chex.Array | None = None,
-    ) -> AttentionLayerOutput:
-        fused_qkv = checkpoint_name(self.query_key_value(hidden_states), name="attn_qkv")
-        num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
-        # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_states, key_states, value_states) = self._split_heads(fused_qkv)
-        batch_size, query_length, _, _ = query_states.shape
-        key_length = query_length
-        query_states = query_states.reshape(
-            batch_size,
-            query_length,
-            self.num_heads,
-            self.head_dim,
+        config: FalconConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> RowParallelLinear:
+        return RowParallelLinear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            rngs=rngs,
+            use_bias=config.bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
+            precision=precision,
+            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
-        key_states = key_states.reshape(
-            batch_size,
-            query_length,
-            num_kv_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            query_length,
-            num_kv_heads,
-            self.head_dim,
-        )
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        if alibi is None:
-            query_states, key_states = self.rotary(
-                positions=position_ids,
-                query=query_states,
-                key=key_states,
-                frequencies=frequencies,
-            )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
-
-        if alibi is None:
-            attention = self.attention_performer.forward(
-                query_states=query_states,
-                key_states=key_states,
-                value_states=value_states,
-                mode=mode,
-                bias=None,
-                cache_metadata=cache_metadata,
-                cache_view=cache_view,
-                init_bias=init_attention_bias,
-                mask_info=mask_info,
-                causal=True,
-            )
-            attention_outputs = attention.attention_outputs
-            attention_outputs = attention_outputs.reshape(batch_size, query_length, self.num_heads * self.head_dim)
-            output_tensor = checkpoint_name(self.dense(attention_outputs), name="attn_output")
-            return AttentionLayerOutput(
-                attention_output=output_tensor,
-                attention_weight=attention.attention_weights if output_attentions else None,
-                cache_view=cache_view,
-            )
-
-        else:
-            attention_scores = jnp.einsum("...qhd,...khd->...hqk", query_states, key_states, precision=self.precision)
-            attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
-            attention_scores = attention_scores + alibi.reshape(batch_size, self.num_heads, 1, -1)
-            attention_scores *= self.inv_norm_factor
-            attention_scores = jax.nn.softmax(
-                attention_scores + init_attention_bias(),
-                axis=-1,
-            )
-            attention_scores = attention_scores.reshape(batch_size, self.num_heads, query_length, key_length)
-            attn_output = jax.lax.batch_matmul(attention_scores, value_states.transpose(0, 2, 1, 3))
-            attn_output = attn_output.reshape((attn_output.shape[1] * attn_output.shape[0], *attn_output.shape[2:]))
-            attn_output = self.shard_attention_prod(self._merge_heads(attn_output))
-
-            output_tensor = checkpoint_name(self.dense(attn_output), name="attn_output")
-
-            AttentionLayerOutput(
-                attention_output=output_tensor,
-                attention_weight=attention.attention_weights if output_attentions else None,
-                cache_view=cache_view,
-            )
 
 
 class FalconMlp(nn.Module):
@@ -343,6 +191,7 @@ class FalconMlp(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -396,6 +245,7 @@ class FalconBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -435,11 +285,9 @@ class FalconBlock(nn.Module):
                     param_dtype=self.param_dtype,
                     rngs=rngs,
                 )
-        attn_block = FalconAttention
-        mlp_block = FalconMlp
         attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
+            FalconAttention,
+            FalconMlp,
             policy=config.gradient_checkpointing,
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
@@ -451,6 +299,7 @@ class FalconBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.self_attention = attn_block(
             config=config,
@@ -458,6 +307,7 @@ class FalconBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.dropout = nn.Dropout(self.config.attention_dropout)
@@ -567,6 +417,7 @@ class FalconModel(EasyDeLBaseModule):
         self.h = [
             FalconBlock(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -620,7 +471,7 @@ class FalconModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -629,9 +480,7 @@ class FalconModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0), (batch_size, sequence_length)
-            )
+            position_ids = mask_info.q_position_ids
 
         alibi = None
         if self.config.alibi:
@@ -640,10 +489,7 @@ class FalconModel(EasyDeLBaseModule):
                 self.config.num_attention_heads,
             ).astype(inputs_embeds.dtype)
         elif position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
         if mode is None:
             mode = (
                 common_types.MODE_DECODE

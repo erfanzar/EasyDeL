@@ -27,10 +27,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    BaseModelOutput,
-    DecoderLayerOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
@@ -80,6 +77,7 @@ class GPTNeoXAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize GPT-NeoX attention."""
         super().__init__(
@@ -88,6 +86,7 @@ class GPTNeoXAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
             use_fused_qkv=True,
@@ -133,6 +132,7 @@ class GPTNeoXMlp(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         self.config = config
         self.dtype = dtype
@@ -207,6 +207,7 @@ class GPTNeoXBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         self.config = config
         self.dtype = dtype
@@ -239,12 +240,13 @@ class GPTNeoXBlock(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attention = GPTNeoXAttention(
+        self.attention = attn_block(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = GPTNeoXMlp(
             config=config,
@@ -252,6 +254,7 @@ class GPTNeoXBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
     def __call__(
@@ -351,6 +354,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         self.layers = [
             GPTNeoXBlock(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -417,7 +421,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embed_in(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -425,10 +429,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

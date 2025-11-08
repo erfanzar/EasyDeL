@@ -176,12 +176,12 @@ class MiniMaxText01LightningAttention(nn.Module):
     def __init__(
         self,
         config: MiniMaxText01Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -279,12 +279,12 @@ class MiniMaxText01Attention(AttentionModule):
     def __init__(
         self,
         config: MiniMaxText01Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__(config=config)
 
@@ -634,12 +634,12 @@ class MiniMaxText01DecoderLayer(nn.Module):
     def __init__(
         self,
         config: MiniMaxText01Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.layer_idx = layer_idx
@@ -662,11 +662,11 @@ class MiniMaxText01DecoderLayer(nn.Module):
         )
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.block_sparse_moe = mlp_block(
@@ -912,7 +912,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -928,10 +928,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = self.dropout(inputs_embeds)
         if mode is None:

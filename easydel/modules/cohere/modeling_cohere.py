@@ -132,6 +132,7 @@ class CohereAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         """Initialize Cohere attention with optional Q/K normalization."""
         super().__init__(
@@ -140,6 +141,7 @@ class CohereAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
         )
@@ -191,6 +193,7 @@ class CohereMLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.dtype = dtype
@@ -254,6 +257,7 @@ class CohereBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         self.config = config
@@ -273,6 +277,7 @@ class CohereBlock(nn.Module):
         )
         self.self_attn = attn_block(
             config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -281,6 +286,7 @@ class CohereBlock(nn.Module):
 
         self.mlp = mlp_block(
             config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -401,12 +407,13 @@ class CohereModel(EasyDeLBaseModule):
         self.layers = [
             CohereBlock(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
                 rngs=rngs,
             )
-            for _ in range(config.num_hidden_layers)
+            for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(
             self.config.hidden_size,
@@ -451,7 +458,7 @@ class CohereModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -466,10 +473,7 @@ class CohereModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
         hidden_states = inputs_embeds
         if mode is None:
             mode = (

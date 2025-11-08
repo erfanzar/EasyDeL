@@ -47,7 +47,8 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
@@ -139,7 +140,7 @@ class Conv1D(nn.Module):
         return y
 
 
-class GPT2Attention(AttentionModule):
+class GPT2Attention(UnifiedAttention):
     """GPT-2 Attention module.
 
     This module implements the standard multi-head self-attention mechanism used in GPT-2.
@@ -158,6 +159,7 @@ class GPT2Attention(AttentionModule):
     def __init__(
         self,
         config: GPT2Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -166,16 +168,35 @@ class GPT2Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
+        self.is_cross_attention = is_cross_attention
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=causal,
+            use_fused_qkv=not is_cross_attention,
+        )
         self.precision = precision
         self.dtype = dtype
         self.rngs = rngs
-        self.is_cross_attention = is_cross_attention
         self.causal = causal
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
 
+    def define_network(
+        self,
+        config: GPT2Config,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> None:
+        """Create GPT-2 specific projection layers."""
         if self.is_cross_attention:
             self.c_attn = Conv1D(
                 self.embed_dim,
@@ -202,6 +223,8 @@ class GPT2Attention(AttentionModule):
                 precision=precision,
                 rngs=rngs,
             )
+            self.q_attn = None
+
         self.c_proj = Conv1D(
             self.embed_dim,
             self.embed_dim,
@@ -210,9 +233,12 @@ class GPT2Attention(AttentionModule):
             precision=precision,
             rngs=rngs,
         )
-
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
-        self.attention_performer = FlexibleAttentionModule(
+        self.attention_performer = self._create_attention_performer(self.config, self.rngs)
+
+    def _create_attention_performer(self, config: GPT2Config, rngs: nn.Rngs) -> FlexibleAttentionModule:
+        """Use GPT-2 specific attention dropout setting."""
+        return FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attn_pdrop,
             base_config=config,
@@ -417,6 +443,7 @@ class GPT2Block(nn.Module):
     def __init__(
         self,
         config: GPT2Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
@@ -451,6 +478,7 @@ class GPT2Block(nn.Module):
 
         self.attn = attn_block(
             config,
+            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -467,9 +495,11 @@ class GPT2Block(nn.Module):
         if config.add_cross_attention:
             self.crossattention = attn_block(
                 config=config,
+                layer_idx=layer_idx,
                 dtype=dtype,
                 causal=True,
                 is_cross_attention=True,
+                rngs=rngs,
             )
             self.ln_cross_attn = nn.LayerNorm(
                 config.hidden_size,
@@ -653,6 +683,7 @@ class GPT2Model(EasyDeLBaseModule):
         self.h = [
             GPT2Block(
                 self.config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -711,7 +742,7 @@ class GPT2Model(EasyDeLBaseModule):
         elif input_ids is not None:
             batch_size, sequence_length = input_ids.shape
         elif inputs_embeds is not None:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
+            sequence_length = inputs_embeds.shape[1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
         mask_info = MaskInfo.dynamic_init(
@@ -727,10 +758,7 @@ class GPT2Model(EasyDeLBaseModule):
             else:
                 encoder_mask_info = MaskInfo.from_attention_mask(encoder_attention_mask)
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         # Get input embeddings
         if inputs_embeds is None:

@@ -74,6 +74,7 @@ class ArcticAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize ArcticAttention with sliding window configuration.
 
@@ -84,15 +85,16 @@ class ArcticAttention(UnifiedAttention):
             precision: JAX precision setting
             rngs: Random number generators
         """
-        self.sliding_window = config.sliding_window
         super().__init__(
             config,
             dtype,
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window,
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -340,12 +342,12 @@ class ArcticMoeBlock(BaseMoeModule):
     def __init__(
         self,
         config: ArcticConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         super().__init__(
             config=config,
@@ -444,12 +446,12 @@ class ArcticDecoderLayer(nn.Module):
     def __init__(
         self,
         config: ArcticConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         self.config = config
@@ -473,6 +475,7 @@ class ArcticDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.block_sparse_moe = mlp_block(
             config=config,
@@ -695,7 +698,7 @@ class ArcticModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -704,10 +707,7 @@ class ArcticModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
 

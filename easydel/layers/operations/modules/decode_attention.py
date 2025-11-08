@@ -188,7 +188,9 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         output_sharding: Ps | None = self.create_stable_sharding(
             shardings.query3d, tensor=query_squeezed, preserved_indices=[0, 1]
         )
-
+        if sliding_window is not None:
+            if isinstance(sliding_window, int):
+                sliding_window = (sliding_window, sliding_window)
         attn_output: Float[Array, "batch num_q_heads head_dim"] = ragged_decode_attention(
             query_squeezed,
             key,

@@ -207,8 +207,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: str | jax.lax.Precision | None = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
         attention_type: Literal["standard", "mla", "alibi"] = "standard",
         causal: bool = True,
+        sliding_window: int | tuple[int, int] | None = None,
         use_qk_norm: bool = False,
         use_fused_qkv: bool = False,
         use_gqa: bool = False,
@@ -231,8 +233,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         self.precision = precision
         self.rngs = rngs
 
+        self.layer_idx = layer_idx
+
         self.attention_type = attention_type
         self.causal = causal
+        self.sliding_window = sliding_window
         self.use_qk_norm = use_qk_norm
         self.use_fused_qkv = use_fused_qkv
         self.use_gqa = use_gqa
@@ -736,9 +741,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         """
         batch_size: int = hidden_states.shape[0]
         seq_len: int = hidden_states.shape[1]
-        merged: Float[Array, "batch_size seq_len hidden_dim"] = hidden_states.reshape(
-            batch_size, seq_len, self.num_heads * self.head_dim
-        )
+        merged = hidden_states.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         return merged
 
     def forward(
@@ -827,9 +830,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
         # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
-
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         (
@@ -865,15 +866,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
 
         # 8. Merge heads and output projection
-        attention_out_merged: Float[Array, "batch_size seq_len hidden_dim"] = self._merge_heads(
-            attentions.attention_outputs
-        )
-        attn_output_sharded: Float[Array, "batch_size seq_len hidden_dim"] = self.shard_attention_prod(
-            attention_out_merged
-        )
-        attn_output: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(
-            self.output_projection(attn_output_sharded), "attn_output"
-        )
+        attention_out = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(attention_out)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
         # 9. Optional residual dropout
         if hasattr(self, "resid_dropout"):

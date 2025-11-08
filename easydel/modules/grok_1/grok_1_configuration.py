@@ -104,6 +104,7 @@ class Grok1Config(EasyDeLBaseConfig):
         num_experts=8,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
+        rope_theta: float = 10000,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         **kwargs,
@@ -155,7 +156,7 @@ class Grok1Config(EasyDeLBaseConfig):
         self.num_key_value_heads = num_key_value_heads
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-
+        self.rope_theta = rope_theta
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
         self.output_router_logits = output_router_logits

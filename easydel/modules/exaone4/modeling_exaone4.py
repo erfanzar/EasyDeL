@@ -26,10 +26,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    BaseModelOutput,
-    DecoderLayerOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import (
     ACT2FN,
     auto_remat,
@@ -160,9 +157,7 @@ class Exaone4Attention(UnifiedAttention):
             precision: JAX precision for matrix multiplications.
             rngs: Random number generators.
         """
-        self.layer_idx = layer_idx
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        self.sliding_window = config.sliding_window if self.is_sliding else None
 
         super().__init__(
             config,
@@ -170,8 +165,10 @@ class Exaone4Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=True,  # Exaone4 uses Q/K normalization
         )
 
@@ -272,26 +269,26 @@ class Exaone4DecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        attn_block = Exaone4Attention
-        mlp_block = Exaone4MLP
-
-        if self.config.gradient_checkpointing != "":
-            attn_block = auto_remat(
-                attn_block,
-                policy=config.gradient_checkpointing,
-            )
-            mlp_block = auto_remat(
-                mlp_block,
-                policy=config.gradient_checkpointing,
-            )
+        attn_block = auto_remat(
+            Exaone4Attention,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        mlp_block = auto_remat(
+            Exaone4MLP,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -479,7 +476,7 @@ class Exaone4Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -494,10 +491,7 @@ class Exaone4Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

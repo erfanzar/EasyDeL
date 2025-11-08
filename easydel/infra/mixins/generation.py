@@ -406,15 +406,10 @@ class EasyGenerationMixin:
     @staticmethod
     def compute_prefill_length_from_mask(mask) -> chex.Array:
         """
-        Calculates the number of padding tokens at the beginning of each sequence.
-
-        This is useful for determining the actual starting position in a KV cache when
-        dealing with left-padded inputs.
-
-        Returns:
-            chex.Array: An array of shape (batch_size,) containing the number of leading
-                padding tokens for each sequence in the batch.
+        Calculates the number of padding tokens at the beginning of each sequence
+        from a 0/1 or boolean mask.
         """
+        mask = mask.astype(jnp.bool_)
         return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
 
     def _make_mask_info(
@@ -504,22 +499,22 @@ class EasyGenerationMixin:
                 mask_info = MaskInfo.from_segments(seg)
             else:
                 mask_info = MaskInfo.from_attention_mask(attention_mask)
-
-        base_mask_info = self._pad_maskinfo_to_maxlen(
+        # Build a base, max_length-shaped decoder mask_info; we will slice per step.
+        mask_info = self._pad_maskinfo_to_maxlen(
             mask_info,
             max_length=max_length,
-            make_causal=not self.config.is_encoder_decoder,
+            # Decoder self-attention is causal for both decoder-only and encoder-decoder generation.
+            make_causal=True,
         )
+
         if attention_mask is not None:
-            position_ids = attention_mask.astype(jnp.bool_).cumsum(axis=-1) - 1
+            am = attention_mask.astype(jnp.bool_)
+            position_ids = jnp.where(am, am.astype(jnp.int32).cumsum(axis=-1) - 1, 0)
         else:
             position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype=jnp.int32)[None, :], (batch_size, seq_length))
 
-        calldict = dict(
-            past_key_values=past_key_values,
-            mask_info=base_mask_info,  # store padded + causal; slice per step at call-time
-            position_ids=position_ids,
-        )
+        calldict = dict(past_key_values=past_key_values, mask_info=mask_info, position_ids=position_ids)
+
         if token_type_ids is not None:
             calldict["token_type_ids"] = token_type_ids
 
@@ -537,36 +532,23 @@ class EasyGenerationMixin:
 
         q_ids = jnp.asarray(mask_info.q_segment_ids, jnp.int32)  # (B, Q0)
         kv_ids = jnp.asarray(mask_info.kv_segment_ids, jnp.int32)  # (B, K0)
-        _B, Q0 = q_ids.shape
+        B, Q0 = q_ids.shape
         K0 = kv_ids.shape[-1]
 
-        def _last_seg(ids):
-            valid = ids >= 0
-            has_any = valid.any(axis=-1, keepdims=True)
-            rev = jnp.flip(valid, axis=-1)
-            last_from_end = jnp.argmax(rev, axis=-1)  # idx from end
-            last_idx = (ids.shape[-1] - 1) - last_from_end
-            last_val = jnp.take_along_axis(ids, last_idx[:, None], axis=-1).squeeze(-1)
-            return jnp.where(has_any.squeeze(-1), last_val, jnp.int32(0))
-
-        last_q = _last_seg(q_ids)
-        last_kv = _last_seg(kv_ids)
-
         if Q0 < max_length:
-            q_pad = jnp.tile(last_q[:, None], (1, max_length - Q0))
+            q_pad = jnp.full((B, max_length - Q0), 0)
             q_ids = jnp.concatenate([q_ids, q_pad], axis=-1)
+        else:
+            q_ids = q_ids[:, :max_length]
         if K0 < max_length:
-            kv_pad = jnp.tile(last_kv[:, None], (1, max_length - K0))
+            kv_pad = jnp.full((B, max_length - K0), 0)
             kv_ids = jnp.concatenate([kv_ids, kv_pad], axis=-1)
+        else:
+            kv_ids = kv_ids[:, :max_length]
 
         base = MaskInfo.from_segments(q_ids, kv_ids)
-
         if make_causal:
             base = base.apply_causal(offset=0)
-
-        base = base.materialize_attention_mask(dtype=jnp.bool_)
-        if base.attention_mask.ndim == 3:
-            base = base.replace(attention_mask=base.attention_mask[:, None, :, :])
         return base
 
     def update_inputs_for_generation(
@@ -595,8 +577,7 @@ class EasyGenerationMixin:
         return model_kwargs
 
     def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, chex.Array],
+        self, model_kwargs: dict[str, chex.Array]
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         """
         Placeholder method to extract or create properties required for specific model types
@@ -651,9 +632,12 @@ class EasyGenerationMixin:
             dict: A dictionary containing dummy keyword arguments suitable for model compilation.
         """
         deteshape = (batch_size, input_tokens_length)
+        # Return a dummy MaskInfo instead of attention_mask for compilation
+        seg = jnp.zeros((batch_size, input_tokens_length), dtype=jnp.int32)  # all valid
+        mi = MaskInfo.from_segments(seg).apply_causal()
         return dict(
             input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
-            attention_mask=jnp.ones(deteshape, dtype="b1", device=input_sharding),
+            mask_info=mi,
             rng=rngs,
         )
 
@@ -1310,7 +1294,9 @@ class EasyGenerationMixin:
 
         def greedy_search_body_fn(state):
             """state update fn."""
-            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            call_kwargs = {
+                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
+            }
             model_outputs = model(state.running_token, **call_kwargs)
             logits = model_outputs.logits[:, -1]
 
@@ -1406,7 +1392,9 @@ class EasyGenerationMixin:
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
 
-            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            call_kwargs = {
+                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
+            }
             model_outputs = model(state.running_token, **call_kwargs)
 
             logits = model_outputs.logits[:, -1]
@@ -1431,10 +1419,7 @@ class EasyGenerationMixin:
                 next_token,
                 (0, state.cur_len),
             )
-            next_model_kwargs = self.update_inputs_for_generation(
-                model_outputs,
-                state.model_kwargs,
-            )
+            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
 
             return SampleState(
                 cur_len=state.cur_len + 1,
@@ -1609,6 +1594,7 @@ class EasyGenerationMixin:
                     (batch_size, num_beams, input_ids_length),
                 )
             )
+            # Leave mask_info as the base; cache layer will compute step-specific mask
             model_outputs = model(input_token, **state.model_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
