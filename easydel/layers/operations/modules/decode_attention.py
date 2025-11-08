@@ -67,6 +67,7 @@ from easydel.layers.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .vanilla_attention import VanillaAttn
 
 
 @OperationRegistry.register
@@ -146,7 +147,20 @@ class AutoRegressiveDecodeAttn(OperationImpl):
                   Attended representation for the current query token.
                 - attention_weights: None (not computed for memory efficiency).
         """
-
+        if jax.default_backend() != "gpu":
+            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
+            fallback_output_1: AttentionOutput = vanilla_attn(
+                query=query,
+                key=key,
+                value=value,
+                cache_metadata=cache_metadata,
+                softmax_scale=softmax_scale,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                softmax_aux=softmax_aux,
+                **ignores,
+            )
+            return fallback_output_1
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
@@ -168,25 +182,44 @@ class AutoRegressiveDecodeAttn(OperationImpl):
 
         # Create sharding specs for all inputs
         query_sharding: Ps | None = self.create_stable_sharding(
-            shardings.query3d, dep=query_squeezed, tensor=query_squeezed, preserved_indices=[0, 1]
+            shardings.query3d,
+            dep=query_squeezed,
+            tensor=query_squeezed,
+            preserved_indices=[0, 1],
         )
         key_sharding: Ps | None = self.create_stable_sharding(
-            shardings.key, dep=key, tensor=key, preserved_indices=[0, 2]
+            shardings.key,
+            dep=key,
+            tensor=key,
+            preserved_indices=[0, 2],
         )
         value_sharding: Ps | None = self.create_stable_sharding(
-            shardings.value, dep=value, tensor=value, preserved_indices=[0, 2]
+            shardings.value,
+            dep=value,
+            tensor=value,
+            preserved_indices=[0, 2],
         )
         starts_sharding: Ps | None = self.create_stable_sharding(
-            views_sharding, dep=starts_flat, tensor=starts_flat, preserved_indices=[0]
+            views_sharding,
+            dep=starts_flat,
+            tensor=starts_flat,
+            preserved_indices=[0],
         )
         indexs_sharding: Ps | None = self.create_stable_sharding(
-            views_sharding, dep=indexs_flat, tensor=indexs_flat, preserved_indices=[0]
+            views_sharding,
+            dep=indexs_flat,
+            tensor=indexs_flat,
+            preserved_indices=[0],
         )
         softmax_aux_sharding: Ps | None = self.create_stable_sharding(
-            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+            shardings.softmax_aux,
+            dep=softmax_aux,
+            tensor=softmax_aux,
         )
         output_sharding: Ps | None = self.create_stable_sharding(
-            shardings.query3d, tensor=query_squeezed, preserved_indices=[0, 1]
+            shardings.query3d,
+            tensor=query_squeezed,
+            preserved_indices=[0, 1],
         )
         if sliding_window is not None:
             if isinstance(sliding_window, int):
