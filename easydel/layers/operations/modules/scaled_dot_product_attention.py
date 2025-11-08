@@ -171,31 +171,27 @@ class ScaledDotProductAttn(OperationImpl):
             bias_computed = bias
 
         # Cast tensors to runtime dtype
-        query_casted: Float[Array, "batch seq_len num_q_heads head_dim"] = query.astype(dtype)
-        key_casted: Float[Array, "batch kv_len num_kv_heads head_dim"] = key.astype(dtype)
-        value_casted: Float[Array, "batch kv_len num_kv_heads head_dim"] = value.astype(dtype)
-        bias_casted: Float[Array, "batch num_heads seq_len kv_len"] | None = (
+        query: Float[Array, "batch seq_len num_q_heads head_dim"] = query.astype(dtype)
+        key: Float[Array, "batch kv_len num_kv_heads head_dim"] = key.astype(dtype)
+        value: Float[Array, "batch kv_len num_kv_heads head_dim"] = value.astype(dtype)
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = (
             bias_computed.astype(dtype) if bias_computed is not None else None
         )
 
         # Create sharding specs
-        query_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.query, [0, 2], dep=query)
-        key_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.key, [0, 2], dep=key)
-        value_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.value, [0, 2], dep=value)
-        bias_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.bias, dep=bias_computed)
-        cum_seqlens_q_sharding: PartitionSpec | None = self.create_stable_sharding(
-            PartitionSpec(shardings.query[0]), dep=cum_seqlens_q
-        )
-        cum_seqlens_k_sharding: PartitionSpec | None = self.create_stable_sharding(
-            PartitionSpec(shardings.query[0]), dep=cum_seqlens_k
-        )
-        output_sharding: PartitionSpec | None = self.create_stable_sharding(shardings.output, [0, 2])
+        query_sharding = self.create_stable_sharding(shardings.query, [0, 2], dep=query)
+        key_sharding = self.create_stable_sharding(shardings.key, [0, 2], dep=key)
+        value_sharding = self.create_stable_sharding(shardings.value, [0, 2], dep=value)
+        bias_sharding = self.create_stable_sharding(shardings.bias, dep=bias_computed)
+        cum_seqlens_q_sharding = self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_q)
+        cum_seqlens_k_sharding = self.create_stable_sharding(PartitionSpec(shardings.query[0]), dep=cum_seqlens_k)
+        output_sharding = self.create_stable_sharding(shardings.output, [0, 2])
 
         attention_output: Float[Array, "batch seq_len num_q_heads head_dim"] = scaled_dot_product_attention(
-            query_casted,
-            key_casted,
-            value_casted,
-            bias_casted,
+            query,
+            key,
+            value,
+            bias,
             cum_seqlens_q,
             cum_seqlens_k,
             mask_info=mask_info,

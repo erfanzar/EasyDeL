@@ -64,6 +64,7 @@ from __future__ import annotations
 import typing as tp
 
 import jax
+from eformer import common_types
 from ejkernel.modules import blocksparse_attention
 from ejkernel.types import MaskInfo
 from jax import numpy as jnp
@@ -190,9 +191,7 @@ class BlockSparseAttn(OperationImpl):
         # TPU constraints: dimensions divisible by 128, causal=True, seq_len > 1
         query_dim_mod_128: int = query_dim % 128
         value_dim_mod_128: int = value_dim % 128
-        tpu_constraints_failed: bool = (
-            not causal or query_dim_mod_128 != 0 or value_dim_mod_128 != 0 or query_length == 1
-        )
+        tpu_constraints_failed: bool = query_dim_mod_128 != 0 or value_dim_mod_128 != 0 or query_length == 1
 
         # GPU constraints: dimensions divisible by 16
         query_dim_mod_16: int = query_dim % 16
@@ -220,6 +219,8 @@ class BlockSparseAttn(OperationImpl):
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         dtype: jnp.dtype = self.metadata.runtime_dtype
         model_mode = self.get_mode(query=query, BTHD=False)
+        is_decode_mode = model_mode == common_types.MODE_DECODE
+        causal_computed: bool = causal if not is_decode_mode else False
 
         shardings = self.metadata.get_shardings(
             mode=model_mode,
@@ -234,20 +235,33 @@ class BlockSparseAttn(OperationImpl):
         value_transposed: Float[Array, "batch kv_num_heads kv_len vhead_dim"] = value.transpose(0, 2, 1, 3).astype(dtype)
 
         # Create sharding specs
-        query_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.query, dep=query_transposed, tensor=query_transposed, preserved_indices=[0, 1]
+        query_sharding = self.create_stable_sharding(
+            shardings.query,
+            dep=query_transposed,
+            tensor=query_transposed,
+            preserved_indices=[0, 1],
         )
-        key_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.key, dep=key_transposed, tensor=key_transposed, preserved_indices=[0, 1]
+        key_sharding = self.create_stable_sharding(
+            shardings.key,
+            dep=key_transposed,
+            tensor=key_transposed,
+            preserved_indices=[0, 1],
         )
-        value_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.value, dep=value_transposed, tensor=value_transposed, preserved_indices=[0, 1]
+        value_sharding = self.create_stable_sharding(
+            shardings.value,
+            dep=value_transposed,
+            tensor=value_transposed,
+            preserved_indices=[0, 1],
         )
-        softmax_aux_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.softmax_aux, dep=softmax_aux, tensor=softmax_aux
+        softmax_aux_sharding = self.create_stable_sharding(
+            shardings.softmax_aux,
+            dep=softmax_aux,
+            tensor=softmax_aux,
         )
-        output_sharding: PartitionSpec | None = self.create_stable_sharding(
-            shardings.output, tensor=query_transposed, preserved_indices=[0, 1]
+        output_sharding = self.create_stable_sharding(
+            shardings.output,
+            tensor=query_transposed,
+            preserved_indices=[0, 1],
         )
 
         outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
@@ -260,7 +274,7 @@ class BlockSparseAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             softmax_scale=softmax_scale_computed,
             sliding_window=sliding_window,
-            causal=causal,
+            causal=causal_computed,
             fused_backward=fused_backward,
             mesh=self.metadata.mesh,
             out_specs=output_sharding,
