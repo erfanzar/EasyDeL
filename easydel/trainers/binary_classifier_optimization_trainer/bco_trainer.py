@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import dataclass
 
 import jax
 import numpy as np
@@ -34,107 +33,11 @@ from easydel.utils.traversals import deepcopy_model
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt, maybe_unpair_preference_dataset
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..utils import (
-    pad,
-    pad_single,
-)
+from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
 from ._fn import RunningMoments, concatenated_forward, evaluation_step, training_step
 from .bco_config import BCOConfig
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class _BCODataCollatorMixin:
-    max_prompt_length: int
-    max_completion_length: int
-    pad_token_id: int
-    label_pad_token_id: int
-    is_encoder_decoder: bool
-
-    def _pad_prompt(self, arrays: list[np.ndarray], padding_value: int, side: str = "left") -> jnp.ndarray:
-        return pad(arrays, self.max_prompt_length, padding_value=padding_value, padding_side=side)
-
-    def _pad_completion(self, arrays: list[np.ndarray], padding_value: int) -> jnp.ndarray:
-        return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
-
-    def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
-        return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
-
-
-class BCODataCollatorTFDS(_BCODataCollatorMixin):
-    """Data collator for BCO training with TFDS backends."""
-
-    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
-        prompt_input_ids = [np.asarray(f["prompt_input_ids"], dtype=np.int32) for f in features]
-        prompt_attention_mask = [np.asarray(f["prompt_attention_mask"], dtype=np.int32) for f in features]
-        completion_input_ids = [np.asarray(f["completion_input_ids"], dtype=np.int32) for f in features]
-        completion_attention_mask = [np.asarray(f["completion_attention_mask"], dtype=np.int32) for f in features]
-        completion_labels = [np.asarray(f["completion_labels"], dtype=np.int32) for f in features]
-        labels = np.asarray([bool(f["label"]) for f in features])
-
-        batch: dict[str, jnp.ndarray] = {}
-        batch["prompt_input_ids"] = self._pad_prompt(prompt_input_ids, self.pad_token_id)
-        batch["prompt_attention_mask"] = self._pad_prompt(prompt_attention_mask, 0)
-        batch["completion_input_ids"] = self._pad_optional(
-            completion_input_ids, self.max_completion_length, self.pad_token_id, "right"
-        )
-        batch["completion_attention_mask"] = self._pad_optional(
-            completion_attention_mask, self.max_completion_length, 0, "right"
-        )
-        batch["completion_labels"] = self._pad_optional(
-            completion_labels, self.max_completion_length, self.label_pad_token_id, "right"
-        )
-        batch["label"] = jnp.asarray(labels, dtype=jnp.bool_)
-
-        if "embedding_input_ids" in features[0]:
-            embedding_input_ids = [np.asarray(f["embedding_input_ids"], dtype=np.int32) for f in features]
-            embedding_attention_mask = [np.asarray(f["embedding_attention_mask"], dtype=np.int32) for f in features]
-            batch["embedding_input_ids"] = pad(embedding_input_ids, None, padding_value=self.pad_token_id)
-            batch["embedding_attention_mask"] = pad(embedding_attention_mask, None, padding_value=0)
-
-        if "reference_logps" in features[0]:
-            reference_logps = np.asarray([f["reference_logps"] for f in features], dtype=np.float32)
-            batch["reference_logps"] = jnp.asarray(reference_logps)
-
-        return batch
-
-
-class BCODataCollatorGrain(_BCODataCollatorMixin):
-    """Grain-compatible BCO data collator."""
-
-    def __call__(self, feature: dict[str, tp.Any]) -> dict[str, jnp.ndarray]:
-        prompt_input_ids = np.asarray(feature["prompt_input_ids"], dtype=np.int32)
-        prompt_attention_mask = np.asarray(feature["prompt_attention_mask"], dtype=np.int32)
-        completion_input_ids = np.asarray(feature["completion_input_ids"], dtype=np.int32)
-        completion_attention_mask = np.asarray(feature["completion_attention_mask"], dtype=np.int32)
-        completion_labels = np.asarray(feature["completion_labels"], dtype=np.int32)
-
-        batch: dict[str, jnp.ndarray] = {}
-        batch["prompt_input_ids"] = pad_single(
-            prompt_input_ids, self.max_prompt_length, padding_value=self.pad_token_id, padding_side="left"
-        )
-        batch["prompt_attention_mask"] = pad_single(
-            prompt_attention_mask, self.max_prompt_length, padding_value=0, padding_side="left"
-        )
-        batch["completion_input_ids"] = pad_single(
-            completion_input_ids, self.max_completion_length, padding_value=self.pad_token_id
-        )
-        batch["completion_attention_mask"] = pad_single(
-            completion_attention_mask, self.max_completion_length, padding_value=0
-        )
-        batch["completion_labels"] = pad_single(
-            completion_labels, self.max_completion_length, padding_value=self.label_pad_token_id
-        )
-        batch["label"] = jnp.asarray([bool(feature["label"])], dtype=jnp.bool_)
-
-        if "embedding_input_ids" in feature:
-            batch["embedding_input_ids"] = jnp.asarray(feature["embedding_input_ids"], dtype=jnp.int32)
-            batch["embedding_attention_mask"] = jnp.asarray(feature["embedding_attention_mask"], dtype=jnp.int32)
-        if "reference_logps" in feature:
-            batch["reference_logps"] = jnp.asarray([feature["reference_logps"]], dtype=jnp.float32)
-
-        return batch
 
 
 def _tokenize(
@@ -142,6 +45,16 @@ def _tokenize(
     tokenizer,
     embedding_tokenizer=None,
 ) -> dict[str, list[tp.Any]]:
+    """Tokenize prompts and completions for BCO training.
+
+    Args:
+        batch: Dictionary containing 'prompt' and 'completion' lists.
+        tokenizer: Primary tokenizer for model inputs.
+        embedding_tokenizer: Optional tokenizer for UDM embeddings.
+
+    Returns:
+        Dictionary with tokenized prompt, answer, and optional embedding fields.
+    """
     prompt_tokenized = tokenizer(batch["prompt"], add_special_tokens=False)
     prompt_input_ids = prompt_tokenized["input_ids"]
     prompt_attention_mask = prompt_tokenized["attention_mask"]
@@ -202,6 +115,23 @@ def _process_tokens(
     max_completion_length: int | None,
     model: tp.Any = None,
 ) -> dict[str, tp.Any]:
+    """Process and truncate tokenized sequences for BCO training.
+
+    Args:
+        example: Single example with prompt, completion, and label.
+        prefix: Prefix for output keys.
+        tokenizer: Tokenizer for special tokens.
+        is_encoder_decoder: Whether model uses encoder-decoder architecture.
+        max_length: Maximum total sequence length.
+        truncation_mode: How to truncate sequences.
+        label_pad_token_id: Token ID for padding labels.
+        max_prompt_length: Maximum prompt length.
+        max_completion_length: Maximum completion length.
+        model: Optional model for encoder-decoder input preparation.
+
+    Returns:
+        Dictionary with processed sequences and labels.
+    """
     prompt = example["prompt"]
     completion = example["completion"]
     batch = {f"{prefix}label": example["label"]}
@@ -290,7 +220,7 @@ def _process_tokens(
 
         if model is not None and hasattr(model, "prepare_decoder_input_ids_from_labels"):
             decoder_input_ids = model.prepare_decoder_input_ids_from_labels(
-                labels=jnp.asarray(batch[f"{prefix}completion_labels"])
+                labels=np.asarray(batch[f"{prefix}completion_labels"])
             )
             batch[f"{prefix}completion_decoder_input_ids"] = np.asarray(decoder_input_ids)
 
@@ -299,7 +229,23 @@ def _process_tokens(
 
 @Registry.register("trainer", "bco")
 class BCOTrainer(Trainer):
-    """Binary Classifier Optimisation trainer."""
+    """Binary Classifier Optimization (BCO) trainer.
+
+    Implements BCO training which aligns language models using binary feedback.
+    Supports Unbiased Data Marginalization (UDM) for handling distribution mismatch
+    between desirable and undesirable examples.
+
+    Args:
+        arguments: BCO-specific training configuration.
+        model: Policy model to train.
+        reference_model: Reference model for computing log probability ratios.
+        processing_class: Tokenizer or processor.
+        train_dataset: Training dataset with prompt, completion, and label.
+        eval_dataset: Optional evaluation dataset.
+        data_collator: Optional custom data collator.
+        embedding_func: Optional embedding function for UDM.
+        embedding_tokenizer: Optional tokenizer for UDM embeddings.
+    """
 
     arguments: BCOConfig
 
@@ -418,6 +364,15 @@ class BCOTrainer(Trainer):
         )
 
     def _prepare_dataset(self, dataset: Dataset | IterableDataset, name: str):
+        """Prepare dataset by extracting prompts, applying templates, and tokenizing.
+
+        Args:
+            dataset: Raw dataset to process.
+            name: Dataset name for logging.
+
+        Returns:
+            Processed dataset with tokenized fields.
+        """
         map_kwargs = {}
         if isinstance(dataset, Dataset):
             map_kwargs["num_proc"] = self.arguments.dataset_num_proc
@@ -459,6 +414,15 @@ class BCOTrainer(Trainer):
         return dataset
 
     def _vectorize_prompt(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+        """Convert prompt tokens to embeddings using the embedding function.
+
+        Args:
+            input_ids: Token IDs.
+            attention_mask: Attention mask.
+
+        Returns:
+            Prompt embeddings.
+        """
         if self.embedding_func is None or self.embedding_tokenizer is None:
             return np.array([])
         input_ids = np.where(
@@ -475,6 +439,15 @@ class BCOTrainer(Trainer):
         return np.asarray(embeddings)
 
     def _get_prompt_embeddings(self, dataset: Dataset, sample_size: int) -> np.ndarray:
+        """Extract and pool prompt embeddings from dataset samples.
+
+        Args:
+            dataset: Dataset to sample from.
+            sample_size: Number of samples to use.
+
+        Returns:
+            Stacked prompt embeddings.
+        """
         n_samples = min(len(dataset), sample_size)
         indices = self._rng.choice(len(dataset), size=n_samples, replace=False)
         sampled = dataset.select(indices)
@@ -488,6 +461,11 @@ class BCOTrainer(Trainer):
         return np.stack(embeddings, axis=0)
 
     def _train_density_ratio_classifier(self, train_dataset: Dataset):
+        """Train UDM density ratio classifier using desirable/undesirable prompt embeddings.
+
+        Args:
+            train_dataset: Training dataset containing labeled examples.
+        """
         desirable = train_dataset.filter(lambda x: x["label"], num_proc=self.arguments.dataset_num_proc)
         undesirable = train_dataset.filter(lambda x: not x["label"], num_proc=self.arguments.dataset_num_proc)
 
@@ -516,6 +494,18 @@ class BCOTrainer(Trainer):
         max_iter: int = 500,
         tol: float = 1e-5,
     ) -> tuple[np.ndarray, float]:
+        """Fit logistic regression classifier using gradient descent.
+
+        Args:
+            embeddings: Feature embeddings.
+            labels: Binary labels.
+            lr: Learning rate.
+            max_iter: Maximum iterations.
+            tol: Convergence tolerance.
+
+        Returns:
+            Tuple of (weights, bias).
+        """
         weights = np.zeros(embeddings.shape[1], dtype=np.float32)
         bias = 0.0
         n_pos = np.count_nonzero(labels)
@@ -539,6 +529,11 @@ class BCOTrainer(Trainer):
         return weights.astype(np.float32), float(bias)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Configure JIT-compiled training and evaluation functions.
+
+        Returns:
+            Configuration containing compiled step functions and mesh.
+        """
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
@@ -604,6 +599,15 @@ class BCOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
+        """Create data collator for Grain data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length.
+            truncation_mode: How to truncate sequences.
+
+        Returns:
+            Grain-compatible data collator.
+        """
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -611,9 +615,26 @@ class BCOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
+        """Create data collator for TFDS data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length.
+            truncation_mode: How to truncate sequences.
+
+        Returns:
+            TFDS-compatible data collator.
+        """
         return self.input_data_collator_tfds
 
-    def compute_reference_log_probs(self, batch: dict[str, jnp.ndarray]) -> jnp.ndarray:
+    def compute_reference_log_probs(self, batch: dict[str, np.ndarray]) -> np.ndarray:
+        """Compute reference model log probabilities for a batch.
+
+        Args:
+            batch: Input batch.
+
+        Returns:
+            Completion log probabilities from reference model.
+        """
         if self.reference_state is None:
             reference_model = self.model_state.model
         else:
@@ -624,9 +645,19 @@ class BCOTrainer(Trainer):
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
-        batch: dict[str, jnp.ndarray],
+        batch: dict[str, np.ndarray],
         is_train: bool,
-    ) -> tuple[dict[str, jnp.ndarray], dict[str, tp.Any]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, tp.Any]]:
+        """Preprocess batch by adding running moments and UDM weights.
+
+        Args:
+            state: Current model state.
+            batch: Input batch.
+            is_train: Whether this is a training step.
+
+        Returns:
+            Processed batch with additional fields and metrics dictionary.
+        """
         batch["running_mean"] = jnp.asarray(self.running.mean, dtype=jnp.float32)
         informations: dict[str, tp.Any] = {}
 
@@ -650,22 +681,3 @@ class BCOTrainer(Trainer):
                 informations["udm_ratio_mean"] = float(ratio.mean())
 
         return batch, informations
-
-    # def save_state(self, save_directory: str):
-    #     save_path = ePath(save_directory)
-    #     running_path = save_path / "bco_running_stats.json"
-    #     running_path.write_text(json.dumps(self.running.as_dict()))
-    #     if self.clf_weights is not None:
-    #         clf_path = save_path / "bco_density_ratio.json"
-    #         w, b = self.clf_weights
-    #         clf_path.write_text(json.dumps({"weights": w.tolist(), "bias": b}))
-
-    # def load_state(self, load_directory: str):
-    #     save_path = ePath(load_directory)
-    #     running_path = save_path / "bco_running_stats.json"
-    #     if running_path.exists():
-    #         self.running.load_dict(json.loads(running_path.read_text()))
-    #     clf_path = save_path / "bco_density_ratio.json"
-    #     if clf_path.exists():
-    #         data = json.loads(clf_path.read_text())
-    #         self.clf_weights = (np.asarray(data["weights"], dtype=np.float32), float(data["bias"]))

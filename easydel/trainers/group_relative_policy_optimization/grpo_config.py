@@ -90,7 +90,7 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "whenever to skip extracting prompt from dataset."},
     )
     num_return_sequences: int = field(
-        default=False,
+        default=4,
         metadata={
             "help": "The number of sequences to return for each input prompt. Used during sampling to "
             "generate multiple completions per prompt."

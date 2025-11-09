@@ -81,8 +81,6 @@ from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
 
 if tp.TYPE_CHECKING:
-    from easydel.inference import vInference, vInferenceConfig, vInferencePreCompileConfig
-    from easydel.infra.utils import ProcessingClassType
     from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
 
 logger = get_logger(__name__)
@@ -1684,56 +1682,3 @@ class EasyGenerationMixin:
         scores = flatten_beam_dim(scores[:, :num_return_sequences])
 
         return BeamSearchOutput(sequences=sequences, scores=scores)
-
-    def create_vinference(
-        self,
-        processor: ProcessingClassType,
-        generation_config: vInferenceConfig,
-        compile_config: vInferencePreCompileConfig | None = None,
-        input_partition_spec: PartitionSpec | None = None,
-        seed: int | None = None,
-    ) -> vInference:
-        from easydel import SamplingParams, vInference, vInferenceConfig
-
-        if hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                sampling_params = generation_config.sampling_params
-                generation_config = vInferenceConfig(
-                    bos_token_id=generation_config.bos_token_id or self.generation_config.bos_token_id,
-                    eos_token_id=generation_config.eos_token_id or self.generation_config.eos_token_id,
-                    pad_token_id=generation_config.pad_token_id or self.generation_config.pad_token_id,
-                    max_new_tokens=generation_config.max_new_tokens or self.generation_config.max_new_tokens,
-                    streaming_chunks=generation_config.streaming_chunks or 64,
-                    sampling_params=SamplingParams(
-                        max_tokens=sampling_params.max_tokens or self.generation_config.max_new_tokens,
-                        temperature=sampling_params.temperature or self.generation_config.temperature,
-                        top_k=sampling_params.top_k or self.generation_config.top_k,
-                        top_p=sampling_params.top_p or self.generation_config.top_p,
-                    ),
-                )
-        num_params = sum(n.size for n in jax.tree_util.tree_flatten(self.graphstate)[0])
-        size_in_billions = num_params / 1e9
-        size_in_billions = f"{size_in_billions:.2f}b"
-        vinference = vInference(
-            model=None,
-            processor_class=processor,
-            generation_config=generation_config,
-            graphdef=self.graphdef,
-            mesh=self.mesh,
-            partition_axis=self.config.partition_axis,
-            inference_name=str(getattr(self._model_task, "value", self._model_task))
-            + "-"
-            + str(self._model_type)
-            + ":"
-            + size_in_billions,
-            input_partition_spec=input_partition_spec,
-            seed=seed,
-            report_metrics=False,
-        )
-        if compile_config is not None:
-            vinference.precompile(
-                config=compile_config,
-                graphother=self.graphother,
-                graphstate=self.graphstate,
-            )
-        return vinference

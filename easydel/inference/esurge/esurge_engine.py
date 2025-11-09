@@ -274,6 +274,7 @@ class eSurge:
         prefer_preserve_prompt: bool = True,
         decode_truncated_prompt: bool = True,
         bytecode_decode: bool = True,
+        destroy_pages_on_pause: bool = True,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -314,6 +315,8 @@ class eSurge:
                 UTF-8 sequences. This prevents "�" characters during streaming when
                 tokens split multi-byte UTF-8 characters. Uses intelligent buffering
                 and progressive backtracking to find clean decode points.
+            destroy_pages_on_pause: When True, destroying the ragged KV cache upon
+                pause() to free memory, and lazily reinitializing it on resume().
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -384,6 +387,9 @@ class eSurge:
         self._bytecode_decode = bytecode_decode
         self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
         self._scheduler_running = False
+        self.destroy_pages_on_pause = destroy_pages_on_pause
+        self._kv_cache_valid = True
+        self._paused = False
         self.runner = eSurgeRunner(
             model=self.model,
             hbm_utilization=hbm_utilization,
@@ -402,6 +408,8 @@ class eSurge:
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
+        self._scheduler_max_num_batched_tokens = max_num_batched_tokens
+        self._scheduler_enable_prefix_caching = enable_prefix_caching
 
         # Streaming decode cadence
         self.decode_interval_tokens = 4
@@ -500,6 +508,10 @@ class eSurge:
                 logger.info("Scheduler loop is already running")
                 return
 
+            if self.runner.executor_manager.kv_pages is None:
+                self.runner.initialize_kv_cache()
+                self._kv_cache_valid = True
+
             def _scheduler_loop():
                 logger.info("Starting background scheduler loop")
                 while self._scheduler_running:
@@ -519,6 +531,7 @@ class eSurge:
             self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
             self._scheduler_thread.start()
             logger.info("Background scheduler initiated")
+            self._paused = False
 
     def terminate(self) -> None:
         """Stop the background scheduler thread.
@@ -539,6 +552,37 @@ class eSurge:
                     logger.warning("Scheduler thread did not stop gracefully")
                 self._scheduler_thread = None
             logger.info("Background scheduler terminated")
+
+    def pause(self) -> None:
+        """Pause the background scheduler without clearing queued state."""
+        if not self._scheduler_running:
+            logger.info("Scheduler loop already paused or not running")
+            self._paused = True
+            return
+
+        logger.info("Pausing eSurge scheduler loop...")
+        self.terminate()
+        self._paused = True
+        if self.destroy_pages_on_pause:
+            if self.num_running_requests > 0 or self.num_pending_requests > 0:
+                logger.warning(
+                    f"Active or pending requests detected; skipping KV cache destruction (num running requests "
+                    f"{self.num_running_requests} | num pending requests {self.num_pending_requests})."
+                )
+            else:
+                self.runner.destroy_kv_cache()
+                self._kv_cache_valid = False
+
+    def resume(self) -> None:
+        """Resume the scheduler if it was paused."""
+        if self._scheduler_running:
+            logger.info("Scheduler loop already running")
+            return
+        logger.info("Resuming eSurge scheduler loop...")
+        if self.destroy_pages_on_pause and not self._kv_cache_valid:
+            self.runner.initialize_kv_cache()
+            self._kv_cache_valid = True
+        self.initiate()
 
     def _format_chat_prompt(
         self,
@@ -954,6 +998,71 @@ class eSurge:
             )
             # generate() returns a list; chat is single prompt, so return the first
             return outs[0]
+
+    def update_model_weights(
+        self,
+        model: EasyDeLBaseModule | None = None,
+        *,
+        graphdef=None,
+        graphstate=None,
+        graphother=None,
+        restart_scheduler: bool = True,
+    ) -> None:
+        """Hot-swap the underlying model weights/graphs.
+
+        The engine must be idle (no pending or running requests) before calling
+        this method. It temporarily stops the scheduler loop, refreshes runner
+        state, rebuilds the scheduler, and optionally restarts background serving.
+
+        Args:
+            model: Optional EasyDeLBaseModule carrying the new weights.
+            graphdef: Optional graphdef override.
+            graphstate: Optional graphstate override.
+            graphother: Optional graphother override.
+            restart_scheduler: Restart the scheduler thread if it was previously
+                running (default: True).
+
+        Raises:
+            RuntimeError: If there are active or pending requests.
+            ValueError: If no model/graph data is provided.
+        """
+
+        if self._active_requests or self.num_running_requests > 0 or self.num_pending_requests > 0:
+            raise RuntimeError("Cannot update model weights while requests are active or pending")
+
+        if model is None and graphdef is None and graphstate is None and graphother is None:
+            raise ValueError("No new model or graph components provided for update")
+
+        was_running = self._scheduler_running
+        if was_running:
+            self.terminate()
+
+        if model is not None:
+            model = model.update_module(attn_mechanism="ragged_page_attention")
+            self.model = model
+
+        self.runner.update_model_weights(
+            model=model,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+            reset_state=True,
+        )
+        self._kv_cache_valid = self.runner.executor_manager.kv_pages is not None
+
+        with self._request_lock, self._output_lock:
+            self._active_requests.clear()
+            self._request_outputs.clear()
+        self._request_events.clear()
+
+        self.scheduler = Scheduler.from_runner(
+            self.runner,
+            max_num_batched_tokens=self._scheduler_max_num_batched_tokens,
+            enable_prefix_caching=self._scheduler_enable_prefix_caching,
+        )
+
+        if restart_scheduler and was_running:
+            self.initiate()
 
     def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
         """Add a new request to the scheduler queue with intelligent context management.

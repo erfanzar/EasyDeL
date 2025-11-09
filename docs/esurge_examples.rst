@@ -477,4 +477,3 @@ See Also
 
 - :doc:`esurge` - Main eSurge documentation
 - :doc:`api_docs/inference_esurge` - API reference
-- :doc:`vinference_api` - Alternative inference engine

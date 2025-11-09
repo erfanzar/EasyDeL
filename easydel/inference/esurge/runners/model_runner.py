@@ -474,6 +474,58 @@ class eSurgeRunner:
             allowed_max=512,
         )
 
+    def update_model_weights(
+        self,
+        model: EasyDeLBaseModule | None = None,
+        *,
+        graphdef=None,
+        graphstate=None,
+        graphother=None,
+        reset_state: bool = True,
+    ) -> None:
+        """Update the runner's model weights/graphs and optionally reset state.
+
+        Args:
+            model: Optional EasyDeL model instance providing new weights. If
+                omitted, graph components must be supplied explicitly.
+            graphdef: Optional graphdef override.
+            graphstate: Optional graphstate override.
+            graphother: Optional graphother override.
+            reset_state: When True (default) reinitializes internal buffers and
+                cached requests to ensure the new weights are applied cleanly.
+
+        Raises:
+            RuntimeError: If active requests exist while reset_state is True.
+        """
+        if reset_state and self.requests:
+            raise RuntimeError("Cannot update model weights while requests are active")
+
+        if model is not None:
+            self.model = model
+
+        self.executor_manager.update_graphs(
+            model=model,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+        )
+
+        if reset_state:
+            self._setup_variables()
+
+    def destroy_kv_cache(self) -> None:
+        """Destroy the current ragged KV cache to release memory."""
+        logger.info("Destroying eSurgeRunner ragged KV cache pages")
+        self.executor_manager.kv_pages = None
+
+    def initialize_kv_cache(self) -> None:
+        """Reinitialize the ragged KV cache if it has been destroyed."""
+        if self.executor_manager.kv_pages is not None:
+            logger.debug("KV cache already initialized; skipping reallocation")
+            return
+        logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
+        self.executor_manager.kv_pages = self.model.init_ragged_pages(self.metadata)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
 

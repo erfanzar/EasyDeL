@@ -1109,29 +1109,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
         ...
 
-    @abstractmethod
-    def create_vinference(
-        self,
-        processor: tp.Any,
-        generation_config: tp.Any,
-        compile_config: tp.Any | None = None,
-        input_partition_spec: PartitionSpec | None = None,
-        seed: int | None = None,
-    ):
-        """Creates a vInference instance for optimized inference.
-
-        Args:
-            processor: The processor class for handling inputs/outputs.
-            generation_config: Configuration for generation behavior.
-            compile_config: Optional pre-compilation configuration.
-            input_partition_spec: Optional sharding specification for inputs.
-            seed: Optional random seed for reproducibility.
-
-        Returns:
-            A configured vInference instance ready for inference.
-        """
-        ...
-
     def __str__(self):
         return printify_nnx(self)
 

@@ -684,43 +684,6 @@ Example of a batch processing service:
     if __name__ == "__main__":
         asyncio.run(main())
 
-Migration Guide
----------------
-
-From vInference to eSurge
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-If you're migrating from vInference to eSurge:
-
-.. code-block:: python
-
-    # Old vInference code
-    from easydel.inference import vInference
-
-    engine = vInference(
-        model=model,
-        processor=tokenizer,
-        generation_config=config,
-    )
-
-    # New eSurge code
-    from easydel.inference.esurge import eSurge
-
-    engine = eSurge(
-        model=model,
-        tokenizer=tokenizer,
-        max_model_len=config.max_length,
-        max_num_seqs=16,  # New parameter for concurrency
-        hbm_utilization=0.9,  # Better memory control
-    )
-
-Key differences:
-
-- eSurge uses ``tokenizer`` instead of ``processor``
-- More granular configuration options
-- Built-in support for continuous batching
-- Improved memory management with paged attention
-
 Performance Comparison
 ----------------------
 
@@ -729,19 +692,19 @@ eSurge vs Other Engines
 
 Performance characteristics compared to other inference engines:
 
-+------------------+----------+----------+-----------+-------------+
-| Metric           | eSurge   | vLLM     | TGI       | vInference  |
-+==================+==========+==========+===========+=============+
-| TPU Support      | ✅ Native| ⚠️ Limited  | ❌ None   | ✅ Native   |
-+------------------+----------+----------+-----------+-------------+
-| Paged Attention  | ✅ Yes   | ✅ Yes   | ✅ Yes    | ❌ No       |
-+------------------+----------+----------+-----------+-------------+
-| Prefix Caching   | ✅ Yes   | ✅ Yes   | ⚠️ Limited| ❌ No       |
-+------------------+----------+----------+-----------+-------------+
-| JAX/Flax Native  | ✅ Yes   | ❌ No    | ❌ No     | ✅ Yes      |
-+------------------+----------+----------+-----------+-------------+
-| Continuous Batch | ✅ Yes   | ✅ Yes   | ✅ Yes    | ⚠️ Limited  |
-+------------------+----------+----------+-----------+-------------+
++------------------+----------+----------+-----------+
+| Metric           | eSurge   | vLLM     | TGI       |
++==================+==========+==========+===========+
+| TPU Support      | ✅ Native| ⚠️ Limited  | ❌ None   |
++------------------+----------+----------+-----------+
+| Paged Attention  | ✅ Yes   | ✅ Yes   | ✅ Yes    |
++------------------+----------+----------+-----------+
+| Prefix Caching   | ✅ Yes   | ✅ Yes   | ⚠️ Limited|
++------------------+----------+----------+-----------+
+| JAX/Flax Native  | ✅ Yes   | ❌ No    | ❌ No     |
++------------------+----------+----------+-----------+
+| Continuous Batch | ✅ Yes   | ✅ Yes   | ✅ Yes    |
++------------------+----------+----------+-----------+
 
 Future Roadmap
 --------------

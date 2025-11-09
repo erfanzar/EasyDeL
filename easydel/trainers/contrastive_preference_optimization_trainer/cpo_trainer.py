@@ -48,7 +48,19 @@ logger = get_logger(__name__)
 
 @Registry.register("trainer", "cpo")
 class CPOTrainer(Trainer):
-    """Contrastive Preference Optimisation trainer."""
+    """Contrastive Preference Optimization (CPO) trainer.
+
+    Implements CPO training which aligns language models using preference pairs.
+    Supports multiple loss variants including sigmoid, hinge, IPO, SimPO, and AlphaPO.
+
+    Args:
+        arguments: CPO-specific training configuration.
+        model: Policy model to train.
+        processing_class: Tokenizer or processor.
+        train_dataset: Training dataset with prompt, chosen, and rejected fields.
+        eval_dataset: Optional evaluation dataset.
+        data_collator: Optional custom data collator.
+    """
 
     arguments: CPOConfig
 
@@ -169,6 +181,17 @@ class CPOTrainer(Trainer):
         arguments: CPOConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        """Prepare dataset by extracting prompts, applying templates, and tokenizing.
+
+        Args:
+            dataset: Raw dataset to process.
+            processing_class: Tokenizer or processor.
+            arguments: Training configuration.
+            dataset_name: Name for logging.
+
+        Returns:
+            Processed dataset with tokenized fields.
+        """
         map_kwargs: dict[str, tp.Any] = {}
         from datasets import Dataset
 
@@ -208,6 +231,17 @@ class CPOTrainer(Trainer):
         max_prompt_length: int | None,
         max_completion_length: int | None,
     ) -> dict[str, list[int]]:
+        """Tokenize a single row with prompt, chosen, and rejected completions.
+
+        Args:
+            features: Dictionary with 'prompt', 'chosen', and 'rejected' fields.
+            processing_class: Tokenizer.
+            max_prompt_length: Maximum prompt length.
+            max_completion_length: Maximum completion length.
+
+        Returns:
+            Dictionary with tokenized fields.
+        """
         tokenizer = processing_class
         prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
@@ -234,6 +268,11 @@ class CPOTrainer(Trainer):
         }
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
+        """Configure JIT-compiled training and evaluation functions.
+
+        Returns:
+            Configuration containing compiled step functions and mesh.
+        """
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
@@ -324,6 +363,15 @@ class CPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
+        """Create data collator for Grain data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length.
+            truncation_mode: How to truncate sequences.
+
+        Returns:
+            Grain-compatible data collator.
+        """
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -331,6 +379,15 @@ class CPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
+        """Create data collator for TFDS data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length.
+            truncation_mode: How to truncate sequences.
+
+        Returns:
+            TFDS-compatible data collator.
+        """
         return self.input_data_collator_tfds
 
     @property
@@ -347,4 +404,14 @@ class CPOTrainer(Trainer):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
+        """Called at the end of each training step.
+
+        Args:
+            state: Current model state.
+            metrics: Step metrics.
+            step: Current step number.
+
+        Returns:
+            Potentially modified state and metrics.
+        """
         return state, metrics

@@ -30,8 +30,9 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
   - Image-Text-to-Image generation
   - Image-to-Text processing
 - **Production-Ready Serving**:
-  - `vInference` engine for efficient LLM inference
-  - `vInferenceApiServer` for OpenAI-compatible API endpoints
+  - `eSurge` engine for enterprise-grade, unified/ragged attention inference with paged KV cache and continuous batching
+  - `vSurge` orchestrator for long-lived, multi-request inference services
+  - `vWhisper` for OpenAI-compatible speech transcription endpoints
 - **Performance Optimization**:
   - Integration with multiple attention mechanisms
   - Advanced quantization support including NF4, A8BIT, A8Q, and A4Q
@@ -107,38 +108,62 @@ import easydel as ed
 from transformers import AutoTokenizer
 import jax.numpy as jnp
 
-# Initialize model
-model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.1-8B-instruct",
-    dtype=jnp.float16,
-    platform=ed.EasyDeLPlatforms.TRITON,
-    auto_shard_model=True
-)
-
-# Setup tokenizer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-instruct")
+# Initialize model + tokenizer
+model_id = "meta-llama/Llama-3.1-8B-instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 tokenizer.pad_token_id = tokenizer.eos_token_id
-
-# Create inference engine
-sampling_params=ed.SamplingParams(
-    max_tokens=1024,
-    temperature=0.8,
-    top_p=0.95,
-    top_k=10,
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    model_id,
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    auto_shard_model=True,
+    sharding_axis_dims=(1, 1, 1, -1, 1),
 )
-inference = ed.vInference(
+
+# Spin up eSurge for high-throughput decoding
+engine = ed.eSurge(
     model=model,
     tokenizer=tokenizer,
-    generation_config=ed.vInferenceConfig(
-        max_new_tokens=1024,
-        sampling_params=sampling_params,
-        streaming_chunks=32,
-    )
+    max_model_len=4096,
+    max_num_seqs=8,
 )
 
-# Create API server (OpenAI compatible)
-api_server = ed.vInferenceApiServer({inference.inference_name: inference})
-api_server.fire()
+for output in engine.stream("Hello EasyDeL!", sampling_params=ed.SamplingParams(max_tokens=128)):
+    print(output.delta_text, end="", flush=True)
+print("\nTokens/s:", output.tokens_per_second)
+```
+
+### Fast Inference Engines: eSurge & vSurge
+
+- **eSurge** is the primary high-performance path: it pairs unified/ragged attention kernels with paged KV caches, memory pooling, and continuous batching. Use `engine.stream(...)` for interactive token streaming or `engine.generate(...)` for low-latency batch completions.
+- **vSurge** manages persistent decoding workers, provides request scheduling/queuing, and plugs directly into the OpenAI-compatible API server. Use it when you need a daemonized server that multiplexes many users and models.
+
+Minimal `vSurge` example:
+
+```python
+import asyncio
+import easydel as ed
+
+surge = ed.vSurge.from_model(
+    model=model,
+    processor=tokenizer,
+    max_prefill_length=2048,
+    max_concurrent_prefill=1,
+    max_concurrent_decodes=32,
+)
+
+surge.compile()
+surge.start()
+
+async def run():
+    samples = await surge.generate(
+        prompts=["USER:Write a haiku about EasyDeL\nASSISTANT:"],
+        sampling_params=[ed.SamplingParams(max_tokens=64, temperature=0.7)],
+        stream=False,
+    )
+    print(samples[0].text)
+
+asyncio.run(run())
 ```
 
 ### DPOTraining Example

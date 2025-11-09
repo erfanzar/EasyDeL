@@ -22,7 +22,7 @@ import easydel as ed
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
     from _common import (  # type: ignore
-        build_sft_text_dataset,
+        build_lm_dataset,
         get_logger,
         get_tokenizer,
         load_causal_lm_model,
@@ -30,7 +30,7 @@ if __package__ in {None, ""}:
     )
 else:
     from ._common import (
-        build_sft_text_dataset,
+        build_lm_dataset,
         get_logger,
         get_tokenizer,
         load_causal_lm_model,
@@ -41,25 +41,34 @@ else:
 def main():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
-    model = load_causal_lm_model()
+    student_model = load_causal_lm_model()
+    student_state = student_model.to_state()
+    teacher_model = load_causal_lm_model("Qwen/Qwen3-4B")
+    teacher_state = teacher_model.to_state()
 
     trainer_args = make_config(
-        ed.SFTConfig,
-        "supervised-fine-tuning",
-        overrides={"dataset_text_field": "text", "packing": False},
+        ed.GKDConfig,
+        "gkd",
+        overrides={
+            "dataset_text_field": None,
+            "lmbda": 0.0,  # disable on-policy sampling for the smoke test
+            "max_new_tokens": 16,
+        },
     )
 
-    dataset = build_sft_text_dataset(tokenizer=tokenizer)
+    dataset = build_lm_dataset(tokenizer)
 
-    logger.info("Starting SFT run.")
-    trainer = ed.SFTTrainer(
+    logger.info("Instantiating GKDTrainer.")
+    trainer = ed.GKDTrainer(
         arguments=trainer_args,
-        model=model,
-        train_dataset=dataset,
         processing_class=tokenizer,
+        model=student_state,
+        teacher_model=teacher_state,
+        train_dataset=dataset,
     )
+    logger.info("Launching GKD training.")
     trainer.train()
-    logger.info("SFT run finished.")
+    logger.info("GKD training run finished.")
 
 
 if __name__ == "__main__":

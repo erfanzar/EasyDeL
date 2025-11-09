@@ -283,10 +283,6 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Maximum number of newly generated tokens for previews."},
     )
-    generation_max_length: int | None = field(
-        default=None,
-        metadata={"help": "Total maximum length (prompt + completion) for preview generations."},
-    )
     generation_shard_inputs: bool = field(
         default=True,
         metadata={"help": "Whether generation previews should reuse the model's sharding plan."},
@@ -322,6 +318,10 @@ class TrainingArguments:
     generation_seed: int | None = field(
         default=None,
         metadata={"help": "Seed for preview prompt sampling (None uses a random seed)."},
+    )
+    generation_preview_print: bool = field(
+        default=False,
+        metadata={"help": "Whether to print preview generations to Terminal."},
     )
     generation_log_to_wandb: bool = field(
         default=True,
@@ -675,13 +675,6 @@ class TrainingArguments:
         _inherit_generation_attr("generation_temperature", "temperature")
         _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
         _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
-        _inherit_generation_attr("generation_max_length", "max_sequence_length")
-
-        if self.generation_max_length is None:
-            max_prompt_length = getattr(self, "max_prompt_length", None)
-            max_completion_length = getattr(self, "max_completion_length", None)
-            if max_prompt_length is not None and max_completion_length is not None:
-                self.generation_max_length = max_prompt_length + max_completion_length
 
         if self.generation_num_return_sequences is not None:
             try:

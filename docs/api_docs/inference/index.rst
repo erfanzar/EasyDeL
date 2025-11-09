@@ -7,7 +7,6 @@ easydel.inference package
    inference/esurge/index
    inference/evaluations/index
    inference/tools/index
-   inference/vinference/index
    inference/vsurge/index
    inference/vwhisper/index
    inference/decoders

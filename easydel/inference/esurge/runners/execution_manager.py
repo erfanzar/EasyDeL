@@ -253,6 +253,54 @@ class ExecutionManager:
     def clear_cache(self):
         self._lowerd_history.clear()
 
+    def update_graphs(
+        self,
+        model: EasyDeLBaseModule | None = None,
+        *,
+        graphdef=None,
+        graphstate=None,
+        graphother=None,
+    ) -> None:
+        """Update the graph components (weights) used by the fused executor.
+
+        Args:
+            model: Optional EasyDeL module to source new graph parts from. When
+                provided, graphdef/graphstate/graphother are pulled from this
+                model unless explicitly overridden via the keyword arguments.
+            graphdef: Optional graph definition replacement.
+            graphstate: Optional graph state replacement (typically the weights).
+            graphother: Optional auxiliary graph data replacement.
+
+        Raises:
+            ValueError: If neither a model nor explicit graph components are
+                provided.
+        """
+
+        if model is not None:
+            logger.info("Updating ExecutionManager graphs from provided model instance")
+            self.model = model
+            new_graphdef, new_graphstate, new_graphother = model.split_module()
+            graphdef = new_graphdef if graphdef is None else graphdef
+            graphstate = new_graphstate if graphstate is None else graphstate
+            graphother = new_graphother if graphother is None else graphother
+
+        if graphdef is None and graphstate is None and graphother is None:
+            raise ValueError("No graph components supplied for update")
+
+        if graphdef is not None:
+            self.graphdef = graphdef
+
+        if graphstate is not None:
+            shardings = es.extract_shardings(self.graphstate, self.mesh)
+            self.graphstate = _device_put_tree_with_shardings(graphstate, shardings)
+
+        if graphother is not None:
+            shardings = es.extract_shardings(self.graphother, self.mesh)
+            self.graphother = _device_put_tree_with_shardings(graphother, shardings)
+
+        # Clear cached baselines so future diagnostics re-hash with new weights.
+        self._debug_baselines.clear()
+
     def execute(
         self,
         num_tokens: int,
