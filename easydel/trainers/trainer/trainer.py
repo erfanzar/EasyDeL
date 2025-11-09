@@ -529,8 +529,7 @@ class Trainer(BaseTrainer):
                 try:
                     self.maybe_generate(state=state, step=current_step, metrics=metrics)
                 except Exception as exc:  # pragma: no cover - preview must not interrupt training
-                    logger.debug(f"Preview generation hook failed: {exc}")
-                # Save checkpoint if needed (handled by checkpointer policies)
+                    logger.warn(f"Preview generation hook failed: {exc}")
 
                 def checkpoint_callback(dest, mesh, meta, s=state):
                     self._save_state(

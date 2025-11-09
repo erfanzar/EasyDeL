@@ -11,3 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""XPO (Exploratory Preference Optimization) trainer module.
+
+This module provides the XPO trainer for preference-based reinforcement learning
+with exploratory sampling, extending the GRPO framework.
+"""
+
+from .xpo_config import XPOConfig
+from .xpo_trainer import XPOTrainer
+
+__all__ = (
+    "XPOConfig",
+    "XPOTrainer",
+)

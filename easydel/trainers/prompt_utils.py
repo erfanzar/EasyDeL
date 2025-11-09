@@ -497,30 +497,6 @@ def maybe_apply_chat_template(
         return example
 
 
-def _unpair_row(examples: list[dict[str, list[dict[str, str]]]]) -> list[dict[str, list[dict[str, str]]]]:
-    """Internal function to unpair preference data rows.
-
-    Converts paired chosen/rejected examples into separate rows with labels.
-
-    Args:
-        examples: Batch of paired preference examples.
-
-    Returns:
-        dict: Unpaired examples with 'completion' and 'label' fields.
-
-    Note:
-        Internal helper for unpair_preference_dataset.
-    """
-    batch_size = len(examples["chosen"])
-    new_rows = {
-        "completion": examples["chosen"] + examples["rejected"],
-        "label": [True] * batch_size + [False] * batch_size,
-    }
-    if "prompt" in examples:
-        new_rows["prompt"] = examples["prompt"] + examples["prompt"]
-    return new_rows
-
-
 def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
     """
     Convert a conversational dataset with fields `from` and `value` to ChatML format.
@@ -685,7 +661,9 @@ def keep_arrays_map(
     return results
 
 
-def _unpair_row(examples: list[dict[str, list[dict[str, str]]]]) -> list[dict[str, list[dict[str, str]]]]:
+def _unpair_row(examples: dict[str, list[tp.Any]]) -> dict[str, list[tp.Any]]:
+    """Convert a batch of paired preference rows into unpaired rows."""
+
     batch_size = len(examples["chosen"])
     new_rows = {
         "completion": examples["chosen"] + examples["rejected"],
@@ -735,21 +713,38 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
     ```
     """
 
-    def _convert(split):
-        num_rows = len(split["chosen"])
-        completions = split["chosen"] + split["rejected"]
-        labels = [True] * num_rows + [False] * num_rows
-        payload: dict[str, tp.Any] = {
-            "completion": completions,
-            "label": labels,
-        }
-        if "prompt" in split.column_names:
-            payload["prompt"] = split["prompt"] + split["prompt"]
-        return Dataset.from_dict(payload)
-
     if isinstance(dataset, DatasetDict):
-        return DatasetDict({key: _convert(ds) for key, ds in dataset.items()})
-    return _convert(dataset)
+        return DatasetDict(
+            {
+                key: unpair_preference_dataset(subset, num_proc=num_proc, desc=desc)
+                for key, subset in dataset.items()
+            }
+        )
+
+    column_names = dataset.column_names
+
+    remove_columns = ["chosen", "rejected"]
+
+    try:
+        return dataset.map(
+            _unpair_row,
+            batched=True,
+            remove_columns=remove_columns,
+            num_proc=num_proc,
+            desc=desc,
+        )
+    except pa.ArrowInvalid:
+        data = {"completion": [], "label": []}
+        if "prompt" in column_names:
+            data["prompt"] = []
+        for example in dataset:
+            prompt_value = example.get("prompt")
+            for completion, label in ((example["chosen"], True), (example["rejected"], False)):
+                data["completion"].append(completion)
+                data["label"].append(label)
+                if "prompt" in column_names:
+                    data["prompt"].append(prompt_value)
+        return Dataset.from_dict(data)
 
 
 def maybe_unpair_preference_dataset(

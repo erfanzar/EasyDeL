@@ -29,7 +29,11 @@ from ..training_utils import make_assertions_and_get_sizes, minibatch_call, upda
 
 
 class RunningMoments:
-    """Simple running mean/variance tracker compatible with host-side updates."""
+    """Simple running mean/variance tracker for BCO delta parameter.
+
+    Tracks running statistics compatible with host-side updates for maintaining
+    the BCO delta parameter across training steps.
+    """
 
     def __init__(self):
         self.mean = 0.0
@@ -37,6 +41,11 @@ class RunningMoments:
         self.count = 1e-24
 
     def update(self, values: tp.Sequence[float] | jnp.ndarray | None):
+        """Update running statistics with new values.
+
+        Args:
+            values: New values to incorporate into running statistics.
+        """
         if values is None:
             return
         arr = jnp.asarray(values).reshape(-1)
@@ -58,9 +67,19 @@ class RunningMoments:
         self.count = tot_count
 
     def as_dict(self) -> dict[str, float]:
+        """Export statistics as dictionary.
+
+        Returns:
+            Dictionary with mean, var, and count.
+        """
         return {"mean": float(self.mean), "var": float(self.var), "count": float(self.count)}
 
     def load_dict(self, data: dict[str, float]):
+        """Load statistics from dictionary.
+
+        Args:
+            data: Dictionary with mean, var, and count.
+        """
         self.mean = float(data.get("mean", 0.0))
         self.var = float(data.get("var", 1.0))
         self.count = float(data.get("count", 1e-24))
@@ -77,7 +96,21 @@ def concatenated_forward(
     truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     aux_loss_enabled: bool = False,
 ) -> dict[str, jax.Array]:
-    """Run model to obtain completion log probabilities for each example."""
+    """Run model forward pass to compute completion log probabilities.
+
+    Args:
+        model: Model to run forward pass on.
+        batch: Input batch with prompts and completions.
+        is_encoder_decoder: Whether model uses encoder-decoder architecture.
+        label_pad_token_id: Token ID for padding labels.
+        padding_value: Padding token ID.
+        max_length: Maximum sequence length.
+        truncation_mode: How to truncate sequences.
+        aux_loss_enabled: Whether to compute auxiliary loss.
+
+    Returns:
+        Dictionary with completion log probabilities and logits.
+    """
 
     prompt_input_ids = batch["prompt_input_ids"]
     prompt_attention_mask = batch["prompt_attention_mask"]
@@ -125,24 +158,19 @@ def concatenated_forward(
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
         logits = outputs.logits
 
-        # Shift logits and labels for next-token prediction
         logits_shifted = logits[:, :-1, :]
         labels_shifted = completion_labels[:, 1:]
 
-        # Loss mask must be based on labels (ignore prompt via label_pad_token_id)
         loss_mask = labels_shifted != label_pad_token_id
 
-        # Sanitize masked labels to avoid negative indices
         labels_safe = jnp.where(loss_mask, labels_shifted, 0)
 
         log_probs = jax.nn.log_softmax(logits_shifted, axis=-1)
 
-        # Gather log probs for the actual tokens
         seq_len = labels_safe.shape[1]
         per_token = log_probs[jnp.arange(log_probs.shape[0])[:, None], jnp.arange(seq_len)[None, :], labels_safe]
         completion_logps = jnp.where(loss_mask, per_token, 0.0).sum(axis=1)
 
-        # Consistent diagnostic using the same mask
         mean_logits = jnp.where(loss_mask[..., None], logits_shifted, 0.0).sum() / jnp.maximum(
             loss_mask.sum(), jnp.array(1, dtype=jnp.int32)
         )
@@ -168,7 +196,20 @@ def compute_bco_loss(
     delta: float,
     udm_weights: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Return per-example losses and rewards for BCO."""
+    """Compute BCO loss and rewards for desirable/undesirable examples.
+
+    Args:
+        policy_logps: Policy model log probabilities.
+        reference_logps: Reference model log probabilities.
+        chosen_mask: Mask for desirable examples.
+        rejected_mask: Mask for undesirable examples.
+        beta: Temperature parameter.
+        delta: Running delta parameter.
+        udm_weights: Optional UDM weights for handling distribution mismatch.
+
+    Returns:
+        Tuple of (loss, chosen_rewards, rejected_rewards, chosen_losses, rejected_losses, chosen_mask_f, rejected_mask_f).
+    """
 
     chosen_mask_f = chosen_mask.astype(policy_logps.dtype)
     rejected_mask_f = rejected_mask.astype(policy_logps.dtype)
@@ -213,7 +254,22 @@ def training_step(
     partition_spec: PartitionSpec | None,
     gradient_accumulation_steps: int,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """JIT-compiled BCO training step."""
+    """Execute BCO training step with gradient computation.
+
+    Args:
+        state: Current model state.
+        batch: Training batch.
+        reference_state: Reference model state.
+        learning_rate_fn: Function mapping step to learning rate.
+        concatenated_forward_fn: Forward function.
+        beta: Temperature parameter.
+        loss_config: Optional loss configuration.
+        partition_spec: Sharding specification.
+        gradient_accumulation_steps: Number of gradient accumulation steps.
+
+    Returns:
+        Updated state and loss metrics.
+    """
 
     _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -322,7 +378,18 @@ def evaluation_step(
     concatenated_forward_fn: tp.Callable[..., dict[str, jax.Array]],
     beta: float,
 ) -> LossMetrics:
-    """BCO evaluation step."""
+    """Execute BCO evaluation step without gradients.
+
+    Args:
+        state: Current model state.
+        batch: Evaluation batch.
+        reference_state: Reference model state.
+        concatenated_forward_fn: Forward function.
+        beta: Temperature parameter.
+
+    Returns:
+        Loss metrics.
+    """
 
     running_delta = batch.get("running_mean")
     if running_delta is None:
@@ -394,7 +461,14 @@ def evaluation_step(
 
 
 def detach_metrics(metrics: LossMetrics) -> LossMetrics:
-    """Convert metrics to host scalars for serialization."""
+    """Convert metrics to host scalars for serialization.
+
+    Args:
+        metrics: Loss metrics to detach.
+
+    Returns:
+        Detached metrics with scalar values.
+    """
 
     if metrics.other_metrics is not None:
         filtered_other = {}

@@ -1039,6 +1039,111 @@ class DataCollatorForPreferenceGrain:
         return output
 
 
+@dataclass
+class _BCODataCollatorMixin:
+    max_prompt_length: int
+    max_completion_length: int
+    pad_token_id: int
+    label_pad_token_id: int
+    is_encoder_decoder: bool
+
+    def _pad_prompt(self, arrays: list[np.ndarray], padding_value: int, side: str = "left") -> jnp.ndarray:
+        return pad(arrays, self.max_prompt_length, padding_value=padding_value, padding_side=side)
+
+    def _pad_completion(self, arrays: list[np.ndarray], padding_value: int) -> jnp.ndarray:
+        return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
+
+    def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
+        return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
+
+
+class BCODataCollatorTFDS(_BCODataCollatorMixin):
+    """Data collator for BCO training with TFDS backends."""
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        prompt_input_ids = [np.asarray(f["prompt_input_ids"], dtype=np.int32) for f in features]
+        prompt_attention_mask = [np.asarray(f["prompt_attention_mask"], dtype=np.int32) for f in features]
+        completion_input_ids = [np.asarray(f["completion_input_ids"], dtype=np.int32) for f in features]
+        completion_attention_mask = [np.asarray(f["completion_attention_mask"], dtype=np.int32) for f in features]
+        completion_labels = [np.asarray(f["completion_labels"], dtype=np.int32) for f in features]
+        labels = np.asarray([bool(f["label"]) for f in features])
+
+        batch: dict[str, jnp.ndarray] = {}
+        batch["prompt_input_ids"] = self._pad_prompt(prompt_input_ids, self.pad_token_id)
+        batch["prompt_attention_mask"] = self._pad_prompt(prompt_attention_mask, 0)
+        batch["completion_input_ids"] = self._pad_optional(
+            completion_input_ids, self.max_completion_length, self.pad_token_id, "right"
+        )
+        batch["completion_attention_mask"] = self._pad_optional(
+            completion_attention_mask, self.max_completion_length, 0, "right"
+        )
+        batch["completion_labels"] = self._pad_optional(
+            completion_labels, self.max_completion_length, self.label_pad_token_id, "right"
+        )
+        batch["label"] = jnp.asarray(labels, dtype=jnp.bool_)
+
+        if "embedding_input_ids" in features[0]:
+            embedding_input_ids = [np.asarray(f["embedding_input_ids"], dtype=np.int32) for f in features]
+            embedding_attention_mask = [np.asarray(f["embedding_attention_mask"], dtype=np.int32) for f in features]
+            batch["embedding_input_ids"] = pad(embedding_input_ids, None, padding_value=self.pad_token_id)
+            batch["embedding_attention_mask"] = pad(embedding_attention_mask, None, padding_value=0)
+
+        if "reference_logps" in features[0]:
+            reference_logps = np.asarray([f["reference_logps"] for f in features], dtype=np.float32)
+            batch["reference_logps"] = jnp.asarray(reference_logps)
+
+        return batch
+
+
+class BCODataCollatorGrain(_BCODataCollatorMixin):
+    """Grain-compatible BCO data collator."""
+
+    def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        prompt_input_ids = np.asarray(feature["prompt_input_ids"], dtype=np.int32)
+        prompt_attention_mask = np.asarray(feature["prompt_attention_mask"], dtype=np.int32)
+        completion_input_ids = np.asarray(feature["completion_input_ids"], dtype=np.int32)
+        completion_attention_mask = np.asarray(feature["completion_attention_mask"], dtype=np.int32)
+        completion_labels = np.asarray(feature["completion_labels"], dtype=np.int32)
+
+        batch: dict[str, np.ndarray] = {}
+        batch["prompt_input_ids"] = pad_single(
+            prompt_input_ids,
+            self.max_prompt_length,
+            padding_value=self.pad_token_id,
+            padding_side="left",
+        )
+        batch["prompt_attention_mask"] = pad_single(
+            prompt_attention_mask,
+            self.max_prompt_length,
+            padding_value=0,
+            padding_side="left",
+        )
+        batch["completion_input_ids"] = pad_single(
+            completion_input_ids,
+            self.max_completion_length,
+            padding_value=self.pad_token_id,
+        )
+        batch["completion_attention_mask"] = pad_single(
+            completion_attention_mask,
+            self.max_completion_length,
+            padding_value=0,
+        )
+        batch["completion_labels"] = pad_single(
+            completion_labels,
+            self.max_completion_length,
+            padding_value=self.label_pad_token_id,
+        )
+        batch["label"] = np.asarray([feature["label"]], dtype=np.bool_)
+
+        if "embedding_input_ids" in feature:
+            batch["embedding_input_ids"] = np.asarray(feature["embedding_input_ids"], dtype=np.int32)
+            batch["embedding_attention_mask"] = np.asarray(feature["embedding_attention_mask"], dtype=np.int32)
+        if "reference_logps" in feature:
+            batch["reference_logps"] = np.asarray([feature["reference_logps"]], dtype=np.float32)
+
+        return batch
+
+
 @auto_pytree
 class DPODataCollatorWithPaddingTFDS:
     """Advanced data collator for DPO training with TFDS.

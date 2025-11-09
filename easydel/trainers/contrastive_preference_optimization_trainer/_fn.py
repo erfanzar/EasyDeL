@@ -193,7 +193,20 @@ def cpo_loss(
     simpo_gamma: float,
     alpha: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Compute per-example CPO losses and associated rewards."""
+    """Compute CPO losses and rewards for chosen/rejected pairs.
+
+    Args:
+        policy_chosen_logps: Policy log probs for chosen completions.
+        policy_rejected_logps: Policy log probs for rejected completions.
+        beta: Temperature parameter.
+        label_smoothing: Label smoothing factor.
+        loss_type: Loss variant (sigmoid, hinge, ipo, simpo).
+        simpo_gamma: Margin for SimPO loss.
+        alpha: AlphaPO reward shaping parameter.
+
+    Returns:
+        Tuple of (losses, chosen_rewards, rejected_rewards).
+    """
 
     if alpha != 0.0:
         chosen_probs = jnp.exp(policy_chosen_logps)
@@ -233,6 +246,15 @@ def _policy_nll_loss(
     chosen_logps_raw: jax.Array,
     chosen_lengths: jax.Array,
 ) -> jax.Array:
+    """Compute negative log-likelihood loss for policy regularization.
+
+    Args:
+        chosen_logps_raw: Raw log probabilities for chosen completions.
+        chosen_lengths: Token counts for normalization.
+
+    Returns:
+        Scalar NLL loss.
+    """
     total_tokens = jnp.maximum(jnp.sum(chosen_lengths), 1)
     total_logprob = jnp.sum(chosen_logps_raw)
     return -total_logprob / total_tokens
@@ -253,7 +275,26 @@ def training_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
 ) -> tuple[EasyDeLState, LossMetrics]:
-    """CPO training step with optional gradient accumulation."""
+    """Execute CPO training step with gradient computation.
+
+    Args:
+        state: Current model state.
+        batch: Training batch with chosen/rejected pairs.
+        learning_rate_fn: Function mapping step to learning rate.
+        concatenated_forward_fn: Forward function.
+        beta: Temperature parameter.
+        label_smoothing: Label smoothing factor.
+        loss_type: Loss variant to use.
+        cpo_alpha: Weight for behavior cloning regularization.
+        simpo_gamma: Margin for SimPO.
+        alpha: AlphaPO reward shaping parameter.
+        loss_config: Optional loss configuration.
+        partition_spec: Sharding specification.
+        gradient_accumulation_steps: Number of gradient accumulation steps.
+
+    Returns:
+        Updated state and loss metrics.
+    """
 
     _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -341,7 +382,23 @@ def evaluation_step(
     alpha: float,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
-    """CPO evaluation step."""
+    """Execute CPO evaluation step without gradients.
+
+    Args:
+        state: Current model state.
+        batch: Evaluation batch.
+        concatenated_forward_fn: Forward function.
+        beta: Temperature parameter.
+        label_smoothing: Label smoothing factor.
+        loss_type: Loss variant to use.
+        cpo_alpha: Weight for behavior cloning regularization.
+        simpo_gamma: Margin for SimPO.
+        alpha: AlphaPO reward shaping parameter.
+        partition_spec: Sharding specification.
+
+    Returns:
+        Loss metrics.
+    """
     del partition_spec
 
     model_outputs = concatenated_forward_fn(state.model, batch)

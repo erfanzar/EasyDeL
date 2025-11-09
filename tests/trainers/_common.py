@@ -1,3 +1,17 @@
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import logging
@@ -17,8 +31,8 @@ import easydel as ed
 MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
 PREFERENCE_SPLIT = "train[:50%]"
-MAX_PROMPT_LENGTH = 128
-MAX_COMPLETION_LENGTH = 128
+MAX_PROMPT_LENGTH = 512
+MAX_COMPLETION_LENGTH = 512
 MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH
 MAX_TRAINING_STEP = 512
 SAVE_ROOT = Path("tmp-files") / "trainer-smoke-tests"
@@ -40,9 +54,9 @@ def _prepare_save_dir(name: str) -> str:
     return str(path)
 
 
-@lru_cache(maxsize=1)
-def get_tokenizer():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO)
+@lru_cache(maxsize=4)
+def get_tokenizer(model_repo: str = MODEL_REPO):
+    tokenizer = AutoTokenizer.from_pretrained(model_repo)
     if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -71,9 +85,10 @@ def _load_model_kwargs() -> dict[str, Any]:
     )
 
 
-def load_causal_lm_model() -> ed.AutoEasyDeLModelForCausalLM:
-    tokenizer = get_tokenizer()
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(MODEL_REPO, **_load_model_kwargs())
+def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelForCausalLM:
+    repo = model_repo or MODEL_REPO
+    tokenizer = get_tokenizer(repo)
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(repo, **_load_model_kwargs())
     model.config.pad_token_id = tokenizer.pad_token_id
     return model
 
@@ -81,9 +96,7 @@ def load_causal_lm_model() -> ed.AutoEasyDeLModelForCausalLM:
 def load_sequence_classifier_model() -> ed.AutoEasyDeLModelForSequenceClassification:
     tokenizer = get_tokenizer()
     model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
-        MODEL_REPO,
-        num_labels=1,
-        **_load_model_kwargs(),
+        MODEL_REPO, num_labels=1, **_load_model_kwargs()
     )
     model.config.pad_token_id = tokenizer.pad_token_id
     return model
@@ -104,10 +117,7 @@ def build_sft_text_dataset(
         def template(sample):
             return sample["chosen"]
 
-    out = dataset.map(
-        lambda sample: {"messages": template(sample)},
-        remove_columns=dataset.column_names,
-    )
+    out = dataset.map(lambda sample: {"messages": template(sample)}, remove_columns=dataset.column_names)
     return out
 
 
@@ -119,22 +129,17 @@ def build_lm_dataset(
     text_dataset = build_sft_text_dataset(split, tokenizer=tokenizer)
 
     def tokenize(batch: dict[str, list[str]]) -> dict[str, list[np.ndarray]]:
-        encoded = tokenizer(
-            batch["text"],
+        encoded = tokenizer.apply_chat_template(
+            batch["messages"],
             padding="max_length",
             truncation=True,
             max_length=max_length,
             return_attention_mask=True,
+            return_dict=True,
         )
-        input_ids = [np.array(ids, dtype=np.int32) for ids in encoded["input_ids"]]
-        attention_mask = [np.array(mask, dtype=np.int32) for mask in encoded["attention_mask"]]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": [np.array(ids, dtype=np.int32) for ids in encoded["input_ids"]],
-        }
+        return encoded
 
-    return text_dataset.map(tokenize, batched=True, remove_columns=["text"])
+    return text_dataset.map(tokenize, batched=True, remove_columns=["messages"])
 
 
 def make_config(
@@ -149,19 +154,30 @@ def make_config(
         "total_batch_size": 4,
         "gradient_accumulation_steps": 1,
         "log_steps": 1,
-        "learning_rate": 1e-6,
+        "learning_rate": 8e-6,
         "max_training_steps": MAX_TRAINING_STEP,
         "max_sequence_length": MAX_TOTAL_LENGTH,
         "save_steps": 1_000,
         "save_total_limit": 1,
         "save_optimizer_state": False,
         "do_last_save": True,
-        "use_wandb": False,
+        "use_wandb": True,
+        "wandb_entity": "erfanzar",
         "shuffle_train_dataset": False,
         "progress_bar_type": "json",
         "max_prompt_length": MAX_PROMPT_LENGTH,
         "max_completion_length": MAX_COMPLETION_LENGTH,
         "max_length": MAX_TOTAL_LENGTH,
+        "generation_top_p": 0.95,
+        "generation_top_k": 4,
+        "generation_temperature": 0.4,
+        "generation_do_sample": True,
+        "generation_num_return_sequences": 4,
+        "generation_max_new_tokens": 2048,
+        "generation_interval": 100,
+        "generation_prompts": ["Here's Fibo in c++"],
+        "generation_use_train_prompts": False,
+        "generation_log_to_wandb": True,
     }
 
     if overrides:
@@ -207,10 +223,10 @@ def build_reward_dataset(split: str = PREFERENCE_SPLIT):
 
 def dummy_reward_fn(*, completions: Iterable[Any] | None = None, **_: Any):
     if completions is None:
-        return [0.0]
+        return [0.1]
     if isinstance(completions, list | tuple):
         length = len(completions)
     else:
         completions = list(completions)
         length = len(completions)
-    return [0.0] * max(length, 1)
+    return [0.1] * max(length, 1)

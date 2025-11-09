@@ -73,6 +73,7 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+log_debug_maybe = logger.debug
 
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
@@ -523,7 +524,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _configure_generation_function(self):
         """Prepare a default generation function when the model supports generation."""
-        if getattr(self, "generate_function", None) is not None:
+        if self.generate_function is not None:
             return
         state = getattr(self, "model_state", None)
         if state is None or not hasattr(state, "model"):
@@ -541,7 +542,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 **kwargs,
             )
         except Exception as exc:  # pragma: no cover - generation is optional
-            logger.debug(f"Skipping default generation function setup due to: {exc}")
+            log_debug_maybe(f"Skipping default generation function setup due to: {exc}")
 
     def _prepare_generation_config(
         self,
@@ -560,7 +561,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
     def _default_generation_kwargs(self) -> dict[str, tp.Any]:
         """Assemble default keyword arguments for `model.generate` based on training arguments."""
-        args = getattr(self, "arguments", None)
+        args = self.arguments
         if args is None:
             return {}
 
@@ -569,46 +570,41 @@ class BaseTrainer(BaseTrainerProtocol):
                 target[key] = value
 
         kwargs: dict[str, tp.Any] = {}
-        _maybe_insert(kwargs, "top_p", getattr(args, "generation_top_p", None))
-        _maybe_insert(kwargs, "top_k", getattr(args, "generation_top_k", None))
-        _maybe_insert(kwargs, "temperature", getattr(args, "generation_temperature", None))
-        _maybe_insert(kwargs, "do_sample", getattr(args, "generation_do_sample", None))
-        _maybe_insert(kwargs, "num_return_sequences", getattr(args, "generation_num_return_sequences", None))
-        _maybe_insert(kwargs, "max_new_tokens", getattr(args, "generation_max_new_tokens", None))
-        _maybe_insert(kwargs, "max_length", getattr(args, "generation_max_length", None))
+        _maybe_insert(kwargs, "top_p", args.generation_top_p)
+        _maybe_insert(kwargs, "top_k", args.generation_top_k)
+        _maybe_insert(kwargs, "temperature", args.generation_temperature)
+        _maybe_insert(kwargs, "do_sample", args.generation_do_sample)
+        _maybe_insert(kwargs, "num_return_sequences", args.generation_num_return_sequences)
+        _maybe_insert(kwargs, "max_new_tokens", args.generation_max_new_tokens)
 
         if "max_new_tokens" not in kwargs:
-            fallback = getattr(args, "max_completion_length", None)
+            fallback = args.max_completion_length
             if fallback is not None:
                 kwargs["max_new_tokens"] = fallback
 
-        if "max_length" not in kwargs:
-            fallback = getattr(args, "generation_max_length", None)
-            if fallback is None:
-                prompt_len = getattr(args, "max_prompt_length", None)
-                completion_len = getattr(args, "max_completion_length", None)
-                if prompt_len is not None and completion_len is not None:
-                    fallback = prompt_len + completion_len
-            if fallback is not None:
-                kwargs["max_length"] = fallback
-
         if "num_return_sequences" not in kwargs:
-            fallback = getattr(args, "num_return_sequences", None)
+            fallback = args.num_return_sequences
             if fallback is not None:
                 kwargs["num_return_sequences"] = fallback
 
         if "do_sample" not in kwargs:
             if any(key in kwargs for key in ("top_p", "top_k", "temperature")):
                 kwargs["do_sample"] = True
-
-        extra = getattr(args, "generation_extra_kwargs", None)
+        if "eos_token_id" not in kwargs:
+            proc = self._get_processing_class()
+            eos_token_id = getattr(proc, "eos_token_id", None)
+            if eos_token_id is not None:
+                kwargs["eos_token_id"] = eos_token_id
+            else:
+                kwargs["eos_token_id"] = getattr(getattr(proc, "tokenizer", None), "eos_token_id", None)
+        extra = args.generation_extra_kwargs
         if extra:
             kwargs.update(extra)
 
         return kwargs
 
     def _default_generation_config_overrides(self) -> dict[str, tp.Any] | None:
-        overrides = getattr(self.arguments, "generation_config_overrides", None)
+        overrides = self.arguments.generation_config_overrides
         if not overrides:
             return None
         return dict(overrides)
@@ -762,7 +758,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 **merged_kwargs,
             )
         else:
-            if getattr(self, "generate_function", None) is None:
+            if self.generate_function is None:
                 default_kwargs = self._default_generation_kwargs()
                 default_overrides = self._default_generation_config_overrides()
                 self.generate_function = self.create_generate_function(
@@ -787,6 +783,9 @@ class BaseTrainer(BaseTrainerProtocol):
         proc = getattr(self, "processing_class", None)
         if proc is not None:
             return proc
+        proc = getattr(self, "tokenizer", None)
+        if proc is not None:
+            return proc
         state = getattr(self, "model_state", None)
         if state is not None:
             model = state.model
@@ -808,18 +807,18 @@ class BaseTrainer(BaseTrainerProtocol):
         try:
             return processor.batch_decode(array, skip_special_tokens=True)
         except Exception as exc:  # pragma: no cover - best effort decoding
-            logger.debug(f"Failed to decode generation tokens: {exc}")
+            log_debug_maybe(f"Failed to decode generation tokens: {exc}")
             return None
 
     def _collect_generation_prompts(self) -> list[tp.Any]:
-        args = getattr(self, "arguments", None)
+        args = self.arguments
         if args is None:
             return []
-        configured_prompts = list(getattr(args, "generation_prompts", []))
-        target = getattr(args, "generation_num_prompts", len(configured_prompts) or 1)
+        configured_prompts = list(args.generation_prompts)
+        target = args.generation_num_prompts
         prompts = configured_prompts[: target or len(configured_prompts)]
         remaining = max(target - len(prompts), 0)
-        if remaining > 0 and getattr(args, "generation_use_train_prompts", False):
+        if remaining > 0 and args.generation_use_train_prompts:
             prompts.extend(self._sample_prompts_from_dataset(remaining))
         return prompts
 
@@ -830,7 +829,7 @@ class BaseTrainer(BaseTrainerProtocol):
         try:
             dataset_len = len(dataset)
         except Exception as exc:  # pragma: no cover - some datasets are not sized
-            logger.debug(f"Cannot sample prompts from training dataset: {exc}")
+            log_debug_maybe(f"Cannot sample prompts from training dataset: {exc}")
             return []
         if dataset_len == 0:
             return []
@@ -841,7 +840,7 @@ class BaseTrainer(BaseTrainerProtocol):
             try:
                 sample = dataset[int(idx)]
             except Exception as exc:  # pragma: no cover - ignore invalid rows
-                logger.debug(f"Failed to sample dataset prompt at index {idx}: {exc}")
+                log_debug_maybe(f"Failed to sample dataset prompt at index {idx}: {exc}")
                 continue
             prompts.append(sample)
         return prompts
@@ -849,7 +848,18 @@ class BaseTrainer(BaseTrainerProtocol):
     def _prepare_generation_input(self, prompt: tp.Any) -> dict[str, tp.Any] | None:
         processor = self._get_processing_class()
         prompt_text: str | None = None
-
+        encode_kwargs = dict(
+            truncation=True,
+            truncation_side="left",
+            tokenize=True,
+            padding="max_length",
+            max_length=self.arguments.max_sequence_length,
+            return_attention_mask=True,
+            return_tensors="jax",
+            return_dict=True,
+            padding_side="left",
+            add_generation_prompt=True,
+        )
         if isinstance(prompt, dict):
             if "input_ids" in prompt:
                 input_ids = prompt["input_ids"]
@@ -862,26 +872,24 @@ class BaseTrainer(BaseTrainerProtocol):
                 for key in ("prompt", "text"):
                     if key in prompt:
                         return self._prepare_generation_input(prompt[key])
-                logger.debug("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
+                log_debug_maybe("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
                 return None
         elif isinstance(prompt, str):
             if processor is None:
-                logger.debug("No tokenizer/processor available; cannot tokenize prompt text.")
+                logger.warn("No tokenizer/processor available; cannot tokenize prompt text.")
                 return None
             prompt_text = prompt
-            encode_kwargs = dict(return_tensors="np", truncation=True)
-            max_length = getattr(self.arguments, "max_prompt_length", None)
-            if max_length is not None:
-                encode_kwargs["max_length"] = max_length
+
             try:
-                encoded = processor(prompt, **encode_kwargs)
+                processor.padding_side = "left"
+                encoded = processor.apply_chat_template([{"role": "user", "content": prompt}], **encode_kwargs)
             except Exception as exc:  # pragma: no cover - tokenizer issues
-                logger.debug(f"Failed to tokenize generation prompt: {exc}")
+                log_debug_maybe(f"Failed to tokenize generation prompt: {exc}")
                 return None
             input_ids = encoded["input_ids"]
             attention = encoded.get("attention_mask")
         else:
-            logger.debug(f"Unsupported prompt type for preview generation: {type(prompt)}")
+            log_debug_maybe(f"Unsupported prompt type for preview generation: {type(prompt)}")
             return None
 
         input_array = np.asarray(input_ids)
@@ -918,17 +926,16 @@ class BaseTrainer(BaseTrainerProtocol):
     ) -> None:
         """Optionally run preview generation to monitor training progress."""
 
-        args = getattr(self, "arguments", None)
+        args = self.arguments
         if args is None:
             return
-        interval = getattr(args, "generation_interval", None)
+
+        interval = args.generation_interval
+
         if interval is None:
             return
+
         if interval <= 0 or step % interval != 0:
-            return
-        if not (args.is_process_zero or args.log_all_workers):
-            return
-        if getattr(self, "generate_function", None) is None:
             return
 
         prompts = self._collect_generation_prompts()
@@ -952,7 +959,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     shard_inputs=args.generation_shard_inputs,
                 )
             except Exception as exc:  # pragma: no cover - preview should not break training
-                logger.debug(f"Preview generation failed: {exc}")
+                log_debug_maybe(f"Preview generation failed: {exc}")
                 continue
 
             sequences = np.asarray(jax.device_get(sequences))
@@ -977,13 +984,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 if decoded_prompt:
                     prompt_text = decoded_prompt[0]
 
-            results.append(
-                {
-                    "prompt": prompt_text,
-                    "completions": completions,
-                    "step": step,
-                }
-            )
+            results.append({"prompt": prompt_text, "completions": completions, "step": step})
 
         if not results:
             return
@@ -992,22 +993,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
         for record in results:
             prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
-            logger.info(f"[preview step {step}] prompt: {prompt_repr}")
-            for idx, completion in enumerate(record["completions"]):
-                logger.info(f"  completion[{idx}]: {completion}")
 
-        if (
-            wandb is not None
-            and getattr(args, "use_wandb", False)
-            and getattr(args, "can_log_metrics", False)
-            and getattr(args, "generation_log_to_wandb", True)
-        ):
+        if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
             table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
             for record in results:
                 prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
                 for idx, completion in enumerate(record["completions"]):
                     table.add_data(step, prompt_repr, idx, completion)
             wandb.log({"preview_generations": table}, step=step)
+        if args.generation_preview_print:
+            logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+            for idx, completion in enumerate(record["completions"]):
+                logger.info(f"  completion[{idx}]: {completion}")
 
     def _one_to_all(self, arr: jax.Array) -> jax.Array:
         """Distribute array from one device to all devices.

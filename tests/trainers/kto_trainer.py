@@ -22,44 +22,49 @@ import easydel as ed
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
     from _common import (  # type: ignore
-        build_sft_text_dataset,
         get_logger,
         get_tokenizer,
         load_causal_lm_model,
+        load_preference_dataset,
         make_config,
+        run_trainer,
     )
 else:
     from ._common import (
-        build_sft_text_dataset,
         get_logger,
         get_tokenizer,
         load_causal_lm_model,
+        load_preference_dataset,
         make_config,
+        run_trainer,
     )
+
+REFERENCE_MODEL_REPO = "Qwen/Qwen3-4B"
 
 
 def main():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
-    model = load_causal_lm_model()
+    policy_model = load_causal_lm_model()
+    reference_model = load_causal_lm_model(REFERENCE_MODEL_REPO)
 
     trainer_args = make_config(
-        ed.SFTConfig,
-        "supervised-fine-tuning",
-        overrides={"dataset_text_field": "text", "packing": False},
+        ed.KTOConfig,
+        "kto",
+        overrides={"beta": 0.1, "loss_type": "kto"},
     )
 
-    dataset = build_sft_text_dataset(tokenizer=tokenizer)
+    dataset = load_preference_dataset()
 
-    logger.info("Starting SFT run.")
-    trainer = ed.SFTTrainer(
+    run_trainer(
+        ed.KTOTrainer,
+        model=policy_model,
         arguments=trainer_args,
-        model=model,
+        tokenizer=tokenizer,
         train_dataset=dataset,
-        processing_class=tokenizer,
+        logger=logger,
+        extra_kwargs={"reference_model": reference_model},
     )
-    trainer.train()
-    logger.info("SFT run finished.")
 
 
 if __name__ == "__main__":

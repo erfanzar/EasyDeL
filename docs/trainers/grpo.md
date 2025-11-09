@@ -85,16 +85,6 @@ def math_problem_reward_function(completion, reference_answer=None):
     except:
         return 0.0
 
-# Initialize vInference for generation
-inference = ed.vInference(
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=256,
-    num_return_sequences=4,  # Generate 4 different completions
-    temperature=0.7,
-    top_p=0.95
-)
-
 # Create GRPO config
 config = ed.GRPOConfig(
     model_name="grpo_math_solver",
@@ -111,7 +101,6 @@ config = ed.GRPOConfig(
 # Initialize trainer
 trainer = ed.GRPOTrainer(
     arguments=config,
-    vinference=inference,
     model=model,
     reward_funcs=math_problem_reward_function,
     train_dataset=dataset,
@@ -195,24 +184,6 @@ trainer = ed.GRPOTrainer(
     reward_funcs=[correctness_reward, reasoning_reward],
     # If you need specific tokenizers for different reward functions:
     reward_processing_classes=[tokenizer, tokenizer],
-)
-```
-
-### Custom Generation Parameters
-
-You can customize the generation parameters in vInference:
-
-```python
-inference = ed.vInference(
-    model=model,
-    tokenizer=tokenizer,
-    max_new_tokens=256,
-    num_return_sequences=8,      # More generations for better exploration
-    temperature=0.9,             # Higher temperature for more diversity
-    top_p=0.92,
-    top_k=100,
-    do_sample=True,
-    repetition_penalty=1.1,
 )
 ```
 

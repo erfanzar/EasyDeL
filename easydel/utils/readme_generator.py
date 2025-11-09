@@ -246,7 +246,7 @@ This model is built using [EasyDeL](https://github.com/erfanzar/EasyDeL), an ope
 - **Multi-Device Support**: Optimized to run on TPU, GPU, and CPU environments.
 - **Sharded Model Parallelism**: Supports model parallelism across multiple devices for scalability (using `auto_shard_model=True`).
 - **Customizable Precision**: Allows specification of `dtype`, `param_dtype`, and `precision`.
-- **Advanced Serving**: Includes `vInference` engine and OpenAI-compatible API server.
+- **Advanced Serving**: Includes `eSurge` LLM serving engine, `vWhisper` speech endpoints, and OpenAI-compatible APIs.
 - **Optimized Kernels**: Integrates multiple attention mechanisms (like `{{ model.attn_mechanism }}`) and platform-specific optimizations.
 
 ## Installation

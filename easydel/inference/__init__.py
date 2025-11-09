@@ -19,21 +19,10 @@ large language models and speech recognition models efficiently on JAX/XLA.
 
 Key Components:
     - vSurge: High-performance batched inference engine with continuous batching
-    - vInference: Streamlined inference engine for single/batch generation
     - vWhisper: Speech recognition and transcription engine
     - OpenAI API compatibility layer for seamless integration
 
 Example:
-    Basic text generation with vInference:
-
-    >>> from easydel.inference import vInference, vInferenceConfig
-    >>> config = vInferenceConfig(
-    ...     model_id="google/gemma-2b",
-    ...     max_new_tokens=100
-    ... )
-    >>> engine = vInference(config=config)
-    >>> response = engine.generate("Hello, how are you?")
-
     Running an OpenAI-compatible API server:
 
     >>> from easydel.inference import vSurgeApiServer, vSurge
@@ -49,10 +38,6 @@ Attributes:
     SamplingParams: High-level sampling configuration
     vDriver: Low-level driver for vSurge engine
     vEngine: Core vSurge inference engine
-    vInference: Streamlined inference interface
-    vInferenceApiServer: API server for vInference
-    vInferenceConfig: Configuration for vInference
-    vInferencePreCompileConfig: Pre-compilation settings
     vSurge: High-performance batched inference engine
     vSurgeApiServer: API server for vSurge
     vSurgeRequest: Request object for vSurge
@@ -64,7 +49,6 @@ from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer,
 from .oai_proxies import InferenceApiRouter
 from .sampling_params import JitableSamplingParams, SamplingParams
 from .tools import ToolParser, ToolParserManager
-from .vinference import vInference, vInferenceApiServer, vInferenceConfig, vInferencePreCompileConfig
 from .vsurge import vDriver, vEngine, vSurge, vSurgeApiServer, vSurgeRequest
 from .vwhisper import vWhisperInference, vWhisperInferenceConfig
 
@@ -81,10 +65,6 @@ __all__ = (
     "eSurgeRunner",
     "vDriver",
     "vEngine",
-    "vInference",
-    "vInferenceApiServer",
-    "vInferenceConfig",
-    "vInferencePreCompileConfig",
     "vSurge",
     "vSurgeApiServer",
     "vSurgeRequest",

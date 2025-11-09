@@ -118,7 +118,7 @@ class InferenceApiRouter:
     """Enhanced FastAPI server acting as an OpenAI API proxy.
 
     This server provides a complete OpenAI API-compatible interface that can
-    forward requests to either OpenAI's API or a local vSurge/vInference server.
+    forward requests to either OpenAI's API or a local eSurge/vSurge server.
     It includes additional monitoring, health check, and function calling endpoints.
 
     The router automatically detects backend capabilities and provides appropriate
