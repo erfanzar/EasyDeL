@@ -615,7 +615,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             prompt_tokens = len(esurge.tokenizer(content)["input_ids"])
             sampling_params = self._create_sampling_params(request)
 
-            tool_parser = self.get_tool_parser_for_model(request.model)
+            tool_parser = self.clone_tool_parser_for_model(request.model)
 
             previous_text = ""
             previous_token_ids = []
@@ -646,6 +646,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                             current_token_ids=current_token_ids,
                             delta_token_ids=delta_token_ids,
                             request=request,
+                            parser=tool_parser,
                         )
                         previous_text = current_text
                         previous_token_ids = current_token_ids
