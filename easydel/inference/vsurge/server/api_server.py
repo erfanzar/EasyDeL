@@ -353,7 +353,7 @@ class vSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             prompt_tokens = vsurge.count_tokens(content)
             sampling_params = self._create_sampling_params(request)
 
-            tool_parser = self.get_tool_parser_for_model(request.model)
+            tool_parser = self.clone_tool_parser_for_model(request.model)
 
             previous_text = ""
 
@@ -400,6 +400,7 @@ class vSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                                 current_text=current_text,
                                 delta_text=delta_text,
                                 request=request,
+                                parser=tool_parser,
                             )
 
                             previous_text = current_text

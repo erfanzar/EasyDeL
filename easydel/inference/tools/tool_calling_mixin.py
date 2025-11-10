@@ -123,6 +123,7 @@ class ToolCallingMixin:
         current_token_ids: list[int] | None = None,
         delta_token_ids: list[int] | None = None,
         request: ChatCompletionRequest | None = None,
+        parser: ToolParser | None = None,
     ) -> DeltaMessage | None:
         """Extract tool calls from streaming response.
 
@@ -139,10 +140,11 @@ class ToolCallingMixin:
         Returns:
             DeltaMessage with tool call information or None
         """
-        if not hasattr(self, "tool_parsers") or model_name not in self.tool_parsers:
-            return None
-
-        tool_parser = self.tool_parsers[model_name]
+        tool_parser = parser
+        if tool_parser is None:
+            if not hasattr(self, "tool_parsers") or model_name not in self.tool_parsers:
+                return None
+            tool_parser = self.tool_parsers[model_name]
 
         previous_token_ids = previous_token_ids or []
         current_token_ids = current_token_ids or []
@@ -157,6 +159,19 @@ class ToolCallingMixin:
             delta_token_ids=delta_token_ids,
             request=request,
         )
+
+    def clone_tool_parser_for_model(self, model_name: str) -> ToolParser | None:
+        """Create an isolated tool parser instance for request-scoped usage."""
+        parser = self.get_tool_parser_for_model(model_name)
+        if parser is None:
+            return None
+
+        parser_class = type(parser)
+        try:
+            return parser_class(parser.model_tokenizer)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning(f"Failed to clone tool parser for {model_name}: {exc}")
+            return None
 
     def get_tool_parser_for_model(self, model_name: str) -> ToolParser | None:
         """Get the tool parser for a specific model.
