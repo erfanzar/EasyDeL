@@ -81,8 +81,8 @@ class eSurgeLMEvalAdapter(LM):
     def _setup(self):
         """Set up the eSurge engine.
 
-        Ensures the eSurge scheduler is running. Unlike vSurge, eSurge
-        automatically initiates its scheduler in __init__, so we just verify it's running.
+        Ensures the eSurge scheduler is running; it should auto-init at construction,
+        but we guard against any cases where it is not.
         """
         if self.setup_complete:
             return

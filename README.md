@@ -31,7 +31,6 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
   - Image-to-Text processing
 - **Production-Ready Serving**:
   - `eSurge` engine for enterprise-grade, unified/ragged attention inference with paged KV cache and continuous batching
-  - `vSurge` orchestrator for long-lived, multi-request inference services
   - `vWhisper` for OpenAI-compatible speech transcription endpoints
 - **Performance Optimization**:
   - Integration with multiple attention mechanisms
@@ -133,38 +132,9 @@ for output in engine.stream("Hello EasyDeL!", sampling_params=ed.SamplingParams(
 print("\nTokens/s:", output.tokens_per_second)
 ```
 
-### Fast Inference Engines: eSurge & vSurge
+### Fast Inference Engine: eSurge
 
-- **eSurge** is the primary high-performance path: it pairs unified/ragged attention kernels with paged KV caches, memory pooling, and continuous batching. Use `engine.stream(...)` for interactive token streaming or `engine.generate(...)` for low-latency batch completions.
-- **vSurge** manages persistent decoding workers, provides request scheduling/queuing, and plugs directly into the OpenAI-compatible API server. Use it when you need a daemonized server that multiplexes many users and models.
-
-Minimal `vSurge` example:
-
-```python
-import asyncio
-import easydel as ed
-
-surge = ed.vSurge.from_model(
-    model=model,
-    processor=tokenizer,
-    max_prefill_length=2048,
-    max_concurrent_prefill=1,
-    max_concurrent_decodes=32,
-)
-
-surge.compile()
-surge.start()
-
-async def run():
-    samples = await surge.generate(
-        prompts=["USER:Write a haiku about EasyDeL\nASSISTANT:"],
-        sampling_params=[ed.SamplingParams(max_tokens=64, temperature=0.7)],
-        stream=False,
-    )
-    print(samples[0].text)
-
-asyncio.run(run())
-```
+`eSurge` is the high-performance path: it pairs unified/ragged attention kernels with paged KV caches, memory pooling, and continuous batching. Use `engine.stream(...)` for interactive token streaming or `engine.generate(...)` for low-latency batch completions.
 
 ### DPOTraining Example
 

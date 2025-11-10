@@ -61,6 +61,7 @@ from __future__ import annotations
 import time
 import typing
 from bisect import bisect_left
+from concurrent.futures import Future
 from dataclasses import replace
 from functools import partial
 
@@ -71,7 +72,7 @@ from jax import numpy as jnp
 
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
-from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
+from ..page_table import PAGE_TABLE_PADDING_VAL
 from ..scheduler import SchedulerOutput
 from .execution_manager import ExecutionManager
 from .sequence_buffer import (
@@ -181,6 +182,8 @@ class eSurgeRunner:
         max_num_seqs: int = 16,
         use_aot_forward: bool = True,
         verbose: bool = False,
+        enable_overlap_execution: bool = False,
+        enable_sampler_metrics: bool = False,
     ):
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
@@ -220,6 +223,9 @@ class eSurgeRunner:
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
+        self.enable_overlap_execution = enable_overlap_execution
+        self.enable_sampler_metrics = enable_sampler_metrics
+        self._sampler_engine = None
         logger.debug("eSurgeRunner initialization complete")
 
     @property
@@ -315,26 +321,6 @@ class eSurgeRunner:
             dtype=jnp.int32,
             device=self._empty_sharding,
         )
-
-        self.max_padded_slices = int(self.metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
-        self.slot_mapping_buf = jnp.full(
-            (3, self.max_padded_slices),
-            fill_value=SLOT_MAPPING_PADDING_VAL,
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-
-        self.page_table_flat_buf = jnp.zeros(
-            (self.num_reqs_max_model_len * self.max_pages_per_req,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-
-        self.slot_mapping_scratch_buf = jnp.zeros(
-            (self.max_padded_slices, 3),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
         self.num_tokens_paddings_arr = jnp.array(
             self.num_tokens_paddings,
             dtype=jnp.int32,
@@ -356,8 +342,6 @@ class eSurgeRunner:
             dtype=bool,
             device=self._empty_sharding,
         )
-
-        logger.debug(f"Allocated buffers: max_padded_slices={self.max_padded_slices}")
 
     def _precompile_jitted_helpers(
         self,
@@ -652,7 +636,7 @@ class eSurgeRunner:
         has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
 
-    def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+    def _execute_model_impl(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests.
 
         Main entry point for model execution. Processes all scheduled requests
@@ -710,6 +694,7 @@ class eSurgeRunner:
 
         req_ids_all: list[str] = []
         sampled_token_ids_all: list[list[int]] = []
+        token_logprobs: dict[str, float] = {}
 
         t_dev_state_start = time.time()
         dev_state = self.sequence_buffer.to_device_state()
@@ -783,7 +768,6 @@ class eSurgeRunner:
                 self.query_start_loc_buf,
                 self.seq_lens_buf,
                 self.pages_tables_buf,
-                self.slot_mapping_buf,
                 _hidden_states,
                 _logits,
             ) = self.executor_manager.execute(
@@ -794,7 +778,6 @@ class eSurgeRunner:
                 active_mask_full=self.active_mask_full_buf,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
-                slot_mapping_buf=self.slot_mapping_buf,
                 padded_num_reqs=padded_num_reqs,
             )
             # account for device time
@@ -805,6 +788,7 @@ class eSurgeRunner:
             # host copies once
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
+            logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
 
             sq_utime = time.time()
             self.sequence_buffer = self.sequence_buffer.from_device_state(dev_state)
@@ -822,6 +806,16 @@ class eSurgeRunner:
                     sampled_token_ids_all.append([tid])
                     if rid in self.requests:
                         self.requests[rid].output_token_ids.append(tid)
+                    if (
+                        self.enable_sampler_metrics
+                        and self._sampler_engine is not None
+                        and logits_np is not None
+                        and i < logits_np.shape[0]
+                    ):
+                        try:
+                            token_logprobs[rid] = self._sampler_engine.token_logprob(logits_np[i], tid)
+                        except Exception:
+                            pass
                 else:
                     sampled_token_ids_all.append([])
             up_wtime_took = time.time() - up_wtime
@@ -859,4 +853,13 @@ class eSurgeRunner:
             prompt_logprobs_dict={rid: None for rid in req_ids_all},
             finished_sending=None,
             finished_recving=None,
+            token_logprobs=token_logprobs or None,
         )
+
+    def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        return self._execute_model_impl(scheduler_output)
+
+    def wait_for_execution(self, future: Future) -> ModelRunnerOutput:
+        return future.result()
+
+    def shutdown(self) -> None: ...

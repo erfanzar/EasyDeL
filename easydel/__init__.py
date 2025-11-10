@@ -132,15 +132,10 @@ _import_structure = {
         "eSurge",
         "eSurgeApiServer",
         "eSurgeRunner",
-        "vDriver",
-        "vEngine",
-        "vSurge",
-        "vSurgeApiServer",
-        "vSurgeRequest",
         "vWhisperInference",
         "vWhisperInferenceConfig",
     ],
-    "inference.evaluations": ["eSurgeLMEvalAdapter", "vSurgeLMEvalAdapter"],
+    "inference.evaluations": ["eSurgeLMEvalAdapter"],
     "infra": [
         "EasyDeLBaseConfig",
         "EasyDeLBaseConfigDict",
@@ -590,15 +585,10 @@ if _tp.TYPE_CHECKING:
         eSurge,
         eSurgeApiServer,
         eSurgeRunner,
-        vDriver,
-        vEngine,
-        vSurge,
-        vSurgeApiServer,
-        vSurgeRequest,
         vWhisperInference,
         vWhisperInferenceConfig,
     )
-    from .inference.evaluations import eSurgeLMEvalAdapter, vSurgeLMEvalAdapter
+    from .inference.evaluations import eSurgeLMEvalAdapter
     from .infra import (
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
@@ -830,7 +820,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.15"]
+    _targeted_ejkernel_versions = ["0.0.16"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

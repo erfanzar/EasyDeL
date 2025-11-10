@@ -270,6 +270,16 @@ class MetricsCollector:
                 page_free_rate=page_free_rate,
             )
             self.cache_metrics.append(metrics)
+            if self.enable_detailed_logging and self.logger:
+                self.logger.info(json.dumps({"type": "cache_metrics", **asdict(metrics)}))
+
+    def record_cache_event(self, event: str, details: dict[str, Any] | None = None) -> None:
+        """Record lifecycle events for the KV cache."""
+        payload = {"event": event, "timestamp": time.time(), **(details or {})}
+        with self._lock:
+            self.counters[f"cache_event_{event}"] += 1
+        if self.logger:
+            self.logger.info(json.dumps({"type": "cache_event", **payload}))
 
     def get_system_metrics(self, window_seconds: float = 60.0) -> SystemMetrics:
         """Get aggregated system metrics for the specified time window."""

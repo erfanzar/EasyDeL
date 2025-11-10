@@ -224,8 +224,16 @@ Starting the Server
     # Start monitoring (optional)
     engine.start_monitoring()
 
-    # Launch API server
-    server = ed.eSurgeApiServer(engine)
+    # Launch API server (API keys optional)
+    server = ed.eSurgeApiServer(
+        engine,
+        require_api_key=True,                 # Optional: enforce keys at runtime
+        api_keys={"demo-key": {"label": "UI"}},  # Pre-provisioned keys
+    )
+
+    # Additional keys can be issued programmatically
+    print("Generated key:", server.generate_api_key(label="notebook"))
+
     server.fire(host="0.0.0.0", port=8000)
 
 The server provides OpenAI-compatible endpoints:
@@ -247,7 +255,7 @@ Once the server is running, you can use any OpenAI-compatible client:
 
     client = openai.OpenAI(
         base_url="http://localhost:8000/v1",
-        api_key="not-required",  # eSurge doesn't require API keys
+        api_key="demo-key",  # Matches the key configured on the server
     )
 
     response = client.chat.completions.create(
@@ -263,10 +271,19 @@ Once the server is running, you can use any OpenAI-compatible client:
     for chunk in response:
         print(chunk.choices[0].delta.content, end="")
 
+API keys may be supplied via ``Authorization: Bearer <key>``, ``X-API-Key``, or
+an ``api_key`` query parameter. If ``require_api_key`` is ``False`` (the
+default), clients can still connect without a key, but registered keys will
+collect per-client prompt/completion token usage.
+
 Monitoring and Metrics
 ----------------------
 
 eSurge provides comprehensive monitoring capabilities:
+
+When API key enforcement is enabled, the ``/metrics`` endpoint includes an
+``api_key_usage`` section that reports prompt and completion token totals for
+each registered key, making it easy to attribute usage per client.
 
 Console Monitoring
 ~~~~~~~~~~~~~~~~~~

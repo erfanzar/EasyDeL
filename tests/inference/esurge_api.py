@@ -17,6 +17,13 @@ def main():
     parser.add_argument("--port", type=int, default=11559, help="Port to run the server on")
     parser.add_argument("--workers", type=int, default=1, help="Number of worker processes")
     parser.add_argument("--enable-function-calling", action="store_true", help="Enable function calling support")
+    parser.add_argument("--require-api-key", action="store_true", help="Require API keys for every request")
+    parser.add_argument(
+        "--api-key",
+        action="append",
+        default=None,
+        help="Pre-provisioned API key (can be passed multiple times)",
+    )
     parser.add_argument("--log-level", type=str, default="info", help="Logging level")
 
     args = parser.parse_args()
@@ -57,7 +64,13 @@ def main():
         oai_like_processor=True,
         enable_function_calling=args.enable_function_calling,
         default_function_format=FunctionCallFormat.OPENAI,
+        require_api_key=args.require_api_key,
+        api_keys=args.api_key,
     )
+
+    if args.require_api_key and not args.api_key:
+        generated_key = server.generate_api_key(label="cli")
+        print(f"[API] Generated key for testing: {generated_key}")
 
     server.run(host=args.host, port=args.port, workers=args.workers, log_level=args.log_level)
 

@@ -242,8 +242,12 @@ Starting the Server
     # Enable monitoring
     engine.start_monitoring()
 
-    # Launch API server
-    server = ed.eSurgeApiServer(engine)
+    # Launch API server (keys optional)
+    server = ed.eSurgeApiServer(
+        engine,
+        require_api_key=True,
+        api_keys={"demo-key": {"label": "dashboard"}},
+    )
     server.fire(host="0.0.0.0", port=8000)
 
 Using with OpenAI Client
@@ -256,7 +260,7 @@ Using with OpenAI Client
     # Configure client
     client = openai.OpenAI(
         base_url="http://localhost:8000/v1",
-        api_key="not-required",
+        api_key="demo-key",
     )
 
     # Chat completion
@@ -275,6 +279,10 @@ Using with OpenAI Client
     for chunk in response:
         if chunk.choices[0].delta.content:
             print(chunk.choices[0].delta.content, end="")
+
+API keys may be sent via ``Authorization`` (Bearer), ``X-API-Key``, or the
+``api_key`` query parameter, and per-key token usage is surfaced under
+``/metrics`` when the feature is enabled.
 
 Performance Monitoring
 ----------------------

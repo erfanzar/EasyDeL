@@ -164,33 +164,6 @@ class eSurgeCfg(TypedDict, total=False):
     verbose: NotRequired[bool]
 
 
-class vSurgeCfg(TypedDict, total=False):
-    """vSurge inference engine configuration.
-
-    Attributes:
-        max_concurrent_decodes: Maximum number of concurrent decode calls (default: device count)
-        max_concurrent_prefill: Maximum number of concurrent prefill steps (default: 1)
-        prefill_lengths: Custom prefill lengths as int or list of ints
-        max_prefill_length: Maximum tokens during prefill phase (default: max_length // 2)
-        max_length: Maximum sequence length for decoding
-        interleaved_mode: Enable interleaved decoding and prefill scheduling
-        slot_clear_steps: Steps after which stale memory slots are cleared (default: 0)
-        bytecode_decode: Enable bytecode decoding for handling malformed UTF-8
-        verbose: Enable verbose vSurge output
-        seed: Random seed for consistent decoding (default: 894)
-    """
-
-    max_concurrent_decodes: NotRequired[int]
-    max_concurrent_prefill: NotRequired[int]
-    prefill_lengths: NotRequired[int | list[int]]
-    max_prefill_length: NotRequired[int]
-    max_length: NotRequired[int]
-    interleaved_mode: NotRequired[bool]
-    slot_clear_steps: NotRequired[int]
-    bytecode_decode: NotRequired[bool]
-    verbose: NotRequired[bool]
-    seed: NotRequired[int]
-
 
 class TextDatasetInformCfg(TypedDict, total=False):
     """Text dataset information configuration.
@@ -383,7 +356,6 @@ class ELMConfig(TypedDict, total=False):
         base_config: Base model configuration values
         mixture: Data mixture configuration for training/evaluation datasets
         esurge: eSurge inference engine configuration
-        vsurge: vSurge inference engine configuration
         trainer: Training configuration
         eval: Evaluation configuration for lm-evaluation-harness
 
@@ -436,6 +408,5 @@ class ELMConfig(TypedDict, total=False):
     base_config: NotRequired[BaseCfg]
     mixture: NotRequired[DataMixtureCfg]
     esurge: NotRequired[eSurgeCfg]
-    vsurge: NotRequired[vSurgeCfg]
     trainer: NotRequired[TrainerConfig]
     eval: NotRequired[EvalKwargs]

@@ -26,7 +26,7 @@ from enum import Enum
 from http import HTTPStatus
 
 from eformer.loggings import get_logger
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
@@ -48,6 +48,7 @@ from ...openai_api_modules import (
 from ...sampling_params import SamplingParams
 from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
+from .api_keys import ApiKeyManager
 
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
@@ -218,6 +219,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         oai_like_processor: bool = True,
         enable_function_calling: bool = True,
         tool_parser_name: str = "hermes",
+        require_api_key: bool = False,
+        api_keys: dict[str, dict[str, tp.Any]] | list[str] | None = None,
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -227,6 +230,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             oai_like_processor: Enable OpenAI-like processor compatibility for chat templates.
             enable_function_calling: Enable function/tool calling support.
             tool_parser_name: Name of the tool parser to use (e.g., "hermes", "qwen", etc.)
+            require_api_key: Enforce API key authentication for every endpoint.
+            api_keys: Optional list/dict of pre-provisioned API keys with metadata.
             **kwargs: Additional arguments passed to BaseInferenceApiServer.
 
         Raises:
@@ -259,6 +264,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         self.status = ServerStatus.STARTING
         self._active_requests: dict[str, dict] = {}
         self.tool_parser_name = tool_parser_name
+        self.api_key_manager: ApiKeyManager | None = None
+        if require_api_key or api_keys:
+            self.api_key_manager = ApiKeyManager(api_keys=api_keys, require_api_key=require_api_key)
 
         super().__init__(
             server_name="EasyDeL eSurge API Server",
@@ -312,6 +320,66 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             return adapter.count_tokens(content)
         adapter = next(iter(self.adapters.values()))
         return adapter.count_tokens(content)
+
+    def generate_api_key(self, label: str | None = None) -> str:
+        """Create and register a new random API key."""
+        if self.api_key_manager is None:
+            self.api_key_manager = ApiKeyManager(require_api_key=False)
+        return self.api_key_manager.generate_api_key(label=label).key
+
+    def register_api_key(self, key: str, label: str | None = None) -> str:
+        """Register a user-supplied API key."""
+        if self.api_key_manager is None:
+            self.api_key_manager = ApiKeyManager(require_api_key=False)
+        return self.api_key_manager.register_api_key(key=key, label=label).key
+
+    def _extract_api_key(self, raw_request: Request) -> str | None:
+        """Extract API key from Authorization header, X-API-Key header, or query param."""
+        auth_header = raw_request.headers.get("Authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            return auth_header.split(" ", 1)[1].strip()
+
+        header_key = raw_request.headers.get("X-API-Key")
+        if header_key:
+            return header_key.strip()
+
+        query_key = raw_request.query_params.get("api_key")
+        if query_key:
+            return query_key.strip()
+
+        return None
+
+    def _authorize_request(self, raw_request: Request) -> str | None:
+        """Validate incoming request when API key enforcement is enabled."""
+        if self.api_key_manager is None or not self.api_key_manager.enabled:
+            return None
+
+        api_key = self._extract_api_key(raw_request)
+        usage = self.api_key_manager.validate_key(api_key)
+
+        if usage is None:
+            if self.api_key_manager.require_api_key:
+                raise HTTPException(status_code=401, detail="Missing or invalid API key")
+            return None
+
+        raw_request.state.api_key = usage.key
+        return usage.key
+
+    def _record_api_key_usage(
+        self,
+        raw_request: Request | None,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        """Track per-key token usage after a request completes."""
+        if self.api_key_manager is None or raw_request is None:
+            return
+
+        api_key = getattr(raw_request.state, "api_key", None)
+        if not api_key:
+            return
+
+        self.api_key_manager.record_usage(api_key, prompt_tokens, completion_tokens)
 
     @staticmethod
     def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
@@ -457,7 +525,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self.thread_pool, self._prepare_chat_input, request, esurge)
 
-    async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
+    async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> tp.Any:
         """Handle chat completion requests.
 
         Main endpoint for /v1/chat/completions. Supports both streaming and
@@ -475,6 +543,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             HTTPException: For client errors (400, 404).
         """
         request_id = str(uuid.uuid4())
+        self._authorize_request(raw_request)
         self.metrics.total_requests += 1
 
         try:
@@ -487,9 +556,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             content = await self._prepare_chat_input_async(request, esurge)
 
             if request.stream:
-                return await self._handle_chat_streaming(request, esurge, content, request_id)
+                return await self._handle_chat_streaming(request, esurge, content, request_id, raw_request)
             else:
-                return await self._handle_chat_completion(request, esurge, content, request_id)
+                return await self._handle_chat_completion(request, esurge, content, request_id, raw_request)
 
         except HTTPException:
             self.metrics.failed_requests += 1
@@ -506,6 +575,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         esurge: eSurge,
         content: str,
         request_id: str,
+        raw_request: Request,
     ) -> ChatCompletionResponse:
         """Handle non-streaming chat completion.
 
@@ -575,6 +645,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         )
 
         self.metrics.successful_requests += 1
+        self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
 
         return ChatCompletionResponse(
             model=request.model,
@@ -588,6 +659,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         esurge: eSurge,
         content: str,
         request_id: str,
+        raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming chat completion with delta chunks.
 
@@ -718,6 +790,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
                 self.metrics.total_tokens_generated += total_generated
                 self.metrics.successful_requests += 1
+                self._record_api_key_usage(raw_request, prompt_tokens, total_generated)
 
             except Exception as e:
                 self.metrics.failed_requests += 1
@@ -735,7 +808,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             },
         )
 
-    async def completions(self, request: CompletionRequest) -> tp.Any:
+    async def completions(self, request: CompletionRequest, raw_request: Request) -> tp.Any:
         """Handle completion requests.
 
         Endpoint for /v1/completions. Simpler text completion without
@@ -753,6 +826,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         """
         request_id = str(uuid.uuid4())
         self.metrics.total_requests += 1
+        self._authorize_request(raw_request)
 
         try:
             adapter = self._get_adapter(request.model)
@@ -766,9 +840,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                 raise HTTPException(400, "Prompt cannot be empty")
 
             if request.stream:
-                return await self._handle_completion_streaming(request, esurge, prompt, request_id)
+                return await self._handle_completion_streaming(request, esurge, prompt, request_id, raw_request)
             else:
-                return await self._handle_completion_response(request, esurge, prompt, request_id)
+                return await self._handle_completion_response(request, esurge, prompt, request_id, raw_request)
 
         except HTTPException:
             self.metrics.failed_requests += 1
@@ -784,6 +858,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         esurge: eSurge,
         prompt: str,
         request_id: str,
+        raw_request: Request,
     ) -> CompletionResponse:
         """Handle non-streaming completion.
 
@@ -833,6 +908,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         )
 
         self.metrics.successful_requests += 1
+        self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
 
         return CompletionResponse(
             model=request.model,
@@ -846,6 +922,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         esurge: eSurge,
         prompt: str,
         request_id: str,
+        raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming completion with delta chunks.
 
@@ -928,6 +1005,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
                 self.metrics.total_tokens_generated += total_generated
                 self.metrics.successful_requests += 1
+                self._record_api_key_usage(raw_request, prompt_tokens, total_generated)
 
             except Exception as e:
                 self.metrics.failed_requests += 1
@@ -945,7 +1023,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             },
         )
 
-    async def health_check(self) -> JSONResponse:
+    async def health_check(self, raw_request: Request) -> JSONResponse:
         """Health check endpoint.
 
         Returns server health status and model information.
@@ -960,6 +1038,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
             Status code 200 if READY, 503 otherwise.
         """
+        self._authorize_request(raw_request)
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         model_health_info = {}
@@ -982,13 +1061,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         status_code = 200 if self.status == ServerStatus.READY else 503
         return JSONResponse(health_status, status_code=status_code)
 
-    async def get_metrics(self) -> JSONResponse:
+    async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """Get server performance metrics.
 
         Returns:
             JSONResponse with comprehensive server metrics including
             request counts, token statistics, throughput, and status.
         """
+        self._authorize_request(raw_request)
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         return JSONResponse(
@@ -1002,10 +1082,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                 "active_requests": len(self._active_requests),
                 "models_loaded": len(self.adapters),
                 "status": self.status.value,
+                "api_key_usage": self.api_key_manager.usage_snapshot() if self.api_key_manager else {},
             }
         )
 
-    async def list_models(self) -> JSONResponse:
+    async def list_models(self, raw_request: Request) -> JSONResponse:
         """List available models.
 
         OpenAI-compatible model listing endpoint.
@@ -1013,6 +1094,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         Returns:
             JSONResponse with list of available models and their metadata.
         """
+        self._authorize_request(raw_request)
         models_data = []
         for model_id, adapter in self.adapters.items():
             model_info = adapter.get_model_info()
@@ -1039,7 +1121,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             }
         )
 
-    async def get_model(self, model_id: str) -> JSONResponse:
+    async def get_model(self, model_id: str, raw_request: Request) -> JSONResponse:
         """Get model details.
 
         Args:
@@ -1051,6 +1133,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         Raises:
             HTTPException: If model not found.
         """
+        self._authorize_request(raw_request)
         adapter = self._get_adapter(model_id)
         model_info = adapter.get_model_info()
 
@@ -1068,7 +1151,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             }
         )
 
-    async def list_tools(self) -> JSONResponse:
+    async def list_tools(self, raw_request: Request) -> JSONResponse:
         """List available tools/functions for each model.
 
         Returns example tool definitions and supported formats.
@@ -1077,6 +1160,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         Returns:
             JSONResponse with tool definitions per model.
         """
+        self._authorize_request(raw_request)
         model_names = list(self.adapters.keys())
         tools_response = self.create_tools_response(model_names)
         return JSONResponse(tools_response)
@@ -1110,14 +1194,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             usage=usage,
         )
 
-    async def execute_tool(self, request: tp.Any) -> JSONResponse:
+    async def execute_tool(self, raw_request: Request) -> JSONResponse:
         """Execute a tool/function call.
 
         Placeholder endpoint for tool execution. Implement this method
         to integrate with actual tool execution systems.
 
         Args:
-            request: Tool execution request.
+            raw_request: Tool execution request.
 
         Returns:
             JSONResponse with NOT_IMPLEMENTED status.
@@ -1126,4 +1210,5 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             This is a placeholder that should be implemented based on
             specific tool execution requirements.
         """
+        self._authorize_request(raw_request)
         return self.create_tool_execution_placeholder()

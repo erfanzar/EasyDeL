@@ -70,6 +70,7 @@ Technical Details:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -87,13 +88,14 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
+from easydel.workers.esurge.pipeline import DetokenizerResult, WorkerManager
 
 from ..decoders import SmartBytecodeDecoder
 from .engine_types import EngineCoreOutputs
-from .metrics import get_metrics_collector, initialize_metrics
+from .metrics import get_metrics_collector, initialize_metrics, log_metrics_summary
 from .request import EngineRequest, EngineRequestStatus
 from .runners import eSurgeRunner
-from .scheduler import Scheduler
+from .scheduler import Scheduler, SchedulerOutput
 from .utils import truncate_tokens
 
 if typing.TYPE_CHECKING:
@@ -265,6 +267,8 @@ class eSurge:
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
+        overlap_execution: bool = False,
+        sampler_metrics: bool = False,
         esurge_name: str | None = None,
         reserve_tokens: int | None = None,
         auto_truncate_prompt: bool = True,
@@ -275,6 +279,9 @@ class eSurge:
         decode_truncated_prompt: bool = True,
         bytecode_decode: bool = True,
         destroy_pages_on_pause: bool = True,
+        detokenizer_max_states: int = 1 << 16,
+        tokenizer_endpoint: str | None = None,
+        detokenizer_endpoint: str | None = None,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -315,8 +322,16 @@ class eSurge:
                 UTF-8 sequences. This prevents "�" characters during streaming when
                 tokens split multi-byte UTF-8 characters. Uses intelligent buffering
                 and progressive backtracking to find clean decode points.
+            overlap_execution: Enable double-buffered model execution to overlap
+                scheduler work with device execution (experimental).
+            sampler_metrics: Enable the lightweight sampler JIT for recording
+                token log-probabilities on-device.
+            detokenizer_max_states: Maximum number of streaming decode states
+                the detokenizer worker will keep resident (power-of-two recommended).
             destroy_pages_on_pause: When True, destroying the ragged KV cache upon
                 pause() to free memory, and lazily reinitializing it on resume().
+            tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
+            detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -346,6 +361,44 @@ class eSurge:
         self.page_size = page_size
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
+        if tokenizer is None:
+            if isinstance(model, str):
+                tokenizer_source = model
+                tokenizer_obj = AutoTokenizer.from_pretrained(model)
+            else:
+                raise ValueError("Tokenizer must be provided when using preloaded model")
+        elif isinstance(tokenizer, str):
+            tokenizer_source = tokenizer
+            tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
+        else:
+            tokenizer_obj = tokenizer
+            tokenizer_source = getattr(tokenizer_obj, "name_or_path", None)
+        self.tokenizer = tokenizer_obj
+
+        self._monitoring_server = None
+        self._dashboard = None
+        self._dashboard_thread = None
+        self._dashboard_urls = None
+        self._monitoring_initialized = False
+        self._esurge_name = esurge_name
+        self._bytecode_decode = bytecode_decode
+        self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
+        self._scheduler_running = False
+        self.destroy_pages_on_pause = destroy_pages_on_pause
+        self._kv_cache_valid = True
+        self._paused = False
+
+        tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
+        detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
+        self._worker_manager = WorkerManager(tokenizer_source)
+        self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
+            detokenizer_max_states=detokenizer_max_states,
+            tokenizer_endpoint=tokenizer_endpoint,
+            detokenizer_endpoint=detokenizer_endpoint,
+        )
+        self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
+        self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
+
         if isinstance(model, str):
             self.model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
@@ -367,29 +420,12 @@ class eSurge:
         else:
             model = model.update_module(attn_mechanism="ragged_page_attention")
             self.model = model
-
-        if tokenizer is None:
-            if isinstance(model, str):
-                self.tokenizer = AutoTokenizer.from_pretrained(model)
-            else:
-                raise ValueError("Tokenizer must be provided when using preloaded model")
-        elif isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-        else:
-            self.tokenizer = tokenizer
-
-        self._monitoring_server = None
-        self._dashboard = None
-        self._dashboard_thread = None
-        self._dashboard_urls = None
-        self._monitoring_initialized = False
-        self._esurge_name = esurge_name
-        self._bytecode_decode = bytecode_decode
-        self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
-        self._scheduler_running = False
-        self.destroy_pages_on_pause = destroy_pages_on_pause
-        self._kv_cache_valid = True
-        self._paused = False
+        # Profiling state
+        self._profiling_active = False
+        self._profiling_steps_remaining = 0
+        self._profiling_output_dir: str | None = None
+        self._profiling_host_level: int | None = None
+        self._profiling_python_level: int | None = None
         self.runner = eSurgeRunner(
             model=self.model,
             hbm_utilization=hbm_utilization,
@@ -399,7 +435,10 @@ class eSurge:
             max_num_seqs=max_num_seqs,
             use_aot_forward=use_aot_forward,
             verbose=runner_verbose,
+            enable_overlap_execution=overlap_execution,
+            enable_sampler_metrics=sampler_metrics,
         )
+        self._overlap_execution = overlap_execution
         if compile_runner:
             self.runner.compile()
 
@@ -514,17 +553,42 @@ class eSurge:
 
             def _scheduler_loop():
                 logger.info("Starting background scheduler loop")
+                if not self._overlap_execution:
+                    while self._scheduler_running:
+                        try:
+                            scheduler_output = self.scheduler.schedule()
+                            model_output = self.runner.execute_model(scheduler_output)
+                            engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                            if engine_outputs:
+                                self._process_engine_outputs(engine_outputs)
+                        except Exception as e:
+                            traceback.print_exc()
+                            logger.error(f"Error in scheduler loop: {e}")
+                            time.sleep(0.01)
+                    logger.info("Background scheduler loop stopped")
+                    return
+
+                pending_future: tuple[Any, SchedulerOutput] | None = None
                 while self._scheduler_running:
                     try:
+                        if pending_future is not None:
+                            self._drain_runner_future(*pending_future)
+                            pending_future = None
+
                         scheduler_output = self.scheduler.schedule()
-                        model_output = self.runner.execute_model(scheduler_output)
-                        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
-                        if engine_outputs:
-                            self._process_engine_outputs(engine_outputs)
+                        future = self.runner.execute_model_async(scheduler_output)
+                        pending_future = (future, scheduler_output)
                     except Exception as e:
                         traceback.print_exc()
                         logger.error(f"Error in scheduler loop: {e}")
                         time.sleep(0.01)
+
+                if pending_future is not None:
+                    try:
+                        self._drain_runner_future(*pending_future)
+                    except Exception as e:
+                        traceback.print_exc()
+                        logger.error(f"Error processing pending batch: {e}")
                 logger.info("Background scheduler loop stopped")
 
             self._scheduler_running = True
@@ -552,6 +616,16 @@ class eSurge:
                     logger.warning("Scheduler thread did not stop gracefully")
                 self._scheduler_thread = None
             logger.info("Background scheduler terminated")
+            if self._profiling_active:
+                try:
+                    self.stop_profiling()
+                except Exception:
+                    logger.debug("Profiler stop encountered an error", exc_info=True)
+            if hasattr(self.runner, "shutdown"):
+                try:
+                    self.runner.shutdown()
+                except Exception:
+                    logger.debug("Runner shutdown encountered an error", exc_info=True)
 
     def pause(self) -> None:
         """Pause the background scheduler without clearing queued state."""
@@ -563,6 +637,7 @@ class eSurge:
         logger.info("Pausing eSurge scheduler loop...")
         self.terminate()
         self._paused = True
+        self._drain_pipeline_workers("pause")
         if self.destroy_pages_on_pause:
             if self.num_running_requests > 0 or self.num_pending_requests > 0:
                 logger.warning(
@@ -572,6 +647,7 @@ class eSurge:
             else:
                 self.runner.destroy_kv_cache()
                 self._kv_cache_valid = False
+                self._log_cache_event("kv_cache_destroyed", {"reason": "pause"})
 
     def resume(self) -> None:
         """Resume the scheduler if it was paused."""
@@ -579,9 +655,11 @@ class eSurge:
             logger.info("Scheduler loop already running")
             return
         logger.info("Resuming eSurge scheduler loop...")
+        self._drain_pipeline_workers("resume")
         if self.destroy_pages_on_pause and not self._kv_cache_valid:
             self.runner.initialize_kv_cache()
             self._kv_cache_valid = True
+            self._log_cache_event("kv_cache_reinitialized", {"reason": "resume"})
         self.initiate()
 
     def _format_chat_prompt(
@@ -629,6 +707,73 @@ class eSurge:
             add_generation_prompt=add_generation_prompt,
             chat_template=chat_template,
         )
+
+    def _tokenize_prompt(self, request_id: str, prompt: str) -> list[int]:
+        return self._tokenizer_client.tokenize(request_id, prompt)
+
+    def _decode_with_pipeline(
+        self,
+        request_id: str,
+        generated_tokens: list[int],
+        *,
+        finished: bool,
+        skip_special_tokens: bool = True,
+    ) -> DetokenizerResult:
+        return self._detokenizer_client.decode(
+            request_id,
+            generated_tokens,
+            finished=finished,
+            skip_special_tokens=skip_special_tokens,
+        )
+
+    @staticmethod
+    def _to_python_scalar(value: Any) -> Any:
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        return value
+
+    def _sanitize_metrics_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {k: self._to_python_scalar(v) for k, v in payload.items()}
+
+    def _kv_cache_metadata(self) -> dict[str, Any]:
+        metadata = getattr(getattr(self.runner, "executor_manager", None), "metadata", None)
+        details: dict[str, Any] = {
+            "max_model_len": self.max_model_len,
+            "max_num_seqs": self.max_num_seqs,
+            "page_size": self.page_size,
+        }
+        if metadata is not None:
+            for attr in ("num_pages", "page_size", "max_model_length", "hbm_utilization"):
+                value = getattr(metadata, attr, None)
+                if value is not None:
+                    details[attr] = self._to_python_scalar(value)
+        return details
+
+    def _record_cache_event(self, event: str, payload: dict[str, Any]) -> None:
+        metrics_collector = get_metrics_collector()
+        if metrics_collector:
+            metrics_collector.record_cache_event(event, payload)
+
+    def _log_cache_event(self, event: str, extra: dict[str, Any] | None = None) -> None:
+        payload = self._kv_cache_metadata()
+        if extra:
+            payload.update(extra)
+        sanitized = self._sanitize_metrics_payload(payload)
+        logger.info("KV cache %s: %s", event, sanitized)
+        self._record_cache_event(event, sanitized)
+
+    def _drain_pipeline_workers(self, reason: str) -> None:
+        manager = getattr(self, "_worker_manager", None)
+        if not manager:
+            return
+        try:
+            manager.drain_workers()
+            logger.info("Drained tokenizer/detokenizer workers (%s)", reason)
+        except Exception:
+            logger.warning("Failed to drain tokenizer/detokenizer workers during %s", reason, exc_info=True)
 
     def generate(
         self,
@@ -709,7 +854,8 @@ class eSurge:
 
         try:
             for prompt, req_id in zip(prompts, request_ids, strict=False):
-                self._add_request(req_id, prompt, sampling_params)
+                prompt_tokens = self._tokenize_prompt(req_id, prompt)
+                self._add_request(req_id, prompt, sampling_params, prompt_token_ids=prompt_tokens)
 
             outputs = []
             pbar = None
@@ -827,7 +973,8 @@ class eSurge:
                 self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
 
         try:
-            self._add_request(request_id, prompt, sampling_params)
+            prompt_tokens = self._tokenize_prompt(request_id, prompt)
+            self._add_request(request_id, prompt, sampling_params, prompt_token_ids=prompt_tokens)
 
             if not self._scheduler_running:
                 raise RuntimeError("Background scheduler is not running. Call initiate() first.")
@@ -1037,6 +1184,8 @@ class eSurge:
         if was_running:
             self.terminate()
 
+        self._drain_pipeline_workers("update_model_weights")
+
         if model is not None:
             model = model.update_module(attn_mechanism="ragged_page_attention")
             self.model = model
@@ -1049,6 +1198,8 @@ class eSurge:
             reset_state=True,
         )
         self._kv_cache_valid = self.runner.executor_manager.kv_pages is not None
+        cache_event = "kv_cache_reinitialized" if self._kv_cache_valid else "kv_cache_destroyed"
+        self._log_cache_event(cache_event, {"reason": "update_model_weights"})
 
         with self._request_lock, self._output_lock:
             self._active_requests.clear()
@@ -1064,7 +1215,13 @@ class eSurge:
         if restart_scheduler and was_running:
             self.initiate()
 
-    def _add_request(self, request_id: str, prompt: str, sampling_params: SamplingParams) -> None:
+    def _add_request(
+        self,
+        request_id: str,
+        prompt: str,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None = None,
+    ) -> None:
         """Add a new request to the scheduler queue with intelligent context management.
 
         Internal method that tokenizes the prompt, applies context length management
@@ -1086,11 +1243,6 @@ class eSurge:
                - Or raises error if strict_context=True
             3. Adjusts max_new_tokens to fit within remaining context
             4. Prioritizes based on prefer_preserve_prompt setting
-
-        Smart Decoding Setup:
-            When bytecode_decode is enabled, initializes:
-            - buffered_tokens: Empty list for incomplete token buffering
-            - previous_decoded_text: Empty string for tracking decoded state
 
         Truncation Strategies:
             - "left": Removes tokens from beginning (keeps recent context)
@@ -1115,10 +1267,10 @@ class eSurge:
         requested_new = _get_requested_new(sampling_params)
         original_requested_new = requested_new
 
-        tokenizer_output = self.tokenizer(prompt, return_tensors=None)
-        token_ids = tokenizer_output["input_ids"]
-        if token_ids and isinstance(token_ids[0], list):
-            token_ids = token_ids[0]
+        token_ids_source = (
+            prompt_token_ids if prompt_token_ids is not None else self._tokenize_prompt(request_id, prompt)
+        )
+        token_ids = list(token_ids_source)
         prompt_len = len(token_ids)
 
         max_prompt_budget = max(0, max_model_len - self.reserve_tokens)
@@ -1235,8 +1387,6 @@ class eSurge:
                 "requested_new_tokens_final": requested_new,
                 "reserve_tokens": self.reserve_tokens,
                 "max_model_len": max_model_len,
-                "buffered_tokens": [],  # For smart bytecode decoding
-                "previous_decoded_text": "",  # Track previously decoded text
             }
 
         metrics_collector = get_metrics_collector()
@@ -1306,6 +1456,10 @@ class eSurge:
                 ro.finished = True
                 ro.outputs[0].finish_reason = "aborted"
                 ro.update_seq += 1
+        try:
+            self._detokenizer_client.reset(request_id)
+        except Exception:
+            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
 
         # Notify both per-request and global waiters
         with self._request_lock:
@@ -1313,6 +1467,7 @@ class eSurge:
         if ev:
             ev.set()
         self._output_event.set()
+        log_metrics_summary()
 
     @property
     def num_pending_requests(self) -> int:
@@ -1333,6 +1488,68 @@ class eSurge:
         """
         with self._scheduler_lock:
             return len(self.scheduler.running)
+
+    def start_profiling(
+        self,
+        output_dir: str,
+        num_batches: int = 10,
+        host_tracer_level: int | None = None,
+        python_tracer_level: int | None = None,
+    ) -> None:
+        """Start a JAX profiler trace for the next ``num_batches`` scheduler updates."""
+        if self._profiling_active:
+            raise RuntimeError("A profiling session is already active")
+        if num_batches <= 0:
+            raise ValueError("num_batches must be positive")
+
+        profiler_options = jax.profiler.ProfileOptions()
+        if host_tracer_level is not None:
+            profiler_options.host_tracer_level = host_tracer_level
+        if python_tracer_level is not None:
+            profiler_options.python_tracer_level = python_tracer_level
+
+        jax.profiler.start_trace(output_dir, profiler_options=profiler_options)
+        self._profiling_active = True
+        self._profiling_steps_remaining = num_batches
+        self._profiling_output_dir = output_dir
+        self._profiling_host_level = host_tracer_level
+        self._profiling_python_level = python_tracer_level
+        logger.info(
+            "Started profiler trace -> %s (batches=%d, host_tracer_level=%s, python_tracer_level=%s)",
+            output_dir,
+            num_batches,
+            host_tracer_level,
+            python_tracer_level,
+        )
+
+    def stop_profiling(self) -> None:
+        """Stop the active JAX profiler trace, if any."""
+        if not self._profiling_active:
+            return
+        try:
+            jax.profiler.stop_trace()
+            logger.info("Stopped profiler trace -> %s", self._profiling_output_dir)
+        finally:
+            self._profiling_active = False
+            self._profiling_steps_remaining = 0
+            self._profiling_output_dir = None
+            self._profiling_host_level = None
+            self._profiling_python_level = None
+
+    def _drain_runner_future(self, future, scheduler_output: SchedulerOutput) -> None:
+        model_output = self.runner.wait_for_execution(future)
+        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+        if engine_outputs:
+            self._process_engine_outputs(engine_outputs)
+        self._handle_profiling_step()
+
+    def _handle_profiling_step(self) -> None:
+        if not self._profiling_active:
+            return
+        if self._profiling_steps_remaining > 0:
+            self._profiling_steps_remaining -= 1
+        if self._profiling_steps_remaining <= 0:
+            self.stop_profiling()
 
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
         """Process engine outputs and update request outputs (thread-safe).
@@ -1403,52 +1620,21 @@ class eSurge:
                             or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
                         )
                         if should_decode and num_generated > last_idx:
-                            if self._bytecode_decode and self._smart_decoder:
-                                # Optimized smart bytecode decoding
-                                new_tokens = rd["generated_tokens"][last_idx:]
-                                buffered_tokens = rd.get("buffered_tokens", [])
-                                previous_text = rd.get("previous_decoded_text", "")
-
-                                # Decode with recovery to handle malformed UTF-8
-                                delta, new_buffered_tokens, had_malformed = self._smart_decoder.decode_with_recovery(
-                                    new_tokens,
-                                    previous_text,
-                                    buffered_tokens,
-                                )
-
-                                rd["buffered_tokens"] = new_buffered_tokens
-                                if had_malformed and new_buffered_tokens:
-                                    new_accumulated_text = previous_text + delta
-                                else:
-                                    try:
-                                        full_decoded = self.tokenizer.decode(
-                                            rd["generated_tokens"],
-                                            skip_special_tokens=True,
-                                        )
-                                        new_accumulated_text = (
-                                            full_decoded
-                                            if not self._smart_decoder.contains_malformed_chars(full_decoded)
-                                            else previous_text + delta
-                                        )
-                                    except Exception:
-                                        new_accumulated_text = previous_text + delta
-                                ro.accumulated_text = new_accumulated_text
-                                rd["previous_decoded_text"] = new_accumulated_text
-                            else:
-                                delta = self.tokenizer.decode(
-                                    rd["generated_tokens"][last_idx:], skip_special_tokens=True
-                                )
-                                ro.accumulated_text += delta
-
-                            rd["last_decoded_index"] = num_generated
+                            pipeline_result = self._decode_with_pipeline(
+                                request_id,
+                                rd["generated_tokens"],
+                                finished=False,
+                            )
+                            rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
-                            ro.delta_text = delta
-                            ro.delta_seq += 1
-                            text_changed = True
-
-                            comp = ro.outputs[0]
-                            comp.text = ro.accumulated_text
-                            comp.token_ids = list(rd["generated_tokens"])
+                            ro.accumulated_text = pipeline_result.accumulated_text
+                            ro.delta_text = pipeline_result.delta_text
+                            if pipeline_result.delta_text:
+                                ro.delta_seq += 1
+                                text_changed = True
+                                comp = ro.outputs[0]
+                                comp.text = ro.accumulated_text
+                                comp.token_ids = list(rd["generated_tokens"])
 
                         ro.num_generated_tokens = len(rd["generated_tokens"])
 
@@ -1475,45 +1661,19 @@ class eSurge:
                         num_generated = len(rd["generated_tokens"])
                         last_idx = rd["last_decoded_index"]
                         if num_generated > last_idx:
-                            if self._bytecode_decode and self._smart_decoder:
-                                new_tokens = rd["generated_tokens"][last_idx:]
-                                buffered_tokens = rd.get("buffered_tokens", [])
-
-                                all_remaining_tokens = new_tokens + buffered_tokens
-                                if all_remaining_tokens:
-                                    previous_text = rd.get("previous_decoded_text", "")
-                                    try:
-                                        full_decoded = self.tokenizer.decode(
-                                            rd["generated_tokens"], skip_special_tokens=True
-                                        )
-                                        if full_decoded.startswith(previous_text):
-                                            delta = full_decoded[len(previous_text) :]
-                                            ro.accumulated_text = full_decoded
-                                        else:
-                                            delta, _, _ = self._smart_decoder.decode_with_recovery(
-                                                all_remaining_tokens, previous_text, []
-                                            )
-                                            ro.accumulated_text = previous_text + delta
-                                    except Exception:
-                                        delta, _, _ = self._smart_decoder.decode_with_recovery(
-                                            all_remaining_tokens, previous_text, []
-                                        )
-                                        ro.accumulated_text = previous_text + delta
-                                else:
-                                    delta = ""
-                            else:
-                                delta = self.tokenizer.decode(
-                                    rd["generated_tokens"][last_idx:],
-                                    skip_special_tokens=True,
-                                )
-                                ro.accumulated_text += delta
-
-                            ro.delta_text = delta
-                            ro.delta_seq += 1
-                            comp.text = ro.accumulated_text
-                            comp.token_ids = list(rd["generated_tokens"])
-                            rd["last_decoded_index"] = num_generated
-                            text_changed = True
+                            pipeline_result = self._decode_with_pipeline(
+                                request_id,
+                                rd["generated_tokens"],
+                                finished=True,
+                            )
+                            ro.accumulated_text = pipeline_result.accumulated_text
+                            ro.delta_text = pipeline_result.delta_text
+                            rd["last_decoded_index"] = pipeline_result.last_decoded_index
+                            if pipeline_result.delta_text:
+                                ro.delta_seq += 1
+                                comp.text = ro.accumulated_text
+                                comp.token_ids = list(rd["generated_tokens"])
+                                text_changed = True
 
                         num_prompt_tokens = (
                             len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else len(ro.prompt_token_ids)
@@ -1545,7 +1705,10 @@ class eSurge:
                                 request_id,
                                 finish_reason=comp.finish_reason,
                             )
-
+                        try:
+                            self._detokenizer_client.reset(request_id)
+                        except Exception:
+                            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
                     ro.update_seq += 1
                     if text_changed or engine_output.finished:
                         ev = self._request_events.get(request_id)
@@ -1750,6 +1913,21 @@ class eSurge:
         if self._monitoring_initialized:
             try:
                 self.stop_monitoring()
+            except Exception:
+                pass
+        if getattr(self, "_profiling_active", False):
+            try:
+                self.stop_profiling()
+            except Exception:
+                pass
+        if hasattr(self, "_worker_manager"):
+            try:
+                self._worker_manager.shutdown()
+            except Exception:
+                pass
+        if hasattr(self, "runner"):
+            try:
+                self.runner.shutdown()
             except Exception:
                 pass
 

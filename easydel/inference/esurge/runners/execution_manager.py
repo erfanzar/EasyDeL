@@ -59,7 +59,7 @@ from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView, Ragge
 from easydel.utils import ejit
 
 from ...sampling_funcs import sample_top_p_efficient
-from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
+from ..page_table import PAGE_TABLE_PADDING_VAL
 from .sequence_buffer import DeviceSequenceState, SequenceBuffer
 
 if typing.TYPE_CHECKING:
@@ -310,10 +310,10 @@ class ExecutionManager:
         active_mask_full: jax.Array,
         input_ids_buf: jax.Array,
         position_ids_buf: jax.Array,
-        slot_mapping_buf: jax.Array,
         padded_num_reqs: int,
     ) -> tuple[
         DeviceSequenceState,
+        jax.Array,
         jax.Array,
         jax.Array,
         jax.Array,
@@ -340,7 +340,6 @@ class ExecutionManager:
             query_start_loc_buf: Buffer for query start locations [max_num_reqs+1].
             seq_lens_buf: Buffer for sequence lengths [max_num_reqs].
             pages_tables_buf: Buffer for page tables [num_reqs_max_model_len, max_pages_per_req].
-            slot_mapping_buf: Buffer for slot mapping [3, max_padded_slices].
             padded_num_reqs: Padded number of requests for compilation efficiency.
 
         Returns:
@@ -353,7 +352,6 @@ class ExecutionManager:
                 - query_start_loc_buf: Updated query start locations buffer.
                 - seq_lens_buf: Updated sequence lengths buffer.
                 - pages_tables_buf: Updated page tables buffer.
-                - slot_mapping_buf: Updated slot mapping buffer.
 
         Raises:
             KeyError: If no compiled function exists for the given configuration.
@@ -373,7 +371,6 @@ class ExecutionManager:
         #         active_mask_full,
         #         input_ids_buf,
         #         position_ids_buf,
-        #         slot_mapping_buf,
         #         self.rng_key,
         #     )
         # )
@@ -388,7 +385,6 @@ class ExecutionManager:
             active_mask_full,
             input_ids_buf,
             position_ids_buf,
-            slot_mapping_buf,
             self.rng_key,
         )
 
@@ -400,7 +396,6 @@ class ExecutionManager:
             query_start_loc_buf,
             seq_lens_buf,
             pages_tables_buf,
-            slot_mapping_buf,
             self.rng_key,
             out_tokens_full,
             valid_mask_full,
@@ -417,7 +412,6 @@ class ExecutionManager:
             query_start_loc_buf,
             seq_lens_buf,
             pages_tables_buf,
-            slot_mapping_buf,
             hidden_states,
             logits,
         )
@@ -547,18 +541,11 @@ class ExecutionManager:
 
         """
         max_num_reqs = int(self.max_num_reqs)
-        page_size = int(self.metadata.page_size)
-        max_pages_per_req = int(self.metadata.max_num_pages_per_req)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
-        slices_per_page = int(self.metadata.num_slices_per_kv_cache_update_page)
         page_table_pad = jnp.int32(PAGE_TABLE_PADDING_VAL)
-        slot_mapping_pad = jnp.int32(SLOT_MAPPING_PADDING_VAL)
-        max_num_tokens = int(self.max_num_tokens)
-        max_padded_slices = int(self.metadata.get_padded_num_slices(max_num_tokens, max_num_reqs))
 
         i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
         i_rows_pt = jnp.arange(num_reqs_max_model_len, dtype=jnp.int32)
-        i_slices = jnp.arange(max_padded_slices, dtype=jnp.int32)
 
         @ejit(
             static_argnums=(0, 1),
@@ -567,7 +554,6 @@ class ExecutionManager:
                 "kv_pages",
                 "input_ids_buf",
                 "position_ids_buf",
-                "slot_mapping_buf",
             ],
             in_shardings=(
                 es.extract_shardings(self.graphstate, self.mesh),  # graphstate
@@ -579,7 +565,6 @@ class ExecutionManager:
                 self._empty_sharding,  # active_mask_full
                 self._empty_sharding,  # input_ids_buf
                 self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # slot_mapping_buf
                 self._empty_sharding,  # rng_key
             ),
             out_shardings=(
@@ -590,7 +575,6 @@ class ExecutionManager:
                 self._empty_sharding,  # query_start_loc_buf
                 self._empty_sharding,  # seq_lens_buf
                 self._empty_sharding,  # pages_tables_buf
-                self._empty_sharding,  # slot_mapping_buf
                 self._empty_sharding,  # rng_key
                 self._empty_sharding,  # out_tokens (full-size, masked)
                 self._empty_sharding,  # valid_mask (full-size)
@@ -610,7 +594,6 @@ class ExecutionManager:
             active_mask_full: jax.Array,  # [max_num_reqs] bool
             input_ids_buf: jax.Array,  # [max_num_tokens]
             position_ids_buf: jax.Array,  # [max_num_tokens]
-            slot_mapping_buf: jax.Array,  # [3, max_padded_slices]
             rng_key: jax.Array,
         ):
             with self.model.mesh:
@@ -643,56 +626,20 @@ class ExecutionManager:
                 mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
                 pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
 
-                s = dev_state.num_computed_tokens
-                e = s + scheduled
-                lps = s // page_size
-                lpe = (jnp.maximum(e, 1) - 1) // page_size
-                page_lens = jnp.where(scheduled > 0, lpe - lps + 1, 0)
-                page_cum = jnp.cumsum(page_lens)
-                total_pages = page_cum[-1]
-                sp = jnp.int32(slices_per_page)
-                padded_num_slices = jnp.minimum(((total_pages + sp - 1) // sp) * sp, jnp.int32(max_padded_slices))
-
-                valid_slice = i_slices < total_pages
-                within_pad = i_slices < padded_num_slices
-                slice_active = valid_slice & within_pad
-
-                page_cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), page_cum[:-1]])
-                req_for_slice = jnp.searchsorted(page_cum, i_slices, side="right")
-                req_for_slice = jnp.where(slice_active, req_for_slice, 0)
-                local_off = i_slices - page_cum_prev[req_for_slice]
-                pt_full = pt.reshape((-1,))
-                gpi = req_for_slice * jnp.int32(max_pages_per_req) + lps[req_for_slice] + local_off
-                gpi_safe = jnp.clip(gpi, 0, jnp.int32(pt_full.size - 1))
-                page_numbers = jnp.where(slice_active, pt_full[gpi_safe], 0)
-
-                s_mod = s % page_size
-                e_mod = ((jnp.maximum(e, 1) - 1) % page_size) + 1
-                lens_rep = page_lens[req_for_slice]
-
-                is_first = local_off == 0
-                is_last = local_off == (lens_rep - 1)
-
-                kv_local_st = jnp.where(is_first, s_mod[req_for_slice], 0)
-                kv_local_en = jnp.where(is_last, e_mod[req_for_slice], jnp.int32(page_size))
-                slice_lens = jnp.maximum(kv_local_en - kv_local_st, 0)
-                kv_cache_start = kv_local_st + page_numbers * page_size
-
-                slice_lens_masked = jnp.where(slice_active, slice_lens, 0)
-                csl = jnp.cumsum(slice_lens_masked)
-                new_kv_start = jnp.where(slice_active, jnp.roll(csl, 1).at[0].set(0), 0)
-                slot_mapping_buf = slot_mapping_buf.at[0, :].set(
-                    jnp.where(slice_active, kv_cache_start, slot_mapping_pad)
-                )
-                slot_mapping_buf = slot_mapping_buf.at[1, :].set(jnp.where(slice_active, new_kv_start, slot_mapping_pad))
-                slot_mapping_buf = slot_mapping_buf.at[2, :].set(jnp.where(slice_active, slice_lens, slot_mapping_pad))
-
                 nr_safe = jnp.maximum(nr, 1)
                 next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
                 padded_num_reqs = jnp.where(
                     nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2
                 )
                 padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
+
+                active_num_computed = jnp.where(mask_reqs, dev_state.num_computed_tokens, 0)
+                is_decode = (scheduled == 1) & (active_num_computed > 0)
+                is_chunked_prefill = (scheduled > 1) & (active_num_computed > 0)
+                decode_count = jnp.sum(is_decode.astype(jnp.int32))
+                chunked_prefill_count = jnp.sum(is_chunked_prefill.astype(jnp.int32))
+                boundary = jnp.minimum(decode_count + chunked_prefill_count, nr)
+                request_distribution = jnp.array([decode_count, boundary, nr], dtype=jnp.int32)
 
                 tmp_logits = cum - 1
                 mask_logits = i_reqs < padded_num_reqs
@@ -708,13 +655,12 @@ class ExecutionManager:
                     past_key_values=kv_pages,
                     cache_metadata=RaggedPagesMetadata(
                         pages_tables=pt,
-                        slot_mapping=slot_mapping_buf,
                         context_lens=seq_lens[:num_reqs_max_model_len],
                         query_start_loc=qsl[: num_reqs_max_model_len + 1],
                         num_seqs=jnp.array([nr], dtype=jnp.int32),
-                        num_kv_update_slices=jnp.array([total_pages], dtype=jnp.int32),
                         num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
                         page_size=self.metadata.page_size,
+                        request_distribution=request_distribution,
                     ),
                     apply_lm_head=False,
                 )
@@ -762,7 +708,6 @@ class ExecutionManager:
                     qsl,
                     seq_lens,
                     pt,
-                    slot_mapping_buf,
                     rng_key,
                     out_tokens_full,
                     valid_mask_full,
@@ -802,8 +747,7 @@ class ExecutionManager:
                     compargs[7],  # active_mask_full (PartitionSpec())
                     compargs[8],  # input_ids_buf (PartitionSpec())
                     compargs[9],  # position_ids_buf (PartitionSpec())
-                    compargs[10],  # slot_mapping_buf (PartitionSpec())
-                    compargs[11],  # rng_key (None)
+                    compargs[10],  # rng_key (None)
                 )
                 self._debug_baselines[f"{num_tokens}_hash_in"] = _tree_hash(warm_args)
             else:
@@ -818,7 +762,6 @@ class ExecutionManager:
                     _query_start_loc_buf,
                     _seq_lens_buf,
                     _pages_tables_buf,
-                    _slot_mapping_buf,
                     _rng_key,
                     _out_tokens_full,
                     _valid_mask_full,
@@ -878,8 +821,6 @@ class ExecutionManager:
         )
         dev_state = temp_buffer.to_device_state()
 
-        max_padded_slices = metadata.get_padded_num_slices(self.max_num_tokens, max_num_reqs)
-
         fused_args = [
             self.graphdef,
             self.graphstate,
@@ -891,12 +832,11 @@ class ExecutionManager:
             jnp.ones((max_num_reqs,), dtype=bool),
             jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
             jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            jnp.full((3, max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
             rng_key,
         ]
 
         fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
-        for idx in (5, 6, 7, 8, 9, 10, 11):
+        for idx in (5, 6, 7, 8, 9, 10):
             if hasattr(fused_args[idx], "dtype"):
                 fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
 

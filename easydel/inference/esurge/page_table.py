@@ -19,15 +19,6 @@ This version:
   - Makes updates functional (return new instances) to be jit-friendly
   - Keeps a fused jittable kernel for batch appends with buffer donation
 
-Example:
-    >>> table = PageTable.create(
-    ...     page_size=16,
-    ...     max_num_reqs=32,
-    ...     max_num_pages_per_req=128,
-    ...     max_num_batched_tokens=2048,
-    ... )
-    >>> table = table.add_row([10, 11, 12], row_idx=0)
-    >>> slots = table.get_slot_mapping(jnp.array([0]), jnp.array([48]))
 """
 
 from __future__ import annotations
@@ -64,21 +55,19 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-SLOT_MAPPING_PADDING_VAL = 0
 PAGE_TABLE_PADDING_VAL = 0
 
 
 @auto_pytree(frozen=True)
 class PageTable:
-    """Manages page allocation and slot mapping for KV-cache.
+    """Manages page allocation for paged KV-cache layouts.
 
     A functional, JAX-jittable dataclass that manages the mapping between
     request positions and physical page locations in the KV-cache. Supports
     efficient batched operations and is designed to work with paged attention.
 
     The page table maintains a 2D array where each row corresponds to a request
-    and contains the page IDs allocated to that request. It also manages slot
-    mapping for direct token-to-cache-position translation.
+    and contains the page IDs allocated to that request.
 
     Attributes:
         page_size: Number of tokens per page (static, non-pytree).
@@ -87,7 +76,6 @@ class PageTable:
         max_num_batched_tokens: Maximum tokens processable in a batch (static).
         page_table: Page allocation table [max_num_reqs, max_num_pages_per_req].
         num_pages_per_row: Number of valid pages per request [max_num_reqs].
-        slot_mapping: Direct token-to-slot mapping [max_num_batched_tokens].
 
     Note:
         All operations are functional and return new instances rather than
@@ -103,7 +91,6 @@ class PageTable:
     # PyTree leaves
     page_table: jax.Array
     num_pages_per_row: jax.Array
-    slot_mapping: jax.Array
 
     @classmethod
     def create(
@@ -141,11 +128,6 @@ class PageTable:
             dtype=jnp.int32,
         )
         num_pages_per_row = jnp.zeros((max_num_reqs,), dtype=jnp.int32)
-        slot_mapping = jnp.full(
-            (max_num_batched_tokens,),
-            fill_value=SLOT_MAPPING_PADDING_VAL,
-            dtype=jnp.int32,
-        )
         return cls(
             page_size=page_size,
             max_num_reqs=max_num_reqs,
@@ -153,12 +135,8 @@ class PageTable:
             max_num_batched_tokens=max_num_batched_tokens,
             page_table=page_table,
             num_pages_per_row=num_pages_per_row,
-            slot_mapping=slot_mapping,
         )
 
-    # ---------------------------
-    # Jittable fused kernel
-    # ---------------------------
     @staticmethod
     @ejit(donate_argnums=(0, 1))
     def _append_rows_batch_jit(
@@ -327,53 +305,6 @@ class PageTable:
         npr = npr.at[tgt].set(npr_src)
         return replace(self, page_table=pt, num_pages_per_row=npr)
 
-    def compute_slot_mapping(self, req_indices: jax.Array, positions: jax.Array) -> PageTable:
-        """Compute and store slot mapping for token positions.
-
-        Calculates the flat cache slot indices for given request-position pairs
-        and stores them in the internal slot_mapping array.
-
-        Args:
-            req_indices: Request indices for each token.
-            positions: Position indices within each request.
-
-        Returns:
-            A new PageTable with updated slot_mapping.
-
-        Note:
-            The slot mapping translates (request, position) pairs to
-            flat indices in the KV-cache storage.
-        """
-        page_table_indices = req_indices * self.max_num_pages_per_req + positions // self.page_size
-        page_table_flat = self.page_table.reshape((-1,))
-        page_numbers = page_table_flat[page_table_indices]
-        page_offsets = positions % self.page_size
-        slot_values = page_numbers * self.page_size + page_offsets
-        num_tokens = req_indices.shape[0]
-        new_slot_mapping = self.slot_mapping.at[:num_tokens].set(slot_values)
-        return replace(self, slot_mapping=new_slot_mapping)
-
-    def get_slot_mapping(self, req_indices: jax.Array, positions: jax.Array) -> jax.Array:
-        """Get slot indices for token positions.
-
-        Pure function that computes slot mappings without modifying state.
-
-        Args:
-            req_indices: Request indices for each token.
-            positions: Position indices within each request.
-
-        Returns:
-            Array of flat slot indices in the KV-cache.
-
-        Note:
-            This is a pure function that doesn't modify the PageTable.
-        """
-        page_table_indices = req_indices * self.max_num_pages_per_req + positions // self.page_size
-        page_table_flat = self.page_table.reshape((-1,))
-        page_numbers = page_table_flat[page_table_indices]
-        page_offsets = positions % self.page_size
-        return page_numbers * self.page_size + page_offsets
-
     def clear(self) -> PageTable:
         """Clear all data in the page table.
 
@@ -381,14 +312,11 @@ class PageTable:
             A new PageTable with all arrays reset to initial values.
 
         Note:
-            Page table is filled with PAGE_TABLE_PADDING_VAL,
-            slot mapping with SLOT_MAPPING_PADDING_VAL,
-            and page counts are zeroed.
+            Page table is filled with PAGE_TABLE_PADDING_VAL and page counts are zeroed.
         """
         new_pt = jnp.full_like(self.page_table, PAGE_TABLE_PADDING_VAL)
         new_npr = jnp.zeros_like(self.num_pages_per_row)
-        new_sm = jnp.full_like(self.slot_mapping, SLOT_MAPPING_PADDING_VAL)
-        return replace(self, page_table=new_pt, num_pages_per_row=new_npr, slot_mapping=new_sm)
+        return replace(self, page_table=new_pt, num_pages_per_row=new_npr)
 
     def get_array(self) -> jax.Array:
         """Get the underlying page table array.
@@ -401,9 +329,6 @@ class PageTable:
         """
         return self.page_table
 
-    # ---------------------------
-    # Batched convenience (Python lists) -> jittable kernel
-    # ---------------------------
     def append_rows_batch(self, page_ids_list: Sequence[Sequence[int]], req_indices_list: Sequence[int]) -> PageTable:
         """Batch append pages to multiple rows.
 
@@ -480,9 +405,6 @@ class PageTable:
         new_npr = self.num_pages_per_row.at[req_indices].set(0)
         return replace(self, num_pages_per_row=new_npr).append_rows_batch(page_ids_list, req_indices_list)
 
-    # ---------------------------
-    # Jittable batch append that accepts pre-padded arrays
-    # ---------------------------
     def append_rows_batch_from_padded(
         self,
         req_indices: jax.Array,  # [B] int32
@@ -700,19 +622,6 @@ class MultiGroupPageTable:
             group_lists = [tpl[gi] for tpl in page_ids_per_req]
             new_pts[gi] = new_pts[gi].add_rows_batch(group_lists, req_indices)
         return replace(self, page_tables=tuple(new_pts))
-
-    def compute_slot_mapping(self, req_indices: jax.Array, positions: jax.Array) -> MultiGroupPageTable:
-        """Compute slot mappings for all groups.
-
-        Args:
-            req_indices: Request indices for tokens.
-            positions: Position indices within requests.
-
-        Returns:
-            A new MultiGroupPageTable with updated slot mappings.
-        """
-        new_pts = tuple(pt.compute_slot_mapping(req_indices, positions) for pt in self.page_tables)
-        return replace(self, page_tables=new_pts)
 
     def clear(self) -> MultiGroupPageTable:
         """Clear all page tables.

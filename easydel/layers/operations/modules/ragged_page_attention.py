@@ -14,7 +14,7 @@
 
 
 from eformer import common_types as ct
-from ejkernel.modules import ragged_page_attention
+from ejkernel.modules import ragged_page_attention_v3
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -68,6 +68,8 @@ class RaggedPageAttn(OperationImpl):
     def forward_native(
         self,
         query: Float[Array, "total_tokens num_q_heads head_dim"],
+        key: Float[Array, "total_tokens num_kv_heads head_dim"],
+        value: Float[Array, "total_tokens num_kv_heads head_dim"],
         cache_view: RaggedPagesCacheView,
         cache_metadata: RaggedPagesMetadata,
         softmax_scale: float | None = None,
@@ -111,11 +113,17 @@ class RaggedPageAttn(OperationImpl):
             AttentionOutput: Contains attention outputs [total_tokens, num_q_heads, head_dim].
                 Attention weights are not computed.
         """
-        kv_pages: Float[Array, "num_pages page_size num_kv_heads head_dim"] = cache_view.kv_pages
+        kv_pages = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
+        request_distribution = cache_metadata.request_distribution
+
+        if request_distribution is None:
+            request_distribution = jnp.array([0, 0, num_seqs_flat.shape[0]], dtype=jnp.int32)
+
         qaxes: Ps = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        kvaxes: Ps = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
 
         # Determine sharding spec for softmax_aux based on dimensionality
         aux_spec: PartitionSpec = PartitionSpec(None)
@@ -124,51 +132,49 @@ class RaggedPageAttn(OperationImpl):
             if num_aux_dims == 2:
                 aux_spec = resolve(axes=[ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
             elif num_aux_dims == 1:
-                aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
-
-        # Set default compute dtype if not provided
-        dtype_for_compute: DTypeLike
-        if compute_dtype is None:
-            dtype_for_compute = jnp.bfloat16
-        else:
-            dtype_for_compute = compute_dtype
+                aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)  # noqa
 
         # Create sharding spec for kv_pages
         kv_pages_spec: Ps = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=kv_pages.shape
+            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=kv_pages.shape,
         )
+
         empty_spec: Ps = Ps()
 
-        output: Float[Array, "total_tokens num_q_heads head_dim"] = ragged_page_attention(
-            query,
-            kv_pages,
-            cache_metadata.context_lens,
-            cache_metadata.pages_tables,
-            cache_metadata.query_start_loc,
-            num_seqs_flat,
-            softmax_aux,
+        call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             vmem_limit_bytes=vmem_limit_bytes,
-            optimized=optimized,
-            compute_dtype=dtype_for_compute,
-            mask_value=mask_value,
             sliding_window=sliding_window,
             in_specs=(
                 qaxes,
+                kvaxes,
+                kvaxes,
                 kv_pages_spec,
                 empty_spec,
                 empty_spec,
                 empty_spec,
                 empty_spec,
-                aux_spec,
             ),
-            out_specs=qaxes,
+            out_specs=(qaxes, kv_pages_spec),
             mesh=self.metadata.mesh,
         )
 
-        result: AttentionOutput = AttentionOutput(attention_weights=None, attention_outputs=output)
-        return result
+        output, kv_pages = ragged_page_attention_v3(
+            query,
+            key,
+            value,
+            kv_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables.reshape(-1),
+            cache_metadata.query_start_loc,
+            request_distribution,
+            **call_kwargs,
+        )
+        cache_view.kv_pages = kv_pages
+        return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """ROCm GPU forward pass. Not implemented for Paged Attention."""
@@ -192,7 +198,9 @@ class RaggedPageAttn(OperationImpl):
 
     def __call__(
         self,
-        query: Float[Array, "batch 1 num_heads head_dim"],
+        query: Float[Array, "batch tokens num_heads head_dim"],
+        key: Float[Array, "batch tokens num_kv_heads head_dim"],
+        value: Float[Array, "batch tokens num_kv_heads head_dim"],
         cache_view: RaggedPagesCacheView,
         cache_metadata: RaggedPagesMetadata,
         softmax_scale: float | None = None,
@@ -244,10 +252,14 @@ class RaggedPageAttn(OperationImpl):
             batch, sequence, head, dim = query.shape
 
         # Reshape query to ragged format [total_tokens, num_heads, head_dim]
-        query_reshaped: Float[Array, "total_tokens num_heads head_dim"] = query.reshape(-1, *query.shape[-2:])
+        query_reshaped = query.reshape(-1, *query.shape[-2:])
+        key_reshaped = key.reshape(-1, *key.shape[-2:])
+        value_reshaped = value.reshape(-1, *value.shape[-2:])
 
         output: AttentionOutput = super().__call__(
             query=query_reshaped,
+            key=key_reshaped,
+            value=value_reshaped,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             softmax_scale=softmax_scale,
@@ -263,9 +275,7 @@ class RaggedPageAttn(OperationImpl):
 
         # Restore original shape if input was 4D
         if is_4d:
-            outputs_reshaped: Float[Array, "batch sequence num_heads head_dim"] = output.attention_outputs.reshape(
-                batch, sequence, head, dim
-            )
+            outputs_reshaped = output.attention_outputs.reshape(batch, sequence, head, dim)
             output.attention_outputs = outputs_reshaped
 
         return output

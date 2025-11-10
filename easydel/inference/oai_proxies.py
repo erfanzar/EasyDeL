@@ -15,7 +15,7 @@
 """Enhanced FastAPI server that proxies requests to OpenAI API.
 
 This module provides a proxy server that forwards requests to OpenAI's API
-while adding vSurge-specific monitoring and compatibility features.
+while adding EasyDeL-specific monitoring and compatibility features.
 It enables seamless integration between EasyDeL inference engines and
 OpenAI-compatible clients.
 
@@ -35,7 +35,7 @@ Example:
     ... )
     >>> router.run(host="0.0.0.0", port=8084)
 
-    >>> # Or proxy to a local vSurge server
+    >>> # Or proxy to a local EasyDeL server
     >>> router = InferenceApiRouter(
     ...     base_url="http://localhost:8000/v1",
     ...     enable_function_calling=True
@@ -118,7 +118,7 @@ class InferenceApiRouter:
     """Enhanced FastAPI server acting as an OpenAI API proxy.
 
     This server provides a complete OpenAI API-compatible interface that can
-    forward requests to either OpenAI's API or a local eSurge/vSurge server.
+    forward requests to either OpenAI's API or a local EasyDeL inference server.
     It includes additional monitoring, health check, and function calling endpoints.
 
     The router automatically detects backend capabilities and provides appropriate
@@ -142,7 +142,7 @@ class InferenceApiRouter:
         **kwargs,
     ) -> None:
         """
-        Initialize the Inference API Router with vSurge compatibility.
+        Initialize the Inference API Router with EasyDeL compatibility.
 
         Args:
             api_key: OpenAI API key
@@ -182,7 +182,7 @@ class InferenceApiRouter:
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
-        """Define all API endpoints matching vSurge API server."""
+        """Define all API endpoints matching EasyDeL API servers."""
         return [
             EndpointConfig(
                 path="/v1/chat/completions",
@@ -573,7 +573,7 @@ class InferenceApiRouter:
         """
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
-        # If backend is a vSurge server, try to get its metrics
+        # If backend is an EasyDeL server, try to get its metrics
         backend_metrics = None
         if self.base_url:
             try:
@@ -624,12 +624,12 @@ class InferenceApiRouter:
                     "parent": None,
                 }
 
-                # Add metadata if we're connected to a vSurge backend
+                # Add metadata if we're connected to a custom backend
                 if self.base_url:
                     model_info["metadata"] = {
                         "supports_chat": True,  # Assume true for now
                         "supports_function_calling": self.enable_function_calling,
-                        "backend_type": "vsurge" if "vsurge" in self.base_url.lower() else "openai",
+                        "backend_type": "custom",
                     }
 
                 models_data.append(model_info)
@@ -668,7 +668,7 @@ class InferenceApiRouter:
                 model_info["metadata"] = {
                     "supports_chat": True,
                     "supports_function_calling": self.enable_function_calling,
-                    "backend_type": "vsurge" if "vsurge" in self.base_url.lower() else "openai",
+                    "backend_type": "custom",
                 }
 
             return JSONResponse(model_info, status_code=200)
@@ -692,7 +692,7 @@ class InferenceApiRouter:
                 status_code=200,
             )
 
-        # If backend is a vSurge server, try to get its tools
+        # If backend exposes tools, try to fetch them directly
         if self.base_url:
             try:
                 import aiohttp
@@ -723,7 +723,7 @@ class InferenceApiRouter:
         if not self.enable_function_calling:
             return create_error_response(HTTPStatus.NOT_IMPLEMENTED, "Function calling is disabled")
 
-        # If backend is a vSurge server, proxy the request
+        # If backend exposes tool execution, proxy the request
         if self.base_url:
             try:
                 import aiohttp

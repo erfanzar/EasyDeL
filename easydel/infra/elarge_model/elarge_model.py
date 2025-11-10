@@ -23,7 +23,7 @@ Key Features:
     - Unified configuration management for models, training, and inference
     - Automatic model and tokenizer initialization from HuggingFace or local paths
     - Support for multiple training paradigms (SFT, DPO, ORPO, GRPO, distillation)
-    - Integration with eSurge and vSurge inference engines
+    - Integration with the eSurge inference engine
     - Built-in evaluation with lm-evaluation-harness
     - Flexible dataset mixture configuration
     - Model sharding and quantization support
@@ -52,11 +52,9 @@ from .builders import (
     build_dataset,
     build_esurge,
     build_model,
-    build_vsurge,
     to_data_mixture_kwargs,
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
-    to_vsurge_kwargs,
 )
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
 from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
@@ -101,7 +99,7 @@ class eLargeModel:
     - Configuration management (load, save, create)
     - Model building and initialization (including teacher/reference models)
     - Training orchestration with multiple paradigms (SFT, DPO, ORPO, etc.)
-    - eSurge and vSurge inference engine integration
+    - eSurge inference engine integration
     - Tokenizer management
     - Dataset mixture configuration
     - Model evaluation with lm-evaluation-harness
@@ -482,49 +480,6 @@ class eLargeModel:
         esurge.update(kwargs)
         return self
 
-    def set_vsurge(
-        self,
-        max_concurrent_decodes: int | None = None,
-        max_concurrent_prefill: int = 1,
-        bytecode_decode: bool = False,
-        **kwargs,
-    ) -> eLargeModel:
-        """Configure vSurge inference settings.
-
-        vSurge is a low-latency inference engine optimized for interactive
-        applications. It supports streaming and provides better per-request
-        latency compared to eSurge.
-
-        Args:
-            max_concurrent_decodes: Maximum concurrent decode calls.
-                If None, defaults to number of devices.
-            max_concurrent_prefill: Maximum concurrent prefill operations.
-                Higher values can improve throughput for mixed workloads.
-            bytecode_decode: Enable JAX bytecode compilation for decode step.
-                Can improve performance but increases compilation time.
-            **kwargs: Additional vSurge options:
-                - interleaved_mode: Enable interleaved prefill/decode
-                - ring_buffer_size: Size of internal ring buffer
-                - enable_streaming: Enable token streaming (default: True)
-                - compile_prefill: Compile prefill function (default: False)
-
-        Returns:
-            Self for method chaining
-
-        Example:
-            >>> elm.set_vsurge(
-            ...     max_concurrent_decodes=8,
-            ...     bytecode_decode=True,
-            ...     interleaved_mode=True
-            ... )
-        """
-        vsurge = self._config.setdefault("vsurge", {})
-        if max_concurrent_decodes is not None:
-            vsurge["max_concurrent_decodes"] = max_concurrent_decodes
-        vsurge["max_concurrent_prefill"] = max_concurrent_prefill
-        vsurge["bytecode_decode"] = bytecode_decode
-        vsurge.update(kwargs)
-        return self
 
     def set_mixture(
         self,
@@ -791,24 +746,6 @@ class eLargeModel:
         """
         return to_esurge_kwargs(self._config)
 
-    def get_vsurge_kwargs(self) -> dict[str, Any]:
-        """Get kwargs for vSurge initialization.
-
-        Extracts and formats the configuration options for creating a
-        vSurge engine instance.
-
-        Returns:
-            Dictionary of vSurge arguments including max_concurrent_decodes,
-            bytecode_decode, and other engine settings
-
-        Example:
-            >>> kwargs = elm.get_vsurge_kwargs()
-            >>> # Can be used directly:
-            >>> from easydel.inference import vSurge
-            >>> engine = vSurge(model, **kwargs)
-        """
-        return to_vsurge_kwargs(self._config)
-
     def get_base_config(self, prefer: str = "base") -> dict[str, Any]:
         """Get materialized base configuration.
 
@@ -903,27 +840,6 @@ class eLargeModel:
         """
         self.build_model()
         return build_esurge(self._config, self._model)
-
-    def build_vsurge(self):
-        """Build the vSurge inference engine.
-
-        Creates a vSurge engine instance configured with the current settings.
-        Automatically builds the model if not already built.
-
-        Returns:
-            vSurge instance ready for streaming inference
-
-        Example:
-            >>> elm.set_vsurge(max_concurrent_decodes=4, bytecode_decode=True)
-            >>> engine = elm.build_vsurge()
-            >>> # Use engine for streaming inference
-            >>> stream = engine.generate_stream(prompt, max_tokens=100)
-            >>> for token in stream:
-            ...     print(token, end="")
-        """
-
-        self.build_model()
-        return build_vsurge(self._config, self._model)
 
     def build_teacher_model(self) -> EasyDeLBaseModule | None:
         """Build the teacher model for distillation training.
@@ -1363,14 +1279,14 @@ class eLargeModel:
     def eval(
         self,
         tasks: str | list[str],
-        engine: typing.Literal["esurge", "vsurge", "auto"] | Any = "auto",
+        engine: typing.Literal["esurge", "auto"] | Any = "auto",
         num_fewshot: int = 0,
         output_path: str | None = None,
     ) -> dict[str, Any]:
         """Run evaluation on specified tasks using lm-evaluation-harness.
 
-        This method provides a unified interface for evaluating models using either
-        eSurge or vSurge engines with the lm-evaluation-harness framework.
+        This method provides a unified interface for evaluating models using the
+        eSurge engine with the lm-evaluation-harness framework.
 
         Args:
             tasks: Task name(s) to evaluate on. Can be a single task string or list of tasks.
@@ -1383,10 +1299,9 @@ class eLargeModel:
                 - Coding: "humaneval", "mbpp"
                 Full list: https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks
             engine: Inference engine to use. Options:
-                - "esurge": Use eSurge engine (better for large batches, high throughput)
-                - "vsurge": Use vSurge engine (better for streaming, low latency)
+                - "esurge": Use eSurge engine (high throughput)
                 - "auto": Automatically select based on configuration (default)
-                - An existing eSurge/vSurge instance for custom configuration
+                - An existing eSurge instance for custom configuration
             num_fewshot: Number of few-shot examples to use (default: 0 for zero-shot).
                 Different tasks may have different recommended values:
                 - MMLU: typically 5-shot
@@ -1426,13 +1341,9 @@ class eLargeModel:
             >>> for task, metrics in results["results"].items():
             ...     print(f"{task}: {metrics.get('acc', metrics.get('exact_match')):.2%}")
 
-            Using pre-built engine with custom config:
-            >>> engine = elm.build_vsurge()
-            >>> results = elm.eval("arc_easy", engine=engine, num_fewshot=25)
-
             Evaluation with custom settings:
             >>> elm.set_eval(
-            ...     max_new_tokens=512,
+                ...     max_new_tokens=512,
             ...     temperature=0.0,  # Greedy decoding
             ...     batch_size=32
             ... )
@@ -1469,12 +1380,7 @@ class eLargeModel:
 
         if isinstance(engine, str):
             if engine == "auto":
-                if self._config.get("esurge"):
-                    engine = "esurge"
-                elif self._config.get("vsurge"):
-                    engine = "vsurge"
-                else:
-                    engine = "esurge"
+                engine = "esurge"
 
             if engine == "esurge":
                 from easydel.inference.evaluations import eSurgeLMEvalAdapter
@@ -1490,23 +1396,6 @@ class eLargeModel:
                     max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
                     max_new_tokens=max_new_tokens,
                     batch_size=batch_size,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
-
-            elif engine == "vsurge":
-                from easydel.inference.evaluations import vSurgeLMEvalAdapter
-
-                engine_instance = self.build_vsurge()
-
-                if batch_size is None:
-                    batch_size = self._config.get("vsurge", {}).get("max_concurrent_decodes", jax.device_count())
-
-                eval_adapter = vSurgeLMEvalAdapter(
-                    surge=engine_instance,
-                    processor=self._tokenizer,
-                    max_length=self._model.config.granted_mask_max_position_embedding if self._model else 8192,
-                    max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                 )
@@ -1532,20 +1421,6 @@ class eLargeModel:
                     top_p=top_p,
                 )
 
-            elif "vSurge" in engine_type:
-                from easydel.inference.evaluations import vSurgeLMEvalAdapter
-
-                if batch_size is None:
-                    batch_size = getattr(engine.driver, "max_concurrent_decodes", jax.device_count())
-
-                eval_adapter = vSurgeLMEvalAdapter(
-                    surge=engine,
-                    processor=self._tokenizer,
-                    max_length=getattr(engine.driver.engine.model.config, "granted_mask_max_position_embedding", 8192),
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
             else:
                 raise ValueError(f"Unknown engine instance type: {engine_type}")
 
@@ -1686,22 +1561,6 @@ class eLargeModel:
                     lines.append(f"│   • Backend: {platform['backend']}")
                 if platform.get("platform"):
                     lines.append(f"│   • Hardware: {platform['platform']}")
-
-        vsurge = self._config.get("vsurge", {})
-        if vsurge:
-            has_vsurge_config = any(
-                vsurge.get(k) is not None for k in ["max_concurrent_decodes", "bytecode_decode", "interleaved_mode"]
-            )
-            if has_vsurge_config:
-                lines.append("│ ⚡ vSurge")
-                if vsurge.get("max_concurrent_decodes"):
-                    lines.append(f"│   • Max decodes: {vsurge['max_concurrent_decodes']}")
-                if vsurge.get("max_concurrent_prefill"):
-                    lines.append(f"│   • Max prefill: {vsurge['max_concurrent_prefill']}")
-                if vsurge.get("bytecode_decode"):
-                    lines.append(f"│   • Bytecode decode: {vsurge['bytecode_decode']}")
-                if vsurge.get("interleaved_mode"):
-                    lines.append(f"│   • Interleaved mode: {vsurge['interleaved_mode']}")
 
         lines.append("│ 📊 Status")
         lines.append(f"│   • Model loaded: {'✓' if self._model is not None else '✗'}")

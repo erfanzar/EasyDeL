@@ -43,14 +43,6 @@ DEFAULTS: ELMConfig = {
         "enable_prefix_caching": True,
         "verbose": False,
     },
-    "vsurge": {
-        "bytecode_decode": True,
-        "interleaved_mode": False,
-        "max_concurrent_decodes": 8,
-        "max_concurrent_prefill": 1,
-        "verbose": False,
-        "seed": 448,
-    },
     "mixture": {
         "cache_dir": f"{pathlib.Path.home()}/.cache/easydel",
         "streaming": True,

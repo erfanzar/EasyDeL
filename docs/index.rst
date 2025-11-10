@@ -126,8 +126,6 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    esurge
    esurge_examples
    whisper_api.md
-	 vsurge_example
-   vsurge_api_server_example
    trainers/dpo.md
    trainers/grpo.md
    trainers/orpo.md
