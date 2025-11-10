@@ -12,31 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Execution manager for efficient model inference with precompiled fused step functions.
+"""Execution manager for high-performance model inference with fused step functions.
 
-This module provides the ExecutionManager class that handles compilation and caching
-of fused step execution functions for different batch sizes and token counts. It uses
-AOT (Ahead-of-Time) compilation for optimal performance in production environments.
+This module implements the ExecutionManager class, which handles compilation, caching,
+and execution of fused inference steps. The manager pre-compiles functions for multiple
+input configurations to eliminate runtime compilation overhead during serving.
 
-The manager uses a fused execution mode where a single function combines:
-    - Input preparation (prepare_inputs)
-    - Model forward pass
-    - Token sampling
-    - State updates (apply_token)
+Architecture:
+    The manager uses a fused execution model where a single JIT-compiled function
+    combines four sequential operations:
 
-This provides maximum performance by minimizing host-device communication and
-maximizing kernel fusion opportunities.
+    1. Input preparation: Token gathering and position calculation
+    2. Model forward pass: Transformer execution with paged attention
+    3. Token sampling: Stochastic sampling with temperature/top-k/top-p
+    4. State updates: Token buffer updates and sequence tracking
+
+    This fusion minimizes host-device communication (single dispatch per step) and
+    maximizes kernel fusion opportunities within JAX/XLA.
+
+Compilation Modes:
+    - AOT (Ahead-of-Time): Pre-compiles all configurations using lower().compile()
+      for predictable latency and minimal warmup. Default for production.
+    - JIT (Just-in-Time): Defers compilation to first execution. Faster initial
+      setup but unpredictable first-step latency.
+
+Performance Characteristics:
+    - Single host-device round-trip per inference step
+    - Automatic kernel fusion via XLA compiler
+    - Bucketed compilation: O(log N) unique compilations for N request sizes
+    - LRU cache with capacity of 64 compiled variants
 
 Example:
     >>> from easydel.inference.esurge.runners import ExecutionManager
     >>> executor = ExecutionManager(
-    ...     model=my_model,
-    ...     mesh=device_mesh,
-    ...     kv_pages=cache_pages,
+    ...     model=model,
+    ...     mesh=jax.sharding.Mesh(devices, ('dp', 'tp')),
+    ...     kv_pages=cache,
     ...     use_aot_forward=True,
     ... )
-    >>> executor.compile(token_paddings, ...)
-    >>> result = executor.execute(...)
+    >>> executor.compile(
+    ...     num_tokens_paddings=[128, 256, 512, 1024],
+    ...     num_reqs_max_model_len=16,
+    ...     max_pages_per_req=64,
+    ...     max_num_reqs=32,
+    ...     metadata=cache_metadata,
+    ... )
+    >>> result = executor.execute(
+    ...     num_tokens=256,
+    ...     device_state=state,
+    ...     scheduled_full=scheduled,
+    ...     req_num_tokens_full=req_tokens,
+    ...     active_mask_full=active_mask,
+    ...     input_ids_buf=input_buf,
+    ...     position_ids_buf=pos_buf,
+    ...     padded_num_reqs=16,
+    ... )
 """
 
 from __future__ import annotations
@@ -58,8 +88,10 @@ from jax._src import pjit
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils import ejit
 
-from ...sampling_funcs import sample_top_p_efficient
+from ..core.sampler import sample_tokens
+from ..core.sampling_metadata import SamplingMetadata
 from ..page_table import PAGE_TABLE_PADDING_VAL
+from .execution_types import StepFunctionInputs, StepFunctionOutputs
 from .sequence_buffer import DeviceSequenceState, SequenceBuffer
 
 if typing.TYPE_CHECKING:
@@ -154,38 +186,80 @@ def _tree_hash_diff(tree_hash1, tree_hash2):
 
 
 class ExecutionManager:
-    """Manages precompiled fused step execution functions for efficient model inference.
+    """Compilation and execution manager for fused inference step functions.
 
-    This class handles the compilation and caching of fused step execution functions
-    for different token counts. The fused step combines input preparation, model
-    forward pass, token sampling, and state updates into a single compiled function
-    for maximum performance.
+    The ExecutionManager pre-compiles and caches fused step functions for multiple
+    input configurations, enabling low-latency serving without runtime compilation.
+    It uses bucketed compilation (powers of 2) to reduce the number of unique
+    variants while maintaining good hardware utilization.
 
-    The manager uses AOT (Ahead-of-Time) compilation, pre-compiling functions using
-    JAX's lower/compile API for optimal performance in production environments.
+    Architecture:
+        The manager splits the model into (graphdef, graphstate, graphother) for
+        efficient functional transformations. The graphstate (weights) can be
+        updated without recompilation. Compiled functions are cached in an LRU
+        structure with 64-entry capacity.
 
-    The manager pre-compiles functions for various token count configurations to avoid
-    runtime compilation overhead, enabling seamless switching between different
-    batch sizes during inference.
+    Compilation Strategy:
+        Request counts are bucketed into powers of 2 (up to min_input_pad, then
+        nearest power of 2 above). Token counts use explicit padding values provided
+        during compile(). This produces O(log N * M) compilations for N request
+        sizes and M token configurations.
 
     Attributes:
-        model: The EasyDeL model being managed.
-        mesh: JAX sharding mesh for distributed execution.
-        kv_pages: KV cache pages for attention.
-        use_aot_forward: Whether to use AOT compilation (default: True).
-        graphdef, graphstate, graphother: Split model components for JAX.
-        _step_fn: The compiled fused step function.
-        _lowerd_history: Cache of compiled functions.
+        model: EasyDeL model instance (EasyDeLBaseModule).
+        mesh: JAX sharding mesh for distributed execution across devices.
+        kv_pages: Paged KV cache storage (RaggedPagesCache).
+        use_aot_forward: If True, use AOT compilation via lower().compile().
+            If False, use JIT compilation on first call. Default: True.
+        min_input_pad: Minimum request count padding for bucketing. Default: 8.
+        max_model_len: Maximum sequence length supported by model.
+        max_num_reqs: Maximum concurrent requests.
+        max_num_tokens: Maximum tokens per batch (defaults to max_model_len).
+        metadata: KV cache metadata (RaggedPagesCacheView).
+        graphdef: Model graph definition (static structure).
+        graphstate: Model graph state (weights, device-resident).
+        graphother: Auxiliary model state (buffers, etc.).
+        rng_key: JAX random key for sampling, threaded through steps.
+
+    Private Attributes:
+        _step_fn: Base step function wrapper (ejit-decorated).
+        _lowerd_history: OrderedDict LRU cache of compiled functions.
+        _cache_capacity: Maximum cache entries (64).
+        _debug_baselines: Hash baselines for debugging recompilations.
+        _empty_sharding: Default sharding (replicated across mesh).
 
     Example:
+        >>> # Initialize manager
         >>> executor = ExecutionManager(
-        ...     model=my_model,
-        ...     mesh=device_mesh,
-        ...     kv_pages=cache_pages,
+        ...     model=model,
+        ...     mesh=mesh,
+        ...     kv_pages=cache,
         ...     use_aot_forward=True,
+        ...     min_input_pad=8,
+        ...     max_model_len=8192,
+        ...     max_num_reqs=32,
         ... )
-        >>> executor.compile(token_paddings, ...)
-        >>> result = executor.execute(...)
+        >>>
+        >>> # Pre-compile for expected configurations
+        >>> executor.compile(
+        ...     num_tokens_paddings=[128, 256, 512, 1024, 2048],
+        ...     num_reqs_max_model_len=16,
+        ...     max_pages_per_req=128,
+        ...     max_num_reqs=32,
+        ...     metadata=cache.metadata,
+        ... )
+        >>>
+        >>> # Execute steps during serving
+        >>> results = executor.execute(
+        ...     num_tokens=512,
+        ...     device_state=state,
+        ...     scheduled_full=scheduled,
+        ...     req_num_tokens_full=req_tokens,
+        ...     active_mask_full=active,
+        ...     input_ids_buf=input_buf,
+        ...     position_ids_buf=pos_buf,
+        ...     padded_num_reqs=16,
+        ... )
     """
 
     def __init__(
@@ -304,7 +378,7 @@ class ExecutionManager:
     def execute(
         self,
         num_tokens: int,
-        dev_state: DeviceSequenceState,
+        device_state: DeviceSequenceState,
         scheduled_full: jax.Array,
         req_num_tokens_full: jax.Array,
         active_mask_full: jax.Array,
@@ -323,88 +397,93 @@ class ExecutionManager:
         jax.Array,
         jax.Array,
     ]:
-        """Execute the fused step function.
+        """Execute a single fused inference step.
 
-        This method runs a single fused execution step that combines input preparation,
-        model forward pass, token sampling, and state updates into a single compiled
-        function for maximum efficiency.
+        Runs a pre-compiled fused function that combines input preparation, model
+        forward pass, token sampling, and state updates in a single device dispatch.
 
         Args:
-            num_tokens: Number of tokens to process in this batch.
-            dev_state: Current device sequence state containing token IDs and metadata.
-            scheduled_full: Array of scheduled tokens per request [max_num_reqs].
-            req_num_tokens_full: Array of required number of tokens per request [max_num_reqs].
-            active_mask_full: Boolean mask indicating active requests [max_num_reqs].
-            input_ids_buf: Buffer for input token IDs [max_num_tokens].
-            position_ids_buf: Buffer for position IDs [max_num_tokens].
-            query_start_loc_buf: Buffer for query start locations [max_num_reqs+1].
-            seq_lens_buf: Buffer for sequence lengths [max_num_reqs].
-            pages_tables_buf: Buffer for page tables [num_reqs_max_model_len, max_pages_per_req].
-            padded_num_reqs: Padded number of requests for compilation efficiency.
+            num_tokens: Total tokens to process across all requests in this step.
+                Must match a value from num_tokens_paddings used during compile().
+            device_state: Current device-side sequence state (DeviceSequenceState).
+                Contains token buffers, position tracking, and sampling parameters.
+            scheduled_full: Number of tokens scheduled per request [max_num_reqs].
+                Determines how many tokens from each request enter this step.
+            req_num_tokens_full: Target token count per request [max_num_reqs].
+                Used to determine when requests have generated enough tokens.
+            active_mask_full: Boolean mask for active requests [max_num_reqs].
+                Inactive requests are skipped during processing.
+            input_ids_buf: Contiguous token ID buffer [max_num_tokens]. Flattened
+                across requests for efficient batch processing.
+            position_ids_buf: Contiguous position ID buffer [max_num_tokens].
+                Parallel to input_ids_buf with position indices.
+            padded_num_reqs: Bucketed request count for compilation lookup. Must
+                be a power of 2 (or min_input_pad) matching a compiled variant.
 
         Returns:
-            A tuple containing:
-                - dev_state: Updated device sequence state.
-                - out_tokens_full: Generated token IDs for each request.
-                - valid_mask_full: Mask indicating which tokens are valid.
-                - input_ids_buf: Updated input IDs buffer.
-                - position_ids_buf: Updated position IDs buffer.
-                - query_start_loc_buf: Updated query start locations buffer.
-                - seq_lens_buf: Updated sequence lengths buffer.
-                - pages_tables_buf: Updated page tables buffer.
+            Tuple of 10 elements:
+                - device_state: Updated sequence state with new tokens written.
+                - out_tokens_full: Generated tokens [max_num_reqs], -1 for invalid.
+                - valid_mask_full: Boolean mask for valid generations [max_num_reqs].
+                - input_ids_buf: Updated input buffer (may contain new tokens).
+                - position_ids_buf: Updated position buffer.
+                - query_start_loc_buf: Query start locations [max_num_reqs+1].
+                - seq_lens_buf: Sequence lengths [max_num_reqs].
+                - pages_tables_buf: Page tables [num_reqs, max_pages].
+                - hidden_states: Last layer hidden states [num_tokens, hidden_dim].
+                - logits: Output logits [padded_num_reqs, vocab_size].
 
         Raises:
-            KeyError: If no compiled function exists for the given configuration.
+            KeyError: If no compiled function exists for (num_tokens, padded_num_reqs).
+                This indicates the configuration wasn't included in compile() call.
 
+        Note:
+            The KV cache (self.kv_pages) and random key (self.rng_key) are updated
+            in-place on self after execution completes.
+
+        Example:
+            >>> results = executor.execute(
+            ...     num_tokens=256,
+            ...     device_state=state,
+            ...     scheduled_full=jnp.array([4, 8, 2, ...]),
+            ...     req_num_tokens_full=jnp.array([512, 256, 128, ...]),
+            ...     active_mask_full=jnp.array([True, True, False, ...]),
+            ...     input_ids_buf=input_buf,
+            ...     position_ids_buf=pos_buf,
+            ...     padded_num_reqs=16,
+            ... )
+            >>> new_state, tokens, valid, *rest = results
         """
         fn = self.get_compiled_key(num_tokens, padded_num_reqs)
 
-        # comp_hash = self._debug_baselines[f"{num_tokens}_hash_in"]
-        # new_hash = _tree_hash(
-        #     (
-        #         self.graphstate,
-        #         self.graphother,
-        #         dev_state,
-        #         self.kv_pages,
-        #         scheduled_full,
-        #         req_num_tokens_full,
-        #         active_mask_full,
-        #         input_ids_buf,
-        #         position_ids_buf,
-        #         self.rng_key,
-        #     )
-        # )
-        # _ = _tree_hash_diff(comp_hash, new_hash)
-        result = fn(
-            self.graphstate,
-            self.graphother,
-            dev_state,
-            self.kv_pages,
-            scheduled_full,
-            req_num_tokens_full,
-            active_mask_full,
-            input_ids_buf,
-            position_ids_buf,
-            self.rng_key,
+        inputs = StepFunctionInputs(
+            device_state=device_state,
+            kv_pages=self.kv_pages,
+            scheduled_full=scheduled_full,
+            req_num_tokens_full=req_num_tokens_full,
+            active_mask_full=active_mask_full,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            rng_key=self.rng_key,
         )
 
-        (
-            dev_state,
-            self.kv_pages,
-            input_ids_buf,
-            position_ids_buf,
-            query_start_loc_buf,
-            seq_lens_buf,
-            pages_tables_buf,
-            self.rng_key,
-            out_tokens_full,
-            valid_mask_full,
-            hidden_states,
-            logits,
-        ) = result
+        result = fn(self.graphstate, self.graphother, inputs)
+
+        device_state = result.device_state
+        self.kv_pages = result.kv_pages
+        input_ids_buf = result.input_ids_buf
+        position_ids_buf = result.position_ids_buf
+        query_start_loc_buf = result.query_start_loc
+        seq_lens_buf = result.seq_lens
+        pages_tables_buf = result.pages_tables
+        self.rng_key = result.rng_key
+        out_tokens_full = result.out_tokens
+        valid_mask_full = result.valid_mask
+        hidden_states = result.hidden_states
+        logits = result.logits
 
         return (
-            dev_state,
+            device_state,
             out_tokens_full,
             valid_mask_full,
             input_ids_buf,
@@ -529,16 +608,30 @@ class ExecutionManager:
         self._step_fn = self.get_step_fn()
 
     def get_step_fn(self) -> typing.Callable:
-        """Create the fused step function.
+        """Create the fused step execution function.
 
-        Creates a single function that combines input preparation, model forward pass,
-        token sampling, and state updates. This provides the best performance by
-        minimizing host-device communication and maximizing kernel fusion.
+        Builds a single ejit-wrapped function that performs a complete inference step:
+        input preparation, model forward pass, token sampling, and state updates.
+        This fusion minimizes host-device round-trips and enables XLA kernel fusion.
+
+        The returned function signature is:
+            fn(num_tokens: int, graphdef, graphstate, graphother, inputs: StepFunctionInputs)
+            -> StepFunctionOutputs
+
+        Where:
+            - num_tokens: Static argument (compilation key) for token count bucket
+            - graphdef: Static model structure
+            - graphstate: Model weights (donated for in-place updates)
+            - graphother: Auxiliary model state (donated)
+            - inputs: StepFunctionInputs PyTree (donated)
 
         Returns:
-            A callable that performs a complete inference step. The function is
-            wrapped with ejit for efficient execution.
+            Callable fused step function with shardings applied for inputs/outputs.
+            The function is decorated with ejit for efficient lowering and execution.
 
+        Note:
+            The function uses donate_argnames for memory efficiency. Input buffers
+            are donated and may be mutated in-place by XLA.
         """
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
@@ -547,55 +640,58 @@ class ExecutionManager:
         i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
         i_rows_pt = jnp.arange(num_reqs_max_model_len, dtype=jnp.int32)
 
+        inputs_shardings = StepFunctionInputs(
+            device_state=self._empty_sharding,
+            kv_pages=es.extract_shardings(self.kv_pages, self.mesh),
+            scheduled_full=self._empty_sharding,
+            req_num_tokens_full=self._empty_sharding,
+            active_mask_full=self._empty_sharding,
+            input_ids_buf=self._empty_sharding,
+            position_ids_buf=self._empty_sharding,
+            rng_key=self._empty_sharding,
+        )
+
+        outputs_shardings = StepFunctionOutputs(
+            device_state=self._empty_sharding,
+            kv_pages=es.extract_shardings(self.kv_pages, self.mesh),
+            input_ids_buf=self._empty_sharding,
+            position_ids_buf=self._empty_sharding,
+            query_start_loc=self._empty_sharding,
+            seq_lens=self._empty_sharding,
+            pages_tables=self._empty_sharding,
+            rng_key=self._empty_sharding,
+            out_tokens=self._empty_sharding,
+            valid_mask=self._empty_sharding,
+            hidden_states=self._empty_sharding,
+            logits=self._empty_sharding,
+        )
+
         @ejit(
             static_argnums=(0, 1),
-            donate_argnames=[
-                "dev_state",
-                "kv_pages",
-                "input_ids_buf",
-                "position_ids_buf",
-            ],
+            donate_argnames=["inputs"],
             in_shardings=(
                 es.extract_shardings(self.graphstate, self.mesh),  # graphstate
                 es.extract_shardings(self.graphother, self.mesh),  # graphother
-                self._empty_sharding,  # dev_state (PyTree)
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # scheduled_full
-                self._empty_sharding,  # req_num_tokens_full
-                self._empty_sharding,  # active_mask_full
-                self._empty_sharding,  # input_ids_buf
-                self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # rng_key
+                inputs_shardings,  # StepFunctionInputs PyTree
             ),
-            out_shardings=(
-                self._empty_sharding,  # dev_state (updated)
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # input_ids_buf
-                self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # query_start_loc_buf
-                self._empty_sharding,  # seq_lens_buf
-                self._empty_sharding,  # pages_tables_buf
-                self._empty_sharding,  # rng_key
-                self._empty_sharding,  # out_tokens (full-size, masked)
-                self._empty_sharding,  # valid_mask (full-size)
-                self._empty_sharding,  # hidden_states
-                self._empty_sharding,  # logits
-            ),
+            out_shardings=outputs_shardings,  # StepFunctionOutputs PyTree
         )
         def _fn(
             num_tokens_static: int,  # STATIC: padded_total bucket
             graphdef,
             graphstate,
             graphother,
-            dev_state: DeviceSequenceState,
-            kv_pages: RaggedPagesCache,
-            scheduled_full: jax.Array,  # [max_num_reqs] int32
-            req_num_tokens_full: jax.Array,  # [max_num_reqs] int32
-            active_mask_full: jax.Array,  # [max_num_reqs] bool
-            input_ids_buf: jax.Array,  # [max_num_tokens]
-            position_ids_buf: jax.Array,  # [max_num_tokens]
-            rng_key: jax.Array,
-        ):
+            inputs: StepFunctionInputs,
+        ) -> StepFunctionOutputs:
+            device_state = inputs.device_state
+            kv_pages = inputs.kv_pages
+            scheduled_full = inputs.scheduled_full
+            req_num_tokens_full = inputs.req_num_tokens_full
+            active_mask_full = inputs.active_mask_full
+            input_ids_buf = inputs.input_ids_buf
+            position_ids_buf = inputs.position_ids_buf
+            rng_key = inputs.rng_key
+
             with self.model.mesh:
                 nr = jnp.minimum(jnp.int32(jnp.sum(active_mask_full)), jnp.int32(max_num_reqs))
                 mask_reqs = i_reqs < nr
@@ -609,19 +705,19 @@ class ExecutionManager:
                 req_for_tok = jnp.searchsorted(cum, it, side="right")
                 req_for_tok = jnp.where(valid_tok, req_for_tok, 0)
                 cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), cum[:-1]])
-                base_pos = dev_state.num_computed_tokens[req_for_tok]
+                base_pos = device_state.num_computed_tokens[req_for_tok]
                 off_in_req = it - cum_prev[req_for_tok]
                 positions = base_pos + off_in_req
                 positions = jnp.where(valid_tok, positions, 0)
 
-                in_ids = dev_state.token_ids[req_for_tok, positions]
+                in_ids = device_state.token_ids[req_for_tok, positions]
                 in_ids = jnp.where(valid_tok, in_ids, 0)
                 input_ids_buf = input_ids_buf.at[:num_tokens_static].set(in_ids)
                 position_ids_buf = position_ids_buf.at[:num_tokens_static].set(positions)
                 qsl = jnp.zeros((max_num_reqs + 1,), dtype=jnp.int32).at[1:].set(cum)
-                seq_lens = jnp.where(mask_reqs, dev_state.num_computed_tokens + scheduled, 0)
+                seq_lens = jnp.where(mask_reqs, device_state.num_computed_tokens + scheduled, 0)
 
-                pt_array = dev_state.page_table[0].get_array()
+                pt_array = device_state.page_table[0].get_array()
                 pt_src = pt_array[: min(pt_array.shape[0], num_reqs_max_model_len), :]
                 mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
                 pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
@@ -629,11 +725,13 @@ class ExecutionManager:
                 nr_safe = jnp.maximum(nr, 1)
                 next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
                 padded_num_reqs = jnp.where(
-                    nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2
+                    nr <= jnp.int32(self.min_input_pad),
+                    jnp.int32(self.min_input_pad),
+                    next_pow2,
                 )
                 padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
 
-                active_num_computed = jnp.where(mask_reqs, dev_state.num_computed_tokens, 0)
+                active_num_computed = jnp.where(mask_reqs, device_state.num_computed_tokens, 0)
                 is_decode = (scheduled == 1) & (active_num_computed > 0)
                 is_chunked_prefill = (scheduled > 1) & (active_num_computed > 0)
                 decode_count = jnp.sum(is_decode.astype(jnp.int32))
@@ -667,52 +765,54 @@ class ExecutionManager:
                 hs = output.last_hidden_state.squeeze(0)
                 logits = model.apply_lm_head(hs[logits_indices])
 
-                temp = dev_state.temperature[:max_num_reqs].astype(logits.dtype)
-                topp = dev_state.top_p[:max_num_reqs].astype(logits.dtype)
+                temp = device_state.temperature[:max_num_reqs].reshape(-1, 1).astype(logits.dtype)
+                topp = device_state.top_p[:max_num_reqs].astype(logits.dtype)
+                topk = device_state.top_k[:max_num_reqs].astype(jnp.int32)
+                minp = device_state.min_p[:max_num_reqs].astype(logits.dtype)
 
                 is_all_greedy = jnp.all(temp <= 0.0)
+                need_min_p_sampling = jnp.any(minp > 0.0)
 
-                def do_greedy(_):
-                    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                sampling_metadata = SamplingMetadata(
+                    temperatures=temp,
+                    top_ps=topp,
+                    top_ks=topk,
+                    min_ps=minp,
+                    sampling_seeds=None,
+                    is_all_greedy=is_all_greedy,
+                    need_min_p_sampling=need_min_p_sampling,
+                    do_penalties=False,
+                    linear_penalty=None,
+                )
 
-                def do_sample(_):
-                    B = logits.shape[0]
-                    row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
-                    samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
-                        logits, topp, temp, row_keys, 64
-                    )
-                    return samples.reshape(-1)
-
-                sampled_flat = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None).reshape(-1)
+                positions = device_state.num_computed_tokens[:max_num_reqs]
+                sampled_flat = sample_tokens(logits, sampling_metadata, positions, rng_key)
                 rng_key = jax.random.fold_in(rng_key, jnp.int32(num_tokens_static))
 
-                seq_lens_now_full = dev_state.num_computed_tokens + scheduled
+                seq_lens_now_full = device_state.num_computed_tokens + scheduled
                 meets_len_full = seq_lens_now_full >= req_num_tokens_full
                 valid_mask_full = (i_reqs < nr) & active_mask_full & (scheduled > 0) & meets_len_full
 
                 j_pos_full = jnp.clip(seq_lens_now_full, 0, self.max_model_len - 1)
-                curr_vals_full = dev_state.token_ids[i_reqs, j_pos_full]
+                curr_vals_full = device_state.token_ids[i_reqs, j_pos_full]
                 delta_full = jnp.where(valid_mask_full, sampled_flat - curr_vals_full, 0)
 
-                token_ids = dev_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
-                num_tokens = dev_state.num_tokens + valid_mask_full.astype(dev_state.num_tokens.dtype)
+                token_ids = device_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
+                num_tokens = device_state.num_tokens + valid_mask_full.astype(device_state.num_tokens.dtype)
 
-                dev_state = dev_state.with_updates(token_ids=token_ids, num_tokens=num_tokens)
-
-                out_tokens_full = jnp.where(valid_mask_full, sampled_flat, -1)
-                return (
-                    dev_state,
-                    output.past_key_values,
-                    input_ids_buf,
-                    position_ids_buf,
-                    qsl,
-                    seq_lens,
-                    pt,
-                    rng_key,
-                    out_tokens_full,
-                    valid_mask_full,
-                    hs,
-                    logits,
+                return StepFunctionOutputs(
+                    device_state=device_state.with_updates(token_ids=token_ids, num_tokens=num_tokens),
+                    kv_pages=output.past_key_values,
+                    input_ids_buf=input_ids_buf,
+                    position_ids_buf=position_ids_buf,
+                    query_start_loc=qsl,
+                    seq_lens=seq_lens,
+                    pages_tables=pt,
+                    rng_key=rng_key,
+                    out_tokens=jnp.where(valid_mask_full, sampled_flat, -1),
+                    valid_mask=valid_mask_full,
+                    hidden_states=hs,
+                    logits=logits,
                 )
 
         return _fn
@@ -737,37 +837,23 @@ class ExecutionManager:
             if self.use_aot_forward:
                 compiled = self._step_fn.lower(num_tokens, *compargs).compile()
                 self._cache_put(fused_key, compiled)
-                warm_args = (
-                    compargs[1],  # graphstate
-                    compargs[2],  # graphother
-                    compargs[3],  # dev_state (PartitionSpec())
-                    compargs[4],  # kv_pages   (per-leaf sharding)
-                    compargs[5],  # scheduled_full (PartitionSpec())
-                    compargs[6],  # req_num_tokens_full (PartitionSpec())
-                    compargs[7],  # active_mask_full (PartitionSpec())
-                    compargs[8],  # input_ids_buf (PartitionSpec())
-                    compargs[9],  # position_ids_buf (PartitionSpec())
-                    compargs[10],  # rng_key (None)
-                )
+                warm_args = (compargs[1], compargs[2], compargs[3])
                 self._debug_baselines[f"{num_tokens}_hash_in"] = _tree_hash(warm_args)
             else:
                 partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
-
-                result = partial_fn(self.graphstate, self.graphother, *compargs[3:])
-                (
-                    _dev_state,
-                    self.kv_pages,
-                    _input_ids_buf,
-                    _position_ids_buf,
-                    _query_start_loc_buf,
-                    _seq_lens_buf,
-                    _pages_tables_buf,
-                    _rng_key,
-                    _out_tokens_full,
-                    _valid_mask_full,
-                    _hidden_states,
-                    _logits,
-                ) = result
+                result = partial_fn(self.graphstate, self.graphother, compargs[3])
+                _device_state = result.device_state
+                self.kv_pages = result.kv_pages
+                _input_ids_buf = result.input_ids_buf
+                _position_ids_buf = result.position_ids_buf
+                _query_start_loc_buf = result.query_start_loc
+                _seq_lens_buf = result.seq_lens
+                _pages_tables_buf = result.pages_tables
+                _rng_key = result.rng_key
+                _out_tokens_full = result.out_tokens
+                _valid_mask_full = result.valid_mask
+                _hidden_states = result.hidden_states
+                _logits = result.logits
 
                 self._cache_put(fused_key, partial_fn)
 
@@ -796,20 +882,38 @@ class ExecutionManager:
         self,
         kv_pages: RaggedPagesCache,
         rng_key: jax.random.PRNGKey,
-        num_tokens: int,  # unused - kept for API compatibility
-        num_reqs_max_model_len: int,  # unused - kept for API compatibility
-        max_pages_per_req: int,  # unused - kept for API compatibility
+        num_tokens: int,
+        num_reqs_max_model_len: int,
+        max_pages_per_req: int,
         max_num_reqs: int,
-        padded_num_reqs: int,  # unused - kept for API compatibility
+        padded_num_reqs: int,
         metadata: RaggedPagesCacheView,
     ):
-        """Generate example arguments for fused step function compilation.
+        """Generate compilation arguments for step function.
 
-        Creates mock input arguments with the correct shapes and types for
-        compiling the fused step execution function. These arguments are used
-        to trace through the function during compilation. All arrays are
-        device_put to the exact shardings used at runtime to prevent AOT
-        variant recompiles.
+        Creates dummy input structures with correct shapes, dtypes, and shardings
+        for tracing the step function during AOT/JIT compilation. All arrays are
+        device-resident with appropriate sharding annotations to prevent XLA from
+        generating multiple compilation variants.
+
+        Args:
+            kv_pages: KV cache pages (used as-is in compilation args).
+            rng_key: Random key for sampling (device-placed with empty sharding).
+            num_tokens: Token count (unused, for API compatibility).
+            num_reqs_max_model_len: Max requests at model length (unused).
+            max_pages_per_req: Max pages per request (unused).
+            max_num_reqs: Maximum concurrent requests for buffer sizing.
+            padded_num_reqs: Padded request count (unused).
+            metadata: KV cache metadata for buffer initialization.
+
+        Returns:
+            List of compilation arguments: [graphdef, graphstate, graphother, inputs]
+            where inputs is a StepFunctionInputs PyTree with dummy values.
+
+        Note:
+            Dummy values use simple patterns (ones, zeros) since compilation only
+            traces shapes/dtypes. The returned structures must match runtime
+            shardings exactly to avoid recompilation.
         """
 
         temp_buffer = SequenceBuffer.create(
@@ -819,25 +923,17 @@ class ExecutionManager:
             vocab_size=self.model.config.get_text_config().vocab_size,
             page_sizes=[metadata.page_size],
         )
-        dev_state = temp_buffer.to_device_state()
+        device_state = temp_buffer.to_device_state()
 
-        fused_args = [
-            self.graphdef,
-            self.graphstate,
-            self.graphother,
-            dev_state,
-            kv_pages,
-            jnp.ones((max_num_reqs,), dtype=jnp.int32),
-            jnp.full((max_num_reqs,), 10, dtype=jnp.int32),
-            jnp.ones((max_num_reqs,), dtype=bool),
-            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            rng_key,
-        ]
+        inputs = StepFunctionInputs(
+            device_state=_device_put_tree_uniform(device_state, self._empty_sharding),
+            kv_pages=kv_pages,
+            scheduled_full=jax.device_put(jnp.ones((max_num_reqs,), dtype=jnp.int32), self._empty_sharding),
+            req_num_tokens_full=jax.device_put(jnp.full((max_num_reqs,), 10, dtype=jnp.int32), self._empty_sharding),
+            active_mask_full=jax.device_put(jnp.ones((max_num_reqs,), dtype=bool), self._empty_sharding),
+            input_ids_buf=jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding),
+            position_ids_buf=jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding),
+            rng_key=jax.device_put(rng_key, self._empty_sharding),
+        )
 
-        fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
-        for idx in (5, 6, 7, 8, 9, 10):
-            if hasattr(fused_args[idx], "dtype"):
-                fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
-
-        return fused_args
+        return [self.graphdef, self.graphstate, self.graphother, inputs]

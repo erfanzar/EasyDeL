@@ -251,7 +251,6 @@ class eSurgeRunner:
         if not ((min_token_size & (min_token_size - 1) == 0) and min_token_size > 0):
             logger.error(f"Invalid min_token_size={min_token_size}, must be power of 2")
             raise ValueError(f"min_token_size must be a power of 2, got {min_token_size}")
-        assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
         paddings = []
         num = min_token_size
 
@@ -275,7 +274,6 @@ class eSurgeRunner:
         """Initialize internal variables and preallocate reusable buffers."""
         self.num_reqs_max_model_len = min(self.metadata.get_max_num_seqs(), self.max_num_reqs)
         self.num_reqs_most_model_len = self.num_reqs_max_model_len
-        # num_tokens_paddings and max_num_tokens already calculated before ExecutionManager creation
         self.requests: dict[str, CachedRequestState] = {}
         logger.debug(f"Token padding sizes: {len(self.num_tokens_paddings)} levels, max={self.max_num_tokens}")
 
@@ -449,13 +447,14 @@ class eSurgeRunner:
             max_num_reqs=self.max_num_reqs,
             metadata=self.metadata,
         )
+
         req_bucket = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
 
         self._precompile_jitted_helpers(
             reqs_padds=sorted({req_bucket(n, self.max_num_reqs) for n in range(1, self.max_num_reqs + 1)}),
             prompt_len_buckets=[min(n, self.max_model_len) for n in self.num_tokens_paddings],
             precompile_allowed_mask=False,
-            allowed_max=512,
+            allowed_max=4096,
         )
 
     def update_model_weights(
@@ -696,9 +695,9 @@ class eSurgeRunner:
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
 
-        t_dev_state_start = time.time()
-        dev_state = self.sequence_buffer.to_device_state()
-        t_dev_state = time.time() - t_dev_state_start
+        t_device_state_start = time.time()
+        device_state = self.sequence_buffer.to_device_state()
+        t_device_state = time.time() - t_device_state_start
 
         while start_index < self.sequence_buffer.num_reqs:
             t_prep_start = time.time()
@@ -760,7 +759,7 @@ class eSurgeRunner:
 
             exec_start = time.time()
             (
-                dev_state,
+                device_state,
                 out_tokens_win,
                 valid_mask_win,
                 self.input_ids_buf,
@@ -772,7 +771,7 @@ class eSurgeRunner:
                 _logits,
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
-                dev_state=dev_state,
+                device_state=device_state,
                 scheduled_full=self.scheduled_full_buf,
                 req_num_tokens_full=self.req_num_tokens_full_buf,
                 active_mask_full=self.active_mask_full_buf,
@@ -791,7 +790,7 @@ class eSurgeRunner:
             logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
 
             sq_utime = time.time()
-            self.sequence_buffer = self.sequence_buffer.from_device_state(dev_state)
+            self.sequence_buffer = self.sequence_buffer.from_device_state(device_state)
             sq_utime_took = time.time() - sq_utime
             total_sync_time += sq_utime_took
 
@@ -837,7 +836,7 @@ class eSurgeRunner:
             f"prep={total_prep_time:.3f}s "
             f"sync={total_sync_time:.3f}s "
             f"post={total_post_proc_time:.3f}s "
-            f"init_dev={t_dev_state:.3f}s "
+            f"init_dev={t_device_state:.3f}s "
             f"upd_states={updating_states_time:.3f}s "
             f"total={total_time:.3f}s"
         )
