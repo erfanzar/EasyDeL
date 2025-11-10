@@ -57,6 +57,9 @@ class SchedulerConfig:
     chunked_prefill_enabled: bool = False
     """A flag to enable or disable chunked prefilling."""
 
+    token_safety_margin: int | None = None
+    """Reserved tokens per running request to prevent over-allocation."""
+
 
 @dataclass
 class CacheConfig:

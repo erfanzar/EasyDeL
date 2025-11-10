@@ -275,6 +275,16 @@ class SequenceBuffer:
     bad_words_token_ids: dict[int, list[list[int]]] = field(default_factory=dict, pytree_node=False)
     allowed_token_ids_mask: Any = None  # jax.Array | None
 
+    def _compute_request_distribution(self) -> list[int]:
+        """Compute the request distribution triple [decode_only, chunked_prefill, total]."""
+        total = len(self.req_id_to_index)
+        return [0, 0, total]
+
+    def _with_updates(self, **kwargs) -> "SequenceBuffer":
+        """Return a new buffer with updated leaves and refreshed request distribution."""
+        new_buf = replace(self, **kwargs)
+        return replace(new_buf, request_distribution=new_buf._compute_request_distribution())
+
     @classmethod
     def create(
         cls,
@@ -496,8 +506,7 @@ class SequenceBuffer:
             min(int(request.num_computed_tokens), self.max_model_len)
         )
 
-        buf = replace(
-            self,
+        buf = self._with_updates(
             token_ids=new_token_ids,
             num_prompt_tokens=new_num_prompt_tokens,
             num_tokens=new_num_tokens,
@@ -506,7 +515,7 @@ class SequenceBuffer:
         )
 
         # Page table
-        buf = replace(buf, page_table=buf.page_table.add_row(request.page_ids, req_index))
+        buf = buf._with_updates(page_table=buf.page_table.add_row(request.page_ids, req_index))
 
         # Sampling params
         sampling_params = request.sampling_params
@@ -569,7 +578,7 @@ class SequenceBuffer:
         if new_mask is not None:
             new_mask = new_mask.at[req_index].set(False)
 
-        return replace(self, allowed_token_ids_mask=new_mask), req_index
+        return self._with_updates(allowed_token_ids_mask=new_mask), req_index
 
     def swap_states(self, i1: int, i2: int) -> SequenceBuffer:
         """Swap the states of two requests at given indices.
@@ -624,8 +633,7 @@ class SequenceBuffer:
         swap_dict_values(self.bad_words_token_ids, i1, i2)
         self.logit_bias[i1], self.logit_bias[i2] = self.logit_bias[i2], self.logit_bias[i1]
 
-        return replace(
-            self,
+        return self._with_updates(
             num_tokens=new_num_tokens,
             num_tokens_no_spec=new_num_tokens_no_spec,
             num_prompt_tokens=new_num_prompt_tokens,
@@ -727,8 +735,7 @@ class SequenceBuffer:
         new_page_table = self.page_table.move_row(from_idx, to_idx)
 
         # Sparse/optional
-        buf = replace(
-            self,
+        buf = self._with_updates(
             token_ids=new_token_ids,
             num_tokens=new_num_tokens,
             num_tokens_no_spec=new_num_tokens_no_spec,
@@ -779,7 +786,7 @@ class SequenceBuffer:
             new_mask = new_mask.at[to_idx].set(new_mask[from_idx])
             new_mask = new_mask.at[from_idx].set(False)
 
-        return replace(self, allowed_token_ids_mask=new_mask)
+        return self._with_updates(allowed_token_ids_mask=new_mask)
 
     def _process_sampling_params(self, sampling_params: SamplingParams, req_id: str, req_index: int) -> SequenceBuffer:
         """Process and store core sampling parameters.
@@ -841,8 +848,7 @@ class SequenceBuffer:
             repetition_penalties = repetition_penalties.at[req_index].set(sampling_params.repetition_penalty)
             self.repetition_penalties_reqs.add(req_id)
 
-        return replace(
-            self,
+        return self._with_updates(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -938,7 +944,7 @@ class SequenceBuffer:
         if allowed_token_ids:
             mask = mask.at[req_index, allowed_token_ids].set(False)
 
-        return replace(self, allowed_token_ids_mask=mask)
+        return self._with_updates(allowed_token_ids_mask=mask)
 
     def _allocate_index(self, req_index: int | None) -> int:
         """Allocate an index for a new request.
@@ -1097,8 +1103,7 @@ class SequenceBuffer:
         self.bad_words_token_ids.clear()
         self.logit_bias = [None] * self.max_num_reqs
 
-        return replace(
-            self,
+        return self._with_updates(
             token_ids=token_ids,
             num_tokens=num_tokens,
             num_tokens_no_spec=num_tokens_no_spec,
@@ -1159,8 +1164,7 @@ class SequenceBuffer:
             This is used to incorporate results from device computation
             back into the buffer.
         """
-        return replace(
-            self,
+        return self._with_updates(
             token_ids=dev.token_ids,
             num_tokens=dev.num_tokens,
             num_tokens_no_spec=dev.num_tokens_no_spec,
@@ -1183,8 +1187,7 @@ class SequenceBuffer:
         def put(a):
             return jax.device_put(a, sharding)
 
-        return replace(
-            self,
+        return self._with_updates(
             token_ids=put(self.token_ids),
             num_tokens=put(self.num_tokens),
             num_tokens_no_spec=put(self.num_tokens_no_spec),

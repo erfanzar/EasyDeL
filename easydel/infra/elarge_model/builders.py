@@ -184,52 +184,6 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def to_vsurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
-    """Convert ELM configuration to kwargs for vSurge initialization.
-
-    Extracts vSurge-specific configuration values and infers defaults from
-    base configuration when needed.
-
-    Args:
-        cfg_like: ELM configuration dictionary or mapping
-
-    Returns:
-        Dictionary of keyword arguments for vSurge initialization
-
-    Example:
-        >>> cfg = {
-        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "vsurge": {"max_concurrent_decodes": 8, "bytecode_decode": True}
-        ... }
-        >>> kwargs = to_vsurge_kwargs(cfg)
-        >>> kwargs["bytecode_decode"]
-        True
-    """
-    cfg = normalize(cfg_like)
-    vs = cfg.get("vsurge", {})
-    base_vals = dict(cfg.get("base_config", {}).get("values", {}) or {})
-
-    max_length = (
-        vs.get("max_length")
-        or base_vals.get("mask_max_position_embeddings")
-        or base_vals.get("freq_max_position_embeddings")
-        or 8192
-    )
-
-    return dict(
-        max_concurrent_decodes=vs.get("max_concurrent_decodes"),
-        max_concurrent_prefill=int(vs.get("max_concurrent_prefill", 1)),
-        prefill_lengths=vs.get("prefill_lengths"),
-        max_prefill_length=int(vs.get("max_prefill_length", max_length // 2)),
-        max_length=int(max_length),
-        interleaved_mode=bool(vs.get("interleaved_mode", False)),
-        slot_clear_steps=int(vs.get("slot_clear_steps", 0)),
-        bytecode_decode=bool(vs.get("bytecode_decode", False)),
-        verbose=bool(vs.get("verbose", True)),
-        seed=int(vs.get("seed", 894)),
-    )
-
-
 def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
     """Build an eSurge inference engine from ELM configuration.
 
@@ -417,44 +371,3 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
     mixture = DatasetMixture(**mixture_kwargs)
     return mixture.build()
 
-
-def build_vsurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
-    """Build a vSurge inference engine from ELM configuration.
-
-    Creates a vSurge instance with the model, processor, and inference
-    configuration specified in the ELM config.
-
-    Args:
-        cfg_like: ELM configuration dictionary or mapping
-
-    Returns:
-        vSurge: Configured vSurge inference engine
-
-    Raises:
-        NotImplementedError: If the task type is not supported by vSurge
-
-    Example:
-        >>> cfg = {
-        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "vsurge": {"max_concurrent_decodes": 8, "bytecode_decode": True}
-        ... }
-        >>> engine = build_vsurge(cfg)
-        >>>
-    """
-    from transformers import AutoTokenizer
-
-    from easydel.inference import vSurge
-
-    cfg = normalize(cfg_like)
-    task = resolve_task(cfg)
-    if task not in [TaskType.CAUSAL_LM, TaskType.IMAGE_TEXT_TO_TEXT, getattr(TaskType, "VISION_LM", None)]:
-        raise NotImplementedError(f"vSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, VISION_LM]; got {task}")
-
-    tok_path = cfg["model"].get("tokenizer", cfg["model"]["name_or_path"])
-    if model is None:
-        model = build_model(cfg)
-    return vSurge.from_model(
-        model=model,
-        processor=AutoTokenizer.from_pretrained(tok_path),
-        **to_vsurge_kwargs(cfg),
-    )

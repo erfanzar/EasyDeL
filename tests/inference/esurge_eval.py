@@ -33,7 +33,7 @@ def main():
     processor = AutoTokenizer.from_pretrained(model_id)
     processor.pad_token_id = processor.eos_token_id
 
-    # Create eSurge instance instead of vSurge
+    # Create eSurge instance for evaluation
     surge = ed.eSurge(
         model=model_id,
         tokenizer=processor,

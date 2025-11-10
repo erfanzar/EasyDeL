@@ -865,6 +865,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             sliding_window=getattr(self, "sliding_window", None),
         )
 
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+
         # 8. Merge heads and output projection
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)

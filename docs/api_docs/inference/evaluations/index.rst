@@ -5,4 +5,3 @@ easydel.inference.evaluations package
    :maxdepth: 2
 
    inference/evaluations/esurge_eval
-   inference/evaluations/vsurge_eval

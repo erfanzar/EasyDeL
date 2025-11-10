@@ -74,6 +74,7 @@ class ModelRunnerOutput:
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
     num_nans_in_logits: dict[str, int] | None = None
+    token_logprobs: dict[str, float] | None = None
 
 
 def swap_dict_values(obj: dict[_K, _V], key1: _K, key2: _K) -> None:

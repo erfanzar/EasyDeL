@@ -430,13 +430,16 @@ class BaseInferenceApiServer(ABC):
 
     @abstractmethod
     async def chat_completions(
-        self, request: ChatCompletionRequest
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request,
     ) -> ChatCompletionResponse | StreamingResponse | JSONResponse:
         """
         Handle chat completion requests.
 
         Args:
             request: The chat completion request
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Chat completion response (streaming or non-streaming)
@@ -444,12 +447,17 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def completions(self, request: CompletionRequest) -> CompletionResponse | StreamingResponse | JSONResponse:
+    async def completions(
+        self,
+        request: CompletionRequest,
+        raw_request: Request,
+    ) -> CompletionResponse | StreamingResponse | JSONResponse:
         """
         Handle completion requests.
 
         Args:
             request: The completion request
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Completion response (streaming or non-streaming)
@@ -457,9 +465,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def health_check(self) -> JSONResponse:
+    async def health_check(self, raw_request: Request) -> JSONResponse:
         """
         Perform comprehensive health check.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Health status information
@@ -467,9 +478,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_metrics(self) -> JSONResponse:
+    async def get_metrics(self, raw_request: Request) -> JSONResponse:
         """
         Get server performance metrics.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Server metrics information
@@ -477,9 +491,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def list_models(self) -> JSONResponse:
+    async def list_models(self, raw_request: Request) -> JSONResponse:
         """
         List available models.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             List of available models with metadata
@@ -487,12 +504,13 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_model(self, model_id: str) -> JSONResponse:
+    async def get_model(self, model_id: str, raw_request: Request) -> JSONResponse:
         """
         Get detailed information about a specific model.
 
         Args:
             model_id: The model identifier
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Model details
@@ -500,9 +518,12 @@ class BaseInferenceApiServer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def list_tools(self) -> JSONResponse:
+    async def list_tools(self, raw_request: Request) -> JSONResponse:
         """
         List available tools/functions.
+
+        Args:
+            raw_request: Raw FastAPI request containing headers
 
         Returns:
             Available tools information
@@ -638,7 +659,7 @@ class InferenceEngineAdapter(ABC):
     """
     Abstract adapter interface for different inference engines.
 
-    This allows different inference engines (vSurge, vLLM, TGI, etc.) to be used
+    This allows different inference engines (eSurge, vLLM, TGI, etc.) to be used
     with the same API server interface.
     """
 

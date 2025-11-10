@@ -46,7 +46,7 @@ Example:
 
 import typing as tp
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, partial
 
 import einops
 import flax.nnx as nn
@@ -62,7 +62,6 @@ from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
 from jaxtyping import Array as JArray
 from jaxtyping import Bool, Complex, Float, Int
-from wrapt import partial
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType

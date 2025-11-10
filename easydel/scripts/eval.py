@@ -23,8 +23,6 @@ from lm_eval import evaluator
 from transformers import AutoTokenizer
 
 import easydel as ed
-from easydel.inference.esurge.vsruge_eval import vSurgeLMEvalAdapter
-
 
 @auto_pytree
 class EvaluationConfig:
@@ -37,15 +35,13 @@ class EvaluationConfig:
     Attributes:
         model (str): Model name or path to load for evaluation.
         tasks (List[str]): List of task names (from lm-eval) to evaluate the model on.
-        runner_driver (tp.Literal["vdriver", "odriver"]): The driver type to use for the vSurge engine.
         attn_mechanism (ed.AttentionMechanisms): The attention mechanism configuration for the model.
         output (str): Path to save the evaluation results (in JSON format).
         sharding_axis (str | tuple): String representation or tuple of sharding dimensions for model parallelism.
         max_length (int): Maximum sequence length the model can handle.
-        prefill_length (int): Maximum length for the prefill phase in the vSurge engine.
-        page_size (int): Page size for the paged attention mechanism (if used).
-        hbm_utilization (float): Fraction of HBM memory to utilize (relevant for oDriver).
-        max_concurrent_decodes (int): Maximum number of concurrent decode operations in the vSurge engine.
+        max_new_tokens (int): Maximum number of tokens generated per request.
+        max_num_seqs (int): Maximum number of concurrent requests processed by eSurge.
+        reserve_tokens (int): Tokens reserved from the context window for safety.
         num_fewshot (int): Number of few-shot examples to use for tasks that support them.
     """
 
@@ -56,11 +52,6 @@ class EvaluationConfig:
     tasks: list[str] = field(
         default_factory=lambda: ["gsm8k"],
         metadata={"help": "Tasks to evaluate on."},
-    )
-
-    runner_driver: tp.Literal["vdriver", "odriver"] = field(
-        default="odriver",
-        metadata={"help": "The driver to use for evaluation."},
     )
 
     attn_mechanism: ed.AttentionMechanisms = field(
@@ -79,21 +70,37 @@ class EvaluationConfig:
         default=8192,
         metadata={"help": "Maximum sequence length."},
     )
-    prefill_length: int = field(
-        default=4096,
-        metadata={"help": "Prefill length."},
+    max_new_tokens: int = field(
+        default=2048,
+        metadata={"help": "Maximum number of tokens to decode per prompt."},
     )
-    page_size: int = field(
-        default=128,
-        metadata={"help": "Page size."},
+    max_num_seqs: int = field(
+        default=32,
+        metadata={"help": "Maximum number of concurrent sequences processed by eSurge."},
     )
-    hbm_utilization: float = field(
-        default=0.875,
-        metadata={"help": "HBM utilization."},
+    reserve_tokens: int = field(
+        default=800,
+        metadata={"help": "Safety tokens reserved inside eSurge context budget."},
     )
-    max_concurrent_decodes: int = field(
-        default=64,
-        metadata={"help": "Maximum concurrent decodes."},
+    auto_truncate_prompt: bool = field(
+        default=True,
+        metadata={"help": "Allow eSurge to truncate prompts that exceed the context window."},
+    )
+    auto_cap_new_tokens: bool = field(
+        default=True,
+        metadata={"help": "Automatically cap new tokens to respect the context budget."},
+    )
+    bytecode_decode: bool = field(
+        default=True,
+        metadata={"help": "Enable smart bytecode decoding in eSurge."},
+    )
+    compile_runner: bool = field(
+        default=True,
+        metadata={"help": "Compile the underlying runner for faster generation."},
+    )
+    runner_verbose: bool = field(
+        default=False,
+        metadata={"help": "Enable verbose logs from the eSurge runner."},
     )
     num_fewshot: int = field(
         default=0,
@@ -120,17 +127,17 @@ def main():
     2. Determines the appropriate data type based on the JAX backend.
     3. Initializes the tokenizer and sets padding side and pad token ID.
     4. Loads the EasyDeL model with specified configurations and sharding.
-    5. Creates a vSurge engine instance (vdriver or odriver) based on the configuration.
-    6. Wraps the model and engine in an vSurgeLMEvalAdapter adapter for compatibility with lm-eval.
+    5. Creates an eSurge engine instance with evaluation-friendly defaults.
+    6. Wraps the engine in an eSurgeLMEvalAdapter for compatibility with lm-eval.
     7. Runs the evaluation using `lm_eval.evaluator.simple_evaluate` on the specified tasks.
     8. Saves the evaluation results to a JSON file.
     9. Prints a summary of the evaluation results.
-    10. Ensures the vSurge engine is stopped upon completion or error.
+    10. Ensures the eSurge engine is stopped upon completion or error.
     """
     parser = DataClassArgumentParser(EvaluationConfig)
     eval_config = parser.parse_args_into_dataclasses()[0]
     print(eval_config)
-    print(f"Creating vSurgeLMEvalAdapter adapter for {eval_config.model}")
+    print(f"Creating eSurge evaluation adapter for {eval_config.model}")
     if jax.default_backend() == "tpu":
         dtype = param_dtype = jnp.bfloat16
     else:
@@ -142,7 +149,7 @@ def main():
     if processor.pad_token_id is None:
         processor.pad_token_id = processor.eos_token_id
 
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    loaded_model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         eval_config.model,
         auto_shard_model=True,
         sharding_axis_dims=eval_config.sharding_axis,
@@ -161,29 +168,36 @@ def main():
         precision=jax.lax.Precision.DEFAULT,
     )
 
-    surge = ed.vSurge.from_model(
-        model=model,
-        processor=processor,
-        max_prefill_length=eval_config.prefill_length,
-        max_length=eval_config.max_length,
-        prefill_lengths=[eval_config.prefill_length],
-        max_concurrent_decodes=eval_config.max_concurrent_decodes,
+    surge = ed.eSurge(
+        model=loaded_model,
+        tokenizer=processor,
+        dtype=dtype,
+        max_model_len=eval_config.max_length,
+        max_num_seqs=eval_config.max_num_seqs,
+        reserve_tokens=eval_config.reserve_tokens,
+        auto_truncate_prompt=eval_config.auto_truncate_prompt,
+        auto_cap_new_tokens=eval_config.auto_cap_new_tokens,
+        bytecode_decode=eval_config.bytecode_decode,
+        compile_runner=eval_config.compile_runner,
+        runner_verbose=eval_config.runner_verbose,
+        esurge_name="esurge-eval",
     )
 
-    model = vSurgeLMEvalAdapter(
+    adapter = ed.eSurgeLMEvalAdapter(
         surge=surge,
         processor=processor,
         max_length=eval_config.max_length,
-        max_new_tokens=eval_config.max_length - eval_config.prefill_length,
+        max_new_tokens=eval_config.max_new_tokens,
+        batch_size=eval_config.max_num_seqs,
     )
 
     try:
         print(f"Starting evaluation on tasks: {eval_config.tasks}")
         results = evaluator.simple_evaluate(
-            model=model,
+            model=adapter,
             tasks=eval_config.tasks,
             num_fewshot=eval_config.num_fewshot,
-            batch_size=eval_config.max_concurrent_decodes,
+            batch_size=eval_config.max_num_seqs,
             device="cpu",
         )
 
@@ -196,7 +210,7 @@ def main():
             print(f"{task}: {metrics}")
 
     finally:
-        model.stop()
+        adapter.stop()
 
     return results
 

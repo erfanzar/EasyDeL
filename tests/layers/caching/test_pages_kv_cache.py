@@ -52,31 +52,18 @@ def test_kv_cache_write():
     key = jnp.ones((batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float32)
     value = jnp.ones((batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float32) * 2
 
-    # Create cache metadata for writing
-    # slot_mapping: [kv_cache_start_indices, new_kv_start_indices, slice_lens]
-    slot_mapping = jnp.array(
-        [
-            [16, -1, -1, -1],  # kv_cache_start_indices (page 1 * page_size 16)
-            [0, -1, -1, -1],  # new_kv_start_indices
-            [3, -1, -1, -1],  # slice_lens
-        ],
-        dtype=jnp.int32,
-    )
-
     cache_metadata = RaggedPagesMetadata(
         pages_tables=jnp.array([[1, -1, -1, -1]], dtype=jnp.int32),  # Use page 1
         context_lens=jnp.array([3], dtype=jnp.int32),
         query_start_loc=jnp.array([0, 3], dtype=jnp.int32),
         num_seqs=jnp.array([1], dtype=jnp.int32),
-        slot_mapping=slot_mapping,
-        num_kv_update_slices=jnp.array([1], dtype=jnp.int32),
         num_slices_per_kv_cache_update_page=metadata.num_slices_per_kv_cache_update_page,
         page_size=metadata.page_size,
+        request_distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
     )
 
     print("\nCache metadata created:")
-    print(f"  slot_mapping shape: {cache_metadata.slot_mapping.shape}")
-    print(f"  slot_mapping:\n{cache_metadata.slot_mapping}")
+    print(f"  request_distribution: {cache_metadata.request_distribution}")
 
     # Get initial cache state
     initial_page = cache.views[0].kv_pages[1, :3, :, :].copy()

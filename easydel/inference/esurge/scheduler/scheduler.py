@@ -29,6 +29,7 @@ from ..request import EngineRequest, EngineRequestStatus
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .request_queue import SchedulingPolicy, create_request_queue
+from .token_budget import TokenBudgetManager
 from .utils import check_stop
 
 if typing.TYPE_CHECKING:
@@ -56,6 +57,15 @@ class Scheduler(SchedulerInterface):
         assert num_pages is not None and num_pages > 0
 
         self.page_size = self.cache_config.page_size
+        safety_margin = self.scheduler_config.token_safety_margin
+        if safety_margin is None:
+            self._token_budget_manager = None
+        else:
+            self._token_budget_manager = TokenBudgetManager(
+                max_batch_tokens=self.max_num_scheduled_tokens,
+                page_size=self.page_size,
+                safety_margin_tokens=safety_margin,
+            )
 
         self.requests: dict[str, EngineRequest] = {}
 
@@ -139,7 +149,10 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_page_ids: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        if self._token_budget_manager:
+            token_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
+        else:
+            token_budget = self.max_num_scheduled_tokens
 
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -191,7 +204,14 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+            if self._token_budget_manager:
+                self._token_budget_manager.consume(num_new_tokens)
+                token_budget = self._token_budget_manager.remaining
+            else:
+                token_budget -= num_new_tokens
+            if token_budget <= 0:
+                req_index += 1
+                break
             req_index += 1
 
             if request.spec_token_ids:
@@ -278,13 +298,20 @@ class Scheduler(SchedulerInterface):
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
                 req_to_new_page_ids[request.request_id] = self.kv_cache_manager.get_page_ids(request.request_id)
+                if self._token_budget_manager:
+                    self._token_budget_manager.consume(num_new_tokens)
+                    token_budget = self._token_budget_manager.remaining
+                else:
+                    token_budget -= num_new_tokens
                 num_scheduled_tokens[request.request_id] = num_new_tokens
-                token_budget -= num_new_tokens
                 request.status = EngineRequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
 
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+
+                if token_budget <= 0:
+                    break
 
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)

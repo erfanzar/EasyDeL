@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .driver import vDriver
-from .engine import vEngine
 
-__all__ = "vDriver", "vEngine"
+"""eSurge worker processes for external task handling.
+
+This module provides worker implementations specifically for the eSurge inference
+engine, handling tasks that require external processes.
+
+Note:
+    This module is for internal use only and is not part of EasyDeL's public API.
+    It is only accessible to EasyDeL modules that require external worker processes
+    to handle specific tasks.
+"""

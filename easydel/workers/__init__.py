@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .api_server import vSurgeApiServer
 
-__all__ = ("vSurgeApiServer",)
+"""Worker processes for handling external dependencies.
+
+This package contains internal worker implementations that are not exposed
+in EasyDeL's public API. These workers are designed to handle tasks that
+depend on external processes, such as tokenization and detokenization services.
+
+Note:
+    This module is for internal use only and is not part of EasyDeL's public API.
+    It is only accessible to EasyDeL modules that require external worker processes
+    to handle specific tasks.
+"""
