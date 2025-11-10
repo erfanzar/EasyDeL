@@ -218,12 +218,11 @@ class SFTTrainer(Trainer):
             if is_conversational_from_value(first_example):
                 if isinstance(dataset, Dataset):
                     map_kwargs["desc"] = "Converting dataset to ChatML"
+                remove_columns = "conversations" if "conversations" in column_names else None
+                if remove_columns is None:
+                    remove_columns = "conversation" if "conversation" in column_names else None
                 column_names = next(iter(dataset)).keys()
-                dataset = dataset.map(
-                    maybe_convert_to_chatml,
-                    remove_columns="conversations" if "conversations" in column_names else None,
-                    **map_kwargs,
-                )
+                dataset = dataset.map(maybe_convert_to_chatml, remove_columns=remove_columns, **map_kwargs)
 
             first_example = next(iter(dataset))
             if not is_conversational(first_example):
