@@ -527,7 +527,7 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
                   {'role': 'assistant', 'content': 'It is blue.'}]}
     ```
     """
-    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations"]:
+    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations", "conversation"]:
         if key in example and isinstance(example[key], list):
             messages = example[key]
             for message in messages:
@@ -539,6 +539,9 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
 
     if "conversations" in example:
         example["messages"] = example.pop("conversations")
+
+    if "conversation" in example:
+        example["messages"] = example.pop("conversation")
 
     return example
 
@@ -715,10 +718,7 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
 
     if isinstance(dataset, DatasetDict):
         return DatasetDict(
-            {
-                key: unpair_preference_dataset(subset, num_proc=num_proc, desc=desc)
-                for key, subset in dataset.items()
-            }
+            {key: unpair_preference_dataset(subset, num_proc=num_proc, desc=desc) for key, subset in dataset.items()}
         )
 
     column_names = dataset.column_names
@@ -1254,11 +1254,16 @@ def is_conversational_from_value(example: dict[str, tp.Any]) -> bool:
     ```
     """
     maybe_messages = example.get("conversations")
+    if maybe_messages is None:
+        maybe_messages = example.get("conversation")
 
     if isinstance(maybe_messages, list):
         maybe_message = maybe_messages[0]
 
         if isinstance(maybe_message, dict) and "from" in maybe_message and "value" in maybe_message:
+            return True
+
+        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
             return True
 
     return False
