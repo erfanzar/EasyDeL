@@ -347,15 +347,68 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         if query_key:
             return query_key.strip()
 
+        query_key = raw_request.query_params.get("user")
+        if query_key:
+            return query_key.strip()
+
         return None
 
-    def _authorize_request(self, raw_request: Request) -> str | None:
+    @staticmethod
+    def _extract_payload_api_keys(payload: tp.Any) -> list[str]:
+        """Collect API key candidates embedded in the JSON payload."""
+        candidates: list[str] = []
+
+        def add_candidate(value: tp.Any) -> None:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped and stripped not in candidates:
+                    candidates.append(stripped)
+
+        extras: dict[str, tp.Any] | None = None
+        if hasattr(payload, "model_extra"):
+            extras = payload.model_extra or {}
+        elif isinstance(payload, dict):
+            extras = payload
+
+        if isinstance(extras, dict):
+            for field in ("api_key", "apiKey", "api-key", "x-api-key", "auth", "authorization", "token", "key"):
+                add_candidate(extras.get(field))
+
+        if hasattr(payload, "user"):
+            add_candidate(payload.user)
+
+        return candidates
+
+    def _authorize_request(
+        self,
+        raw_request: Request,
+        payload_api_keys: str | tp.Iterable[str | None] | None = None,
+    ) -> str | None:
         """Validate incoming request when API key enforcement is enabled."""
         if self.api_key_manager is None or not self.api_key_manager.enabled:
             return None
 
-        api_key = self._extract_api_key(raw_request)
-        usage = self.api_key_manager.validate_key(api_key)
+        candidate_keys: list[str] = []
+
+        def add_candidate(value: tp.Any) -> None:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped and stripped not in candidate_keys:
+                    candidate_keys.append(stripped)
+
+        if isinstance(payload_api_keys, str):
+            add_candidate(payload_api_keys)
+        elif payload_api_keys:
+            for value in payload_api_keys:
+                add_candidate(value)
+
+        add_candidate(self._extract_api_key(raw_request))
+
+        usage = None
+        for candidate in candidate_keys:
+            usage = self.api_key_manager.validate_key(candidate)
+            if usage is not None:
+                break
 
         if usage is None:
             if self.api_key_manager.require_api_key:
@@ -543,7 +596,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             HTTPException: For client errors (400, 404).
         """
         request_id = str(uuid.uuid4())
-        self._authorize_request(raw_request)
+        payload_api_keys = self._extract_payload_api_keys(request)
+        self._authorize_request(raw_request, payload_api_keys=payload_api_keys)
         self.metrics.total_requests += 1
 
         try:
@@ -826,7 +880,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         """
         request_id = str(uuid.uuid4())
         self.metrics.total_requests += 1
-        self._authorize_request(raw_request)
+        payload_api_keys = self._extract_payload_api_keys(request)
+        self._authorize_request(raw_request, payload_api_keys=payload_api_keys)
 
         try:
             adapter = self._get_adapter(request.model)
