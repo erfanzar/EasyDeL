@@ -33,6 +33,7 @@ from jaxtyping import Array, Float, Int
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
+from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -139,6 +140,9 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
     num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
     max_num_tokens: int = field(pytree_node=False, default=-1)
     max_num_reqs: int = field(pytree_node=False, default=-1)
+
+    version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
+
     _kvdtype_str: str = field(pytree_node=False, default="bf16")
 
     @staticmethod
@@ -164,6 +168,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
         v_headdim: int | None = None,
         hbm_utilization: float = 0.9,
         page_size: int = 128,
+        version: tp.Literal["v3", "v2"] = "v3",
     ) -> RaggedPagesCacheMetaData:
         if k_headdim is None:
             assert kv_head_dim_size is not None, "Either `k_headdim` or `kv_head_dim_size` must be provided"
@@ -185,6 +190,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
             f"Creating PagesCacheMetadata with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
         )
+        assert version in ["v3", "v2"], f"got unknown version {version} it should be v3/v2."
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -203,6 +209,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
                     kv_cache_dtype=kvdtype,
                 )
             ),
+            version=version,
             _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
         )
 
@@ -250,6 +257,36 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4
 
+    def get_shape_and_axes(self):
+        if self.version == "v3":
+            kv_pages_shape = (
+                self.num_pages,
+                self.page_size,
+                self.storage_num_kv_groups,
+                self.kv_head_packing,
+                self.storage_head_dim,
+            )
+            axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY, common_types.EMPTY]
+        elif self.version == "v2":
+            kv_pages_shape = (
+                self.num_pages,
+                self.page_size,
+                self.storage_num_kv_groups * self.kv_head_packing,
+                self.storage_head_dim,
+            )
+            axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
+        else:
+            raise ValueError(f"got unknown version {self.version} it should be v3/v2.")
+        return kv_pages_shape, axes
+
+    @property
+    def is_v3(self):
+        return self.version == "v3"
+
+    @property
+    def is_v2(self):
+        return self.version == "v2"
+
 
 @auto_pytree
 class RaggedPagesCacheView(BaseCacheView):
@@ -272,7 +309,11 @@ class RaggedPagesCacheView(BaseCacheView):
     metadata: RaggedPagesCacheMetaData
     layer_index: int = field(pytree_node=False)
 
-    kv_pages: Float[Array, "num_pages page_size storage_groups packing head_dim"] | ImplicitArray
+    kv_pages: (
+        Float[Array, "num_pages page_size storage_groups packing head_dim"]
+        | Float[Array, "num_pages page_size kv_head_combined head_dim"]
+        | ImplicitArray
+    )
     partition_manager: PartitionManager = field(
         pytree_node=False,
         default_factory=lambda: PartitionManager(PartitionAxis()),
@@ -309,14 +350,7 @@ class RaggedPagesCacheView(BaseCacheView):
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-        kv_pages_shape = (
-            metadata.num_pages,
-            metadata.page_size,
-            metadata.storage_num_kv_groups,
-            metadata.kv_head_packing,
-            metadata.storage_head_dim,
-        )
-        axes = [common_types.EMPTY, common_types.EMPTY, common_types.KV_HEAD, common_types.EMPTY, common_types.EMPTY]
+        kv_pages_shape, axes = metadata.get_shape_and_axes()
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
@@ -330,10 +364,64 @@ class RaggedPagesCacheView(BaseCacheView):
         value: Float[Array, "batch seq_len num_value_heads head_dim"],
         cache_metadata: RaggedPagesMetadata,
     ) -> RaggedPagesCacheView:
-        # non-op fn
+        if self.metadata.is_v2:
+            num_kv_heads = key.shape[2]
+            head_size = key.shape[3]
+            key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+            value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+            use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
+            use_shardmap = use_kernel
+
+            def _update_fn(
+                kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
+                slots: Int[Array, "num_tokens"],  # noqa: F821
+                pages: Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"],
+                num_update_slices: Int[Array, ""],
+            ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+                orgshape = pages.shape
+                pages = pages.reshape(-1, *orgshape[2:])
+                if use_kernel:
+                    pages = kv_cache_update(
+                        kv,
+                        slots,
+                        pages,
+                        num_update_slices,
+                        page_size=cache_metadata.page_size,
+                        slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
+                    )
+                else:
+                    pages = kv_cache_update_jax(
+                        kv,
+                        slots,
+                        pages,
+                        num_update_slices,
+                        page_size=cache_metadata.page_size,
+                    )
+                return pages.reshape(*orgshape)
+
+            if use_shardmap:
+                resolve = self.partition_manager.resolve
+                _update_fn = jax.shard_map(
+                    _update_fn,
+                    in_specs=(
+                        resolve([EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
+                        resolve([EMPTY], mode=MODE_PREFILL),
+                    ),
+                    out_specs=resolve([EMPTY, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
+                    mesh=es.get_incontext_mesh(),
+                    check_vma=False,
+                )
+
+            kvs = jnp.stack([key, value], axis=2).reshape(-1, num_kv_heads * 2, head_size)
+            kv_pages = _update_fn(kvs, cache_metadata.slot_mapping, self.kv_pages, cache_metadata.num_kv_update_slices)
+            return self.replace(kv_pages=kv_pages)
         return self
 
     def flattened_kv_pages(self) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+        if self.metadata.is_v2:
+            return self.kv_pages
         pages = self.kv_pages
         shape = pages.shape
         return pages.reshape(shape[0], shape[1], shape[2] * shape[3], shape[4])
@@ -433,11 +521,17 @@ class RaggedPagesMetadata:
     context_lens: Int[Array, "max_num_reqs"]  # noqa: F821
     query_start_loc: Int[Array, "max_num_reqs_plus_1"]  # noqa: F821
     num_seqs: Int[Array, "max_num_reqs"]  # noqa: F821
+
+    slot_mapping: Int[Array, "num_tokens"] | None = None  # noqa: F821
     position_ids: Int[Array, "num_tokens"] | None = None  # noqa: F821
+
+    request_distribution: Int[Array, "3"] | None = None
+
+    version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
+
     num_slices_per_kv_cache_update_page: int | None = field(pytree_node=False, default_factory=lambda: None)
     page_size: int = field(pytree_node=False, default=128)
     prefill_chunk_size: int = field(pytree_node=False, default=512)
-    request_distribution: Int[Array, "3"] | None = None
 
     @classmethod
     def create_empty(
@@ -446,14 +540,17 @@ class RaggedPagesMetadata:
         max_num_reqs: int,
         max_pages: int,
         page_size: int = 128,
+        version: tp.Literal["v3", "v2"] = "v3",
     ) -> RaggedPagesMetadata:
         """Create empty metadata with proper shapes."""
         return cls(
+            slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32) if version == "v2" else None,
             pages_tables=jnp.zeros((max_num_reqs, max_pages), dtype=jnp.int32),
             context_lens=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             query_start_loc=jnp.zeros([max_num_reqs + 1], dtype=jnp.int32),
             position_ids=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
-            page_size=page_size,
-            request_distribution=jnp.zeros((3,), dtype=jnp.int32),
+            request_distribution=jnp.zeros((3,), dtype=jnp.int32) if version == "v3" else None,
+       
+            page_size=page_size,     version=version,
         )

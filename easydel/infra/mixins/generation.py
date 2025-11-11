@@ -59,7 +59,6 @@ from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
@@ -199,8 +198,20 @@ class EasyGenerationMixin:
             num_key_value_heads = num_attention_heads
 
         head_dim = _safepick(self.config, "head_dim")
+
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
+
+        from easydel.layers.attention import AttentionMechanisms
+
+        match self.config.attn_mechanism:
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
+                version = "v3"
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
+                version = "v2"
+            case _:
+                version = "v3"
+                logger.warn("couldn't retrive version from attention mechanism we will set v3 for default")
 
         return RaggedPagesCacheMetaData.create(
             mesh=self.mesh,
@@ -214,6 +225,7 @@ class EasyGenerationMixin:
             v_headdim=None,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            version=version,
         )
 
     def create_cache_metadata(
@@ -497,13 +509,8 @@ class EasyGenerationMixin:
                 mask_info = MaskInfo.from_segments(seg)
             else:
                 mask_info = MaskInfo.from_attention_mask(attention_mask)
-        # Build a base, max_length-shaped decoder mask_info; we will slice per step.
-        mask_info = self._pad_maskinfo_to_maxlen(
-            mask_info,
-            max_length=max_length,
-            # Decoder self-attention is causal for both decoder-only and encoder-decoder generation.
-            make_causal=True,
-        )
+
+        mask_info = self._pad_maskinfo_to_maxlen(mask_info, max_length=max_length, make_causal=True)
 
         if attention_mask is not None:
             am = attention_mask.astype(jnp.bool_)

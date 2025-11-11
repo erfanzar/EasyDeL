@@ -84,7 +84,7 @@ Here's a simple example to get started with eSurge:
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
-            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
             attn_dtype=jnp.bfloat16,
         ),
     )
@@ -533,7 +533,7 @@ Complete example of a chat application:
             param_dtype=jnp.bfloat16,
             auto_shard_model=True,
             config_kwargs=ed.EasyDeLBaseConfigDict(
-                attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
+                attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
             ),
         )
 

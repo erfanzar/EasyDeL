@@ -120,7 +120,8 @@ class AttentionMechanisms(str, Enum):
         BLOCKWISE: Blockwise computation for memory efficiency.
         SDPA: Scaled Dot Product Attention (JAX native).
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
-        RAGGED_PAGE_ATTENTION: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -134,7 +135,8 @@ class AttentionMechanisms(str, Enum):
     BLOCKWISE: str = "blockwise"
     SDPA: str = "sdpa"
     CUDA_FLASH_ATTN2: str = "cuda_flash_attn2"
-    RAGGED_PAGE_ATTENTION: str = "ragged_page_attention"
+    RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
+    RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
     REGRESSIVE_DECODE: str = "autoregressive_decodeattn"
 
@@ -393,8 +395,12 @@ class FlexibleAttentionModule(nn.Module):
         """
         is_ragged_page_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
         if is_ragged_page_cache:
-            mechanism_is_ragged_page: bool = self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
+            mechanism_is_ragged_page = self.config.attn_mechanism in [
+                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
+                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
+            ]
             assert mechanism_is_ragged_page
+
         # NOTE: Attention Dropout is disabled for now.
         # try:
         #     rngs = self.rngs()
@@ -405,14 +411,13 @@ class FlexibleAttentionModule(nn.Module):
         # if dropout_rng is None:
 
         # Use provided deterministic or self.deterministic
-        deterministic_computed: bool
+
         if deterministic is None:
             deterministic_computed = self.deterministic
         else:
             deterministic_computed = deterministic
 
         # Use provided softmax_scale or self.softmax_scale
-        softmax_scale_computed: float
         if softmax_scale is None:
             softmax_scale_computed = self.softmax_scale
         else:
@@ -422,14 +427,12 @@ class FlexibleAttentionModule(nn.Module):
         dropout_rng_final: tp.Any | None = None
 
         # Use provided precision or default
-        precision_computed: lax.PrecisionLike
         if precision is None:
             precision_computed = lax.Precision.DEFAULT
         else:
             precision_computed = precision
 
         # Use provided policy or default
-        policy_computed: tp.Any
         if policy is None:
             policy_computed = jax.checkpoint_policies.nothing_saveable
         else:

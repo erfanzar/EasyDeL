@@ -14,7 +14,7 @@
 
 
 from eformer import common_types as ct
-from ejkernel.modules import ragged_page_attention_v3
+from ejkernel.modules import ragged_page_attention, ragged_page_attention_v3
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -28,8 +28,7 @@ from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistr
 USE_SHARDMAP = True
 
 
-@OperationRegistry.register
-class RaggedPageAttn(OperationImpl):
+class _RaggedPageAttn(OperationImpl):
     """
     Attention implementation using the Paged Attention mechanism with TPU Pallas kernels.
 
@@ -52,9 +51,9 @@ class RaggedPageAttn(OperationImpl):
         Returns the registered name for this attention implementation.
 
         Returns:
-            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention".
+            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3" or "ragged_page_attention_v2".
         """
-        return "ragged_page_attention"
+        raise NotImplementedError()
 
     def get_impl_metadata(self) -> OperationMetadata:
         """
@@ -65,11 +64,9 @@ class RaggedPageAttn(OperationImpl):
         """
         return self.metadata
 
-    def forward_native(
+    def forward_v2(
         self,
         query: Float[Array, "total_tokens num_q_heads head_dim"],
-        key: Float[Array, "total_tokens num_kv_heads head_dim"],
-        value: Float[Array, "total_tokens num_kv_heads head_dim"],
         cache_view: RaggedPagesCacheView,
         cache_metadata: RaggedPagesMetadata,
         softmax_scale: float | None = None,
@@ -82,6 +79,144 @@ class RaggedPageAttn(OperationImpl):
         vmem_limit_bytes: int | None = None,
         **ignore,
     ) -> AttentionOutput:
+        kv_pages: Float[Array, "num_pages page_size num_kv_heads head_dim"] = cache_view.kv_pages
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+
+        aux_spec = PartitionSpec(None)
+        if softmax_aux is not None:
+            num_aux_dims: int = softmax_aux.ndim
+            if num_aux_dims == 2:
+                aux_spec = resolve(axes=[ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+            elif num_aux_dims == 1:
+                aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+
+        if compute_dtype is None:
+            dtype_for_compute = jnp.bfloat16
+        else:
+            dtype_for_compute = compute_dtype
+
+        output = ragged_page_attention(
+            query,
+            kv_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables,
+            cache_metadata.query_start_loc,
+            num_seqs_flat,
+            softmax_aux,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            vmem_limit_bytes=vmem_limit_bytes,
+            optimized=optimized,
+            compute_dtype=dtype_for_compute,
+            mask_value=mask_value,
+            sliding_window=sliding_window,
+            in_specs=(
+                qaxes,
+                resolve(
+                    axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+                    mode=ct.MODE_PREFILL,
+                    shape=kv_pages.shape,
+                ),
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),
+                aux_spec,
+            ),
+            out_specs=qaxes,
+            mesh=self.metadata.mesh,
+        )
+
+        return AttentionOutput(attention_weights=None, attention_outputs=output)
+
+    def forward_v3(
+        self,
+        query: Float[Array, "total_tokens num_q_heads head_dim"],
+        key: Float[Array, "total_tokens num_kv_heads head_dim"],
+        value: Float[Array, "total_tokens num_kv_heads head_dim"],
+        cache_view: RaggedPagesCacheView,
+        cache_metadata: RaggedPagesMetadata,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        sliding_window: int | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
+        vmem_limit_bytes: int | None = None,
+        **ignore,
+    ) -> AttentionOutput:
+        kv_pages = cache_view.kv_pages
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
+        request_distribution = cache_metadata.request_distribution
+
+        if request_distribution is None:
+            request_distribution = jnp.array([0, 0, num_seqs_flat.shape[0]], dtype=jnp.int32)
+
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+
+        if softmax_aux is not None:
+            raise NotImplementedError("softmax_aux is only supported in v2 kernel")
+
+        kv_pages_spec = resolve(
+            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=kv_pages.shape,
+        )
+
+        call_kwargs = dict(
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            vmem_limit_bytes=vmem_limit_bytes,
+            sliding_window=sliding_window,
+            in_specs=(
+                qaxes,
+                kvaxes,
+                kvaxes,
+                kv_pages_spec,
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),
+            ),
+            out_specs=(qaxes, kv_pages_spec),
+            mesh=self.metadata.mesh,
+        )
+
+        output, kv_pages = ragged_page_attention_v3(
+            query,
+            key,
+            value,
+            kv_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables.reshape(-1),
+            cache_metadata.query_start_loc,
+            request_distribution,
+            **call_kwargs,
+        )
+        cache_view.kv_pages = kv_pages
+        return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
+
+    def forward_native(
+        self,
+        query: Float[Array, "total_tokens num_q_heads head_dim"],
+        key: Float[Array, "total_tokens num_kv_heads head_dim"],
+        value: Float[Array, "total_tokens num_kv_heads head_dim"],
+        cache_view: RaggedPagesCacheView,
+        cache_metadata: RaggedPagesMetadata,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        sliding_window: int | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
+        vmem_limit_bytes: int | None = None,
+        mask_value: float | None = None,
+        compute_dtype: DTypeLike = jnp.bfloat16,
+        optimized: bool = False,
+        **ignore,
+    ):
         """
         Native forward pass for paged attention using ragged format.
 
@@ -113,68 +248,22 @@ class RaggedPageAttn(OperationImpl):
             AttentionOutput: Contains attention outputs [total_tokens, num_q_heads, head_dim].
                 Attention weights are not computed.
         """
-        kv_pages = cache_view.kv_pages
-        manager = self.metadata.partition_manager
-        resolve = manager.resolve
-        num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
-        request_distribution = cache_metadata.request_distribution
-
-        if request_distribution is None:
-            request_distribution = jnp.array([0, 0, num_seqs_flat.shape[0]], dtype=jnp.int32)
-
-        qaxes: Ps = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-        kvaxes: Ps = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-
-        # Determine sharding spec for softmax_aux based on dimensionality
-        aux_spec: PartitionSpec = PartitionSpec(None)
-        if softmax_aux is not None:
-            num_aux_dims: int = softmax_aux.ndim
-            if num_aux_dims == 2:
-                aux_spec = resolve(axes=[ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
-            elif num_aux_dims == 1:
-                aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)  # noqa
-
-        # Create sharding spec for kv_pages
-        kv_pages_spec: Ps = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=kv_pages.shape,
-        )
-
-        empty_spec: Ps = Ps()
-
-        call_kwargs = dict(
+        return self.forward_v3(
+            query=query,
+            key=key,
+            value=value,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             vmem_limit_bytes=vmem_limit_bytes,
+            optimized=optimized,
+            compute_dtype=compute_dtype,
+            softmax_aux=softmax_aux,
+            mask_value=mask_value,
             sliding_window=sliding_window,
-            in_specs=(
-                qaxes,
-                kvaxes,
-                kvaxes,
-                kv_pages_spec,
-                empty_spec,
-                empty_spec,
-                empty_spec,
-                empty_spec,
-            ),
-            out_specs=(qaxes, kv_pages_spec),
-            mesh=self.metadata.mesh,
+            **ignore,
         )
-
-        output, kv_pages = ragged_page_attention_v3(
-            query,
-            key,
-            value,
-            kv_pages,
-            cache_metadata.context_lens,
-            cache_metadata.pages_tables.reshape(-1),
-            cache_metadata.query_start_loc,
-            request_distribution,
-            **call_kwargs,
-        )
-        cache_view.kv_pages = kv_pages
-        return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
         """ROCm GPU forward pass. Not implemented for Paged Attention."""
@@ -279,3 +368,29 @@ class RaggedPageAttn(OperationImpl):
             output.attention_outputs = outputs_reshaped
 
         return output
+
+
+@OperationRegistry.register
+class RaggedPageAttnV2(_RaggedPageAttn):
+    @classmethod
+    def get_impl_name(cls) -> str | tuple[str]:
+        """
+        Returns the registered name for this attention implementation.
+
+        Returns:
+            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v2".
+        """
+        return "ragged_page_attention_v2"
+
+
+@OperationRegistry.register
+class RaggedPageAttnV3(_RaggedPageAttn):
+    @classmethod
+    def get_impl_name(cls) -> str | tuple[str]:
+        """
+        Returns the registered name for this attention implementation.
+
+        Returns:
+            tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3".
+        """
+        return "ragged_page_attention_v3"

@@ -107,11 +107,12 @@ class TensorConverter:
     """Handles tensor conversions between PyTorch and JAX."""
 
     @staticmethod
-    def convert_pytorch_to_jax(tensor: tp.Any, dtype: jnp.dtype) -> jnp.ndarray:
+    def convert_pytorch_to_jnp(tensor: tp.Any, dtype: jnp.dtype) -> jnp.ndarray:
         """Convert PyTorch tensor to JAX array."""
         if "bfloat16" in str(tensor.dtype):
             tensor = tensor.float()
-        return jnp.asarray(tensor.cpu().detach().numpy(), dtype=dtype)
+        npv = tensor.cpu().detach().numpy()
+        return jnp.array(npv, dtype=dtype)
 
     @staticmethod
     @functools.lru_cache
@@ -203,7 +204,7 @@ class StateDictConverter:
         if config["uses_tie_word_embedding"] and config["lm_head_name"] and key_tuple[0] == config["lm_head_name"]:
             return None
 
-        array = TensorConverter.convert_pytorch_to_jax(tensor, config["dtype"])
+        array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
         return key_tuple, array
 
     @staticmethod
@@ -247,8 +248,14 @@ class StateDictConverter:
         with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():
             flax_dict = {}
             with tqdm(total=len(state_dict), disable=not verbose, desc="Converting Model") as pbar:
-                for key, tensor in state_dict.items():
+                keys = sorted(state_dict.keys())
+                for key in keys:
+                    tensor = state_dict.get(key)
                     try:
+                        bytesi = {
+                            i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
+                            for i in range(jax.local_device_count())
+                        }
                         result = StateDictConverter.process_tensor(key, tensor, config)
                         if result is not None:
                             key_tuple, jax_array = result
@@ -256,6 +263,16 @@ class StateDictConverter:
                                 jax_array = shard_fns[key_tuple](jax_array)
                             if callback is not None:
                                 jax_array = callback(jax_array, key_tuple)
+                            bytesn = {
+                                i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
+                                for i in range(jax.local_device_count())
+                            }
+                            change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
+                            divider = 1024**3
+                            change_gb = {i: round(change[i] / divider, 4) for i in change}
+                            usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
+                            strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
+                            logger.debug(strm)
                             flax_dict[key_tuple] = jax_array
                     except Exception as e:
                         logger.error(f"Error processing key {key}: {e!s}")
