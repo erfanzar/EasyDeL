@@ -15,7 +15,7 @@
 from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
-from .ragged_page_attention import RaggedPageAttn
+from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
 from .vanilla_attention import VanillaAttn
@@ -24,7 +24,8 @@ __all__ = (
     "AutoRegressiveDecodeAttn",
     "BlockSparseAttn",
     "FlashAttn",
-    "RaggedPageAttn",
+    "RaggedPageAttnV2",
+    "RaggedPageAttnV3",
     "RingAttn",
     "ScaledDotProductAttn",
     "VanillaAttn",

@@ -153,8 +153,8 @@ class Qwen3MoeMLP(nn.Module):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -243,8 +243,8 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            dtype (jnp.dtype): Data type for computations (default: jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.bfloat16).
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
             rngs (nn.Rngs): Random number generators.
         """
@@ -386,8 +386,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
             layer_idx (int): The index of the layer in the model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -541,8 +541,8 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -841,8 +841,8 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
                 Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
 

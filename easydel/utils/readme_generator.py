@@ -37,7 +37,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "flash_attn2": "FLASH_ATTN2", "flash_attention2": "FLASH_ATTN2", "flashattn2": "FLASH_ATTN2",
     "blocksparse": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
     "ring": "RING", "ring_attn": "RING", "ring_attention": "RING",
-    "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention": "PAGED",
+    "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention_v3": "PAGED", "ragged_page_attention_v2": "PAGED",
     "mistral": "MISTRAL"
 } %}
 {%- set attn_enum = attn_enum_map.get(model.attn_mechanism_str.lower(), "VANILLA") %}
@@ -188,7 +188,8 @@ JINJA_TEMPLATE = """
     "ring_attention": "RING",
     "paged": "PAGED",
     "paged_attn": "PAGED",
-    "ragged_page_attention": "PAGED",
+    "ragged_page_attention_v2": "PAGED",
+    "ragged_page_attention_v3": "PAGED",
     "mistral": "MISTRAL"
 } %}
 {% set attn_enum = attn_enum_map.get(model.attn_mechanism.lower(), "VANILLA") %}

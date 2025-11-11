@@ -390,6 +390,7 @@ class eSurge:
 
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
+
         self._worker_manager = WorkerManager(tokenizer_source)
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
             detokenizer_max_states=detokenizer_max_states,
@@ -400,7 +401,7 @@ class eSurge:
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
 
         if isinstance(model, str):
-            self.model = AutoEasyDeLModelForCausalLM.from_pretrained(
+            model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
                 dtype=dtype,
                 param_dtype=dtype,
@@ -408,7 +409,7 @@ class eSurge:
                 auto_shard_model=auto_shard_model,
                 sharding_axis_dims=sharding_axis_dims,
                 config_kwargs=EasyDeLBaseConfigDict(
-                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.RAGGED_PAGE_ATTENTION),
+                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3),
                     attn_dtype=dtype,
                     kvdtype=dtype,
                     freq_max_position_embeddings=max_model_len,
@@ -418,8 +419,10 @@ class eSurge:
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
         else:
-            model = model.update_module(attn_mechanism="ragged_page_attention")
-            self.model = model
+            model = model.update_module(attn_mechanism="ragged_page_attention_v3")
+
+        self.model = model
+
         # Profiling state
         self._profiling_active = False
         self._profiling_steps_remaining = 0
@@ -1187,7 +1190,7 @@ class eSurge:
         self._drain_pipeline_workers("update_model_weights")
 
         if model is not None:
-            model = model.update_module(attn_mechanism="ragged_page_attention")
+            model = model.update_module(attn_mechanism="ragged_page_attention_v2")
             self.model = model
 
         self.runner.update_model_weights(
