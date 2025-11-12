@@ -95,6 +95,8 @@ from ..page_table import PAGE_TABLE_PADDING_VAL
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from .sequence_buffer import DeviceSequenceState, SequenceBuffer
 
+DEBUG_MODE = False
+
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
@@ -171,19 +173,24 @@ def _tree_hash(tree):
         )
 
     return jax.tree_util.tree_map_with_path(
-        _map, tree, is_leaf=lambda x: isinstance(x, jax.Array | numpy.ndarray | int | float | bool)
+        _map,
+        tree,
+        is_leaf=lambda x: isinstance(
+            x,
+            jax.Array | numpy.ndarray | int | float | bool | None,
+        ),
     )
 
 
-def _tree_hash_diff(tree_hash1, tree_hash2):
+def _tree_hash_diff(orgin, new):
     def _map(p, t1, t2):
         p = key_path_to_str(p)
         oo = t1 == t2
         if not oo:
-            print(f"p : {p} oo : {oo} t1 : {t1} t2 : {t2}")
+            print(f"path: {p} out: {oo} orgin: {t1} new: {t2}")
         return oo
 
-    return jax.tree_util.tree_map_with_path(_map, tree_hash1, tree_hash2, is_leaf=lambda x: isinstance(x, str))
+    return jax.tree_util.tree_map_with_path(_map, orgin, new, is_leaf=lambda x: isinstance(x, str))
 
 
 class ExecutionManager:
@@ -276,6 +283,7 @@ class ExecutionManager:
         max_num_reqs: int = 16,
         max_num_tokens: int | None = None,
         metadata: RaggedPagesCacheView = None,
+        verbose: bool = False,
     ):
         """Initialize the executor manager.
 
@@ -304,6 +312,8 @@ class ExecutionManager:
         self.max_num_tokens = max_num_tokens if max_num_tokens is not None else max_model_len
         self.metadata = metadata
         self.graphdef, self.graphstate, self.graphother = model.split_module()
+
+        self.log_it = logger.info if verbose else logger.debug
 
         self._empty_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -339,10 +349,20 @@ class ExecutionManager:
         self._model_lowerd_history.move_to_end(key)
         return value
 
+    def _sampler_cache_put(self, key, value):
+        self._sampler_lowerd_history[key] = value
+        self._sampler_lowerd_history.move_to_end(key)
+        if len(self._sampler_lowerd_history) > self._cache_capacity:
+            self._sampler_lowerd_history.popitem(last=False)
+
+    def _sampler_cache_get(self, key):
+        value = self._sampler_lowerd_history[key]
+        self._sampler_lowerd_history.move_to_end(key)
+        return value
+
     def clear_cache(self):
         self._model_lowerd_history.clear()
         self._sampler_lowerd_history.clear()
-        self._sampling_impl = self._sampling_fn
 
     def update_graphs(
         self,
@@ -402,7 +422,6 @@ class ExecutionManager:
         input_ids_buf: jax.Array,
         position_ids_buf: jax.Array,
         padded_num_reqs: int,
-        # NEW: Pass NumPy arrays for CPU-first batch metadata preparation
         token_ids_cpu: numpy.ndarray,
         num_computed_tokens_cpu: numpy.ndarray,
         temperature_cpu: numpy.ndarray,
@@ -479,24 +498,23 @@ class ExecutionManager:
             ... )
             >>> new_state, tokens, valid, *rest = results
         """
-        model_fn = self.get_compiled_key(num_tokens, padded_num_reqs)
+        model_fn, sampler_fn = self.get_compiled_key(num_tokens, padded_num_reqs)
         start_prep = time.time()
-        batch_metadata, input_ids_buf, position_ids_buf = jax.block_until_ready(
-            self.prepare_batch_metadata(
-                num_tokens_static=num_tokens,
-                device_state=device_state,
-                scheduled_full_cpu=scheduled_full_cpu,
-                active_mask_full_cpu=active_mask_full_cpu,
-                input_ids_buf=input_ids_buf,
-                position_ids_buf=position_ids_buf,
-                token_ids_cpu=token_ids_cpu,
-                num_computed_tokens_cpu=num_computed_tokens_cpu,
-                temperature_cpu=temperature_cpu,
-                top_p_cpu=top_p_cpu,
-                top_k_cpu=top_k_cpu,
-                min_p_cpu=min_p_cpu,
-                page_table_cpu=page_table_cpu,
-            )
+        print(num_tokens)
+        batch_metadata, input_ids_buf, position_ids_buf = self.prepare_batch_metadata(
+            num_tokens_static=num_tokens,
+            device_state=device_state,
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            temperature_cpu=temperature_cpu,
+            top_p_cpu=top_p_cpu,
+            top_k_cpu=top_k_cpu,
+            min_p_cpu=min_p_cpu,
+            page_table_cpu=page_table_cpu,
         )
         prep_took = time.time() - start_prep
 
@@ -513,20 +531,18 @@ class ExecutionManager:
             rng_key=self.rng_key,
             batch_metadata=batch_metadata,
         )
+        if DEBUG_MODE:
+            model_hash = _tree_hash((self.graphstate, self.graphother, inputs))
+            model_hash_baseline = self._debug_baselines[f"{num_tokens}_hash_in_model"]
+            _tree_hash_diff(model_hash_baseline, model_hash)
 
         start_exec = time.time()
-        model_outputs = jax.block_until_ready(model_fn(self.graphstate, self.graphother, inputs))
+        model_outputs = model_fn(self.graphstate, self.graphother, inputs)
         exec_took = time.time() - start_exec
 
         self.kv_pages = model_outputs.kv_pages
-        start_sample = time.time()
-        sampler_fn = self._sampling_impl
-        (
-            device_state,
-            self.rng_key,
-            out_tokens_full,
-            valid_mask_full,
-        ) = sampler_fn(
+
+        sampler_inputs = (
             batch_metadata,
             device_state,
             req_num_tokens_full,
@@ -534,9 +550,18 @@ class ExecutionManager:
             model_outputs.logits,
             self.rng_key,
         )
+
+        if DEBUG_MODE:
+            sampler_hash = _tree_hash(sampler_inputs)
+            sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_hash_in_sampler"]
+            _tree_hash_diff(sampler_hash_baseline, sampler_hash)
+
+        start_sample = time.time()
+        device_state, self.rng_key, out_tokens_full, valid_mask_full = sampler_fn(*sampler_inputs)
         sample_took = time.time() - start_sample
 
-        logger.info(f"model={exec_took} sampler={sample_took} prep={prep_took}")
+        self.log_it(f"model={exec_took} sampler={sample_took} prep={prep_took}")
+
         query_start_loc_buf = batch_metadata.query_start_loc
         seq_lens_buf = batch_metadata.seq_lens
         pages_tables_buf = batch_metadata.pages_tables
@@ -656,7 +681,7 @@ class ExecutionManager:
         # compargs already contains properly prepared metadata from get_compile_configurations
         inputs = compargs[3]
         self._compile_model_step(num_tokens, compargs)
-        self._compile_sampler(inputs, inputs.batch_metadata)
+        self._compile_sampler(num_tokens, inputs, inputs.batch_metadata)
 
     def init_fns(self) -> None:
         """Initialize the fused step execution function.
@@ -678,7 +703,6 @@ class ExecutionManager:
         active_mask_full_cpu: numpy.ndarray,  # CPU array instead of device
         input_ids_buf: jax.Array,
         position_ids_buf: jax.Array,
-        # NEW: Pass NumPy arrays from SequenceBuffer for fast CPU operations
         token_ids_cpu: numpy.ndarray,
         num_computed_tokens_cpu: numpy.ndarray,
         temperature_cpu: numpy.ndarray,
@@ -795,7 +819,6 @@ class ExecutionManager:
             ),
             self._empty_sharding,
         )
-
         # Build BatchMetadata with device arrays
         metadata = BatchMetadata(
             scheduled=jax.device_put(scheduled, self._empty_sharding),
@@ -805,14 +828,14 @@ class ExecutionManager:
             padded_num_reqs=jax.device_put(numpy.int32(padded_num_reqs), self._empty_sharding),
             request_distribution=req_dist,
             logits_indices=logits_indices,
-            input_ids_buf=input_ids_buf[:max_num_reqs],
-            position_ids_buf=position_ids_buf[:max_num_reqs],
+            input_ids_buf=input_ids_buf[:num_tokens_static],
+            position_ids_buf=position_ids_buf[:num_tokens_static],
             num_requests=jax.device_put(numpy.int32(num_requests), self._empty_sharding),
             temperature=jax.device_put(temperature_cpu, self._empty_sharding),
             top_p=jax.device_put(top_p_cpu, self._empty_sharding),
             top_k=jax.device_put(top_k_cpu, self._empty_sharding),
             min_p=jax.device_put(min_p_cpu, self._empty_sharding),
-            positions=jax.device_put(num_computed_tokens_cpu[:max_num_reqs], self._empty_sharding),
+            positions=jax.device_put(num_computed_tokens_cpu[:num_tokens_static], self._empty_sharding),
         )
 
         return metadata, input_ids_buf, position_ids_buf
@@ -977,23 +1000,21 @@ class ExecutionManager:
                 compiled = self._model_step_fn.lower(*compargs).compile()
                 self._model_cache_put(key, compiled)
                 warm_args = (compargs[1], compargs[2], compargs[3])
-                self._debug_baselines[f"{num_tokens}_hash_in"] = _tree_hash(warm_args)
+                self._debug_baselines[f"{num_tokens}_hash_in_model"] = _tree_hash(warm_args)
             else:
 
-                def wrapped(graphstate, graphother, inputs, *, manager=self, num_tokens=num_tokens):
-                    return manager._model_step_fn(manager.graphdef, graphstate, graphother, inputs)
+                def wrapped(graphstate, graphother, inputs):
+                    return self._model_step_fn(self.graphdef, graphstate, graphother, inputs)
 
                 _ = wrapped(self.graphstate, self.graphother, compargs[3])
                 self._model_cache_put(key, wrapped)
 
-    def _compile_sampler(self, inputs: StepFunctionInputs, metadata: BatchMetadata):
+    def _compile_sampler(self, num_tokens: int, inputs: StepFunctionInputs, metadata: BatchMetadata):
         """Compile the sampler/update ejit."""
         mode = "aot" if self.use_aot_forward else "jit"
-        key = ("sampler", mode)
+        key = (num_tokens, "sampler", mode)
 
         if key in self._sampler_lowerd_history:
-            if self.use_aot_forward:
-                self._sampling_impl = self._sampler_lowerd_history[key]
             return
 
         vocab_size = self.model.config.get_text_config().vocab_size
@@ -1015,12 +1036,11 @@ class ExecutionManager:
 
         if self.use_aot_forward:
             compiled = self._sampling_fn.lower(*sampler_args).compile()
-            self._sampler_lowerd_history[key] = compiled
-            self._sampling_impl = compiled
+            self._sampler_cache_put(key, compiled)
+            self._debug_baselines[f"{num_tokens}_hash_in_sampler"] = _tree_hash(sampler_args)
         else:
             _ = self._sampling_fn(*sampler_args)
-            self._sampler_lowerd_history[key] = self._sampling_fn
-            self._sampling_impl = self._sampling_fn
+            self._sampler_cache_put(key, self._sampling_fn)
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
         """Retrieve pre-compiled model step function for given input dimensions.
@@ -1034,14 +1054,19 @@ class ExecutionManager:
         """
 
         mode = "aot" if self.use_aot_forward else "jit"
-        key = (num_tokens, "model", mode)
-
-        if key in self._model_lowerd_history:
+        model_key = (num_tokens, "model", mode)
+        sampler_key = (num_tokens, "sampler", mode)
+        if model_key in self._model_lowerd_history:
             ...
         else:
-            logger.warning(f"Cache miss for key={key}! Will trigger recompilation")
+            logger.warning(f"Cache miss for key={model_key}! Will trigger recompilation (model)")
             logger.warning(f"Available keys in cache: {list(self._model_lowerd_history.keys())}")
-        return self._model_cache_get(key)
+        if sampler_key in self._sampler_lowerd_history:
+            ...
+        else:
+            logger.warning(f"Cache miss for key={sampler_key}! Will trigger recompilation (sampler)")
+            logger.warning(f"Available keys in cache: {list(self._sampler_lowerd_history.keys())}")
+        return self._model_cache_get(model_key), self._sampler_cache_get(sampler_key)
 
     def get_compile_configurations(
         self,
@@ -1088,6 +1113,7 @@ class ExecutionManager:
             max_num_batched_tokens=self.max_num_tokens,
             vocab_size=self.model.config.get_text_config().vocab_size,
             page_sizes=[metadata.page_size],
+            sharding=self._empty_sharding,
         )
 
         # Convert to device state

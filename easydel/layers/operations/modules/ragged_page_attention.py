@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import jax
 from eformer import common_types as ct
 from ejkernel.modules import ragged_page_attention, ragged_page_attention_v3
+from ejkernel.modules.operations.ragged_page_attention_v3 import RaggedPageAttentionv3Config
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -89,7 +91,7 @@ class _RaggedPageAttn(OperationImpl):
         if softmax_aux is not None:
             num_aux_dims: int = softmax_aux.ndim
             if num_aux_dims == 2:
-                aux_spec = resolve(axes=[ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+                aux_spec = resolve(axes=[ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
             elif num_aux_dims == 1:
                 aux_spec = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
 
@@ -116,7 +118,7 @@ class _RaggedPageAttn(OperationImpl):
             in_specs=(
                 qaxes,
                 resolve(
-                    axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+                    axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY],
                     mode=ct.MODE_PREFILL,
                     shape=kv_pages.shape,
                 ),
@@ -162,7 +164,7 @@ class _RaggedPageAttn(OperationImpl):
             raise NotImplementedError("softmax_aux is only supported in v2 kernel")
 
         kv_pages_spec = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY, ct.EMPTY],
+            axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
@@ -172,6 +174,13 @@ class _RaggedPageAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             vmem_limit_bytes=vmem_limit_bytes,
             sliding_window=sliding_window,
+            cfg=RaggedPageAttentionv3Config(
+                num_queries_per_block=None,
+                num_kv_pages_per_block=None,
+                chunk_prefill_size=None,
+                platform="pallas" if jax.default_backend() == "tpu" else "auto",
+                backend="any",
+            ),
             in_specs=(
                 qaxes,
                 kvaxes,

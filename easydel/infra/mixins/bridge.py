@@ -658,9 +658,6 @@ class EasyBridgeMixin(PushToHubMixin):
             fns.update(shard_fns)
             shard_fns = fns
 
-        elif auto_shard_model and shard_fns is not None:
-            logger.warning("`auto_shard_model` will be ignored since `shard_fns` is provided.")
-
         resolved_archive_file = None
         if pretrained_model_name_or_path:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
@@ -803,7 +800,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 )
             except OSError:
                 logger.info("Generation config file not found, using a generation config created from the model config.")
-
+        if auto_shard_model:
+            # double check to make sure weights are correct or just a simple non-op.
+            model = model.shard_model(partition_rules=partition_rules)
         return model
 
     @classmethod

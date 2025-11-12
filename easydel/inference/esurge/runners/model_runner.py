@@ -220,6 +220,7 @@ class eSurgeRunner:
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             metadata=self.metadata,
+            verbose=verbose,
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
@@ -688,7 +689,6 @@ class eSurgeRunner:
             )
 
         start_index = 0
-        total_exec_time = 0.0
         total_prep_time = 0.0
         total_sync_time = 0.0
         total_post_proc_time = 0.0
@@ -730,7 +730,7 @@ class eSurgeRunner:
             if num_reqs > 0:
                 # Keep scheduled and active_mask as CPU arrays
                 scheduled_full_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
-                scheduled_full_cpu[:len(scheduled_list)] = scheduled_list
+                scheduled_full_cpu[: len(scheduled_list)] = scheduled_list
 
                 req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
                 active_mask_full_cpu = np.zeros(self.max_num_reqs, dtype=bool)
@@ -756,7 +756,6 @@ class eSurgeRunner:
             t_prep = time.time() - t_prep_start
             total_prep_time += t_prep
 
-            exec_start = time.time()
             (
                 device_state,
                 out_tokens_win,
@@ -788,8 +787,6 @@ class eSurgeRunner:
             )
             # account for device time
             jax.block_until_ready(valid_mask_win)
-            t_exec = time.time() - exec_start
-            total_exec_time += t_exec
 
             # host copies once
             tokens_np = np.asarray(out_tokens_win)
@@ -839,7 +836,7 @@ class eSurgeRunner:
 
         total_time = time.time() - execution_start_time
         self.log_it(
-            f"[fused] exec={total_exec_time:.3f}s "
+            f"[fused] "
             f"prep={total_prep_time:.3f}s "
             f"sync={total_sync_time:.3f}s "
             f"post={total_post_proc_time:.3f}s "
