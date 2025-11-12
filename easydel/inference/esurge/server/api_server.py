@@ -48,7 +48,8 @@ from ...openai_api_modules import (
 from ...sampling_params import SamplingParams
 from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
-from .api_keys import ApiKeyManager
+from .auth_endpoints import AuthEndpointsMixin
+from .auth_manager import EnhancedApiKeyManager, PermissionDenied, QuotaExceeded, RateLimitExceeded
 
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
@@ -197,7 +198,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
         return self.esurge.tokenizer
 
 
-class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
+class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMixin):
     """eSurge-specific API server implementation with OpenAI compatibility.
 
     Provides a FastAPI-based REST API server that exposes eSurge engines
@@ -211,6 +212,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
     - Function/tool calling support
     - Real-time metrics and health monitoring
     - Thread-safe request handling
+    - Production-grade authentication with RBAC, rate limiting, and audit logging
     """
 
     def __init__(
@@ -220,7 +222,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         enable_function_calling: bool = True,
         tool_parser_name: str = "hermes",
         require_api_key: bool = False,
-        api_keys: dict[str, dict[str, tp.Any]] | list[str] | None = None,
+        admin_key: str | None = None,
+        enable_audit_logging: bool = True,
+        max_audit_entries: int = 10000,
+        storage_dir: str | None = None,
+        enable_persistence: bool = True,
+        auto_save_interval: float = 60.0,
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -231,7 +238,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             enable_function_calling: Enable function/tool calling support.
             tool_parser_name: Name of the tool parser to use (e.g., "hermes", "qwen", etc.)
             require_api_key: Enforce API key authentication for every endpoint.
-            api_keys: Optional list/dict of pre-provisioned API keys with metadata.
+            admin_key: Optional admin key for initial setup. If provided, creates an admin key.
+            enable_audit_logging: Enable comprehensive audit logging for all auth operations.
+            max_audit_entries: Maximum number of audit log entries to keep in memory (default: 10000).
+            storage_dir: Directory for persistent auth storage. Defaults to ~/.cache/esurge-auth/
+            enable_persistence: Enable persistent storage of auth data to disk (default: True).
+            auto_save_interval: Seconds between automatic saves (default: 60.0).
             **kwargs: Additional arguments passed to BaseInferenceApiServer.
 
         Raises:
@@ -264,9 +276,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         self.status = ServerStatus.STARTING
         self._active_requests: dict[str, dict] = {}
         self.tool_parser_name = tool_parser_name
-        self.api_key_manager: ApiKeyManager | None = None
-        if require_api_key or api_keys:
-            self.api_key_manager = ApiKeyManager(api_keys=api_keys, require_api_key=require_api_key)
+
+        # Initialize enhanced authentication manager with persistent storage
+        self.auth_manager = EnhancedApiKeyManager(
+            require_api_key=require_api_key,
+            admin_key=admin_key,
+            enable_audit_logging=enable_audit_logging,
+            max_audit_entries=max_audit_entries,
+            storage_dir=storage_dir,
+            enable_persistence=enable_persistence,
+            auto_save=enable_persistence,  # Auto-save if persistence enabled
+            save_interval=auto_save_interval,
+        )
+        if enable_persistence:
+            storage_path = storage_dir or "~/.cache/esurge-auth"
+            logger.info(f"Enhanced authentication system initialized with persistent storage at: {storage_path}")
+        else:
+            logger.info("Enhanced authentication system initialized (in-memory only)")
 
         super().__init__(
             server_name="EasyDeL eSurge API Server",
@@ -321,17 +347,28 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         adapter = next(iter(self.adapters.values()))
         return adapter.count_tokens(content)
 
-    def generate_api_key(self, label: str | None = None) -> str:
-        """Create and register a new random API key."""
-        if self.api_key_manager is None:
-            self.api_key_manager = ApiKeyManager(require_api_key=False)
-        return self.api_key_manager.generate_api_key(label=label).key
+    def generate_api_key(
+        self,
+        name: str,
+        role: tp.Any = None,
+        **kwargs,
+    ) -> tuple[str, tp.Any]:
+        """Create and register a new random API key with enhanced features.
 
-    def register_api_key(self, key: str, label: str | None = None) -> str:
-        """Register a user-supplied API key."""
-        if self.api_key_manager is None:
-            self.api_key_manager = ApiKeyManager(require_api_key=False)
-        return self.api_key_manager.register_api_key(key=key, label=label).key
+        Args:
+            name: Human-readable name for the key.
+            role: Access control role (ApiKeyRole). Defaults to USER.
+            **kwargs: Additional arguments passed to auth_manager.generate_api_key()
+                (description, expires_in_days, rate_limits, quota, permissions, tags, metadata)
+
+        Returns:
+            Tuple of (raw_key, metadata). Store raw_key securely - it won't be retrievable later.
+        """
+        from .auth_models import ApiKeyRole
+
+        if role is None:
+            role = ApiKeyRole.USER
+        return self.auth_manager.generate_api_key(name=name, role=role, **kwargs)
 
     def _extract_api_key(self, raw_request: Request) -> str | None:
         """Extract API key from Authorization header, X-API-Key header, or query param."""
@@ -383,11 +420,29 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         self,
         raw_request: Request,
         payload_api_keys: str | tp.Iterable[str | None] | None = None,
+        endpoint: str | None = None,
+        model: str | None = None,
+        requested_tokens: int = 0,
     ) -> str | None:
-        """Validate incoming request when API key enforcement is enabled."""
-        if self.api_key_manager is None or not self.api_key_manager.enabled:
+        """Authorize request using enhanced auth system with RBAC and rate limiting.
+
+        Args:
+            raw_request: FastAPI request object.
+            payload_api_keys: API keys from request payload.
+            endpoint: Endpoint being accessed.
+            model: Model being requested.
+            requested_tokens: Number of tokens requested.
+
+        Returns:
+            Validated API key string if successful, None if auth not required.
+
+        Raises:
+            HTTPException: If authentication or authorization fails.
+        """
+        if not self.auth_manager.enabled:
             return None
 
+        # Collect candidate keys
         candidate_keys: list[str] = []
 
         def add_candidate(value: tp.Any) -> None:
@@ -404,19 +459,39 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
         add_candidate(self._extract_api_key(raw_request))
 
-        usage = None
+        # Get client IP
+        ip_address = raw_request.client.host if raw_request.client else None
+
+        # Try each candidate key
         for candidate in candidate_keys:
-            usage = self.api_key_manager.validate_key(candidate)
-            if usage is not None:
-                break
+            try:
+                metadata = self.auth_manager.authorize_request(
+                    raw_key=candidate,
+                    ip_address=ip_address,
+                    endpoint=endpoint,
+                    model=model,
+                    requested_tokens=requested_tokens,
+                )
+                # Authorization successful
+                raw_request.state.api_key = candidate
+                raw_request.state.api_key_metadata = metadata
+                return candidate
+            except (PermissionDenied, RateLimitExceeded, QuotaExceeded) as e:
+                # If we have more candidates, try them. Otherwise, raise the exception.
+                if candidate == candidate_keys[-1]:
+                    # Last candidate failed
+                    if isinstance(e, RateLimitExceeded):
+                        raise HTTPException(status_code=429, detail=str(e)) from e
+                    elif isinstance(e, QuotaExceeded):
+                        raise HTTPException(status_code=429, detail=str(e)) from e
+                    else:
+                        raise HTTPException(status_code=403, detail=str(e)) from e
+                continue
 
-        if usage is None:
-            if self.api_key_manager.require_api_key:
-                raise HTTPException(status_code=401, detail="Missing or invalid API key")
-            return None
-
-        raw_request.state.api_key = usage.key
-        return usage.key
+        # No valid key found
+        if self.auth_manager.require_api_key:
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+        return None
 
     def _record_api_key_usage(
         self,
@@ -425,14 +500,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         completion_tokens: int,
     ) -> None:
         """Track per-key token usage after a request completes."""
-        if self.api_key_manager is None or raw_request is None:
+        if raw_request is None:
             return
 
         api_key = getattr(raw_request.state, "api_key", None)
         if not api_key:
             return
 
-        self.api_key_manager.record_usage(api_key, prompt_tokens, completion_tokens)
+        self.auth_manager.record_usage(api_key, prompt_tokens, completion_tokens)
 
     @staticmethod
     def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
@@ -597,7 +672,15 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         """
         request_id = str(uuid.uuid4())
         payload_api_keys = self._extract_payload_api_keys(request)
-        self._authorize_request(raw_request, payload_api_keys=payload_api_keys)
+        # Authorize with endpoint, model, and estimated tokens for enhanced auth
+        max_tokens = request.max_tokens or 128
+        self._authorize_request(
+            raw_request,
+            payload_api_keys=payload_api_keys,
+            endpoint="/v1/chat/completions",
+            model=request.model,
+            requested_tokens=max_tokens,
+        )
         self.metrics.total_requests += 1
 
         try:
@@ -754,8 +837,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
 
                     current_text = output.accumulated_text or ""
                     # Compute delta from accumulated text to prevent token loss in concurrent scenarios
-                    delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
-
+                    delta_text = output.delta_text
                     # Get delta message from tool parser if available
                     if tool_parser:
                         current_token_ids = output.outputs[0].token_ids if output.outputs else []
@@ -881,7 +963,15 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         request_id = str(uuid.uuid4())
         self.metrics.total_requests += 1
         payload_api_keys = self._extract_payload_api_keys(request)
-        self._authorize_request(raw_request, payload_api_keys=payload_api_keys)
+        # Authorize with endpoint, model, and estimated tokens for enhanced auth
+        max_tokens = request.max_tokens or 128
+        self._authorize_request(
+            raw_request,
+            payload_api_keys=payload_api_keys,
+            endpoint="/v1/completions",
+            model=request.model,
+            requested_tokens=max_tokens,
+        )
 
         try:
             adapter = self._get_adapter(request.model)
@@ -1123,8 +1213,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
             JSONResponse with comprehensive server metrics including
             request counts, token statistics, throughput, and status.
         """
-        self._authorize_request(raw_request)
+        self._authorize_request(raw_request, endpoint="/v1/metrics")
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
+
+        # Get authentication statistics
+        auth_stats = self.auth_manager.get_statistics()
 
         return JSONResponse(
             {
@@ -1137,7 +1230,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
                 "active_requests": len(self._active_requests),
                 "models_loaded": len(self.adapters),
                 "status": self.status.value,
-                "api_key_usage": self.api_key_manager.usage_snapshot() if self.api_key_manager else {},
+                "auth_stats": auth_stats,
             }
         )
 
@@ -1267,3 +1360,101 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin):
         """
         self._authorize_request(raw_request)
         return self.create_tool_execution_placeholder()
+
+    @property
+    def _endpoints(self) -> list:
+        """Define all API endpoints including admin auth endpoints.
+
+        Extends the base endpoints with admin authentication endpoints
+        for API key management.
+
+        Returns:
+            List of EndpointConfig objects defining all server endpoints.
+        """
+        from ...inference_engine_interface import EndpointConfig
+
+        # Get base endpoints from parent class
+        base_endpoints = super()._endpoints
+
+        # Add admin authentication endpoints
+        admin_endpoints = [
+            EndpointConfig(
+                path="/v1/admin/keys",
+                handler=self.create_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary="Create a new API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys",
+                handler=self.list_api_keys_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary="List all API keys",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.get_api_key_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary="Get API key details",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.update_api_key_endpoint,
+                methods=["PATCH"],
+                tags=["Admin", "Authentication"],
+                summary="Update API key configuration",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/revoke",
+                handler=self.revoke_api_key_endpoint,
+                methods=["DELETE"],
+                tags=["Admin", "Authentication"],
+                summary="Revoke an API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/suspend",
+                handler=self.suspend_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary="Suspend an API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/reactivate",
+                handler=self.reactivate_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary="Reactivate a suspended API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}",
+                handler=self.delete_api_key_endpoint,
+                methods=["DELETE"],
+                tags=["Admin", "Authentication"],
+                summary="Permanently delete an API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/{key_id}/rotate",
+                handler=self.rotate_api_key_endpoint,
+                methods=["POST"],
+                tags=["Admin", "Authentication"],
+                summary="Rotate an API key",
+            ),
+            EndpointConfig(
+                path="/v1/admin/keys/stats",
+                handler=self.get_api_key_stats_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Authentication"],
+                summary="Get API key statistics",
+            ),
+            EndpointConfig(
+                path="/v1/admin/audit-logs",
+                handler=self.get_audit_logs_endpoint,
+                methods=["GET"],
+                tags=["Admin", "Audit"],
+                summary="Get audit logs",
+            ),
+        ]
+
+        return base_endpoints + admin_endpoints

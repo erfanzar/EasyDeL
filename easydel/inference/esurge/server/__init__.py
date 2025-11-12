@@ -13,11 +13,29 @@
 # limitations under the License.
 
 from .api_server import ErrorResponse, ServerMetrics, ServerStatus, create_error_response, eSurgeAdapter, eSurgeApiServer
+from .auth_endpoints import AuthEndpointsMixin, CreateApiKeyRequest, UpdateApiKeyRequest
+from .auth_manager import EnhancedApiKeyManager, PermissionDenied, QuotaExceeded, RateLimitExceeded
+from .auth_models import ApiKeyMetadata, ApiKeyPermissions, ApiKeyRole, ApiKeyStatus, QuotaConfig, RateLimitConfig
+from .auth_storage import AuthStorage
 
 __all__ = (
+    "ApiKeyMetadata",
+    "ApiKeyPermissions",
+    "ApiKeyRole",
+    "ApiKeyStatus",
+    "AuthEndpointsMixin",
+    "AuthStorage",
+    "CreateApiKeyRequest",
+    "EnhancedApiKeyManager",
     "ErrorResponse",
+    "PermissionDenied",
+    "QuotaConfig",
+    "QuotaExceeded",
+    "RateLimitConfig",
+    "RateLimitExceeded",
     "ServerMetrics",
     "ServerStatus",
+    "UpdateApiKeyRequest",
     "create_error_response",
     "eSurgeAdapter",
     "eSurgeApiServer",
