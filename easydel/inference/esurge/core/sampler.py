@@ -51,10 +51,9 @@ def _apply_min_p_mask(logits: jax.Array, sampling_metadata: SamplingMetadata) ->
     Note:
         Min-p is applied as: keep tokens where p(token) >= min_p * max(p).
     """
-    probs = jax.nn.softmax(logits, axis=-1)
-    max_probs = jnp.max(probs, axis=-1, keepdims=True)
+    max_probs = jnp.max(logits, axis=-1, keepdims=True)
     threshold = sampling_metadata.min_ps[:, None] * max_probs
-    mask = probs >= threshold
+    mask = logits >= threshold
     return jnp.where(mask, logits, jnp.full_like(logits, -1e10))
 
 
@@ -121,11 +120,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         topk_fn = apply_topk_mask_bf16 if use_bf16_path else apply_topk_mask
 
         def topk_per_sample(logits_i, k_i):
-            return lax.cond(
-                k_i > 0,
-                lambda: topk_fn(logits_i[None, :], k_i, -1e10)[0],
-                lambda: logits_i,
-            )
+            return lax.cond(k_i > 0, lambda: topk_fn(logits_i[None, :], k_i, -1e10)[0], lambda: logits_i)
 
         return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
 
@@ -146,11 +141,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         topp_fn = apply_topp_mask_bf16 if use_bf16_path else apply_topp_mask
 
         def topp_per_sample(logits_i, p_i):
-            return lax.cond(
-                p_i < 1.0,
-                lambda: topp_fn(logits_i[None, :], p_i, -1e10)[0],
-                lambda: logits_i,
-            )
+            return lax.cond(p_i < 1.0, lambda: topp_fn(logits_i[None, :], p_i, -1e10)[0], lambda: logits_i)
 
         return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
 
