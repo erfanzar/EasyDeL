@@ -26,75 +26,97 @@ from .auth_models import ApiKeyPermissions, ApiKeyRole, ApiKeyStatus, QuotaConfi
 
 
 class CreateApiKeyRequest(BaseModel):
-    """Request model for creating a new API key."""
+    """Request model for creating a new API key.
+
+    All optional fields default to None, which means unlimited/unrestricted access:
+    - expires_in_days=None → Key never expires
+    - Rate limit fields=None → No rate limiting
+    - Quota fields=None → No usage limits
+    - allowed_models=None → Access to all models
+    - allowed_endpoints=None → Access to all endpoints
+    - allowed_ip_addresses=None → No IP restrictions
+    - max_tokens_per_request=None → No per-request token limit
+    """
 
     name: str = Field(..., description="Human-readable name for the key")
     role: ApiKeyRole = Field(ApiKeyRole.USER, description="Access control role")
     description: str | None = Field(None, description="Optional description")
-    expires_in_days: int | None = Field(None, description="Number of days until expiration")
+    expires_in_days: int | None = Field(None, description="Days until expiration (None = never expires)")
 
-    # Rate limits
-    requests_per_minute: int | None = None
-    requests_per_hour: int | None = None
-    requests_per_day: int | None = None
-    tokens_per_minute: int | None = None
-    tokens_per_hour: int | None = None
-    tokens_per_day: int | None = None
+    # Rate limits (None = unlimited)
+    requests_per_minute: int | None = Field(None, description="Max requests per minute (None = unlimited)")
+    requests_per_hour: int | None = Field(None, description="Max requests per hour (None = unlimited)")
+    requests_per_day: int | None = Field(None, description="Max requests per day (None = unlimited)")
+    tokens_per_minute: int | None = Field(None, description="Max tokens per minute (None = unlimited)")
+    tokens_per_hour: int | None = Field(None, description="Max tokens per hour (None = unlimited)")
+    tokens_per_day: int | None = Field(None, description="Max tokens per day (None = unlimited)")
 
-    # Quotas
-    max_total_tokens: int | None = None
-    max_total_requests: int | None = None
-    monthly_token_limit: int | None = None
-    monthly_request_limit: int | None = None
+    # Quotas (None = unlimited)
+    max_total_tokens: int | None = Field(None, description="Lifetime token limit (None = unlimited)")
+    max_total_requests: int | None = Field(None, description="Lifetime request limit (None = unlimited)")
+    monthly_token_limit: int | None = Field(None, description="Monthly token limit (None = unlimited)")
+    monthly_request_limit: int | None = Field(None, description="Monthly request limit (None = unlimited)")
 
-    # Permissions
-    allowed_models: list[str] | None = None
-    allowed_endpoints: list[str] | None = None
-    allowed_ip_addresses: list[str] | None = None
-    blocked_ip_addresses: list[str] | None = None
-    enable_streaming: bool = True
-    enable_function_calling: bool = True
-    max_tokens_per_request: int | None = None
+    # Permissions (None = unrestricted access)
+    allowed_models: list[str] | None = Field(None, description="Allowed models (None = all models)")
+    allowed_endpoints: list[str] | None = Field(None, description="Allowed endpoints (None = all endpoints)")
+    allowed_ip_addresses: list[str] | None = Field(
+        None, description="Allowed IPs (None = all IPs). If set, only these IPs can use the key"
+    )
+    blocked_ip_addresses: list[str] | None = Field(None, description="Blocked IPs (None = no blocks)")
+    enable_streaming: bool = Field(True, description="Allow streaming requests")
+    enable_function_calling: bool = Field(True, description="Allow function calling")
+    max_tokens_per_request: int | None = Field(None, description="Max tokens per single request (None = unlimited)")
 
     # Metadata
-    tags: list[str] | None = None
-    metadata: dict[str, tp.Any] | None = None
+    tags: list[str] | None = Field(None, description="Tags for organization")
+    metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
 
 
 class UpdateApiKeyRequest(BaseModel):
-    """Request model for updating an API key."""
+    """Request model for updating an API key.
 
-    name: str | None = None
-    description: str | None = None
-    role: ApiKeyRole | None = None
-    expires_in_days: int | None = None
+    Only provided fields will be updated. Omitted fields remain unchanged.
+    Setting a field to None means unlimited/unrestricted:
+    - expires_in_days=None → Key never expires
+    - Rate limit fields=None → No rate limiting
+    - Quota fields=None → No usage limits
+    - allowed_models=None → Access to all models
+    - allowed_endpoints=None → Access to all endpoints
+    - allowed_ip_addresses=None → No IP restrictions
+    """
 
-    # Rate limits
-    requests_per_minute: int | None = None
-    requests_per_hour: int | None = None
-    requests_per_day: int | None = None
-    tokens_per_minute: int | None = None
-    tokens_per_hour: int | None = None
-    tokens_per_day: int | None = None
+    name: str | None = Field(None, description="Update key name")
+    description: str | None = Field(None, description="Update description")
+    role: ApiKeyRole | None = Field(None, description="Update role")
+    expires_in_days: int | None = Field(None, description="Days until expiration (None = never expires)")
 
-    # Quotas
-    max_total_tokens: int | None = None
-    max_total_requests: int | None = None
-    monthly_token_limit: int | None = None
-    monthly_request_limit: int | None = None
+    # Rate limits (None = unlimited)
+    requests_per_minute: int | None = Field(None, description="Max requests per minute (None = unlimited)")
+    requests_per_hour: int | None = Field(None, description="Max requests per hour (None = unlimited)")
+    requests_per_day: int | None = Field(None, description="Max requests per day (None = unlimited)")
+    tokens_per_minute: int | None = Field(None, description="Max tokens per minute (None = unlimited)")
+    tokens_per_hour: int | None = Field(None, description="Max tokens per hour (None = unlimited)")
+    tokens_per_day: int | None = Field(None, description="Max tokens per day (None = unlimited)")
 
-    # Permissions
-    allowed_models: list[str] | None = None
-    allowed_endpoints: list[str] | None = None
-    allowed_ip_addresses: list[str] | None = None
-    blocked_ip_addresses: list[str] | None = None
-    enable_streaming: bool | None = None
-    enable_function_calling: bool | None = None
-    max_tokens_per_request: int | None = None
+    # Quotas (None = unlimited)
+    max_total_tokens: int | None = Field(None, description="Lifetime token limit (None = unlimited)")
+    max_total_requests: int | None = Field(None, description="Lifetime request limit (None = unlimited)")
+    monthly_token_limit: int | None = Field(None, description="Monthly token limit (None = unlimited)")
+    monthly_request_limit: int | None = Field(None, description="Monthly request limit (None = unlimited)")
+
+    # Permissions (None = unrestricted access)
+    allowed_models: list[str] | None = Field(None, description="Allowed models (None = all models)")
+    allowed_endpoints: list[str] | None = Field(None, description="Allowed endpoints (None = all endpoints)")
+    allowed_ip_addresses: list[str] | None = Field(None, description="Allowed IPs (None = all IPs)")
+    blocked_ip_addresses: list[str] | None = Field(None, description="Blocked IPs (None = no blocks)")
+    enable_streaming: bool | None = Field(None, description="Allow streaming requests")
+    enable_function_calling: bool | None = Field(None, description="Allow function calling")
+    max_tokens_per_request: int | None = Field(None, description="Max tokens per request (None = unlimited)")
 
     # Metadata
-    tags: list[str] | None = None
-    metadata: dict[str, tp.Any] | None = None
+    tags: list[str] | None = Field(None, description="Tags for organization")
+    metadata: dict[str, tp.Any] | None = Field(None, description="Additional custom metadata")
 
 
 class ApiKeyResponse(BaseModel):
@@ -131,7 +153,24 @@ class AuthEndpointsMixin:
         Raises:
                 HTTPException: If not authorized as admin.
         """
+        # First, try to get API key from request state (if _authorize_request was already called)
         api_key = getattr(raw_request.state, "api_key", None)
+
+        # If not set in state, extract it manually
+        if not api_key:
+            # Try Authorization header (Bearer token)
+            auth_header = raw_request.headers.get("Authorization")
+            if auth_header and auth_header.lower().startswith("bearer "):
+                api_key = auth_header.split(" ", 1)[1].strip()
+
+            # Try X-API-Key header
+            if not api_key:
+                api_key = raw_request.headers.get("X-API-Key")
+
+            # Try query parameter
+            if not api_key:
+                api_key = raw_request.query_params.get("api_key")
+
         if not api_key:
             raise HTTPException(status_code=401, detail="API key required for this endpoint")
 
@@ -140,8 +179,15 @@ class AuthEndpointsMixin:
             raise HTTPException(status_code=500, detail="Auth manager not initialized")
 
         metadata = self.auth_manager.validate_key(api_key)
-        if not metadata or metadata.role != ApiKeyRole.ADMIN:
+        if not metadata:
+            raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+        if metadata.role != ApiKeyRole.ADMIN:
             raise HTTPException(status_code=403, detail="Admin role required for this endpoint")
+
+        # Store in state for later use
+        raw_request.state.api_key = api_key
+        raw_request.state.api_key_metadata = metadata
 
     async def create_api_key_endpoint(self, request: CreateApiKeyRequest, raw_request: Request) -> JSONResponse:
         """Admin endpoint to create a new API key.

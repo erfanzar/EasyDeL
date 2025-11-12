@@ -179,6 +179,7 @@ class BaseInferenceApiServer(ABC):
         server_name: str = "EasyDeL Inference API Server",
         server_description: str = "High-performance inference server with OpenAI API compatibility",
         server_version: str = "2.0.0",
+        enable_auth_ui: bool = True,
     ) -> None:
         """
         Initialize the base inference API server.
@@ -194,6 +195,7 @@ class BaseInferenceApiServer(ABC):
             server_name: Name of the server for FastAPI app
             server_description: Description of the server
             server_version: Version of the server
+            enable_auth_ui: Enable "Authorize" button in /docs for API key input
         """
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="inference-worker")
         self.max_request_size = max_request_size
@@ -205,12 +207,27 @@ class BaseInferenceApiServer(ABC):
         self.enable_function_calling = enable_function_calling
         self.default_function_format = default_function_format
 
+        # Configure OpenAPI security scheme for API key authentication
+        swagger_ui_init_oauth = None
+        if enable_auth_ui:
+            swagger_ui_init_oauth = {
+                "clientId": "swagger-ui",
+                "appName": "Swagger UI",
+                "usePkceWithAuthorizationCodeGrant": True,
+            }
+
         self.app = FastAPI(
             title=server_name,
             description=server_description,
             version=server_version,
             lifespan=self._lifespan,
+            swagger_ui_init_oauth=swagger_ui_init_oauth,
         )
+
+        # Add security schemes to OpenAPI schema if auth UI is enabled
+        if enable_auth_ui:
+            self.app.openapi_schema = None  # Reset to regenerate
+            self._configure_openapi_security()
 
         if enable_cors:
             self._setup_cors(cors_origins)
@@ -252,6 +269,55 @@ class BaseInferenceApiServer(ABC):
         This method is called once when the server shuts down.
         """
         pass
+
+    def _configure_openapi_security(self) -> None:
+        """Configure OpenAPI security schemes for API key authentication.
+
+        Adds security scheme definitions to the OpenAPI schema, which enables
+        the "Authorize" button in the /docs UI. Users can enter their API key
+        via Bearer token (Authorization header) or X-API-Key header.
+        """
+
+        def custom_openapi():
+            if self.app.openapi_schema:
+                return self.app.openapi_schema
+
+            from fastapi.openapi.utils import get_openapi
+
+            openapi_schema = get_openapi(
+                title=self.app.title,
+                version=self.app.version,
+                description=self.app.description,
+                routes=self.app.routes,
+            )
+
+            # Define security schemes
+            openapi_schema["components"]["securitySchemes"] = {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "API Key",
+                    "description": "Enter your API key as a Bearer token (e.g., `sk-...`)",
+                },
+                "ApiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-API-Key",
+                    "description": "Enter your API key in the X-API-Key header",
+                },
+            }
+
+            # Apply security globally to all endpoints (optional, can be overridden per endpoint)
+            # This makes the "Authorize" button appear in the UI
+            openapi_schema["security"] = [
+                {"BearerAuth": []},
+                {"ApiKeyAuth": []},
+            ]
+
+            self.app.openapi_schema = openapi_schema
+            return self.app.openapi_schema
+
+        self.app.openapi = custom_openapi
 
     def _setup_cors(self, origins: list[str] | None) -> None:
         """Setup CORS middleware.
@@ -638,9 +704,6 @@ class BaseInferenceApiServer(ABC):
 
         if ssl_keyfile and ssl_certfile:
             uvicorn_config.update({"ssl_keyfile": ssl_keyfile, "ssl_certfile": ssl_certfile})
-            logger.info(f"Starting HTTPS server on https://{host}:{port}")
-        else:
-            logger.info(f"Starting HTTP server on http://{host}:{port}")
 
         try:
             import uvloop

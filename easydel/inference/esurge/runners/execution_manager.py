@@ -966,7 +966,7 @@ class ExecutionManager:
                 linear_penalty=None,
             )
 
-            sampled_flat = sample_tokens(jax.nn.softmax(logits), sampling_metadata, metadata.positions, rng_key)
+            sampled_flat = sample_tokens(logits, sampling_metadata, metadata.positions, rng_key)
             total_tokens = metadata.query_start_loc[-1]
             rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 
