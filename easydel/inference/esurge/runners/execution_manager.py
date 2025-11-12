@@ -500,7 +500,6 @@ class ExecutionManager:
         """
         model_fn, sampler_fn = self.get_compiled_key(num_tokens, padded_num_reqs)
         start_prep = time.time()
-        print(num_tokens)
         batch_metadata, input_ids_buf, position_ids_buf = self.prepare_batch_metadata(
             num_tokens_static=num_tokens,
             device_state=device_state,
