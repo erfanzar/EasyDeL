@@ -40,6 +40,36 @@ if typing.TYPE_CHECKING:
 
 
 @auto_pytree(frozen=True)
+class BatchMetadata:
+    """Precomputed tensors describing the current batch layout."""
+
+    scheduled: jax.Array
+    query_start_loc: jax.Array
+    seq_lens: jax.Array
+    pages_tables: jax.Array
+    padded_num_reqs: jax.Array
+    request_distribution: jax.Array
+    logits_indices: jax.Array
+    input_ids_buf: jax.Array
+    position_ids_buf: jax.Array
+    num_requests: jax.Array
+    temperature: jax.Array
+    top_p: jax.Array
+    top_k: jax.Array
+    min_p: jax.Array
+    positions: jax.Array
+
+
+@auto_pytree(frozen=True)
+class ModelStepOutputs:
+    """Outputs returned from the pure model forward pass."""
+
+    kv_pages: RaggedPagesCache
+    hidden_states: jax.Array
+    logits: jax.Array
+
+
+@auto_pytree(frozen=True)
 class StepFunctionInputs:
     """Consolidated inputs for fused step execution.
 
@@ -60,10 +90,6 @@ class StepFunctionInputs:
             [max_num_reqs]. Used for tracking completion and memory allocation.
         active_mask_full: Boolean mask indicating which requests are active
             [max_num_reqs]. Inactive requests are skipped during processing.
-        input_ids_buf: Contiguous buffer of input token IDs [max_num_tokens].
-            Flattened across all active requests for efficient batch processing.
-        position_ids_buf: Contiguous buffer of position IDs [max_num_tokens].
-            Parallel to input_ids_buf, contains position indices for each token.
         rng_key: JAX random key for stochastic sampling operations. Split and
             updated at each step for proper random state management.
 
@@ -78,8 +104,6 @@ class StepFunctionInputs:
         ...     scheduled_full=jnp.array([4, 8, 2]),
         ...     req_num_tokens_full=jnp.array([512, 256, 128]),
         ...     active_mask_full=jnp.array([True, True, False]),
-        ...     input_ids_buf=jnp.array([101, 202, ...]),
-        ...     position_ids_buf=jnp.array([0, 1, 2, ...]),
         ...     rng_key=jax.random.PRNGKey(0),
         ... )
     """
@@ -89,9 +113,8 @@ class StepFunctionInputs:
     scheduled_full: jax.Array  # [max_num_reqs] int32
     req_num_tokens_full: jax.Array  # [max_num_reqs] int32
     active_mask_full: jax.Array  # [max_num_reqs] bool
-    input_ids_buf: jax.Array  # [max_num_tokens] int32
-    position_ids_buf: jax.Array  # [max_num_tokens] int32
     rng_key: jax.Array
+    batch_metadata: BatchMetadata
 
 
 @auto_pytree(frozen=True)

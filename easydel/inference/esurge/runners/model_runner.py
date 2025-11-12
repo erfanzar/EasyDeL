@@ -610,9 +610,11 @@ class eSurgeRunner:
             batched_page_rows.append((req_index, new_page_ids))
 
         if upd_req_indices:
-            idx_arr = jnp.array(upd_req_indices, dtype=jnp.int32)
-            val_arr = jnp.array(upd_num_computed_vals, dtype=jnp.int32)
-            new_num_computed = self.sequence_buffer.num_computed_tokens.at[idx_arr].set(val_arr)
+            # num_computed_tokens is now a NumPy array, use standard indexing
+            idx_arr = np.array(upd_req_indices, dtype=np.int32)
+            val_arr = np.array(upd_num_computed_vals, dtype=np.int32)
+            new_num_computed = self.sequence_buffer.num_computed_tokens.copy()
+            new_num_computed[idx_arr] = val_arr
             self.sequence_buffer = replace(self.sequence_buffer, num_computed_tokens=new_num_computed)
 
         if batched_page_rows:
@@ -696,7 +698,7 @@ class eSurgeRunner:
         token_logprobs: dict[str, float] = {}
 
         t_device_state_start = time.time()
-        device_state = self.sequence_buffer.to_device_state()
+        device_state = self.sequence_buffer.to_device_state(sharding=self._empty_sharding)
         t_device_state = time.time() - t_device_state_start
 
         while start_index < self.sequence_buffer.num_reqs:
@@ -726,33 +728,30 @@ class eSurgeRunner:
             num_tokens_static = int(self.num_tokens_paddings[idx])
 
             if num_reqs > 0:
-                scheduled_np = np.array(scheduled_list, dtype=np.int32)
+                # Keep scheduled and active_mask as CPU arrays
+                scheduled_full_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
+                scheduled_full_cpu[:len(scheduled_list)] = scheduled_list
+
                 req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-                active_mask_np = np.zeros(self.max_num_reqs, dtype=bool)
+                active_mask_full_cpu = np.zeros(self.max_num_reqs, dtype=bool)
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         rs = self.requests.get(rid)
                         if rs:
                             req_num_tokens_np[i] = rs.num_tokens
-                        active_mask_np[i] = True
-                arr = jnp.asarray(scheduled_np, dtype=jnp.int32)
-                if len(scheduled_np) < self.max_num_reqs:
-                    arr = jnp.pad(arr, (0, self.max_num_reqs - len(scheduled_np)), constant_values=0)
-                self.scheduled_full_buf = jax.device_put(arr, self._empty_sharding)
+                        active_mask_full_cpu[i] = True
 
                 self.req_num_tokens_full_buf = jax.device_put(
                     jnp.asarray(req_num_tokens_np, dtype=jnp.int32),
                     self._empty_sharding,
                 )
 
-                self.active_mask_full_buf = jax.device_put(
-                    jnp.asarray(active_mask_np, dtype=bool),
-                    self._empty_sharding,
-                )
-
             nr_safe = max(num_reqs, 1)
             next_pow2 = 1 << (nr_safe - 1).bit_length()
             padded_num_reqs = min(self.min_input_pad if num_reqs <= self.min_input_pad else next_pow2, self.max_num_reqs)
+
+            # Get page table as CPU array (single device transfer per step)
+            page_table_cpu = np.asarray(jax.device_get(self.sequence_buffer.page_table[0].get_array()))
 
             t_prep = time.time() - t_prep_start
             total_prep_time += t_prep
@@ -772,12 +771,20 @@ class eSurgeRunner:
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 device_state=device_state,
-                scheduled_full=self.scheduled_full_buf,
+                scheduled_full_cpu=scheduled_full_cpu,
                 req_num_tokens_full=self.req_num_tokens_full_buf,
-                active_mask_full=self.active_mask_full_buf,
+                active_mask_full_cpu=active_mask_full_cpu,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
                 padded_num_reqs=padded_num_reqs,
+                # Pass NumPy arrays for CPU-first batch metadata preparation
+                token_ids_cpu=self.sequence_buffer.token_ids,
+                num_computed_tokens_cpu=self.sequence_buffer.num_computed_tokens,
+                temperature_cpu=self.sequence_buffer.temperature,
+                top_p_cpu=self.sequence_buffer.top_p,
+                top_k_cpu=self.sequence_buffer.top_k,
+                min_p_cpu=self.sequence_buffer.min_p,
+                page_table_cpu=page_table_cpu,
             )
             # account for device time
             jax.block_until_ready(valid_mask_win)

@@ -40,6 +40,7 @@ from dataclasses import replace
 from typing import Any, cast
 
 import jax
+import numpy as np
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree, field
 from jax import numpy as jnp
@@ -220,36 +221,38 @@ class SequenceBuffer:
     """Buffer for managing token sequences during generation.
 
     Functional, dataclass-PyTree version:
-      - Arrays and page_table are leaves
+      - NumPy arrays stored as non-leaves (CPU-side, for fast metadata prep)
+      - page_table is a leaf (device-side)
       - Python containers (lists/sets/dicts) are static (non-leaves)
       - Mutating methods return a new SequenceBuffer instance
+      - Use to_device_state() to convert to JAX arrays for execution
 
     Use SequenceBuffer.create(...) to construct an instance.
     """
 
-    # Leaves
-    token_ids: jax.Array
-    num_tokens: jax.Array
-    num_tokens_no_spec: jax.Array
-    num_prompt_tokens: jax.Array
-    num_computed_tokens: jax.Array
-
-    temperature: jax.Array
-    top_p: jax.Array
-    top_k: jax.Array
-    min_p: jax.Array
-    frequency_penalties: jax.Array
-    presence_penalties: jax.Array
-    repetition_penalties: jax.Array
-
+    # Page table (leaf - device side)
     page_table: MultiGroupPageTable
 
-    # Optional leaf
     # Static configuration (non-leaves)
     max_num_reqs: int = field(pytree_node=False)
     max_model_len: int = field(pytree_node=False)
     max_num_batched_tokens: int = field(pytree_node=False)
     vocab_size: int = field(pytree_node=False)
+
+    # NumPy arrays (non-leaves, CPU-side for fast operations)
+    token_ids: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs, max_model_len]
+    num_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    num_tokens_no_spec: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    num_prompt_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    num_computed_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+
+    temperature: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    top_p: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    top_k: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    min_p: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    frequency_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    presence_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
+    repetition_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
 
     # Python bookkeeping (non-leaves)
     _req_ids: list[str | None] = field(default_factory=list, pytree_node=False)
@@ -319,19 +322,20 @@ class SequenceBuffer:
             ...     page_sizes=[16, 32]
             ... )
         """
-        token_ids = jnp.zeros((max_num_reqs, max_model_len), dtype=jnp.int32)
-        num_tokens = jnp.zeros((max_num_reqs,), dtype=jnp.int32)
-        num_tokens_no_spec = jnp.zeros((max_num_reqs,), dtype=jnp.int32)
-        num_prompt_tokens = jnp.zeros((max_num_reqs,), dtype=jnp.int32)
-        num_computed_tokens = jnp.zeros((max_num_reqs,), dtype=jnp.int32)
+        # Initialize all arrays as NumPy (CPU-side)
+        token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
+        num_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
+        num_tokens_no_spec = np.zeros((max_num_reqs,), dtype=np.int32)
+        num_prompt_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
+        num_computed_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
 
-        temperature = jnp.full((max_num_reqs,), -1.0, dtype=jnp.float32)
-        top_p = jnp.ones((max_num_reqs,), dtype=jnp.float32)
-        top_k = jnp.full((max_num_reqs,), vocab_size, dtype=jnp.int32)
-        min_p = jnp.zeros((max_num_reqs,), dtype=jnp.float32)
-        frequency_penalties = jnp.zeros((max_num_reqs,), dtype=jnp.float32)
-        presence_penalties = jnp.zeros((max_num_reqs,), dtype=jnp.float32)
-        repetition_penalties = jnp.ones((max_num_reqs,), dtype=jnp.float32)
+        temperature = np.full((max_num_reqs,), -1.0, dtype=np.float32)
+        top_p = np.ones((max_num_reqs,), dtype=np.float32)
+        top_k = np.full((max_num_reqs,), vocab_size, dtype=np.int32)
+        min_p = np.zeros((max_num_reqs,), dtype=np.float32)
+        frequency_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
+        presence_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
+        repetition_penalties = np.ones((max_num_reqs,), dtype=np.float32)
 
         page_table = MultiGroupPageTable.create(
             max_num_reqs=max_num_reqs,
@@ -340,26 +344,13 @@ class SequenceBuffer:
             page_sizes=page_sizes,
         )
 
+        # Apply sharding only to page_table (device-side)
         if sharding is not None:
 
             def put(a):
                 return jax.device_put(a, sharding)
 
             page_table = jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, page_table)
-
-            token_ids = put(token_ids)
-            num_tokens = put(num_tokens)
-            num_tokens_no_spec = put(num_tokens_no_spec)
-            num_prompt_tokens = put(num_prompt_tokens)
-            num_computed_tokens = put(num_computed_tokens)
-
-            temperature = put(temperature)
-            top_p = put(top_p)
-            top_k = put(top_k)
-            min_p = put(min_p)
-            frequency_penalties = put(frequency_penalties)
-            presence_penalties = put(presence_penalties)
-            repetition_penalties = put(repetition_penalties)
         return cls(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
@@ -482,29 +473,35 @@ class SequenceBuffer:
             self.req_output_token_ids[req_index] = request.output_token_ids
         self.req_id_to_index[req_id] = req_index
 
-        # Copy tokens into arrays (functional)
-        num_prompt_tokens = min(len(request.prompt_token_ids), self.max_model_len)
-        new_num_prompt_tokens = self.num_prompt_tokens.at[req_index].set(num_prompt_tokens)
-        new_token_ids = self.token_ids.at[req_index, :num_prompt_tokens].set(
-            jnp.array(request.prompt_token_ids[:num_prompt_tokens], dtype=jnp.int32)
+        # Copy tokens into arrays (NumPy in-place updates)
+        num_prompt_tokens_val = min(len(request.prompt_token_ids), self.max_model_len)
+        new_num_prompt_tokens = self.num_prompt_tokens.copy()
+        new_num_prompt_tokens[req_index] = num_prompt_tokens_val
+
+        new_token_ids = self.token_ids.copy()
+        new_token_ids[req_index, :num_prompt_tokens_val] = np.array(
+            request.prompt_token_ids[:num_prompt_tokens_val], dtype=np.int32
         )
 
         if request.output_token_ids:
-            start_idx = num_prompt_tokens
-            max_output_tokens = self.max_model_len - num_prompt_tokens
+            start_idx = num_prompt_tokens_val
+            max_output_tokens = self.max_model_len - num_prompt_tokens_val
             output_tokens_to_copy = request.output_token_ids[:max_output_tokens]
             if output_tokens_to_copy:
                 end_idx = min(start_idx + len(output_tokens_to_copy), self.max_model_len)
-                new_token_ids = new_token_ids.at[req_index, start_idx:end_idx].set(
-                    jnp.array(output_tokens_to_copy, dtype=jnp.int32)
+                new_token_ids[req_index, start_idx:end_idx] = np.array(
+                    output_tokens_to_copy, dtype=np.int32
                 )
 
         capped_num_tokens = min(int(request.num_tokens), self.max_model_len)
-        new_num_tokens = self.num_tokens.at[req_index].set(capped_num_tokens)
-        new_num_tokens_no_spec = self.num_tokens_no_spec.at[req_index].set(capped_num_tokens)
-        new_num_computed_tokens = self.num_computed_tokens.at[req_index].set(
-            min(int(request.num_computed_tokens), self.max_model_len)
-        )
+        new_num_tokens = self.num_tokens.copy()
+        new_num_tokens[req_index] = capped_num_tokens
+
+        new_num_tokens_no_spec = self.num_tokens_no_spec.copy()
+        new_num_tokens_no_spec[req_index] = capped_num_tokens
+
+        new_num_computed_tokens = self.num_computed_tokens.copy()
+        new_num_computed_tokens[req_index] = min(int(request.num_computed_tokens), self.max_model_len)
 
         buf = self._with_updates(
             token_ids=new_token_ids,
@@ -806,46 +803,47 @@ class SequenceBuffer:
             Maintains separate tracking sets for different sampling strategies
             to enable optimized execution paths.
         """
-        temperature = self.temperature
-        top_p = self.top_p
-        top_k = self.top_k
-        min_p = self.min_p
-        frequency_penalties = self.frequency_penalties
-        presence_penalties = self.presence_penalties
-        repetition_penalties = self.repetition_penalties
+        # Copy arrays for modification (NumPy style)
+        temperature = self.temperature.copy()
+        top_p = self.top_p.copy()
+        top_k = self.top_k.copy()
+        min_p = self.min_p.copy()
+        frequency_penalties = self.frequency_penalties.copy()
+        presence_penalties = self.presence_penalties.copy()
+        repetition_penalties = self.repetition_penalties.copy()
 
         if sampling_params.sampling_type == SamplingType.GREEDY:
-            temperature = temperature.at[req_index].set(-1.0)
+            temperature[req_index] = -1.0
             self.greedy_reqs.add(req_id)
         else:
-            temperature = temperature.at[req_index].set(sampling_params.temperature)
+            temperature[req_index] = sampling_params.temperature
             self.random_reqs.add(req_id)
 
-        top_p = top_p.at[req_index].set(sampling_params.top_p)
+        top_p[req_index] = sampling_params.top_p
         if sampling_params.top_p < 1:
             self.top_p_reqs.add(req_id)
 
         tk = sampling_params.top_k
         if 0 < tk < self.vocab_size:
             self.top_k_reqs.add(req_id)
-            top_k = top_k.at[req_index].set(tk)
+            top_k[req_index] = tk
         else:
-            top_k = top_k.at[req_index].set(self.vocab_size)
+            top_k[req_index] = self.vocab_size
 
-        min_p = min_p.at[req_index].set(sampling_params.min_p)
+        min_p[req_index] = sampling_params.min_p
         if sampling_params.min_p > 1e-5:
             self.min_p_reqs.add(req_id)
 
         if sampling_params.frequency_penalty != 0.0:
-            frequency_penalties = frequency_penalties.at[req_index].set(sampling_params.frequency_penalty)
+            frequency_penalties[req_index] = sampling_params.frequency_penalty
             self.frequency_penalties_reqs.add(req_id)
 
         if sampling_params.presence_penalty != 0.0:
-            presence_penalties = presence_penalties.at[req_index].set(sampling_params.presence_penalty)
+            presence_penalties[req_index] = sampling_params.presence_penalty
             self.presence_penalties_reqs.add(req_id)
 
         if sampling_params.repetition_penalty != 1.0:
-            repetition_penalties = repetition_penalties.at[req_index].set(sampling_params.repetition_penalty)
+            repetition_penalties[req_index] = sampling_params.repetition_penalty
             self.repetition_penalties_reqs.add(req_id)
 
         return self._with_updates(
@@ -997,8 +995,15 @@ class SequenceBuffer:
         if self.num_reqs == 0:
             return jnp.empty((0, 0), dtype=jnp.int32)
 
-        max_prompt_len = int(jnp.max(self.num_prompt_tokens[: self.num_reqs]))
-        return pack_prompts(self.token_ids, self.num_prompt_tokens, self.num_reqs, max_prompt_len, self.vocab_size)
+        max_prompt_len = int(np.max(self.num_prompt_tokens[: self.num_reqs]))
+        # Convert to JAX for pack_prompts (which is JIT-compiled)
+        return pack_prompts(
+            jnp.asarray(self.token_ids),
+            jnp.asarray(self.num_prompt_tokens),
+            self.num_reqs,
+            max_prompt_len,
+            self.vocab_size,
+        )
 
     def get_request_indices_with_penalty(self) -> jax.Array:
         """Get indices of requests with penalties.
@@ -1068,19 +1073,19 @@ class SequenceBuffer:
         self.req_id_to_index.clear()
         self.req_output_token_ids.clear()
 
-        token_ids = jnp.zeros_like(self.token_ids)
-        num_tokens = jnp.zeros_like(self.num_tokens)
-        num_tokens_no_spec = jnp.zeros_like(self.num_tokens_no_spec)
-        num_prompt_tokens = jnp.zeros_like(self.num_prompt_tokens)
-        num_computed_tokens = jnp.zeros_like(self.num_computed_tokens)
+        token_ids = np.zeros_like(self.token_ids)
+        num_tokens = np.zeros_like(self.num_tokens)
+        num_tokens_no_spec = np.zeros_like(self.num_tokens_no_spec)
+        num_prompt_tokens = np.zeros_like(self.num_prompt_tokens)
+        num_computed_tokens = np.zeros_like(self.num_computed_tokens)
 
-        temperature = jnp.full_like(self.temperature, -1.0)
-        top_p = jnp.ones_like(self.top_p)
-        top_k = jnp.full_like(self.top_k, self.vocab_size)
-        min_p = jnp.zeros_like(self.min_p)
-        frequency_penalties = jnp.zeros_like(self.frequency_penalties)
-        presence_penalties = jnp.zeros_like(self.presence_penalties)
-        repetition_penalties = jnp.ones_like(self.repetition_penalties)
+        temperature = np.full_like(self.temperature, -1.0)
+        top_p = np.ones_like(self.top_p)
+        top_k = np.full_like(self.top_k, self.vocab_size)
+        min_p = np.zeros_like(self.min_p)
+        frequency_penalties = np.zeros_like(self.frequency_penalties)
+        presence_penalties = np.zeros_like(self.presence_penalties)
+        repetition_penalties = np.ones_like(self.repetition_penalties)
 
         for req_set in [
             self.greedy_reqs,
@@ -1122,36 +1127,48 @@ class SequenceBuffer:
             else None,
         )
 
-    def to_device_state(self) -> DeviceSequenceState:
+    def to_device_state(self, sharding: jax.sharding.Sharding | None = None) -> DeviceSequenceState:
         """Create a device-compatible view of the buffer.
+
+        Converts NumPy arrays to JAX arrays for device execution.
+
+        Args:
+            sharding: Optional sharding to apply to device arrays.
 
         Returns:
             DeviceSequenceState containing only array/tensor data suitable
             for device operations. No Python containers are included.
 
         Note:
-            This creates a view without copying data, making it efficient
-            for passing to device-compiled functions.
+            This converts NumPy arrays to JAX arrays, transferring data to device.
         """
+
+        def to_jax(arr):
+            if sharding is not None:
+                return jax.device_put(jnp.asarray(arr), sharding)
+            return jnp.asarray(arr)
+
         return DeviceSequenceState(
-            token_ids=self.token_ids,
-            num_tokens=self.num_tokens,
-            num_tokens_no_spec=self.num_tokens_no_spec,
-            num_prompt_tokens=self.num_prompt_tokens,
-            num_computed_tokens=self.num_computed_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            min_p=self.min_p,
-            frequency_penalties=self.frequency_penalties,
-            presence_penalties=self.presence_penalties,
-            repetition_penalties=self.repetition_penalties,
+            token_ids=to_jax(self.token_ids),
+            num_tokens=to_jax(self.num_tokens),
+            num_tokens_no_spec=to_jax(self.num_tokens_no_spec),
+            num_prompt_tokens=to_jax(self.num_prompt_tokens),
+            num_computed_tokens=to_jax(self.num_computed_tokens),
+            temperature=to_jax(self.temperature),
+            top_p=to_jax(self.top_p),
+            top_k=to_jax(self.top_k),
+            min_p=to_jax(self.min_p),
+            frequency_penalties=to_jax(self.frequency_penalties),
+            presence_penalties=to_jax(self.presence_penalties),
+            repetition_penalties=to_jax(self.repetition_penalties),
             page_table=self.page_table,
-            allowed_token_ids_mask=self.allowed_token_ids_mask,
+            allowed_token_ids_mask=to_jax(self.allowed_token_ids_mask) if self.allowed_token_ids_mask is not None else None,
         )
 
     def from_device_state(self, dev: DeviceSequenceState) -> SequenceBuffer:
         """Update buffer with data from device state.
+
+        Converts JAX arrays back to NumPy arrays for CPU-side operations.
 
         Args:
             dev: DeviceSequenceState containing updated arrays from device execution.
@@ -1161,49 +1178,37 @@ class SequenceBuffer:
             while preserving Python bookkeeping structures.
 
         Note:
-            This is used to incorporate results from device computation
-            back into the buffer.
+            This converts JAX arrays back to NumPy, bringing data back to CPU.
         """
+
+        def to_numpy(arr):
+            return np.asarray(jax.device_get(arr))
+
         return self._with_updates(
-            token_ids=dev.token_ids,
-            num_tokens=dev.num_tokens,
-            num_tokens_no_spec=dev.num_tokens_no_spec,
-            num_prompt_tokens=dev.num_prompt_tokens,
-            num_computed_tokens=dev.num_computed_tokens,
-            temperature=dev.temperature,
-            top_p=dev.top_p,
-            top_k=dev.top_k,
-            min_p=dev.min_p,
-            frequency_penalties=dev.frequency_penalties,
-            presence_penalties=dev.presence_penalties,
-            repetition_penalties=dev.repetition_penalties,
+            token_ids=to_numpy(dev.token_ids),
+            num_tokens=to_numpy(dev.num_tokens),
+            num_tokens_no_spec=to_numpy(dev.num_tokens_no_spec),
+            num_prompt_tokens=to_numpy(dev.num_prompt_tokens),
+            num_computed_tokens=to_numpy(dev.num_computed_tokens),
+            temperature=to_numpy(dev.temperature),
+            top_p=to_numpy(dev.top_p),
+            top_k=to_numpy(dev.top_k),
+            min_p=to_numpy(dev.min_p),
+            frequency_penalties=to_numpy(dev.frequency_penalties),
+            presence_penalties=to_numpy(dev.presence_penalties),
+            repetition_penalties=to_numpy(dev.repetition_penalties),
             page_table=dev.page_table,
-            allowed_token_ids_mask=dev.allowed_token_ids_mask,
+            allowed_token_ids_mask=to_numpy(dev.allowed_token_ids_mask) if dev.allowed_token_ids_mask is not None else None,
         )
 
     def attach_sharding(self, sharding: jax.sharding.Sharding) -> "SequenceBuffer":
-        """Return a copy with all arrays (and page table) device_put to the given sharding."""
+        """Apply sharding only to page_table (arrays are NumPy, device placement handled by to_device_state)."""
 
         def put(a):
             return jax.device_put(a, sharding)
 
         return self._with_updates(
-            token_ids=put(self.token_ids),
-            num_tokens=put(self.num_tokens),
-            num_tokens_no_spec=put(self.num_tokens_no_spec),
-            num_prompt_tokens=put(self.num_prompt_tokens),
-            num_computed_tokens=put(self.num_computed_tokens),
-            temperature=put(self.temperature),
-            top_p=put(self.top_p),
-            top_k=put(self.top_k),
-            min_p=put(self.min_p),
-            frequency_penalties=put(self.frequency_penalties),
-            presence_penalties=put(self.presence_penalties),
-            repetition_penalties=put(self.repetition_penalties),
             page_table=jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table),
-            allowed_token_ids_mask=(
-                put(self.allowed_token_ids_mask) if self.allowed_token_ids_mask is not None else None
-            ),
         )
 
 
