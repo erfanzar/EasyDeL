@@ -104,8 +104,6 @@ class SeedOssToolParser(ToolParser):
         self.tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
         self.tool_call_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL)
 
-        logger.info("vLLM Seed-Oss XML tool parser loaded (%s).", self.__class__.__name__)
-
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
