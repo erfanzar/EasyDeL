@@ -30,53 +30,15 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 
-from .binary_search import apply_topk_mask, apply_topk_mask_bf16, apply_topp_mask, apply_topp_mask_bf16
+from .binary_search import (
+    apply_min_p_mask,
+    apply_penalties,
+    apply_topk_mask,
+    apply_topk_mask_bf16,
+    apply_topp_mask,
+    apply_topp_mask_bf16,
+)
 from .sampling_metadata import SamplingMetadata
-
-
-def _apply_min_p_mask(logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
-    """Apply min-p masking to logits.
-
-    Min-p filtering keeps only tokens whose probability is at least min_p times
-    the maximum probability. This helps filter out low-probability tail tokens
-    more aggressively than top-p alone.
-
-    Args:
-        logits: Input logits [batch, vocab_size].
-        sampling_metadata: Sampling configuration containing min_p values.
-
-    Returns:
-        Masked logits with min-p filtering applied [batch, vocab_size].
-
-    Note:
-        Min-p is applied as: keep tokens where p(token) >= min_p * max(p).
-    """
-    max_probs = jnp.max(logits, axis=-1, keepdims=True)
-    threshold = sampling_metadata.min_ps[:, None] * max_probs
-    mask = logits >= threshold
-    return jnp.where(mask, logits, jnp.full_like(logits, -1e10))
-
-
-def _apply_penalties(logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
-    """Apply linear penalties to logits.
-
-    Penalties modify logit values to discourage repetition or enforce other
-    constraints. Common penalties include frequency, presence, and repetition.
-
-    Args:
-        logits: Input logits [batch, vocab_size].
-        sampling_metadata: Sampling configuration with optional penalty matrix.
-
-    Returns:
-        Logits with penalties applied [batch, vocab_size].
-
-    Note:
-        If no penalty is specified (None), returns logits unchanged.
-    """
-    if sampling_metadata.linear_penalty is None:
-        return logits
-    penalty = sampling_metadata.linear_penalty.astype(logits.dtype)
-    return logits + penalty
 
 
 def _greedy_sample(logits: jax.Array) -> jax.Array:
@@ -94,9 +56,9 @@ def _greedy_sample(logits: jax.Array) -> jax.Array:
 def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng: jax.Array) -> jax.Array:
     """Stochastic sampling with top-k, top-p, and min-p filtering.
 
-    Applies filtering in order: top-k → min-p → top-p, then samples from the
-    resulting distribution. Uses binary search for efficient filtering without
-    sorting. Automatically selects bfloat16-optimized variants when applicable.
+    Applies filtering in order: top-k → top-p → temperature → min-p, then samples
+    from the resulting distribution. Uses binary search for efficient filtering
+    without sorting. Automatically selects bfloat16-optimized variants when applicable.
 
     Args:
         logits: Input logits [batch, vocab_size].
@@ -111,44 +73,45 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         - Binary search: O(32 reductions) for top-k/p vs O(V log V) for sorting
         - Vectorized: Per-sample parameters via vmap
     """
+    logits = logits.astype("f4")
+
     use_bf16_path = logits.dtype == jnp.bfloat16
 
+    topp_fn = apply_topp_mask_bf16 if use_bf16_path else apply_topp_mask
+    topk_fn = apply_topk_mask_bf16 if use_bf16_path else apply_topk_mask
+    min_val = jnp.finfo(logits.dtype).min
     # Top-k filtering
     need_top_k = jnp.any(sampling_metadata.top_ks > 0)
 
     def apply_topk(legi):
-        topk_fn = apply_topk_mask_bf16 if use_bf16_path else apply_topk_mask
-
         def topk_per_sample(logits_i, k_i):
-            return lax.cond(k_i > 0, lambda: topk_fn(logits_i[None, :], k_i, -1e10)[0], lambda: logits_i)
+            return lax.cond(k_i > 0, lambda: topk_fn(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
 
     logits = lax.cond(need_top_k, apply_topk, lambda legi: legi, logits)
 
-    # Min-p filtering
-    logits = lax.cond(
-        sampling_metadata.need_min_p_sampling,
-        lambda legi: _apply_min_p_mask(legi, sampling_metadata),
-        lambda legi: legi,
-        logits,
-    )
-
     # Top-p filtering
     need_top_p = jnp.any(sampling_metadata.top_ps < 1.0)
 
     def apply_topp(legi):
-        topp_fn = apply_topp_mask_bf16 if use_bf16_path else apply_topp_mask
-
         def topp_per_sample(logits_i, p_i):
-            return lax.cond(p_i < 1.0, lambda: topp_fn(logits_i[None, :], p_i, -1e10)[0], lambda: logits_i)
+            return lax.cond(p_i < 1.0, lambda: topp_fn(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
 
     logits = lax.cond(need_top_p, apply_topp, lambda legi: legi, logits)
 
-    # Temperature scaling
+    # Temperature scaling (apply before min-p to match sglang-jax behavior)
     logits = logits / sampling_metadata.temperatures
+
+    # Min-p filtering (applied after temperature scaling)
+    logits = lax.cond(
+        sampling_metadata.need_min_p_sampling,
+        lambda legi: apply_min_p_mask(legi, sampling_metadata),
+        lambda legi: legi,
+        logits,
+    )
 
     # Sample from filtered distribution
     batch_size = logits.shape[0]
@@ -207,7 +170,7 @@ def sample_tokens(
     """
     logits = lax.cond(
         sampling_metadata.do_penalties,
-        lambda legi: _apply_penalties(legi, sampling_metadata),
+        lambda legi: apply_penalties(legi, sampling_metadata),
         lambda legi: legi,
         logits,
     )

@@ -33,6 +33,8 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 
+from .sampling_metadata import SamplingMetadata
+
 
 def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray], jnp.ndarray]):
     """Perform batched binary search over int32 bit patterns.
@@ -338,3 +340,50 @@ def apply_topp_mask(logits: jnp.ndarray, p: jax.Array, replace_val: float) -> jn
     threshold = apply_float32_bsearch(batch_shape, predicate)
     threshold = lax.expand_dims(threshold, (threshold.ndim,))
     return jnp.where(probs >= threshold, logits, jnp.full_like(logits, replace_val))
+
+
+def apply_min_p_mask(logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
+    """Apply min-p masking to logits.
+
+    Min-p filtering keeps only tokens whose logit is at least min_p times
+    the maximum logit. This helps filter out low-probability tail tokens
+    more aggressively than top-p alone.
+
+    Args:
+        logits: Input logits [batch, vocab_size].
+        sampling_metadata: Sampling configuration containing min_p values.
+
+    Returns:
+        Masked logits with min-p filtering applied [batch, vocab_size].
+
+    Note:
+        Min-p is applied as: keep tokens where logit >= min_p * max(logit).
+        This is computed on logits directly, not on probabilities, to avoid
+        issues with already-filtered distributions.
+    """
+    max_logits = jnp.max(logits, axis=-1, keepdims=True)
+    threshold = sampling_metadata.min_ps[:, None] * max_logits
+    mask = logits >= threshold
+    return jnp.where(mask, logits, jnp.full_like(logits, -1e10))
+
+
+def apply_penalties(logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
+    """Apply linear penalties to logits.
+
+    Penalties modify logit values to discourage repetition or enforce other
+    constraints. Common penalties include frequency, presence, and repetition.
+
+    Args:
+        logits: Input logits [batch, vocab_size].
+        sampling_metadata: Sampling configuration with optional penalty matrix.
+
+    Returns:
+        Logits with penalties applied [batch, vocab_size].
+
+    Note:
+        If no penalty is specified (None), returns logits unchanged.
+    """
+    if sampling_metadata.linear_penalty is None:
+        return logits
+    penalty = sampling_metadata.linear_penalty.astype(logits.dtype)
+    return logits + penalty
