@@ -136,9 +136,15 @@ class DistillationTrainer(Trainer):
             True,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
+            self.arguments.use_attention_transfer,
+            self.arguments.attention_loss_weight,
+            self.arguments.attention_match_layers,
+            self.arguments.use_feature_matching,
+            self.arguments.feature_loss_weight,
+            self.arguments.feature_match_layers,
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -155,6 +161,12 @@ class DistillationTrainer(Trainer):
             False,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
+            self.arguments.use_attention_transfer,
+            self.arguments.attention_loss_weight,
+            self.arguments.attention_match_layers,
+            self.arguments.use_feature_matching,
+            self.arguments.feature_loss_weight,
+            self.arguments.feature_match_layers,
         )
 
         sharded_evaluation_step_function = ejit(
