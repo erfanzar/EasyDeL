@@ -747,12 +747,24 @@ class EasyBridgeMixin(PushToHubMixin):
                             except Exception as e:
                                 raise RuntimeError(f"Downloaded sharded index but failed to fetch shards: {e}") from e
 
+            if not local_files_only:
+                api.snapshot_download(
+                    repo_id=pretrained_model_name_or_path,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+
             if is_local:
                 logger.debug(f"loading weights file {archive_file}")
                 resolved_archive_file = str(archive_file)
                 filename = os.path.basename(str(archive_file))
             else:
                 logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
+
         cls = get_modules_by_type(config.model_type, cls._model_task)[1]
         model = cls.lazy_init(
             config=config,
@@ -761,7 +773,6 @@ class EasyBridgeMixin(PushToHubMixin):
             precision=precision,
             rngs=nn.Rngs(0),
         )
-
         model = cls._load_model_weights(
             resolved_archive_file,
             model,

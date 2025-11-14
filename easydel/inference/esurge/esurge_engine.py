@@ -70,6 +70,7 @@ Technical Details:
 
 from __future__ import annotations
 
+import copy
 import os
 import threading
 import time
@@ -282,6 +283,8 @@ class eSurge:
         detokenizer_max_states: int = 1 << 16,
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
+        sampling_params_callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None]
+        | None = None,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -332,6 +335,11 @@ class eSurge:
                 pause() to free memory, and lazily reinitializing it on resume().
             tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
             detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
+            sampling_params_callback: Optional callable that can inspect/modify
+                the SamplingParams for each submitted request. Receives a cloned
+                SamplingParams instance and request metadata dict containing
+                "request_id", "prompt", and "engine". May return a new instance
+                or mutate the provided one in-place.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -387,6 +395,7 @@ class eSurge:
         self.destroy_pages_on_pause = destroy_pages_on_pause
         self._kv_cache_valid = True
         self._paused = False
+        self._sampling_params_callback = sampling_params_callback
 
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
@@ -531,6 +540,21 @@ class eSurge:
             ...     print("Decoder is active and handling UTF-8 sequences")
         """
         return self._smart_decoder
+
+    def set_sampling_params_callback(
+        self,
+        callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None,
+    ) -> None:
+        """Register or clear the sampling-params callback.
+
+        Args:
+            callback: Callable receiving a cloned SamplingParams and metadata
+                dict (``request_id``, ``prompt``, ``engine``). Return a new
+                SamplingParams, mutate the provided one, or return None to
+                keep the original values. Pass None to disable the callback.
+        """
+
+        self._sampling_params_callback = callback
 
     def initiate(self) -> None:
         """Start the background scheduler thread.
@@ -778,6 +802,35 @@ class eSurge:
         except Exception:
             logger.warning("Failed to drain tokenizer/detokenizer workers during %s", reason, exc_info=True)
 
+    def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        try:
+            return copy.deepcopy(sampling_params)
+        except Exception:
+            logger.exception("Failed to clone sampling params; using original instance")
+            return sampling_params
+
+    def _prepare_sampling_params_for_request(
+        self,
+        template: SamplingParams,
+        *,
+        request_id: str,
+        prompt: str,
+    ) -> SamplingParams:
+        params = self._clone_sampling_params(template)
+        callback = self._sampling_params_callback
+        if callback is None:
+            return params
+
+        metadata = {"request_id": request_id, "prompt": prompt, "engine": self}
+        try:
+            result = callback(params, metadata)
+            if result is None:
+                return params
+            return result
+        except Exception:
+            logger.exception("Sampling params callback failed; falling back to unmodified parameters")
+            return params
+
     def generate(
         self,
         prompts: str | list[str],
@@ -845,8 +898,7 @@ class eSurge:
         else:
             request_ids = request_id
 
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=128)
+        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
         # Override bytecode_decode if specified
         original_bytecode_decode = self._bytecode_decode
@@ -858,7 +910,12 @@ class eSurge:
         try:
             for prompt, req_id in zip(prompts, request_ids, strict=False):
                 prompt_tokens = self._tokenize_prompt(req_id, prompt)
-                self._add_request(req_id, prompt, sampling_params, prompt_token_ids=prompt_tokens)
+                effective_params = self._prepare_sampling_params_for_request(
+                    base_sampling_params,
+                    request_id=req_id,
+                    prompt=prompt,
+                )
+                self._add_request(req_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
             outputs = []
             pbar = None
@@ -965,8 +1022,7 @@ class eSurge:
         if request_id is None:
             request_id = self._generate_request_id()
 
-        if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=128)
+        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
         # Override bytecode_decode if specified
         original_bytecode_decode = self._bytecode_decode
@@ -977,7 +1033,12 @@ class eSurge:
 
         try:
             prompt_tokens = self._tokenize_prompt(request_id, prompt)
-            self._add_request(request_id, prompt, sampling_params, prompt_token_ids=prompt_tokens)
+            effective_params = self._prepare_sampling_params_for_request(
+                base_sampling_params,
+                request_id=request_id,
+                prompt=prompt,
+            )
+            self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
             if not self._scheduler_running:
                 raise RuntimeError("Background scheduler is not running. Call initiate() first.")

@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Admin endpoints for API key management."""
+"""Admin endpoints for API key management.
+
+This module centralizes every privileged API route exposed by the inference
+server: creation, rotation, suspension, auditing, and statistics. Treat it as
+an operator handbook baked into code. Each handler performs its own access
+control and returns structured JSON so that dashboards, CLIs, or automation can
+interact with the auth subsystem without sprinkling logic across the codebase.
+
+The file is intentionally verbose. Each endpoint documents the corresponding
+HTTP method and path, describes the purpose of the operation, and highlights the
+required role. That level of detail doubles as living documentation for the
+security posture of the deployment—reviewers can scan this module to understand
+exactly which admin capabilities exist and which invariants (audit trails,
+metadata updates, rate-limit policies) are enforced at the boundary.
+"""
 
 from __future__ import annotations
 
