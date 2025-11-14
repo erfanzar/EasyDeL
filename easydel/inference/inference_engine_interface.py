@@ -382,49 +382,113 @@ class BaseInferenceApiServer(ABC):
 
     @property
     def _endpoints(self) -> list[EndpointConfig]:
-        """Define all API endpoints."""
+        """Define all API endpoints.
+
+        The base server exposes a predictable suite of OpenAI-compatible
+        endpoints, so this list acts as the single source of truth for route
+        registration. Subclasses rarely need to override individual routes;
+        instead they can extend or prune the list by overriding the property and
+        composing additional :class:`EndpointConfig` entries. Keeping the
+        definitions centralized also makes it easier to document the surface
+        area of a deployment, since API docs, middleware, and monitoring only
+        have to inspect one place to understand which handlers exist.
+
+        Each entry intentionally captures the handler callable, HTTP verbs,
+        documentation metadata, and optional response model. This mirrors the
+        arguments passed to ``FastAPI.add_api_route`` and prevents drift between
+        declarative configuration and runtime state. By standardizing this
+        schema we can build tooling (for example automated smoke tests or
+        changelog generators) that iterate through the endpoints without having
+        to introspect the FastAPI app directly.
+        """
         return [
             EndpointConfig(
                 path="/v1/chat/completions",
                 handler=self.chat_completions,
                 methods=["POST"],
                 tags=["Chat"],
-                summary="Create a chat completion",
+                summary=(
+                    "Submit a conversation expressed as OpenAI-style chat messages and "
+                    "receive assistant turns that honor streaming, function calling, and"
+                    "token usage accounting. The endpoint mirrors the semantics of the "
+                    "OpenAI Chat Completions API so existing SDKs and client libraries can"
+                    "drop in without translation.\n\n"
+                    "Use this route whenever you need multi-turn context, tool invocation,"
+                    "or delta streaming—Simple text prompts should go through the plain"
+                    "completions endpoint below."
+                ),
             ),
             EndpointConfig(
                 path="/v1/completions",
                 handler=self.completions,
                 methods=["POST"],
                 tags=["Completions"],
-                summary="Create a completion",
+                summary=(
+                    "Generate text from a raw prompt without chat scaffolding. This matches"
+                    "OpenAI's legacy completion API and is ideal for single-turn tasks such"
+                    "as template expansion, summarization, or logit probing.\n\n"
+                    "Clients receive either a full response object or a text/event-stream"
+                    "when `stream=true`, making it a minimal surface for classic prompt"
+                    "engineering workloads."
+                ),
             ),
             EndpointConfig(
                 path="/health",
                 handler=self.health_check,
                 methods=["GET"],
                 tags=["Health"],
-                summary="Comprehensive health check",
+                summary=(
+                    "Lightweight health probe that reports server status, uptime, active"
+                    "request counts, and model metadata. Load balancers and orchestrators"
+                    "can call this endpoint to decide whether a replica should receive"
+                    "traffic.\n\n"
+                    "The payload is intentionally human-readable so operators can curl the"
+                    "route during incidents and immediately understand whether the server"
+                    "is READY, BUSY, or encountering errors."
+                ),
             ),
             EndpointConfig(
                 path="/v1/models",
                 handler=self.list_models,
                 methods=["GET"],
                 tags=["Models"],
-                summary="List available models",
+                summary=(
+                    "Enumerate every model the server has loaded along with ownership,"
+                    "capabilities, and tokenizer limits. The response mirrors the OpenAI"
+                    "`/v1/models` schema so existing tooling (CLI, dashboards, SDKs) can"
+                    "introspect deployments without custom code.\n\n"
+                    "Call this endpoint when building control planes or auditing which"
+                    "models are exposed to end users."
+                ),
             ),
             EndpointConfig(
                 path="/v1/models/{model_id}",
                 handler=self.get_model,
                 methods=["GET"],
                 tags=["Models"],
-                summary="Get model details",
+                summary=(
+                    "Return detailed metadata for a specific model ID, including tokenizer"
+                    "capabilities, architecture hints, and server ownership information."
+                    "Use this to confirm feature support (e.g., chat templates or tool"
+                    "calling) before dispatching a request.\n\n"
+                    "The payload is stable enough to cache in control planes or config"
+                    "UIs that need to display per-model characteristics."
+                ),
             ),
             EndpointConfig(
                 path="/metrics",
                 handler=self.get_metrics,
                 methods=["GET"],
                 tags=["Monitoring"],
-                summary="Get server metrics",
+                summary=(
+                    "Expose aggregated counters covering request throughput, success and"
+                    "failure rates, generated tokens, and authentication statistics."
+                    "Intended for SRE dashboards, autoscalers, or simple cron-based"
+                    "reporting scripts.\n\n"
+                    "Because it shares the same authorization story as model endpoints,"
+                    "operators can lock down who may read metrics without punching holes"
+                    "in infrastructure firewalls."
+                ),
             ),
         ]
 

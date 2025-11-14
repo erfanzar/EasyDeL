@@ -81,7 +81,7 @@ import chex
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh
 
 from easydel.layers.linear import ParallelLinear
 

@@ -124,7 +124,6 @@ def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num
     )
 
 
-@ejit
 def swap_rows(arr, i1, i2):
     """Swap two rows in an array.
 
@@ -137,12 +136,28 @@ def swap_rows(arr, i1, i2):
         Array with rows i1 and i2 swapped.
 
     Note:
-        This function is JIT-compiled for efficient execution.
+        Works for both NumPy ndarrays and JAX arrays. Always returns a new array.
     """
-    idx = jnp.arange(arr.shape[0])
-    idx = idx.at[i1].set(i2)
-    idx = idx.at[i2].set(i1)
-    return arr[idx]
+    if isinstance(arr, np.ndarray):
+        out = np.asarray(arr).copy()
+        tmp = out[i1].copy()
+        out[i1] = out[i2]
+        out[i2] = tmp
+        return out
+
+    if hasattr(arr, "at"):
+        row_i1 = arr[i1]
+        row_i2 = arr[i2]
+        arr = arr.at[i1].set(row_i2)
+        arr = arr.at[i2].set(row_i1)
+        return arr
+
+    # Fallback for Python sequences
+    out = np.asarray(arr).copy()
+    tmp = out[i1].copy()
+    out[i1] = out[i2]
+    out[i2] = tmp
+    return out
 
 
 def swap_rows_pytree(arrs, i1, i2):
@@ -159,7 +174,6 @@ def swap_rows_pytree(arrs, i1, i2):
     return jax.tree_map(lambda a: swap_rows(a, i1, i2), arrs)
 
 
-@ejit
 def move_row(arr, from_idx, to_idx):
     """Move a row from one index to another.
 
@@ -172,9 +186,19 @@ def move_row(arr, from_idx, to_idx):
         Array with row moved from from_idx to to_idx.
 
     Note:
-        This overwrites the destination row without preserving it.
+        Works for both NumPy ndarrays and JAX arrays. Always returns a new array.
     """
-    return arr.at[to_idx].set(arr[from_idx])
+    if isinstance(arr, np.ndarray):
+        out = np.asarray(arr).copy()
+        out[to_idx] = out[from_idx]
+        return out
+
+    if hasattr(arr, "at"):
+        return arr.at[to_idx].set(arr[from_idx])
+
+    out = np.asarray(arr).copy()
+    out[to_idx] = out[from_idx]
+    return out
 
 
 @ejit(static_argnames=("vocab_size", "max_allowed"))
@@ -1182,7 +1206,10 @@ class SequenceBuffer:
         """
 
         def to_numpy(arr):
-            return np.asarray(jax.device_get(arr))
+            np_arr = np.asarray(jax.device_get(arr))
+            if not np_arr.flags.writeable:
+                np_arr = np_arr.copy()
+            return np_arr
 
         return self._with_updates(
             token_ids=to_numpy(dev.token_ids),
