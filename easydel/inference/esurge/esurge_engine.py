@@ -1326,10 +1326,12 @@ class eSurge:
                 return int(sp.max_tokens)
             if hasattr(sp, "max_new_tokens") and sp.max_new_tokens is not None:
                 return int(sp.max_new_tokens)
-            return 0
+            return None
 
-        requested_new = _get_requested_new(sampling_params)
-        original_requested_new = requested_new
+        requested_new_raw = _get_requested_new(sampling_params)
+        auto_infer_new_tokens = requested_new_raw is None
+        requested_new = int(requested_new_raw) if requested_new_raw is not None else 0
+        original_requested_new = requested_new if not auto_infer_new_tokens else -1
 
         token_ids_source = (
             prompt_token_ids if prompt_token_ids is not None else self._tokenize_prompt(request_id, prompt)
@@ -1355,6 +1357,18 @@ class eSurge:
             logger.warn(
                 f"Truncated prompt by {dropped} tokens to fit model budget "
                 f"(mode={self.truncate_mode}, new_len={prompt_len}, budget={max_prompt_budget})."
+            )
+
+        if auto_infer_new_tokens:
+            requested_new = max(0, max_model_len - prompt_len - self.reserve_tokens)
+            _set_requested_new(sampling_params, requested_new)
+            logger.debug(
+                "Auto-inferred max_tokens=%s for request %s (prompt_len=%s, reserve=%s, model_max=%s).",
+                requested_new,
+                request_id,
+                prompt_len,
+                self.reserve_tokens,
+                max_model_len,
             )
 
         allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len)

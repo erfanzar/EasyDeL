@@ -188,7 +188,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     model: str
     messages: list[ChatMessage]
-    max_tokens: int = 128
+    max_tokens: int | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -262,7 +262,7 @@ class CompletionRequest(OpenAIBaseModel):
 
     model: str
     prompt: str | list[str]
-    max_tokens: int = 128
+    max_tokens: int | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0

@@ -730,14 +730,45 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
     ) -> int:
         """Ensure the request has max_tokens set, inferring from the engine when missing."""
         max_tokens_raw = getattr(request, "max_tokens", None)
-        if max_tokens_raw is None:
-            inferred = self._infer_sequence_length_from_engine(esurge)
+        inferred_value: int | None = None
+
+        def _mark_auto(value: int) -> int:
             try:
-                request.max_tokens = inferred
+                request._auto_max_tokens = True
+            except (AttributeError, ValueError):
+                logger.debug("Unable to mark request as auto max_tokens.", exc_info=True)
+            return value
+
+        def _mark_manual() -> None:
+            try:
+                request._auto_max_tokens = False
+            except (AttributeError, ValueError):
+                logger.debug("Unable to mark request as manual max_tokens.", exc_info=True)
+
+        def _infer_and_assign() -> int:
+            nonlocal inferred_value
+            if inferred_value is None:
+                inferred_value = self._infer_sequence_length_from_engine(esurge)
+            try:
+                request.max_tokens = inferred_value
             except (AttributeError, ValueError):
                 logger.debug("Unable to set inferred max_tokens on request; continuing with inferred value.")
-            return inferred
-        return int(max_tokens_raw)
+            return _mark_auto(inferred_value)
+
+        if max_tokens_raw is None:
+            return _infer_and_assign()
+
+        try:
+            max_tokens_int = int(max_tokens_raw)
+        except (TypeError, ValueError):
+            logger.debug("Invalid max_tokens=%s supplied; inferring from engine.", max_tokens_raw)
+            return _infer_and_assign()
+
+        if max_tokens_int < 0:
+            return _infer_and_assign()
+
+        _mark_manual()
+        return max_tokens_int
 
     def _prepare_sampling_params(
         self,
@@ -764,7 +795,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         Returns:
             SamplingParams configured for eSurge generation.
         """
-        max_tokens = int(request.max_tokens or 128)
+        raw_max_tokens = getattr(request, "max_tokens", None)
+        max_tokens: int | None
+        auto_max_tokens_requested = bool(getattr(request, "_auto_max_tokens", False))
+        if raw_max_tokens is None or auto_max_tokens_requested:
+            max_tokens = None
+        else:
+            try:
+                max_tokens = int(raw_max_tokens)
+            except (TypeError, ValueError):
+                logger.debug("Unable to parse max_tokens=%s; defaulting to auto.", raw_max_tokens)
+                max_tokens = None
+            else:
+                if max_tokens < 0:
+                    max_tokens = None
         temperature = max(0.0, min(float(request.temperature or 1.0), 2.0))
 
         return SamplingParams(

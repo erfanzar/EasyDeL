@@ -451,6 +451,10 @@ class SamplingParams:
         if self.seed == -1:
             self.seed = None
 
+        if self.max_tokens is not None and self.max_tokens < 0:
+            logger.debug("Received negative max_tokens (%s); treating as auto-infer.", self.max_tokens)
+            self.max_tokens = None
+
         if isinstance(self.stop, str):
             self.stop = [self.stop]
 
