@@ -31,6 +31,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
+from easydel.workers.esurge.auth import (
+    ApiKeyRole,
+    EnhancedApiKeyManager,
+    PermissionDenied,
+    QuotaExceeded,
+    RateLimitExceeded,
+)
+
 from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
 from ...openai_api_modules import (
     ChatCompletionRequest,
@@ -49,7 +57,6 @@ from ...sampling_params import SamplingParams
 from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
 from .auth_endpoints import AuthEndpointsMixin
-from .auth_manager import EnhancedApiKeyManager, PermissionDenied, QuotaExceeded, RateLimitExceeded
 
 TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
@@ -228,6 +235,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         storage_dir: str | None = None,
         enable_persistence: bool = True,
         auto_save_interval: float = 60.0,
+        auth_worker_client: tp.Any | None = None,
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -244,6 +252,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             storage_dir: Directory for persistent auth storage. Defaults to ~/.cache/esurge-auth/
             enable_persistence: Enable persistent storage of auth data to disk (default: True).
             auto_save_interval: Seconds between automatic saves (default: 60.0).
+            auth_worker_client: Optional AuthWorkerClient instance for ZMQ-based auth (default: None, uses in-process auth).
+            tool_parser_worker_client: Optional ToolParserWorkerClient instance for ZMQ-based tool parsing. If None and use_tool_parser_worker=True, spawns a worker automatically.
+            use_tool_parser_worker: If True and enable_function_calling=True, automatically spawns a tool parser ZMQ worker (default: True).
             **kwargs: Additional arguments passed to BaseInferenceApiServer.
 
         Raises:
@@ -276,23 +287,30 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         self.status = ServerStatus.STARTING
         self._active_requests: dict[str, dict] = {}
         self.tool_parser_name = tool_parser_name
+        self.model_processors = model_processors  # Store for ZMQ worker session init
 
-        # Initialize enhanced authentication manager with persistent storage
-        self.auth_manager = EnhancedApiKeyManager(
-            require_api_key=require_api_key,
-            admin_key=admin_key,
-            enable_audit_logging=enable_audit_logging,
-            max_audit_entries=max_audit_entries,
-            storage_dir=storage_dir,
-            enable_persistence=enable_persistence,
-            auto_save=enable_persistence,  # Auto-save if persistence enabled
-            save_interval=auto_save_interval,
-        )
-        if enable_persistence:
-            storage_path = storage_dir or "~/.cache/esurge-auth"
-            logger.info(f"Enhanced authentication system initialized with persistent storage at: {storage_path}")
+        # Initialize authentication manager (either ZMQ worker or in-process)
+        if auth_worker_client is not None:
+            # Use ZMQ worker for authentication
+            self.auth_manager = auth_worker_client
+            logger.info("Using ZMQ auth worker for authentication")
         else:
-            logger.info("Enhanced authentication system initialized (in-memory only)")
+            # Use in-process enhanced authentication manager
+            self.auth_manager = EnhancedApiKeyManager(
+                require_api_key=require_api_key,
+                admin_key=admin_key,
+                enable_audit_logging=enable_audit_logging,
+                max_audit_entries=max_audit_entries,
+                storage_dir=storage_dir,
+                enable_persistence=enable_persistence,
+                auto_save=enable_persistence,  # Auto-save if persistence enabled
+                save_interval=auto_save_interval,
+            )
+            if enable_persistence:
+                storage_path = storage_dir or "~/.cache/esurge-auth"
+                logger.info(f"Enhanced authentication system initialized with persistent storage at: {storage_path}")
+            else:
+                logger.info("Enhanced authentication system initialized (in-memory only)")
 
         super().__init__(
             server_name="EasyDeL eSurge API Server",
@@ -312,6 +330,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             logger.info(f"  - {name}")
         self.status = ServerStatus.READY
         logger.info("eSurge API Server is ready")
+
+    async def on_shutdown(self) -> None:
+        """Custom shutdown logic for eSurge.
+
+        Called when the FastAPI server shuts down. Cleans up ZMQ workers.
+        """
+        logger.info("eSurge API Server shutting down")
+        self.status = ServerStatus.SHUTTING_DOWN
+
+        # Shutdown tool parser worker if we own it
+        if self.tool_parser_worker_manager is not None:
+            try:
+                logger.info("Shutting down tool parser worker")
+                self.tool_parser_worker_manager.shutdown()
+            except Exception as e:
+                logger.error(f"Error shutting down tool parser worker: {e}")
+
+        logger.info("eSurge API Server shutdown complete")
 
     def _get_adapter(self, model_name: str) -> eSurgeAdapter:
         """Get adapter by model name.
@@ -364,7 +400,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         Returns:
             Tuple of (raw_key, metadata). Store raw_key securely - it won't be retrievable later.
         """
-        from .auth_models import ApiKeyRole
 
         if role is None:
             role = ApiKeyRole.USER
