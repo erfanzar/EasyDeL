@@ -27,7 +27,6 @@ Note:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -37,10 +36,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from easydel.workers.loggers import get_logger
+
 from .zmq_workers import DetokenizerWorkerClient, TokenizerWorkerClient
 
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class WorkerManager:
@@ -99,9 +99,7 @@ class WorkerManager:
 
         if needs_tokenizer_spawn or needs_detokenizer_spawn:
             if not self._tokenizer_source:
-                raise ValueError(
-                    "Tokenizer identifier must be provided when worker endpoints are not supplied."
-                )
+                raise ValueError("Tokenizer identifier must be provided when worker endpoints are not supplied.")
 
         if needs_tokenizer_spawn:
             tokenizer_endpoint = self._make_ipc_endpoint("tokenizer")
@@ -141,7 +139,9 @@ class WorkerManager:
 
     def shutdown(self) -> None:
         self._shutdown_client("_tokenizer_client", "_tokenizer_owned", "_tokenizer_process", self._tokenizer_endpoint)
-        self._shutdown_client("_detokenizer_client", "_detokenizer_owned", "_detokenizer_process", self._detokenizer_endpoint)
+        self._shutdown_client(
+            "_detokenizer_client", "_detokenizer_owned", "_detokenizer_process", self._detokenizer_endpoint
+        )
         self._tokenizer_endpoint = None
         self._detokenizer_endpoint = None
 

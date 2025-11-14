@@ -22,7 +22,14 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .auth_models import ApiKeyPermissions, ApiKeyRole, ApiKeyStatus, QuotaConfig, RateLimitConfig
+# Import auth models from workers
+from easydel.workers.esurge.auth.auth_models import (
+    ApiKeyPermissions,
+    ApiKeyRole,
+    ApiKeyStatus,
+    QuotaConfig,
+    RateLimitConfig,
+)
 
 
 class CreateApiKeyRequest(BaseModel):
