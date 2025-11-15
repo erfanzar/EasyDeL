@@ -21,14 +21,13 @@ from eformer.common_types import (
     TP,
     ColumnWise,
     DynamicShardingAxes,
-    ExpertColumnWiseAlt,
-    ExpertRowWiseAlt,
     Replicated,
     RowWise,
 )
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers.moe.utils import get_moe_partition_spec
 
 
 class ExpertTensorParallel(DynamicShardingAxes):
@@ -253,11 +252,21 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
             (r"mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
             (
                 r"mlp/experts/(gate_proj|up_proj)/kernel",
-                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertColumnWiseAlt),
+                get_moe_partition_spec(
+                    partition_manager=self.partition_manager,
+                    direction="column",
+                    tensors_are_expert=self.use_expert_tensor_mode,
+                    is_bias=False,
+                ),
             ),
             (
                 r"mlp/experts/down_proj/kernel",
-                pmag.resolve(ExpertTensorParallel if self.use_expert_tensor_mode else ExpertRowWiseAlt),
+                get_moe_partition_spec(
+                    partition_manager=self.partition_manager,
+                    direction="row",
+                    tensors_are_expert=self.use_expert_tensor_mode,
+                    is_bias=False,
+                ),
             ),
             # --- Shared Experts ---
             (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),

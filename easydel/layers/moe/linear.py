@@ -30,7 +30,10 @@ from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Int
+
+from .utils import get_moe_partition_spec
 
 if typing.TYPE_CHECKING:
     pass
@@ -46,43 +49,10 @@ FSDP = common_types.FSDP
 TP = common_types.TP
 SP = common_types.SP
 
-ExpertColumnWiseAlt = common_types.ExpertColumnWiseAlt
-ExpertRowWiseAlt = common_types.ExpertRowWiseAlt
-DynamicShardingAxes = common_types.DynamicShardingAxes
-
 
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
 Initializer = nn.initializers.Initializer
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism sharding configuration for MoE linear layers.
-
-    This sharding strategy distributes expert parameters across the Tensor Parallel (TP)
-    axis instead of the traditional Expert Parallel (EP) axis. This mode is enabled when
-    `use_expert_tensor_mode=True` in the layer configuration.
-
-    The sharding pattern [TP, EMPTY, EMPTY] means:
-    - First dimension (experts) is sharded across TP devices
-    - Second dimension (input features) is replicated
-    - Third dimension (output features) is replicated
-
-    This allows alternative parallelism strategies where tensor parallel and expert
-    parallel roles are swapped, which can be beneficial for certain hardware
-    configurations or memory constraints.
-
-    Attributes:
-        axes: Sharding pattern [TP, EMPTY, EMPTY] for expert tensor parallelism.
-        mode: Training mode constant (MODE_TRAIN).
-
-    See Also:
-        ExpertColumnWiseAlt: Column-wise expert parallelism (standard mode)
-        ExpertRowWiseAlt: Row-wise expert parallelism (standard mode)
-    """
-
-    axes: typing.ClassVar = [TP, EMPTY, EMPTY]
-    mode: typing.ClassVar = MODE_TRAIN
 
 
 class ParallelMoELinear(nn.Module):
@@ -201,28 +171,20 @@ class ParallelMoELinear(nn.Module):
         return self.partition_manager is not None and self._direction is not None
 
     @property
-    def alt_sharding(self) -> ExpertRowWiseAlt | ExpertColumnWiseAlt | None:
+    def alt_sharding(self) -> PartitionSpec | None:
         """Returns the ALT (Alternative) sharding configuration for this layer.
 
         ALT sharding provides pre-defined sharding patterns for common parallelism
         strategies, simplifying the configuration of distributed execution.
-
-        Returns:
-            ExpertRowWiseAlt for row parallelism,
-            ExpertColumnWiseAlt for column parallelism,
-            or None if no direction is set.
-
-        Raises:
-            NotImplementedError: If an unsupported direction is configured.
         """
         if self.direction is None:
             return None
         if self.use_expert_tensor_mode:
-            return ExpertTensorParallel
+            return get_moe_partition_spec(self.partition_manager, "column", self.use_expert_tensor_mode, True)
         elif self.direction == "row":
-            return ExpertRowWiseAlt
+            return get_moe_partition_spec(self.partition_manager, "row", self.use_expert_tensor_mode, False)
         elif self.direction == "column":
-            return ExpertColumnWiseAlt
+            return get_moe_partition_spec(self.partition_manager, "column", self.use_expert_tensor_mode, False)
         else:
             direction = self.direction
             raise NotImplementedError(f"ALT-Sharding Rule for {direction=} is not implemented!.")

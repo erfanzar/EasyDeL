@@ -1069,3 +1069,34 @@ def resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
     if not was_list:
         return out[0]
     return out
+
+
+def get_moe_partition_spec(
+    partition_manager: PartitionManager,
+    direction: typing.Literal["row", "column"],
+    tensors_are_expert: bool,
+    is_bias: bool = False,
+) -> jax.sharding.PartitionSpec:
+    if direction not in ("row", "column"):
+        raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
+
+    expert_axis_name = resolve_eformer_axis(EP, partition_manager)
+    tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
+
+    if tensors_are_expert:
+        # Expert tensor mode: all experts sharded across TP axis
+        if is_bias:
+            return jax.sharding.PartitionSpec(tensor_axis_name, None)
+        else:
+            return jax.sharding.PartitionSpec(tensor_axis_name, None, None)
+    else:
+        # Standard mode: experts on EP, features on TP
+        if is_bias:
+            return jax.sharding.PartitionSpec(expert_axis_name, None)
+        else:
+            if direction == "column":
+                # Column-wise: [expert, None, tp] for wi/wu
+                return jax.sharding.PartitionSpec(expert_axis_name, None, tensor_axis_name)
+            else:  # direction == "row"
+                # Row-wise: [expert, tp, None] for wd
+                return jax.sharding.PartitionSpec(expert_axis_name, tensor_axis_name, None)
