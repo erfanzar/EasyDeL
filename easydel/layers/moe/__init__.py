@@ -117,6 +117,7 @@ from .utils import (
     MoEMethods,
     MoeMetrics,
     MoeRoutingStrategy,
+    get_moe_partition_spec,
 )
 
 __all__ = (
@@ -129,4 +130,5 @@ __all__ = (
     "MoeRoutingStrategy",
     "ParallelMoELinear",
     "RowParallelMoELinear",
+    "get_moe_partition_spec",
 )
