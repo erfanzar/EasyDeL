@@ -113,6 +113,8 @@ DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
 DEFAULT_MOE_METHOD = "fused_moe"
 EXPERT_TP_MODE = False
+FSDP_IS_EP_BOUND = True
+SP_IS_EP_BOUND = True
 RING_EXPERTS = False
 ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
@@ -394,6 +396,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_force_xla_gmm: bool = False,
         use_expert_tensor_mode: bool = EXPERT_TP_MODE,
         use_ring_of_experts: bool = RING_EXPERTS,
+        fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
+        sp_is_ep_bound: bool = SP_IS_EP_BOUND,
         **kwargs,
     ):
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
@@ -462,6 +466,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_force_xla_gmm = getattr(self, "moe_force_xla_gmm", moe_force_xla_gmm)
         self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
+        self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
+        self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
 
         self.pretraining_tp = 1  # it's for pytorch models.
         if self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE and self.use_sharded_kv_caching:
@@ -766,6 +772,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_force_xla_gmm",
             "use_ring_of_experts",
             "use_expert_tensor_mode",
+            "fsdp_is_ep_bound",
+            "sp_is_ep_bound",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -819,6 +827,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_force_xla_gmm: bool = NOT_GIVEN,
         use_ring_of_experts: bool = NOT_GIVEN,
         use_expert_tensor_mode: bool = NOT_GIVEN,
+        fsdp_is_ep_bound: bool = NOT_GIVEN,
+        sp_is_ep_bound: bool = NOT_GIVEN,
         **kwargs,
     ):
         """
@@ -941,6 +951,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)
         set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
         set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
+        set_attrs_smartly(self, "fsdp_is_ep_bound", FSDP_IS_EP_BOUND, fsdp_is_ep_bound)
+        set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
 
         for key_, value_ in kwargs.items():
             setattr(self, key_, value_)

@@ -257,6 +257,9 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
                     direction="column",
                     tensors_are_expert=self.use_expert_tensor_mode,
                     is_bias=False,
+                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+                    sp_is_ep_bound=self.sp_is_ep_bound,
+                    module_view=True,
                 ),
             ),
             (
@@ -266,6 +269,9 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
                     direction="row",
                     tensors_are_expert=self.use_expert_tensor_mode,
                     is_bias=False,
+                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+                    sp_is_ep_bound=self.sp_is_ep_bound,
+                    module_view=True,
                 ),
             ),
             # --- Shared Experts ---

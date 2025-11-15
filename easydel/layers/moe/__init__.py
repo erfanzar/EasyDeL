@@ -40,6 +40,9 @@ Core Components
     - `MoeFusedHooks`: Hook system for custom interventions during MoE execution
     - `MoeMetrics`: Container for MoE metrics (expert loads, routing entropy, auxiliary losses)
 
+**Partition Spec Utilities:**
+    - `get_moe_partition_spec`: Generate partition specs for MoE weight tensors
+
 Features
 --------
 
@@ -63,14 +66,38 @@ Features
     - Fully Sharded Data Parallel (FSDP): Memory-efficient parameter sharding
     - Sequence Parallelism (SP): Partition sequence dimension
     - Expert Tensor Mode: Alternative sharding with experts on TP axis
+    - **3D Expert Mesh**: Simplified mesh combining FSDP, EP, and SP into single expert dimension
 
 **Execution Modes:**
     - Fused MoE: Optimized grouped matmul with shard_map (best for TPU/GPU)
     - Standard MoE: Traditional permute-compute-unpermute (most flexible)
     - Dense MoE: Per-token einsum operations (debugging/fallback)
 
+**Communication Patterns:**
+    - Ring-of-Experts: Efficient all-gather pattern for expert parallelism
+    - All-to-All: Ragged all-to-all communication for token redistribution
+    - Automatic selection based on mesh configuration
+
+Recent Improvements
+-------------------
+
+**3D Expert Mesh (v0.0.81+):**
+    The MoE implementation has been refactored to use a simplified 3D expert mesh
+    that combines FSDP, EP, and SP axes into a single unified expert dimension.
+    This provides:
+
+    - Cleaner sharding specifications with (dp, expert, tp) layout
+    - Simplified partition spec generation via `get_moe_partition_spec`
+    - Better compatibility with grouped matmul kernels
+    - Automatic resharding between 5D model mesh and 3D expert mesh
+
+    The 3D expert mesh is created automatically in `BaseMoeModule._create_expert_mesh()`
+    and used internally for all MoE operations, with automatic resharding at boundaries.
+
 Example Usage
 -------------
+
+**Basic MoE Layer:**
 
     >>> from easydel.layers.moe import (
     ...     BaseMoeModule,
@@ -78,28 +105,75 @@ Example Usage
     ...     MoeRoutingStrategy,
     ...     MoeLoadBalancingStrategy,
     ... )
+    >>> from flax import nnx as nn
     >>>
     >>> # Configure MoE execution
     >>> config.moe_method = MoEMethods.FUSED_MOE
     >>> config.routing_strategy = MoeRoutingStrategy.TOP_K
     >>> config.load_balancing_strategy = MoeLoadBalancingStrategy.STANDARD
+    >>> config.n_routed_experts = 8
+    >>> config.num_experts_per_tok = 2
     >>>
     >>> # Create custom MoE layer by extending BaseMoeModule
     >>> class MyMoELayer(BaseMoeModule):
-    ...     def __init__(self, config):
+    ...     def __init__(self, config, rngs):
     ...         super().__init__(config)
-    ...         # Initialize gate and expert layers
+    ...         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, rngs=rngs)
+    ...         # Initialize expert FFN weights...
     ...
     ...     def __call__(self, hidden_states):
-    ...         # Use helper methods for MoE computation
-    ...         return self.moe_call(...)
+    ...         output, router_logits = self.moe_call(
+    ...             hidden_state=hidden_states,
+    ...             gate_layer=self.gate,
+    ...             wi_kernel=self.wi_kernel,
+    ...             wu_kernel=self.wu_kernel,
+    ...             wd_kernel=self.wd_kernel,
+    ...             act_fn=nn.silu,
+    ...         )
+    ...         return output
+
+**Custom Routing with Hooks:**
+
+    >>> from easydel.layers.moe import MoeFusedHooks
+    >>>
+    >>> # Define custom weight refinement
+    >>> def temperature_scaling(weights):
+    ...     temperature = 0.5
+    ...     return jax.nn.softmax(weights / temperature)
+    >>>
+    >>> # Create hooks with custom logic
+    >>> hooks = MoeFusedHooks(refine_weights_hook=temperature_scaling)
+    >>>
+    >>> # Use hooks in MoE layer
+    >>> moe_layer = MyMoELayer(config, moe_hooks=hooks, rngs=rngs)
+
+**Distributed Training Setup:**
+
+    >>> import jax
+    >>> from jax.sharding import Mesh
+    >>> from eformer.escale import PartitionManager
+    >>>
+    >>> # Create 5D mesh for model training
+    >>> devices = jax.devices()
+    >>> mesh = Mesh(
+    ...     devices.reshape(1, 1, 4, 2, 1),  # (dp, fsdp, ep, tp, sp)
+    ...     axis_names=("dp", "fsdp", "expert", "tensor", "sequence")
+    ... )
+    >>>
+    >>> # Configure partition manager
+    >>> config.mesh = mesh
+    >>> config.partition_manager = PartitionManager(mesh, ...)
+    >>>
+    >>> # MoE layer automatically creates 3D expert mesh:
+    >>> # Combines FSDP*EP*SP into single expert axis (4*1 = 4)
+    >>> # Resulting expert_mesh shape: (dp=1, expert=4, tp=2)
 
 See Also
 --------
 
-- Module documentation: easydel.layers.moe.moe.BaseMoeModule
-- Utilities documentation: easydel.layers.moe.utils
-- Linear layers documentation: easydel.layers.moe.linear
+- Module documentation: :class:`easydel.layers.moe.moe.BaseMoeModule`
+- Utilities documentation: :mod:`easydel.layers.moe.utils`
+- Linear layers documentation: :mod:`easydel.layers.moe.linear`
 
 Notes
 -----
@@ -107,6 +181,10 @@ Notes
 The modules are designed to work seamlessly with JAX distributed meshes and
 EFormer's PartitionManager for automatic sharding. All implementations support
 gradient checkpointing and mixed precision training.
+
+For optimal performance on TPUs, use `MoEMethods.FUSED_MOE` with the grouped
+matmul kernel. On GPUs, both FUSED_MOE and STANDARD_MOE work well, with FUSED_MOE
+providing better performance for large expert counts.
 """
 
 from .linear import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear

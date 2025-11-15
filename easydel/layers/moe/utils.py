@@ -747,6 +747,17 @@ def permute(
     belonging to the same expert are contiguous. The output layout is suitable
     for ragged or grouped matrix multiplications used in expert FFNs.
 
+    **Algorithm Overview:**
+
+        1. **Expert Selection**: For each token, select top-k experts based on router logits
+        2. **Token Replication**: Replicate each token k times (once per selected expert)
+        3. **Sorting**: Sort all replicated tokens by their assigned expert ID
+        4. **Group Computation**: Compute how many tokens are assigned to each expert
+
+    This creates a layout where tokens for expert 0 are first, then expert 1, etc.,
+    enabling efficient grouped/ragged matrix multiplication where each expert processes
+    its assigned tokens as a contiguous batch.
+
     Args:
         inputs: Token representations. Shape: (batch, seq, hidden).
         gate_logits: Router logits for expert selection. Shape: (batch*seq, E)
@@ -755,6 +766,8 @@ def permute(
         use_custom_sort_vjp: Whether to use the custom VJP sorter for efficiency.
         roll_to_expert_id: Optional expert ID offset to rotate indices (e.g., when
             each shard processes a subset of experts in ring-of-experts setups).
+            This is used in ring-of-experts mode where each device processes a
+            contiguous subset of experts. The offset makes expert IDs local to each shard.
         num_experts_per_tok: Number of experts selected per token (k).
         num_experts: Total number of experts (E).
         dtype: Output dtype for the sorted inputs.
@@ -773,6 +786,20 @@ def permute(
         - `weights`: Selected expert weights per repeated token. Shape: (tokens*k,).
         - `group_size`: Number of tokens per expert. Shape: (E,).
         - `sorted_experts`: Expert id per sorted row. Shape: (tokens*k,).
+
+    Example:
+        >>> # 2 tokens, 2 experts per token, 4 total experts
+        >>> inputs = jnp.ones((1, 2, 128))  # (batch, seq, hidden)
+        >>> gate_logits = jnp.array([[0.9, 0.1, 0.8, 0.2],  # token 0 -> experts 0, 2
+        ...                           [0.3, 0.7, 0.4, 0.6]]) # token 1 -> experts 1, 3
+        >>>
+        >>> sorted_inputs, indices, weights, sizes, expert_ids = permute(
+        ...     inputs, gate_logits, num_experts_per_tok=2, num_experts=4, dtype=jnp.bfloat16
+        ... )
+        >>>
+        >>> # sorted_inputs: tokens grouped as [tok0_exp0, tok1_exp1, tok0_exp2, tok1_exp3]
+        >>> # sizes: [1, 1, 1, 1] - one token per expert
+        >>> # expert_ids: [0, 1, 2, 3] - expert ID for each sorted token
     """
     # reshape inputs (batch, sequence, emb) to (batch * sequence, emb)
     inputs_shape = inputs.shape
@@ -831,6 +858,16 @@ def unpermute(
     sums across the per-expert dimension using the provided weights, and restores
     the original `(batch, seq, hidden)` layout.
 
+    **Algorithm Overview:**
+
+        1. **Unsort**: Apply inverse permutation to restore original token order
+        2. **Reshape**: Reshape from (tokens*k, hidden) to (tokens, k, hidden)
+        3. **Weighted Sum**: Combine k expert outputs per token using weights
+        4. **Restore Shape**: Reshape from (tokens, hidden) to (batch, seq, hidden)
+
+    The weighted combination computes: output[i] = sum_j(weights[i,j] * expert_outputs[i,j])
+    where j ranges over the k selected experts for token i.
+
     Args:
         intermediate: Outputs computed in expert-grouped order. Shape:
             (tokens*k, out_dim).
@@ -848,6 +885,27 @@ def unpermute(
 
     Returns:
         Output tensor with original layout. Shape: (batch_size, sequence_length, out_dim).
+
+    Example:
+        >>> # Following the permute example
+        >>> # intermediate outputs from experts (4 tokens, 128 dim)
+        >>> intermediate = expert_outputs  # Shape: (4, 128)
+        >>> sorted_indices = jnp.array([0, 1, 2, 3])  # From permute
+        >>> weights = jnp.array([0.6, 0.4, 0.7, 0.3])  # Expert weights
+        >>>
+        >>> output = unpermute(
+        ...     intermediate,
+        ...     sorted_indices,
+        ...     weights,
+        ...     batch_size=1,
+        ...     sequence_length=2,
+        ...     num_experts_per_tok=2,
+        ...     dtype=jnp.bfloat16
+        ... )
+        >>>
+        >>> # output.shape = (1, 2, 128)
+        >>> # output[0,0] = 0.6*expert0_out + 0.7*expert2_out  # token 0's combined output
+        >>> # output[0,1] = 0.4*expert1_out + 0.3*expert3_out  # token 1's combined output
     """
 
     unsort_intermediate = sort_activations(intermediate, jnp.argsort(sorted_selected_experts), use_custom_sort_vjp)
@@ -1076,13 +1134,25 @@ def get_moe_partition_spec(
     direction: typing.Literal["row", "column"],
     tensors_are_expert: bool,
     is_bias: bool = False,
+    fsdp_is_ep_bound: bool = True,
+    sp_is_ep_bound: bool = True,
+    module_view: bool = False,
 ) -> jax.sharding.PartitionSpec:
     if direction not in ("row", "column"):
         raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
 
     expert_axis_name = resolve_eformer_axis(EP, partition_manager)
+    fsdp_axis_name = resolve_eformer_axis(FSDP, partition_manager)
+    sp_axis_name = resolve_eformer_axis(SP, partition_manager)
     tensor_axis_name = resolve_eformer_axis(TP, partition_manager)
-
+    expert_place = (expert_axis_name,)
+    if module_view:
+        if sp_is_ep_bound:
+            expert_place += (sp_axis_name,)
+        if fsdp_is_ep_bound:
+            expert_place += (fsdp_axis_name,)
+    if len(expert_place) == 1:
+        expert_place = expert_place[0]
     if tensors_are_expert:
         # Expert tensor mode: all experts sharded across TP axis
         if is_bias:
@@ -1092,11 +1162,11 @@ def get_moe_partition_spec(
     else:
         # Standard mode: experts on EP, features on TP
         if is_bias:
-            return jax.sharding.PartitionSpec(expert_axis_name, None)
+            return jax.sharding.PartitionSpec(expert_place, None)
         else:
             if direction == "column":
                 # Column-wise: [expert, None, tp] for wi/wu
-                return jax.sharding.PartitionSpec(expert_axis_name, None, tensor_axis_name)
+                return jax.sharding.PartitionSpec(expert_place, None, tensor_axis_name)
             else:  # direction == "row"
                 # Row-wise: [expert, tp, None] for wd
-                return jax.sharding.PartitionSpec(expert_axis_name, tensor_axis_name, None)
+                return jax.sharding.PartitionSpec(expert_place, tensor_axis_name, None)

@@ -60,7 +60,6 @@ from functools import partial
 
 import jax
 from eformer import common_types
-from eformer.common_types import DynamicShardingAxes
 from eformer.loggings import get_logger
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
 from flax import nnx as nn
@@ -104,41 +103,6 @@ DP = common_types.DP
 FSDP = common_types.FSDP
 TP = common_types.TP
 SP = common_types.SP
-
-
-class ExpertRowWise(DynamicShardingAxes):
-    axes: tp.ClassVar = [[FSDP, SP, EP], TP, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
-
-
-class ExpertColumnWise(DynamicShardingAxes):
-    axes: tp.ClassVar = [[FSDP, SP, EP], EMPTY, TP]
-    mode: tp.ClassVar = MODE_TRAIN
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding configuration.
-
-    This sharding strategy distributes experts across the Tensor Parallel (TP) axis
-    instead of the traditional Expert Parallel (EP) axis. This is controlled by the
-    `use_expert_tensor_mode` configuration flag.
-
-    In Expert Tensor mode:
-    - Experts are sharded over TP axis [TP, EMPTY, EMPTY]
-    - Allows different parallelism patterns for specific hardware configurations
-    - First dimension (TP) shards the expert dimension
-    - Remaining dimensions (EMPTY) are replicated
-
-    Attributes:
-        axes: Sharding pattern [TP, EMPTY, EMPTY] for expert tensor parallelism.
-        mode: Training mode constant (MODE_TRAIN).
-
-    Note:
-        When using this mode, ensure EP (expert parallel) size is set to 1 in the mesh.
-    """
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 class BaseMoeModule(nn.Module, ABC):
@@ -214,6 +178,18 @@ class BaseMoeModule(nn.Module, ABC):
 
         Combines FSDP, EP, and SP axes into a single 'expert' dimension,
         resulting in a cleaner (dp, expert, tp) mesh for MoE operations.
+
+        This transformation simplifies sharding specifications and improves compatibility
+        with grouped matmul kernels. The expert dimension size is computed as:
+            expert_size = FSDP_size x EP_size x SP_size
+
+        The 3D expert mesh is used internally for all MoE computations, with automatic
+        resharding at the boundaries to/from the original 5D model mesh.
+
+        Example:
+            >>> # Input 5D mesh: (dp=2, fsdp=2, ep=4, tp=2, sp=1)
+            >>> # Output 3D expert_mesh: (dp=2, expert=8, tp=2)
+            >>> #   where expert = fsdp*ep*sp = 2*4*1 = 8
         """
         pm = self.partition_manager
 
@@ -232,7 +208,17 @@ class BaseMoeModule(nn.Module, ABC):
         ospsize = self.mesh.shape.get(spname, 1)
 
         # Combine FSDP, EP, SP into single expert dimension
-        epsize = oepsize * ofsdpsize * ospsize
+
+        epsize = oepsize
+        if self.config.fsdp_is_ep_bound:
+            epsize *= ofsdpsize
+        else:
+            odpsize *= ofsdpsize
+
+        if self.config.sp_is_ep_bound:
+            epsize *= ospsize
+        else:
+            odpsize *= ospsize
 
         devices = self.mesh.devices.flatten()
         self.expert_mesh = jax.sharding.Mesh(
@@ -289,6 +275,9 @@ class BaseMoeModule(nn.Module, ABC):
             direction=direction,
             tensors_are_expert=tensors_are_expert,
             is_bias=is_bias,
+            fsdp_is_ep_bound=self.config.fsdp_is_ep_bound,
+            sp_is_ep_bound=self.config.sp_is_ep_bound,
+            module_view=False,
         )
 
     def _get_sharding_status(self):
@@ -743,6 +732,16 @@ class BaseMoeModule(nn.Module, ABC):
         ring-of-experts and all-to-all expert-parallel communication depending on
         configuration and mesh sizes.
 
+        **Architecture Overview:**
+            1. **Routing**: Compute router logits via gate_layer and apply softmax
+            2. **Permutation**: Sort tokens by expert assignment for grouped computation
+            3. **Expert Computation**: Apply grouped matmul for W_i, W_u, activation, W_d
+            4. **Communication** (if EP > 1):
+               - Ring-of-Experts: All-gather pattern with local expert subsets
+               - All-to-All: Ragged all-to-all for token redistribution
+            5. **Unpermutation**: Restore token order and combine expert outputs
+            6. **Resharding**: Convert from 3D expert mesh back to 5D model mesh
+
         **Hook Integration:**
             This method reads hooks from `self.moe_hooks` (automatically configured
             by `moe_call()` based on routing strategy). The following hooks
@@ -773,6 +772,30 @@ class BaseMoeModule(nn.Module, ABC):
             Tuple `(output, router_logits)` where:
             - output: MoE layer output. Shape: [B, S, H].
             - router_logits: Pre-softmax router logits for auxiliary losses. Shape: [B*S, E].
+
+        Example:
+            >>> # Setup MoE layer with 8 experts, top-2 routing
+            >>> config.n_routed_experts = 8
+            >>> config.num_experts_per_tok = 2
+            >>> config.use_ring_of_experts = False  # Use all-to-all
+            >>>
+            >>> # Initialize expert kernels
+            >>> wi_kernel = jax.random.normal(key, (8, 768, 3072))  # gate/up
+            >>> wu_kernel = jax.random.normal(key, (8, 768, 3072))  # up
+            >>> wd_kernel = jax.random.normal(key, (8, 3072, 768))  # down
+            >>>
+            >>> # Call fused MoE
+            >>> hidden_states = jnp.ones((2, 512, 768))  # (batch, seq, hidden)
+            >>> output, logits = moe_layer._sparse_moe_call(
+            ...     hidden_state=hidden_states,
+            ...     gate_layer=gate,
+            ...     wi_kernel=wi_kernel,
+            ...     wu_kernel=wu_kernel,
+            ...     wd_kernel=wd_kernel,
+            ...     act_fn=jax.nn.silu,
+            ... )
+            >>> # output.shape = (2, 512, 768)
+            >>> # logits.shape = (1024, 8)  # batch*seq, n_experts
         """
 
         select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
