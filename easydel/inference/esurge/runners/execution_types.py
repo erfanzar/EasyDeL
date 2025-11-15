@@ -41,7 +41,12 @@ if typing.TYPE_CHECKING:
 
 @auto_pytree(frozen=True)
 class BatchMetadata:
-    """Precomputed tensors describing the current batch layout."""
+    """Precomputed tensors describing the current batch layout.
+
+    This metadata supports both v2 and v3 attention kernels:
+    - v2: Uses slot_mapping and num_kv_update_slices for KV cache updates
+    - v3: Uses request_distribution for optimized ragged attention
+    """
 
     scheduled: jax.Array
     query_start_loc: jax.Array
@@ -58,6 +63,10 @@ class BatchMetadata:
     top_k: jax.Array
     min_p: jax.Array
     positions: jax.Array
+
+    # v2-specific fields (optional, only populated when version="v2")
+    slot_mapping: jax.Array | None = None
+    num_kv_update_slices: jax.Array | None = None
 
 
 @auto_pytree(frozen=True)

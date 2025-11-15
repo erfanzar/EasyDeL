@@ -526,6 +526,7 @@ class RaggedPagesMetadata:
     position_ids: Int[Array, "num_tokens"] | None = None  # noqa: F821
 
     request_distribution: Int[Array, "3"] | None = None
+    num_kv_update_slices: Int[Array, "1"] | None = None
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 
@@ -551,6 +552,7 @@ class RaggedPagesMetadata:
             position_ids=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             num_seqs=jnp.zeros([max_num_reqs], dtype=jnp.int32),
             request_distribution=jnp.zeros((3,), dtype=jnp.int32) if version == "v3" else None,
-       
-            page_size=page_size,     version=version,
+            num_kv_update_slices=jnp.zeros((1,), dtype=jnp.int32) if version == "v2" else None,
+            page_size=page_size,
+            version=version,
         )
