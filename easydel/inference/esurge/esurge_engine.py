@@ -428,7 +428,7 @@ class eSurge:
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
         else:
-            model = model.update_module(attn_mechanism="ragged_page_attention_v3")
+            ...
 
         self.model = model
 

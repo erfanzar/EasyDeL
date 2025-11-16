@@ -15,7 +15,7 @@
 
 import jax
 from eformer import common_types as ct
-from ejkernel.modules import ragged_page_attention, ragged_page_attention_v3
+from ejkernel.modules import RaggedPageAttentionConfig, ragged_page_attention, ragged_page_attention_v3
 from ejkernel.modules.operations.ragged_page_attention_v3 import RaggedPageAttentionv3Config
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -28,6 +28,24 @@ from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 
 USE_SHARDMAP = True
+
+
+def get_tpu_version() -> int:
+    """Returns the numeric version of the TPU, or -1 if not on TPU."""
+    kind = jax.devices()[0].device_kind
+    if "TPU" not in kind:
+        return -1
+    if kind.endswith(" lite"):
+        kind = kind[: -len(" lite")]
+    if kind.endswith("p"):
+        kind = kind[:-1]
+    if kind == "TPU7x":
+        return 7
+    try:
+        assert kind[:-1] == "TPU v", kind
+        return int(kind[-1])
+    except Exception:
+        return 0
 
 
 class _RaggedPageAttn(OperationImpl):
@@ -99,7 +117,13 @@ class _RaggedPageAttn(OperationImpl):
             dtype_for_compute = jnp.bfloat16
         else:
             dtype_for_compute = compute_dtype
-
+        platform = "pallas" if jax.default_backend() == "tpu" else "auto"
+        num_kv_pages_per_block = None
+        num_queries_per_block = None
+        if platform == "pallas":
+            if get_tpu_version() == 4:
+                num_kv_pages_per_block = 16
+                num_queries_per_block = 4
         output = ragged_page_attention(
             query,
             kv_pages,
@@ -115,6 +139,12 @@ class _RaggedPageAttn(OperationImpl):
             compute_dtype=dtype_for_compute,
             mask_value=mask_value,
             sliding_window=sliding_window,
+            cfg=RaggedPageAttentionConfig(
+                num_queries_per_block=num_queries_per_block,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                platform=platform,
+                backend="any",
+            ),
             in_specs=(
                 qaxes,
                 resolve(
@@ -257,7 +287,8 @@ class _RaggedPageAttn(OperationImpl):
             AttentionOutput: Contains attention outputs [total_tokens, num_q_heads, head_dim].
                 Attention weights are not computed.
         """
-        return self.forward_v3(
+        fn = self.forward_v3 if self.get_impl_name() == "ragged_page_attention_v3" else self.forward_v2
+        return fn(
             query=query,
             key=key,
             value=value,

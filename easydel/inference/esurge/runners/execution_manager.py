@@ -91,7 +91,7 @@ from easydel.utils import ejit
 
 from ..core.sampler import sample_tokens
 from ..core.sampling_metadata import SamplingMetadata
-from ..page_table import PAGE_TABLE_PADDING_VAL
+from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from .sequence_buffer import DeviceSequenceState, SequenceBuffer
 
@@ -301,7 +301,7 @@ class ExecutionManager:
             max_num_tokens: Maximum number of tokens for batching.
             metadata: Pages cache metadata.
         """
-        logger.info("Initializing ExecutionManager")
+        logger.info(f"initializing eSurge-ExecutionManager Version {metadata.version}")
         self.model = model
         self.mesh = mesh
         self.kv_pages = kv_pages
@@ -335,6 +335,17 @@ class ExecutionManager:
         self._logits_indices_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
         self._scheduled_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
         self._arange_cpu = numpy.arange(max_num_tokens, dtype=numpy.int32)
+
+        if metadata is not None and metadata.version == "v2":
+            self._slices_per_page = metadata.num_slices_per_kv_cache_update_page
+            self._max_padded_slices = int(metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
+            self._slot_mapping_cpu = numpy.full((3, self._max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=numpy.int32)
+            self._slot_mapping_indices = numpy.arange(self._max_padded_slices, dtype=numpy.int32)
+        else:
+            self._max_padded_slices = None
+            self._slot_mapping_cpu = None
+            self._slices_per_page = None
+            self._slot_mapping_indices = None
 
         self.init_fns()
 
@@ -694,6 +705,93 @@ class ExecutionManager:
         """
         self._model_step_fn = self.get_model_step_fn()
 
+    def _compute_slot_mapping_v2(
+        self,
+        num_requests: int,
+        scheduled: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        page_table_cpu: numpy.ndarray,
+    ) -> tuple[numpy.ndarray, int]:
+        """Rebuild slot_mapping tensor for ragged-page attention v2."""
+
+        slot_mapping = self._slot_mapping_cpu
+        slot_mapping.fill(SLOT_MAPPING_PADDING_VAL)
+
+        if num_requests <= 0:
+            return slot_mapping.copy(), 0
+
+        # Slice arrays to active requests
+        scheduled_active = numpy.asarray(scheduled[:num_requests], dtype=numpy.int32)
+        num_computed_active = numpy.asarray(num_computed_tokens_cpu[:num_requests], dtype=numpy.int32)
+        if not numpy.any(scheduled_active):
+            return slot_mapping.copy(), 0
+
+        page_size = int(self.metadata.page_size)
+        max_pages_per_req = int(self.metadata.max_num_pages_per_req)
+        slices_per_page = int(self._slices_per_page)
+
+        # Compute per-request page spans
+        start_tokens = num_computed_active
+        end_tokens = num_computed_active + scheduled_active
+        lps = start_tokens // page_size
+        lpe = (numpy.maximum(end_tokens, 1) - 1) // page_size
+        page_lens = numpy.where(scheduled_active > 0, lpe - lps + 1, 0).astype(numpy.int32)
+
+        if not numpy.any(page_lens):
+            return slot_mapping.copy(), 0
+
+        page_cum = numpy.cumsum(page_lens, dtype=numpy.int32)
+        total_pages = int(page_cum[-1])
+
+        max_padded_slices = int(self._max_padded_slices)
+        padded_num_slices = min(
+            ((total_pages + slices_per_page - 1) // slices_per_page) * slices_per_page,
+            max_padded_slices,
+        )
+
+        indices = self._slot_mapping_indices
+        if indices is None:
+            return slot_mapping.copy(), total_pages
+
+        slice_active_mask = (indices < total_pages) & (indices < padded_num_slices)
+        active_positions = indices[slice_active_mask]
+        if active_positions.size == 0:
+            return slot_mapping.copy(), total_pages
+
+        page_cum_prev = numpy.concatenate(([0], page_cum[:-1]))
+        req_for_slice = numpy.searchsorted(page_cum, active_positions, side="right").astype(numpy.int32)
+        local_off = active_positions - page_cum_prev[req_for_slice]
+
+        pt = numpy.asarray(page_table_cpu[:num_requests, :max_pages_per_req], dtype=numpy.int32)
+        pt_flat = pt.reshape(-1)
+        gather_idx = req_for_slice * max_pages_per_req + lps[req_for_slice] + local_off
+        numpy.clip(gather_idx, 0, pt_flat.size - 1, out=gather_idx)
+        page_numbers = pt_flat[gather_idx]
+
+        s_mod = start_tokens % page_size
+        e_mod = ((numpy.maximum(end_tokens, 1) - 1) % page_size) + 1
+        lens_rep = page_lens
+
+        is_first = local_off == 0
+        is_last = local_off == (lens_rep[req_for_slice] - 1)
+
+        kv_local_st = numpy.where(is_first, s_mod[req_for_slice], 0)
+        kv_local_en = numpy.where(is_last, e_mod[req_for_slice], page_size)
+        slice_lens = numpy.maximum(kv_local_en - kv_local_st, 0).astype(numpy.int32)
+        kv_cache_start = kv_local_st + page_numbers * page_size
+
+        # Prefix sums for new_kv_start
+        new_kv_start = numpy.cumsum(slice_lens, dtype=numpy.int32)
+        if new_kv_start.size:
+            new_kv_start = numpy.roll(new_kv_start, 1)
+            new_kv_start[0] = 0
+
+        slot_mapping[0, active_positions] = kv_cache_start
+        slot_mapping[1, active_positions] = new_kv_start
+        slot_mapping[2, active_positions] = slice_lens
+
+        return slot_mapping.copy(), total_pages
+
     def prepare_batch_metadata(
         self,
         num_tokens_static: int,
@@ -801,6 +899,24 @@ class ExecutionManager:
 
         # Sampling params are already on CPU (passed as arguments), no device transfer needed!
 
+        # ========== v2-specific: Compute slot_mapping if needed ==========
+        slot_mapping_device = None
+        num_kv_update_slices_device = None
+
+        if self.metadata.version == "v2":
+            # Compute slot_mapping and num_kv_update_slices for v2 kernels
+            slot_mapping_cpu, total_pages = self._compute_slot_mapping_v2(
+                num_requests=num_requests,
+                scheduled=scheduled,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                page_table_cpu=page_table_cpu,
+            )
+            # Transfer to device
+            slot_mapping_device = jax.device_put(slot_mapping_cpu, self._empty_sharding)
+            num_kv_update_slices_device = jax.device_put(
+                numpy.array([total_pages], dtype=numpy.int32), self._empty_sharding
+            )
+
         # ========== STEP 3: Single device transfer (ONE SHOT!) ==========
 
         # Transfer all CPU-computed metadata to device in one call
@@ -835,6 +951,9 @@ class ExecutionManager:
             top_k=jax.device_put(top_k_cpu, self._empty_sharding),
             min_p=jax.device_put(min_p_cpu, self._empty_sharding),
             positions=jax.device_put(num_computed_tokens_cpu[:num_tokens_static], self._empty_sharding),
+            # v2-specific fields (None for v3)
+            slot_mapping=slot_mapping_device,
+            num_kv_update_slices=num_kv_update_slices_device,
         )
 
         return metadata, input_ids_buf, position_ids_buf
@@ -861,6 +980,9 @@ class ExecutionManager:
             top_k=self._empty_sharding,
             min_p=self._empty_sharding,
             positions=self._empty_sharding,
+            # v2-specific shardings (None if not used)
+            slot_mapping=self._empty_sharding if self.metadata.version == "v2" else None,
+            num_kv_update_slices=self._empty_sharding if self.metadata.version == "v2" else None,
         )
 
         inputs_shardings = StepFunctionInputs(
@@ -903,6 +1025,7 @@ class ExecutionManager:
                 input_ids_view = metadata.input_ids_buf
                 position_ids_view = metadata.position_ids_buf
 
+                # Build RaggedPagesMetadata with conditional v2/v3 fields
                 cache_metadata = RaggedPagesMetadata(
                     pages_tables=metadata.pages_tables,
                     context_lens=metadata.seq_lens[:num_reqs_max_model_len],
@@ -910,7 +1033,13 @@ class ExecutionManager:
                     num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
                     num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
                     page_size=self.metadata.page_size,
+                    # v3 field: always populated
                     request_distribution=metadata.request_distribution,
+                    # v2 fields: only populated when version="v2"
+                    slot_mapping=metadata.slot_mapping,
+                    num_kv_update_slices=metadata.num_kv_update_slices,
+                    # Pass version from metadata
+                    version=self.metadata.version,
                 )
 
                 output = model(
