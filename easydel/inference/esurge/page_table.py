@@ -55,6 +55,7 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+SLOT_MAPPING_PADDING_VAL = 0
 PAGE_TABLE_PADDING_VAL = 0
 
 
