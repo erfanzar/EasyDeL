@@ -59,10 +59,12 @@ import os
 import pickle
 import typing as tp
 import warnings
+from functools import wraps
 
 import jax
 import numpy as np
 from ejkernel.callib import ejit
+from jax._src.interpreters import pxla
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
 from .helpers import check_bool_flag, get_cache_dir
@@ -307,3 +309,43 @@ def smart_compile(
                         stacklevel=4,
                     )
         return compiled_func, signature
+
+
+class NoCompileContext:
+    """Context manager that fails if JAX triggers a new compilation.
+
+    Useful around hot paths that are expected to hit cached executables only.
+    """
+
+    def __init__(self, message: str = "JAX attempted to compile a new executable inside ForbidCompile."):
+        """Initialize the guard with a custom failure message."""
+        self.message = message
+        self._original_func = None
+
+    def __enter__(self):
+        """Patch JAX's cached lowering to detect compilation cache misses."""
+        # Store the original function
+        self._original_func = pxla._cached_lowering_to_hlo
+        original_cached_func = self._original_func
+
+        @wraps(original_cached_func)
+        def wrapper(*args, **kwargs):
+            info_before = original_cached_func.cache_info()
+            misses_before = info_before.misses
+
+            result = original_cached_func(*args, **kwargs)
+            info_after = original_cached_func.cache_info()
+            misses_after = info_after.misses
+
+            if misses_after > misses_before:
+                raise RuntimeError(self.message)
+
+            return result
+
+        pxla._cached_lowering_to_hlo = wrapper
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Restore the cached lowering function."""
+        if self._original_func:
+            pxla._cached_lowering_to_hlo = self._original_func
+        return False

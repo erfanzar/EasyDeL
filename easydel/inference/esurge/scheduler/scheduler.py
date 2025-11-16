@@ -42,6 +42,7 @@ class Scheduler(SchedulerInterface):
         config: Config,
         kv_cache_config: CacheGroupsConfig,
         include_finished_set: bool = False,
+        max_num_seq_buckets: list[int] | None = None,
     ) -> None:
         self.config = config
         self.scheduler_config = config.scheduler_config
@@ -94,6 +95,17 @@ class Scheduler(SchedulerInterface):
             use_eagle=self.use_eagle,
         )
 
+        buckets = max_num_seq_buckets or list(self.scheduler_config.max_num_seq_buckets or ())
+        if not buckets:
+            buckets = [self.max_num_running_reqs]
+        buckets = sorted({int(b) for b in buckets if b > 0})
+        if not buckets:
+            buckets = [self.max_num_running_reqs]
+        if buckets[-1] != self.max_num_running_reqs:
+            buckets.append(self.max_num_running_reqs)
+        self.max_num_seq_buckets = buckets
+        self._current_seq_bucket = self._select_seq_bucket(0)
+
     @classmethod
     def from_runner(
         cls,
@@ -115,6 +127,7 @@ class Scheduler(SchedulerInterface):
                     max_num_seqs=runner.max_num_seqs,
                     max_num_batched_tokens=max_num_batched_tokens,
                     max_model_len=runner.max_model_len,
+                    max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
                 ),
                 cache_config=CacheConfig(
                     num_pages=metadata.num_pages,
@@ -138,6 +151,19 @@ class Scheduler(SchedulerInterface):
             ),
         )
 
+    def _select_seq_bucket(self, num_reqs: int) -> int:
+        if num_reqs <= 0:
+            return self.max_num_seq_buckets[0]
+        for bucket in self.max_num_seq_buckets:
+            if num_reqs <= bucket:
+                return bucket
+        return self.max_num_seq_buckets[-1]
+
+    def _ensure_capacity(self, desired_running: int) -> bool:
+        bucket = self._select_seq_bucket(desired_running)
+        self._current_seq_bucket = bucket
+        return desired_running <= bucket
+
     def schedule(self) -> SchedulerOutput:
         import time
 
@@ -157,6 +183,7 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         req_index = 0
+        self._ensure_capacity(len(self.running))
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
@@ -224,7 +251,7 @@ class Scheduler(SchedulerInterface):
 
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                if not self._ensure_capacity(len(self.running) + 1):
                     break
 
                 request = self.waiting.peek_request()
@@ -316,10 +343,11 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
+        self._ensure_capacity(len(self.running))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
+        assert len(self.running) <= self._current_seq_bucket
 
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
 
@@ -345,6 +373,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_common_prefix_pages=num_common_prefix_pages,
             finished_req_ids=self.finished_req_ids,
+            suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
         )
 
         self._update_after_schedule(scheduler_output)

@@ -63,7 +63,6 @@ import typing
 from bisect import bisect_left
 from concurrent.futures import Future
 from dataclasses import replace
-from functools import partial
 
 import jax
 import numpy as np
@@ -180,6 +179,7 @@ class eSurgeRunner:
         max_model_len: int = 2**13,
         min_input_pad: int = 256,
         max_num_seqs: int = 16,
+        max_num_seq_buckets: list[int] | None = None,
         use_aot_forward: bool = True,
         verbose: bool = False,
         enable_overlap_execution: bool = False,
@@ -193,12 +193,12 @@ class eSurgeRunner:
             page_size=page_size,
             max_model_length=max_model_len,
         )
+        self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
-        self.max_num_reqs = max_num_seqs
+        self.max_num_reqs = self.max_num_seq_buckets[-1]
 
         self.max_model_len = max_model_len
-        self.min_input_pad = max(min_input_pad, max_num_seqs)
-
+        self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
@@ -220,7 +220,8 @@ class eSurgeRunner:
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             metadata=self.metadata,
-            verbose=verbose,
+            verbose=False,
+            # verbose=verbose,
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
@@ -270,6 +271,48 @@ class eSurgeRunner:
         if paddings[-1] != max_token_size:
             paddings.append(max_token_size)
         return paddings
+
+    @staticmethod
+    def _get_request_paddings(min_bucket: int, max_bucket: int) -> list[int]:
+        min_bucket = max(1, min(min_bucket, max_bucket))
+        buckets: list[int] = []
+        current = min_bucket
+        while current < max_bucket:
+            buckets.append(current)
+            current *= 2
+        if not buckets or buckets[-1] != max_bucket:
+            buckets.append(max_bucket)
+        return buckets
+
+    def _init_seq_buckets(
+        self,
+        user_buckets: list[int] | None,
+        max_num_seqs: int,
+        min_input_pad: int,
+    ) -> list[int]:
+        if user_buckets:
+            buckets = sorted({int(b) for b in user_buckets if 0 < int(b) <= max_num_seqs})
+        else:
+            buckets = self._get_request_paddings(min_input_pad, max_num_seqs)
+        if not buckets or buckets[-1] != max_num_seqs:
+            buckets.append(max_num_seqs)
+        return buckets
+
+    def _get_current_bucket(self, num_reqs: int) -> int:
+        """Select the smallest bucket that can accommodate num_reqs.
+
+        Args:
+            num_reqs: Number of active requests
+
+        Returns:
+            Smallest sufficient bucket size from self.max_num_seq_buckets
+        """
+        if num_reqs <= 0:
+            return self.max_num_seq_buckets[0]
+        for bucket in self.max_num_seq_buckets:
+            if num_reqs <= bucket:
+                return bucket
+        return self.max_num_seq_buckets[-1]
 
     def _setup_variables(self):
         """Initialize internal variables and preallocate reusable buffers."""
@@ -341,6 +384,8 @@ class eSurgeRunner:
             dtype=bool,
             device=self._empty_sharding,
         )
+        self._device_state_cache = None
+        self._device_state_dirty = True
 
     def _precompile_jitted_helpers(
         self,
@@ -447,12 +492,11 @@ class eSurgeRunner:
             max_pages_per_req=self.max_pages_per_req,
             max_num_reqs=self.max_num_reqs,
             metadata=self.metadata,
+            num_reqs_paddings=self.max_num_seq_buckets,
         )
 
-        req_bucket = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
-
         self._precompile_jitted_helpers(
-            reqs_padds=sorted({req_bucket(n, self.max_num_reqs) for n in range(1, self.max_num_reqs + 1)}),
+            reqs_padds=self.max_num_seq_buckets,
             prompt_len_buckets=[min(n, self.max_model_len) for n in self.num_tokens_paddings],
             precompile_allowed_mask=False,
             allowed_max=4096,
@@ -509,6 +553,8 @@ class eSurgeRunner:
             return
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
         self.executor_manager.kv_pages = self.model.init_ragged_pages(self.metadata)
+        self._device_state_cache = None
+        self._device_state_dirty = True
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
@@ -689,7 +735,7 @@ class eSurgeRunner:
             )
 
         start_index = 0
-        total_prep_time = 0.0
+        total_step_time = 0.0
         total_sync_time = 0.0
         total_post_proc_time = 0.0
 
@@ -697,13 +743,7 @@ class eSurgeRunner:
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
 
-        t_device_state_start = time.time()
-        device_state = self.sequence_buffer.to_device_state(sharding=self._empty_sharding)
-        t_device_state = time.time() - t_device_state_start
-
         while start_index < self.sequence_buffer.num_reqs:
-            t_prep_start = time.time()
-
             num_reqs_total = self.sequence_buffer.num_reqs
             scheduled_list: list[int] = []
             req_ids_window = []
@@ -727,13 +767,18 @@ class eSurgeRunner:
                 idx = len(self.num_tokens_paddings) - 1
             num_tokens_static = int(self.num_tokens_paddings[idx])
 
+            # Select optimal bucket for current batch size
+            # This determines which compiled function to use
+            current_bucket = self._get_current_bucket(num_reqs)
+            padded_num_reqs = current_bucket  # Use bucket size for compilation lookup
+
             if num_reqs > 0:
-                # Keep scheduled and active_mask as CPU arrays
-                scheduled_full_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
+                # Keep scheduled and active_mask as CPU arrays, sized to current bucket
+                scheduled_full_cpu = np.zeros(current_bucket, dtype=np.int32)
                 scheduled_full_cpu[: len(scheduled_list)] = scheduled_list
 
-                req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-                active_mask_full_cpu = np.zeros(self.max_num_reqs, dtype=bool)
+                req_num_tokens_np = np.zeros(current_bucket, dtype=np.int32)
+                active_mask_full_cpu = np.zeros(current_bucket, dtype=bool)
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         rs = self.requests.get(rid)
@@ -746,18 +791,11 @@ class eSurgeRunner:
                     self._empty_sharding,
                 )
 
-            nr_safe = max(num_reqs, 1)
-            next_pow2 = 1 << (nr_safe - 1).bit_length()
-            padded_num_reqs = min(self.min_input_pad if num_reqs <= self.min_input_pad else next_pow2, self.max_num_reqs)
-
             # Get page table as CPU array (single device transfer per step)
             page_table_cpu = np.asarray(jax.device_get(self.sequence_buffer.page_table[0].get_array()))
-
-            t_prep = time.time() - t_prep_start
-            total_prep_time += t_prep
-
+            step_start = time.time()
             (
-                device_state,
+                minimal_device_state,
                 out_tokens_win,
                 valid_mask_win,
                 self.input_ids_buf,
@@ -769,9 +807,8 @@ class eSurgeRunner:
                 _logits,
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
-                device_state=device_state,
                 scheduled_full_cpu=scheduled_full_cpu,
-                req_num_tokens_full=self.req_num_tokens_full_buf,
+                req_num_tokens_full=self.req_num_tokens_full_buf[:current_bucket],  # SLICE to bucket size
                 active_mask_full_cpu=active_mask_full_cpu,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
@@ -784,17 +821,31 @@ class eSurgeRunner:
                 top_k_cpu=self.sequence_buffer.top_k,
                 min_p_cpu=self.sequence_buffer.min_p,
                 page_table_cpu=page_table_cpu,
+                query_start_loc_buf=self.query_start_loc_buf[:current_bucket+1],  # SLICE
+                seq_lens_buf=self.seq_lens_buf[:current_bucket],  # SLICE
+                pages_tables_buf=self.pages_tables_buf,  # Already correct size
             )
+
             # account for device time
             jax.block_until_ready(valid_mask_win)
-
+            total_step_time += time.time() - step_start
             # host copies once
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
             logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
 
+            # Sync back minimal device state to CPU SequenceBuffer
             sq_utime = time.time()
-            self.sequence_buffer = self.sequence_buffer.from_device_state(device_state)
+            token_ids_updated = np.asarray(jax.device_get(minimal_device_state.token_ids))
+            num_tokens_updated = np.asarray(jax.device_get(minimal_device_state.num_tokens))
+            if not token_ids_updated.flags.writeable:
+                token_ids_updated = token_ids_updated.copy()
+            if not num_tokens_updated.flags.writeable:
+                num_tokens_updated = num_tokens_updated.copy()
+            self.sequence_buffer = self.sequence_buffer._with_updates(
+                token_ids=token_ids_updated,
+                num_computed_tokens=num_tokens_updated,
+            )
             sq_utime_took = time.time() - sq_utime
             total_sync_time += sq_utime_took
 
@@ -836,11 +887,10 @@ class eSurgeRunner:
 
         total_time = time.time() - execution_start_time
         self.log_it(
-            f"[fused] "
-            f"prep={total_prep_time:.3f}s "
+            f"[execute] "
+            f"step={total_step_time:.3f}s "
             f"sync={total_sync_time:.3f}s "
             f"post={total_post_proc_time:.3f}s "
-            f"init_dev={t_device_state:.3f}s "
             f"upd_states={updating_states_time:.3f}s "
             f"total={total_time:.3f}s"
         )
