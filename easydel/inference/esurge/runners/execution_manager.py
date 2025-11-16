@@ -534,13 +534,13 @@ class ExecutionManager:
         prep_took = time.time() - start_prep
 
         # Convert CPU arrays to device for model execution
-        scheduled_full = jax.device_put(jnp.asarray(scheduled_full_cpu), self._empty_sharding)
-        active_mask_full = jax.device_put(jnp.asarray(active_mask_full_cpu), self._empty_sharding)
+        scheduled_full = jnp.array(scheduled_full_cpu, device=self._empty_sharding)
+        active_mask_full = jnp.array(active_mask_full_cpu, device=self._empty_sharding)
 
         # Create minimal device state from CPU arrays (only what sampler needs to update)
         device_state = MinimalDeviceState(
-            token_ids=jax.device_put(jnp.asarray(token_ids_cpu), self._empty_sharding),
-            num_tokens=jax.device_put(jnp.asarray(num_computed_tokens_cpu), self._empty_sharding),
+            token_ids=jnp.array(token_ids_cpu, device=self._empty_sharding),
+            num_tokens=jnp.array(num_computed_tokens_cpu, device=self._empty_sharding),
         )
 
         inputs = StepFunctionInputs(
