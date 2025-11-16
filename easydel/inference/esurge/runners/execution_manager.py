@@ -311,6 +311,9 @@ class ExecutionManager:
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens if max_num_tokens is not None else max_model_len
         self.metadata = metadata
+        self._metadata_version = metadata.version
+        self._use_slot_mapping = metadata.version == "v2"
+        self._use_request_distribution = not self._use_slot_mapping
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
         self.log_it = logger.info if verbose else logger.debug
@@ -335,11 +338,16 @@ class ExecutionManager:
         self._logits_indices_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
         self._scheduled_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
         self._arange_cpu = numpy.arange(max_num_tokens, dtype=numpy.int32)
+        self._request_distribution_placeholder = numpy.zeros((3,), dtype=numpy.int32)
+        self._slot_mapping_placeholder = numpy.zeros((3, 1), dtype=numpy.int32)
+        self._num_kv_update_placeholder = numpy.zeros((1,), dtype=numpy.int32)
 
-        if metadata is not None and metadata.version == "v2":
+        if self._use_slot_mapping and metadata is not None:
             self._slices_per_page = metadata.num_slices_per_kv_cache_update_page
             self._max_padded_slices = int(metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
-            self._slot_mapping_cpu = numpy.full((3, self._max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=numpy.int32)
+            self._slot_mapping_cpu = numpy.full(
+                (3, self._max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=numpy.int32
+            )
             self._slot_mapping_indices = numpy.arange(self._max_padded_slices, dtype=numpy.int32)
         else:
             self._max_padded_slices = None
@@ -888,60 +896,62 @@ class ExecutionManager:
         mask_rows = numpy.arange(num_reqs_max_model_len) < min(num_requests, num_reqs_max_model_len)
         pages_tables_cpu = numpy.where(mask_rows[:, None], pt_src, PAGE_TABLE_PADDING_VAL)
 
-        # Request distribution on CPU
-        active_num_computed = numpy.where(mask_reqs, num_computed_tokens_cpu, 0)
-        is_decode = (scheduled == 1) & (active_num_computed > 0)
-        is_chunked_prefill = (scheduled > 1) & (active_num_computed > 0)
-        decode_count = int(numpy.sum(is_decode))
-        chunked_prefill_count = int(numpy.sum(is_chunked_prefill))
-        boundary = min(decode_count + chunked_prefill_count, num_requests)
-        request_distribution = numpy.array([decode_count, boundary, num_requests], dtype=numpy.int32)
+        # Request distribution (v3)
+        request_distribution = None
+        if self._use_request_distribution:
+            active_num_computed = numpy.where(mask_reqs, num_computed_tokens_cpu, 0)
+            is_decode = (scheduled == 1) & (active_num_computed > 0)
+            is_chunked_prefill = (scheduled > 1) & (active_num_computed > 0)
+            decode_count = int(numpy.sum(is_decode))
+            chunked_prefill_count = int(numpy.sum(is_chunked_prefill))
+            boundary = min(decode_count + chunked_prefill_count, num_requests)
+            request_distribution = numpy.array([decode_count, boundary, num_requests], dtype=numpy.int32)
 
-        # Sampling params are already on CPU (passed as arguments), no device transfer needed!
-
-        # ========== v2-specific: Compute slot_mapping if needed ==========
-        slot_mapping_device = None
-        num_kv_update_slices_device = None
-
-        if self.metadata.version == "v2":
-            # Compute slot_mapping and num_kv_update_slices for v2 kernels
+        slot_mapping_cpu = None
+        num_kv_update_cpu = None
+        if self._use_slot_mapping:
             slot_mapping_cpu, total_pages = self._compute_slot_mapping_v2(
                 num_requests=num_requests,
                 scheduled=scheduled,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 page_table_cpu=page_table_cpu,
             )
-            # Transfer to device
-            slot_mapping_device = jax.device_put(slot_mapping_cpu, self._empty_sharding)
-            num_kv_update_slices_device = jax.device_put(
-                numpy.array([total_pages], dtype=numpy.int32), self._empty_sharding
-            )
+            num_kv_update_cpu = numpy.array([total_pages], dtype=numpy.int32)
 
         # ========== STEP 3: Single device transfer (ONE SHOT!) ==========
-
-        # Transfer all CPU-computed metadata to device in one call
-        input_ids_buf = jax.device_put(self._input_ids_cpu[: self.max_num_tokens], self._empty_sharding)
-        position_ids_buf = jax.device_put(self._positions_cpu[: self.max_num_tokens], self._empty_sharding)
-
-        # Transfer all metadata arrays
-        qsl, seq_lens, logits_indices, pt, req_dist = jax.device_put(
-            (
-                self._query_start_loc_cpu,
-                self._seq_lens_cpu,
-                self._logits_indices_cpu,
-                pages_tables_cpu,
-                request_distribution,
-            ),
-            self._empty_sharding,
+        host_payload = (
+            self._input_ids_cpu[: self.max_num_tokens],
+            self._positions_cpu[: self.max_num_tokens],
+            self._query_start_loc_cpu,
+            self._seq_lens_cpu,
+            self._logits_indices_cpu,
+            pages_tables_cpu,
+            scheduled,
+            num_computed_tokens_cpu[:num_tokens_static],
+            request_distribution if request_distribution is not None else self._request_distribution_placeholder,
+            slot_mapping_cpu if slot_mapping_cpu is not None else self._slot_mapping_placeholder,
+            num_kv_update_cpu if num_kv_update_cpu is not None else self._num_kv_update_placeholder,
         )
+        (
+            input_ids_buf,
+            position_ids_buf,
+            qsl,
+            seq_lens,
+            logits_indices,
+            pt,
+            scheduled_dev,
+            positions_dev,
+            req_dist_dev,
+            slot_mapping_dev,
+            num_kv_update_dev,
+        ) = jax.device_put(host_payload, self._empty_sharding)
         # Build BatchMetadata with device arrays
         metadata = BatchMetadata(
-            scheduled=jax.device_put(scheduled, self._empty_sharding),
+            scheduled=scheduled_dev,
             query_start_loc=qsl,
             seq_lens=seq_lens,
             pages_tables=pt,
             padded_num_reqs=jax.device_put(numpy.int32(padded_num_reqs), self._empty_sharding),
-            request_distribution=req_dist,
             logits_indices=logits_indices,
             input_ids_buf=input_ids_buf[:num_tokens_static],
             position_ids_buf=position_ids_buf[:num_tokens_static],
@@ -950,10 +960,10 @@ class ExecutionManager:
             top_p=jax.device_put(top_p_cpu, self._empty_sharding),
             top_k=jax.device_put(top_k_cpu, self._empty_sharding),
             min_p=jax.device_put(min_p_cpu, self._empty_sharding),
-            positions=jax.device_put(num_computed_tokens_cpu[:num_tokens_static], self._empty_sharding),
-            # v2-specific fields (None for v3)
-            slot_mapping=slot_mapping_device,
-            num_kv_update_slices=num_kv_update_slices_device,
+            positions=positions_dev,
+            request_distribution=req_dist_dev if self._use_request_distribution else None,
+            slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
+            num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
         )
 
         return metadata, input_ids_buf, position_ids_buf
@@ -981,8 +991,8 @@ class ExecutionManager:
             min_p=self._empty_sharding,
             positions=self._empty_sharding,
             # v2-specific shardings (None if not used)
-            slot_mapping=self._empty_sharding if self.metadata.version == "v2" else None,
-            num_kv_update_slices=self._empty_sharding if self.metadata.version == "v2" else None,
+            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
+            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
         )
 
         inputs_shardings = StepFunctionInputs(
@@ -1039,7 +1049,7 @@ class ExecutionManager:
                     slot_mapping=metadata.slot_mapping,
                     num_kv_update_slices=metadata.num_kv_update_slices,
                     # Pass version from metadata
-                    version=self.metadata.version,
+                    version=self._metadata_version,
                 )
 
                 output = model(
