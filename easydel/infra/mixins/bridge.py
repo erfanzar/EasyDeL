@@ -747,7 +747,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             except Exception as e:
                                 raise RuntimeError(f"Downloaded sharded index but failed to fetch shards: {e}") from e
 
-            if not local_files_only:
+            if not local_files_only and not is_local:
                 api.snapshot_download(
                     repo_id=pretrained_model_name_or_path,
                     revision=revision,
