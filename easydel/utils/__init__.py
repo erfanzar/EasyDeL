@@ -61,7 +61,7 @@ Note:
 from eformer.paths import ePath, ePathLike
 
 from . import analyze_memory, compiling_utils, traversals
-from .compiling_utils import ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
+from .compiling_utils import NoCompileContext, ejit, load_cached_functions, load_compiled_fn, save_compiled_fn
 from .data_managers import (
     DatasetLoadError,
     DatasetMixture,
@@ -83,6 +83,7 @@ __all__ = (
     "DatasetMixture",
     "DatasetType",
     "LazyModule",
+    "NoCompileContext",
     "Registry",
     "TextDatasetInform",
     "Timer",

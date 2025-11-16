@@ -249,7 +249,7 @@ class SequenceBuffer:
       - page_table is a leaf (device-side)
       - Python containers (lists/sets/dicts) are static (non-leaves)
       - Mutating methods return a new SequenceBuffer instance
-      - Use to_device_state() to convert to JAX arrays for execution
+      - CPU arrays stay on host; only minimal token_ids and num_tokens sent to device per step
 
     Use SequenceBuffer.create(...) to construct an instance.
     """
@@ -1151,85 +1151,9 @@ class SequenceBuffer:
             else None,
         )
 
-    def to_device_state(self, sharding: jax.sharding.Sharding | None = None) -> DeviceSequenceState:
-        """Create a device-compatible view of the buffer.
-
-        Converts NumPy arrays to JAX arrays for device execution.
-
-        Args:
-            sharding: Optional sharding to apply to device arrays.
-
-        Returns:
-            DeviceSequenceState containing only array/tensor data suitable
-            for device operations. No Python containers are included.
-
-        Note:
-            This converts NumPy arrays to JAX arrays, transferring data to device.
-        """
-
-        def to_jax(arr):
-            if sharding is not None:
-                return jax.device_put(jnp.asarray(arr), sharding)
-            return jnp.asarray(arr)
-
-        return DeviceSequenceState(
-            token_ids=to_jax(self.token_ids),
-            num_tokens=to_jax(self.num_tokens),
-            num_tokens_no_spec=to_jax(self.num_tokens_no_spec),
-            num_prompt_tokens=to_jax(self.num_prompt_tokens),
-            num_computed_tokens=to_jax(self.num_computed_tokens),
-            temperature=to_jax(self.temperature),
-            top_p=to_jax(self.top_p),
-            top_k=to_jax(self.top_k),
-            min_p=to_jax(self.min_p),
-            frequency_penalties=to_jax(self.frequency_penalties),
-            presence_penalties=to_jax(self.presence_penalties),
-            repetition_penalties=to_jax(self.repetition_penalties),
-            page_table=self.page_table,
-            allowed_token_ids_mask=to_jax(self.allowed_token_ids_mask) if self.allowed_token_ids_mask is not None else None,
-        )
-
-    def from_device_state(self, dev: DeviceSequenceState) -> SequenceBuffer:
-        """Update buffer with data from device state.
-
-        Converts JAX arrays back to NumPy arrays for CPU-side operations.
-
-        Args:
-            dev: DeviceSequenceState containing updated arrays from device execution.
-
-        Returns:
-            A new SequenceBuffer with arrays updated from the device state
-            while preserving Python bookkeeping structures.
-
-        Note:
-            This converts JAX arrays back to NumPy, bringing data back to CPU.
-        """
-
-        def to_numpy(arr):
-            np_arr = np.asarray(jax.device_get(arr))
-            if not np_arr.flags.writeable:
-                np_arr = np_arr.copy()
-            return np_arr
-
-        return self._with_updates(
-            token_ids=to_numpy(dev.token_ids),
-            num_tokens=to_numpy(dev.num_tokens),
-            num_tokens_no_spec=to_numpy(dev.num_tokens_no_spec),
-            num_prompt_tokens=to_numpy(dev.num_prompt_tokens),
-            num_computed_tokens=to_numpy(dev.num_computed_tokens),
-            temperature=to_numpy(dev.temperature),
-            top_p=to_numpy(dev.top_p),
-            top_k=to_numpy(dev.top_k),
-            min_p=to_numpy(dev.min_p),
-            frequency_penalties=to_numpy(dev.frequency_penalties),
-            presence_penalties=to_numpy(dev.presence_penalties),
-            repetition_penalties=to_numpy(dev.repetition_penalties),
-            page_table=dev.page_table,
-            allowed_token_ids_mask=to_numpy(dev.allowed_token_ids_mask) if dev.allowed_token_ids_mask is not None else None,
-        )
 
     def attach_sharding(self, sharding: jax.sharding.Sharding) -> "SequenceBuffer":
-        """Apply sharding only to page_table (arrays are NumPy, device placement handled by to_device_state)."""
+        """Apply sharding only to page_table (arrays are NumPy, stay on CPU)."""
 
         def put(a):
             return jax.device_put(a, sharding)
@@ -1237,64 +1161,6 @@ class SequenceBuffer:
         return self._with_updates(
             page_table=jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table),
         )
-
-
-@auto_pytree(frozen=True)
-class DeviceSequenceState:
-    """Device-compatible state for sequence processing.
-
-    A PyTree containing only array data suitable for device operations.
-    This class excludes Python containers to enable efficient device execution.
-
-    Attributes:
-        token_ids: Token IDs for all requests [max_num_reqs, max_model_len].
-        num_tokens: Total tokens per request [max_num_reqs].
-        num_tokens_no_spec: Tokens excluding speculative decoding [max_num_reqs].
-        num_prompt_tokens: Number of prompt tokens [max_num_reqs].
-        num_computed_tokens: Tokens already processed [max_num_reqs].
-        temperature: Sampling temperature [max_num_reqs].
-        top_p: Top-p sampling values [max_num_reqs].
-        top_k: Top-k sampling values [max_num_reqs].
-        min_p: Minimum probability threshold [max_num_reqs].
-        frequency_penalties: Frequency penalty values [max_num_reqs].
-        presence_penalties: Presence penalty values [max_num_reqs].
-        repetition_penalties: Repetition penalty values [max_num_reqs].
-        page_table: Page table for KV cache management.
-        allowed_token_ids_mask: Optional mask for allowed tokens.
-
-    Note:
-        Use SequenceBuffer.to_device_state()/from_device_state() to convert
-        between this representation and the full SequenceBuffer.
-    """
-
-    token_ids: jax.Array
-    num_tokens: jax.Array
-    num_tokens_no_spec: jax.Array
-    num_prompt_tokens: jax.Array
-    num_computed_tokens: jax.Array
-
-    temperature: jax.Array
-    top_p: jax.Array
-    top_k: jax.Array
-    min_p: jax.Array
-    frequency_penalties: jax.Array
-    presence_penalties: jax.Array
-    repetition_penalties: jax.Array
-
-    page_table: MultiGroupPageTable
-
-    allowed_token_ids_mask: jax.Array | None = None
-
-    def with_updates(self, **kwargs) -> DeviceSequenceState:
-        """Create a new DeviceSequenceState with updated fields.
-
-        Args:
-            **kwargs: Fields to update with new values.
-
-        Returns:
-            A new DeviceSequenceState with the specified updates.
-        """
-        return replace(self, **kwargs)
 
 
 @auto_pytree

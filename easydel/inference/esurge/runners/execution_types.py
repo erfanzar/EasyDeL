@@ -33,10 +33,23 @@ from eformer.pytree import auto_pytree
 
 from easydel.layers.caching import RaggedPagesCache
 
-from .sequence_buffer import DeviceSequenceState
-
 if typing.TYPE_CHECKING:
     pass
+
+
+@auto_pytree(frozen=True)
+class MinimalDeviceState:
+    """Minimal device state for sampler updates only.
+
+    Contains only the fields that must be updated on device during sampling.
+    All other metadata stays on CPU in SequenceBuffer as NumPy arrays.
+
+    Attributes:
+        token_ids: Token IDs buffer [max_num_reqs, max_model_len] for sampler updates.
+        num_tokens: Total token count per request [max_num_reqs] for sampler increments.
+    """
+    token_ids: jax.Array
+    num_tokens: jax.Array
 
 
 @auto_pytree(frozen=True)
@@ -87,8 +100,8 @@ class StepFunctionInputs:
     via JAX pytree transformations.
 
     Attributes:
-        device_state: Device-side sequence state containing token buffers, position
-            tracking, page allocation maps, and request metadata.
+        device_state: Minimal device state containing only token_ids and num_tokens
+            for sampler updates. All other metadata stays on CPU.
         kv_pages: Paged key-value cache storage for attention computation.
             Uses ragged paging for memory-efficient caching across variable-length
             sequences.
@@ -101,6 +114,7 @@ class StepFunctionInputs:
             [max_num_reqs]. Inactive requests are skipped during processing.
         rng_key: JAX random key for stochastic sampling operations. Split and
             updated at each step for proper random state management.
+        batch_metadata: Pre-computed batch metadata prepared from CPU arrays.
 
     Note:
         All arrays are device-resident. The structure is frozen for immutability
@@ -108,16 +122,17 @@ class StepFunctionInputs:
 
     Example:
         >>> inputs = StepFunctionInputs(
-        ...     device_state=state,
+        ...     device_state=MinimalDeviceState(...),
         ...     kv_pages=cache,
         ...     scheduled_full=jnp.array([4, 8, 2]),
         ...     req_num_tokens_full=jnp.array([512, 256, 128]),
         ...     active_mask_full=jnp.array([True, True, False]),
         ...     rng_key=jax.random.PRNGKey(0),
+        ...     batch_metadata=metadata,
         ... )
     """
 
-    device_state: DeviceSequenceState
+    device_state: MinimalDeviceState
     kv_pages: RaggedPagesCache
     scheduled_full: jax.Array  # [max_num_reqs] int32
     req_num_tokens_full: jax.Array  # [max_num_reqs] int32
@@ -134,8 +149,8 @@ class StepFunctionOutputs:
     structure, enabling clean return semantics and automatic sharding propagation.
 
     Attributes:
-        device_state: Updated device-side sequence state reflecting new token
-            generation, page allocations, and position updates.
+        device_state: Updated minimal device state (token_ids, num_tokens) reflecting
+            new token generation from sampler.
         kv_pages: Updated key-value cache pages with newly computed attention states.
         input_ids_buf: Updated input token buffer [max_num_tokens]. May contain
             newly sampled tokens appended for next iteration.
@@ -171,7 +186,7 @@ class StepFunctionOutputs:
         >>> updated_cache = outputs.kv_pages
     """
 
-    device_state: DeviceSequenceState
+    device_state: MinimalDeviceState
     kv_pages: RaggedPagesCache
     input_ids_buf: jax.Array
     position_ids_buf: jax.Array

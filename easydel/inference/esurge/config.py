@@ -60,6 +60,9 @@ class SchedulerConfig:
     token_safety_margin: int | None = None
     """Reserved tokens per running request to prevent over-allocation."""
 
+    max_num_seq_buckets: tuple[int, ...] | None = None
+    """Optional explicit request-capacity buckets (e.g., (8, 16, 32, 64))."""
+
 
 @dataclass
 class CacheConfig:
