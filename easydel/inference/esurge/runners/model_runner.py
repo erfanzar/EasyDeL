@@ -805,6 +805,7 @@ class eSurgeRunner:
                 self.pages_tables_buf,
                 _hidden_states,
                 _logits,
+                metrics,
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 scheduled_full_cpu=scheduled_full_cpu,
@@ -883,11 +884,19 @@ class eSurgeRunner:
             )
 
         total_time = time.time() - execution_start_time
+        exec_took = metrics["exec_time"]
+        sample_took = metrics["sample_time"]
+        prep_took = metrics["prep_time"]
+        buckets_processed = metrics["buckets_processed"]
+
         self.log_it(
             f"[execute] "
             f"step={total_step_time:.3f}s "
-            f"sync={total_sync_time:.3f}s "
-            f"post={total_post_proc_time:.3f}s "
+            f"model_fwd={exec_took:.3f}s "
+            f"sample={sample_took:.3f}s "
+            f"prep={sample_took:.3f}s "
+            f"post={prep_took:.3f}s "
+            f"p-bs={buckets_processed}s "
             f"upd_states={updating_states_time:.3f}s "
             f"total={total_time:.3f}s"
         )

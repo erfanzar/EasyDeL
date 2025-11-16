@@ -580,8 +580,13 @@ class ExecutionManager:
         start_sample = time.time()
         device_state, self.rng_key, out_tokens_full, valid_mask_full = sampler_fn(*sampler_inputs)
         sample_took = time.time() - start_sample
-
-        self.log_it(f"model={exec_took} sampler={sample_took} prep={prep_took}")
+        buckets_processed = batch_metadata.input_ids_buf.shape[-1]
+        metrics = {
+            "exec_time": exec_took,
+            "sample_time": sample_took,
+            "prep_time": prep_took,
+            "buckets_processed": buckets_processed,
+        }
 
         query_start_loc_buf = batch_metadata.query_start_loc
         seq_lens_buf = batch_metadata.seq_lens
@@ -600,6 +605,7 @@ class ExecutionManager:
             pages_tables_buf,
             hidden_states,
             logits,
+            metrics,
         )
 
     def compile(
@@ -1145,6 +1151,7 @@ class ExecutionManager:
 
             # MinimalDeviceState is a frozen pytree, use replace to create updated version
             from dataclasses import replace
+
             new_state = replace(device_state, token_ids=token_ids, num_tokens=num_tokens)
             out_tokens = jnp.where(valid_mask_full, sampled_flat, -1)
             return new_state, rng_key, out_tokens, valid_mask_full
