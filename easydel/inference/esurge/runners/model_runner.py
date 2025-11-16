@@ -773,12 +773,12 @@ class eSurgeRunner:
             padded_num_reqs = current_bucket  # Use bucket size for compilation lookup
 
             if num_reqs > 0:
-                # Keep scheduled and active_mask as CPU arrays, sized to current bucket
-                scheduled_full_cpu = np.zeros(current_bucket, dtype=np.int32)
+                # Keep scheduled and active_mask as CPU arrays
+                scheduled_full_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
                 scheduled_full_cpu[: len(scheduled_list)] = scheduled_list
 
-                req_num_tokens_np = np.zeros(current_bucket, dtype=np.int32)
-                active_mask_full_cpu = np.zeros(current_bucket, dtype=bool)
+                req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+                active_mask_full_cpu = np.zeros(self.max_num_reqs, dtype=bool)
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         rs = self.requests.get(rid)
@@ -808,7 +808,7 @@ class eSurgeRunner:
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 scheduled_full_cpu=scheduled_full_cpu,
-                req_num_tokens_full=self.req_num_tokens_full_buf[:current_bucket],  # SLICE to bucket size
+                req_num_tokens_full=self.req_num_tokens_full_buf,
                 active_mask_full_cpu=active_mask_full_cpu,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
@@ -821,9 +821,6 @@ class eSurgeRunner:
                 top_k_cpu=self.sequence_buffer.top_k,
                 min_p_cpu=self.sequence_buffer.min_p,
                 page_table_cpu=page_table_cpu,
-                query_start_loc_buf=self.query_start_loc_buf[:current_bucket+1],  # SLICE
-                seq_lens_buf=self.seq_lens_buf[:current_bucket],  # SLICE
-                pages_tables_buf=self.pages_tables_buf,  # Already correct size
             )
 
             # account for device time
