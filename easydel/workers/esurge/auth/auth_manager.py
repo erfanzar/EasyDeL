@@ -107,7 +107,10 @@ class EnhancedApiKeyManager:
         # Reverse lookup: raw_key -> hashed_key (only used during validation)
         self._raw_to_hash_cache: dict[str, str] = {}
 
-        self._lock = threading.Lock()
+        # Auto-save routines call back into helper methods that also grab this lock,
+        # so we need a re-entrant lock to prevent deadlocks when the same thread
+        # re-acquires it during persistence.
+        self._lock = threading.RLock()
 
         # Rate limiting tracking: key_id -> time window -> deque of timestamps
         self._rate_limit_windows: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
