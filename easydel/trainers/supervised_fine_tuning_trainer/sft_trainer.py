@@ -310,13 +310,25 @@ class SFTTrainer(Trainer):
                             )
                         output = processed
                     else:
-                        output = processing_class(
-                            text=example[dataset_text_field],
-                            return_dict=True,
-                            return_attention_mask=True,
-                            truncation=True,
-                            max_length=self.arguments.max_sequence_length,
-                        )
+                        try:
+                            output = processing_class(
+                                text=example[dataset_text_field],
+                                return_dict=True,
+                                return_attention_mask=True,
+                                truncation=True,
+                                max_length=self.arguments.max_sequence_length,
+                            )
+                        except TypeError as e:
+                            if "keyword argument 'return_dict'" in str(e):
+                                output = processing_class(
+                                    text=example[dataset_text_field],
+                                    return_attention_mask=True,
+                                    truncation=True,
+                                    max_length=self.arguments.max_sequence_length,
+                                )
+                            else:
+                                raise e
+
                 return output
 
             dataset = dataset.map(
