@@ -85,7 +85,7 @@ The dashboard provides:
 # limitations under the License.
 
 import ray
-from eformer.executor.ray import TpuAcceleratorConfig, execute_multislice_resumable
+from eformer.executor.ray import TpuAcceleratorConfig, autoscale_execute_resumable
 
 BUCKET_PATH = "gs://your-bucket/easydel-checkpoints"
 
@@ -104,7 +104,7 @@ execution_env = {
 
 ray.init(runtime_env=execution_env)
 
-@execute_multislice_resumable(TpuAcceleratorConfig("v4-512", 4, execution_env=execution_env))
+@autoscale_execute_resumable(TpuAcceleratorConfig("v4-512", 4, execution_env=execution_env))
 def health_check():
     import jax
     print(f"Available devices: {jax.local_devices()}")
@@ -182,7 +182,7 @@ Key environment variables for EasyDeL/eFormer:
    - Use model parallelism with EasyScaler
 
 4. **Preemption Handling**
-   - Use `execute_multislice_resumable` decorator
+   - Use `autoscale_execute_resumable` decorator
    - Configure checkpoint saving frequency
    - Implement automatic restart logic
 
