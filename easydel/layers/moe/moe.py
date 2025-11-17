@@ -59,6 +59,7 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
+import jax.extend
 from eformer import common_types
 from eformer.loggings import get_logger
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
@@ -801,7 +802,7 @@ class BaseMoeModule(nn.Module, ABC):
         select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
         refine_weights_hook = self.moe_hooks.refine_weights_hook if self.moe_hooks else None
         refine_inputs_hook = self.moe_hooks.refine_inputs_hook if self.moe_hooks else None
-        BS, SQLN, HD = hidden_state.shape
+        _BS, _SQLN, HD = hidden_state.shape
         prein_gate_logits = gate_layer(hidden_state.reshape(-1, HD))
         gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
 
@@ -845,6 +846,13 @@ class BaseMoeModule(nn.Module, ABC):
         wubps = self.get_moe_spec("column", use_expert_tensor, is_bias=True) if wu_bias is not None else None
         wdbps = self.get_moe_spec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
 
+        gmm_kws = {"preferred_element_type": jnp.bfloat16}
+        if self.config.moe_force_xla_gmm:
+            gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
+        else:
+            if jax.default_backend() == "tpu":
+                gmm_kws.update(platform="pallas")
+
         @partial(
             shard_map,
             mesh=expert_mesh,  # Use 3D expert_mesh instead of 5D mesh
@@ -864,9 +872,6 @@ class BaseMoeModule(nn.Module, ABC):
         ):
             batch_size, sequence_length, _ = x.shape
             expert_shard_id = jax.lax.axis_index(expert_axis_name)
-            gmm_kws = {"preferred_element_type": jnp.bfloat16}
-            if self.config.moe_force_xla_gmm:
-                gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
 
             if self.config.use_ring_of_experts:
                 x, gate_logits = tuple(
