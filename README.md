@@ -42,15 +42,15 @@ TPU/GPU clusters.
 - **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, and OpenAI-compatible API
 - **Full Multimodal Support**: Vision-language models (LLaVA, Qwen2-VL, Llama4-Vision), speech recognition (Whisper), and diffusion models
 - **🚀 TPU & GPU Optimized**: Triton (GPU) and Pallas (TPU) kernel options where available
-- **💜 Hackable Like Transformers, MaxText-Inspired**: Easy to understand and modify like HuggingFace Transformers, with MaxText-style optimizations in pure JAX
+- **💜 Hackable Like Transformers, as fast as MaxText**: Easy to understand and modify like HuggingFace Transformers, with optimizations in Pallas/Triton/CUDA.
 
 ## Performance & Hackability
 
 EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem:
 
-### 🚀 MaxText-Inspired Performance
+### 🚀 Notch Performance
 
-- Triton and Pallas attention kernels plus sharding axes for DP/FSDP/TP/EP
+- Triton and Pallas kernels plus dynamic sharding axes for DP/FSDP/TP/EP
 - Paged KV cache and continuous batching in eSurge for high-throughput inference
 - Gradient checkpointing options and experimental quantization to manage memory
 - Sharding-aware training utilities for TPU/GPU clusters
