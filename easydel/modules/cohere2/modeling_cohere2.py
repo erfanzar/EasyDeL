@@ -33,7 +33,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -79,12 +79,11 @@ class Cohere2LayerNorm(nn.Module):
         self.eps = eps
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.kernel = nn.Param(
-            nn.initializers.ones(
-                key=rngs.params(),
-                shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
-                dtype=self.param_dtype,
-            ),
+        self.kernel = ArrayParam.bound(
+            shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
+            dtype=self.param_dtype,
+            init_fn=nn.initializers.ones,
+            key=rngs.params(),
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -184,6 +183,8 @@ class Cohere2Attention(UnifiedAttention):
 
 
 class Cohere2MLP(nn.Module):
+    """Feed-forward network used in Cohere v2 decoder layers."""
+
     def __init__(
         self,
         config: Cohere2Config,
@@ -241,6 +242,8 @@ class Cohere2MLP(nn.Module):
 
 
 class Cohere2Block(nn.Module):
+    """Cohere v2 transformer block combining attention and MLP."""
+
     def __init__(
         self,
         config: Cohere2Config,
@@ -366,6 +369,8 @@ class Cohere2Block(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Cohere2Config, model_type="cohere2")
 class Cohere2Model(EasyDeLBaseModule):
+    """Decoder-only Cohere v2 model with embeddings, blocks, and final norm."""
+
     def __init__(
         self,
         config: Cohere2Config,

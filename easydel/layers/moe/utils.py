@@ -1162,7 +1162,10 @@ def get_moe_partition_spec(
     else:
         # Standard mode: experts on EP, features on TP
         if is_bias:
-            return jax.sharding.PartitionSpec(expert_place, None)
+            if direction == "column":
+                return jax.sharding.PartitionSpec(expert_place, None)
+            else:
+                return jax.sharding.PartitionSpec(expert_place, tensor_axis_name)
         else:
             if direction == "column":
                 # Column-wise: [expert, None, tp] for wi/wu

@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -142,7 +142,12 @@ class Gemma3RMSNorm(nn.Module):
         self.epsilon = self.config.rms_norm_eps if epsilon is None else epsilon
         self.param_dtype = param_dtype
         dim = self.config.hidden_size if dim is None else dim
-        self.kernel = nn.Param(jnp.ones(dim, dtype=param_dtype))
+        self.kernel = ArrayParam.bound(
+            shape=(dim,),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
     def _norm(self, x: jax.Array) -> jax.Array:
         return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
@@ -454,6 +459,8 @@ class Gemma3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3TextModel(EasyDeLBaseModule):
+    """Decoder-only Gemma3 text transformer with embeddings and stacked decoder layers."""
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -780,6 +787,8 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3ForSequenceClassification(EasyDeLBaseModule):
+    """Text-only Gemma3 backbone with a classification head for sequence tasks."""
+
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -919,14 +928,14 @@ class Gemma3MultiModalProjector(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        self.mm_input_projection_weight = nn.Param(
-            jnp.zeros(
-                (
-                    config.get_text_config().hidden_size,
-                    config.vision_config.hidden_size,
-                ),
-                dtype=param_dtype,
-            )
+        self.mm_input_projection_weight = ArrayParam.bound(
+            shape=(
+                config.get_text_config().hidden_size,
+                config.vision_config.hidden_size,
+            ),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            key=None,
         )
         self.mm_soft_emb_norm = Gemma3RMSNorm(
             config.vision_config,
@@ -973,6 +982,8 @@ class Gemma3MultiModalProjector(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma3Config, model_type="gemma3")
 class Gemma3Model(EasyDeLBaseModule):
+    """Multimodal Gemma3 stack combining a vision tower, projector, and language model."""
+
     def __init__(
         self,
         config: Gemma3Config,
@@ -1197,6 +1208,8 @@ class Gemma3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Gemma3Config, model_type="gemma3")
 class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
+    """Gemma3 multimodal language model for conditional generation."""
+
     loss_type = "ForCausalLM"
 
     def __init__(

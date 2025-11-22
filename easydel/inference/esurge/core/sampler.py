@@ -34,9 +34,7 @@ from .binary_search import (
     apply_min_p_mask,
     apply_penalties,
     apply_topk_mask,
-    apply_topk_mask_bf16,
     apply_topp_mask,
-    apply_topp_mask_bf16,
 )
 from .sampling_metadata import SamplingMetadata
 
@@ -73,19 +71,17 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
         - Binary search: O(32 reductions) for top-k/p vs O(V log V) for sorting
         - Vectorized: Per-sample parameters via vmap
     """
-    logits = logits.astype("f4")
+    # Convert to float32 for numerical stability in sampling operations
+    logits = logits.astype(jnp.float32)
 
-    use_bf16_path = logits.dtype == jnp.bfloat16
+    min_val = -1e10
 
-    topp_fn = apply_topp_mask_bf16 if use_bf16_path else apply_topp_mask
-    topk_fn = apply_topk_mask_bf16 if use_bf16_path else apply_topk_mask
-    min_val = jnp.finfo(logits.dtype).min
     # Top-k filtering
     need_top_k = jnp.any(sampling_metadata.top_ks > 0)
 
     def apply_topk(legi):
         def topk_per_sample(logits_i, k_i):
-            return lax.cond(k_i > 0, lambda: topk_fn(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
+            return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
 
@@ -96,7 +92,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
 
     def apply_topp(legi):
         def topp_per_sample(logits_i, p_i):
-            return lax.cond(p_i < 1.0, lambda: topp_fn(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
+            return lax.cond(p_i < 1.0, lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
 

@@ -25,7 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.caching.mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
@@ -34,11 +34,14 @@ from .mamba2_configuration import Mamba2Config as Mamba2Config
 
 
 def init_to_value(x, dtype):
+    """Return a parameter initializer that fills tensors with a fixed value."""
     return lambda *_: x.astype(dtype)
 
 
 @auto_pytree
 class Mamba2Output(BaseModelOutput):
+    """Output type for the base Mamba2 model including cache state."""
+
     last_hidden_state: chex.Array = None
     cache_params: Mamba2Cache | None = None
     hidden_states: tuple[chex.Array] | None = None
@@ -46,6 +49,8 @@ class Mamba2Output(BaseModelOutput):
 
 @auto_pytree
 class Mamba2CausalLMOutput(BaseModelOutput):
+    """Causal language modeling output with logits and cached state."""
+
     logits: chex.Array = None
     cache_params: Mamba2Cache | None = None
     hidden_states: tuple[chex.Array] | None = None
@@ -107,6 +112,7 @@ _T = tp.TypeVar("_T")
 def create_tuple_parser(
     n: int,
 ) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
+    """Ensure a scalar or sequence is expanded into a tuple of length ``n``."""
     def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
         if isinstance(x, tp.Sequence):
             if len(x) == n:
@@ -120,6 +126,8 @@ def create_tuple_parser(
 
 
 class Conv1D(nn.Module):
+    """Lightweight 1D convolution wrapper used by the Mamba2 mixer."""
+
     def __init__(
         self,
         features: int,
@@ -136,21 +144,19 @@ class Conv1D(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.kernel = nn.Param(
-            nn.initializers.lecun_normal(dtype=param_dtype)(
-                rngs.params(),
-                (kernel_size, 1, features),
-                param_dtype,
-            ),
+        self.kernel = ArrayParam.bound(
+            shape=(kernel_size, 1, features),
+            dtype=param_dtype,
+            init_fn=nn.initializers.lecun_normal(dtype=param_dtype),
+            key=rngs.params(),
         )
 
         if use_bias:
-            self.bias = nn.Param(
-                nn.initializers.zeros(
-                    rngs.params(),
-                    shape=(features,),
-                    dtype=param_dtype,
-                )
+            self.bias = ArrayParam.bound(
+                shape=(features,),
+                dtype=param_dtype,
+                init_fn=nn.initializers.zeros,
+                key=rngs.params(),
             )
 
         self.features = features
@@ -188,6 +194,8 @@ class Conv1D(nn.Module):
 
 
 class MambaRMSNormGated(nn.Module):
+    """RMSNorm variant that optionally gates inputs before normalization."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -197,8 +205,11 @@ class MambaRMSNormGated(nn.Module):
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
-        self.kernel = nn.Param(
-            jnp.ones((self.hidden_size,), self.dtype),
+        self.kernel = ArrayParam.bound(
+            shape=(self.hidden_size,),
+            dtype=self.dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
         )
 
     def __call__(self, hidden_states, gate=None):
@@ -216,6 +227,8 @@ class MambaRMSNormGated(nn.Module):
 
 
 class Mamba2Mixer(nn.Module):
+    """Selective state space mixer powering the Mamba2 token mixing step."""
+
     def __init__(
         self,
         config: Mamba2Config,
@@ -295,14 +308,28 @@ class Mamba2Mixer(nn.Module):
         )
 
         inv_dt = dt + jnp.log(-jnp.expm1(-dt))
-        self.dt_bias = nn.Param(inv_dt.astype(self.param_dtype))
-
-        self.A_log = nn.Param(
-            jnp.log(
-                jnp.arange(1, self.num_heads + 1, dtype=jnp.float32),
-            ).astype(self.param_dtype),
+        self.dt_bias = ArrayParam.bound(
+            shape=inv_dt.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: inv_dt.astype(dtype),
+            key=None,
+            value=inv_dt.astype(self.param_dtype),
         )
-        self.D = nn.Param(jnp.ones(self.num_heads, dtype=self.param_dtype))
+
+        self.A_log = ArrayParam.bound(
+            shape=(self.num_heads,),
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.log(
+                jnp.arange(1, self.num_heads + 1, dtype=jnp.float32)
+            ).astype(dtype),
+            key=None,
+        )
+        self.D = ArrayParam.bound(
+            shape=(self.num_heads,),
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
         self.norm = MambaRMSNormGated(
             self.intermediate_size,
@@ -571,6 +598,8 @@ class Mamba2Mixer(nn.Module):
 
 
 class Mamba2Block(nn.Module):
+    """Single Mamba2 layer combining normalization, mixer, and residual path."""
+
     def __init__(
         self,
         config: Mamba2Config,
@@ -633,6 +662,8 @@ class Mamba2Block(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mamba2Config, model_type="mamba2")
 class Mamba2Model(EasyDeLBaseModule):
+    """Stacked Mamba2 mixer blocks with token embeddings and final norm."""
+
     def __init__(
         self,
         config: Mamba2Config,
@@ -754,6 +785,8 @@ class Mamba2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
 class Mamba2ForCausalLM(EasyDeLBaseModule):
+    """Mamba2 language model with tied backbone and projection head."""
+
     def __init__(
         self,
         config: Mamba2Config,

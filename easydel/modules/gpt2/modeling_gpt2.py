@@ -46,7 +46,7 @@ from easydel.infra.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     DecoderLayerOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -93,14 +93,19 @@ class Conv1D(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.kernel = nn.Param(
-            nn.initializers.normal(stddev=0.02)(rngs.params(), (out_features, in_features)),
+        self.kernel = ArrayParam.bound(
+            shape=(out_features, in_features),
+            dtype=param_dtype,
+            init_fn=nn.initializers.normal(stddev=0.02),
+            key=rngs.params(),
         )
 
-        self.bias = nn.Param(
-            nn.initializers.zeros(
-                rngs.params(),
-                (in_features,),
+        self.bias = (
+            ArrayParam.bound(
+                shape=(in_features,),
+                dtype=param_dtype,
+                init_fn=nn.initializers.zeros,
+                key=rngs.params(),
             )
             if use_bias
             else None

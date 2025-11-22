@@ -85,6 +85,8 @@ class LlavaCausalLMOutputWithPast(ModelOutput):
 
 
 class LlavaMultiModalProjector(nn.Module):
+    """Projects visual features into the LLaVA language embedding space."""
+
     def __init__(
         self,
         config: LlavaConfig,

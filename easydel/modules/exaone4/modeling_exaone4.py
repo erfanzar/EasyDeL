@@ -50,6 +50,8 @@ from .exaone4_configuration import Exaone4Config
 
 
 class Exaone4MLP(nn.Module):
+    """Feed-forward network used inside Exaone4 decoder layers."""
+
     def __init__(
         self,
         config: Exaone4Config,
@@ -137,6 +139,8 @@ class Exaone4MLP(nn.Module):
 
 
 class Exaone4Attention(UnifiedAttention):
+    """Multi-head attention block configured for Exaone4."""
+
     def __init__(
         self,
         config: Exaone4Config,
@@ -243,6 +247,8 @@ class Exaone4Attention(UnifiedAttention):
 
 
 class Exaone4DecoderLayer(nn.Module):
+    """Single Exaone4 decoder layer with attention and MLP."""
+
     def __init__(
         self,
         config: Exaone4Config,
@@ -387,6 +393,8 @@ class Exaone4DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Exaone4Config, model_type="exaone4")
 class Exaone4Model(EasyDeLBaseModule):
+    """Exaone4 decoder stack with embeddings, transformer layers, and final norm."""
+
     def __init__(
         self,
         config: Exaone4Config,

@@ -34,7 +34,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -65,7 +65,12 @@ class GemmaRMSNorm(nn.Module):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
-        self.kernel = nn.Param(jnp.ones(self.config.hidden_size, dtype=dtype))
+        self.kernel = ArrayParam.bound(
+            shape=(self.config.hidden_size,),
+            dtype=dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -353,6 +358,8 @@ class GemmaDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GemmaConfig, model_type="gemma")
 class GemmaModel(EasyDeLBaseModule):
+    """Decoder-only Gemma transformer wiring embeddings, decoder blocks, and output norm."""
+
     def __init__(
         self,
         config: GemmaConfig,
@@ -648,6 +655,8 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GemmaConfig, model_type="gemma")
 class GemmaForSequenceClassification(EasyDeLBaseModule):
+    """Gemma encoder stack with a linear classification head for sequence labels."""
+
     def __init__(
         self,
         config: GemmaConfig,

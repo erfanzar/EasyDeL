@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -63,6 +63,8 @@ from .deepseek_configuration import DeepseekV2Config
 
 
 class DeepseekV2MLPMoE(nn.Module):
+    """Mixture-of-experts feed-forward used in DeepSeek V2 MoE layers."""
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -146,6 +148,8 @@ class DeepseekV2MLPMoE(nn.Module):
 
 
 class DeepseekV2MLP(nn.Module):
+    """Standard DeepSeek V2 feed-forward block for dense layers."""
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -196,6 +200,8 @@ class DeepseekV2MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """Router that scores tokens and selects experts for DeepSeek V2 MoE blocks."""
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -224,10 +230,11 @@ class MoEGate(nn.Module):
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
-        self.kernel = nn.Param(
-            nn.initializers.kaiming_uniform(dtype=self.param_dtype)(
-                rngs.params(), (self.n_routed_experts, self.gating_dim)
-            ),
+        self.kernel = ArrayParam.bound(
+            shape=(self.n_routed_experts, self.gating_dim),
+            dtype=self.param_dtype,
+            init_fn=nn.initializers.kaiming_uniform(dtype=self.param_dtype),
+            key=rngs.params(),
         )
         self.dp = nn.Dropout(0, rngs=rngs)
 
@@ -271,6 +278,8 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(BaseMoeModule):
+    """Wraps gating and experts to apply DeepSeek V2 mixture-of-experts feed-forward."""
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -540,6 +549,8 @@ class DeepseekV2Attention(UnifiedAttention):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    """Single DeepSeek V2 transformer block with MLA attention and optional MoE MLP."""
+
     def __init__(
         self,
         config: DeepseekV2Config,
@@ -690,6 +701,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV2Config, model_type="deepseek_v2")
 class DeepseekV2Model(EasyDeLBaseModule):
+    """DeepSeek V2 decoder stack connecting embeddings, decoder layers, and final norm."""
+
     def __init__(
         self,
         config: DeepseekV2Config,

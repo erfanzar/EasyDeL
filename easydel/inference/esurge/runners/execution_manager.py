@@ -242,7 +242,6 @@ class ExecutionManager:
         >>> # Initialize manager
         >>> executor = ExecutionManager(
         ...     model=model,
-        ...     mesh=mesh,
         ...     kv_pages=cache,
         ...     use_aot_forward=True,
         ...     min_input_pad=8,
@@ -275,8 +274,6 @@ class ExecutionManager:
     def __init__(
         self,
         model: EasyDeLBaseModule,
-        mesh: jax.sharding.Mesh,
-        kv_pages: RaggedPagesCache,
         use_aot_forward: bool = True,
         min_input_pad: int = 8,
         max_model_len: int = 2**13,
@@ -290,7 +287,6 @@ class ExecutionManager:
         Args:
             model: The EasyDeL model instance.
             mesh: JAX sharding mesh for distributed execution.
-            kv_pages: Pages cache for KV cache management.
             use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
                 execution. When True (default), functions are pre-compiled for better
                 performance. When False, uses Just-In-Time (JIT) compilation with
@@ -303,8 +299,8 @@ class ExecutionManager:
         """
         logger.info(f"initializing eSurge-ExecutionManager Version {metadata.version}")
         self.model = model
-        self.mesh = mesh
-        self.kv_pages = kv_pages
+        self.mesh = model.mesh
+        self.kv_pages = model.init_ragged_pages(metadata)
         self.use_aot_forward = use_aot_forward
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
@@ -318,7 +314,7 @@ class ExecutionManager:
 
         self.log_it = logger.info if verbose else logger.debug
 
-        self._empty_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        self._empty_sharding = jax.NamedSharding(model.mesh, jax.sharding.PartitionSpec())
 
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
 
@@ -346,7 +342,9 @@ class ExecutionManager:
             self._slices_per_page = metadata.num_slices_per_kv_cache_update_page
             self._max_padded_slices = int(metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
             self._slot_mapping_cpu = numpy.full(
-                (3, self._max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=numpy.int32
+                (3, self._max_padded_slices),
+                SLOT_MAPPING_PADDING_VAL,
+                dtype=numpy.int32,
             )
             self._slot_mapping_indices = numpy.arange(self._max_padded_slices, dtype=numpy.int32)
         else:
@@ -406,7 +404,6 @@ class ExecutionManager:
         """
 
         if model is not None:
-            logger.info("Updating ExecutionManager graphs from provided model instance")
             self.model = model
             new_graphdef, new_graphstate, new_graphother = model.split_module()
             graphdef = new_graphdef if graphdef is None else graphdef
@@ -530,6 +527,7 @@ class ExecutionManager:
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
+            padded_num_reqs_in=padded_num_reqs,
         )
         prep_took = time.time() - start_prep
 
@@ -829,6 +827,7 @@ class ExecutionManager:
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
+        padded_num_reqs_in: int,
     ) -> tuple[BatchMetadata, jax.Array, jax.Array]:
         """Precompute batch metadata using CPU-first approach.
 
@@ -844,6 +843,7 @@ class ExecutionManager:
             position_ids_buf: Position buffer (will be replaced)
             token_ids_cpu: NumPy array of token IDs [max_num_reqs, max_model_len]
             num_computed_tokens_cpu: NumPy array of computed tokens [max_num_reqs]
+            padded_num_reqs_in: Caller-selected padded request bucket
 
         Returns:
             Tuple of (BatchMetadata, input_ids_buf, position_ids_buf)
@@ -900,10 +900,12 @@ class ExecutionManager:
         # Logits indices on CPU
         self._logits_indices_cpu[:num_requests] = self._query_start_loc_cpu[1 : num_requests + 1] - 1
 
-        # Compute padded_num_reqs on CPU
+        # Compute padded_num_reqs on CPU, honoring caller-selected bucket
         nr_safe = max(num_requests, 1)
+        requested_bucket = max(int(padded_num_reqs_in), nr_safe)
         next_pow2 = 1 << (nr_safe - 1).bit_length()
-        padded_num_reqs = min(self.min_input_pad if num_requests <= self.min_input_pad else next_pow2, max_num_reqs)
+        fallback_bucket = self.min_input_pad if nr_safe <= self.min_input_pad else next_pow2
+        padded_num_reqs = min(max(requested_bucket, fallback_bucket), max_num_reqs)
 
         # Page table already on CPU
         pt_src = page_table_cpu[: min(page_table_cpu.shape[0], num_reqs_max_model_len), :]
@@ -915,11 +917,8 @@ class ExecutionManager:
         if self._use_request_distribution:
             active_num_computed = numpy.where(mask_reqs, num_computed_tokens_cpu, 0)
             is_decode = (scheduled == 1) & (active_num_computed > 0)
-            is_chunked_prefill = (scheduled > 1) & (active_num_computed > 0)
             decode_count = int(numpy.sum(is_decode))
-            chunked_prefill_count = int(numpy.sum(is_chunked_prefill))
-            boundary = min(decode_count + chunked_prefill_count, num_requests)
-            request_distribution = numpy.array([decode_count, boundary, num_requests], dtype=numpy.int32)
+            request_distribution = numpy.array([decode_count, decode_count, num_requests], dtype=numpy.int32)
 
         slot_mapping_cpu = None
         num_kv_update_cpu = None
@@ -1277,7 +1276,7 @@ class ExecutionManager:
         """
 
         # Create temporary buffer to generate dummy inputs
-        temp_buffer = SequenceBuffer.create(
+        temp_buffer = SequenceBuffer(
             max_num_reqs=max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
@@ -1301,7 +1300,7 @@ class ExecutionManager:
         position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 
         # Get page table as CPU array
-        page_table_cpu_dummy = numpy.asarray(jax.device_get(temp_buffer.page_table[0].get_array()))
+        page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
 
         dummy_metadata, input_ids_buf, position_ids_buf = self.prepare_batch_metadata(
             num_tokens_static=num_tokens,
@@ -1316,6 +1315,7 @@ class ExecutionManager:
             top_k_cpu=temp_buffer.top_k,
             min_p_cpu=temp_buffer.min_p,
             page_table_cpu=page_table_cpu_dummy,
+            padded_num_reqs_in=padded_num_reqs,
         )
 
         # Convert to device for StepFunctionInputs

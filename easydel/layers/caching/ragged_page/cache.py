@@ -272,7 +272,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
                 self.num_pages,
                 self.page_size,
                 self.storage_num_kv_groups * self.kv_head_packing,
-                self.storage_head_dim,
+                self.k_headdim,
             )
             axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
         else:
@@ -370,7 +370,12 @@ class RaggedPagesCacheView(BaseCacheView):
             key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
             value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
             use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
-            use_shardmap = use_kernel
+
+            if head_size != 128 and use_kernel:
+                use_kernel = False
+                use_shardmap = True
+            else:
+                use_shardmap = use_kernel
 
             def _update_fn(
                 kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],

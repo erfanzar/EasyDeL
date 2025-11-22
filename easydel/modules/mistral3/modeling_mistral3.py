@@ -42,6 +42,8 @@ logger = get_logger(__name__)
 
 @auto_pytree
 class Mistral3ModelOutput(BaseModelOutput):
+    """Model output carrying text hidden states and optional projected image embeddings."""
+
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
@@ -89,6 +91,8 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
 
 
 class Mistral3PatchMerger(nn.Module):
+    """Spatially merges neighboring vision patches before projecting into text space."""
+
     def __init__(
         self,
         config: Mistral3Config,
@@ -142,6 +146,8 @@ class Mistral3PatchMerger(nn.Module):
 
 
 class Mistral3MultiModalProjector(nn.Module):
+    """Projects vision tower features into the language model embedding space."""
+
     def __init__(
         self,
         config: Mistral3Config,
@@ -205,6 +211,8 @@ class Mistral3MultiModalProjector(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mistral3Config, model_type="mistral3")
 class Mistral3Model(EasyDeLBaseModule):
+    """Multimodal Mistral3 wrapper combining a vision tower, projector, and language model."""
+
     def __init__(
         self,
         config: Mistral3Config,

@@ -36,7 +36,6 @@ Example:
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any, cast
 
 import jax
@@ -240,92 +239,29 @@ def build_allowed_mask(allowed_ids_padded, allowed_lens, vocab_size, max_allowed
     return mask
 
 
-@auto_pytree(frozen=True)
 class SequenceBuffer:
     """Buffer for managing token sequences during generation.
 
-    Functional, dataclass-PyTree version:
-      - NumPy arrays stored as non-leaves (CPU-side, for fast metadata prep)
-      - page_table is a leaf (device-side)
-      - Python containers (lists/sets/dicts) are static (non-leaves)
-      - Mutating methods return a new SequenceBuffer instance
-      - CPU arrays stay on host; only minimal token_ids and num_tokens sent to device per step
+    Mutable, class-based design:
+      - All arrays are mutable instance attributes
+      - Methods modify state in-place (return None)
+      - NumPy arrays stay on CPU for fast metadata operations
+      - PageTable manages device-side KV cache allocations
+      - Simplified mental model: direct state mutations
 
-    Use SequenceBuffer.create(...) to construct an instance.
+    Use SequenceBuffer() constructor to create instances.
     """
 
-    # Page table (leaf - device side)
-    page_table: MultiGroupPageTable
-
-    # Static configuration (non-leaves)
-    max_num_reqs: int = field(pytree_node=False)
-    max_model_len: int = field(pytree_node=False)
-    max_num_batched_tokens: int = field(pytree_node=False)
-    vocab_size: int = field(pytree_node=False)
-
-    # NumPy arrays (non-leaves, CPU-side for fast operations)
-    token_ids: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs, max_model_len]
-    num_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    num_tokens_no_spec: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    num_prompt_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    num_computed_tokens: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-
-    temperature: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    top_p: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    top_k: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    min_p: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    frequency_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    presence_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-    repetition_penalties: Any = field(default=None, pytree_node=False)  # np.ndarray [max_num_reqs]
-
-    # Python bookkeeping (non-leaves)
-    _req_ids: list[str | None] = field(default_factory=list, pytree_node=False)
-    req_id_to_index: dict[str, int] = field(default_factory=dict, pytree_node=False)
-    req_output_token_ids: list[list[int] | None] = field(default_factory=list, pytree_node=False)
-    request_distribution: list[int] = field(default_factory=lambda: [0, 0, 0], pytree_node=False)
-    greedy_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    random_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    top_p_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    top_k_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    min_p_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    frequency_penalties_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    presence_penalties_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    repetition_penalties_reqs: set[str] = field(default_factory=set, pytree_node=False)
-    has_allowed_token_ids: set[str] = field(default_factory=set, pytree_node=False)
-
-    min_tokens: dict[int, tuple[int, set[int]]] = field(default_factory=dict, pytree_node=False)
-    generator_seeds: dict[int, int] = field(default_factory=dict, pytree_node=False)
-    num_logprobs: dict[str, int] = field(default_factory=dict, pytree_node=False)
-    num_prompt_logprobs: dict[str, int] = field(default_factory=dict, pytree_node=False)
-    in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = field(default_factory=dict, pytree_node=False)
-    logit_bias: list[dict[int, float] | None] = field(default_factory=list, pytree_node=False)
-    bad_words_token_ids: dict[int, list[list[int]]] = field(default_factory=dict, pytree_node=False)
-    allowed_token_ids_mask: Any = None  # jax.Array | None
-
-    def _compute_request_distribution(self) -> list[int]:
-        """Compute the request distribution triple [decode_only, chunked_prefill, total]."""
-        total = len(self.req_id_to_index)
-        return [0, 0, total]
-
-    def _with_updates(self, **kwargs) -> "SequenceBuffer":
-        """Return a new buffer with updated leaves and refreshed request distribution."""
-        new_buf = replace(self, **kwargs)
-        return replace(new_buf, request_distribution=new_buf._compute_request_distribution())
-
-    @classmethod
-    def create(
-        cls,
+    def __init__(
+        self,
         max_num_reqs: int,
         max_model_len: int,
         max_num_batched_tokens: int,
         vocab_size: int,
         page_sizes: list[int],
         sharding: jax.sharding.Sharding | None = None,
-    ) -> SequenceBuffer:
-        """Create a new SequenceBuffer with initialized arrays.
-
-        Factory method that creates a SequenceBuffer with all arrays
-        properly initialized to their default values.
+    ):
+        """Initialize a SequenceBuffer with all arrays and page table.
 
         Args:
             max_num_reqs: Maximum number of concurrent requests.
@@ -333,68 +269,75 @@ class SequenceBuffer:
             max_num_batched_tokens: Maximum tokens in a batch.
             vocab_size: Size of the model vocabulary.
             page_sizes: List of page sizes for the page table.
-
-        Returns:
-            A new SequenceBuffer instance with initialized arrays and page table.
-
-        Example:
-            >>> buffer = SequenceBuffer.create(
-            ...     max_num_reqs=32,
-            ...     max_model_len=2048,
-            ...     max_num_batched_tokens=4096,
-            ...     vocab_size=50000,
-            ...     page_sizes=[16, 32]
-            ... )
+            sharding: Optional JAX sharding for page table arrays.
         """
-        # Initialize all arrays as NumPy (CPU-side)
-        token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
-        num_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
-        num_tokens_no_spec = np.zeros((max_num_reqs,), dtype=np.int32)
-        num_prompt_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
-        num_computed_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
+        # Static configuration
+        self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.vocab_size = vocab_size
 
-        temperature = np.full((max_num_reqs,), -1.0, dtype=np.float32)
-        top_p = np.ones((max_num_reqs,), dtype=np.float32)
-        top_k = np.full((max_num_reqs,), vocab_size, dtype=np.int32)
-        min_p = np.zeros((max_num_reqs,), dtype=np.float32)
-        frequency_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
-        presence_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
-        repetition_penalties = np.ones((max_num_reqs,), dtype=np.float32)
+        # Initialize all NumPy arrays (CPU-side)
+        self.token_ids = np.zeros((max_num_reqs, max_model_len), dtype=np.int32)
+        self.num_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
+        self.num_tokens_no_spec = np.zeros((max_num_reqs,), dtype=np.int32)
+        self.num_prompt_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
+        self.num_computed_tokens = np.zeros((max_num_reqs,), dtype=np.int32)
 
-        page_table = MultiGroupPageTable.create(
+        self.temperature = np.full((max_num_reqs,), -1.0, dtype=np.float32)
+        self.top_p = np.ones((max_num_reqs,), dtype=np.float32)
+        self.top_k = np.full((max_num_reqs,), vocab_size, dtype=np.int32)
+        self.min_p = np.zeros((max_num_reqs,), dtype=np.float32)
+        self.frequency_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
+        self.presence_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
+        self.repetition_penalties = np.ones((max_num_reqs,), dtype=np.float32)
+
+        # Page table
+        self.page_table = MultiGroupPageTable(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             page_sizes=page_sizes,
         )
 
-        # Apply sharding only to page_table (device-side)
+        # Apply sharding only to page_table if provided
         if sharding is not None:
 
             def put(a):
                 return jax.device_put(a, sharding)
 
-            page_table = jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, page_table)
-        return cls(
-            max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            vocab_size=vocab_size,
-            token_ids=token_ids,
-            num_tokens=num_tokens,
-            num_tokens_no_spec=num_tokens_no_spec,
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=num_computed_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            frequency_penalties=frequency_penalties,
-            presence_penalties=presence_penalties,
-            repetition_penalties=repetition_penalties,
-            page_table=page_table,
-            logit_bias=[None] * max_num_reqs,
-        )
+            self.page_table = jax.tree_util.tree_map(
+                lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table
+            )
+
+        # Python bookkeeping
+        self._req_ids: list[str | None] = []
+        self.req_id_to_index: dict[str, int] = {}
+        self.req_output_token_ids: list[list[int] | None] = []
+        self.request_distribution: list[int] = [0, 0, 0]
+        self.greedy_reqs: set[str] = set()
+        self.random_reqs: set[str] = set()
+        self.top_p_reqs: set[str] = set()
+        self.top_k_reqs: set[str] = set()
+        self.min_p_reqs: set[str] = set()
+        self.frequency_penalties_reqs: set[str] = set()
+        self.presence_penalties_reqs: set[str] = set()
+        self.repetition_penalties_reqs: set[str] = set()
+        self.has_allowed_token_ids: set[str] = set()
+
+        self.min_tokens: dict[int, tuple[int, set[int]]] = {}
+        self.generator_seeds: dict[int, int] = {}
+        self.num_logprobs: dict[str, int] = {}
+        self.num_prompt_logprobs: dict[str, int] = {}
+        self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
+        self.logit_bias: list[dict[int, float] | None] = [None] * max_num_reqs
+        self.bad_words_token_ids: dict[int, list[list[int]]] = {}
+        self.allowed_token_ids_mask: jax.Array | None = None
+
+    def _update_request_distribution(self) -> None:
+        """Update the request distribution triple [decode_only, chunked_prefill, total]."""
+        total = len(self.req_id_to_index)
+        self.request_distribution = [0, 0, total]
 
     @property
     def req_ids(self) -> list[str]:
@@ -456,7 +399,7 @@ class SequenceBuffer:
         if len(self.logit_bias) <= upto_idx:
             self.logit_bias.extend([None] * (upto_idx + 1 - len(self.logit_bias)))
 
-    def add_request(self, request: EngineRequest, req_index: int | None = None) -> SequenceBuffer:
+    def add_request(self, request: EngineRequest, req_index: int | None = None) -> None:
         """Add a new request to the buffer.
 
         Adds a request with its tokens, sampling parameters, and metadata.
@@ -471,17 +414,13 @@ class SequenceBuffer:
             req_index: Optional specific index to place the request.
                 If None, finds the next available slot.
 
-        Returns:
-            A new SequenceBuffer instance with the request added.
-
         Raises:
             ValueError: If the request ID already exists in the buffer.
             IndexError: If req_index is out of bounds.
             RuntimeError: If the buffer is full.
 
         Note:
-            This method is functional and returns a new buffer instance
-            rather than modifying in place.
+            This method modifies the buffer in-place.
         """
         req_id = request.req_id
         if req_id in self.req_id_to_index:
@@ -527,25 +466,25 @@ class SequenceBuffer:
         new_num_computed_tokens = self.num_computed_tokens.copy()
         new_num_computed_tokens[req_index] = min(int(request.num_computed_tokens), self.max_model_len)
 
-        buf = self._with_updates(
-            token_ids=new_token_ids,
-            num_prompt_tokens=new_num_prompt_tokens,
-            num_tokens=new_num_tokens,
-            num_tokens_no_spec=new_num_tokens_no_spec,
-            num_computed_tokens=new_num_computed_tokens,
-        )
+        # Update arrays in-place
+        self.token_ids = new_token_ids
+        self.num_prompt_tokens = new_num_prompt_tokens
+        self.num_tokens = new_num_tokens
+        self.num_tokens_no_spec = new_num_tokens_no_spec
+        self.num_computed_tokens = new_num_computed_tokens
 
-        # Page table
-        buf = buf._with_updates(page_table=buf.page_table.add_row(request.page_ids, req_index))
+        # Page table - mutate in-place
+        self.page_table.add_row(request.page_ids, req_index)
+        self.page_table.commit(self.num_reqs)
 
         # Sampling params
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
-        buf = buf._process_sampling_params(sampling_params, req_id, req_index)
-        buf = buf._process_optional_params(request, sampling_params, req_id, req_index)
-        return buf
+        self._process_sampling_params(sampling_params, req_id, req_index)
+        self._process_optional_params(request, sampling_params, req_id, req_index)
+        self._update_request_distribution()
 
-    def remove_request(self, req_id: str) -> tuple[SequenceBuffer, int | None]:
+    def remove_request(self, req_id: str) -> int | None:
         """Remove a request from the buffer.
 
         Removes all data associated with a request ID and cleans up
@@ -555,18 +494,17 @@ class SequenceBuffer:
             req_id: The request ID to remove.
 
         Returns:
-            A tuple containing:
-                - new_buffer: Updated SequenceBuffer with request removed
-                - removed_index: Index where the request was removed, or None if not found
+            The index where the request was removed, or None if not found.
 
         Note:
-            This method should typically be followed by condense() to remove
-            gaps in the buffer and maintain efficiency.
+            This method modifies the buffer in-place.
+            Should typically be followed by condense() to remove gaps
+            in the buffer and maintain efficiency.
         """
         req_index = self.req_id_to_index.pop(req_id, None)
 
         if req_index is None:
-            return self, None
+            return None
 
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
@@ -595,13 +533,13 @@ class SequenceBuffer:
         self._ensure_logit_bias_capacity(req_index)
         self.logit_bias[req_index] = None
 
-        new_mask = self.allowed_token_ids_mask
-        if new_mask is not None:
-            new_mask = new_mask.at[req_index].set(False)
+        if self.allowed_token_ids_mask is not None:
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index].set(False)
 
-        return self._with_updates(allowed_token_ids_mask=new_mask), req_index
+        self._update_request_distribution()
+        return req_index
 
-    def swap_states(self, i1: int, i2: int) -> SequenceBuffer:
+    def swap_states(self, i1: int, i2: int) -> None:
         """Swap the states of two requests at given indices.
 
         Exchanges all data (tokens, parameters, metadata) between two
@@ -611,14 +549,12 @@ class SequenceBuffer:
             i1: Index of the first request.
             i2: Index of the second request.
 
-        Returns:
-            A new SequenceBuffer with the two requests swapped.
-
         Raises:
             AssertionError: If either index doesn't contain a valid request.
 
         Note:
-            This is useful for buffer reorganization and optimization.
+            This method modifies the buffer in-place.
+            Useful for buffer reorganization and optimization.
         """
         old_id_i1, old_id_i2 = self._req_ids[i1], self._req_ids[i2]
         self._req_ids[i1], self._req_ids[i2] = old_id_i2, old_id_i1
@@ -631,47 +567,35 @@ class SequenceBuffer:
         self.req_id_to_index[old_id_i1] = i2
         self.req_id_to_index[old_id_i2] = i1
 
-        # Swap arrays
-        new_num_tokens = swap_rows(self.num_tokens, i1, i2)
-        new_num_tokens_no_spec = swap_rows(self.num_tokens_no_spec, i1, i2)
-        new_num_prompt_tokens = swap_rows(self.num_prompt_tokens, i1, i2)
-        new_num_computed_tokens = swap_rows(self.num_computed_tokens, i1, i2)
-        new_temperature = swap_rows(self.temperature, i1, i2)
-        new_top_p = swap_rows(self.top_p, i1, i2)
-        new_top_k = swap_rows(self.top_k, i1, i2)
-        new_frequency_penalties = swap_rows(self.frequency_penalties, i1, i2)
-        new_presence_penalties = swap_rows(self.presence_penalties, i1, i2)
-        new_repetition_penalties = swap_rows(self.repetition_penalties, i1, i2)
-        new_min_p = swap_rows(self.min_p, i1, i2)
-        new_token_ids = swap_rows(self.token_ids, i1, i2)
+        # Swap arrays in-place
+        self.num_tokens = swap_rows(self.num_tokens, i1, i2)
+        self.num_tokens_no_spec = swap_rows(self.num_tokens_no_spec, i1, i2)
+        self.num_prompt_tokens = swap_rows(self.num_prompt_tokens, i1, i2)
+        self.num_computed_tokens = swap_rows(self.num_computed_tokens, i1, i2)
+        self.temperature = swap_rows(self.temperature, i1, i2)
+        self.top_p = swap_rows(self.top_p, i1, i2)
+        self.top_k = swap_rows(self.top_k, i1, i2)
+        self.frequency_penalties = swap_rows(self.frequency_penalties, i1, i2)
+        self.presence_penalties = swap_rows(self.presence_penalties, i1, i2)
+        self.repetition_penalties = swap_rows(self.repetition_penalties, i1, i2)
+        self.min_p = swap_rows(self.min_p, i1, i2)
+        self.token_ids = swap_rows(self.token_ids, i1, i2)
 
-        new_mask = self.allowed_token_ids_mask
-        if new_mask is not None:
-            new_mask = swap_rows(new_mask, i1, i2)
+        if self.allowed_token_ids_mask is not None:
+            self.allowed_token_ids_mask = swap_rows(self.allowed_token_ids_mask, i1, i2)
 
         swap_dict_values(self.generator_seeds, i1, i2)
         swap_dict_values(self.min_tokens, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
         self.logit_bias[i1], self.logit_bias[i2] = self.logit_bias[i2], self.logit_bias[i1]
 
-        return self._with_updates(
-            num_tokens=new_num_tokens,
-            num_tokens_no_spec=new_num_tokens_no_spec,
-            num_prompt_tokens=new_num_prompt_tokens,
-            num_computed_tokens=new_num_computed_tokens,
-            temperature=new_temperature,
-            top_p=new_top_p,
-            top_k=new_top_k,
-            frequency_penalties=new_frequency_penalties,
-            presence_penalties=new_presence_penalties,
-            repetition_penalties=new_repetition_penalties,
-            min_p=new_min_p,
-            token_ids=new_token_ids,
-            page_table=self.page_table.swap_row(i1, i2),
-            allowed_token_ids_mask=new_mask,
-        )
+        # Page table - mutate in-place
+        self.page_table.swap_row(i1, i2)
+        self.page_table.commit(self.num_reqs)
 
-    def condense(self, empty_req_indices: list[int]) -> SequenceBuffer:
+        self._update_request_distribution()
+
+    def condense(self, empty_req_indices: list[int]) -> None:
         """Condense the buffer by removing gaps.
 
         Moves requests from the end of the buffer to fill empty slots,
@@ -680,20 +604,16 @@ class SequenceBuffer:
         Args:
             empty_req_indices: List of indices that are now empty and need filling.
 
-        Returns:
-            A new SequenceBuffer with gaps removed and requests condensed.
-
         Note:
             This operation is important for maintaining buffer efficiency
             after removing requests. It ensures active requests are packed
-            at the beginning of the buffer.
+            at the beginning of the buffer. Modifies the buffer in-place.
         """
-        buf = self
-        num_reqs = buf.num_reqs
+        num_reqs = self.num_reqs
         if num_reqs == 0:
-            buf._req_ids.clear()
-            buf.req_output_token_ids.clear()
-            return buf
+            self._req_ids.clear()
+            self.req_output_token_ids.clear()
+            return
 
         last_req_index = num_reqs + len(empty_req_indices) - 1
 
@@ -702,14 +622,14 @@ class SequenceBuffer:
                 last_req_index -= 1
             if empty_index >= last_req_index:
                 continue
-            buf = buf._move_request(last_req_index, empty_index)
+            self._move_request(last_req_index, empty_index)
             last_req_index -= 1
 
-        del buf._req_ids[buf.num_reqs :]
-        del buf.req_output_token_ids[buf.num_reqs :]
-        return buf
+        del self._req_ids[self.num_reqs :]
+        del self.req_output_token_ids[self.num_reqs :]
+        self._update_request_distribution()
 
-    def _move_request(self, from_idx: int, to_idx: int) -> SequenceBuffer:
+    def _move_request(self, from_idx: int, to_idx: int) -> None:
         """Move a request from one index to another.
 
         Internal method for relocating a request within the buffer.
@@ -718,15 +638,12 @@ class SequenceBuffer:
             from_idx: Source index of the request.
             to_idx: Destination index for the request.
 
-        Returns:
-            A new SequenceBuffer with the request moved.
-
         Raises:
             AssertionError: If from_idx doesn't contain a valid request.
 
         Note:
             This is an internal method used by condense() and other
-            buffer reorganization operations.
+            buffer reorganization operations. Modifies the buffer in-place.
         """
         req_id = self._req_ids[from_idx]
         assert req_id is not None
@@ -738,42 +655,28 @@ class SequenceBuffer:
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
 
-        # Arrays
-        new_token_ids = move_row(self.token_ids, from_idx, to_idx)
-        new_num_tokens = move_row(self.num_tokens, from_idx, to_idx)
-        new_num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)
-        new_num_prompt_tokens = move_row(self.num_prompt_tokens, from_idx, to_idx)
-        new_num_computed_tokens = move_row(self.num_computed_tokens, from_idx, to_idx)
-        new_temperature = move_row(self.temperature, from_idx, to_idx)
-        new_top_p = move_row(self.top_p, from_idx, to_idx)
-        new_top_k = move_row(self.top_k, from_idx, to_idx)
-        new_frequency_penalties = move_row(self.frequency_penalties, from_idx, to_idx)
-        new_presence_penalties = move_row(self.presence_penalties, from_idx, to_idx)
-        new_repetition_penalties = move_row(self.repetition_penalties, from_idx, to_idx)
-        new_min_p = move_row(self.min_p, from_idx, to_idx)
+        # Arrays - update in-place
+        self.token_ids = move_row(self.token_ids, from_idx, to_idx)
+        self.num_tokens = move_row(self.num_tokens, from_idx, to_idx)
+        self.num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)
+        self.num_prompt_tokens = move_row(self.num_prompt_tokens, from_idx, to_idx)
+        self.num_computed_tokens = move_row(self.num_computed_tokens, from_idx, to_idx)
+        self.temperature = move_row(self.temperature, from_idx, to_idx)
+        self.top_p = move_row(self.top_p, from_idx, to_idx)
+        self.top_k = move_row(self.top_k, from_idx, to_idx)
+        self.frequency_penalties = move_row(self.frequency_penalties, from_idx, to_idx)
+        self.presence_penalties = move_row(self.presence_penalties, from_idx, to_idx)
+        self.repetition_penalties = move_row(self.repetition_penalties, from_idx, to_idx)
+        self.min_p = move_row(self.min_p, from_idx, to_idx)
 
-        # Page table
-        new_page_table = self.page_table.move_row(from_idx, to_idx)
+        # Page table - mutate in-place
+        self.page_table.move_row(from_idx, to_idx)
+        self.page_table.commit(self.num_reqs)
 
-        # Sparse/optional
-        buf = self._with_updates(
-            token_ids=new_token_ids,
-            num_tokens=new_num_tokens,
-            num_tokens_no_spec=new_num_tokens_no_spec,
-            num_prompt_tokens=new_num_prompt_tokens,
-            num_computed_tokens=new_num_computed_tokens,
-            temperature=new_temperature,
-            top_p=new_top_p,
-            top_k=new_top_k,
-            frequency_penalties=new_frequency_penalties,
-            presence_penalties=new_presence_penalties,
-            repetition_penalties=new_repetition_penalties,
-            min_p=new_min_p,
-            page_table=new_page_table,
-        )
-        return buf._move_sparse_data(from_idx, to_idx)
+        # Sparse/optional data
+        self._move_sparse_data(from_idx, to_idx)
 
-    def _move_sparse_data(self, from_idx: int, to_idx: int) -> SequenceBuffer:
+    def _move_sparse_data(self, from_idx: int, to_idx: int) -> None:
         """Move sparse and optional data between indices.
 
         Handles the movement of data that may not exist for all requests,
@@ -783,12 +686,10 @@ class SequenceBuffer:
             from_idx: Source index.
             to_idx: Destination index.
 
-        Returns:
-            A new SequenceBuffer with sparse data moved.
-
         Note:
             This method complements _move_request() by handling
             optional parameters that aren't stored in the main arrays.
+            Modifies the buffer in-place.
         """
         if from_idx in self.generator_seeds:
             self.generator_seeds[to_idx] = self.generator_seeds.pop(from_idx)
@@ -802,14 +703,11 @@ class SequenceBuffer:
         self.logit_bias[to_idx] = self.logit_bias[from_idx]
         self.logit_bias[from_idx] = None
 
-        new_mask = self.allowed_token_ids_mask
-        if new_mask is not None:
-            new_mask = new_mask.at[to_idx].set(new_mask[from_idx])
-            new_mask = new_mask.at[from_idx].set(False)
+        if self.allowed_token_ids_mask is not None:
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[to_idx].set(self.allowed_token_ids_mask[from_idx])
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[from_idx].set(False)
 
-        return self._with_updates(allowed_token_ids_mask=new_mask)
-
-    def _process_sampling_params(self, sampling_params: SamplingParams, req_id: str, req_index: int) -> SequenceBuffer:
+    def _process_sampling_params(self, sampling_params: SamplingParams, req_id: str, req_index: int) -> None:
         """Process and store core sampling parameters.
 
         Updates arrays with sampling configuration like temperature, top_p, top_k, etc.
@@ -820,12 +718,9 @@ class SequenceBuffer:
             req_id: Request identifier for bookkeeping.
             req_index: Index where parameters should be stored.
 
-        Returns:
-            A new SequenceBuffer with updated sampling parameters.
-
         Note:
             Maintains separate tracking sets for different sampling strategies
-            to enable optimized execution paths.
+            to enable optimized execution paths. Modifies the buffer in-place.
         """
         # Copy arrays for modification (NumPy style)
         temperature = self.temperature.copy()
@@ -870,15 +765,14 @@ class SequenceBuffer:
             repetition_penalties[req_index] = sampling_params.repetition_penalty
             self.repetition_penalties_reqs.add(req_id)
 
-        return self._with_updates(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            frequency_penalties=frequency_penalties,
-            presence_penalties=presence_penalties,
-            repetition_penalties=repetition_penalties,
-        )
+        # Update arrays in-place
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.min_p = min_p
+        self.frequency_penalties = frequency_penalties
+        self.presence_penalties = presence_penalties
+        self.repetition_penalties = repetition_penalties
 
     def _process_optional_params(
         self,
@@ -886,7 +780,7 @@ class SequenceBuffer:
         sampling_params: SamplingParams,
         req_id: str,
         req_index: int,
-    ) -> SequenceBuffer:
+    ) -> None:
         """Process optional and sparse sampling parameters.
 
         Handles parameters that may not be present for all requests,
@@ -898,14 +792,11 @@ class SequenceBuffer:
             req_id: Request identifier.
             req_index: Index for parameter storage.
 
-        Returns:
-            A new SequenceBuffer with optional parameters processed.
-
         Note:
             These parameters are stored in sparse data structures
             to avoid memory overhead for unused features.
+            Modifies the buffer in-place.
         """
-        buf = self
         if sampling_params.min_tokens:
             self.min_tokens[req_index] = (sampling_params.min_tokens, sampling_params.all_stop_token_ids)
 
@@ -925,14 +816,12 @@ class SequenceBuffer:
             self.logit_bias[req_index] = sampling_params.logit_bias
 
         if sampling_params.allowed_token_ids:
-            buf = buf._set_allowed_token_ids(req_id, req_index, sampling_params.allowed_token_ids)
+            self._set_allowed_token_ids(req_id, req_index, sampling_params.allowed_token_ids)
 
         if sampling_params.bad_words_token_ids:
             self.bad_words_token_ids[req_index] = sampling_params.bad_words_token_ids
 
-        return buf
-
-    def _set_allowed_token_ids(self, req_id: str, req_index: int, allowed_token_ids: list[int]) -> SequenceBuffer:
+    def _set_allowed_token_ids(self, req_id: str, req_index: int, allowed_token_ids: list[int]) -> None:
         """Set the allowed token IDs for a request.
 
         Creates or updates a mask indicating which tokens are allowed for generation.
@@ -943,15 +832,12 @@ class SequenceBuffer:
             req_index: Index of the request.
             allowed_token_ids: List of token IDs that are allowed.
 
-        Returns:
-            A new SequenceBuffer with updated allowed token mask.
-
         Raises:
             ValueError: If any token ID is outside the valid vocabulary range.
 
         Note:
             The mask uses inverted logic (True=disallowed) for compatibility
-            with JAX masking operations.
+            with JAX masking operations. Modifies the buffer in-place.
         """
         if any((t < 0 or t >= self.vocab_size) for t in allowed_token_ids):
             raise ValueError(f"allowed_token_ids must be within [0, {self.vocab_size})")
@@ -966,7 +852,7 @@ class SequenceBuffer:
         if allowed_token_ids:
             mask = mask.at[req_index, allowed_token_ids].set(False)
 
-        return self._with_updates(allowed_token_ids_mask=mask)
+        self.allowed_token_ids_mask = mask
 
     def _allocate_index(self, req_index: int | None) -> int:
         """Allocate an index for a new request.
@@ -1081,35 +967,32 @@ class SequenceBuffer:
 
         return params
 
-    def clear(self) -> SequenceBuffer:
+    def clear(self) -> None:
         """Clear all data in the buffer.
 
         Resets all arrays to their initial values and clears all bookkeeping.
 
-        Returns:
-            A new SequenceBuffer with all data cleared.
-
         Note:
             This maintains the buffer structure and capacity but removes
-            all request data.
+            all request data. Modifies the buffer in-place.
         """
         self._req_ids.clear()
         self.req_id_to_index.clear()
         self.req_output_token_ids.clear()
 
-        token_ids = np.zeros_like(self.token_ids)
-        num_tokens = np.zeros_like(self.num_tokens)
-        num_tokens_no_spec = np.zeros_like(self.num_tokens_no_spec)
-        num_prompt_tokens = np.zeros_like(self.num_prompt_tokens)
-        num_computed_tokens = np.zeros_like(self.num_computed_tokens)
+        self.token_ids = np.zeros_like(self.token_ids)
+        self.num_tokens = np.zeros_like(self.num_tokens)
+        self.num_tokens_no_spec = np.zeros_like(self.num_tokens_no_spec)
+        self.num_prompt_tokens = np.zeros_like(self.num_prompt_tokens)
+        self.num_computed_tokens = np.zeros_like(self.num_computed_tokens)
 
-        temperature = np.full_like(self.temperature, -1.0)
-        top_p = np.ones_like(self.top_p)
-        top_k = np.full_like(self.top_k, self.vocab_size)
-        min_p = np.zeros_like(self.min_p)
-        frequency_penalties = np.zeros_like(self.frequency_penalties)
-        presence_penalties = np.zeros_like(self.presence_penalties)
-        repetition_penalties = np.ones_like(self.repetition_penalties)
+        self.temperature = np.full_like(self.temperature, -1.0)
+        self.top_p = np.ones_like(self.top_p)
+        self.top_k = np.full_like(self.top_k, self.vocab_size)
+        self.min_p = np.zeros_like(self.min_p)
+        self.frequency_penalties = np.zeros_like(self.frequency_penalties)
+        self.presence_penalties = np.zeros_like(self.presence_penalties)
+        self.repetition_penalties = np.ones_like(self.repetition_penalties)
 
         for req_set in [
             self.greedy_reqs,
@@ -1132,35 +1015,14 @@ class SequenceBuffer:
         self.bad_words_token_ids.clear()
         self.logit_bias = [None] * self.max_num_reqs
 
-        return self._with_updates(
-            token_ids=token_ids,
-            num_tokens=num_tokens,
-            num_tokens_no_spec=num_tokens_no_spec,
-            num_prompt_tokens=num_prompt_tokens,
-            num_computed_tokens=num_computed_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            frequency_penalties=frequency_penalties,
-            presence_penalties=presence_penalties,
-            repetition_penalties=repetition_penalties,
-            page_table=self.page_table.clear(),
-            allowed_token_ids_mask=jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
-            if self.allowed_token_ids_mask is not None
-            else None,
-        )
+        # Page table - mutate in-place (no commit needed for clear)
+        self.page_table.clear()
 
+        # Clear allowed token IDs mask
+        if self.allowed_token_ids_mask is not None:
+            self.allowed_token_ids_mask = jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
 
-    def attach_sharding(self, sharding: jax.sharding.Sharding) -> "SequenceBuffer":
-        """Apply sharding only to page_table (arrays are NumPy, stay on CPU)."""
-
-        def put(a):
-            return jax.device_put(a, sharding)
-
-        return self._with_updates(
-            page_table=jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table),
-        )
+        self._update_request_distribution()
 
 
 @auto_pytree

@@ -52,6 +52,7 @@ import re
 import types
 import typing as tp
 import warnings
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -66,6 +67,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
+from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
@@ -1690,6 +1692,48 @@ class OverWriteWithGradient(nn.Param):
     overwrite the parameter values during optimization, useful for
     certain advanced optimization techniques.
     """
+
+
+class ArrayParam(nn.Param):
+    shape: Sequence[int]
+    dtype: DTypeLike
+    init_fn: tp.Callable[[PRNGKeyArray, Sequence[int], DTypeLike], Array]
+
+    @classmethod
+    def bound(
+        cls,
+        shape: Sequence[int],
+        dtype: DTypeLike,
+        init_fn: tp.Callable[[PRNGKeyArray, Sequence[int], DTypeLike], Array],
+        *,
+        key: PRNGKeyArray | None = None,
+        value: Array | None = None,
+        use_ref: bool | None = None,
+        **metadata,
+    ):
+        if value is None:
+            value = init_fn(key, shape, dtype)
+        return cls(
+            shape=shape,
+            dtype=dtype,
+            init_fn=init_fn,
+            value=value,
+            use_ref=use_ref,
+            **metadata,
+        )
+
+    def resure(
+        self,
+        key: PRNGKeyArray,
+        shard_fn: tp.Callable[[Array], Array] | None = None,
+    ) -> None:
+        val = self.init_fn(key, self.shape, self.dtype)
+
+        if shard_fn is not None:
+            val = shard_fn(val)
+
+        self.value = val
+        self.raw_value = val
 
 
 if tp.TYPE_CHECKING:

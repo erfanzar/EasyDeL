@@ -97,6 +97,12 @@ class XPOTrainer(GRPOTrainer):
         self._alpha_schedule = arguments.alpha
         self.loss_type_id = 0 if arguments.loss_type == "sigmoid" else 1
 
+        if reward_funcs is not None:
+            reward_funcs_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
+            if len(reward_funcs_list) != 1:
+                raise ValueError("XPOTrainer only supports a single reward function/model.")
+            reward_funcs = reward_funcs_list
+
         super().__init__(
             arguments=arguments,
             model=model,
@@ -106,6 +112,19 @@ class XPOTrainer(GRPOTrainer):
             processing_class=processing_class,
             reward_processing_classes=reward_processing_classes,
         )
+
+    def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
+        """Normalize reward processing classes to a list aligned to reward functions."""
+        reward_processing_classes = self.reward_processing_classes
+        if reward_processing_classes is None:
+            return [None] * len(self.reward_funcs)
+        if isinstance(reward_processing_classes, (list, tuple)):
+            if len(reward_processing_classes) == 0:
+                return [None] * len(self.reward_funcs)
+            if len(reward_processing_classes) == 1 and len(self.reward_funcs) > 1:
+                return list(reward_processing_classes) * len(self.reward_funcs)
+            return list(reward_processing_classes)
+        return [reward_processing_classes] * len(self.reward_funcs)
 
     def _schedule_value(self, schedule: tp.Any, default: float) -> float:
         """Resolve a scheduled value based on current training progress.
@@ -202,8 +221,13 @@ class XPOTrainer(GRPOTrainer):
 
     def _score_rewards(
         self,
-        prompts: list[str],
-        completions: list[str],
+        prompt_ids: jax.Array,
+        prompt_mask: jax.Array,
+        completion_ids: jax.Array,
+        completion_mask: jax.Array,
+        *,
+        prompt_texts: list[str] | None,
+        completion_texts: list[str] | None,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Score completions using configured reward functions.
 
@@ -212,8 +236,12 @@ class XPOTrainer(GRPOTrainer):
         reward models.
 
         Args:
-            prompts: List of prompt strings.
-            completions: List of completion strings to score.
+            prompt_ids: Token IDs for the prompt portion.
+            prompt_mask: Attention mask for the prompt portion.
+            completion_ids: Token IDs for the completion portion.
+            completion_mask: Attention mask for the completion portion.
+            prompt_texts: Optional prompt strings (needed for text-based reward funcs).
+            completion_texts: Optional completion strings (needed for text-based reward funcs).
 
         Returns:
             Tuple of (total_rewards, reward_breakdown) where total_rewards is
@@ -222,45 +250,61 @@ class XPOTrainer(GRPOTrainer):
         """
         rewards = []
         breakdown: dict[str, jnp.ndarray] = {}
-        for reward_func, reward_processing_class in zip(
-            self.reward_funcs,
-            self.reward_processing_classes,
-            strict=True,
-        ):
+        reward_processing_classes = self._get_reward_processing_classes()
+        for reward_func, reward_processing_class in zip(self.reward_funcs, reward_processing_classes, strict=False):
             name = getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
-            if isinstance(reward_func, EasyDeLState):
-                if reward_processing_class is None:
-                    raise ValueError("Reward processing class must be provided when using EasyDeL reward models.")
-                texts = [p + c for p, c in zip(prompts, completions, strict=False)]
-                tokenized = reward_processing_class(
-                    texts,
-                    return_tensors="jax",
-                    padding="max_length",
-                    padding_side="right",
-                    add_special_tokens=False,
-                    truncation=True,
-                    return_attention_mask=True,
-                    max_length=self.arguments.max_sequence_length,
-                )
+            if isinstance(reward_func, EasyDeLState) and (
+                reward_processing_class is None or reward_processing_class is self.processing_class
+            ):
+                reward_inputs = {
+                    "input_ids": jnp.concatenate([prompt_ids, completion_ids], axis=1),
+                    "attention_mask": jnp.concatenate([prompt_mask, completion_mask], axis=1),
+                }
                 logits = reward_func.apply_fn(
                     reward_func.graphdef,
                     reward_func.graphstate,
                     reward_func.graphother,
-                    dict(tokenized),
+                    reward_inputs,
                 ).logits[:, 0]
                 values = jnp.asarray(logits, dtype=jnp.float32)
             else:
-                outputs = reward_func(
-                    prompts=prompts,
-                    completions=completions,
-                    max_length=self.arguments.max_sequence_length,
-                )
-                values = jnp.asarray(np.asarray(list(outputs), dtype=np.float32))
+                if prompt_texts is None or completion_texts is None:
+                    raise ValueError(
+                        "Text prompts are required for text-based reward functions or mismatched tokenizers."
+                    )
+                if isinstance(reward_func, EasyDeLState):
+                    if reward_processing_class is None:
+                        raise ValueError("Reward processing class must be provided when using EasyDeL reward models.")
+                    texts = [p + c for p, c in zip(prompt_texts, completion_texts, strict=False)]
+                    tokenized = reward_processing_class(
+                        texts,
+                        return_tensors="jax",
+                        padding="max_length",
+                        padding_side="right",
+                        add_special_tokens=False,
+                        truncation=True,
+                        return_attention_mask=True,
+                        max_length=self.arguments.max_sequence_length,
+                    )
+                    logits = reward_func.apply_fn(
+                        reward_func.graphdef,
+                        reward_func.graphstate,
+                        reward_func.graphother,
+                        dict(tokenized),
+                    ).logits[:, 0]
+                    values = jnp.asarray(logits, dtype=jnp.float32)
+                else:
+                    outputs = reward_func(
+                        prompts=prompt_texts,
+                        completions=completion_texts,
+                        max_length=self.arguments.max_sequence_length,
+                    )
+                    values = jnp.asarray(np.asarray(list(outputs), dtype=np.float32))
             rewards.append(values)
             breakdown[name] = values
 
         if not rewards:
-            zeros = jnp.zeros((len(prompts),), dtype=jnp.float32)
+            zeros = jnp.zeros((prompt_ids.shape[0],), dtype=jnp.float32)
             return zeros, {}
 
         stacked = jnp.stack(rewards, axis=1)
@@ -307,37 +351,84 @@ class XPOTrainer(GRPOTrainer):
             prompt_mask = batch["attention_mask"]
 
             with capture_time() as policy_time_fn:
-                policy_sequences, prompt_ids, prompt_mask = jax.block_until_ready(
-                    self.generate_function(state, prompt_ids, prompt_mask)
+                policy_results = self.generate_unified(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
                 )
+                jax.block_until_ready(policy_results.sequences)
+                prompt_ids = policy_results.prompt_ids
+                prompt_mask = policy_results.prompt_mask
+                policy_completion_ids = policy_results.completion_ids
+                policy_completion_mask = policy_results.completion_mask
             policy_generation_time = policy_time_fn()
-            policy_completion_ids = policy_sequences[..., prompt_ids.shape[-1] :]
-            policy_completion_mask = self._make_attn_mask(policy_completion_ids)
 
             with capture_time() as ref_time_fn:
-                ref_sequences, _, _ = jax.block_until_ready(
-                    self.generate_function(self.ref_state, prompt_ids, prompt_mask)
+                ref_results = self.generate_unified(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=self.ref_state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
                 )
+                jax.block_until_ready(ref_results.sequences)
+                ref_completion_ids = ref_results.completion_ids
+                ref_completion_mask = ref_results.completion_mask
             ref_generation_time = ref_time_fn()
-            ref_completion_ids = ref_sequences[..., prompt_ids.shape[-1] :]
-            ref_completion_mask = self._make_attn_mask(ref_completion_ids)
 
         preprocessing_time = preprocessing_time_fn()
 
-        prompts = list(
-            self.processing_class.batch_decode(np.asarray(jax.device_get(prompt_ids)), skip_special_tokens=True)
-        )
-        policy_texts = list(
-            self.processing_class.batch_decode(
-                np.asarray(jax.device_get(policy_completion_ids)), skip_special_tokens=True
-            )
-        )
-        ref_texts = list(
-            self.processing_class.batch_decode(np.asarray(jax.device_get(ref_completion_ids)), skip_special_tokens=True)
+        reward_processing_classes = self._get_reward_processing_classes()
+        needs_text_for_rewards = any(
+            not isinstance(rf, EasyDeLState) or (rpc is not None and rpc is not self.processing_class)
+            for rf, rpc in zip(self.reward_funcs, reward_processing_classes, strict=False)
         )
 
-        policy_scores, reward_breakdown = self._score_rewards(prompts, policy_texts)
-        ref_scores, _ = self._score_rewards(prompts, ref_texts)
+        prompt_texts: list[str] | None = None
+        policy_texts: list[str] | None = None
+        ref_texts: list[str] | None = None
+        if needs_text_for_rewards:
+            prompt_texts = list(
+                self.processing_class.batch_decode(
+                    np.asarray(jax.device_get(prompt_ids)),
+                    skip_special_tokens=True,
+                )
+            )
+            policy_texts = list(
+                self.processing_class.batch_decode(
+                    np.asarray(jax.device_get(policy_completion_ids)),
+                    skip_special_tokens=True,
+                )
+            )
+            ref_texts = list(
+                self.processing_class.batch_decode(
+                    np.asarray(jax.device_get(ref_completion_ids)),
+                    skip_special_tokens=True,
+                )
+            )
+
+        policy_scores, reward_breakdown = self._score_rewards(
+            prompt_ids,
+            prompt_mask,
+            policy_completion_ids,
+            policy_completion_mask,
+            prompt_texts=prompt_texts,
+            completion_texts=policy_texts,
+        )
+        ref_scores, _ = self._score_rewards(
+            prompt_ids,
+            prompt_mask,
+            ref_completion_ids,
+            ref_completion_mask,
+            prompt_texts=prompt_texts,
+            completion_texts=ref_texts,
+        )
 
         if self.arguments.missing_eos_penalty is not None:
             eos_id = getattr(self.processing_class, "eos_token_id", None)

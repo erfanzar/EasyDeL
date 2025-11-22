@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import ArrayParam, auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -50,6 +50,8 @@ from .gpt_oss_configuration import GptOssConfig
 
 
 class GptOssExperts(nn.Module):
+    """Grouped expert feed-forward network used inside GPT-OSS MoE layers."""
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -68,84 +70,72 @@ class GptOssExperts(nn.Module):
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
+
         initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-        self.gate_up_proj = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+
+        NEP = self.num_experts
+        HD = self.hidden_size
+        ED = self.expert_dim
+
+        self.gate_up_proj = ArrayParam.bound(
+            shape=(NEP, HD, 2 * ED),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
-        self.gate_up_proj_bias = nn.Param(
-            initializer(
-                shape=(self.num_experts, 2 * self.expert_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+        self.gate_up_proj_bias = ArrayParam.bound(
+            shape=(NEP, 2 * ED),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
-        self.down_proj = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.expert_dim, self.hidden_size),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+        self.down_proj = ArrayParam.bound(
+            shape=(NEP, ED, HD),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
-        self.down_proj_bias = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_size),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+        self.down_proj_bias = ArrayParam.bound(
+            shape=(NEP, HD),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
 
         self.alpha = 1.702
         self.limit = 7.0
 
     def __call__(self, hidden_states: jax.Array, router_indices=None, routing_weights=None, training=False) -> jax.Array:
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        num_experts = routing_weights.shape[1]
+        del training
+        batch_size, seq_len = hidden_states.shape[:2]
+        tokens = batch_size * seq_len
 
-        if training:
-            next_states = jnp.zeros_like(hidden_states)
-            expert_mask = jax.nn.one_hot(router_indices, num_classes=num_experts)
-            expert_mask = expert_mask.transpose(2, 1, 0)
-            expert_hitted = jnp.greater(expert_mask.sum(axis=(-1, -2)), 0).nonzero()[0]
+        hidden_states = hidden_states.reshape(tokens, self.hidden_size)
+        routing_weights = routing_weights.reshape(tokens, -1)
+        router_indices = router_indices.reshape(tokens, -1)
 
-            for expert_idx in expert_hitted:
-                token_idx = jnp.where(expert_mask[expert_idx])[1]
-                current_state = hidden_states[token_idx]
-                gate_up = current_state @ self.gate_up_proj.value[expert_idx] + self.gate_up_proj_bias.value[expert_idx]
-                gate = gate_up[..., ::2]
-                up = gate_up[..., 1::2]
-                gate = jnp.clip(gate, a_max=self.limit)
-                up = jnp.clip(up, min=-self.limit, a_max=self.limit)
-                glu = gate * jax.nn.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-                out = gated_output @ self.down_proj.value[expert_idx] + self.down_proj_bias.value[expert_idx]
-                weighted_output = out * routing_weights[token_idx, expert_idx, None]
-                next_states = next_states.at[token_idx].add(weighted_output)
+        gate_up_proj = jnp.take(self.gate_up_proj.value, router_indices, axis=0)
+        gate_up = jnp.einsum("td,txdf->txf", hidden_states, gate_up_proj, precision=self.precision)
+        gate_up += jnp.take(self.gate_up_proj_bias.value, router_indices, axis=0)
 
-            next_states = next_states.reshape(batch_size, -1, self.hidden_size)
-        else:
-            hidden_states = jnp.repeat(hidden_states[None, :, :], num_experts, axis=0)
-            gate_up = jnp.matmul(hidden_states, self.gate_up_proj.value) + self.gate_up_proj_bias.value[:, None, :]
-            gate = gate_up[..., ::2]
-            up = gate_up[..., 1::2]
-            gate = jnp.clip(gate, a_max=self.limit)
-            up = jnp.clip(up, min=-self.limit, a_max=self.limit)
-            glu = gate * jax.nn.sigmoid(gate * self.alpha)
-            next_states = jnp.matmul((up + 1) * glu, self.down_proj.value)
-            next_states = next_states + self.down_proj_bias.value[:, None, :]
-            next_states = next_states.reshape(num_experts, batch_size, -1, self.hidden_size)
-            routing_weights_expanded = routing_weights.transpose(1, 0).reshape(num_experts, batch_size, -1, 1)
-            next_states = next_states * routing_weights_expanded
-            next_states = next_states.sum(axis=0)
+        gate = jnp.clip(gate_up[..., ::2], a_max=self.limit)
+        up = jnp.clip(gate_up[..., 1::2], a_min=-self.limit, a_max=self.limit)
+        glu = gate * jax.nn.sigmoid(gate * self.alpha)
+        fused = (up + 1) * glu
 
-        return next_states
+        down_proj = jnp.take(self.down_proj.value, router_indices, axis=0)
+        next_states = jnp.einsum("txf,txfd->txd", fused, down_proj, precision=self.precision)
+        next_states += jnp.take(self.down_proj_bias.value, router_indices, axis=0)
+
+        topk_weights = jnp.take_along_axis(routing_weights, router_indices, axis=1)
+        next_states = jnp.einsum("txd,tx->td", next_states, topk_weights, precision=self.precision)
+
+        return next_states.reshape(batch_size, seq_len, self.hidden_size)
 
 
 class GptOssTopKRouter(nn.Module):
+    """Top-k router that scores tokens and selects experts per token."""
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -163,19 +153,17 @@ class GptOssTopKRouter(nn.Module):
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
         initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-        self.kernel = nn.Param(
-            initializer(
-                shape=(self.num_experts, self.hidden_dim),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+        self.kernel = ArrayParam.bound(
+            shape=(self.num_experts, self.hidden_dim),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
-        self.bias = nn.Param(
-            initializer(
-                shape=(self.num_experts,),
-                key=rngs.param(),
-                dtype=param_dtype,
-            )
+        self.bias = ArrayParam.bound(
+            shape=(self.num_experts,),
+            dtype=param_dtype,
+            init_fn=initializer,
+            key=rngs.param(),
         )
 
     def __call__(
@@ -194,6 +182,8 @@ class GptOssTopKRouter(nn.Module):
 
 
 class GptOssMLP(nn.Module):
+    """Mixture-of-experts MLP combining the router and shared experts."""
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -266,12 +256,11 @@ class GptOssAttention(UnifiedAttention):
             self.sliding_window = config.sliding_window
 
         # Sink tokens for improved attention
-        self.sinks = nn.Param(
-            jax.nn.initializers.normal(config.initializer_range)(
-                rngs.param(),
-                shape=(config.num_attention_heads,),
-                dtype=param_dtype,
-            )
+        self.sinks = ArrayParam.bound(
+            shape=(config.num_attention_heads,),
+            dtype=param_dtype,
+            init_fn=jax.nn.initializers.normal(config.initializer_range),
+            key=rngs.param(),
         )
 
     def forward_standard(
@@ -353,6 +342,8 @@ class GptOssAttention(UnifiedAttention):
 
 
 class GptOssDecoderLayer(nn.Module):
+    """Single GPT-OSS decoder block with attention and expert MLP."""
+
     def __init__(
         self,
         config: GptOssConfig,

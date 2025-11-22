@@ -26,9 +26,9 @@ from .packer import pack_sequences
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
-from .xpo_trainer import XPOConfig, XPOTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
+from .xpo_trainer import XPOConfig, XPOTrainer
 
 __all__ = (
     "BCOConfig",
@@ -55,9 +55,9 @@ __all__ = (
     "RewardTrainer",
     "SFTConfig",
     "SFTTrainer",
-    "XPOConfig",
-    "XPOTrainer",
     "Trainer",
     "TrainingArguments",
+    "XPOConfig",
+    "XPOTrainer",
     "pack_sequences",
 )

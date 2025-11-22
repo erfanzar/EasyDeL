@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     RaggedPagesCacheView,
@@ -52,6 +52,8 @@ from .roberta_configuration import RobertaConfig as RobertaConfig
 
 
 class RobertaEmbeddings(nn.Module):
+    """Construct the embeddings from word, position, and token_type embeddings for RoBERTa."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -120,6 +122,8 @@ class RobertaEmbeddings(nn.Module):
 
 
 class RobertaSelfAttention(AttentionModule):
+    """Multi-head self-attention used throughout RoBERTa layers."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -272,6 +276,8 @@ class RobertaSelfAttention(AttentionModule):
 
 
 class RobertaSelfOutput(nn.Module):
+    """Dense projection and dropout following RoBERTa self-attention."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -312,6 +318,8 @@ class RobertaSelfOutput(nn.Module):
 
 
 class RobertaAttention(nn.Module):
+    """Full attention module combining self-attention and its output projection."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -371,6 +379,8 @@ class RobertaAttention(nn.Module):
 
 
 class RobertaIntermediate(nn.Module):
+    """First feed-forward layer of the RoBERTa transformer MLP."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -405,6 +415,8 @@ class RobertaIntermediate(nn.Module):
 
 
 class RobertaOutput(nn.Module):
+    """Output feed-forward layer with dropout and residual connection."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -448,6 +460,8 @@ class RobertaOutput(nn.Module):
 
 
 class RobertaLayer(nn.Module):
+    """Single RoBERTa transformer encoder layer."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -544,6 +558,8 @@ class RobertaLayer(nn.Module):
 
 
 class RobertaEncoder(nn.Module):
+    """Stack of RoBERTa encoder layers with optional gradient checkpointing."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -640,6 +656,8 @@ class RobertaEncoder(nn.Module):
 
 
 class RobertaPooler(nn.Module):
+    """Pooling layer that projects the first token representation."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -673,6 +691,8 @@ class RobertaPooler(nn.Module):
 
 
 class RobertaLMHead(nn.Module):
+    """Language modeling head for masked language modeling on top of RoBERTa."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -714,12 +734,11 @@ class RobertaLMHead(nn.Module):
             rngs=rngs,
             **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
-        self.bias = nn.Param(
-            jax.nn.initializers.zeros(
-                key=rngs.params(),
-                shape=(self.config.vocab_size,),
-                dtype=self.param_dtype,
-            )
+        self.bias = ArrayParam.bound(
+            shape=(self.config.vocab_size,),
+            dtype=self.param_dtype,
+            init_fn=jax.nn.initializers.zeros,
+            key=rngs.params(),
         )
 
     def __call__(self, hidden_states, shared_embedding=None):
@@ -737,6 +756,8 @@ class RobertaLMHead(nn.Module):
 
 
 class RobertaClassificationHead(nn.Module):
+    """Classifier head used for sequence-level classification tasks."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -794,6 +815,8 @@ class RobertaClassificationHead(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=RobertaConfig, model_type="roberta")
 class RobertaModel(EasyDeLBaseModule):
+    """RoBERTa encoder composed of embeddings, stacked layers, and pooling."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -957,6 +980,8 @@ class RobertaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
 class RobertaForSequenceClassification(EasyDeLBaseModule):
+    """RoBERTa backbone with a classification head for sequence-level labels."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -1047,6 +1072,8 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 
 
 class RobertaForMultipleChoice(EasyDeLBaseModule):
+    """RoBERTa encoder adapted for multiple-choice tasks with per-option scoring."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -1151,6 +1178,8 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 
 
 class RobertaForTokenClassification(EasyDeLBaseModule):
+    """RoBERTa encoder with token classification head for per-token labels."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -1260,6 +1289,8 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 
 
 class RobertaForQuestionAnswering(EasyDeLBaseModule):
+    """RoBERTa encoder with start/end span heads for extractive QA."""
+
     def __init__(
         self,
         config: RobertaConfig,
@@ -1364,6 +1395,8 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
 class RobertaForCausalLM(EasyDeLBaseModule):
+    """RoBERTa repurposed for causal language modeling with an LM head."""
+
     def __init__(
         self,
         config: RobertaConfig,

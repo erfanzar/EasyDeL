@@ -110,6 +110,7 @@ class DistillationTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=student_model,
             data_collator=data_collator,
+            processing_class=processing_class,
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:

@@ -318,6 +318,7 @@ class KTOTrainer(Trainer):
             dataset_train=train_dataset,
             dataset_eval=eval_dataset,
             data_collator=None,
+            processing_class=processing_class,
         )
 
         if arguments.disable_dropout:

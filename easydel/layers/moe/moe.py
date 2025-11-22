@@ -170,72 +170,13 @@ class BaseMoeModule(nn.Module, ABC):
         self.routing_strategy = routing_strategy
         self.load_balancing_strategy = load_balancing_strategy
         self.moe_hooks = MoeFusedHooks() if moe_hooks is None else moe_hooks
-        self.dtype = getattr(self, "dtype", jnp.bfloat16)
         self.module_moe_method = self.config.moe_method
-        self._create_expert_mesh()
 
-    def _create_expert_mesh(self):
-        """Creates a simplified 3D expert mesh from the 5D model mesh.
+        self.expert_mesh = self.config.expert_mesh
+        self.auto_expert_mesh = self.config.auto_expert_mesh
+        self.expert_abstract_mesh = self.config.expert_abstract_mesh
 
-        Combines FSDP, EP, and SP axes into a single 'expert' dimension,
-        resulting in a cleaner (dp, expert, tp) mesh for MoE operations.
-
-        This transformation simplifies sharding specifications and improves compatibility
-        with grouped matmul kernels. The expert dimension size is computed as:
-            expert_size = FSDP_size x EP_size x SP_size
-
-        The 3D expert mesh is used internally for all MoE computations, with automatic
-        resharding at the boundaries to/from the original 5D model mesh.
-
-        Example:
-            >>> # Input 5D mesh: (dp=2, fsdp=2, ep=4, tp=2, sp=1)
-            >>> # Output 3D expert_mesh: (dp=2, expert=8, tp=2)
-            >>> #   where expert = fsdp*ep*sp = 2*4*1 = 8
-        """
-        pm = self.partition_manager
-
-        # Resolve Names
-        dpname = resolve_eformer_axis(DP, pm)
-        fsdpname = resolve_eformer_axis(FSDP, pm)
-        epname = resolve_eformer_axis(EP, pm)
-        tpname = resolve_eformer_axis(TP, pm)
-        spname = resolve_eformer_axis(SP, pm)
-
-        # Resolve sizes
-        odpsize = self.mesh.shape.get(dpname, 1)
-        ofsdpsize = self.mesh.shape.get(fsdpname, 1)
-        oepsize = self.mesh.shape.get(epname, 1)
-        otpsize = self.mesh.shape.get(tpname, 1)
-        ospsize = self.mesh.shape.get(spname, 1)
-
-        # Combine FSDP, EP, SP into single expert dimension
-
-        epsize = oepsize
-        if self.config.fsdp_is_ep_bound:
-            epsize *= ofsdpsize
-        else:
-            odpsize *= ofsdpsize
-
-        if self.config.sp_is_ep_bound:
-            epsize *= ospsize
-        else:
-            odpsize *= ospsize
-
-        devices = self.mesh.devices.flatten()
-        self.expert_mesh = jax.sharding.Mesh(
-            devices.reshape(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-        )
-        self.auto_expert_mesh = jax.sharding.Mesh(
-            devices.reshape(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-            axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
-        )
-        self.abs_expert_mesh = self.expert_mesh.abstract_mesh.update(
-            axis_sizes=(odpsize, epsize, otpsize),
-            axis_names=(dpname, epname, tpname),
-        )
+        self.dtype = getattr(self, "dtype", jnp.bfloat16)
 
     def get_moe_spec(
         self,
@@ -1110,6 +1051,9 @@ class BaseMoeModule(nn.Module, ABC):
         with self.auto_expert_mesh:
             match self.module_moe_method:
                 case MoEMethods.STANDARD_MOE:
+                    logger.warn_once(
+                        "You are using MoEMethods.STANDARD_MOE which is not really recommended please switch to FUSED_MOE"
+                    )
                     return self._moe_call_standard(
                         gate_layer=gate_layer,
                         expert_layer=expert_layer,
@@ -1133,6 +1077,9 @@ class BaseMoeModule(nn.Module, ABC):
                         ffn_activation=ffn_activation,
                     )
                 case MoEMethods.DENSE_MOE:
+                    logger.warn_once(
+                        "You are using MoEMethods.DENSE_MOE which is not really recommended please switch to FUSED_MOE"
+                    )
                     return self._moe_call_dense(
                         hidden_state=hidden_state,
                         gate_layer=gate_layer,

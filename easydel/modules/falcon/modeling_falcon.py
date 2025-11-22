@@ -183,6 +183,8 @@ class FalconAttention(UnifiedAttention):
 
 
 class FalconMlp(nn.Module):
+    """Gated feed-forward network for Falcon decoder blocks."""
+
     def __init__(
         self,
         config: FalconConfig,
@@ -237,6 +239,8 @@ class FalconMlp(nn.Module):
 
 
 class FalconBlock(nn.Module):
+    """Single Falcon transformer block with attention and MLP."""
+
     def __init__(
         self,
         config: FalconConfig,
@@ -391,6 +395,8 @@ class FalconBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=FalconConfig, model_type="falcon")
 class FalconModel(EasyDeLBaseModule):
+    """Falcon decoder-only transformer with embeddings, blocks, and final norm."""
+
     def __init__(
         self,
         config: FalconConfig,

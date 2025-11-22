@@ -52,6 +52,7 @@ _lightning_attention = None  # TODO:FIX
 
 
 def compute_slops(nhd):
+    """Generate ALiBi-style slopes for the provided number of attention heads."""
     def get_slopes(n):
         def get_slopes_power_of_2(n):
             start = 2 ** (-(2 ** -(math.log2(n) - 3)))
@@ -71,6 +72,7 @@ def compute_slops(nhd):
 
 
 def get_activation_fn(activation):
+    """Map activation name to a callable used inside MiniMax feed-forward blocks."""
     if activation == "gelu":
         return partial(jax.nn.gelu, approximate=False)
     elif activation == "relu":

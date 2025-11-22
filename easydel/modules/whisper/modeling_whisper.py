@@ -1267,6 +1267,8 @@ class WhisperModel(EasyDeLBaseModule):
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
 class WhisperForConditionalGeneration(EasyDeLBaseModule):
+    """Whisper encoder-decoder with projection head for speech-to-text generation."""
+
     loss_type = "ForCausalLM"
 
     def __init__(
@@ -1619,6 +1621,8 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 
 @register_module(TaskType.AUDIO_CLASSIFICATION, config=WhisperConfig, model_type="whisper")
 class WhisperForAudioClassification(EasyDeLBaseModule):
+    """Encoder-only Whisper variant with pooling and classifier for audio tagging."""
+
     def __init__(
         self,
         config: WhisperConfig,

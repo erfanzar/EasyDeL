@@ -58,6 +58,8 @@ def is_flatten(pytree: dict):
 
 
 class AutoEasyDeLConfig:
+    """Factory helpers to load EasyDeL configs from identifiers or checkpoints."""
+
     @staticmethod
     def bind_model_task(model_task: TaskType, architectures: list[str] | str):
         if model_task == TaskType.AUTO_BIND:

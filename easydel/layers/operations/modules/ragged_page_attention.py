@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import re
+
 import jax
 from eformer import common_types as ct
 from ejkernel.modules import RaggedPageAttentionConfig, ragged_page_attention, ragged_page_attention_v3
@@ -30,21 +32,25 @@ from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistr
 USE_SHARDMAP = True
 
 
-def get_tpu_version() -> int:
-    """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
-        return -1
-    if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-    if kind.endswith("p"):
-        kind = kind[:-1]
-    if kind == "TPU7x":
-        return 7
+def get_tpu_generation() -> int:
+    """
+    Returns the TPU generation as an integer (e.g., 3, 4, 5).
+    Returns 0 if no TPU is detected or if the generation cannot be determined.
+    """
     try:
-        assert kind[:-1] == "TPU v", kind
-        return int(kind[-1])
-    except Exception:
+        devices = jax.devices("tpu")
+
+        if not devices:
+            return 0
+        device_kind = devices[0].device_kind
+        match = re.search(r"v(\d+)", device_kind)
+
+        if match:
+            return int(match.group(1))
+
+        return 0
+
+    except (RuntimeError, IndexError):
         return 0
 
 
@@ -118,12 +124,21 @@ class _RaggedPageAttn(OperationImpl):
         else:
             dtype_for_compute = compute_dtype
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
-        num_kv_pages_per_block = None
-        num_queries_per_block = None
+        cfg = RaggedPageAttentionConfig(
+            num_kv_pages_per_block=None,
+            num_queries_per_block=None,
+            platform=platform,
+            backend="any",
+        )
+
         if platform == "pallas":
-            if get_tpu_version() == 4:
-                num_kv_pages_per_block = 16
-                num_queries_per_block = 4
+            if query.shape[-1] == 128:
+                if get_tpu_generation() == 4:
+                    cfg.num_kv_pages_per_block = 16
+                    cfg.num_queries_per_block = 4
+            else:
+                platform = "xla"
+                cfg = None  # AutoTune...
         output = ragged_page_attention(
             query,
             kv_pages,
@@ -139,12 +154,8 @@ class _RaggedPageAttn(OperationImpl):
             compute_dtype=dtype_for_compute,
             mask_value=mask_value,
             sliding_window=sliding_window,
-            cfg=RaggedPageAttentionConfig(
-                num_queries_per_block=num_queries_per_block,
-                num_kv_pages_per_block=num_kv_pages_per_block,
-                platform=platform,
-                backend="any",
-            ),
+            cfg=cfg,
+            platform=platform,
             in_specs=(
                 qaxes,
                 resolve(
@@ -187,8 +198,12 @@ class _RaggedPageAttn(OperationImpl):
         if request_distribution is None:
             request_distribution = jnp.array([0, 0, num_seqs_flat.shape[0]], dtype=jnp.int32)
 
+        sinks_axis = None
+
+        if softmax_aux is not None:
+            sinks_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
 
         if softmax_aux is not None:
             raise NotImplementedError("softmax_aux is only supported in v2 kernel")
@@ -199,32 +214,38 @@ class _RaggedPageAttn(OperationImpl):
             shape=kv_pages.shape,
         )
 
+        cfg = RaggedPageAttentionv3Config(
+            num_queries_per_block=None,
+            num_kv_pages_per_block=None,
+            chunk_prefill_size=None,
+            platform="pallas" if jax.default_backend() == "tpu" else "auto",
+            backend="any",
+        )
+        # handled by autotune in ejkernel
+        # tpname = manager.paxis.resolve_axis([ct.HEAD], ct.MODE_TRAIN)[0]
+        # tpsize = self.metadata.mesh.shape.get(tpname, 1)
+        # page_size = kv_pages.shape[1]
+        # if cfg.platform == "pallas":
+        #     if get_tpu_generation() in [4, 5] and tpsize == 1:
+        #         # Q: why doing this hard set?
+        #         # A: you should thank me for stoping u to face vmem limit issues
+        #         if page_size == 32:
+        #             cfg.num_queries_per_block = 4
+        #             cfg.num_kv_pages_per_block = 32
+        #         if page_size == 64:
+        #             cfg.num_queries_per_block = 8
+        #             cfg.num_kv_pages_per_block = 16
+
         call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             vmem_limit_bytes=vmem_limit_bytes,
             sliding_window=sliding_window,
-            cfg=RaggedPageAttentionv3Config(
-                num_queries_per_block=None,
-                num_kv_pages_per_block=None,
-                chunk_prefill_size=None,
-                platform="pallas" if jax.default_backend() == "tpu" else "auto",
-                backend="any",
-            ),
-            in_specs=(
-                qaxes,
-                kvaxes,
-                kvaxes,
-                kv_pages_spec,
-                Ps(),
-                Ps(),
-                Ps(),
-                Ps(),
-            ),
+            cfg=cfg,
+            in_specs=(qaxes, kvaxes, kvaxes, kv_pages_spec, Ps(), Ps(), Ps(), Ps(), sinks_axis),
             out_specs=(qaxes, kv_pages_spec),
             mesh=self.metadata.mesh,
         )
-
         output, kv_pages = ragged_page_attention_v3(
             query,
             key,
@@ -234,6 +255,7 @@ class _RaggedPageAttn(OperationImpl):
             cache_metadata.pages_tables.reshape(-1),
             cache_metadata.query_start_loc,
             request_distribution,
+            softmax_aux,
             **call_kwargs,
         )
         cache_view.kv_pages = kv_pages

@@ -90,10 +90,6 @@ class EvaluationConfig:
         default=True,
         metadata={"help": "Automatically cap new tokens to respect the context budget."},
     )
-    bytecode_decode: bool = field(
-        default=True,
-        metadata={"help": "Enable smart bytecode decoding in eSurge."},
-    )
     compile_runner: bool = field(
         default=True,
         metadata={"help": "Compile the underlying runner for faster generation."},
@@ -177,7 +173,6 @@ def main():
         reserve_tokens=eval_config.reserve_tokens,
         auto_truncate_prompt=eval_config.auto_truncate_prompt,
         auto_cap_new_tokens=eval_config.auto_cap_new_tokens,
-        bytecode_decode=eval_config.bytecode_decode,
         compile_runner=eval_config.compile_runner,
         runner_verbose=eval_config.runner_verbose,
         esurge_name="esurge-eval",

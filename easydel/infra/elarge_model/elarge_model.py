@@ -38,7 +38,6 @@ import typing
 from collections.abc import Mapping
 from typing import Any, NotRequired, Unpack
 
-import jax
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from transformers import AutoTokenizer
@@ -479,7 +478,6 @@ class eLargeModel:
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
         return self
-
 
     def set_mixture(
         self,
