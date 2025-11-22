@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     ImageClassifierOutput,
     ModelOutput,
 )
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
@@ -45,6 +45,8 @@ from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionCo
 
 @auto_pytree
 class SiglipVisionModelOutput(ModelOutput):
+    """Outputs from the SigLIP vision tower including pooled embeddings."""
+
     image_embeds: chex.Array | None = None
     last_hidden_state: chex.Array = None
     hidden_states: tuple[chex.Array, ...] | None = None
@@ -53,6 +55,8 @@ class SiglipVisionModelOutput(ModelOutput):
 
 @auto_pytree
 class SiglipTextModelOutput(ModelOutput):
+    """Outputs from the SigLIP text encoder with optional attentions."""
+
     text_embeds: chex.Array | None = None
     last_hidden_state: chex.Array = None
     hidden_states: tuple[chex.Array, ...] | None = None
@@ -61,6 +65,8 @@ class SiglipTextModelOutput(ModelOutput):
 
 @auto_pytree
 class SiglipOutput(ModelOutput):
+    """Contrastive SigLIP output bundling text/vision logits and embeddings."""
+
     loss: chex.Array | None = None
     logits_per_image: chex.Array = None
     logits_per_text: chex.Array = None
@@ -77,6 +83,8 @@ class SiglipOutput(ModelOutput):
 
 
 class SiglipVisionEmbeddings(nn.Module):
+    """Patch projection and positional encoding for the SigLIP vision encoder."""
+
     def __init__(
         self,
         config: SiglipVisionConfig,
@@ -157,6 +165,8 @@ class SiglipVisionEmbeddings(nn.Module):
 
 
 class SiglipTextEmbeddings(nn.Module):
+    """Token and position embeddings for the SigLIP text encoder."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -213,6 +223,8 @@ class SiglipTextEmbeddings(nn.Module):
 
 
 class SiglipAttention(AttentionModule):
+    """Multi-head self-attention module used across SigLIP encoders."""
+
     def __init__(
         self,
         config,
@@ -324,6 +336,8 @@ class SiglipAttention(AttentionModule):
 
 
 class SiglipMLP(nn.Module):
+    """Two-layer feed-forward network for SigLIP transformer blocks."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -369,6 +383,8 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
+    """Transformer encoder block with pre-norm attention and MLP."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -440,6 +456,8 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
+    """Stack of SigLIP encoder layers with optional attention and hidden state capture."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -501,6 +519,8 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipTextTransformer(EasyDeLBaseModule):
+    """Text-side transformer backbone providing embeddings, encoder, and projection head."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -616,6 +636,8 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 
 @register_module(TaskType.BASE_MODULE, config=SiglipTextConfig, model_type="siglip_text_model")
 class SiglipTextModel(EasyDeLBaseModule):
+    """Public text-only SigLIP model wrapper exposing the transformer backbone."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -686,6 +708,8 @@ class SiglipTextModel(EasyDeLBaseModule):
 
 
 class SiglipVisionTransformer(EasyDeLBaseModule):
+    """Vision-side transformer encoder used by SigLIP for patch representations."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -797,6 +821,8 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 
 
 class MultiheadAttention(nn.Module):
+    """Simple multi-head attention used by the vision pooling head."""
+
     def __init__(
         self,
         embed_dim,
@@ -825,8 +851,18 @@ class MultiheadAttention(nn.Module):
         def ze_init(*shape):
             return jnp.zeros(shape, param_dtype)
 
-        self.in_proj_weight = nn.Param(normal_init(embed_dim * 3, embed_dim))
-        self.in_proj_bias = nn.Param(ze_init(3 * embed_dim))
+        self.in_proj_weight = ArrayParam.bound(
+            shape=(embed_dim * 3, embed_dim),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: normal_init(*shape),
+            key=None,
+        )
+        self.in_proj_bias = ArrayParam.bound(
+            shape=(3 * embed_dim,),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: ze_init(*shape),
+            key=None,
+        )
         self.out_proj = RowParallelLinear(
             embed_dim,
             embed_dim,
@@ -869,6 +905,8 @@ class MultiheadAttention(nn.Module):
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
+    """Pools vision tokens with a learned probe followed by MLP refinement."""
+
     def __init__(
         self,
         config: SiglipTextConfig,
@@ -878,12 +916,11 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.probe = nn.Param(
-            jax.random.normal(
-                rngs.param(),
-                (1, 1, config.hidden_size),
-                param_dtype,
-            )
+        self.probe = ArrayParam.bound(
+            shape=(1, 1, config.hidden_size),
+            dtype=param_dtype,
+            init_fn=jax.random.normal,
+            key=rngs.param(),
         )
         self.attention = MultiheadAttention(
             config.hidden_size,
@@ -921,6 +958,8 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=SiglipVisionConfig, model_type="siglip_vision_model")
 class SiglipVisionModel(nn.Module):
+    """Convenience wrapper around the SigLIP vision transformer backbone."""
+
     def __init__(
         self,
         config: SiglipVisionConfig,
@@ -981,6 +1020,8 @@ class SiglipVisionModel(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=SiglipConfig, model_type="siglip")
 class SiglipModel(EasyDeLBaseModule):
+    """Full SigLIP contrastive model combining text and vision towers."""
+
     def __init__(
         self,
         config: SiglipConfig,
@@ -1030,8 +1071,18 @@ class SiglipModel(EasyDeLBaseModule):
         self.text_model = text_model.text_model
         self.vision_model = vision_model.vision_model
 
-        self.logit_scale = nn.Param(jax.random.normal(rngs.param(), (1,), param_dtype))
-        self.logit_bias = nn.Param(jax.random.normal(rngs.param(), (1,), param_dtype))
+        self.logit_scale = ArrayParam.bound(
+            shape=(1,),
+            dtype=param_dtype,
+            init_fn=jax.random.normal,
+            key=rngs.param(),
+        )
+        self.logit_bias = ArrayParam.bound(
+            shape=(1,),
+            dtype=param_dtype,
+            init_fn=jax.random.normal,
+            key=rngs.param(),
+        )
 
     def get_text_features(
         self,
@@ -1188,6 +1239,8 @@ class SiglipModel(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_CLASSIFICATION, config=SiglipConfig, model_type="siglip")
 class SiglipForImageClassification(EasyDeLBaseModule):
+    """Image-classification head on top of the SigLIP vision encoder."""
+
     def __init__(
         self,
         config: SiglipConfig,

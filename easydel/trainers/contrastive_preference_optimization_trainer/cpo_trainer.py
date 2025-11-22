@@ -172,6 +172,7 @@ class CPOTrainer(Trainer):
             dataset_train=prepared_train,
             dataset_eval=prepared_eval,
             data_collator=None,
+            processing_class=processing_class,
         )
 
     def _prepare_dataset(

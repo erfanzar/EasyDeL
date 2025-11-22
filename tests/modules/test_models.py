@@ -1308,29 +1308,109 @@ class TestAllModels:
         )
         assert res, f"Qwen3Moe model Failed [ERROR {err}]"
 
-    # def test_qwen2_vl(self, small_model_config):
-    #     """Test Qwen2-VL vision-language model."""
-    #     header_config = ed.AutoEasyDeLConfig.from_pretrained(
-    #         "Qwen/Qwen2-VL-2B-Instruct",
-    #         model_task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
-    #     )
-    #     header_config.hidden_size = 128 * 4
-    #     header_config.initializer_range = 0.02
-    #     header_config.intermediate_size = 256
-    #     header_config.max_position_embeddings = 1024
-    #     header_config.max_window_layers = 8
-    #     header_config.num_attention_heads = 4
-    #     header_config.num_hidden_layers = 8
-    #     header_config.num_key_value_heads = 2
+    def test_qwen3_vl(self, small_model_config):
+        """Test Qwen3-VL vision-language model (text-only parity)."""
+        local_cfg = small_model_config.copy()
+        local_cfg["vocab_size"] = 128
+        local_cfg["sequence_length"] = 16
+        local_cfg["max_position_embeddings"] = 32
+        vision_cfg = dict(
+            depth=1,
+            embed_dim=16,
+            hidden_size=16,
+            intermediate_size=32,
+            hidden_act="quick_gelu",
+            mlp_ratio=2,
+            num_heads=4,
+            in_channels=3,
+            patch_size=2,
+            spatial_merge_size=1,
+            temporal_patch_size=1,
+            tokens_per_second=1.0,
+            out_hidden_size=16,
+            deepstack_visual_indexes=[1],
+        )
+        rope_scaling = {"rope_type": "default", "mrope_section": [24, 20, 20]}
+        header_config = ed.Qwen3VLConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,  # 32 // 4 = 8
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            attention_dropout=0.0,
+            tie_word_embeddings=False,
+            max_position_embeddings=32,
+            image_token_id=126,
+            video_token_id=127,
+            vision_start_token_id=125,
+            vision_config=vision_cfg,
+            rope_scaling=rope_scaling,
+        )
+        header_config.sharding_axis_dims = (1, -1, 1, 1, 1)
+        header_config.sharding_axis_names = ("dp", "fsdp", "tp", "ep", "sp")
+        if hasattr(header_config, "attach_custom_arguments"):
+            header_config.attach_custom_arguments()
+        header_config.add_basic_configurations(
+            shard_attention_computation=False,
+            use_sharding_constraint=False,
+            scan_mlp_chunk_size=16,
+        )
 
-    #     res, err = self.create_test_for_models(
-    #         "qwen2_vl",
-    #         transformers.Qwen2VLForConditionalGeneration,
-    #         ed.TaskType.IMAGE_TEXT_TO_TEXT,
-    #         small_model_config,
-    #         header_config=header_config,
-    #     )
-    #     assert res, f"Qwen2VL model Failed [ERROR {err}]"
+        res, err = self.create_test_for_models(
+            "qwen3_vl",
+            transformers.Qwen3VLForConditionalGeneration,
+            ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            local_cfg,
+            header_config=header_config,
+        )
+        assert res, f"Qwen3-VL model Failed [ERROR {err}]"
+
+    def test_qwen2_vl(self, small_model_config):
+        """Test Qwen2-VL vision-language model."""
+        vision_cfg = dict(
+            depth=4,
+            embed_dim=128,
+            hidden_size=128,
+            mlp_ratio=2,
+            num_heads=4,
+            in_channels=3,
+            patch_size=14,
+            spatial_merge_size=2,
+        )
+        text_cfg = dict(
+            vocab_size=small_model_config["vocab_size"],
+            hidden_size=small_model_config["hidden_size"],
+            intermediate_size=small_model_config["intermediate_size"],
+            num_hidden_layers=small_model_config["num_hidden_layers"],
+            num_attention_heads=small_model_config["num_attention_heads"],
+            num_key_value_heads=small_model_config.get("num_key_value_heads"),
+            max_position_embeddings=small_model_config["max_position_embeddings"],
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            attention_dropout=0.0,
+            tie_word_embeddings=False,
+            rope_scaling={"rope_type": "default", "mrope_section": [4, 6, 6]},
+        )
+        header_config = ed.Qwen2VLConfig(
+            text_config=text_cfg,
+            vision_config=vision_cfg,
+            image_token_id=151655,
+            video_token_id=151656,
+            vision_start_token_id=151652,
+        )
+
+        res, err = self.create_test_for_models(
+            "qwen2_vl",
+            transformers.Qwen2VLForConditionalGeneration,
+            ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            small_model_config,
+            header_config=header_config,
+        )
+        assert res, f"Qwen2VL model Failed [ERROR {err}]"
 
     # def test_roberta(self, small_model_config):
     #     """Test RoBERTa model."""

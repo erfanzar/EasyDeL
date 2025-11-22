@@ -12,14 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_qwen2_vl import Qwen2VLForConditionalGeneration, Qwen2VLModel, Qwen2VLTextModel
-from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
-
-__all__ = (
-    "Qwen2VLConfig",
-    "Qwen2VLForConditionalGeneration",
-    "Qwen2VLModel",
-    "Qwen2VLTextConfig",
-    "Qwen2VLTextModel",
-    "Qwen2VLVisionConfig",
+from .modeling_qwen3_vl import (
+    Qwen3VisionTransformerPretrainedModel,
+    Qwen3VLCausalLMOutputWithPast,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLModel,
+    Qwen3VLTextModel,
 )
+from .qwen3_vl_configuration import (
+    Qwen3VLConfig,
+    Qwen3VLTextConfig,
+    Qwen3VLVisionConfig,
+)
+
+__all__ = [
+    "Qwen3VLCausalLMOutputWithPast",
+    "Qwen3VLConfig",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLModel",
+    "Qwen3VLTextConfig",
+    "Qwen3VLTextModel",
+    "Qwen3VLVisionConfig",
+    "Qwen3VisionTransformerPretrainedModel",
+]

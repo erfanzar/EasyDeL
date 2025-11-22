@@ -43,6 +43,8 @@ from .glm4_configuration import Glm4Config
 
 
 class Glm4MLP(nn.Module):
+    """Feed-forward network used inside GLM-4 decoder layers."""
+
     def __init__(
         self,
         config: Glm4Config,
@@ -98,6 +100,8 @@ class Glm4MLP(nn.Module):
 
 
 class Glm4Attention(UnifiedAttention):
+    """Multi-head attention block configured for GLM-4."""
+
     def __init__(
         self,
         config: Glm4Config,
@@ -120,6 +124,8 @@ class Glm4Attention(UnifiedAttention):
 
 
 class Glm4DecoderLayer(nn.Module):
+    """Single GLM-4 decoder block combining attention and MLP."""
+
     def __init__(
         self,
         config: Glm4Config,

@@ -19,6 +19,8 @@ import typing
 from collections import defaultdict
 from collections.abc import Iterable
 
+from eformer.loggings import get_logger
+
 from ..config import Config
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
@@ -34,6 +36,8 @@ from .utils import check_stop
 
 if typing.TYPE_CHECKING:
     from ..runners.model_runner import eSurgeRunner
+
+logger = get_logger("eSurgeScheduler")
 
 
 class Scheduler(SchedulerInterface):
@@ -84,8 +88,14 @@ class Scheduler(SchedulerInterface):
 
         self.finished_recving_kv_req_ids: set[str] = set()
 
+        speculative_config = config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        if speculative_config:
+            self.num_spec_tokens = speculative_config.num_speculative_tokens
+            if speculative_config.use_eagle():
+                self.use_eagle = True
+                self.num_lookahead_tokens = self.num_spec_tokens
 
         self.kv_cache_manager = CacheManager(
             num_pages=num_pages,
@@ -198,11 +208,24 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            preemption_attempts = 0
+            max_preemption_attempts = len(self.running) + 1  # Allow one full cycle plus one
+
             while True:
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens, num_lookahead_tokens=self.num_lookahead_tokens
                 )
                 if new_pages is None:
+                    preemption_attempts += 1
+                    if preemption_attempts >= max_preemption_attempts:
+                        # Cannot allocate even after preempting all requests
+                        logger.warning(
+                            f"Cannot allocate {num_new_tokens} tokens for request {request.request_id} "
+                            f"after {preemption_attempts} preemption attempts. Skipping."
+                        )
+                        can_schedule = False
+                        break
+
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
@@ -291,9 +314,22 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
                     if not self.scheduler_config.chunked_prefill_enabled and num_new_tokens > token_budget:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
-                        continue
+                        # If the request is larger than the max batch size, we MUST allow it if the batch is empty,
+                        # otherwise it will never run.
+                        # If it's larger than available memory (reflected in token_budget via capacity),
+                        # allocate_slots will fail anyway.
+                        is_inherently_too_large = num_new_tokens > self.max_num_scheduled_tokens
+                        is_batch_empty = (
+                            len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) == 0
+                        )
+
+                        if is_inherently_too_large and is_batch_empty:
+                            # Allow it to proceed to allocation
+                            pass
+                        else:
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.prepend_request(request)
+                            continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
@@ -352,9 +388,21 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
 
         num_common_prefix_pages = [0] * len(self.kv_cache_config.kv_cache_groups)
-        if self.running:
-            any_request = self.running[0]
-            num_common_prefix_pages = self.kv_cache_manager.get_num_common_prefix_pages(any_request, len(self.running))
+        scheduled_req_count = len(num_scheduled_tokens)
+        if scheduled_req_count > 0:
+            if scheduled_running_reqs:
+                representative_req = scheduled_running_reqs[0]
+            elif scheduled_resumed_reqs:
+                representative_req = scheduled_resumed_reqs[0]
+            elif scheduled_new_reqs:
+                representative_req = scheduled_new_reqs[0]
+            else:
+                representative_req = None
+
+            if representative_req is not None:
+                num_common_prefix_pages = self.kv_cache_manager.get_num_common_prefix_pages(
+                    representative_req, scheduled_req_count
+                )
         new_reqs_data = [
             NewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
         ]
@@ -374,6 +422,7 @@ class Scheduler(SchedulerInterface):
             num_common_prefix_pages=num_common_prefix_pages,
             finished_req_ids=self.finished_req_ids,
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
+            async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
         )
 
         self._update_after_schedule(scheduler_output)

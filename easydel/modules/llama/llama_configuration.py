@@ -190,6 +190,8 @@ class LlamaConfig(EasyDeLBaseConfig):
 
 
 class VisionLlamaConfig(LlamaConfig):
+    """Configuration for Llama models augmented with a vision vocabulary."""
+
     def __init__(
         self,
         vision_vocab_size=8448,

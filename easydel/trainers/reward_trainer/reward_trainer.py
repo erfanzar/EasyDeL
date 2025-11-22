@@ -187,6 +187,7 @@ class RewardTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=model,
             data_collator=None,
+            processing_class=processing_class,
         )
 
     def create_collect_function(self, max_sequence_length, truncation_mode="keep_end"):

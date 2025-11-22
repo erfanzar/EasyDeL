@@ -659,6 +659,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 
 
 class AutoStateForCausalLM(BaseAutoEasyState):
+    """Loads saved states for causal language modeling tasks."""
+
     _base = AutoEasyDeLModelForCausalLM
 
 
@@ -677,6 +679,8 @@ class AutoEasyDeLModelForDiffusionLM(BaseAutoEasyModel):
 
 
 class AutoStateForDiffusionLM(BaseAutoEasyState):
+    """Loads saved states for diffusion-based language models."""
+
     _base = AutoEasyDeLModelForDiffusionLM
 
 
@@ -695,6 +699,8 @@ class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
 
 
 class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
+    """Loads saved states for zero-shot image classification models."""
+
     _base = AutoEasyDeLModelForZeroShotImageClassification
 
 
@@ -737,6 +743,8 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 
 
 class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
+    """Loads saved states for speech-to-text sequence-to-sequence models."""
+
     _base = AutoEasyDeLModelForSpeechSeq2Seq
 
 
@@ -754,6 +762,8 @@ class AutoEasyDeLModelForSeq2SeqLM(BaseAutoEasyModel):
 
 
 class AutoStateForSeq2SeqLM(BaseAutoEasyState):
+    """Loads saved states for text-to-text sequence-to-sequence models."""
+
     _base = AutoEasyDeLModelForSeq2SeqLM
 
 
@@ -771,6 +781,8 @@ class AutoEasyDeLModelForImageTextToText(BaseAutoEasyModel):
 
 
 class AutoStateForImageTextToText(BaseAutoEasyState):
+    """Loads saved states for image-conditioned text-to-text models."""
+
     _base = AutoEasyDeLModelForImageTextToText
 
 
@@ -788,6 +800,8 @@ class AutoEasyDeLModelForSequenceClassification(BaseAutoEasyModel):
 
 
 class AutoStateForImageSequenceClassification(BaseAutoEasyState):
+    """Loads saved states for image-conditioned sequence classification."""
+
     _base = AutoEasyDeLModelForSequenceClassification
 
 
@@ -805,6 +819,8 @@ class AutoEasyDeLModel(BaseAutoEasyModel):
 
 
 class AutoState(BaseAutoEasyState):
+    """Loads saved states for generic text-only EasyDeL modules."""
+
     _base = AutoEasyDeLModel
 
 
@@ -822,4 +838,6 @@ class AutoEasyDeLVisionModel(BaseAutoEasyModel):
 
 
 class AutoStateVisionModel(BaseAutoEasyState):
+    """Loads saved states for vision-only EasyDeL modules."""
+
     _base = AutoEasyDeLVisionModel

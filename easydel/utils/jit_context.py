@@ -28,8 +28,7 @@ Typical usage::
 
     # Changing the context will trigger a re-trace with new constants.
 
-This mirrors the idea of ``vllm.forward_context`` but is tailored for
-JAX. Only immutable data (``NamedTuple`` instances or similar tuples) is
+Only immutable data (``NamedTuple`` instances or similar tuples) is
 accepted to avoid accidental mutations that would break JIT semantics.
 """
 

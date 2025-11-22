@@ -145,10 +145,10 @@ def xpo_step(
         rejected_log_ratio = rejected_policy_logps - rejected_ref_logps
         logits = chosen_log_ratio - rejected_log_ratio
 
-        if minibatch["loss_type"][0] == 0:
-            dpo_losses = -jnn.log_sigmoid(beta * logits)
-        else:
-            dpo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+        loss_type = minibatch["loss_type"][0]
+        sigmoid_losses = -jnn.log_sigmoid(beta * logits)
+        ipo_losses = (logits - 1.0 / (2.0 * beta)) ** 2
+        dpo_losses = jnp.where(loss_type == 0, sigmoid_losses, ipo_losses)
 
         xpo_losses = alpha * policy_logps_ref
         total_loss = (dpo_losses + xpo_losses).mean()

@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     EncoderLayerOutput,
     ModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -100,6 +100,7 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
 
 
 def bmm(inputs, kernel, precision):
+    """Batch matrix multiplication helper that works for 2D or higher-rank inputs."""
     subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
 
     return jnp.einsum(
@@ -113,6 +114,7 @@ def bmm(inputs, kernel, precision):
 
 @ejit(static_argnums=(0, 1, 2, 3))
 def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
+    """Compute rotary frequencies for the vision transformer grid."""
     img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
     img_idx = jnp.concatenate([img_idx, img_idx[:1]], axis=0)
     img_idx = img_idx.at[-1, -1].set(-2)
@@ -135,6 +137,7 @@ def _create_chunked_attention_mask(
     start: int,
     end: int,
 ):
+    """Create a chunked causal attention mask for sliding window attention."""
     blcok_position = jnp.abs(
         (jnp.arange(start, end)[None, :] // attention_chunk_size)
         - jnp.arange(start, end)[:, None] // attention_chunk_size
@@ -170,19 +173,17 @@ class Llama4TextExperts(nn.Module):
 
         kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
-        self.gate_up_proj = nn.Param(
-            kernel_init(
-                rngs.params(),
-                (self.num_experts, self.hidden_size, 2 * self.expert_dim),
-                self.param_dtype,
-            )
+        self.gate_up_proj = ArrayParam.bound(
+            shape=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
+            dtype=self.param_dtype,
+            init_fn=kernel_init,
+            key=rngs.params(),
         )
-        self.down_proj = nn.Param(
-            kernel_init(
-                rngs.params(),
-                (self.num_experts, self.expert_dim, self.hidden_size),
-                self.param_dtype,
-            )
+        self.down_proj = ArrayParam.bound(
+            shape=(self.num_experts, self.expert_dim, self.hidden_size),
+            dtype=self.param_dtype,
+            init_fn=kernel_init,
+            key=rngs.params(),
         )
 
         self.activation_fn = ACT2FN[self.config.hidden_act]
@@ -353,6 +354,8 @@ class Llama4TextMoe(nn.Module):
 
 
 class Llama4TextAttention(UnifiedAttention):
+    """Attention module for the Llama4 text decoder with optional sliding windows."""
+
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -458,6 +461,8 @@ class Llama4TextAttention(UnifiedAttention):
 
 
 class Llama4TextDecoderLayer(nn.Module):
+    """Single Llama4 text decoder block combining attention and MLP."""
+
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -580,6 +585,8 @@ class Llama4TextDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4TextModel(EasyDeLBaseModule):
+    """Decoder-only Llama4 text model built from embeddings and decoder blocks."""
+
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -865,6 +872,7 @@ class Llama4MultiModalProjector(nn.Module):
 
 
 def pixel_shuffle(input_tensor, shuffle_ratio):
+    """Rearrange flattened vision tokens to a denser spatial grid."""
     batch_size, num_patches, channels = input_tensor.shape
     patch_size = int(math.sqrt(num_patches))
 
@@ -930,6 +938,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
 
 
 def reshape_for_broadcast(frequencies: jax.Array, query: jax.Array) -> jax.Array:
+    """Reshape rotary frequencies so they broadcast over the complex query tensor."""
     ndim = query.ndim
     return jnp.reshape(
         frequencies,
@@ -942,6 +951,7 @@ def vision_apply_rotary_emb(
     key: jax.Array,
     frequencies: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
+    """Apply rotary position embeddings to complex-valued vision queries and keys."""
     query_dtype = query.dtype
     key_dtype = key.dtype
     query_reshaped = query.astype(jnp.float32).reshape((*query.shape[:-1], -1, 2))
@@ -962,6 +972,8 @@ def vision_apply_rotary_emb(
 
 
 class Llama4VisionAttention(AttentionModule):
+    """Attention module for the Llama4 vision transformer."""
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -1370,6 +1382,8 @@ class Llama4UnfoldConvolution(nn.Module):
 @register_module(TaskType.BASE_VISION, config=Llama4VisionConfig, model_type="llama4_vision")
 @register_module(TaskType.BASE_MODULE, config=Llama4VisionConfig, model_type="llama4_vision")
 class Llama4VisionModel(EasyDeLBaseModule):
+    """Vision transformer for Llama4 including patchify stem, transformer blocks, and final norm."""
+
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -1401,21 +1415,17 @@ class Llama4VisionModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.class_embedding = nn.Param(
-            self.scale
-            * jax.random.normal(
-                rngs.params(),
-                (self.hidden_size,),
-                param_dtype,
-            )
+        self.class_embedding = ArrayParam.bound(
+            shape=(self.hidden_size,),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: self.scale * jax.random.normal(key, shape, dtype),
+            key=rngs.params(),
         )
-        self.positional_embedding_vlm = nn.Param(
-            self.scale
-            * jax.random.normal(
-                rngs.params(),
-                (self.num_patches, self.hidden_size),
-                param_dtype,
-            )
+        self.positional_embedding_vlm = ArrayParam.bound(
+            shape=(self.num_patches, self.hidden_size),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: self.scale * jax.random.normal(key, shape, dtype),
+            key=rngs.params(),
         )
         self.layernorm_pre = nn.LayerNorm(
             num_features=self.hidden_size,

@@ -26,6 +26,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.utils import ArrayParam
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
@@ -54,6 +55,7 @@ class RwkvCausalLMOutput(ModelOutput):
 
 
 def init_state(hidden_size):
+    """Create zeroed RWKV recurrent state tensors for a given hidden size."""
     zeros = jnp.zeros(hidden_size)
     min_values = jnp.full(hidden_size, -jnp.inf)
     time_mix_state = (zeros, zeros, zeros, min_values)
@@ -69,6 +71,7 @@ def rwkv_linear_attention(
     state=None,
     return_state=False,
 ):
+    """Compute RWKV linear attention update with optional recurrent state."""
     current_sequence_length = key.shape[1]
     output = jnp.zeros_like(key)
 
@@ -141,11 +144,41 @@ class RwkvSelfAttention(nn.Module):
         time_mix_value = time_mix_key + 0.3 * ratio_0_to_1
         time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
 
-        self.time_decay = nn.Param(time_decay.astype(self.param_dtype))
-        self.time_first = nn.Param(time_first.astype(self.param_dtype))
-        self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
-        self.time_mix_value = nn.Param(time_mix_value.astype(self.param_dtype))
-        self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
+        self.time_decay = ArrayParam.bound(
+            shape=time_decay.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_decay.astype(dtype),
+            key=None,
+            value=time_decay.astype(self.param_dtype),
+        )
+        self.time_first = ArrayParam.bound(
+            shape=time_first.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_first.astype(dtype),
+            key=None,
+            value=time_first.astype(self.param_dtype),
+        )
+        self.time_mix_key = ArrayParam.bound(
+            shape=time_mix_key.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_mix_key.astype(dtype),
+            key=None,
+            value=time_mix_key.astype(self.param_dtype),
+        )
+        self.time_mix_value = ArrayParam.bound(
+            shape=time_mix_value.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_mix_value.astype(dtype),
+            key=None,
+            value=time_mix_value.astype(self.param_dtype),
+        )
+        self.time_mix_receptance = ArrayParam.bound(
+            shape=time_mix_receptance.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_mix_receptance.astype(dtype),
+            key=None,
+            value=time_mix_receptance.astype(self.param_dtype),
+        )
 
         self.key = ColumnParallelLinear(
             hidden_size,
@@ -253,8 +286,20 @@ class RwkvFeedForward(nn.Module):
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
         time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
-        self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
-        self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
+        self.time_mix_key = ArrayParam.bound(
+            shape=time_mix_key.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_mix_key.astype(dtype),
+            key=None,
+            value=time_mix_key.astype(self.param_dtype),
+        )
+        self.time_mix_receptance = ArrayParam.bound(
+            shape=time_mix_receptance.shape,
+            dtype=self.param_dtype,
+            init_fn=lambda key, shape, dtype: time_mix_receptance.astype(dtype),
+            key=None,
+            value=time_mix_receptance.astype(self.param_dtype),
+        )
 
         self.key = ColumnParallelLinear(
             hidden_size,

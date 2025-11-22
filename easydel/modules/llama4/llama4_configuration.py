@@ -20,6 +20,7 @@ from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.layers.moe.utils import get_moe_partition_spec
 
 logger = get_logger(__name__)
 
@@ -30,7 +31,19 @@ def _get_partition_rules(self, *args, **kwargs):
     Returns:
         `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
     """
-    pmag = self.partition_manager
+    pmag = self.partition_manage
+
+    kws = dict(
+        fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+        sp_is_ep_bound=self.sp_is_ep_bound,
+        module_view=True,
+        tensors_are_expert=self.use_expert_tensor_mode,
+        partition_manager=self.partition_manager,
+    )
+
+    eck = get_moe_partition_spec(direction="column", is_bias=False, **kws)
+    erk = get_moe_partition_spec(direction="row", is_bias=False, **kws)
+
     return (
         (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
         (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
@@ -39,9 +52,9 @@ def _get_partition_rules(self, *args, **kwargs):
         (r"self_attn/qk_norm/scale", pmag.resolve(Replicated)),
         (r"feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
         (r"feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-        (r"feed_forward/router/kernel", pmag.resolve(ColumnWise)),
-        (r"feed_forward/experts/gate_up_proj", pmag.resolve(ColumnWise)),
-        (r"feed_forward/experts/down_proj", pmag.resolve(RowWise)),
+        (r"feed_forward/router/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
+        (r"feed_forward/experts/gate_up_proj", eck),
+        (r"feed_forward/experts/down_proj", erk),
         (
             r"feed_forward/shared_expert/(gate_proj|up_proj)/kernel",
             pmag.resolve(ColumnWise),
@@ -76,6 +89,8 @@ def _get_partition_rules(self, *args, **kwargs):
 
 @register_config("llama4_vision_model")
 class Llama4VisionConfig(EasyDeLBaseConfig):
+    """Configuration for the Llama4 vision tower and projector settings."""
+
     model_type = "llama4_vision_model"
     base_config_key = "vision_config"
 
@@ -130,6 +145,8 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
 
 @register_config("llama4_text")
 class Llama4TextConfig(EasyDeLBaseConfig):
+    """Configuration for the Llama4 text decoder stack."""
+
     model_type = "llama4_text"
 
     def __init__(
@@ -233,6 +250,8 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 
 @register_config("llama4")
 class Llama4Config(EasyDeLBaseConfig):
+    """Composite configuration linking Llama4 text and vision components."""
+
     model_type = "llama4"
     sub_configs: typing.ClassVar = {"text_config": Llama4TextConfig, "vision_config": Llama4VisionConfig}
     attribute_map: typing.ClassVar = {

@@ -30,7 +30,7 @@ from jax.ad_checkpoint import checkpoint_name
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import MambaCache, MambaCacheMetaData, MambaCacheView
 from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
@@ -39,11 +39,14 @@ from .mamba_configuration import MambaConfig as MambaConfig
 
 
 def init_to_value(x, dtype):
+    """Return initializer that fills parameters with a broadcasted constant."""
     return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
 @auto_pytree
 class MambaOutput(BaseModelOutput):
+    """Output container for the base Mamba model with cached state."""
+
     last_hidden_state: chex.Array = None
     cache: MambaCache | None = None
     hidden_states: tuple[chex.Array] | None = None
@@ -51,6 +54,8 @@ class MambaOutput(BaseModelOutput):
 
 @auto_pytree
 class MambaCausalLMOutput(BaseModelOutput):
+    """Causal LM output including logits and cache for Mamba decoding."""
+
     logits: chex.Array = None
     cache: MambaCache | None = None
     hidden_states: tuple[chex.Array] | None = None
@@ -63,6 +68,7 @@ _T = tp.TypeVar("_T")
 def create_tuple_parser(
     n: int,
 ) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
+    """Normalize a scalar or sequence into a tuple of length ``n``."""
     def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
         if isinstance(x, tp.Sequence):
             if len(x) == n:
@@ -76,6 +82,8 @@ def create_tuple_parser(
 
 
 class Lambda(nn.Module):
+    """Convenience wrapper to insert callables into module pipelines."""
+
     fn: tp.Callable
 
     def __call__(self, x, **kwargs):
@@ -83,6 +91,8 @@ class Lambda(nn.Module):
 
 
 class MambaConv1D(nn.Module):
+    """Minimal 1D convolution layer backing the Mamba mixer implementation."""
+
     def __init__(
         self,
         features: int,
@@ -100,21 +110,19 @@ class MambaConv1D(nn.Module):
         rngs: nn.Rngs,
     ):
         kernel_shape = (kernel_size, 1, features)
-        self.kernel = nn.Param(
-            nn.initializers.lecun_normal(dtype=param_dtype)(
-                rngs.params(),
-                kernel_shape,
-                param_dtype,
-            ),
+        self.kernel = ArrayParam.bound(
+            shape=kernel_shape,
+            dtype=param_dtype,
+            init_fn=nn.initializers.lecun_normal(dtype=param_dtype),
+            key=rngs.params(),
         )
 
         if use_bias:
-            self.bias = nn.Param(
-                nn.initializers.zeros(
-                    rngs.params(),
-                    shape=(features,),
-                    dtype=param_dtype,
-                )
+            self.bias = ArrayParam.bound(
+                shape=(features,),
+                dtype=param_dtype,
+                init_fn=nn.initializers.zeros,
+                key=rngs.params(),
             )
 
         self.features = features
@@ -152,6 +160,8 @@ class MambaConv1D(nn.Module):
 
 
 class MambaMixer(nn.Module):
+    """Core selective state space mixer used inside each Mamba block."""
+
     def __init__(
         self,
         config: MambaConfig,
@@ -250,8 +260,19 @@ class MambaMixer(nn.Module):
         )
         A = repeat(jnp.arange(1, ssm_state_size + 1), "n -> d n", d=intermediate_size)
 
-        self.A_log = nn.Param(jnp.log(A))
-        self.D = nn.Param(jnp.ones(intermediate_size))
+        self.A_log = ArrayParam.bound(
+            shape=A.shape,
+            dtype=A.dtype,
+            init_fn=lambda key, shape, dtype: jnp.log(A).astype(dtype),
+            key=None,
+            value=jnp.log(A),
+        )
+        self.D = ArrayParam.bound(
+            shape=(intermediate_size,),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
         self.ssm_state_size = ssm_state_size
         self.intermediate_size = intermediate_size
@@ -369,6 +390,8 @@ class MambaMixer(nn.Module):
 
 
 class MambaBlock(nn.Module):
+    """Single Mamba layer applying normalization, mixer, and residual add."""
+
     def __init__(
         self,
         config: MambaConfig,
@@ -429,6 +452,8 @@ class MambaBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=MambaConfig, model_type="mamba")
 class MambaModel(EasyDeLBaseModule):
+    """Sequence model built from stacked Mamba blocks and token embeddings."""
+
     def __init__(
         self,
         config: MambaConfig,
@@ -494,7 +519,7 @@ class MambaModel(EasyDeLBaseModule):
 
         sequence_length = inputs_embeds.shape[1]
         if attention_mask is None:
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+            attention_mask = jnp.ones((inputs_embeds.shape[0], sequence_length), "b1")
         else:
             if attention_mask.dtype != jnp.bool:
                 attention_mask = jnp.astype(attention_mask == 1, "b1")
@@ -591,6 +616,8 @@ class MambaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
 class MambaForCausalLM(EasyDeLBaseModule):
+    """Causal language model head on top of the Mamba backbone."""
+
     def __init__(
         self,
         config: MambaConfig,

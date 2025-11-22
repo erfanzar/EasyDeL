@@ -49,6 +49,8 @@ logger = get_logger(__name__)
 
 
 class ExaoneGatedMLP(nn.Module):
+    """Gated feed-forward block used inside Exaone decoder layers."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -159,6 +161,8 @@ class ExaoneAttentionInner(UnifiedAttention):
 
 
 class ExaoneAttention(nn.Module):
+    """Wrapper around ExaoneAttentionInner to wire it into decoder layers."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -203,6 +207,8 @@ class ExaoneAttention(nn.Module):
 
 
 class ExaoneDecoderLayer(nn.Module):
+    """Single Exaone decoder block combining attention and gated MLP."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -311,6 +317,8 @@ class ExaoneDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, ExaoneConfig, model_type="exaone")
 class ExaoneModel(EasyDeLBaseModule):
+    """Decoder-only Exaone transformer composed of embedding, stacked blocks, and final norm."""
+
     def __init__(
         self,
         config: ExaoneConfig,

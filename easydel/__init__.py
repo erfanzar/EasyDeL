@@ -485,6 +485,16 @@ _import_structure = {
         "Qwen3MoeForSequenceClassification",
         "Qwen3MoeModel",
     ],
+    "modules.qwen3_vl": [
+        "Qwen3VLConfig",
+        "Qwen3VLTextConfig",
+        "Qwen3VLVisionConfig",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLModel",
+        "Qwen3VLTextModel",
+        "Qwen3VisionTransformerPretrainedModel",
+        "Qwen3VLCausalLMOutputWithPast",
+    ],
     "modules.roberta": [
         "RobertaConfig",
         "RobertaForCausalLM",
@@ -736,6 +746,16 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
+    from .modules.qwen3_vl import (
+        Qwen3VisionTransformerPretrainedModel,
+        Qwen3VLCausalLMOutputWithPast,
+        Qwen3VLConfig,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLModel,
+        Qwen3VLTextConfig,
+        Qwen3VLTextModel,
+        Qwen3VLVisionConfig,
+    )
     from .modules.roberta import (
         RobertaConfig,
         RobertaForCausalLM,
@@ -822,7 +842,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.84"]
-    _targeted_ejkernel_versions = ["0.0.16"]
+    _targeted_ejkernel_versions = ["0.0.17"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

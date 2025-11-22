@@ -161,7 +161,6 @@ class eSurgeLMEvalAdapter(LM):
             if len(set(str(sp) for sp in sampling_params_list)) == 1
             else sampling_params_list,
             use_tqdm=True,
-            bytecode_decode=self.surge.bytecode_decode,  # Use engine's bytecode_decode setting
         )
 
         generated_texts = []

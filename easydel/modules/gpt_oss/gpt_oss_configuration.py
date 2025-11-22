@@ -23,58 +23,11 @@ The configuration includes custom sharding specifications for MoE components and
 comprehensive model hyperparameters.
 """
 
-import typing as tp
-
-from eformer.common_types import EMPTY, EP, MODE_TRAIN, TP, ColumnWise, DynamicShardingAxes, Replicated, RowWise
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-
-
-class GateUPW(DynamicShardingAxes):
-    """Dynamic sharding specification for MoE gate and up projection weights.
-
-    This sharding pattern distributes the expert parameters across expert-parallel (EP)
-    and tensor-parallel (TP) dimensions, with the weight matrix sharded as [EP, EMPTY, TP].
-    Used for the fused gate and up projection weights in the MoE layer.
-    """
-
-    axes: tp.ClassVar = [EP, EMPTY, TP]
-    mode: tp.ClassVar = MODE_TRAIN
-
-
-class GateUPB(DynamicShardingAxes):
-    """Dynamic sharding specification for MoE gate and up projection biases.
-
-    Distributes bias parameters across expert-parallel (EP) and tensor-parallel (TP)
-    dimensions as [EP, TP]. Used for the fused gate and up projection biases.
-    """
-
-    axes: tp.ClassVar = [EP, TP]
-    mode: tp.ClassVar = MODE_TRAIN
-
-
-class GateDOW(DynamicShardingAxes):
-    """Dynamic sharding specification for MoE down projection weights.
-
-    Shards the down projection weight matrix across expert-parallel (EP) and
-    tensor-parallel (TP) dimensions as [EP, TP, EMPTY]. This enables efficient
-    distribution of expert parameters in the output projection.
-    """
-
-    axes: tp.ClassVar = [EP, TP, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
-
-
-class GateDOB(DynamicShardingAxes):
-    """Dynamic sharding specification for MoE down projection biases.
-
-    Distributes down projection bias parameters across the expert-parallel (EP)
-    dimension as [EP, EMPTY], keeping the hidden dimension intact.
-    """
-
-    axes: tp.ClassVar = [EP, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
+from easydel.layers.moe.utils import get_moe_partition_spec
 
 
 @register_config("gpt_oss")
@@ -229,29 +182,41 @@ class GptOssConfig(EasyDeLBaseConfig):
             tuple: Partition rules as (regex_pattern, PartitionSpec) pairs
         """
         pmag = self.partition_manager
+
+        kws = dict(
+            fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+            sp_is_ep_bound=self.sp_is_ep_bound,
+            module_view=True,
+            tensors_are_expert=self.use_expert_tensor_mode,
+            partition_manager=self.partition_manager,
+        )
+
+        eck = get_moe_partition_spec(direction="column", is_bias=False, **kws)
+        erk = get_moe_partition_spec(direction="row", is_bias=False, **kws)
+
+        ecb = get_moe_partition_spec(direction="column", is_bias=True, **kws)
+        erb = get_moe_partition_spec(direction="row", is_bias=True, **kws)
+
         return (
-            # Embedding layers - shard across vocabulary dimension
             (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            # Attention projections
             (r".*self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r".*self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            # MoE Router - shard weight matrix column-wise
-            (r".*router/weight", pmag.resolve(ColumnWise)),
-            # MoE Experts - custom expert-parallel sharding
-            (r".*experts/gate_up_proj", pmag.resolve(GateUPW)),
-            (r".*experts/gate_up_proj_bias", pmag.resolve(GateUPB)),
-            (r".*experts/down_proj", pmag.resolve(GateDOW)),
-            (r".*experts/down_proj_bias", pmag.resolve(GateDOB)),
-            # Output heads
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*score/kernel", pmag.resolve(ColumnWise)),
-            # Replicated parameters (not sharded)
-            (r".*router/bias", pmag.resolve(Replicated)),
-            (r".*self_attn/.*/bias", pmag.resolve(Replicated)),
+            (r".*self_attn/.*proj/bias", pmag.resolve(Replicated)),
+            (
+                r".*mlp/gate/kernel",
+                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
+            ),
+            (r".*mlp/gate/bias", pmag.resolve(Replicated)),
+            (r".*mlp/experts/gate_up_proj$", eck),
+            (r".*mlp/experts/down_proj$", erk),
+            (r".*mlp/experts/gate_up_proj_bias", ecb),
+            (r".*mlp/experts/down_proj_bias", erb),
             (r".*layernorm/scale", pmag.resolve(Replicated)),
             (r".*rms_norm/scale", pmag.resolve(Replicated)),
             (r".*norm/scale", pmag.resolve(Replicated)),
-            # Default: replicate any unmatched parameters
+            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
+            (r".*score/kernel", pmag.resolve(ColumnWise)),
+            (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
 

@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import jax
 import numpy as np
 from datasets import Dataset, IterableDataset, load_dataset
 from jax import lax
@@ -28,7 +29,11 @@ from transformers import AutoTokenizer
 
 import easydel as ed
 
-MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
+if jax.default_backend() == "tpu":
+    MODEL_REPO = "Qwen/Qwen3-4B"
+else:
+    MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
+
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
 PREFERENCE_SPLIT = "train[:50%]"
 MAX_PROMPT_LENGTH = 512
@@ -169,8 +174,8 @@ def make_config(
         "max_completion_length": MAX_COMPLETION_LENGTH,
         "max_length": MAX_TOTAL_LENGTH,
         "generation_top_p": 0.95,
-        "generation_top_k": 4,
-        "generation_temperature": 0.4,
+        "generation_top_k": 64,
+        "generation_temperature": 0.7,
         "generation_do_sample": True,
         "generation_num_return_sequences": 4,
         "generation_max_new_tokens": 2048,
@@ -221,7 +226,38 @@ def build_reward_dataset(split: str = PREFERENCE_SPLIT):
     return dataset
 
 
-def dummy_reward_fn(*, completions: Iterable[Any] | None = None, **_: Any):
+def dummy_reward_fn(*, prompts: Iterable[Any] | None = None, completions: Iterable[Any] | None = None, **_: Any):
+    # print("Lengths", len(prompts), len(completions))
+    # print("Prompt ===> ", prompts[0])
+    # print("COMPL ===> ", completions[0])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[1])
+    # print("COMPL ===> ", completions[1])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[2])
+    # print("COMPL ===> ", completions[2])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[3])
+    # print("COMPL ===> ", completions[3])
+    # print("FIRST 4")
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[4])
+    # print("COMPL ===> ", completions[4])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[5])
+    # print("COMPL ===> ", completions[5])
+    # print("THESE 2 should be match")
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[8])
+    # print("COMPL ===> ", completions[8])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[9])
+    # print("COMPL ===> ", completions[9])
+    # print("=" * 15)
+    # print("Prompt ===> ", prompts[10])
+    # print("COMPL ===> ", completions[10])
+    # print("THESE 3 should be match")
+    # print("=" * 15)
     if completions is None:
         return [0.1]
     if isinstance(completions, list | tuple):

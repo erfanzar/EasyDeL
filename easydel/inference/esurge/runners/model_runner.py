@@ -62,8 +62,8 @@ import time
 import typing
 from bisect import bisect_left
 from concurrent.futures import Future
-from dataclasses import replace
 
+import flax
 import jax
 import numpy as np
 from eformer.loggings import get_logger
@@ -73,6 +73,7 @@ from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..page_table import PAGE_TABLE_PADDING_VAL
 from ..scheduler import SchedulerOutput
+from .async_types import AsyncPreResults
 from .execution_manager import ExecutionManager
 from .sequence_buffer import (
     SequenceBuffer,
@@ -187,7 +188,7 @@ class eSurgeRunner:
     ):
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
-        self.model = model
+        self.model = model.esurge_compatible_model
         self.metadata = model.create_paged_metadata(
             hbm_utilization=hbm_utilization,
             page_size=page_size,
@@ -212,22 +213,22 @@ class eSurgeRunner:
         logger.debug("Creating ExecutionManager and initializing pages cache")
         self.executor_manager = ExecutionManager(
             model=model,
-            mesh=model.mesh,
-            kv_pages=model.init_ragged_pages(self.metadata),
             use_aot_forward=use_aot_forward,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             metadata=self.metadata,
-            verbose=False,
-            # verbose=verbose,
+            verbose=verbose,
         )
         self.log_it = logger.info if verbose else logger.debug
         self._setup_variables()
         self.enable_overlap_execution = enable_overlap_execution
         self.enable_sampler_metrics = enable_sampler_metrics
-        self._sampler_engine = None
+
+        # Async scheduling state
+        self._pre_async_results: AsyncPreResults | None = None
+        self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         logger.debug("eSurgeRunner initialization complete")
 
     @property
@@ -324,7 +325,7 @@ class eSurgeRunner:
         logger.debug(
             f"Creating sequence buffer for max_num_reqs={self.max_num_reqs}, max_model_len={self.max_model_len}"
         )
-        self.sequence_buffer = SequenceBuffer.create(
+        self.sequence_buffer = SequenceBuffer(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
@@ -336,26 +337,10 @@ class eSurgeRunner:
         self.arange = jnp.arange(self.max_num_tokens, dtype=jnp.int32)
         self.arange_np = jnp.arange(self.max_num_reqs, dtype=jnp.int32)
 
-        self.input_ids_buf = jnp.zeros(
-            (self.max_num_tokens,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-        self.position_ids_buf = jnp.zeros(
-            (self.max_num_tokens,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-        self.query_start_loc_buf = jnp.zeros(
-            (self.max_num_reqs + 1,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-        self.seq_lens_buf = jnp.zeros(
-            (self.max_num_reqs,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
+        self.input_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
+        self.position_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
+        self.query_start_loc_buf = jnp.zeros((self.max_num_reqs + 1,), dtype=jnp.int32, device=self._empty_sharding)
+        self.seq_lens_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
 
         self.pages_tables_buf = jnp.full(
             (self.num_reqs_max_model_len, self.max_pages_per_req),
@@ -363,29 +348,10 @@ class eSurgeRunner:
             dtype=jnp.int32,
             device=self._empty_sharding,
         )
-        self.num_tokens_paddings_arr = jnp.array(
-            self.num_tokens_paddings,
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-
-        self.scheduled_full_buf = jnp.zeros(
-            (self.max_num_reqs,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-        self.req_num_tokens_full_buf = jnp.zeros(
-            (self.max_num_reqs,),
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
-        self.active_mask_full_buf = jnp.zeros(
-            (self.max_num_reqs,),
-            dtype=bool,
-            device=self._empty_sharding,
-        )
-        self._device_state_cache = None
-        self._device_state_dirty = True
+        self.num_tokens_paddings_arr = jnp.array(self.num_tokens_paddings, dtype=jnp.int32, device=self._empty_sharding)
+        self.scheduled_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
+        self.req_num_tokens_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
+        self.active_mask_full_buf = jnp.zeros((self.max_num_reqs,), dtype=bool, device=self._empty_sharding)
 
     def _precompile_jitted_helpers(
         self,
@@ -528,8 +494,15 @@ class eSurgeRunner:
         if reset_state and self.requests:
             raise RuntimeError("Cannot update model weights while requests are active")
 
-        if model is not None:
-            self.model = model
+        if model is None:
+            assert graphdef is not None
+            assert graphstate is not None
+            assert graphother is not None
+            model = flax.nnx.merge(graphdef, graphstate, graphother)
+
+        model = model.esurge_compatible_model
+        graphdef = model.graphdef
+        self.model = model
 
         self.executor_manager.update_graphs(
             model=model,
@@ -553,8 +526,6 @@ class eSurgeRunner:
             return
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
         self.executor_manager.kv_pages = self.model.init_ragged_pages(self.metadata)
-        self._device_state_cache = None
-        self._device_state_dirty = True
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
@@ -596,7 +567,7 @@ class eSurgeRunner:
         # 2) Remove finished from sequence buffer (functional)
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
-            self.sequence_buffer, req_index = self.sequence_buffer.remove_request(req_id)
+            req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
 
@@ -605,7 +576,7 @@ class eSurgeRunner:
         cached_req_ids = set(self.sequence_buffer.req_id_to_index.keys())
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
         for req_id in unscheduled_req_ids:
-            self.sequence_buffer, req_index = self.sequence_buffer.remove_request(req_id)
+            req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
 
@@ -662,27 +633,162 @@ class eSurgeRunner:
             val_arr = np.array(upd_num_computed_vals, dtype=np.int32)
             new_num_computed = self.sequence_buffer.num_computed_tokens.copy()
             new_num_computed[idx_arr] = val_arr
-            self.sequence_buffer = replace(self.sequence_buffer, num_computed_tokens=new_num_computed)
+            self.sequence_buffer.num_computed_tokens = new_num_computed
 
         if batched_page_rows:
             indices = [ix for ix, _ in batched_page_rows]
             pages_per_req = [ids for _, ids in batched_page_rows]
-            new_pt = self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
-            self.sequence_buffer = replace(self.sequence_buffer, page_table=new_pt)
+            self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
+            self.sequence_buffer.page_table.commit(self.sequence_buffer.num_reqs)
 
         # 6) Add new / reinserted requests
+        # Sort in reverse order and pop() to get highest indices first (avoid reusing index 0/1)
+        # This prevents KV cache corruption from repeatedly reusing low indices
         removed_req_indices = sorted(removed_req_indices, reverse=True)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
+            # Pop() from reverse-sorted list gives highest index first
             reuse_index = removed_req_indices.pop() if removed_req_indices else None
-            self.sequence_buffer = self.sequence_buffer.add_request(req_state, reuse_index)
+            self.sequence_buffer.add_request(req_state, reuse_index)
 
         # 7) Condense to remove holes
         if removed_req_indices:
-            self.sequence_buffer = self.sequence_buffer.condense(removed_req_indices)
+            self.sequence_buffer.condense(removed_req_indices)
 
         has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
+
+    def _modify_prev_results(self) -> None:
+        """Apply previous iteration's tokens to sequence buffer.
+
+        This method is called at the beginning of each iteration when async
+        scheduling is enabled. It retrieves the tokens that were sampled
+        asynchronously in the previous iteration and applies them to the
+        sequence buffer.
+
+        The method blocks until the async token transfer is complete, then
+        updates the token_ids array and request output_token_ids lists.
+
+        Note:
+            This method should only be called when self._pre_async_results is not None.
+        """
+        if self._pre_async_results is None:
+            return
+
+        pre_req_ids = self._pre_async_results.req_ids
+        pre_next_tokens = self._pre_async_results.next_tokens
+        pre_request_seq_lens = self._pre_async_results.request_seq_lens
+        pre_discard_indices = self._pre_async_results.discard_sampled_tokens_req_indices
+
+        # Block until tokens are ready (async copy to host completes)
+        next_tokens_cpu = np.asarray(jax.device_get(pre_next_tokens))
+        selected_token_ids = np.expand_dims(next_tokens_cpu[: len(pre_req_ids)], 1)
+
+        # Mask out discarded tokens
+        valid_sampled_token_ids = [token_id for token_id in selected_token_ids]
+        for i in pre_discard_indices:
+            valid_sampled_token_ids[i] = np.array([])
+
+        # Apply tokens to sequence buffer
+        for pre_req_idx, req_state, _ in pre_request_seq_lens:
+            sampled_ids = valid_sampled_token_ids[pre_req_idx]
+            if len(sampled_ids) == 0:
+                continue
+
+            # Check if request is still active
+            req_id = pre_req_ids[pre_req_idx]
+            if req_id not in self.sequence_buffer.req_id_to_index:
+                continue
+
+            req_idx = self.sequence_buffer.req_id_to_index[req_id]
+            assert req_state is self.requests[req_id], "Request state mismatch"
+
+            # Update token_ids array (replace placeholder)
+            end_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
+            start_idx = end_idx - 1
+            assert end_idx <= self.max_model_len, f"Token count {end_idx} exceeds max_model_len {self.max_model_len}"
+
+            self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
+            # Replace placeholder in output_token_ids
+            req_state.output_token_ids[-1] = int(sampled_ids[-1])
+
+    def _update_placeholder(
+        self,
+        discard_sampled_tokens_req_indices: list[int],
+        request_seq_lens: list[tuple[int, CachedRequestState, int]],
+    ) -> dict[str, int]:
+        """Set placeholders for tokens not yet generated.
+
+        When async scheduling is enabled, this method is called after the
+        forward pass to set placeholder tokens (0) for requests that will
+        generate tokens. The actual tokens will be filled in during the
+        next iteration via _modify_prev_results().
+
+        Args:
+            discard_sampled_tokens_req_indices: Indices of requests whose
+                tokens should be discarded (e.g., partial prefill).
+            request_seq_lens: List of (req_idx, req_state, seq_len) tuples
+                for requests that generated tokens.
+
+        Returns:
+            Mapping from request ID to index for placeholder replacement.
+
+        Note:
+            This method updates num_tokens_no_spec and num_tokens in the
+            sequence buffer, and appends placeholder (0) to output_token_ids.
+        """
+        placeholder_req_id_to_index: dict[str, int] = {}
+        discard_set = set(discard_sampled_tokens_req_indices)
+
+        for req_idx, req_state, _ in request_seq_lens:
+            if req_idx in discard_set:
+                continue
+
+            start_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + 1  # Assume 1 token (no spec decode yet)
+
+            assert end_idx <= self.max_model_len, (
+                f"Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {end_idx} > max_model_len: {self.max_model_len}"
+            )
+
+            # Update buffer state
+            self.sequence_buffer.num_tokens_no_spec[req_idx] = end_idx
+            self.sequence_buffer.num_tokens[req_idx] = end_idx
+
+            # Add placeholder (0) to output
+            req_state.output_token_ids.extend([0])
+            placeholder_req_id_to_index[req_state.req_id] = req_idx
+
+        return placeholder_req_id_to_index
+
+    def _reorder_decode_first(self, scheduler_output: SchedulerOutput) -> None:
+        """Reorder active requests so decode tokens are placed first."""
+        i, j = 0, self.sequence_buffer.num_reqs - 1
+        while i < j:
+            i_req_id = self.sequence_buffer.req_ids[i]
+            j_req_id = self.sequence_buffer.req_ids[j]
+            if i_req_id is None or j_req_id is None:
+                break
+
+            i_is_decode = (
+                scheduler_output.num_scheduled_tokens.get(i_req_id, 0) == 1
+                and self.sequence_buffer.num_computed_tokens[i] > 0
+            )
+            j_is_decode = (
+                scheduler_output.num_scheduled_tokens.get(j_req_id, 0) == 1
+                and self.sequence_buffer.num_computed_tokens[j] > 0
+            )
+
+            if i_is_decode:
+                i += 1
+            elif not j_is_decode:
+                j -= 1
+            else:
+                # Swap to move a decode request forward.
+                self.sequence_buffer.swap_states(i, j)
+                i += 1
+                j -= 1
 
     def _execute_model_impl(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests.
@@ -720,6 +826,15 @@ class eSurgeRunner:
         updating_states_start = time.time()
         self._update_states(scheduler_output)
         updating_states_time = time.time() - updating_states_start
+
+        # Apply previous async results if available
+        if self._pre_async_results is not None:
+            self._modify_prev_results()
+            self._pre_async_results = None  # Clear after applying
+
+        # Align ordering with TPU runner: decode requests first.
+        if self.sequence_buffer.num_reqs > 1:
+            self._reorder_decode_first(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return ModelRunnerOutput(
@@ -791,8 +906,8 @@ class eSurgeRunner:
                     self._empty_sharding,
                 )
 
-            # Get page table as CPU array (single device transfer per step)
-            page_table_cpu = np.asarray(jax.device_get(self.sequence_buffer.page_table[0].get_array()))
+            # Get page table as CPU array (already on CPU, no transfer needed)
+            page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
             step_start = time.time()
             (
                 minimal_device_state,
@@ -840,12 +955,14 @@ class eSurgeRunner:
                 token_ids_updated = token_ids_updated.copy()
             if not num_tokens_updated.flags.writeable:
                 num_tokens_updated = num_tokens_updated.copy()
-            self.sequence_buffer = self.sequence_buffer._with_updates(
-                token_ids=token_ids_updated,
-                num_computed_tokens=num_tokens_updated,
-            )
+            self.sequence_buffer.token_ids = token_ids_updated
+            self.sequence_buffer.num_computed_tokens = num_tokens_updated
             sq_utime_took = time.time() - sq_utime
             total_sync_time += sq_utime_took
+
+            # Track for async scheduling
+            request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+            discard_sampled_tokens_req_indices: list[int] = []
 
             up_wtime = time.time()
             for i, rid in enumerate(req_ids_window):
@@ -855,21 +972,32 @@ class eSurgeRunner:
 
                 if valid_np[i]:
                     tid = int(tokens_np[i])
-                    sampled_token_ids_all.append([tid])
+
+                    # Get request state and sequence length
                     if rid in self.requests:
-                        self.requests[rid].output_token_ids.append(tid)
-                    if (
-                        self.enable_sampler_metrics
-                        and self._sampler_engine is not None
-                        and logits_np is not None
-                        and i < logits_np.shape[0]
-                    ):
+                        req_state = self.requests[rid]
+                        seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0)
+
+                        # Check if async scheduling is enabled
+                        if scheduler_output.async_scheduling:
+                            # Async mode: don't append yet, will be done in next iteration
+                            request_seq_lens.append((i, req_state, seq_len))
+                        else:
+                            # Sync mode: append immediately
+                            sampled_token_ids_all.append([tid])
+                            req_state.output_token_ids.append(tid)
+                    else:
+                        # No request state, append in sync mode
+                        sampled_token_ids_all.append([tid])
+
+                    if self.enable_sampler_metrics and logits_np is not None and i < logits_np.shape[0]:
                         try:
-                            token_logprobs[rid] = self._sampler_engine.token_logprob(logits_np[i], tid)
+                            token_logprobs[rid] = logits_np[i]
                         except Exception:
                             pass
                 else:
                     sampled_token_ids_all.append([])
+                    discard_sampled_tokens_req_indices.append(i)
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
 
@@ -901,6 +1029,41 @@ class eSurgeRunner:
             f"total={total_time:.3f}s"
         )
 
+        # Handle async scheduling return
+        if scheduler_output.async_scheduling:
+            # Set placeholders for current batch
+            placeholder_req_id_to_index = self._update_placeholder(
+                discard_sampled_tokens_req_indices,
+                request_seq_lens,
+            )
+
+            # Async copy to host (non-blocking)
+            next_tokens_jax = jnp.array(tokens_np, dtype=jnp.int32)
+            next_tokens = jax.copy_to_host_async(next_tokens_jax)
+
+            # Store async results for next iteration
+            self._pre_async_results = AsyncPreResults(
+                req_ids=req_ids_all,
+                next_tokens=next_tokens,
+                request_seq_lens=request_seq_lens,
+                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                placeholder_req_id_to_index=placeholder_req_id_to_index,
+            )
+
+            # Return immediately (non-blocking)
+            req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
+            return ModelRunnerOutput(
+                req_ids=req_ids_all,
+                req_id_to_index=req_id_to_out_index,
+                sampled_token_ids=[],  # Empty, will be filled in next iteration
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                finished_sending=None,
+                finished_recving=None,
+                token_logprobs=token_logprobs or None,
+            )
+
         # Stable mapping for scheduler indexing
         req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
         return ModelRunnerOutput(
@@ -918,7 +1081,104 @@ class eSurgeRunner:
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         return self._execute_model_impl(scheduler_output)
 
+    def execute_model_async(self, scheduler_output: SchedulerOutput) -> Future[ModelRunnerOutput]:
+        """Execute model asynchronously in a background thread.
+
+        This method enables async scheduling by executing the model in a separate
+        thread, allowing the caller to continue scheduling the next batch while
+        the current batch is being processed.
+
+        The async execution workflow:
+            1. Submit model execution to thread pool executor
+            2. Return immediately with a Future object
+            3. Caller can schedule next batch while this executes
+            4. Use wait_for_execution(future) to get results when needed
+
+        Args:
+            scheduler_output: Scheduling decisions for this iteration
+
+        Returns:
+            Future[ModelRunnerOutput]: Future that will contain the model output
+                when execution completes. Can be waited on using wait_for_execution().
+
+        Raises:
+            RuntimeError: If async execution is not enabled (executor not initialized)
+
+        Note:
+            This method requires async scheduling to be enabled and the executor
+            to be initialized. Initialize the executor by calling
+            initialize_async_executor() first.
+
+        Example:
+            >>> # Initialize async executor first
+            >>> runner.initialize_async_executor()
+            >>>
+            >>> # Execute asynchronously
+            >>> future = runner.execute_model_async(scheduler_output)
+            >>>
+            >>> # Do other work while model executes...
+            >>> next_schedule = scheduler.schedule()
+            >>>
+            >>> # Wait for current execution to finish
+            >>> output = runner.wait_for_execution(future)
+        """
+        if self._executor is None:
+            raise RuntimeError(
+                "Async execution not enabled. Call initialize_async_executor() first "
+                "or check that async_scheduling is enabled in scheduler config."
+            )
+        return self._executor.submit(self._execute_model_impl, scheduler_output)
+
+    def initialize_async_executor(self) -> None:
+        """Initialize the thread pool executor for async model execution.
+
+        This method creates a single-threaded executor that will be used to
+        run model execution in the background, enabling async scheduling.
+
+        Side Effects:
+            - Creates self._executor as a ThreadPoolExecutor with 1 worker
+            - Existing executor is shutdown if present
+
+        Note:
+            This should be called before using execute_model_async().
+            The executor uses a single worker to maintain execution order.
+        """
+        if self._executor is not None:
+            logger.debug("Shutting down existing executor before reinitializing")
+            self._executor.shutdown(wait=True)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eSurgeAsync")
+        logger.debug("Initialized async executor for model execution")
+
+    def reset_state(self) -> None:
+        """Clear sequence state and request bookkeeping.
+
+        Useful when pausing or resetting the runner to ensure no stale pages
+        or request metadata linger between sessions.
+        """
+        self.requests.clear()
+        self.sequence_buffer.clear()
+        self._pre_async_results = None
+
     def wait_for_execution(self, future: Future) -> ModelRunnerOutput:
+        """Wait for an async execution to complete and return the result.
+
+        Args:
+            future: The Future object returned by execute_model_async()
+
+        Returns:
+            ModelRunnerOutput: The completed model execution output
+
+        Note:
+            This call blocks until the future completes.
+        """
         return future.result()
 
-    def shutdown(self) -> None: ...
+    def shutdown(self) -> None:
+        """Cleanup resources including async executor if present."""
+        if self._executor is not None:
+            logger.debug("Shutting down async executor")
+            self._executor.shutdown(wait=True)
+            self._executor = None

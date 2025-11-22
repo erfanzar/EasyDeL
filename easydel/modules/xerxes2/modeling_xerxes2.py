@@ -261,6 +261,8 @@ class Xerxes2Attention(UnifiedAttention):
 
 
 class Xerxes2MLP(nn.Module):
+    """Feed-forward network used in dense Xerxes2 decoder layers."""
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -477,6 +479,8 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
 
 
 class Xerxes2DecoderLayer(nn.Module):
+    """Transformer decoder layer with Xerxes2 attention and optional MoE MLP."""
+
     def __init__(
         self,
         config: Xerxes2Config,
@@ -607,6 +611,8 @@ class Xerxes2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Xerxes2Config, model_type="xerxes2")
 class Xerxes2Model(EasyDeLBaseModule):
+    """Xerxes2 decoder-only stack connecting embeddings, decoder layers, and final norm."""
+
     def __init__(
         self,
         config: Xerxes2Config,

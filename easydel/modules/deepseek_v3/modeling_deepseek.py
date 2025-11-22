@@ -35,7 +35,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -62,6 +62,8 @@ from .deepseek_configuration import DeepseekV3Config
 
 
 class DeepseekV3MLP(nn.Module):
+    """Standard DeepSeek V3 feed-forward network used in dense decoder layers."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -116,6 +118,8 @@ class DeepseekV3MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """Top-k routing gate that scores tokens for the mixture-of-experts blocks."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -145,14 +149,19 @@ class MoEGate(nn.Module):
             param_dtype,
         )
 
-        self.kernel = nn.Param(kernel)
+        self.kernel = ArrayParam.bound(
+            shape=kernel.shape,
+            dtype=param_dtype,
+            init_fn=nn.initializers.kaiming_uniform(),
+            key=rngs.param(),
+            value=kernel,
+        )
         if self.topk_method == "noaux_tc":
-            self.e_score_correction_bias = nn.Param(
-                nn.initializers.zeros(
-                    rngs.params(),
-                    (self.n_routed_experts,),
-                    param_dtype,
-                )
+            self.e_score_correction_bias = ArrayParam.bound(
+                shape=(self.n_routed_experts,),
+                dtype=param_dtype,
+                init_fn=nn.initializers.zeros,
+                key=rngs.params(),
             )
 
     def __call__(self, hidden_states):
@@ -199,6 +208,8 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV3MLPMoE(nn.Module):
+    """Mixture-of-experts feed-forward module parameterized by the DeepSeek V3 config."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -279,6 +290,8 @@ class DeepseekV3MLPMoE(nn.Module):
 
 
 class DeepseekV3MoE(BaseMoeModule):
+    """Wraps gating and expert networks to apply DeepSeek V3 MoE feed-forward processing."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -552,6 +565,8 @@ class DeepseekV3Attention(UnifiedAttention):
 
 
 class DeepseekV3DecoderLayer(nn.Module):
+    """Single DeepSeek V3 transformer block with MLA attention and optional MoE MLP."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -705,6 +720,8 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3Model(EasyDeLBaseModule):
+    """Full DeepSeek V3 decoder-only transformer composed of MLA blocks and MoE feed-forward layers."""
+
     def __init__(
         self,
         config: DeepseekV3Config,

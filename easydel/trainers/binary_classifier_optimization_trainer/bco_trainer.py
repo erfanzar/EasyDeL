@@ -361,6 +361,7 @@ class BCOTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=model_state,
             data_collator=None,
+            processing_class=processing_class,
         )
 
     def _prepare_dataset(self, dataset: Dataset | IterableDataset, name: str):

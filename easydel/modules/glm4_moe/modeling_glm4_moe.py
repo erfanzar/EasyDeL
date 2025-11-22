@@ -29,7 +29,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
@@ -54,6 +54,8 @@ from .glm4_moe_configuration import Glm4MoeConfig
 
 
 class Glm4MoeMLP(nn.Module):
+    """Dense feed-forward block used in non-MoE GLM-4-MoE layers."""
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -172,6 +174,8 @@ class Glm4MoeMLPStack(nn.Module):
 
 
 class Glm4MoeTopKRouter(nn.Module):
+    """Selects top-k experts per token for GLM-4-MoE routing."""
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -192,14 +196,18 @@ class Glm4MoeTopKRouter(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.kernel = nn.Param(
-            jax.nn.initializers.normal(stddev=config.initializer_range)(
-                rngs.param(),
-                shape=(self.n_routed_experts, config.hidden_size),
-                dtype=param_dtype,
-            )
+        self.kernel = ArrayParam.bound(
+            shape=(self.n_routed_experts, config.hidden_size),
+            dtype=param_dtype,
+            init_fn=jax.nn.initializers.normal(stddev=config.initializer_range),
+            key=rngs.param(),
         )
-        self.e_score_correction_bias = nn.Param(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
+        self.e_score_correction_bias = ArrayParam.bound(
+            shape=(self.n_routed_experts,),
+            dtype=jnp.float32,
+            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            key=None,
+        )
 
     def get_selected_experts(self, scores):
         scores_for_choice = scores + self.e_score_correction_bias.value
@@ -246,6 +254,8 @@ class Glm4MoeTopKRouter(nn.Module):
 
 
 class Glm4MoeMoE(BaseMoeModule):
+    """GLM-4-MoE feed-forward wrapper combining router and expert stacks."""
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -311,6 +321,8 @@ class Glm4MoeMoE(BaseMoeModule):
 
 
 class Glm4MoeAttention(UnifiedAttention):
+    """Attention layer variant used inside GLM-4-MoE decoder blocks."""
+
     def __init__(
         self,
         config: Glm4MoeConfig,
@@ -334,6 +346,8 @@ class Glm4MoeAttention(UnifiedAttention):
 
 
 class Glm4MoeDecoderLayer(nn.Module):
+    """Single decoder block for GLM-4-MoE with attention and MoE MLP."""
+
     def __init__(
         self,
         config: Glm4MoeConfig,

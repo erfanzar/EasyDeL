@@ -42,6 +42,8 @@ class ExpertTensorParallel(DynamicShardingAxes):
 
 @register_config("qwen3_moe")
 class Qwen3MoeConfig(EasyDeLBaseConfig):
+    """Configuration for the Qwen3-MoE variant with routed experts."""
+
     model_type = "qwen3_moe"
 
     def __init__(

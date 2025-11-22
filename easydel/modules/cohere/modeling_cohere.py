@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
@@ -51,6 +51,7 @@ from .cohere_configuration import CohereConfig as CohereConfig
 def repeat_kv(
     x: Float[Array, "batch seq_len num_kv_heads head_dim"], n_rep: int
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    """Tile key/value heads to match the requested number of attention heads."""
     bs, s, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -87,12 +88,11 @@ class RMSNorm(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.do_t = do_t
-        self.kernel = nn.Param(
-            nn.initializers.ones(
-                key=rngs.params(),
-                shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
-                dtype=self.param_dtype,
-            ),
+        self.kernel = ArrayParam.bound(
+            shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
+            dtype=self.param_dtype,
+            init_fn=nn.initializers.ones,
+            key=rngs.params(),
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -373,6 +373,8 @@ class CohereBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=CohereConfig, model_type="cohere")
 class CohereModel(EasyDeLBaseModule):
+    """Decoder-only Cohere transformer assembling embeddings, blocks, and final norm."""
+
     def __init__(
         self,
         config: CohereConfig,

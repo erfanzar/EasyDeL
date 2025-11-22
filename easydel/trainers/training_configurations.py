@@ -327,6 +327,32 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to log preview generations to WandB when available."},
     )
+    use_esurge_generation: bool = field(
+        default=True,
+        metadata={"help": "Whether to use eSurge engine for preview generation instead of compiled functions."},
+    )
+    esurge_hbm_utilization: float | None = field(
+        default=0.45,
+        metadata={"help": "HBM memory utilization target for eSurge engine (0.0-1.0). None uses eSurge default."},
+    )
+    esurge_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of concurrent sequences for eSurge batch processing. None uses eSurge default."
+        },
+    )
+    esurge_min_input_pad: int | None = field(
+        default=None,
+        metadata={"help": "Minimum input padding for eSurge sequences. None uses eSurge default."},
+    )
+    esurge_page_size: int | None = field(
+        default=32,
+        metadata={"help": "Page size for eSurge KV cache management. None uses eSurge default."},
+    )
+    esurge_silent_mode: bool = field(
+        default=True,
+        metadata={"help": "Silence eSurge info logs (engine start/stop/resume, cache events)."},
+    )
     num_train_epochs: int = field(
         default=10,
         metadata={"help": "The number of training epochs."},
@@ -657,10 +683,10 @@ class TrainingArguments:
             self.loss_config = LossConfig()
         if isinstance(self.loss_config, dict):
             self.loss_config = LossConfig(**self.loss_config)
-        if getattr(self, "generation_interval", None) is not None and self.generation_interval <= 0:
+        if self.generation_interval is not None and self.generation_interval <= 0:
             logger.warning("`generation_interval` must be positive; disabling preview generation.")
             self.generation_interval = None
-        if getattr(self, "generation_num_prompts", None) is not None:
+        if self.generation_num_prompts is not None:
             self.generation_num_prompts = max(1, int(self.generation_num_prompts))
 
         def _inherit_generation_attr(attr, fallback_name):
@@ -670,9 +696,6 @@ class TrainingArguments:
                 if fallback_value not in (None, False):
                     setattr(self, attr, fallback_value)
 
-        _inherit_generation_attr("generation_top_p", "top_p")
-        _inherit_generation_attr("generation_top_k", "top_k")
-        _inherit_generation_attr("generation_temperature", "temperature")
         _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
         _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
 

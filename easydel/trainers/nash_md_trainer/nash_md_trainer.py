@@ -114,6 +114,10 @@ class NashMDTrainer(GRPOTrainer):
         self._mixture_schedule = arguments.mixture_coef
         self.missing_eos_penalty = arguments.missing_eos_penalty
         self.num_generations = 1
+        if reward_funcs is not None:
+            reward_funcs_list = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
+            if len(reward_funcs_list) != 1:
+                raise ValueError("NashMDTrainer only supports a single reward function/model.")
 
     def _schedule_value(self, schedule: tp.Any, default: float) -> float:
         """Get current value from schedule based on training epoch.
@@ -318,23 +322,44 @@ class NashMDTrainer(GRPOTrainer):
             prompt_mask = batch["attention_mask"]
 
             with capture_time() as generation_time_fn:
-                sequences, prompt_ids, prompt_mask = jax.block_until_ready(
-                    self.generate_function(state, prompt_ids, prompt_mask)
+                results = self.generate_unified(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
                 )
+                jax.block_until_ready(results.sequences)
+                prompt_ids = results.prompt_ids
+                prompt_mask = results.prompt_mask
+                completion_ids = results.completion_ids
+                completion_mask = results.completion_mask
             generation_time = generation_time_fn()
-            completion_ids = sequences[..., prompt_ids.shape[-1] :]
-            completion_mask = self._make_attn_mask(completion_ids)
 
             with capture_time() as mixture_time_fn:  # noqa
-                mixture_sequences, _, _ = jax.block_until_ready(
-                    self.generate_function(
-                        self.ref_state,
-                        prompt_ids,
-                        prompt_mask,
-                    )
+                mixture_results = self.generate_unified(
+                    input_ids=prompt_ids,
+                    attention_mask=prompt_mask,
+                    state=self.ref_state,
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
+                    config_overrides={"num_return_sequences": 1},
                 )
-            mixture_completion_ids = mixture_sequences[..., prompt_ids.shape[-1] :]
-            mixture_completion_mask = self._make_attn_mask(mixture_completion_ids)  # noqa
+                jax.block_until_ready(mixture_results.sequences)
+                mixture_completion_ids = mixture_results.completion_ids
+                mixture_completion_mask = mixture_results.completion_mask
+
+            # Sample mixture between policy and reference completions per prompt
+            mixture_coef = self._current_mixture_coef()
+            step_int = int(jax.device_get(state.step))
+            mix_key = jax.random.PRNGKey(step_int & 0xFFFFFFFF)
+            take_policy = jax.random.uniform(mix_key, (completion_ids.shape[0],)) < mixture_coef
+            take_policy = take_policy[:, None]
+            mixture_completion_ids = jnp.where(take_policy, completion_ids, mixture_completion_ids)
+            mixture_completion_mask = jnp.where(take_policy, completion_mask, mixture_completion_mask)
 
             prompt_completion_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
             attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)

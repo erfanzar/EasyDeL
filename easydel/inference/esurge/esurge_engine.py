@@ -16,18 +16,14 @@
 
 This module provides the eSurge engine, a high-performance text generation system
 built on JAX that offers efficient batched inference with advanced features like
-smart bytecode decoding, continuous batching, and comprehensive monitoring.
+continuous batching and comprehensive monitoring.
 
 Key Components:
     - eSurge: Main engine class for text generation
     - RequestOutput: Container for generation results and metrics
     - CompletionOutput: Individual completion within a batch
-    - SmartBytecodeDecoder: Intelligent UTF-8 sequence handler
 
 Features:
-    - **Smart Bytecode Decoding**: Prevents malformed UTF-8 characters (�) during
-      streaming by intelligently buffering incomplete tokens and using progressive
-      backtracking to find clean decode points.
     - **Continuous Batching**: Background scheduler thread processes requests
       continuously for optimal throughput.
     - **Context Management**: Automatic prompt truncation and token reservation
@@ -39,10 +35,9 @@ Usage Example:
     >>> from easydel.inference.esurge import eSurge
     >>> from easydel.inference.sampling_params import SamplingParams
     >>>
-    >>> # Initialize engine with smart decoding
+    >>> # Initialize engine
     >>> engine = eSurge(
     ...     model="model-name",
-    ...     bytecode_decode=True,  # Enable smart UTF-8 handling
     ...     max_model_len=8192,
     ...     reserve_tokens=800
     ... )
@@ -62,10 +57,6 @@ Technical Details:
     - Main thread: Handles API calls and request submission
     - Scheduler thread: Continuously processes queued requests
     - JAX computation: Executes model forward passes
-
-    Smart bytecode decoding addresses the common issue where byte-level tokenizers
-    (used by many modern LLMs) can split multi-byte UTF-8 characters across token
-    boundaries, causing malformed characters during streaming decode.
 """
 
 from __future__ import annotations
@@ -82,6 +73,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 
+import flax
+import flax.nnx
 import jax
 from eformer.loggings import get_logger
 from jax import numpy as jnp
@@ -91,7 +84,6 @@ from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
 from easydel.workers.esurge.pipeline import DetokenizerResult, WorkerManager
 
-from ..decoders import SmartBytecodeDecoder
 from .engine_types import EngineCoreOutputs
 from .metrics import get_metrics_collector, initialize_metrics, log_metrics_summary
 from .request import EngineRequest, EngineRequestStatus
@@ -103,6 +95,15 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurgeEngine")
+
+# Configuration constants
+DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
+DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
+DEFAULT_DECODE_INTERVAL_TOKENS = 4  # Decode every N tokens
+DEFAULT_DECODE_INTERVAL_SECS = 0.02  # Or decode every N seconds (20ms)
+MAX_CONSECUTIVE_SCHEDULER_ERRORS = 10  # Stop scheduler after this many consecutive errors
+WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
+WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 
 
 def _set_requested_new(sp, n: int):
@@ -163,8 +164,8 @@ class RequestOutput:
     """
 
     request_id: str
-    prompt: str
-    prompt_token_ids: list[int]
+    prompt: str | list[str]
+    prompt_token_ids: list[list[int]] | list[int]
     outputs: list[CompletionOutput]
     finished: bool = False
     metrics: dict[str, Any] | None = None
@@ -214,21 +215,14 @@ class eSurge:
     - Efficient batched inference with paged attention
     - Continuous batching with background scheduling
     - Streaming generation with delta text tracking
-    - Smart bytecode decoding for handling malformed UTF-8 sequences
     - Comprehensive monitoring and metrics
     - Thread-safe request handling
     - Dynamic context management with automatic prompt truncation
 
     The engine runs a background scheduler thread that continuously processes
-    requests from the queue, enabling high throughput and low latency. It includes
-    advanced features like smart decoding to handle tokenizers that split multi-byte
-    UTF-8 characters across token boundaries, preventing malformed characters (�)
-    during streaming.
+    requests from the queue, enabling high throughput and low latency.
 
     Key Features:
-        - **Smart Bytecode Decoding**: Automatically handles incomplete UTF-8 sequences
-          by buffering partial tokens and using progressive backtracking to find clean
-          decode points.
         - **Context Management**: Automatically manages context length with configurable
           truncation strategies and token reservation.
         - **Streaming Support**: Efficient incremental decoding with configurable
@@ -237,10 +231,9 @@ class eSurge:
           monitoring capabilities.
 
     Example:
-        >>> # Initialize with smart decoding enabled
+        >>> # Initialize engine
         >>> engine = eSurge(
         ...     model="model-name",
-        ...     bytecode_decode=True,  # Enable smart UTF-8 handling
         ...     max_model_len=8192,
         ...     reserve_tokens=800  # Reserve tokens for generation
         ... )
@@ -278,13 +271,13 @@ class eSurge:
         truncate_mode: typing.Literal["left", "right", "middle"] = "left",
         prefer_preserve_prompt: bool = True,
         decode_truncated_prompt: bool = True,
-        bytecode_decode: bool = True,
         destroy_pages_on_pause: bool = True,
-        detokenizer_max_states: int = 1 << 16,
+        detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
         sampling_params_callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None]
         | None = None,
+        silent_mode: bool = False,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -321,10 +314,6 @@ class eSurge:
                 capping new tokens first before truncating the prompt.
             decode_truncated_prompt: Re-decode truncated prompt to update the text
                 representation when truncation occurs.
-            bytecode_decode: Enable smart bytecode decoding for handling malformed
-                UTF-8 sequences. This prevents "�" characters during streaming when
-                tokens split multi-byte UTF-8 characters. Uses intelligent buffering
-                and progressive backtracking to find clean decode points.
             overlap_execution: Enable double-buffered model execution to overlap
                 scheduler work with device execution (experimental).
             sampler_metrics: Enable the lightweight sampler JIT for recording
@@ -340,24 +329,26 @@ class eSurge:
                 SamplingParams instance and request metadata dict containing
                 "request_id", "prompt", and "engine". May return a new instance
                 or mutate the provided one in-place.
+            silent_mode: If True, suppress informational eSurge engine logs.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
             ValueError: If tokenizer not provided and cannot be inferred, or if
                 configuration parameters are invalid.
-
-        Note:
-            The bytecode_decode feature is particularly important for models using
-            byte-level tokenizers (like many modern LLMs) where token boundaries
-            may not align with UTF-8 character boundaries. When enabled, it ensures
-            smooth streaming without malformed characters.
         """
         from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
 
-        if page_size < 256 and jax.default_backend() != "tpu":
-            logger.warn("PageSize less than 256 is inefficient for gpu/cpu so we will automatically use 256 for you!")
-            page_size = 256
+        self.silent_mode = silent_mode
+        self._info = logger.info if not self.silent_mode else lambda *args, **kwargs: None
+
+        if page_size < DEFAULT_PAGE_SIZE_GPU_MIN and jax.default_backend() != "tpu":
+            logger.warn(
+                f"PageSize less than {DEFAULT_PAGE_SIZE_GPU_MIN} is inefficient for gpu/cpu "
+                f"so we will automatically use {DEFAULT_PAGE_SIZE_GPU_MIN} for you!"
+            )
+            page_size = DEFAULT_PAGE_SIZE_GPU_MIN
+
         if reserve_tokens is None:
             reserve_tokens = max_num_seqs
 
@@ -389,13 +380,15 @@ class eSurge:
         self._dashboard_urls = None
         self._monitoring_initialized = False
         self._esurge_name = esurge_name
-        self._bytecode_decode = bytecode_decode
-        self._smart_decoder = SmartBytecodeDecoder(self.tokenizer) if bytecode_decode else None
         self._scheduler_running = False
         self.destroy_pages_on_pause = destroy_pages_on_pause
         self._kv_cache_valid = True
         self._paused = False
         self._sampling_params_callback = sampling_params_callback
+
+        # Detokenizer cleanup tracking
+        self._failed_detokenizer_resets: set[str] = set()
+        self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
 
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
@@ -427,10 +420,6 @@ class eSurge:
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
-        else:
-            ...
-
-        self.model = model
 
         # Profiling state
         self._profiling_active = False
@@ -438,8 +427,10 @@ class eSurge:
         self._profiling_output_dir: str | None = None
         self._profiling_host_level: int | None = None
         self._profiling_python_level: int | None = None
+        self._possible_name = self._get_model_name(model)
+
         self.runner = eSurgeRunner(
-            model=self.model,
+            model=model.esurge_compatible_model,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             max_model_len=max_model_len,
@@ -463,8 +454,9 @@ class eSurge:
         self._scheduler_enable_prefix_caching = enable_prefix_caching
 
         # Streaming decode cadence
-        self.decode_interval_tokens = 4
-        self.decode_interval_secs = 0.02
+        self.decode_interval_tokens = DEFAULT_DECODE_INTERVAL_TOKENS
+        self.decode_interval_secs = DEFAULT_DECODE_INTERVAL_SECS
+
 
         # State
         self._request_counter = 0
@@ -510,36 +502,7 @@ class eSurge:
 
     @cached_property
     def esurge_name(self) -> str:
-        return self._esurge_name or self._get_model_name(self.model)
-
-    @property
-    def bytecode_decode(self) -> bool:
-        """Get the bytecode decoding setting.
-
-        Returns:
-            True if smart bytecode decoding is enabled for handling malformed
-            UTF-8 sequences during token streaming.
-
-        Example:
-            >>> if engine.bytecode_decode:
-            ...     print("Smart UTF-8 handling is enabled")
-        """
-        return self._bytecode_decode
-
-    @property
-    def smart_decoder(self) -> SmartBytecodeDecoder | None:
-        """Get the smart bytecode decoder instance.
-
-        Returns:
-            SmartBytecodeDecoder instance if bytecode_decode is enabled, else None.
-            The decoder handles buffering of incomplete tokens and progressive
-            backtracking to find clean UTF-8 decode points.
-
-        Example:
-            >>> if engine.smart_decoder:
-            ...     print("Decoder is active and handling UTF-8 sequences")
-        """
-        return self._smart_decoder
+        return self._esurge_name or self._possible_name
 
     def set_sampling_params_callback(
         self,
@@ -571,16 +534,22 @@ class eSurge:
         """
         with self._scheduler_lock:
             if self._scheduler_running:
-                logger.info("Scheduler loop is already running")
+                self._info("Scheduler loop is already running")
                 return
 
             if self.runner.executor_manager.kv_pages is None:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
 
+
             def _scheduler_loop():
-                logger.info("Starting background scheduler loop")
+                self._info("Starting background scheduler loop")
+                consecutive_errors = 0
+                max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
+
+
                 if not self._overlap_execution:
+
                     while self._scheduler_running:
                         try:
                             scheduler_output = self.scheduler.schedule()
@@ -588,11 +557,31 @@ class eSurge:
                             engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                             if engine_outputs:
                                 self._process_engine_outputs(engine_outputs)
+                            # Reset error counter on success
+                            consecutive_errors = 0
+                        except KeyboardInterrupt:
+                            self._info("Scheduler loop interrupted by user")
+                            break
                         except Exception as e:
+                            consecutive_errors += 1
                             traceback.print_exc()
-                            logger.error(f"Error in scheduler loop: {e}")
+                            logger.error(
+                                "Scheduler loop error (attempt %d/%d): %s",
+                                consecutive_errors,
+                                max_consecutive_errors,
+                                e,
+                            )
+
+
+                            if consecutive_errors >= max_consecutive_errors:
+                                logger.critical(
+                                    f"Scheduler loop encountered {consecutive_errors} consecutive errors. "
+                                    "Stopping scheduler to prevent resource exhaustion."
+                                )
+                                self._scheduler_running = False
+                                break
                             time.sleep(0.01)
-                    logger.info("Background scheduler loop stopped")
+                    self._info("Background scheduler loop stopped")
                     return
 
                 pending_future: tuple[Any, SchedulerOutput] | None = None
@@ -605,9 +594,28 @@ class eSurge:
                         scheduler_output = self.scheduler.schedule()
                         future = self.runner.execute_model_async(scheduler_output)
                         pending_future = (future, scheduler_output)
+                        # Reset error counter on success
+                        consecutive_errors = 0
+                    except KeyboardInterrupt:
+                        self._info("Scheduler loop interrupted by user")
+                        break
                     except Exception as e:
+                        consecutive_errors += 1
                         traceback.print_exc()
-                        logger.error(f"Error in scheduler loop: {e}")
+                        logger.error(
+                            "Scheduler loop error (attempt %d/%d): %s",
+                            consecutive_errors,
+                            max_consecutive_errors,
+                            e,
+                        )
+
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.critical(
+                                f"Scheduler loop encountered {consecutive_errors} consecutive errors. "
+                                "Stopping scheduler to prevent resource exhaustion."
+                            )
+                            self._scheduler_running = False
+                            break
                         time.sleep(0.01)
 
                 if pending_future is not None:
@@ -615,13 +623,15 @@ class eSurge:
                         self._drain_runner_future(*pending_future)
                     except Exception as e:
                         traceback.print_exc()
-                        logger.error(f"Error processing pending batch: {e}")
-                logger.info("Background scheduler loop stopped")
+                        logger.error("Error processing pending batch: %s", e)
+
+                self._info("Background scheduler loop stopped")
+
 
             self._scheduler_running = True
             self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
             self._scheduler_thread.start()
-            logger.info("Background scheduler initiated")
+            self._info("Background scheduler initiated")
             self._paused = False
 
     def terminate(self) -> None:
@@ -633,16 +643,16 @@ class eSurge:
         """
         with self._scheduler_lock:
             if not self._scheduler_running:
-                logger.info("Scheduler loop is not running")
+                self._info("Scheduler loop is not running")
                 return
-            logger.info("Stopping background scheduler loop...")
+            self._info("Stopping background scheduler loop...")
             self._scheduler_running = False
             if self._scheduler_thread:
                 self._scheduler_thread.join(timeout=5.0)
                 if self._scheduler_thread.is_alive():
                     logger.warning("Scheduler thread did not stop gracefully")
                 self._scheduler_thread = None
-            logger.info("Background scheduler terminated")
+            self._info("Background scheduler terminated")
             if self._profiling_active:
                 try:
                     self.stop_profiling()
@@ -653,15 +663,17 @@ class eSurge:
                     self.runner.shutdown()
                 except Exception:
                     logger.debug("Runner shutdown encountered an error", exc_info=True)
+            # Clear runner buffers if idle to avoid stale state on next start.
+            self._reset_runner_state_if_idle("terminate")
 
     def pause(self) -> None:
         """Pause the background scheduler without clearing queued state."""
         if not self._scheduler_running:
-            logger.info("Scheduler loop already paused or not running")
+            self._info("Scheduler loop already paused or not running")
             self._paused = True
             return
 
-        logger.info("Pausing eSurge scheduler loop...")
+        self._info("Pausing eSurge scheduler loop...")
         self.terminate()
         self._paused = True
         self._drain_pipeline_workers("pause")
@@ -675,13 +687,15 @@ class eSurge:
                 self.runner.destroy_kv_cache()
                 self._kv_cache_valid = False
                 self._log_cache_event("kv_cache_destroyed", {"reason": "pause"})
+        # Always try to clear runner buffers when idle to avoid stale state.
+        self._reset_runner_state_if_idle("pause")
 
     def resume(self) -> None:
         """Resume the scheduler if it was paused."""
         if self._scheduler_running:
-            logger.info("Scheduler loop already running")
+            self._info("Scheduler loop already running")
             return
-        logger.info("Resuming eSurge scheduler loop...")
+        self._info("Resuming eSurge scheduler loop...")
         self._drain_pipeline_workers("resume")
         if self.destroy_pages_on_pause and not self._kv_cache_valid:
             self.runner.initialize_kv_cache()
@@ -738,6 +752,29 @@ class eSurge:
     def _tokenize_prompt(self, request_id: str, prompt: str) -> list[int]:
         return self._tokenizer_client.tokenize(request_id, prompt)
 
+    def _prepare_prompt_segments(self, prompt: typing.Any) -> list[str]:
+        if isinstance(prompt, list):
+            return [segment if isinstance(segment, str) else str(segment) for segment in prompt]
+        return [prompt if isinstance(prompt, str) else str(prompt)]
+
+    def _tokenize_prompt_segments(self, prompt: typing.Any) -> list[list[int]]:
+        segments = self._prepare_prompt_segments(prompt)
+        token_segments: list[list[int]] = []
+        for segment in segments:
+            try:
+                encoded = self.tokenizer(
+                    segment,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                )
+                ids = encoded.get("input_ids", [])
+                if ids and isinstance(ids[0], list):
+                    ids = ids[0]
+            except Exception:
+                ids = []
+            token_segments.append([int(tok) for tok in ids])
+        return token_segments
+
     def _decode_with_pipeline(
         self,
         request_id: str,
@@ -789,18 +826,47 @@ class eSurge:
         if extra:
             payload.update(extra)
         sanitized = self._sanitize_metrics_payload(payload)
-        logger.info("KV cache %s: %s", event, sanitized)
+        self._info("KV cache %s: %s", event, sanitized)
         self._record_cache_event(event, sanitized)
 
     def _drain_pipeline_workers(self, reason: str) -> None:
+        """Drain tokenizer/detokenizer workers with retry logic.
+
+        Args:
+            reason: Reason for draining (for logging).
+        """
         manager = getattr(self, "_worker_manager", None)
         if not manager:
             return
-        try:
-            manager.drain_workers()
-            logger.info("Drained tokenizer/detokenizer workers (%s)", reason)
-        except Exception:
-            logger.warning("Failed to drain tokenizer/detokenizer workers during %s", reason, exc_info=True)
+
+        max_retries = WORKER_DRAIN_MAX_RETRIES
+        retry_delay = WORKER_DRAIN_INITIAL_DELAY
+
+
+        for attempt in range(max_retries):
+            try:
+                manager.drain_workers()
+                self._info("Drained tokenizer/detokenizer workers (%s)", reason)
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Failed to drain workers (attempt %d/%d): %s. Retrying in %.2fs...",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(
+                        "Failed to drain tokenizer/detokenizer workers after %d attempts during %s",
+                        max_retries,
+                        reason,
+                        exc_info=True,
+                    )
+
 
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         try:
@@ -837,7 +903,6 @@ class eSurge:
         sampling_params: SamplingParams | None = None,
         request_id: str | list[str] | None = None,
         use_tqdm: bool = True,
-        bytecode_decode: bool | None = None,
     ) -> list[RequestOutput]:
         """Generate completions for one or more prompts (blocking).
 
@@ -853,9 +918,6 @@ class eSurge:
                 Can be a single string (for single prompt) or list of strings.
             use_tqdm: Show progress bar for batch generation. Useful for tracking
                 progress with multiple prompts.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific call. When True, enables smart UTF-8 handling for this request.
-                When None, uses the instance's default setting.
 
         Returns:
             List of RequestOutput objects containing:
@@ -881,12 +943,6 @@ class eSurge:
             >>> outputs = engine.generate(prompts, use_tqdm=True)
             >>> for i, output in enumerate(outputs):
             ...     print(f"Prompt {i}: {output.get_text()[:50]}...")
-            >>>
-            >>> # Override bytecode decoding for specific request
-            >>> outputs = engine.generate(
-            ...     "Generate UTF-8 text",
-            ...     bytecode_decode=True  # Enable smart decoding
-            ... )
         """
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -900,64 +956,49 @@ class eSurge:
 
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
-        # Override bytecode_decode if specified
-        original_bytecode_decode = self._bytecode_decode
-        if bytecode_decode is not None:
-            self._bytecode_decode = bytecode_decode
-            if bytecode_decode and self._smart_decoder is None:
-                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
+        for prompt, req_id in zip(prompts, request_ids, strict=False):
+            prompt_tokens = self._tokenize_prompt(req_id, prompt)
+            effective_params = self._prepare_sampling_params_for_request(
+                base_sampling_params,
+                request_id=req_id,
+                prompt=prompt,
+            )
+            self._add_request(req_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
-        try:
-            for prompt, req_id in zip(prompts, request_ids, strict=False):
-                prompt_tokens = self._tokenize_prompt(req_id, prompt)
-                effective_params = self._prepare_sampling_params_for_request(
-                    base_sampling_params,
-                    request_id=req_id,
-                    prompt=prompt,
-                )
-                self._add_request(req_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+        outputs = []
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm
 
-            outputs = []
-            pbar = None
-            if use_tqdm:
-                from tqdm import tqdm
+            pbar = tqdm(total=len(prompts), desc="Generating")
 
-                pbar = tqdm(total=len(prompts), desc="Generating")
+        completed = set()
 
-            completed = set()
+        if not self._scheduler_running:
+            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
-            if not self._scheduler_running:
-                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        while len(completed) < len(prompts):
+            self._output_event.wait(timeout=0.1)
+            self._output_event.clear()
+            with self._output_lock:
+                for req_id in request_ids:
+                    if req_id not in completed and req_id in self._request_outputs:
+                        output = self._request_outputs[req_id]
+                        if output.finished:
+                            completed.add(req_id)
+                            outputs.append(output)
+                            if pbar:
+                                pbar.update(1)
 
-            while len(completed) < len(prompts):
-                self._output_event.wait(timeout=0.1)
-                self._output_event.clear()
-                with self._output_lock:
-                    for req_id in request_ids:
-                        if req_id not in completed and req_id in self._request_outputs:
-                            output = self._request_outputs[req_id]
-                            if output.finished:
-                                completed.add(req_id)
-                                outputs.append(output)
-                                if pbar:
-                                    pbar.update(1)
-
-            if pbar:
-                pbar.close()
-            return outputs
-        finally:
-            # Restore original bytecode_decode setting
-            if bytecode_decode is not None:
-                self._bytecode_decode = original_bytecode_decode
-                if not original_bytecode_decode:
-                    self._smart_decoder = None
+        if pbar:
+            pbar.close()
+        return outputs
 
     def stream(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
-        bytecode_decode: bool | None = None,
     ) -> Iterator[RequestOutput]:
         """Stream generation output as tokens are produced.
 
@@ -971,9 +1012,6 @@ class eSurge:
             sampling_params: Generation parameters controlling temperature, top_p,
                 max_tokens, etc. Defaults to SamplingParams(max_tokens=128).
             request_id: Optional request ID for tracking. Auto-generated if None.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific stream. When True, enables smart UTF-8 handling to prevent
-                malformed characters during streaming. When None, uses instance default.
 
         Yields:
             RequestOutput objects with incremental updates:
@@ -995,22 +1033,12 @@ class eSurge:
             ...     if output.finished:
             ...         break
             >>>
-            >>> # Streaming with smart UTF-8 handling
-            >>> for output in engine.stream("Generate emoji text", bytecode_decode=True):
-            ...     print(output.delta_text, end="", flush=True)
-            >>>
             >>> # Monitor generation speed
             >>> for output in engine.stream("Long prompt here..."):
             ...     if output.delta_text:
             ...         print(output.delta_text, end="")
             ...     if output.num_generated_tokens % 10 == 0:
             ...         print(f"\n[{output.tokens_per_second:.1f} tok/s]", end="")
-
-        Note:
-            The bytecode_decode parameter is particularly useful when streaming
-            text that may contain emojis, special characters, or non-ASCII text,
-            as it prevents the appearance of � characters when tokens split
-            multi-byte UTF-8 sequences.
         """
         if isinstance(prompts, list):
             if len(prompts) == 0:
@@ -1024,89 +1052,75 @@ class eSurge:
 
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
-        # Override bytecode_decode if specified
-        original_bytecode_decode = self._bytecode_decode
-        if bytecode_decode is not None:
-            self._bytecode_decode = bytecode_decode
-            if bytecode_decode and self._smart_decoder is None:
-                self._smart_decoder = SmartBytecodeDecoder(self.tokenizer)
+        prompt_tokens = self._tokenize_prompt(request_id, prompt)
+        effective_params = self._prepare_sampling_params_for_request(
+            base_sampling_params,
+            request_id=request_id,
+            prompt=prompt,
+        )
+        self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
-        try:
-            prompt_tokens = self._tokenize_prompt(request_id, prompt)
-            effective_params = self._prepare_sampling_params_for_request(
-                base_sampling_params,
-                request_id=request_id,
-                prompt=prompt,
-            )
-            self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+        if not self._scheduler_running:
+            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
-            if not self._scheduler_running:
-                raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        with self._request_lock:
+            req_event = self._request_events.get(request_id)
+        if req_event is None:
+            raise RuntimeError("Request event missing")
 
-            with self._request_lock:
-                req_event = self._request_events.get(request_id)
-            if req_event is None:
-                raise RuntimeError("Request event missing")
+        last_update_seq = -1
 
-            last_update_seq = -1
+        while True:
+            req_event.wait(timeout=1.0)
+            req_event.clear()
 
-            while True:
-                req_event.wait(timeout=1.0)
-                req_event.clear()
+            snapshot = None
+            with self._output_lock:
+                ro = self._request_outputs.get(request_id)
+                if ro is None:
+                    break
 
-                snapshot = None
-                with self._output_lock:
-                    ro = self._request_outputs.get(request_id)
-                    if ro is None:
-                        break
-
-                    if ro.update_seq != last_update_seq:
-                        # Snapshot without holding the lock during yield
-                        outputs_copy = []
-                        for comp in ro.outputs:
-                            outputs_copy.append(
-                                CompletionOutput(
-                                    index=comp.index,
-                                    text=comp.text,
-                                    token_ids=list(comp.token_ids),
-                                    cumulative_logprob=comp.cumulative_logprob,
-                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
-                                    finish_reason=comp.finish_reason,
-                                )
+                if ro.update_seq != last_update_seq:
+                    # Snapshot without holding the lock during yield
+                    outputs_copy = []
+                    for comp in ro.outputs:
+                        outputs_copy.append(
+                            CompletionOutput(
+                                index=comp.index,
+                                text=comp.text,
+                                token_ids=list(comp.token_ids),
+                                cumulative_logprob=comp.cumulative_logprob,
+                                logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                finish_reason=comp.finish_reason,
                             )
-
-                        snapshot = RequestOutput(
-                            request_id=ro.request_id,
-                            prompt=ro.prompt,
-                            prompt_token_ids=list(ro.prompt_token_ids),
-                            outputs=outputs_copy,
-                            finished=ro.finished,
-                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                            accumulated_text=ro.accumulated_text,
-                            delta_text=ro.delta_text,
-                            tokens_per_second=ro.tokens_per_second,
-                            num_generated_tokens=ro.num_generated_tokens,
-                            time_spent_generating=ro.time_spent_generating,
-                            first_token_time=ro.first_token_time,
-                            processing_time=ro.processing_time,
-                            update_seq=ro.update_seq,
                         )
-                        last_update_seq = ro.update_seq
 
-                if snapshot is not None:
-                    yield snapshot
-                    if snapshot.finished:
-                        break
+                    snapshot = RequestOutput(
+                        request_id=ro.request_id,
+                        prompt=ro.prompt,
+                        prompt_token_ids=list(ro.prompt_token_ids),
+                        outputs=outputs_copy,
+                        finished=ro.finished,
+                        metrics=dict(ro.metrics) if ro.metrics is not None else None,
+                        accumulated_text=ro.accumulated_text,
+                        delta_text=ro.delta_text,
+                        tokens_per_second=ro.tokens_per_second,
+                        num_generated_tokens=ro.num_generated_tokens,
+                        time_spent_generating=ro.time_spent_generating,
+                        first_token_time=ro.first_token_time,
+                        processing_time=ro.processing_time,
+                        update_seq=ro.update_seq,
+                    )
+                    last_update_seq = ro.update_seq
 
-            # Cleanup per-request event (output is preserved for generate or post-hoc access)
-            with self._request_lock:
-                self._request_events.pop(request_id, None)
-        finally:
-            # Restore original bytecode_decode setting
-            if bytecode_decode is not None:
-                self._bytecode_decode = original_bytecode_decode
-                if not original_bytecode_decode:
-                    self._smart_decoder = None
+            if snapshot is not None:
+                yield snapshot
+                if snapshot.finished:
+                    break
+
+        # Cleanup per-request event (output is preserved for generate or post-hoc access)
+        with self._request_lock:
+            self._request_events.pop(request_id, None)
 
     def chat(
         self,
@@ -1115,7 +1129,6 @@ class eSurge:
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         stream: bool = False,
-        bytecode_decode: bool | None = None,
         chat_template: str | None = None,
     ):
         """High-level chat interface compatible with vLLM and OpenAI APIs.
@@ -1139,9 +1152,6 @@ class eSurge:
             stream: If True, returns an iterator yielding incremental RequestOutput
                 objects with delta_text for real-time streaming. If False, returns
                 a single RequestOutput with the complete response.
-            bytecode_decode: Override the instance's bytecode_decode setting for this
-                specific chat. When True, enables smart UTF-8 handling to prevent
-                malformed characters. When None, uses the instance's default.
             chat_template: Optional custom Jinja2 template to override the tokenizer's
                 default chat template. Useful for models with non-standard formats.
 
@@ -1197,7 +1207,6 @@ class eSurge:
                 prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
-                bytecode_decode=bytecode_decode,
             )
         else:
             outs = self.generate(
@@ -1205,7 +1214,6 @@ class eSurge:
                 sampling_params=sampling_params,
                 request_id=request_id,
                 use_tqdm=False,
-                bytecode_decode=bytecode_decode,
             )
             # generate() returns a list; chat is single prompt, so return the first
             return outs[0]
@@ -1238,7 +1246,7 @@ class eSurge:
             ValueError: If no model/graph data is provided.
         """
 
-        if self._active_requests or self.num_running_requests > 0 or self.num_pending_requests > 0:
+        if self.num_running_requests > 0 or self.num_pending_requests > 0:
             raise RuntimeError("Cannot update model weights while requests are active or pending")
 
         if model is None and graphdef is None and graphstate is None and graphother is None:
@@ -1250,12 +1258,15 @@ class eSurge:
 
         self._drain_pipeline_workers("update_model_weights")
 
-        if model is not None:
-            model = model.update_module(attn_mechanism="ragged_page_attention_v2")
-            self.model = model
+        if model is None:
+            model = flax.nnx.merge(graphdef, graphstate, graphother)
+        if graphstate is None:
+            graphstate = model.graphstate
+        if graphother is None:
+            graphother = model.graphother
+        graphdef = model.esurge_graphdef
 
         self.runner.update_model_weights(
-            model=model,
             graphdef=graphdef,
             graphstate=graphstate,
             graphother=graphother,
@@ -1419,7 +1430,7 @@ class eSurge:
                         prompt_len = len(token_ids)
                         truncated = truncated or dropped > 0
                         tokens_dropped += dropped
-                        logger.info(
+                        self._info(
                             f"Truncated prompt by {dropped} tokens (mode={self.truncate_mode}) "
                             f"to honor requested max_new_tokens={requested_new}. "
                             f"New prompt_len={prompt_len}, target_prompt_budget={target_prompt_budget}."
@@ -1471,12 +1482,20 @@ class eSurge:
         if metrics_collector:
             metrics_collector.start_request(request_id, len(token_ids))
 
+        prompt_token_segments = self._tokenize_prompt_segments(prompt_for_engine)
+
+        # Handle n > 1 sampling: create multiple EngineRequest objects
+        n_samples = getattr(sampling_params, "n", 1) or 1
+
+        # Create n CompletionOutput objects for the RequestOutput
+        completion_outputs = [CompletionOutput(index=i, text="", token_ids=[]) for i in range(n_samples)]
+
         with self._output_lock:
             self._request_outputs[request_id] = RequestOutput(
                 request_id=request_id,
                 prompt=prompt_for_engine,
-                prompt_token_ids=token_ids,
-                outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+                prompt_token_ids=prompt_token_segments,
+                outputs=completion_outputs,
                 finished=False,
                 accumulated_text="",
                 delta_text="",
@@ -1489,29 +1508,68 @@ class eSurge:
                 delta_seq=0,
             )
 
-        self.scheduler.add_request(
-            EngineRequest(
-                request_id=request_id,
-                prompt_token_ids=token_ids,
-                sampling_params=sampling_params,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        )
+        # Create n EngineRequest objects for parallel sampling
+        for sample_idx in range(n_samples):
+            if n_samples == 1:
+                # For n=1, use the original request_id
+                child_request_id = request_id
+                parent_id = None
+            else:
+                # For n>1, create child request IDs
+                child_request_id = f"{request_id}-{sample_idx}"
+                parent_id = request_id
 
-        logger.info(
+                # Create tracking entries for child requests
+                # IMPORTANT: Create a fresh dict for each sample to avoid sharing mutable objects
+                with self._request_lock:
+                    self._request_events[child_request_id] = self._request_events[request_id]
+                    self._active_requests[child_request_id] = {
+                        "prompt": prompt_for_engine,
+                        "prompt_token_ids": token_ids,
+                        "generated_tokens": [],  # Fresh list for each sample
+                        "last_decoded_index": 0,
+                        "start_time": start_ts,
+                        "first_token_time": None,
+                        "last_decode_time": start_ts,
+                        "truncated": truncated,
+                        "tokens_dropped": tokens_dropped,
+                        "requested_new_tokens_original": original_requested_new,
+                        "requested_new_tokens_final": requested_new,
+                        "reserve_tokens": self.reserve_tokens,
+                        "max_model_len": max_model_len,
+                        "sample_index": sample_idx,
+                        "parent_request_id": request_id,
+                    }
+
+            self.scheduler.add_request(
+                EngineRequest(
+                    request_id=child_request_id,
+                    prompt_token_ids=token_ids,
+                    sampling_params=sampling_params,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    parent_request_id=parent_id,
+                    sample_index=sample_idx,
+                )
+            )
+
+        self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "
-            f"max_tokens={requested_new}, reserve={self.reserve_tokens}, "
+            f"max_tokens={requested_new}, n={n_samples}, reserve={self.reserve_tokens}, "
             f"model_max={max_model_len}, dropped={tokens_dropped}"
         )
 
     def _generate_request_id(self) -> str:
-        """Generate a unique request ID.
+        """Generate a unique request ID with overflow protection.
+
+        Uses UUID for uniqueness and a counter for ordering. The counter
+        uses modulo arithmetic to prevent unbounded growth in long-running
+        services.
 
         Returns:
             Unique request ID with format 'req-{uuid}-{counter}'.
         """
         with self._counter_lock:
-            self._request_counter += 1
+            self._request_counter = (self._request_counter + 1) % (1 << 32)  # Reset after ~4 billion requests
             return f"req-{uuid.uuid4().hex}-{self._request_counter}"
 
     def abort_request(self, request_id: str) -> None:
@@ -1523,29 +1581,80 @@ class eSurge:
         Args:
             request_id: ID of the request to abort.
         """
-        with self._scheduler_lock:
+        # Acquire all locks atomically to prevent race conditions
+        with self._scheduler_lock, self._request_lock, self._output_lock:
+            # Mark request as aborted in scheduler
             if request_id in self.scheduler.requests:
                 self.scheduler.requests[request_id].status = EngineRequestStatus.FINISHED_ABORTED
 
-        with self._request_lock, self._output_lock:
+            # Clean up active request tracking
             self._active_requests.pop(request_id, None)
+
+            # Update output state with bounds checking
             if request_id in self._request_outputs:
                 ro = self._request_outputs[request_id]
                 ro.finished = True
-                ro.outputs[0].finish_reason = "aborted"
+                # Mark all completion outputs as aborted (handles n>1 case)
+                for output in ro.outputs:
+                    output.finish_reason = "aborted"
                 ro.update_seq += 1
+
+            # Get event while still holding lock
+            ev = self._request_events.get(request_id)
+
+        # Reset detokenizer state (outside locks to avoid blocking)
         try:
             self._detokenizer_client.reset(request_id)
+            # Remove from failed set if it was there
+            self._failed_detokenizer_resets.discard(request_id)
         except Exception:
             logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
+            # Track failed reset
+            self._failed_detokenizer_resets.add(request_id)
+            # Trigger cleanup if threshold reached
+            if len(self._failed_detokenizer_resets) >= self._detokenizer_cleanup_threshold:
+                self._cleanup_detokenizer_state()
 
-        # Notify both per-request and global waiters
-        with self._request_lock:
-            ev = self._request_events.get(request_id)
+        # Notify waiters
         if ev:
             ev.set()
         self._output_event.set()
         log_metrics_summary()
+
+    def _cleanup_detokenizer_state(self) -> None:
+        """Attempt to clean up failed detokenizer states.
+
+        Retries resetting detokenizer state for all tracked failed requests.
+        Clears successfully reset requests from the tracking set.
+        """
+        if not self._failed_detokenizer_resets:
+            return
+
+        self._info(
+            "Attempting to clean up %d failed detokenizer states",
+            len(self._failed_detokenizer_resets),
+        )
+
+        successfully_reset = set()
+        for request_id in list(self._failed_detokenizer_resets):
+            try:
+                self._detokenizer_client.reset(request_id)
+                successfully_reset.add(request_id)
+            except Exception:
+                # Still failing, keep in set
+                pass
+
+        # Remove successfully reset requests
+        self._failed_detokenizer_resets -= successfully_reset
+
+        if successfully_reset:
+            self._info("Successfully cleaned up %d detokenizer states", len(successfully_reset))
+        if self._failed_detokenizer_resets:
+            logger.warning(
+                "%d detokenizer states still failed to reset",
+                len(self._failed_detokenizer_resets),
+            )
+
 
     @property
     def num_pending_requests(self) -> int:
@@ -1566,6 +1675,25 @@ class eSurge:
         """
         with self._scheduler_lock:
             return len(self.scheduler.running)
+
+    def _reset_runner_state_if_idle(self, reason: str) -> None:
+        """Reset runner buffers when there are no active/pending requests."""
+        if not hasattr(self.runner, "reset_state"):
+            return
+        if self.num_running_requests > 0 or self.num_pending_requests > 0:
+            logger.warning(
+                "Skipping runner state reset during %s because there are active or pending requests "
+                "(running=%d, pending=%d)",
+                reason,
+                self.num_running_requests,
+                self.num_pending_requests,
+            )
+            return
+        try:
+            self.runner.reset_state()
+            self._info("Runner state reset (%s)", reason)
+        except Exception:
+            logger.debug("Runner state reset encountered an error during %s", reason, exc_info=True)
 
     def start_profiling(
         self,
@@ -1592,7 +1720,7 @@ class eSurge:
         self._profiling_output_dir = output_dir
         self._profiling_host_level = host_tracer_level
         self._profiling_python_level = python_tracer_level
-        logger.info(
+        self._info(
             "Started profiler trace -> %s (batches=%d, host_tracer_level=%s, python_tracer_level=%s)",
             output_dir,
             num_batches,
@@ -1606,7 +1734,7 @@ class eSurge:
             return
         try:
             jax.profiler.stop_trace()
-            logger.info("Stopped profiler trace -> %s", self._profiling_output_dir)
+            self._info("Stopped profiler trace -> %s", self._profiling_output_dir)
         finally:
             self._profiling_active = False
             self._profiling_steps_remaining = 0
@@ -1634,8 +1762,7 @@ class eSurge:
 
         Core method that processes tokens from the model, performs incremental
         decoding, updates metrics, and signals waiting threads. Uses interval-based
-        decoding to reduce tokenizer overhead during streaming. When bytecode_decode
-        is enabled, employs smart decoding to handle malformed UTF-8 sequences.
+        decoding to reduce tokenizer overhead during streaming.
 
         Args:
             engine_outputs: Dictionary mapping client IDs to engine outputs containing
@@ -1644,21 +1771,10 @@ class eSurge:
         Processing Flow:
             1. Extracts new tokens from engine outputs
             2. Performs interval-based decoding (every 4 tokens or 20ms)
-            3. If bytecode_decode enabled:
-               - Buffers incomplete tokens that would produce malformed chars
-               - Uses progressive backtracking to find clean decode points
-               - Maintains previous decoded text for accurate diffing
-            4. Updates accumulated and delta text fields
-            5. Tracks performance metrics (TTFT, tokens/sec)
-            6. Handles request completion with final token flush
-            7. Signals per-request events for streaming consumers
-
-        Smart Decoding Logic:
-            When bytecode_decode is active, the method:
-            - Attempts to decode new tokens with any buffered tokens
-            - If malformed characters detected, backtracks to find last clean point
-            - Buffers problematic tokens for next iteration
-            - On completion, flushes all remaining buffered tokens
+            3. Updates accumulated and delta text fields
+            4. Tracks performance metrics (TTFT, tokens/sec)
+            5. Handles request completion with final token flush
+            6. Signals per-request events for streaming consumers
 
         Thread Safety:
             Uses request_lock and output_lock to ensure atomic updates across
@@ -1671,9 +1787,15 @@ class eSurge:
             for client_outputs in engine_outputs.values():
                 for engine_output in client_outputs.outputs:
                     request_id = engine_output.request_id
-                    ro = self._request_outputs.get(request_id)
                     rd = self._active_requests.get(request_id)
-                    if ro is None or rd is None:
+                    if rd is None:
+                        continue
+
+                    # Handle n>1 sampling: get parent request and sample index
+                    parent_request_id = rd.get("parent_request_id", request_id)
+                    sample_index = rd.get("sample_index", 0)
+                    ro = self._request_outputs.get(parent_request_id)
+                    if ro is None:
                         continue
 
                     text_changed = False
@@ -1705,14 +1827,20 @@ class eSurge:
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
-                            ro.accumulated_text = pipeline_result.accumulated_text
-                            ro.delta_text = pipeline_result.delta_text
+
+                            # Update the specific sample's completion output
+                            comp = ro.outputs[sample_index]
+                            comp.text = pipeline_result.accumulated_text
+                            comp.token_ids = list(rd["generated_tokens"])
+
+                            # For backwards compatibility, set ro.accumulated_text to first sample's text
+                            if sample_index == 0:
+                                ro.accumulated_text = pipeline_result.accumulated_text
+                                ro.delta_text = pipeline_result.delta_text
+
                             if pipeline_result.delta_text:
                                 ro.delta_seq += 1
                                 text_changed = True
-                                comp = ro.outputs[0]
-                                comp.text = ro.accumulated_text
-                                comp.token_ids = list(rd["generated_tokens"])
 
                         ro.num_generated_tokens = len(rd["generated_tokens"])
 
@@ -1730,11 +1858,19 @@ class eSurge:
                         ro.num_generated_tokens = num_generated
 
                     if engine_output.finished:
-                        comp = ro.outputs[0]
-                        ro.finished = True
+                        comp = ro.outputs[sample_index]
                         comp.finish_reason = (
                             str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
                         )
+
+                        # For n>1, mark RequestOutput as finished only when ALL samples are done
+                        n_samples = len(ro.outputs)
+                        if n_samples == 1:
+                            ro.finished = True
+                        else:
+                            # Check if all samples have finish_reason set
+                            all_finished = all(output.finish_reason is not None for output in ro.outputs)
+                            ro.finished = all_finished
 
                         num_generated = len(rd["generated_tokens"])
                         last_idx = rd["last_decoded_index"]
@@ -1744,17 +1880,25 @@ class eSurge:
                                 rd["generated_tokens"],
                                 finished=True,
                             )
-                            ro.accumulated_text = pipeline_result.accumulated_text
-                            ro.delta_text = pipeline_result.delta_text
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
+
+                            # Update the specific sample's completion output
+                            comp.text = pipeline_result.accumulated_text
+                            comp.token_ids = list(rd["generated_tokens"])
+
+                            # For backwards compatibility, set ro.accumulated_text to first sample's text
+                            if sample_index == 0:
+                                ro.accumulated_text = pipeline_result.accumulated_text
+                                ro.delta_text = pipeline_result.delta_text
+
                             if pipeline_result.delta_text:
                                 ro.delta_seq += 1
-                                comp.text = ro.accumulated_text
-                                comp.token_ids = list(rd["generated_tokens"])
                                 text_changed = True
 
                         num_prompt_tokens = (
-                            len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else len(ro.prompt_token_ids)
+                            len(rd["prompt_token_ids"])
+                            if "prompt_token_ids" in rd
+                            else sum(len(seg) for seg in ro.prompt_token_ids)
                         )
                         num_generated_tokens = len(rd["generated_tokens"])
 
@@ -1789,7 +1933,8 @@ class eSurge:
                             logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
                     ro.update_seq += 1
                     if text_changed or engine_output.finished:
-                        ev = self._request_events.get(request_id)
+                        # Signal the parent request event
+                        ev = self._request_events.get(parent_request_id)
                         if ev:
                             ev.set()
 
@@ -1837,10 +1982,10 @@ class eSurge:
             >>> print(f"Dashboard: {urls['dashboard']}")
         """
         if self._monitoring_initialized:
-            logger.info("Monitoring already initialized for this eSurge instance")
+            self._info("Monitoring already initialized for this eSurge instance")
             return self._dashboard_urls
 
-        logger.info("Starting eSurge monitoring services...")
+        self._info("Starting eSurge monitoring services...")
 
         if not get_metrics_collector():
             initialize_metrics(
@@ -1849,7 +1994,7 @@ class eSurge:
                 history_size=history_size,
                 enable_detailed_logging=enable_detailed_logging,
             )
-            logger.info(" Metrics collection initialized")
+            self._info(" Metrics collection initialized")
 
         urls = {}
 
@@ -1862,11 +2007,11 @@ class eSurge:
                     update_interval=1.0,
                 )
                 urls["prometheus"] = f"http://{dashboard_host}:{prometheus_port}/metrics"
-                logger.info(f" Prometheus metrics: {urls['prometheus']}")
+                self._info(f" Prometheus metrics: {urls['prometheus']}")
             except ImportError:
-                logger.info(" Prometheus monitoring unavailable (install prometheus-client)")
+                self._info(" Prometheus monitoring unavailable (install prometheus-client)")
             except Exception as e:
-                logger.info(f" Failed to start Prometheus server: {e}")
+                self._info(f" Failed to start Prometheus server: {e}")
 
         if enable_dashboard:
             try:
@@ -1886,32 +2031,32 @@ class eSurge:
                 urls["dashboard"] = f"http://{dashboard_host}:{dashboard_port}"
                 urls["health"] = f"http://{dashboard_host}:{dashboard_port}/health"
                 urls["api"] = f"http://{dashboard_host}:{dashboard_port}/api/metrics"
-                logger.info(f" Web dashboard: {urls['dashboard']}")
-                logger.info(f" Health check: {urls['health']}")
+                self._info(f" Web dashboard: {urls['dashboard']}")
+                self._info(f" Health check: {urls['health']}")
             except ImportError:
-                logger.info(" Web dashboard unavailable (install fastapi uvicorn)")
+                self._info(" Web dashboard unavailable (install fastapi uvicorn)")
             except Exception as e:
-                logger.info(f" Failed to start dashboard: {e}")
+                self._info(f" Failed to start dashboard: {e}")
 
         if enable_console:
             try:
                 from .monitoring import start_console_monitor
 
-                logger.info(" Starting console monitor...")
+                self._info(" Starting console monitor...")
                 start_console_monitor(refresh_rate=1.0)
             except ImportError:
-                logger.info(" Console monitor unavailable (install rich)")
+                self._info(" Console monitor unavailable (install rich)")
             except Exception as e:
-                logger.info(f" Failed to start console monitor: {e}")
+                self._info(f" Failed to start console monitor: {e}")
 
         self._monitoring_initialized = True
         if urls:
-            logger.info(" Monitoring services started successfully!")
-            logger.info(" Metrics will be automatically collected during inference")
+            self._info(" Monitoring services started successfully!")
+            self._info(" Metrics will be automatically collected during inference")
             if enable_dashboard:
-                logger.info(f" Open {urls['dashboard']} to view real-time metrics")
+                self._info(f" Open {urls['dashboard']} to view real-time metrics")
         else:
-            logger.info(" No monitoring services were started successfully")
+            self._info(" No monitoring services were started successfully")
         self._dashboard_urls = urls
         return urls
 
@@ -1922,28 +2067,28 @@ class eSurge:
         if they are running.
         """
         if not self._monitoring_initialized:
-            logger.info("No monitoring services to stop")
+            self._info("No monitoring services to stop")
             return
-        logger.info("Stopping eSurge monitoring services...")
+        self._info("Stopping eSurge monitoring services...")
 
         if self._monitoring_server:
             try:
                 self._monitoring_server.stop()
-                logger.info(" Prometheus server stopped")
+                self._info(" Prometheus server stopped")
             except Exception as e:
-                logger.info(f" Error stopping Prometheus server: {e}")
+                self._info(f" Error stopping Prometheus server: {e}")
             self._monitoring_server = None
 
         if self._dashboard_thread and self._dashboard_thread.is_alive():
             try:
-                logger.info(" Dashboard server will stop with process")
+                self._info(" Dashboard server will stop with process")
             except Exception as e:
-                logger.info(f" Error stopping dashboard: {e}")
+                self._info(f" Error stopping dashboard: {e}")
             self._dashboard_thread = None
             self._dashboard = None
 
         self._monitoring_initialized = False
-        logger.info(" Monitoring services stopped")
+        self._info(" Monitoring services stopped")
 
     def get_metrics_summary(self) -> dict[str, Any]:
         """Get current performance metrics summary.
@@ -2022,7 +2167,6 @@ class eSurge:
             f"truncate_mode={self.truncate_mode!r}",
             f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
             f"decode_truncated_prompt={self.decode_truncated_prompt}",
-            f"bytecode_decode={self._bytecode_decode}",
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

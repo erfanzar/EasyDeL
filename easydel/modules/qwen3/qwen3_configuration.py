@@ -25,6 +25,8 @@ logger = get_logger(__name__)
 
 @register_config("qwen3")
 class Qwen3Config(EasyDeLBaseConfig):
+    """Configuration container for the Qwen3 decoder architecture."""
+
     model_type = "qwen3"
 
     def __init__(

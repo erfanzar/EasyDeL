@@ -44,7 +44,6 @@ def main():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
     policy_model = load_causal_lm_model()
-    reference_model = load_causal_lm_model()
 
     trainer_args = make_config(
         ed.XPOConfig,
@@ -64,7 +63,6 @@ def main():
     trainer = ed.XPOTrainer(
         arguments=trainer_args,
         model=policy_model,
-        reference_model=reference_model,
         reward_funcs=dummy_reward_fn,
         train_dataset=dataset,
         processing_class=tokenizer,

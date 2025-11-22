@@ -155,6 +155,7 @@ class SFTTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=model,
             data_collator=data_collator,
+            processing_class=processing_class,
         )
 
     def _prepare_dataset(
