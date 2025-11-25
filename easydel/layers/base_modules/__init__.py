@@ -93,6 +93,14 @@ from ._protocols import (
     VisionModelProtocol,
 )
 
+# VLM feature implementations
+from ._vlm_features import (
+    MultiDimensionalRoPEFeature,
+    MultiModalMergeFeature,
+    VideoProcessingFeature,
+    VisionEncoderFeature,
+)
+
 # Task-specific base modules
 from .causal_lm_module import BaseCausalLMModule
 from .conditional_generation_module import BaseConditionalGenerationModule
@@ -100,6 +108,7 @@ from .image_classification_module import BaseImageClassificationModule
 from .question_answering_module import BaseQuestionAnsweringModule
 from .sequence_classification_module import BaseSequenceClassificationModule
 from .token_classification_module import BaseTokenClassificationModule
+from .vision_language_module import BaseVisionLanguageModule
 
 __all__ = [
     "AUTO_MODEL_FACTORY_REGISTRY",
@@ -111,12 +120,17 @@ __all__ = [
     "BaseSequenceClassificationModule",
     "BaseTaskModule",
     "BaseTokenClassificationModule",
+    "BaseVisionLanguageModule",
     "EncoderDecoderProtocol",
     "GradientCheckpointingFeature",
     "LogitCapFeature",
+    "MultiDimensionalRoPEFeature",
+    "MultiModalMergeFeature",
     "RouterAuxLossFeature",
     "SequenceLengthPoolingFeature",
     "TieEmbeddingsFeature",
+    "VideoProcessingFeature",
+    "VisionEncoderFeature",
     "VisionLanguageProtocol",
     "VisionModelProtocol",
     "create_causal_lm_class",

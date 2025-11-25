@@ -1309,102 +1309,38 @@ class TestAllModels:
     def test_qwen3_vl(self, small_model_config):
         """Test Qwen3-VL vision-language model (text-only parity)."""
         local_cfg = small_model_config.copy()
-        local_cfg["vocab_size"] = 128
-        local_cfg["sequence_length"] = 16
-        local_cfg["max_position_embeddings"] = 32
-        vision_cfg = dict(
-            depth=1,
-            embed_dim=16,
-            hidden_size=16,
-            intermediate_size=32,
-            hidden_act="quick_gelu",
-            mlp_ratio=2,
-            num_heads=4,
-            in_channels=3,
-            patch_size=2,
-            spatial_merge_size=1,
-            temporal_patch_size=1,
-            tokens_per_second=1.0,
-            out_hidden_size=16,
-            deepstack_visual_indexes=[1],
-        )
-        text_cfg = dict(
-            vocab_size=128,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,  # 32 // 4 = 8
-            rms_norm_eps=1e-5,
-            rope_theta=10000.0,
-            attention_dropout=0.0,
-            tie_word_embeddings=False,
-            max_position_embeddings=32,
-            image_token_id=126,
-            video_token_id=127,
-            vision_start_token_id=125,
-            rope_scaling={"rope_type": "default", "mrope_section": [24, 20, 20]},
-        )
-        header_config = ed.Qwen3VLConfig(text_config=text_cfg, vision_config=vision_cfg)
+        local_cfg["max_position_embeddings"] = 2048
+        org_config = ed.Qwen3VLConfig.from_pretrained("Qwen/Qwen3-VL-8B-Thinking")
+        org_config.text_config.hidden_size = 512
+        org_config.text_config.intermediate_size = 1024
+        org_config.text_config.num_attention_heads = 4
+        org_config.text_config.num_key_value_heads = 2
+        org_config.text_config.num_hidden_layers = 2
+        org_config.text_config.head_dim = 128
+        org_config.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [24, 20, 20]}
 
         res, err = self.create_test_for_models(
             "qwen3_vl",
             transformers.Qwen3VLForConditionalGeneration,
             ed.TaskType.IMAGE_TEXT_TO_TEXT,
             local_cfg,
-            header_config=header_config,
+            header_config=org_config,
         )
         assert res, f"Qwen3-VL model Failed [ERROR {err}]"
 
     def test_qwen3_vl_moe(self, small_model_config):
         """Test Qwen3-VL-MoE vision-language model with MoE (text-only parity)."""
         local_cfg = small_model_config.copy()
-        local_cfg["vocab_size"] = 128
-        local_cfg["sequence_length"] = 16
-        local_cfg["max_position_embeddings"] = 32
-        vision_cfg = dict(
-            depth=1,
-            embed_dim=16,
-            hidden_size=16,
-            intermediate_size=32,
-            hidden_act="quick_gelu",
-            mlp_ratio=2,
-            num_heads=4,
-            in_channels=3,
-            patch_size=2,
-            spatial_merge_size=1,
-            temporal_patch_size=1,
-            tokens_per_second=1.0,
-            out_hidden_size=16,
-            deepstack_visual_indexes=[1],
-        )
-        text_cfg = dict(
-            vocab_size=128,
-            hidden_size=512,
-            intermediate_size=1024,
-            num_hidden_layers=4,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=128,
-            rms_norm_eps=1e-5,
-            rope_theta=10000.0,
-            attention_dropout=0.0,
-            tie_word_embeddings=False,
-            max_position_embeddings=1024,
-            rope_scaling={"rope_type": "default", "mrope_section": [24, 20, 20]},
-            # MoE-specific parameters
-            decoder_sparse_step=1,
-            moe_intermediate_size=2048,
-            num_experts_per_tok=2,
-            num_experts=4,
-            norm_topk_prob=False,
-            output_router_logits=True,
-            router_aux_loss_coef=0.001,
-            mlp_only_layers=[],
-        )
-        header_config = ed.Qwen3VLMoeConfig(vision_config=vision_cfg, text_config=text_cfg)
-
+        local_cfg["max_position_embeddings"] = 2048
+        header_config = ed.Qwen3VLConfig.from_pretrained("Qwen/Qwen3-VL-235B-A22B-Thinking")
+        header_config.text_config.hidden_size = 512
+        header_config.text_config.intermediate_size = 1024
+        header_config.text_config.num_attention_heads = 4
+        header_config.text_config.num_key_value_heads = 2
+        header_config.text_config.decoder_sparse_step = 1
+        header_config.text_config.moe_intermediate_size = 1024
+        header_config.text_config.num_experts_per_tok = 4
+        header_config.text_config.num_experts = 128
         res, err = self.create_test_for_models(
             "qwen3_vl_moe",
             transformers.Qwen3VLMoeForConditionalGeneration,

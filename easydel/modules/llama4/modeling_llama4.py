@@ -36,6 +36,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     EncoderLayerOutput,
     ModelOutput,
+    VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -1553,17 +1554,40 @@ class Llama4VisionModel(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Llama4Config, model_type="llama4")
 class Llama4ForConditionalGeneration(EasyDeLBaseModule):
-    """
-    Llama4Vision model for conditional text generation based on image inputs.
+    """Llama4 Vision model for conditional text generation based on image inputs.
+
     Combines a vision tower and a language model with a multi-modal projector.
 
+    Note: Llama4 has a unique architecture where the language_model is already
+    a complete Llama4ForCausalLM (with its own lm_head), unlike other VLMs where
+    the base model doesn't include the lm_head.
+
     Attributes:
-        config (Llama4VisionConfig): Configuration object.
+        config (Llama4Config): Configuration object.
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
         rngs (nn.Rngs): Random number generators.
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "llama4" model identifier
+        _supports_video: True (Llama4 supports video input)
+        _uses_mrope: False (uses standard RoPE)
     """
+
+    # Class attributes for VLM capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "llama4"
+    _config_class = Llama4Config
+    _auto_register = False  # Already registered via decorator
+    _supports_video = True
+    _uses_mrope = False
+
+    # Component name mapping
+    _vision_tower_name = "vision_model"
+    _projector_name = "multi_modal_projector"
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -1576,7 +1600,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Llama4VisionForConditionalGeneration model."""
+        """Initializes the Llama4ForConditionalGeneration model."""
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1688,8 +1712,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             **lm_kwargs,
         )
 
-        return Llama4CausalLMOutputWithPast(
-            loss=None,
+        return VLMCausalLMOutput(
             logits=outputs.logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -1811,26 +1834,29 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         return model_kwargs
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
-        """
+        """Returns the encoder part of the model (vision tower)."""
         return self.vision_model
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
+        """Returns the decoder part of the model."""
         return self.language_model.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
+        """Returns the language model head."""
         return self.language_model.get_lm_head()
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer."""
         return self.language_model.get_embedding()
+
+    def get_vision_tower(self) -> nn.Module:
+        """Returns the vision tower component."""
+        return self.vision_model
+
+    def get_projector(self) -> nn.Module:
+        """Returns the multimodal projector component."""
+        return self.multi_modal_projector
+
+    def get_language_model(self) -> nn.Module:
+        """Returns the language model component."""
+        return self.language_model

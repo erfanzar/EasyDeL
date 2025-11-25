@@ -30,10 +30,17 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput, ModelOutput, MoeCausalLMOutput
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    DecoderLayerOutput,
+    ModelOutput,
+    MoeCausalLMOutput,
+    VLMCausalLMOutput,
+)
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -1004,18 +1011,8 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
             use_qk_norm=True,
         )
 
-    def _postprocess_qkv(
-        self,
-        query_states: chex.Array,
-        key_states: chex.Array,
-        value_states: chex.Array,
-    ) -> tuple[chex.Array, chex.Array, chex.Array]:
-        """Apply Q/K RMSNorm like HF before RoPE."""
-        if hasattr(self, "q_norm"):
-            query_states = self.q_norm(query_states)
-        if hasattr(self, "k_norm"):
-            key_states = self.k_norm(key_states)
-        return query_states, key_states, value_states
+    def _postprocess_qkv(self, query_states, key_states, value_states):
+        return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3VLMoeTextDecoderLayer(nn.Module):
@@ -1164,6 +1161,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        assert isinstance(config, Qwen3VLMoeTextConfig)
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1463,13 +1461,34 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
-class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
+class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeModel, Qwen3VLMoeConfig]):
     """Qwen3-VL-MoE model for conditional generation from images/videos and text.
+
+    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
 
     Architecture matches HuggingFace:
     - model: Qwen3VLMoeModel (contains visual + language_model with MoE)
     - lm_head: Linear projection to vocab
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "qwen3_vl_moe" model identifier
+        _supports_video: True (supports video input)
+        _uses_mrope: True (uses multi-dimensional RoPE)
     """
+
+    # Class attributes for registration and capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "qwen3_vl_moe"
+    _config_class = Qwen3VLMoeConfig
+    _auto_register = False  # Already registered via decorator
+    _supports_video = True
+    _uses_mrope = True
+
+    # Component name mapping
+    _vision_tower_name = "visual"
+    _projector_name = "merger"
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -1482,39 +1501,79 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initializes the Qwen3VLMoeForConditionalGeneration model."""
         super().__init__(
             config=config,
+            base_model_class=Qwen3VLMoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            vision_feature_layer=-1,
+            vision_feature_select_strategy="default",
+            image_token_index=config.image_token_id,
+            video_token_index=config.video_token_id,
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+            router_aux_loss_coef=getattr(config.text_config, "router_aux_loss_coef", 0.001),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
         )
-
-        self.model = Qwen3VLMoeModel(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
         self.vocab_size = config.text_config.vocab_size
 
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.text_config.gradient_checkpointing,
-            save_names=config.text_config.gradient_checkpointing_targets,
-            exclude_names=config.text_config.gradient_checkpointing_targets,
+    @property
+    def visual(self):
+        """Property to access the vision transformer for backward compatibility."""
+        return self.base_model.visual
+
+    def get_image_features(
+        self,
+        pixel_values: Float[Array, "batch channels height width"],
+        image_grid_thw: tuple | None = None,
+        image_max_grid_size: int | None = None,
+        **kwargs,
+    ) -> Float[Array, "batch num_patches hidden"]:
+        """Extract and project image features.
+
+        Args:
+            pixel_values: Input image pixel values
+            image_grid_thw: Image grid shape (temporal=1, height, width)
+            image_max_grid_size: Maximum grid size for images
+            **kwargs: Additional arguments
+
+        Returns:
+            Projected image features
+        """
+        pixel_values = pixel_values.astype(self.base_model.visual.get_dtype())
+        return self.base_model.visual(
+            pixel_values,
+            grid_thw=np.array(image_grid_thw) if image_grid_thw is not None else None,
+            max_grid_size=image_max_grid_size,
         )
-        self.lm_head = lm_head_block(
-            config.text_config.hidden_size,
-            config.text_config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+
+    def get_video_features(
+        self,
+        pixel_values_videos: Float[Array, "batch temporal channels height width"],
+        video_grid_thw: tuple | None = None,
+        video_max_grid_size: int | None = None,
+        **kwargs,
+    ) -> Float[Array, "batch num_tokens hidden"]:
+        """Extract and project video features.
+
+        Args:
+            pixel_values_videos: Input video pixel values
+            video_grid_thw: Video grid shape (temporal, height, width)
+            video_max_grid_size: Maximum grid size for videos
+            **kwargs: Additional arguments
+
+        Returns:
+            Projected video features
+        """
+        pixel_values_videos = pixel_values_videos.astype(self.base_model.visual.get_dtype())
+        return self.base_model.visual(
+            pixel_values_videos,
+            grid_thw=np.array(video_grid_thw) if video_grid_thw is not None else None,
+            max_grid_size=video_max_grid_size,
         )
 
     def __call__(
@@ -1538,7 +1597,35 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
         rope_deltas: chex.Array | None = None,
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
-    ) -> Qwen3VLMoeCausalLMOutputWithPast:
+        **kwargs,
+    ) -> VLMCausalLMOutput:
+        """Forward pass for the Qwen3-VL-MoE model.
+
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            mask_info: Mask information
+            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
+            mode: Runtime mode
+            past_key_values: Cached keys/values
+            cache_metadata: Metadata for paged attention
+            apply_lm_head: Whether to apply the LM head
+            inputs_embeds: Input embeddings
+            output_attentions: Whether to output attentions
+            output_hidden_states: Whether to output hidden states
+            output_router_logits: Whether to output router logits
+            pixel_values: Image pixel values
+            pixel_values_videos: Video pixel values
+            image_grid_thw: Image grid shape for mRoPE
+            video_grid_thw: Video grid shape for mRoPE
+            rope_deltas: Position deltas for mRoPE
+            image_max_grid_size: Maximum grid size for images
+            video_max_grid_size: Maximum grid size for videos
+            **kwargs: Additional arguments
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including logits, router_logits, and optional states
+        """
         output_attentions = (
             output_attentions if output_attentions is not None else self.config.get_text_config().output_attentions
         )
@@ -1555,17 +1642,18 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
         tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 2.0)
         second_per_grid_ts = None
 
-        # Vision processing is now handled inside self.model
+        # Vision processing handled inline for Qwen3-VL-MoE
+        image_hidden_states = None
         if inputs_embeds is None:
-            inputs_embeds = self.model.language_model.embed_tokens(input_ids)
+            inputs_embeds = self.base_model.language_model.embed_tokens(input_ids)
 
             if pixel_values is not None:
-                pixel_values = pixel_values.astype(self.model.visual.get_dtype())
-                image_embeds = self.model.visual(
+                image_embeds = self.get_image_features(
                     pixel_values,
-                    grid_thw=np.array(image_grid_thw),
-                    max_grid_size=image_max_grid_size,
+                    image_grid_thw=image_grid_thw,
+                    image_max_grid_size=image_max_grid_size,
                 )
+                image_hidden_states = image_embeds
                 inputs_embeds = merge_multimodal_embeddings(
                     input_ids=input_ids,
                     inputs_embeds=inputs_embeds,
@@ -1574,11 +1662,10 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
                 )
 
             if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.astype(self.model.visual.get_dtype())
-                video_embeds = self.model.visual(
+                video_embeds = self.get_video_features(
                     pixel_values_videos,
-                    grid_thw=np.array(video_grid_thw),
-                    max_grid_size=video_max_grid_size,
+                    video_grid_thw=video_grid_thw,
+                    video_max_grid_size=video_max_grid_size,
                 )
                 inputs_embeds = merge_multimodal_embeddings(
                     input_ids=input_ids,
@@ -1604,7 +1691,7 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
                     image_grid_thw=np.array(image_grid_thw) if image_grid_thw is not None else None,
                     video_grid_thw=np.array(video_grid_thw) if video_grid_thw is not None else None,
                     attention_mask=np.array(attention_mask) if attention_mask is not None else None,
-                    spatial_merge_size=self.model.visual.spatial_merge_size,
+                    spatial_merge_size=self.base_model.visual.spatial_merge_size,
                     image_token_id=self.config.image_token_id,
                     video_token_id=self.config.video_token_id,
                     vision_start_token_id=self.config.vision_start_token_id,
@@ -1615,8 +1702,9 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
                 sequence_length = inputs_embeds.shape[1]
                 position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
                 position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
-        # Forward through model (language_model only since vision is already processed)
-        outputs = self.model.language_model(
+
+        # Forward through language model (vision already processed)
+        outputs = self.base_model.language_model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -1638,28 +1726,30 @@ class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        logits = None
+        lm_logits = None
         if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.apply_logit_cap(lm_logits)
 
-        return Qwen3VLMoeCausalLMOutputWithPast(
-            logits=logits,
+        return VLMCausalLMOutput(
+            logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=hidden_states,
             attentions=outputs.attentions,
             rope_deltas=rope_deltas,
-            image_hidden_states=hidden_states,
+            image_hidden_states=image_hidden_states,
             router_logits=outputs.router_logits if output_router_logits else None,
         )
 
-    def get_encoder(self):
-        return self.model.visual
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head."""
+        return self.lm_head(hidden_states)
 
-    def get_decoder(self):
-        return self.model.language_model
+    def get_vision_tower(self) -> nn.Module:
+        """Returns the vision tower component."""
+        return self.base_model.visual
 
-    def get_lm_head(self):
-        return self.lm_head
-
-    def get_embedding(self):
-        return self.model.language_model.embed_tokens
+    def get_language_model(self) -> nn.Module:
+        """Returns the language model component."""
+        return self.base_model.language_model

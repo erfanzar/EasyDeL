@@ -1551,9 +1551,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             Dictionary mapping sequence lengths to mask details,
             or None if not applicable.
         """
-        if hasattr(self, "text_config"):
-            return self.get_text_config().get_mask_details()
-        layer_types = getattr(self, "layer_types", None)
+        config = self.get_text_config().get_mask_details()
+        layer_types = getattr(config, "layer_types", None)
         if layer_types is not None:
             from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
@@ -1561,8 +1560,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             for layer_idx, layer_type in enumerate(layer_types):
                 mapping[layer_idx] = AttnMaskDetail(
                     mask_type=AttnMaskType.from_hf(layer_type),
-                    size=getattr(self, "sliding_window", getattr(self, "sliding_windows", None)),
-                    chunks=getattr(self, "attention_chunk_size", None),
+                    size=getattr(config, "sliding_window", getattr(config, "sliding_windows", None)),
+                    chunks=getattr(config, "attention_chunk_size", None),
                 )
             return mapping
         return None
