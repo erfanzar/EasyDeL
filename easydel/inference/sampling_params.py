@@ -362,6 +362,7 @@ class SamplingParams:
         seed: Random seed for reproducibility
         stop: List of stop strings
         stop_token_ids: List of stop token IDs
+        stop_pattern: Regex pattern string for stopping generation
         bad_words: List of strings to avoid generating
         ignore_eos: Whether to ignore end-of-sequence token
         max_tokens: Maximum number of tokens to generate
@@ -402,6 +403,7 @@ class SamplingParams:
     # Stopping Conditions
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
+    stop_pattern: str | None = None  # Regex pattern for stopping generation
     bad_words: list[str] = field(default_factory=list)
     ignore_eos: bool = False
     max_tokens: int | None = 16

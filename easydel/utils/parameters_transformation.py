@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import gc
+import inspect
 import os
 import typing as tp
 import warnings
@@ -170,9 +171,44 @@ class StateDictConverter:
         return all(t in string for t in required) and not any(n in string for n in forbidden)
 
     @staticmethod
-    def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> tuple[tuple, jnp.ndarray] | None:
+    def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
         """Process a single tensor and return its processed key and value."""
         new_key = key
+
+        reform_param = config.get("reform_param", None)
+        if reform_param:
+            sorted_items = sorted(reform_param.items(), key=lambda x: len(x[0]), reverse=True)
+            for key_check, value in sorted_items:
+                anchor_to_end = key_check.endswith("$")
+                match_target = key_check[:-1] if anchor_to_end else key_check
+
+                match_index = key.find(match_target)
+                if match_index != -1:
+                    after_match = key[match_index + len(match_target) :]
+                    if anchor_to_end and after_match:
+                        continue
+                    if not after_match or after_match.startswith("."):
+                        before_match = key[:match_index]
+                        if not before_match or before_match.endswith("."):
+                            splits = value["splits"]
+                            results = []
+
+                            new_config = config.copy()
+                            new_config["reform_param"] = {}
+
+                            for split in splits:
+                                split_name = split["name"]
+                                spliter = split["spliter"]
+                                new_key_split = f"{before_match}{split_name}{after_match}"
+                                tensor_split = spliter(tensor)
+                                sub_results = StateDictConverter.process_tensor(
+                                    new_key_split,
+                                    tensor_split,
+                                    new_config,
+                                )
+                                if sub_results:
+                                    results.extend(sub_results)
+                            return results
 
         if any(layer_name in key for layer_name in config["embedding_layer_names"]):
             new_key = f"{key[: -len('.weight')]}.embedding"
@@ -205,7 +241,7 @@ class StateDictConverter:
             return None
 
         array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
-        return key_tuple, array
+        return [(key_tuple, array)]
 
     @staticmethod
     def _base_huggingface_to_easydel(
@@ -224,6 +260,7 @@ class StateDictConverter:
         lm_head_name: str | None = None,
         uses_tie_word_embedding: bool = False,
         consolidated_moe_keys: set[str] | None = None,
+        reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Base conversion function from PyTorch state dict to EasyDeL format."""
@@ -243,6 +280,7 @@ class StateDictConverter:
             "uses_tie_word_embedding": uses_tie_word_embedding,
             "dtype": dtype,
             "consolidated_moe_keys": consolidated_moe_keys or set(),
+            "reform_param": reform_param,
         }
 
         with jax.default_device(device) if device is not None and shard_fns is None else contextlib.nullcontext():
@@ -256,24 +294,24 @@ class StateDictConverter:
                             i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
                             for i in range(jax.local_device_count())
                         }
-                        result = StateDictConverter.process_tensor(key, tensor, config)
-                        if result is not None:
-                            key_tuple, jax_array = result
-                            if shard_fns and key_tuple in shard_fns:
-                                jax_array = shard_fns[key_tuple](jax_array)
-                            if callback is not None:
-                                jax_array = callback(jax_array, key_tuple)
-                            bytesn = {
-                                i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
-                                for i in range(jax.local_device_count())
-                            }
-                            change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
-                            divider = 1024**3
-                            change_gb = {i: round(change[i] / divider, 4) for i in change}
-                            usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
-                            strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
-                            logger.debug(strm)
-                            flax_dict[key_tuple] = jax_array
+                        results = StateDictConverter.process_tensor(key, tensor, config)
+                        if results is not None:
+                            for key_tuple, jax_array in results:
+                                if shard_fns and key_tuple in shard_fns:
+                                    jax_array = shard_fns[key_tuple](jax_array)
+                                if callback is not None:
+                                    jax_array = callback(jax_array, key_tuple)
+                                bytesn = {
+                                    i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
+                                    for i in range(jax.local_device_count())
+                                }
+                                change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
+                                divider = 1024**3
+                                change_gb = {i: round(change[i] / divider, 4) for i in change}
+                                usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
+                                strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
+                                logger.debug(strm)
+                                flax_dict[key_tuple] = jax_array
                     except Exception as e:
                         logger.error(f"Error processing key {key}: {e!s}")
                     pbar.update(1)
@@ -415,6 +453,7 @@ class StateDictConverter:
         remove_state_dict: bool = False,
         lm_head_name: str | None = None,
         uses_tie_word_embedding: bool = False,
+        reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Convert PyTorch state dict to EasyDeL format with MoE transformations."""
@@ -445,6 +484,7 @@ class StateDictConverter:
             lm_head_name=lm_head_name,
             uses_tie_word_embedding=uses_tie_word_embedding,
             consolidated_moe_keys=consolidated_moe_keys,
+            reform_param=reform_param,
             **kwargs,
         )
 
@@ -506,7 +546,7 @@ class StateDictConverter:
         return new_state_dict
 
     @staticmethod
-    def easydel_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16) -> dict[str, tp.Any]:
+    def easydel_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16, **kwargs) -> dict[str, tp.Any]:
         """Convert EasyDeL module to PyTorch state dict."""
         if dtype is None:
             dtype = module.param_dtype
@@ -574,6 +614,68 @@ class StateDictConverter:
                 moe_block_path=moe_block_path,
             )
 
+        reform_param = kwargs.get("reform_param", None)
+        if reform_param:
+            for key_check, value_check in reform_param.items():
+                inverse_spliter = value_check.get("inverse_spliter", None)
+                if inverse_spliter:
+                    anchor_to_end = key_check.endswith("$")
+                    match_target = key_check[:-1] if anchor_to_end else key_check
+                    candidates = {}  # (prefix, suffix) -> {split_name: tensor}
+
+                    splits = value_check["splits"]
+                    split_names = [s["name"] for s in splits]
+
+                    keys_to_remove = []
+
+                    for key in torch_state_dict.keys():
+                        for split_name in split_names:
+                            match_index = key.find(split_name)
+                            if match_index != -1:
+                                after_match = key[match_index + len(split_name) :]
+                                if anchor_to_end and after_match:
+                                    continue
+                                if not after_match or after_match.startswith("."):
+                                    before_match = key[:match_index]
+                                    if not before_match or before_match.endswith("."):
+                                        original_key_candidate = f"{before_match}{match_target}{after_match}"
+                                        if original_key_candidate.replace(match_target, split_name) == key:
+                                            prefix = before_match
+                                            suffix = after_match
+
+                                            group_key = (prefix, suffix)
+                                            if group_key not in candidates:
+                                                candidates[group_key] = {}
+
+                                            candidates[group_key][split_name] = key
+
+                    for (prefix, suffix), found_splits in candidates.items():
+                        if len(found_splits) == len(split_names):
+                            tensors_to_merge = []
+                            for split in splits:
+                                split_name = split["name"]
+                                key = found_splits[split_name]
+                                tensors_to_merge.append(torch_state_dict[key])
+                                keys_to_remove.append(key)
+
+                            torch_module = TensorConverter.get_torch()
+
+                            positional_params = [
+                                p
+                                for p in inspect.signature(inverse_spliter).parameters.values()
+                                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                            ]
+                            wants_torch = len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
+                            if wants_torch:
+                                merged_tensor = inverse_spliter(torch_module, *tensors_to_merge)
+                            else:
+                                merged_tensor = inverse_spliter(*tensors_to_merge)
+                            original_key = f"{prefix}{match_target}{suffix}"
+                            torch_state_dict[original_key] = merged_tensor
+
+                    for key in keys_to_remove:
+                        del torch_state_dict[key]
+
         return torch_state_dict
 
 
@@ -588,6 +690,7 @@ class ModelConverter:
         base_huggingface_module_kwarguments: dict | None = None,
         dtype: jnp.dtype = jnp.float16,
         use_meta_torch: bool = True,
+        reform_param: dict | None = None,
         **kw,
     ) -> tp.Any:
         """Convert EasyDeL module to HuggingFace model."""
@@ -597,7 +700,7 @@ class ModelConverter:
         if base_huggingface_module_kwarguments is None:
             base_huggingface_module_kwarguments = {}
 
-        state_dict = StateDictConverter.easydel_to_torch(module=module, dtype=dtype)
+        state_dict = StateDictConverter.easydel_to_torch(module=module, dtype=dtype, reform_param=reform_param)
         base_config = base_huggingface_module.config_class.from_dict(config.to_dict())
         with torch.device("meta") if use_meta_torch else contextlib.nullcontext():
             model: torch.nn.Module = base_huggingface_module(config=base_config, **base_huggingface_module_kwarguments)

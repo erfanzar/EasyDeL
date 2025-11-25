@@ -25,6 +25,7 @@ import pathlib
 from collections.abc import Mapping
 from typing import Any
 
+from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
 from easydel.modules.auto import (
@@ -72,7 +73,6 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
 
     config_kwargs = materialize_base_config(cfg, prefer="base")
 
-    config_kwargs.pop("shard_attention_computation", None)
     config_kwargs.pop("partition_axis", None)
     config_kwargs.pop("backend", None)
     config_kwargs.pop("platform", None)
@@ -87,7 +87,6 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         sharding_dcn_axis_dims=tuple(sharding["dcn_axis_dims"]) if sharding.get("dcn_axis_dims") else None,
         sharding_axis_names=tuple(sharding.get("axis_names", ("dp", "fsdp", "ep", "tp", "sp"))),
         partition_axis=sharding.get("partition_axis"),
-        shard_attention_computation=bool(sharding.get("shard_attention_computation", True)),
         shard_fns=sharding.get("shard_fns"),
         backend=platform.get("backend"),
         platform=platform.get("platform"),
@@ -172,15 +171,76 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         or base_vals.get("freq_max_position_embeddings")
         or 8192
     )
+    min_input_pad_val = es.get("min_input_pad")
+    max_num_seqs_val = es.get("max_num_seqs")
+    page_size_val = es.get("page_size")
+    hbm_utilization_val = es.get("hbm_utilization")
+    use_aot_forward_val = es.get("use_aot_forward")
+    enable_prefix_caching_val = es.get("enable_prefix_caching")
+    auto_shard_model_val = es.get("auto_shard_model")
+    compile_runner_val = es.get("compile_runner")
+    overlap_execution_val = es.get("overlap_execution")
+    sampler_metrics_val = es.get("sampler_metrics")
+    auto_truncate_prompt_val = es.get("auto_truncate_prompt")
+    auto_cap_new_tokens_val = es.get("auto_cap_new_tokens")
+    strict_context_val = es.get("strict_context")
+    prefer_preserve_prompt_val = es.get("prefer_preserve_prompt")
+    decode_truncated_prompt_val = es.get("decode_truncated_prompt")
+    destroy_pages_on_pause_val = es.get("destroy_pages_on_pause")
+    silent_mode_val = es.get("silent_mode")
+
+    sharding_axis_dims_val = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
+    sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
+
+    max_num_batched_tokens = es.get("max_num_batched_tokens")
+    if max_num_batched_tokens is not None:
+        max_num_batched_tokens = int(max_num_batched_tokens)
+
+    reserve_tokens = es.get("reserve_tokens")
+    if reserve_tokens is not None:
+        reserve_tokens = int(reserve_tokens)
+
+    detokenizer_max_states = es.get("detokenizer_max_states", DEFAULT_DETOKENIZER_MAX_STATES)
+    if detokenizer_max_states is not None:
+        detokenizer_max_states = int(detokenizer_max_states)
+
+    extra_eos_token_ids = es.get("extra_eos_token_ids")
+    if extra_eos_token_ids is not None:
+        extra_eos_token_ids = list(extra_eos_token_ids)
+
+    runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
+    truncate_mode = es.get("truncate_mode", "left")
+
     return dict(
         max_model_len=int(max_model_len),
-        min_input_pad=int(es.get("min_input_pad", 16)),
-        max_num_seqs=int(es.get("max_num_seqs", 16)),
-        hbm_utilization=float(es.get("hbm_utilization", 0.85)),
-        page_size=int(es.get("page_size", 128)),
-        enable_prefix_caching=bool(es.get("enable_prefix_caching", True)),
-        use_aot_forward=bool(es.get("use_aot_forward", True)),
-        runner_verbose=bool(es.get("verbose", False)),
+        min_input_pad=int(min_input_pad_val) if min_input_pad_val is not None else 16,
+        max_num_seqs=int(max_num_seqs_val) if max_num_seqs_val is not None else 256,
+        max_num_batched_tokens=max_num_batched_tokens,
+        hbm_utilization=float(hbm_utilization_val) if hbm_utilization_val is not None else 0.85,
+        page_size=int(page_size_val) if page_size_val is not None else 128,
+        use_aot_forward=True if use_aot_forward_val is None else bool(use_aot_forward_val),
+        enable_prefix_caching=True if enable_prefix_caching_val is None else bool(enable_prefix_caching_val),
+        auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
+        sharding_axis_dims=sharding_axis_dims,
+        compile_runner=True if compile_runner_val is None else bool(compile_runner_val),
+        runner_verbose=runner_verbose,
+        overlap_execution=False if overlap_execution_val is None else bool(overlap_execution_val),
+        sampler_metrics=False if sampler_metrics_val is None else bool(sampler_metrics_val),
+        esurge_name=es.get("esurge_name"),
+        reserve_tokens=reserve_tokens,
+        auto_truncate_prompt=True if auto_truncate_prompt_val is None else bool(auto_truncate_prompt_val),
+        auto_cap_new_tokens=True if auto_cap_new_tokens_val is None else bool(auto_cap_new_tokens_val),
+        strict_context=False if strict_context_val is None else bool(strict_context_val),
+        truncate_mode=truncate_mode,
+        prefer_preserve_prompt=True if prefer_preserve_prompt_val is None else bool(prefer_preserve_prompt_val),
+        decode_truncated_prompt=True if decode_truncated_prompt_val is None else bool(decode_truncated_prompt_val),
+        destroy_pages_on_pause=True if destroy_pages_on_pause_val is None else bool(destroy_pages_on_pause_val),
+        detokenizer_max_states=detokenizer_max_states,
+        tokenizer_endpoint=es.get("tokenizer_endpoint"),
+        detokenizer_endpoint=es.get("detokenizer_endpoint"),
+        sampling_params_callback=es.get("sampling_params_callback"),
+        extra_eos_token_ids=extra_eos_token_ids,
+        silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
     )
 
 
@@ -370,4 +430,3 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
     mixture_kwargs = to_data_mixture_kwargs(cfg)
     mixture = DatasetMixture(**mixture_kwargs)
     return mixture.build()
-

@@ -2,9 +2,9 @@
 
 # Bases
 ARG HARDWARE_TYPE=cpu
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04 AS gpu-base
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04 AS gpu-base
 FROM ubuntu:22.04 AS tpu-base
-FROM python:3.11-slim AS cpu-base
+FROM python:3.13-slim AS cpu-base
 FROM ghcr.io/astral-sh/uv:latest AS uv
 
 # Final image chosen by HARDWARE_TYPE

@@ -30,11 +30,18 @@ DEFAULTS: ELMConfig = {
     "sharding": {
         "axis_dims": (1, 1, 1, -1, 1),
         "axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
-        "shard_attention_computation": True,
         "auto_shard_model": True,
+        "use_ring_of_experts": False,
+        "fsdp_is_ep_bound": True,
+        "sp_is_ep_bound": True,
     },
-    "quantization": {"block_size": 128, "quantize_tensors": False},
-    "base_config": {"values": {"hardware_abstraction": True, "use_pallas_group_matmul": False}},
+    "quantization": {
+        "block_size": 128,
+        "quantize_tensors": False,
+        "linear_pattern": ".*",
+        "linear_block_size": 64,
+    },
+    "base_config": {"values": {"hardware_abstraction": True}},
     "esurge": {
         "min_input_pad": 16,
         "max_num_seqs": 32,

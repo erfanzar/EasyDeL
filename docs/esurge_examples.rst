@@ -294,15 +294,13 @@ Metrics Collection
 
     # Start monitoring
     urls = engine.start_monitoring(
-        dashboard_port=8080,
         prometheus_port=9090,
-        enable_dashboard=True,
         enable_prometheus=True,
         enable_console=False,
     )
 
-    print(f"Dashboard: {urls['dashboard']}")
     print(f"Prometheus: {urls['prometheus']}")
+    print("Grafana: add the Prometheus endpoint as a data source.")
 
     # Generate some requests
     for i in range(10):

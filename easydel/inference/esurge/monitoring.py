@@ -176,7 +176,7 @@ class RichConsoleMonitor:
         self.running = False
         self._thread: threading.Thread | None = None
 
-        # Layout for the dashboard
+        # Layout for the console display
         self.layout = Layout()
         self.layout.split_column(Layout(name="header", size=3), Layout(name="main"), Layout(name="footer", size=3))
 
@@ -345,22 +345,22 @@ class RichConsoleMonitor:
 
 
 class eSurgeMonitoringServer:
-    """Combined monitoring server with Prometheus and web dashboard."""
+    """Monitoring server for Prometheus export and console monitoring."""
 
     def __init__(
         self,
         prometheus_port: int = 8000,
-        dashboard_port: int = 8080,
+        dashboard_port: int | None = None,
         metrics_prefix: str = "esurge_",
         update_interval: float = 1.0,
     ):
         """Initialize monitoring server.
 
         Args:
-            prometheus_port: Port for Prometheus metrics endpoint
-            dashboard_port: Port for web dashboard
-            metrics_prefix: Prefix for Prometheus metrics
-            update_interval: Update interval in seconds
+            prometheus_port: Port for Prometheus metrics endpoint.
+            dashboard_port: Deprecated; retained for compatibility (ignored).
+            metrics_prefix: Prefix for Prometheus metrics.
+            update_interval: Update interval in seconds.
         """
         self.prometheus_port = prometheus_port
         self.dashboard_port = dashboard_port
@@ -428,7 +428,7 @@ _console_monitor: RichConsoleMonitor | None = None
 
 def start_monitoring_server(
     prometheus_port: int = 8000,
-    dashboard_port: int = 8080,
+    dashboard_port: int | None = None,
     update_interval: float = 1.0,
 ) -> eSurgeMonitoringServer:
     """Start the global monitoring server."""

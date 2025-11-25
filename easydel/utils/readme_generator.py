@@ -172,6 +172,7 @@ JINJA_TEMPLATE = """
 } %}
 {% set auto_class = auto_class_map.get(model.model_task, "AutoEasyDeLModelForCausalLM") %}
 {% set attn_enum_map = {
+    "auto": "AUTO",
     "vanilla": "VANILLA",
     "flash": "FLASH",
     "flash_attn": "FLASH",
@@ -188,8 +189,8 @@ JINJA_TEMPLATE = """
     "ring_attention": "RING",
     "paged": "PAGED",
     "paged_attn": "PAGED",
-    "ragged_page_attention_v2": "PAGED",
-    "ragged_page_attention_v3": "PAGED",
+    "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
+    "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3",
     "mistral": "MISTRAL"
 } %}
 {% set attn_enum = attn_enum_map.get(model.attn_mechanism.lower(), "VANILLA") %}

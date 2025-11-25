@@ -290,8 +290,8 @@ Console Monitoring
 
 .. code-block:: python
 
-    # Start console monitoring
-    engine.start_monitoring()
+    # Start Prometheus exporter and console monitor
+    engine.start_monitoring(enable_console=True)
 
     # The console will display:
     # - Request throughput
@@ -300,31 +300,18 @@ Console Monitoring
     # - Cache hit rates
     # - Active request count
 
-Web Dashboard
-~~~~~~~~~~~~~
+Grafana / Prometheus
+~~~~~~~~~~~~~~~~~~~~
 
-Launch an interactive web dashboard:
-
-.. code-block:: python
-
-    from easydel.inference.esurge import eSurgeWebDashboard
-
-    dashboard = eSurgeWebDashboard(engine)
-    dashboard.launch(port=7860)
-
-Prometheus Metrics
-~~~~~~~~~~~~~~~~~~
-
-Export metrics for Prometheus:
+Export metrics for Prometheus and visualize in Grafana:
 
 .. code-block:: python
-
-    from easydel.inference.esurge import start_monitoring_server
 
     # Start Prometheus metrics server
-    monitoring_server = start_monitoring_server(engine, port=9090)
+    engine.start_monitoring(prometheus_port=9090)
 
     # Access metrics at http://localhost:9090/metrics
+    # Add this URL as a Prometheus data source in Grafana
 
 Performance Tuning
 ------------------
@@ -464,7 +451,7 @@ Improve performance by:
 Handle long-running requests:
 
 - Increase timeout values in sampling parameters
-- Monitor request queue with dashboard
+- Monitor request queue with Prometheus + Grafana
 - Implement request preemption for fairness
 
 Best Practices

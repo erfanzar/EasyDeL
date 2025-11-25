@@ -14,6 +14,7 @@
 
 
 import functools
+import typing
 from typing import ClassVar
 
 import chex
@@ -64,6 +65,22 @@ from .deepseek_configuration import DeepseekV2Config
 
 class DeepseekV2MLPMoE(nn.Module):
     """Mixture-of-experts feed-forward used in DeepSeek V2 MoE layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,

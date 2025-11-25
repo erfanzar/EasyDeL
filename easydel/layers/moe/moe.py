@@ -71,6 +71,7 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.utils.helpers import check_bool_flag
 
 from .utils import (
     MoeFusedHooks,
@@ -743,9 +744,21 @@ class BaseMoeModule(nn.Module, ABC):
         select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
         refine_weights_hook = self.moe_hooks.refine_weights_hook if self.moe_hooks else None
         refine_inputs_hook = self.moe_hooks.refine_inputs_hook if self.moe_hooks else None
+
+        hooks = self.moe_hooks
         _BS, _SQLN, HD = hidden_state.shape
+
+        hidden_state = hidden_state.astype(self.dtype)
+        if hooks is not None and hooks.before_gate is not None:
+            hidden_state = hooks.before_gate(hidden_state)
+
         prein_gate_logits = gate_layer(hidden_state.reshape(-1, HD))
+        if hooks is not None and hooks.after_gate is not None:
+            prein_gate_logits = hooks.after_gate(prein_gate_logits)
+
         gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
+        if hooks is not None and hooks.before_topk is not None:
+            gate_logits = hooks.before_topk(gate_logits)
 
         # Use expert_mesh (3D: dp, ep, tp) for cleaner sharding
         expert_mesh = self.expert_mesh
@@ -793,6 +806,16 @@ class BaseMoeModule(nn.Module, ABC):
         else:
             if jax.default_backend() == "tpu":
                 gmm_kws.update(platform="pallas")
+                if check_bool_flag("DISABLE_MOE_AUTOTUNE_ON_TPU", False):
+                    gmm_kws.update(
+                        cfg=GroupedMatmulConfig(
+                            platform="pallas",
+                            bypass_xla_tiling=True,
+                            block_m=1024,
+                            block_n=1024,
+                            block_k=512,
+                        )
+                    )
 
         @partial(
             shard_map,
@@ -877,7 +900,6 @@ class BaseMoeModule(nn.Module, ABC):
             layer_w0 = grouped_matmul(x, wi_kernel, group_sizes, **gmm_kws)
 
             layer_w0 = checkpoint_name(layer_w0, "mlp_gate")
-
             if wi_bias is not None:
                 layer_w0 = layer_w0 + wi_bias[selected_experts]
 
@@ -967,6 +989,21 @@ class BaseMoeModule(nn.Module, ABC):
                 )
             return output
 
+        # print(
+        #     wi_kernel.shape,
+        #     wikps,
+        #     wi_bias.shape,
+        #     wibps,
+        #     wu_kernel.shape,
+        #     wukps,
+        #     wu_bias.shape,
+        #     wubps,
+        #     wd_kernel.shape,
+        #     wdkps,
+        #     wd_bias.shape,
+        #     wdbps,
+        # )
+
         output = _sparse_call(
             hidden_state,
             gate_logits,
@@ -1005,6 +1042,7 @@ class BaseMoeModule(nn.Module, ABC):
         *,
         act_fn: Callable[[jax.Array], jax.Array],
         output_metrics: bool = False,
+        layer_idx: int | None = None,
     ):
         """Wrapper for fused MoE call with automatic hook configuration.
 
@@ -1062,6 +1100,7 @@ class BaseMoeModule(nn.Module, ABC):
                         validate_inputs=False,
                         apply_capacity_constraint=False,
                         reform_router_probs_fn=reform_router_probs_fn,
+                        layer_idx=layer_idx,
                     )
                 case MoEMethods.FUSED_MOE:
                     return self._sparse_moe_call(
@@ -1233,6 +1272,10 @@ class BaseMoeModule(nn.Module, ABC):
             HASH: Sets `select_hook` to uniform weight distribution.
                 All assigned experts get equal weight (1/k).
         """
+        # Only set default refine_weights_hook if one wasn't already configured by the user.
+        if self.moe_hooks.refine_weights_hook is not None:
+            return
+
         refine_weights_hook = None
         if self.routing_strategy == MoeRoutingStrategy.TOP_K:
             # TOP_K: Normalize weights by their sum (softmax-like)
@@ -1322,6 +1365,7 @@ class BaseMoeModule(nn.Module, ABC):
         validate_inputs: bool = False,
         apply_capacity_constraint: bool = False,
         reform_router_probs_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
+        layer_idx: int | None = None,
     ) -> tuple[jax.Array, MoeMetrics | jax.Array]:
         """Standard MoE forward pass: routing, permutation, expert computation, and combining.
 
@@ -1364,10 +1408,14 @@ class BaseMoeModule(nn.Module, ABC):
 
         router_logits = gate_layer(hidden_state_flat).astype(jnp.promote_types(self.dtype, jnp.float32))
 
-        if hooks.after_gate is not None:
-            router_logits = hooks.after_gate(router_logits)
+        # Store original logits BEFORE any hooks - used for expert selection (matching HF behavior).
+        prein_gate_logits = router_logits
 
-        router_probs = jax.nn.softmax(router_logits, axis=-1)
+        # after_gate hook produces scattered probs for aux loss/logging, but we use original logits for selection.
+        if hooks.after_gate is not None:
+            router_probs = hooks.after_gate(router_logits)
+        else:
+            router_probs = jax.nn.softmax(router_logits, axis=-1)
 
         if reform_router_probs_fn is not None:
             router_probs = reform_router_probs_fn(router_probs)
@@ -1378,16 +1426,34 @@ class BaseMoeModule(nn.Module, ABC):
         if validate_inputs:
             self._validate_routing_inputs(hidden_state, router_logits)
 
+        # Use original logits for expert selection (top-k on logits, then softmax on k selected via refine_weights_hook).
+        # This matches HuggingFace behavior where top-k is done on pre-softmax logits.
         selected_weights, selected_experts = get_experts_location(
-            gate_logits=router_probs,
+            gate_logits=prein_gate_logits,
             pre_bias_logits=None,
             select_hook=hooks.select_hook,
             refine_weights_hook=hooks.refine_weights_hook,
             num_experts_per_tok=self.num_experts_per_tok,
         )
 
-        if hooks.refine_weights_hook is not None:
-            selected_weights = hooks.refine_weights_hook(selected_weights)
+        # Detailed logging for debugging
+        if layer_idx is not None:
+            # Get top-k logits (before softmax) for comparison
+            top_k_logits_pre, _ = jax.lax.top_k(prein_gate_logits, self.num_experts_per_tok)
+            jax.debug.print("  [ED Router L{}] logits[0]: {}", layer_idx, prein_gate_logits[0])
+            jax.debug.print(
+                "  [ED Router L{}] top_idx[0]: {}, top_logits[0]: {}",
+                layer_idx,
+                selected_experts[0],
+                top_k_logits_pre[0],
+            )
+            jax.debug.print(
+                "  [ED Router L{}] top_weights[0]: {} (sum={})",
+                layer_idx,
+                selected_weights[0],
+                selected_weights[0].sum(),
+            )
+            jax.debug.print("  [ED Experts L{}] input[0,:5]: {}", layer_idx, hidden_state_flat[0, :5])
 
         if apply_capacity_constraint:
             selected_experts, selected_weights = self._apply_capacity_constraint(selected_experts, selected_weights)
@@ -1414,6 +1480,10 @@ class BaseMoeModule(nn.Module, ABC):
             out_unflat, selected_weights = hooks.before_combine(out_unflat, selected_weights)
 
         output = jnp.sum(out_unflat * selected_weights[..., None], axis=1).reshape(batch_size, seq_len, hidden_size)
+
+        # Log expert output
+        if layer_idx is not None:
+            jax.debug.print("  [ED Experts L{}] output[0,:5]: {}", layer_idx, output.reshape(-1, hidden_size)[0, :5])
 
         if hooks.finalize_output is not None:
             output = hooks.finalize_output(output)

@@ -225,6 +225,8 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
 
     @property
     def storage_num_combined_kv_heads(self) -> int:
+        if self.k_headdim == 64:
+            return align_to_multiple(self.num_kv_heads, self.kv_head_packing)
         return align_to_multiple(self.num_kv_heads * 2, self.kv_head_packing)
 
     @property
@@ -233,6 +235,8 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
 
     @property
     def storage_head_dim(self) -> int:
+        if self.k_headdim == 64:
+            return 128
         return align_to_multiple(self.k_headdim, 128)
 
     def get_padded_num_slices(
@@ -271,7 +275,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
             kv_pages_shape = (
                 self.num_pages,
                 self.page_size,
-                self.storage_num_kv_groups * self.kv_head_packing,
+                self.num_kv_heads * 2,
                 self.k_headdim,
             )
             axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]

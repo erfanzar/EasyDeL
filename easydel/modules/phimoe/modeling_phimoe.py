@@ -24,13 +24,12 @@ from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import PartitionSpec
 from jaxtyping import Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits, with_sharding_constraint
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.caching import (
     RaggedPagesCache,
@@ -155,21 +154,6 @@ class PhiMoEAttention(UnifiedAttention):
             causal=True,
             sliding_window=config.sliding_window,
         )
-
-    def _merge_heads(
-        self, hidden_states: Float[Array, "batch seq_len num_heads head_dim"]
-    ) -> Float[Array, "batch seq_len hidden_dim"]:
-        attn_output = super()._merge_heads(hidden_states)
-        if self.config.shard_attention_computation:
-            attn_output = with_sharding_constraint(
-                arr=attn_output,
-                sharding=PartitionSpec(
-                    self.config.partition_axis.batch_axis,
-                    (self.config.partition_axis.sequence_axis if attn_output.shape[1] != 1 else None),
-                    self.config.partition_axis.hidden_state_axis,
-                ),
-            )
-        return attn_output
 
 
 class PhiMoeSparseMoeBlock(nn.Module):

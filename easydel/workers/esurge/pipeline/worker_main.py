@@ -63,7 +63,7 @@ class SimpleDecoder:
             return "", [], False
 
         try:
-            decoded = self.tokenizer.decode(merged, skip_special_tokens=True)
+            decoded = self.tokenizer.decode(merged, skip_special_tokens=False)
         except Exception:
             decoded = ""
 
@@ -145,11 +145,20 @@ def _detokenizer_worker(
     Args:
         endpoint: ZeroMQ endpoint to bind to.
         tokenizer_path: Path or identifier for the tokenizer.
-        tokenizer_kwargs: Additional kwargs for loading the tokenizer.
-        max_states: Maximum number of decoding states to maintain.
+    tokenizer_kwargs: Additional kwargs for loading the tokenizer.
+    max_states: Maximum number of decoding states to maintain.
     """
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
     decoder = SimpleDecoder(tokenizer)
+    eos_token_id = tokenizer.eos_token_id
+    eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
+    eos_set = {int(tid) for tid in eos_ids if tid is not None}
+
+    def _strip_eos(tokens: list[int]) -> list[int]:
+        if not eos_set:
+            return list(tokens)
+        return [tok for tok in tokens if tok not in eos_set]
+
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(endpoint)
@@ -169,6 +178,7 @@ def _detokenizer_worker(
                 generated_tokens = message["tokens"]
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
+                generated_tokens = _strip_eos(generated_tokens)
 
                 state = states.setdefault(rid, {"last_index": 0, "previous_text": "", "buffered": []})
                 last_idx = min(state["last_index"], len(generated_tokens))

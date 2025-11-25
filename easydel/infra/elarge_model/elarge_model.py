@@ -178,12 +178,25 @@ class eLargeModel:
 
         Args:
             model_name_or_path: HuggingFace model ID or local path
-            task: Optional task type (auto-detected if not provided)
+            task: Optional task type (auto-detected if not provided or AUTO_BIND)
             **kwargs: Additional configuration options
 
         Returns:
             eLargeModel instance with configuration
         """
+        from .utils import infer_task_from_hf_config, normalize_task
+
+        # Auto-detect task if None or AUTO_BIND
+        if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":
+            inferred_task = infer_task_from_hf_config(model_name_or_path)
+            if inferred_task is not None:
+                task = inferred_task
+                logger.info(f"Auto-detected task type: {task.value}")
+        else:
+            normalized = normalize_task(task)
+            if normalized is not None:
+                task = normalized
+
         config = {
             "model": {
                 "name_or_path": model_name_or_path,
@@ -379,9 +392,7 @@ class eLargeModel:
                 - tp: Tensor parallel
                 - pp: Pipeline parallel
                 - sp: Sequence parallel
-            **kwargs: Additional sharding options:
-                - shard_attention_computation: Whether to shard attention (default: True)
-                - backend: Sharding backend ("jax" or "torch")
+            **kwargs: Additional sharding options.
 
         Returns:
             Self for method chaining
@@ -1484,86 +1495,112 @@ class eLargeModel:
             components including model, loading options, sharding,
             quantization, training, and inference settings.
         """
-        lines = ["╭─── eLargeModel Configuration ───╮"]
+        w = 53  # inner width (content area)
 
-        lines.append("│ 📦 Model")
-        lines.append(f"│   • Name: {self.model_name or 'Not set'}")
-        lines.append(f"│   • Task: {self.task.name if self.task else 'Auto-detect'}")
-        tokenizer = self._config.get("model", {}).get("tokenizer")
-        if tokenizer and tokenizer != self.model_name:
-            lines.append(f"│   • Tokenizer: {tokenizer}")
+        def _fmt(val: Any) -> str:
+            """Format a value for display, handling enums and special types."""
+            if val is None:
+                return "none"
+            if hasattr(val, "value"):
+                return str(val.value) if val.value else "none"
+            if hasattr(val, "name"):
+                return val.name.lower()
+            return str(val)
 
+        def _line(content: str) -> str:
+            """Create a padded line within the box."""
+            return f"║ {content:<{w}}║"
+
+        def _sep() -> str:
+            """Create a separator line."""
+            return f"╟{'─' * (w + 1)}╢"
+
+        lines = []
+        lines.append(f"╔{'═' * (w + 1)}╗")
+        lines.append(f"║{'eLargeModel':^{w + 1}}║")
+        lines.append(f"║{self.model_name or 'not set':^{w + 1}}║")
+        lines.append(f"╠{'═' * (w + 1)}╣")
+
+        # Loader & Task
         loader = self._config.get("loader", {})
-        if loader:
-            lines.append("│ ⚙️  Loading")
-            lines.append(f"│   • Dtype: {loader.get('dtype', 'default')}")
-            if loader.get("param_dtype") and loader["param_dtype"] != loader.get("dtype"):
-                lines.append(f"│   • Param dtype: {loader['param_dtype']}")
-            if loader.get("precision"):
-                lines.append(f"│   • Precision: {loader['precision']}")
-            if loader.get("from_torch") is not None:
-                lines.append(f"│   • From PyTorch: {loader['from_torch']}")
+        dtype_str = loader.get("dtype", "default")
+        prec_str = loader.get("precision", "default")
+        task_str = self.task.name.lower() if self.task else "auto"
+        lines.append(_line(f"▸ dtype: {dtype_str:<12} ▸ task: {task_str}"))
+        lines.append(_line(f"▸ precision: {prec_str}"))
 
+        # Sharding
         sharding = self._config.get("sharding", {})
-        if sharding.get("axis_dims") and sharding["axis_dims"] != (1, 1, 1, -1, 1):
-            lines.append("│ 🔀 Sharding")
-            lines.append(f"│   • Dimensions: {sharding['axis_dims']}")
-            if sharding.get("axis_names"):
-                lines.append(f"│   • Axis names: {sharding['axis_names']}")
-            if sharding.get("shard_attention_computation") is False:
-                lines.append(f"│   • Shard attention: {sharding['shard_attention_computation']}")
+        if sharding.get("axis_dims"):
+            dims = sharding["axis_dims"]
+            auto = "auto" if sharding.get("auto_shard_model") else "manual"
+            dims_str = ",".join(str(d) for d in dims)
+            lines.append(_line(f"▸ shard: ({dims_str}) {auto}"))
 
+        lines.append(_sep())
+
+        # Config section
+        base_cfg = self._config.get("base_config", {}).get("values", {})
+        if base_cfg:
+            if "attn_mechanism" in base_cfg:
+                lines.append(_line(f"▸ attn: {_fmt(base_cfg['attn_mechanism'])}"))
+            if "moe_method" in base_cfg:
+                lines.append(_line(f"▸ moe:  {_fmt(base_cfg['moe_method'])}"))
+            if "gradient_checkpointing" in base_cfg:
+                gc = base_cfg["gradient_checkpointing"]
+                gc_str = _fmt(gc) or "disabled"
+                lines.append(_line(f"▸ grad_ckpt: {gc_str}"))
+
+        # Quantization
         quant = self._config.get("quantization", {})
         if quant.get("method"):
-            lines.append("│ 📉 Quantization")
-            lines.append(f"│   • Method: {quant['method']}")
-            if quant.get("block_size"):
-                lines.append(f"│   • Block size: {quant['block_size']}")
-            if quant.get("platform"):
-                lines.append(f"│   • Platform: {quant['platform']}")
+            lines.append(_line(f"▸ quant: {quant['method']} (block:{quant.get('block_size', 128)})"))
 
+        # eSurge
         esurge = self._config.get("esurge", {})
-        if esurge:
-            has_esurge_config = any(
-                esurge.get(k) is not None for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]
-            )
-            if has_esurge_config:
-                lines.append("│ 🚀 eSurge")
-                if esurge.get("max_model_len"):
-                    lines.append(f"│   • Max length: {esurge['max_model_len']:,}")
-                if esurge.get("max_num_seqs"):
-                    lines.append(f"│   • Max sequences: {esurge['max_num_seqs']}")
-                if esurge.get("hbm_utilization"):
-                    lines.append(f"│   • HBM utilization: {esurge['hbm_utilization']:.0%}")
-                if esurge.get("page_size") and esurge["page_size"] != 128:
-                    lines.append(f"│   • Page size: {esurge['page_size']}")
+        if esurge and any(esurge.get(k) for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]):
+            lines.append(_sep())
+            lines.append(_line("eSurge"))
 
+            ctx = esurge.get("max_model_len", 0)
+            seqs = esurge.get("max_num_seqs", 0)
+            hbm = esurge.get("hbm_utilization", 0)
+            lines.append(_line(f"▸ {ctx:,} context x {seqs} sequences"))
+
+            parts = []
+            if hbm:
+                parts.append(f"{hbm:.0%} HBM")
+            if esurge.get("page_size"):
+                parts.append(f"page:{esurge['page_size']}")
+            if esurge.get("enable_prefix_caching"):
+                parts.append("prefix_cache")
+            if esurge.get("min_input_pad"):
+                parts.append(f"pad:{esurge['min_input_pad']}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
+
+        # Training
         trainer = self._config.get("trainer", {})
         if trainer.get("trainer_type"):
-            lines.append("│ 🎯 Training")
-            lines.append(f"│   • Type: {trainer['trainer_type'].upper()}")
+            lines.append(_sep())
+            lines.append(_line(f"Training: {trainer['trainer_type'].upper()}"))
+            parts = []
             if trainer.get("learning_rate"):
-                lines.append(f"│   • Learning rate: {trainer['learning_rate']:.2e}")
+                parts.append(f"lr:{trainer['learning_rate']:.2e}")
             if trainer.get("num_train_epochs"):
-                lines.append(f"│   • Epochs: {trainer['num_train_epochs']}")
+                parts.append(f"epochs:{trainer['num_train_epochs']}")
             if trainer.get("total_batch_size"):
-                lines.append(f"│   • Batch size: {trainer['total_batch_size']}")
-            if trainer.get("output_dir"):
-                lines.append(f"│   • Output: {trainer['output_dir']}")
+                parts.append(f"batch:{trainer['total_batch_size']}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
 
-        platform = self._config.get("platform", {})
-        if platform:
-            if platform.get("backend") or platform.get("platform"):
-                lines.append("│ 💻 Platform")
-                if platform.get("backend"):
-                    lines.append(f"│   • Backend: {platform['backend']}")
-                if platform.get("platform"):
-                    lines.append(f"│   • Hardware: {platform['platform']}")
-
-        lines.append("│ 📊 Status")
-        lines.append(f"│   • Model loaded: {'✓' if self._model is not None else '✗'}")
-        lines.append(f"│   • Tokenizer loaded: {'✓' if self._tokenizer is not None else '✗'}")
-
-        lines.append("╰────────────────────────────────╯")
+        # Status
+        lines.append(_sep())
+        model_icon = "●" if self._model is not None else "○"
+        tok_icon = "●" if self._tokenizer is not None else "○"
+        model_status = "loaded" if self._model is not None else "not loaded"
+        tok_status = "loaded" if self._tokenizer is not None else "not loaded"
+        lines.append(_line(f"{model_icon} model: {model_status}   {tok_icon} tokenizer: {tok_status}"))
+        lines.append(f"╚{'═' * (w + 1)}╝")
 
         return "\n".join(lines)

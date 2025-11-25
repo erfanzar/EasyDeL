@@ -306,10 +306,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_tiling_size_seqlen: NotRequired[int]
     moe_tiling_size_dim: NotRequired[int]
     partition_axis: NotRequired[PartitionAxis]
-    shard_attention_computation: NotRequired[bool]
     use_sharded_kv_caching: NotRequired[bool]
     use_sharding_constraint: NotRequired[bool]
-    use_pallas_group_matmul: NotRequired[bool]
     backend: NotRequired[EasyDeLBackends | str | None]
     platform: NotRequired[EasyDeLPlatforms | str | None]
     easy_method: NotRequired[tp.Literal["train", "serve", "convert"]]
@@ -337,6 +335,12 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     use_expert_tensor_mode: NotRequired[bool]
     moe_method: NotRequired[AVAILABLE_MOE_METHODS]
     moe_force_xla_gmm: NotRequired[bool]
+    use_ring_of_experts: NotRequired[bool]
+    fsdp_is_ep_bound: NotRequired[bool]
+    sp_is_ep_bound: NotRequired[bool]
+    quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
+    quantization_pattern: NotRequired[str]
+    quantization_blocksize: NotRequired[int]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
@@ -366,10 +370,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_seqlen: Sequence length tiling for MoE kernels. Defaults to ``128``.
         moe_tiling_size_dim: Hidden dimension tiling for MoE kernels. Defaults to ``128``.
         partition_axis: `PartitionAxis` describing how logical axes map to the mesh.
-        shard_attention_computation: Whether to shard attention compute across the mesh.
         use_sharded_kv_caching: Whether to shard KV cache placement instead of replicating.
         use_sharding_constraint: Insert explicit sharding constraints during model build.
-        use_pallas_group_matmul: Prefer pallas group matmul kernels when available.
         backend: Explicit JAX backend (falls back to ``jax.default_backend()``).
         platform: Platform hint for kernel selection (defaults to ``"triton"`` on GPU,
             otherwise ``"jax"``).
@@ -430,10 +432,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_seqlen: int = 128,
         moe_tiling_size_dim: int = 128,
         partition_axis: PartitionAxis = PartitionAxis(),
-        shard_attention_computation: bool = True,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
-        use_pallas_group_matmul: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -495,7 +495,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
         self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
         self.partition_axis = getattr(self, "partition_axis", partition_axis)
-        self.shard_attention_computation = getattr(self, "shard_attention_computation", shard_attention_computation)
         self.bits = getattr(self, "bits", bits)
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
         self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
@@ -503,7 +502,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
         self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
         self.use_sharding_constraint = getattr(self, "use_sharding_constraint", use_sharding_constraint)
-        self.use_pallas_group_matmul = getattr(self, "use_pallas_group_matmul", use_pallas_group_matmul)
         self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
         self.kv_cache_sharding_sequence_axis_name = getattr(
             self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
@@ -853,7 +851,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_tiling_size_seqlen",
             "moe_tiling_size_dim",
             "partition_axis",
-            "shard_attention_computation",
             "use_sharded_kv_caching",
             "backend",
             "platform",
@@ -862,7 +859,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_ring_attention",
             "scan_attention_layers",
             "use_sharding_constraint",
-            "use_pallas_group_matmul",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
             "sequence_axis_name",
@@ -908,7 +904,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_seqlen: int = NOT_GIVEN,
         moe_tiling_size_dim: int = NOT_GIVEN,
         partition_axis: PartitionAxis = NOT_GIVEN,
-        shard_attention_computation: bool = NOT_GIVEN,
         use_sharded_kv_caching: bool = NOT_GIVEN,
         backend: EasyDeLBackends | None = NOT_GIVEN,
         platform: EasyDeLPlatforms | None = NOT_GIVEN,
@@ -917,7 +912,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
-        use_pallas_group_matmul: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
         sequence_axis_name: str = NOT_GIVEN,
@@ -970,7 +964,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             moe_tiling_size_seqlen: Sequence tiling for MoE kernels (default ``128``).
             moe_tiling_size_dim: Hidden-dim tiling for MoE kernels (default ``128``).
             partition_axis: PartitionAxis describing logical mesh layout (default ``PartitionAxis()``).
-            shard_attention_computation: Whether to shard attention computation (default ``True``).
             use_sharded_kv_caching: Whether to shard KV caches (default ``False``).
             backend: Backend string, default ``None`` (falls back to JAX default).
             platform: Platform hint, default ``"jax"``.
@@ -979,7 +972,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             scan_ring_attention: Enable scan for ring attention (default ``True``).
             scan_attention_layers: Enable scan for attention blocks (default ``True``).
             use_sharding_constraint: Insert sharding constraints (default ``False``).
-            use_pallas_group_matmul: Prefer pallas group matmul kernels (default ``True``).
             use_scan_mlp: Enable scan for MLPs (default ``False``).
             scan_mlp_chunk_size: Chunk size for scanned MLPs (default ``1024``).
             sequence_axis_name: Label for the sequence/attention axis (default ``"sp"``).
@@ -1021,11 +1013,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
         set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
-        set_attrs_smartly(self, "use_pallas_group_matmul", True, use_pallas_group_matmul)
 
         set_attrs_smartly(self, "backend", None, backend)
         set_attrs_smartly(self, "platform", "jax", platform)
-        set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
         set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
@@ -1563,6 +1553,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         if hasattr(self, "text_config"):
             return self.get_text_config().get_mask_details()
+        layer_types = getattr(self, "layer_types", None)
+        if layer_types is not None:
+            from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+            mapping = {}
+            for layer_idx, layer_type in enumerate(layer_types):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(layer_type),
+                    size=getattr(self, "sliding_window", getattr(self, "sliding_windows", None)),
+                    chunks=getattr(self, "attention_chunk_size", None),
+                )
+            return mapping
         return None
 
     def get_basic_causal_mask(self, *args, **kwargs):

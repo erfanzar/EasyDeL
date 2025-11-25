@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from functools import partial
 
 import chex
@@ -60,6 +61,22 @@ from .qwen3_moe_configuration import Qwen3MoeConfig
 
 class Qwen3MoeMLPStack(nn.Module):
     """Qwen3Moe MoE MLP using the new ParallelMoELinear layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,

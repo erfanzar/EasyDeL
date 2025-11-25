@@ -123,14 +123,34 @@ class Scheduler(SchedulerInterface):
         max_num_batched_tokens: int | None = None,
         enable_prefix_caching: bool = True,
     ) -> Scheduler:
-        """Create a Scheduler instance from an eSurgeRunner."""
+        """Create a Scheduler instance from an eSurgeRunner.
+
+        This method automatically detects the model's attention types (full, sliding window,
+        chunked) from the model config and creates appropriate cache specifications.
+
+        Args:
+            runner: The eSurgeRunner instance.
+            max_num_batched_tokens: Maximum tokens per batch. Defaults to max_model_len.
+            enable_prefix_caching: Enable prefix caching for faster inference.
+        """
         from ..config import CacheConfig, SchedulerConfig
-        from ..core.interface import CacheGroupSpec, FullAttentionSpec
+        from ..core.interface import create_kv_cache_specs_from_config
 
         metadata = runner.metadata
+        model_config = runner.model.config
 
         if max_num_batched_tokens is None:
             max_num_batched_tokens = runner.max_model_len
+
+        kv_cache_groups = create_kv_cache_specs_from_config(
+            config=model_config,
+            page_size=metadata.page_size,
+            num_kv_heads=metadata.num_kv_heads,
+            head_size=metadata.k_headdim,
+            dtype=runner.executor_manager.kv_pages.views[-1].kv_pages.dtype,
+            use_mla=False,
+        )
+
         return Scheduler(
             config=Config(
                 scheduler_config=SchedulerConfig(
@@ -145,20 +165,7 @@ class Scheduler(SchedulerInterface):
                     enable_prefix_caching=enable_prefix_caching,
                 ),
             ),
-            kv_cache_config=CacheGroupsConfig(
-                num_pages=metadata.num_pages,
-                kv_cache_groups=[
-                    CacheGroupSpec(
-                        FullAttentionSpec(
-                            page_size=metadata.page_size,
-                            num_kv_heads=metadata.num_kv_heads,
-                            head_size=metadata.k_headdim,
-                            dtype=runner.executor_manager.kv_pages.views[-1].kv_pages.dtype,
-                            use_mla=False,
-                        )
-                    )
-                ],
-            ),
+            kv_cache_config=CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups),
         )
 
     def _select_seq_bucket(self, num_reqs: int) -> int:

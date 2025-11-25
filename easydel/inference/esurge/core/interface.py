@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+from collections import defaultdict
 from dataclasses import dataclass
 from math import prod
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from jax import numpy as jnp
 
 from ..utils import cdiv, get_dtype_size
+
+if TYPE_CHECKING:
+    from easydel.infra.base_config import EasyDeLBaseConfig
 
 
 @dataclass
@@ -210,3 +214,120 @@ class CacheGroupsConfig:
 
     num_pages: int
     kv_cache_groups: list[CacheGroupSpec]
+
+
+def create_kv_cache_specs_from_config(
+    config: "EasyDeLBaseConfig",
+    page_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype: jnp.dtype,
+    use_mla: bool = False,
+) -> list[CacheGroupSpec]:
+    """Convert model config's get_mask_details() to CacheGroupSpec list.
+
+    This function reads the attention mask details from the model configuration
+    and creates appropriate cache specifications for each attention type.
+    Layers with the same attention type are grouped together.
+
+    Args:
+        config: Model configuration with get_mask_details() method.
+        page_size: Number of tokens per cache page.
+        num_kv_heads: Number of key-value attention heads.
+        head_size: Dimension of each attention head.
+        dtype: Data type for cache tensors.
+        use_mla: Whether to use Multi-head Latent Attention.
+
+    Returns:
+        List of CacheGroupSpec, one per attention type found in the config.
+        Falls back to a single FullAttentionSpec if no mask details available.
+    """
+    from easydel.infra.utils import AttnMaskType
+
+    mask_details = config.get_mask_details() if hasattr(config, "get_mask_details") else None
+
+    if not mask_details:
+        return [
+            CacheGroupSpec(
+                kv_cache_spec=FullAttentionSpec(
+                    page_size=page_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    dtype=dtype,
+                    use_mla=use_mla,
+                ),
+                layer_names=None,
+            )
+        ]
+
+    groups: dict[AttnMaskType, list[tuple[int, int | None, int | None]]] = defaultdict(list)
+    for layer_idx, detail in mask_details.items():
+        groups[detail.mask_type].append((layer_idx, detail.size, detail.chunks))
+
+    specs: list[CacheGroupSpec] = []
+
+    for mask_type, layers in groups.items():
+        layer_names = [f"layer.{idx}" for idx, _, _ in layers]
+
+        if mask_type == AttnMaskType.FULL:
+            specs.append(
+                CacheGroupSpec(
+                    kv_cache_spec=FullAttentionSpec(
+                        page_size=page_size,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        dtype=dtype,
+                        use_mla=use_mla,
+                    ),
+                    layer_names=layer_names,
+                )
+            )
+        elif mask_type == AttnMaskType.SLIDING:
+            sliding_window = layers[0][1]
+            if sliding_window is None:
+                raise ValueError(f"Sliding window size is required for sliding attention layers: {layer_names}")
+            specs.append(
+                CacheGroupSpec(
+                    kv_cache_spec=SlidingWindowSpec(
+                        page_size=page_size,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        dtype=dtype,
+                        use_mla=False,  # MLA is not supported for sliding window
+                        sliding_window=sliding_window,
+                    ),
+                    layer_names=layer_names,
+                )
+            )
+        elif mask_type == AttnMaskType.CHUNK:
+            chunk_size = layers[0][2]
+            if chunk_size is None:
+                raise ValueError(f"Chunk size is required for chunked attention layers: {layer_names}")
+            specs.append(
+                CacheGroupSpec(
+                    kv_cache_spec=ChunkedLocalAttentionSpec(
+                        page_size=page_size,
+                        num_kv_heads=num_kv_heads,
+                        head_size=head_size,
+                        dtype=dtype,
+                        use_mla=use_mla,
+                        attention_chunk_size=chunk_size,
+                    ),
+                    layer_names=layer_names,
+                )
+            )
+        else:
+            raise ValueError(f"Unknown attention mask type: {mask_type}")
+
+    return specs if specs else [
+        CacheGroupSpec(
+            kv_cache_spec=FullAttentionSpec(
+                page_size=page_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                use_mla=use_mla,
+            ),
+            layer_names=None,
+        )
+    ]

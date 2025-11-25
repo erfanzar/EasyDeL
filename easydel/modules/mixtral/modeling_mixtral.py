@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 import chex
 import jax
 from eformer import common_types
@@ -95,6 +97,22 @@ class MixtralAttention(UnifiedAttention):
 
 class MixtralMoEMlp(nn.Module):
     """Mixtral MoE MLP using the new ParallelMoELinear layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "w1.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "w3.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "w2.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,
