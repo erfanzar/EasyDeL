@@ -26,6 +26,7 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
+from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 
@@ -40,7 +41,7 @@ from ._protocols import BaseModelProtocol
 
 # Type variables for generic base models and configs
 ModelT = TypeVar("ModelT", bound=BaseModelProtocol)
-ConfigT = TypeVar("ConfigT")
+ConfigT = TypeVar("ConfigT", bound=EasyDeLBaseConfig)
 
 
 class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):

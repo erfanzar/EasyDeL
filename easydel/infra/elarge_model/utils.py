@@ -262,8 +262,7 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
                 config = json.loads(config_file.read_text())
             else:
                 logger.warning(
-                    f"No config.json found in local path: {model_name_or_path}. "
-                    f"Task type will fallback to CAUSAL_LM."
+                    f"No config.json found in local path: {model_name_or_path}. Task type will fallback to CAUSAL_LM."
                 )
                 return None
         else:
@@ -313,8 +312,7 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
 
         if not architectures:
             logger.warning(
-                f"No architectures found in config for {model_name_or_path}. "
-                f"Task type will fallback to CAUSAL_LM."
+                f"No architectures found in config for {model_name_or_path}. Task type will fallback to CAUSAL_LM."
             )
             return None
 
@@ -323,13 +321,10 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
             return TaskType.CAUSAL_LM
 
         elif "ForConditionalGeneration" in arch:
-            vision_indicators = ["vision", "vlm", "qwen2_vl", "llava", "paligemma", "idefics", "fuyu", "gemma3"]
-            if any(indicator in model_type for indicator in vision_indicators):
-                return TaskType.IMAGE_TEXT_TO_TEXT
-            elif any(x in model_type for x in ["whisper", "speech2text"]):
+            if any(x in model_type for x in ["whisper", "speech2text"]):
                 return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
             else:
-                return TaskType.SEQUENCE_TO_SEQUENCE
+                return TaskType.IMAGE_TEXT_TO_TEXT
 
         elif "ForSequenceClassification" in arch:
             return TaskType.SEQUENCE_CLASSIFICATION
@@ -359,8 +354,7 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
 
     except Exception as e:
         logger.warning(
-            f"Unexpected error inferring task for {model_name_or_path}: {e}. "
-            f"Task type will fallback to CAUSAL_LM."
+            f"Unexpected error inferring task for {model_name_or_path}: {e}. Task type will fallback to CAUSAL_LM."
         )
         return None
 

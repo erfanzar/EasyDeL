@@ -848,7 +848,22 @@ class RotaryEmbedding(nn.Module):
 
 @rope_wraper("mrope")
 class MultiModalRotaryEmbedding(RotaryEmbedding):
-    """Multi-dimensional RoPE (MRoPE) with interleaved THW layout for Qwen3-Omni Thinker."""
+    """Multi-dimensional RoPE (MRoPE) with interleaved THW layout for Qwen2/3-VL models.
+
+    MRoPE (Multi-dimensional Rotary Position Embedding) extends standard RoPE to handle
+    3D position information (Temporal, Height, Width) for vision-language models.
+
+    The interleaving pattern reorganizes frequencies from chunked [TTT...HHH...WWW] to
+    interleaved [T₀,H₀,W₀, T₁,H₁,W₁, ...], preserving frequency continuity for each
+    spatial/temporal dimension.
+
+    Attributes:
+        mrope_section: Tuple of (T, H, W) dimensions specifying how many frequency
+            components are allocated to each dimension. Default: (24, 20, 20) for
+            64-dim rotary embeddings (128 head_dim / 2).
+        attention_scaling: Post-processing scaling factor applied to cos/sin.
+            Default 1.0 for standard mRoPE. Can be set for advanced RoPE types.
+    """
 
     def __init__(
         self,
@@ -859,6 +874,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: jnp.dtype,
         mrope_section: tuple[int, int, int] | None = None,
+        attention_scaling: float = 1.0,
     ):
         super().__init__(
             head_size=head_size,
@@ -869,6 +885,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             dtype=dtype,
         )
         self.mrope_section = mrope_section if mrope_section is not None else (24, 20, 20)
+        self.attention_scaling = attention_scaling
 
     def _apply_interleaved_mrope(self, freqs: jax.Array) -> jax.Array:
         """Interleave THW frequencies from chunked layout."""
@@ -888,7 +905,21 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         offsets: jax.Array | None = None,
         frequencies: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Apply interleaved THW MRoPE to query/key."""
+        """Apply interleaved THW MRoPE to query/key.
+
+        Args:
+            positions: Position IDs with shape (batch, seq) or (3, batch, seq).
+                If 2D, broadcasts to 3D with same positions for T, H, W.
+                For vision-language tasks, should be (3, batch, seq) with separate
+                T, H, W positions computed via get_rope_index.
+            query: Query tensor to apply rotary embedding to.
+            key: Key tensor to apply rotary embedding to.
+            offsets: Optional position offsets (e.g., for KV cache).
+            frequencies: Optional pre-computed frequency cache.
+
+        Returns:
+            Tuple of (rotated_query, rotated_key) with same dtype as input.
+        """
         # Normalize positions to (3, batch, seq)
         if positions.ndim == 2:
             positions = jnp.broadcast_to(positions[jnp.newaxis, ...], (3, *positions.shape))
@@ -924,6 +955,10 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             sin_half = jnp.sin(freqs)
             cos = jnp.concatenate([cos_half, cos_half], axis=-1)
             sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+
+        # Apply attention scaling (typically 1.0 for standard mRoPE, can be different for advanced types)
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
 
         cos = cos[:, :, jnp.newaxis, :]
         sin = sin[:, :, jnp.newaxis, :]
@@ -1477,6 +1512,9 @@ def get_rope(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
+        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+            scaling_type = "mrope"
+
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
@@ -1649,6 +1687,8 @@ def get_frequencies(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
+        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+            scaling_type = "mrope"
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
@@ -1959,6 +1999,8 @@ class RopeConfig:
     beta_slow: int | None = None
     mscale: int | None = None
     mscale_all_dim: int | None = None
+    mrope_interleaved: bool | None = None
+    mrope_section: list[int] | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, tp.Any]) -> RopeConfig:
@@ -1988,6 +2030,8 @@ class RopeConfig:
             beta_slow=config_dict.get("beta_slow"),
             mscale=config_dict.get("mscale"),
             mscale_all_dim=config_dict.get("mscale_all_dim"),
+            mrope_interleaved=config_dict.get("mrope_interleaved"),
+            mrope_section=config_dict.get("mrope_section"),
         )
 
     def to_dict(self) -> dict[str, tp.Any]:

@@ -124,8 +124,8 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             )
 
         self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
+            config.get_text_config().hidden_size,
+            config.get_text_config().vocab_size,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=self._head_bias,

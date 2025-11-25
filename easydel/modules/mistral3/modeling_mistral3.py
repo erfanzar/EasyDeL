@@ -19,6 +19,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -28,8 +29,9 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput, VLMCausalLMOutput
+from easydel.infra.utils import ACT2FN
+from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import RowParallelLinear
 from easydel.layers.norms import RMSNorm
@@ -432,8 +434,38 @@ class Mistral3Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Mistral3Config, model_type="mistral3")
-class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
-    """Mistral3 model for conditional generation with vision-language capabilities."""
+class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, Mistral3Config]):
+    """Mistral3 model for conditional generation with vision-language capabilities.
+
+    Combines a vision tower, patch merger/projector, and language model for
+    image-to-text generation. Inherits from BaseVisionLanguageModule.
+
+    Attributes:
+        config (Mistral3Config): Configuration object.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): JAX precision level.
+        rngs (nn.Rngs): Random number generators.
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "mistral3" model identifier
+        _supports_video: False (Mistral3 is image-only)
+        _uses_mrope: False (uses standard RoPE)
+    """
+
+    # Class attributes for registration and capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "mistral3"
+    _config_class = Mistral3Config
+    _auto_register = False  # Already registered via decorator
+    _supports_video = False
+    _uses_mrope = False
+
+    # Component name mapping
+    _vision_tower_name = "vision_tower"
+    _projector_name = "multi_modal_projector"
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -446,99 +478,44 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initializes the Mistral3ForConditionalGeneration model."""
         super().__init__(
             config=config,
+            base_model_class=Mistral3Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Mistral3Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = nn.Linear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.get_text_config().hidden_size,
-            config.get_text_config().vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=nn.initializers.normal(0.02),
+            # VLM-specific configuration
+            vision_feature_layer=config.vision_feature_layer,
+            vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
+            image_token_index=config.image_token_index,
+            # LM head configuration
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
         )
 
-    def get_image_features(self, pixel_values: chex.Array, image_sizes: chex.Array):
-        return self.model.get_image_features(pixel_values=pixel_values, image_sizes=image_sizes)
-
-    def init_cache(
+    def get_image_features(
         self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        return self.model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
+        pixel_values: Float[Array, "batch channels height width"],
+        image_sizes: chex.Array | None = None,
         **kwargs,
-    ):
-        return self.model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
+    ) -> Float[Array, "batch num_patches hidden"]:
+        """Extract and project image features from pixel values.
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: Int[Array, "batch seq_len"],
-        max_length: int,
-        pad_token_id: int,
-        starts: int | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    ):
-        return self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            max_length=max_length,
-            pad_token_id=pad_token_id,
-            starts=starts,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask,
-        )
+        Mistral3 uses a patch merger that requires image_sizes to handle
+        variable-sized images.
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        return self.model.update_inputs_for_generation(model_outputs, model_kwargs)
+        Args:
+            pixel_values: Input image pixel values
+            image_sizes: Original sizes of the images (height, width) for patch merging
+            **kwargs: Additional arguments (unused)
+
+        Returns:
+            Projected image features ready for merging with text embeddings
+        """
+        return self.base_model.get_image_features(pixel_values=pixel_values, image_sizes=image_sizes)
 
     def __call__(
         self,
@@ -556,13 +533,38 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
-    ):
+    ) -> VLMCausalLMOutput:
+        """Forward pass for the Mistral3 model.
+
+        Args:
+            input_ids: Input token IDs (batch_size, sequence_length)
+            pixel_values: Input pixel values for images
+            image_sizes: Original sizes of images for patch merging
+            attention_mask: Attention mask
+            mask_info: Mask information
+            position_ids: Position IDs for text
+            mode: Runtime mode
+            past_key_values: Cached keys/values for language model
+            cache_metadata: Metadata for paged attention
+            apply_lm_head: Whether to apply the LM head
+            inputs_embeds: Input embeddings (alternative to input_ids)
+            output_attentions: Whether to output attentions
+            output_hidden_states: Whether to output hidden states
+            **lm_kwargs: Additional arguments passed to the language model
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including logits and optional states
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        outputs = self.model(
+        # Forward through base model (handles image_sizes via kwargs)
+        outputs = self.base_model(
             input_ids=input_ids,
             pixel_values=pixel_values,
             attention_mask=attention_mask,
@@ -577,40 +579,54 @@ class Mistral3ForConditionalGeneration(EasyDeLBaseModule):
             mode=mode,
             **lm_kwargs,
         )
-        logits = None
-        if apply_lm_head:
-            logits = self.lm_head(outputs.last_hidden_state)
 
-        return Mistral3CausalLMOutputWithPast(
-            loss=None,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            image_hidden_states=outputs.image_hidden_states,
+        hidden_states = outputs.last_hidden_state
+
+        # Apply logical sharding
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
         )
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
-        """
-        return self.model.vision_tower
+        # Apply LM head if requested
+        lm_logits = None
+        if apply_lm_head:
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.apply_logit_cap(lm_logits)
 
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.language_model
+        return VLMCausalLMOutput(
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            last_hidden_state=hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states if pixel_values is not None else None,
+        )
 
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
+    def init_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: dict | None = None,
+        pad_token_id: int | None = None,
+    ):
+        """Initialize KV cache for generation."""
+        return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.language_model.embed_tokens
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head."""
+        return self.lm_head(hidden_states)
+
+    def get_vision_tower(self) -> nn.Module:
+        """Returns the vision tower component."""
+        return self.base_model.vision_tower
+
+    def get_projector(self) -> nn.Module:
+        """Returns the multimodal projector component."""
+        return self.base_model.multi_modal_projector
+
+    def get_language_model(self) -> nn.Module:
+        """Returns the language model component."""
+        return self.base_model.language_model

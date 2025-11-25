@@ -29,10 +29,17 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput, ModelOutput
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    BaseModelOutput,
+    DecoderLayerOutput,
+    ModelOutput,
+    VLMCausalLMOutput,
+)
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -1358,8 +1365,37 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen2VLConfig, model_type="qwen2_vl")
-class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
-    """Multimodal Qwen2-VL model for conditional generation from images and text."""
+class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwen2VLConfig]):
+    """Multimodal Qwen2-VL model for conditional generation from images/video and text.
+
+    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
+
+    Attributes:
+        config (Qwen2VLConfig): Configuration object.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): JAX precision level.
+        rngs (nn.Rngs): Random number generators.
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "qwen2_vl" model identifier
+        _supports_video: True (Qwen2-VL supports video input)
+        _uses_mrope: True (uses multi-dimensional RoPE)
+    """
+
+    # Class attributes for registration and capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "qwen2_vl"
+    _config_class = Qwen2VLConfig
+    _auto_register = False  # Already registered via decorator
+    _supports_video = True
+    _uses_mrope = True
+
+    # Component name mapping (Qwen uses "visual" not "vision_tower")
+    _vision_tower_name = "visual"
+    _projector_name = "merger"  # Qwen2VL uses merger in visual
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -1372,50 +1408,74 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initializes the Qwen2VLForConditionalGeneration model."""
         super().__init__(
             config=config,
+            base_model_class=Qwen2VLModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-
-        self.model = Qwen2VLModel(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            # VLM-specific configuration
+            vision_feature_layer=-1,
+            vision_feature_select_strategy="default",
+            image_token_index=config.image_token_id,
+            video_token_index=config.video_token_id,
+            # mRoPE config
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+            # LM head configuration
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
         )
         self.vocab_size = config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+
+    @property
+    def visual(self):
+        """Property to access the vision transformer for backward compatibility."""
+        return self.base_model.visual
 
     def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
+        return self.base_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
+        self.base_model.set_input_embeddings(value)
 
-    def get_video_features(self, pixel_values_videos, video_grid_thw=None):
-        return self.model.get_video_features(pixel_values_videos, video_grid_thw)
+    def get_video_features(
+        self,
+        pixel_values_videos: Float[Array, "batch temporal channels height width"],
+        video_grid_thw: tuple | None = None,
+        **kwargs,
+    ) -> Float[Array, "batch num_tokens hidden"]:
+        """Extract and project video features.
 
-    def get_image_features(self, pixel_values, image_grid_thw=None):
-        return self.model.get_image_features(pixel_values, image_grid_thw)
+        Args:
+            pixel_values_videos: Input video pixel values
+            video_grid_thw: Video grid shape (temporal, height, width)
+            **kwargs: Additional arguments
+
+        Returns:
+            Projected video features
+        """
+        return self.base_model.get_video_features(pixel_values_videos, video_grid_thw)
+
+    def get_image_features(
+        self,
+        pixel_values: Float[Array, "batch channels height width"],
+        image_grid_thw: tuple | None = None,
+        **kwargs,
+    ) -> Float[Array, "batch num_patches hidden"]:
+        """Extract and project image features.
+
+        Args:
+            pixel_values: Input image pixel values
+            image_grid_thw: Image grid shape (temporal=1, height, width)
+            **kwargs: Additional arguments
+
+        Returns:
+            Projected image features
+        """
+        return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
     def __call__(
         self,
@@ -1437,13 +1497,38 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         rope_deltas: chex.Array | None = None,
         cache_position: chex.Array | None = None,
         **kwargs,
-    ) -> tuple | Qwen2VLCausalLMOutputWithPast:
+    ) -> VLMCausalLMOutput:
+        """Forward pass for the Qwen2-VL model.
+
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            mask_info: Mask information
+            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
+            mode: Runtime mode
+            past_key_values: Cached keys/values
+            cache_metadata: Metadata for paged attention
+            apply_lm_head: Whether to apply the LM head
+            inputs_embeds: Input embeddings
+            output_attentions: Whether to output attentions
+            output_hidden_states: Whether to output hidden states
+            pixel_values: Image pixel values
+            pixel_values_videos: Video pixel values
+            image_grid_thw: Image grid shape for mRoPE
+            video_grid_thw: Video grid shape for mRoPE
+            rope_deltas: Position deltas for mRoPE
+            cache_position: Cache position for generation
+            **kwargs: Additional arguments
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including logits and optional states
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        outputs = self.model(
+        outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1470,14 +1555,16 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        logits = None
+        lm_logits = None
         if apply_lm_head:
-            logits = checkpoint_name(self.lm_head(hidden_states), "lm_head_output")
+            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.apply_logit_cap(lm_logits)
 
-        return Qwen2VLCausalLMOutputWithPast(
-            logits=logits,
+        return VLMCausalLMOutput(
+            logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
+            last_hidden_state=hidden_states,
             attentions=outputs.attentions,
             rope_deltas=rope_deltas,
         )
@@ -1543,47 +1630,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         )
         return model_inputs
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        basics = super()._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-
-        if vision_included:
-            assert required_props is not None
-            assert "image_grid_thw" in required_props.keys()
-
-            pixel_values = jnp.ones((vision_height, vision_width), dtype="f4")
-            basics.update(
-                {
-                    "pixel_values": pixel_values,
-                    "image_grid_thw": jnp.array(required_props["image_grid_thw"]["value"]),
-                }
-            )
-        return basics
-
     def _create_required_props_from_kwargs(
         self,
         model_kwargs: dict[str, chex.Array],
@@ -1599,33 +1645,21 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, :, -1:] + 1
         model_kwargs.pop("pixel_values", None)  # only effect first iter
+        model_kwargs.pop("pixel_values_videos", None)  # only effect first iter
         model_kwargs.pop("token_type_ids", None)  # only effect first iter
         return model_kwargs
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
-        """
-        return self.model.visual
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head."""
+        return self.lm_head(hidden_states)
 
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model
+    def get_vision_tower(self) -> nn.Module:
+        """Returns the vision tower component."""
+        return self.base_model.visual
 
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
-        return self.model.language_model.embed_tokens
+    def get_language_model(self) -> nn.Module:
+        """Returns the language model component."""
+        return self.base_model.language_model
 
     def prepare_inputs_for_call(
         self,
@@ -1634,6 +1668,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
         drop_ids: bool = True,
         **others,
     ):
+        """Prepare inputs with mRoPE position IDs computed from grid shapes."""
         attention_mask = others.get("attention_mask", None)
         mask_info = others.get("mask_info", None)
         mask_info = MaskInfo.dynamic_init(

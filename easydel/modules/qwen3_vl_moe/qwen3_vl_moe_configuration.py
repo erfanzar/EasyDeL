@@ -228,6 +228,18 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
                 self.rope_scaling["type"] = "mrope"
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
+    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
+        """Get attention mask details for sliding window attention."""
+        mapping = {}
+        if self.sliding_window is not None and self.use_sliding_window:
+            for layer_idx in range(self.num_hidden_layers):
+                if layer_idx >= self.max_window_layers:
+                    mapping[layer_idx] = AttnMaskDetail(
+                        mask_type=AttnMaskType.SLIDING,
+                        size=self.sliding_window,
+                    )
+        return mapping
+
 
 @register_config("qwen3_vl_moe")
 class Qwen3VLMoeConfig(EasyDeLBaseConfig):
@@ -365,18 +377,6 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
-
-    def get_mask_details(self) -> dict[int, AttnMaskDetail]:
-        """Get attention mask details for sliding window attention."""
-        mapping = {}
-        if self.sliding_window is not None and self.use_sliding_window:
-            for layer_idx in range(self.num_hidden_layers):
-                if layer_idx >= self.max_window_layers:
-                    mapping[layer_idx] = AttnMaskDetail(
-                        mask_type=AttnMaskType.SLIDING,
-                        size=self.sliding_window,
-                    )
-        return mapping
 
 
 __all__ = [

@@ -34,7 +34,7 @@ dependencies = [
 	"jaxlib>=0.8.0",
 	"ray[default]==2.51.0",
 	"eformer==0.0.84",
-	"ejkernel==0.0.20",
+	"ejkernel==0.0.21",
 	"einops~=0.8.0",
 	"transformers>=4.57.1,<5.0.0",
 	"flax==0.11.2",
