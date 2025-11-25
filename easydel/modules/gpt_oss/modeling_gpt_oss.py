@@ -13,6 +13,9 @@
 # limitations under the License.
 
 
+import typing
+
+import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -26,13 +29,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
     DecoderLayerOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -44,13 +46,48 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.moe.linear import ColumnParallelMoELinear, RowParallelMoELinear
+from easydel.layers.moe.moe import BaseMoeModule
+from easydel.layers.moe.utils import MoeLoadBalancingStrategy, MoeRoutingStrategy
 from easydel.layers.norms import RMSNorm
 
 from .gpt_oss_configuration import GptOssConfig
 
 
+class GptOssRMSNorm(RMSNorm): ...
+
+
 class GptOssExperts(nn.Module):
     """Grouped expert feed-forward network used inside GPT-OSS MoE layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., 0::2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., 1::2]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "gate_up_proj_bias$": {
+            "splits": [
+                {"name": "gate_proj.bias", "spliter": lambda x: x[..., 0::2]},
+                {"name": "up_proj.bias", "spliter": lambda x: x[..., 1::2]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+        "down_proj_bias$": {
+            "splits": [
+                {"name": "down_proj.bias", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,
@@ -71,117 +108,59 @@ class GptOssExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
 
-        initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-
-        NEP = self.num_experts
-        HD = self.hidden_size
-        ED = self.expert_dim
-
-        self.gate_up_proj = ArrayParam.bound(
-            shape=(NEP, HD, 2 * ED),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=True,
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
-        self.gate_up_proj_bias = ArrayParam.bound(
-            shape=(NEP, 2 * ED),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=True,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
-        self.down_proj = ArrayParam.bound(
-            shape=(NEP, ED, HD),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            use_bias=True,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
         )
-        self.down_proj_bias = ArrayParam.bound(
-            shape=(NEP, HD),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
-        )
-
         self.alpha = 1.702
-        self.limit = 7.0
-
-    def __call__(self, hidden_states: jax.Array, router_indices=None, routing_weights=None, training=False) -> jax.Array:
-        del training
-        batch_size, seq_len = hidden_states.shape[:2]
-        tokens = batch_size * seq_len
-
-        hidden_states = hidden_states.reshape(tokens, self.hidden_size)
-        routing_weights = routing_weights.reshape(tokens, -1)
-        router_indices = router_indices.reshape(tokens, -1)
-
-        gate_up_proj = jnp.take(self.gate_up_proj.value, router_indices, axis=0)
-        gate_up = jnp.einsum("td,txdf->txf", hidden_states, gate_up_proj, precision=self.precision)
-        gate_up += jnp.take(self.gate_up_proj_bias.value, router_indices, axis=0)
-
-        gate = jnp.clip(gate_up[..., ::2], a_max=self.limit)
-        up = jnp.clip(gate_up[..., 1::2], a_min=-self.limit, a_max=self.limit)
-        glu = gate * jax.nn.sigmoid(gate * self.alpha)
-        fused = (up + 1) * glu
-
-        down_proj = jnp.take(self.down_proj.value, router_indices, axis=0)
-        next_states = jnp.einsum("txf,txfd->txd", fused, down_proj, precision=self.precision)
-        next_states += jnp.take(self.down_proj_bias.value, router_indices, axis=0)
-
-        topk_weights = jnp.take_along_axis(routing_weights, router_indices, axis=1)
-        next_states = jnp.einsum("txd,tx->td", next_states, topk_weights, precision=self.precision)
-
-        return next_states.reshape(batch_size, seq_len, self.hidden_size)
-
-
-class GptOssTopKRouter(nn.Module):
-    """Top-k router that scores tokens and selects experts per token."""
-
-    def __init__(
-        self,
-        config: GptOssConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: nn.Rngs,
-    ):
-        self.config = config
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        initializer = jax.nn.initializers.normal(stddev=self.config.initializer_range)
-        self.kernel = ArrayParam.bound(
-            shape=(self.num_experts, self.hidden_dim),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
-        )
-        self.bias = ArrayParam.bound(
-            shape=(self.num_experts,),
-            dtype=param_dtype,
-            init_fn=initializer,
-            key=rngs.param(),
-        )
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
-    ) -> Float[Array, "batch seq_len hidden_dim"]:
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = hidden_states @ self.kernel.value + self.bias.value
-        router_top_value, router_indices = jax.lax.top_k(router_logits, self.top_k)
-        router_top_value = jax.nn.softmax(router_top_value, axis=1)
-        router_scores = jnp.zeros_like(router_logits)
-        router_scores = router_scores.at[jnp.arange(router_scores.shape[0])[:, None], router_indices].set(
-            router_top_value
-        )
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        w0 = self.gate_proj(hidden_states, group_sizes, sorted_experts)
+        w1 = self.up_proj(hidden_states, group_sizes, sorted_experts)
 
-        return router_scores, router_indices
+        w0 = jnp.clip(w0, min=None, max=7.0)
+        w1 = jnp.clip(w1, min=-7.0, max=7.0)
+
+        glu = w0 * jax.nn.sigmoid(w0 * self.alpha)
+        intermediate = (w1 + 1.0) * glu
+
+        return self.down_proj(intermediate, group_sizes, sorted_experts)
 
 
-class GptOssMLP(nn.Module):
+class GptOssMLP(BaseMoeModule):
     """Mixture-of-experts MLP combining the router and shared experts."""
 
     def __init__(
@@ -193,12 +172,26 @@ class GptOssMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.router = GptOssTopKRouter(
+        super().__init__(
             config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+
+        self.router = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_local_experts,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
         )
         self.experts = GptOssExperts(
             config=config,
@@ -208,15 +201,45 @@ class GptOssMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, training=False):
-        router_scores, router_indices = self.router(hidden_states)
-        routed_out = self.experts(
-            hidden_states,
-            router_indices=router_indices,
-            routing_weights=router_scores,
-            training=training,
+        def _scatter_topk_probs(logits: jax.Array) -> jax.Array:
+            top_vals, top_idx = jax.lax.top_k(logits, k=self.num_experts_per_tok)
+            top_probs = jax.nn.softmax(top_vals, axis=-1)
+            out = jnp.zeros_like(logits)
+            row_idx = jnp.arange(logits.shape[0])[:, None]
+            return out.at[row_idx, top_idx].set(top_probs)
+
+        def _softmax_topk_weights(weights: jax.Array) -> jax.Array:
+            return jax.nn.softmax(weights, axis=-1)
+
+        self.moe_hooks = self.moe_hooks.replace(
+            after_gate=_scatter_topk_probs,
+            refine_weights_hook=_softmax_topk_weights,
         )
-        return routed_out, router_scores
+
+    def __call__(self, hidden_states, training=False, layer_idx=None):
+        del training
+
+        def ffn_activation(w0, w1):
+            w0 = jnp.clip(w0, min=None, max=7.0)
+            w1 = jnp.clip(w1, min=-7.0, max=7.0)
+            glu = w0 * jax.nn.sigmoid(w0 * self.experts.alpha)
+            return (w1 + 1.0) * glu
+
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.router,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            wi_bias=self.experts.gate_proj.bias.value,
+            wu_bias=self.experts.up_proj.bias.value,
+            wd_bias=self.experts.down_proj.bias.value,
+            act_fn=self.experts.act_fn,
+            ffn_activation=ffn_activation,
+            layer_idx=layer_idx,
+        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
 class GptOssAttention(UnifiedAttention):
@@ -237,7 +260,11 @@ class GptOssAttention(UnifiedAttention):
         layer_idx: int,
     ):
         """Initialize GPT-OSS attention with sink tokens."""
-        self.layer_idx = layer_idx
+        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        sliding_window = None
+
+        if is_sliding:
+            sliding_window = config.sliding_window
 
         super().__init__(
             config,
@@ -248,12 +275,8 @@ class GptOssAttention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=sliding_window,
         )
-
-        # Set sliding window attribute for layer-specific attention
-        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        if is_sliding:
-            self.sliding_window = config.sliding_window
 
         # Sink tokens for improved attention
         self.sinks = ArrayParam.bound(
@@ -261,83 +284,6 @@ class GptOssAttention(UnifiedAttention):
             dtype=param_dtype,
             init_fn=jax.nn.initializers.normal(config.initializer_range),
             key=rngs.param(),
-        )
-
-    def forward_standard(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Override to add sink tokens support."""
-        batch_size, sequence_length = hidden_states.shape[:2]
-
-        # 1. Project Q/K/V
-        query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
-        key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
-        value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
-
-        # 2. Reshape to multi-head format
-        query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
-
-        # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
-        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
-
-        # 4. Apply sharding
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        # 5. Apply RoPE
-        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
-
-        # 6. KV cache concatenation
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        # 7. Compute attention with sink tokens
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
-            softmax_aux=self.sinks.value,  # Sink tokens
-        )
-
-        # 8. Merge heads and output projection
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
-        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
         )
 
 
@@ -358,6 +304,7 @@ class GptOssDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.layer_idx = layer_idx
         attn_block = GptOssAttention
         mlp_block = GptOssMLP
         attn_block, mlp_block = auto_remat(
@@ -384,14 +331,14 @@ class GptOssDecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -513,7 +460,7 @@ class GptOssModel(EasyDeLBaseModule):
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.norm = RMSNorm(
+        self.norm = GptOssRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=dtype,

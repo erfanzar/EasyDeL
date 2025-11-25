@@ -40,14 +40,24 @@ def resolve_task(cfg: ELMConfig) -> TaskType:
         cfg: ELM configuration dictionary.
 
     Returns:
-        TaskType: The resolved task type, defaults to CAUSAL_LM if not specified.
+        TaskType: The resolved task type, defaults to CAUSAL_LM if not specified or AUTO_BIND.
 
     Example:
         >>> cfg = {"model": {"name_or_path": "meta-llama/Llama-2-7b", "task": "causal_lm"}}
         >>> resolve_task(cfg)
         <TaskType.CAUSAL_LM: 'causal_lm'>
     """
-    return normalize_task(cfg["model"].get("task")) or TaskType.CAUSAL_LM
+    task = normalize_task(cfg["model"].get("task"))
+    if task is None or task == TaskType.AUTO_BIND:
+        model_name = cfg["model"].get("name_or_path")
+        if model_name:
+            from .utils import infer_task_from_hf_config
+
+            inferred = infer_task_from_hf_config(model_name)
+            if inferred is not None:
+                return inferred
+        return TaskType.CAUSAL_LM
+    return task
 
 
 def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
@@ -114,7 +124,16 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
         'bfloat16'
     """
     cfg = normalize(cfg)
-    base = dict(cfg.get("base_config", {}).get("values", {}) or {})
+    raw_base = dict(cfg.get("base_config", {}).get("values", {}) or {})
+
+    # Coerce dtype fields in base_config.values
+    dtype_fields = {"attn_dtype", "kvdtype", "attn_softmax_dtype"}
+    base = {}
+    for k, v in raw_base.items():
+        if k in dtype_fields and v is not None:
+            base[k] = coerce_dtype(v)
+        else:
+            base[k] = v
     loader = cfg.get("loader", {})
     sharding = cfg.get("sharding", {})
     platform = cfg.get("platform", {})
@@ -134,16 +153,27 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
     set_maybe("attn_softmax_dtype", coerce_dtype(loader.get("dtype")))
 
     set_maybe("partition_axis", sharding.get("partition_axis"))
-    set_maybe("shard_attention_computation", sharding.get("shard_attention_computation"))
     set_maybe("backend", platform.get("backend"))
     set_maybe("platform", platform.get("platform"))
 
+    # MoE expert sharding configuration
+    set_maybe("use_ring_of_experts", sharding.get("use_ring_of_experts"))
+    set_maybe("fsdp_is_ep_bound", sharding.get("fsdp_is_ep_bound"))
+    set_maybe("sp_is_ep_bound", sharding.get("sp_is_ep_bound"))
+
+    # KV cache quantization
     if quant.get("method") is not None:
         set_maybe("kv_cache_quantization_method", quant.get("method"))
     set_maybe("kv_cache_quantization_blocksize", int(quant.get("block_size", 128)))
 
+    # Linear layer quantization
+    if quant.get("linear_method") is not None:
+        set_maybe("quantization_method", quant.get("linear_method"))
+    set_maybe("quantization_pattern", quant.get("linear_pattern"))
+    if quant.get("linear_block_size") is not None:
+        set_maybe("quantization_blocksize", int(quant.get("linear_block_size")))
+
     base.setdefault("hardware_abstraction", True)
-    base.setdefault("use_pallas_group_matmul", False)
 
     if esurge.get("max_model_len") is not None:
         mlen = int(esurge["max_model_len"])

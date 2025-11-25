@@ -828,7 +828,6 @@ class EasyBridgeMixin(PushToHubMixin):
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -894,7 +893,6 @@ class EasyBridgeMixin(PushToHubMixin):
             partition_axis=partition_axis,
             backend=backend,
             platform=platform,
-            shard_attention_computation=shard_attention_computation,
             **config_kwargs,
         )
 
@@ -927,7 +925,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
                 partition_axis=partition_axis,
-                shard_attention_computation=shard_attention_computation,
                 backend=backend,
                 platform=platform,
                 config_kwargs=config_kwargs,

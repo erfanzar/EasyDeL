@@ -118,9 +118,14 @@ class PagePool:
         if num_cached_pages == 0:
             prev_page_hash_value = None
         else:
-            prev_page = pages[num_cached_pages - 1]
-            assert prev_page.page_hash is not None
-            prev_page_hash_value = prev_page.page_hash.get_hash_value()
+            # Find the last page with a hash (skip null pages which don't have hashes)
+            # This is important for sliding window where early pages may be null
+            prev_page_hash_value = None
+            for idx in range(num_cached_pages - 1, -1, -1):
+                prev_page = pages[idx]
+                if prev_page.page_hash is not None:
+                    prev_page_hash_value = prev_page.page_hash.get_hash_value()
+                    break
 
         for i, blk in enumerate(new_full_pages):
             assert blk.page_hash is None

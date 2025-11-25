@@ -31,7 +31,7 @@ def _get_partition_rules(self, *args, **kwargs):
     Returns:
         `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
     """
-    pmag = self.partition_manage
+    pmag = self.partition_manager
 
     kws = dict(
         fsdp_is_ep_bound=self.fsdp_is_ep_bound,

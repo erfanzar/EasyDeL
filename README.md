@@ -121,7 +121,7 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 - **OpenAI-Compatible API** - Drop-in replacement for OpenAI-style endpoints
 - **Authentication & RBAC** - API key management with role-based access control
 - **Function Calling** - Tool call parsing; execution is left to the caller
-- **Real-Time Monitoring** - Prometheus metrics + web dashboard
+- **Real-Time Monitoring** - Prometheus metrics (Grafana-ready) + console monitor
 - **Worker Architecture** - Distributed tokenization/detokenization via ZMQ
 
 #### vWhisper - Speech Recognition
@@ -801,14 +801,11 @@ Enable real-time monitoring:
 
 ```python
 # After creating and initiating `engine`
-# Start monitoring dashboard (web UI)
-engine.start_monitoring(
-    dashboard_host="0.0.0.0",
-    dashboard_port=8080,
-)
+# Start Prometheus metrics exporter
+engine.start_monitoring(prometheus_port=8080)
 
-# Access dashboard at http://localhost:8080
-# Prometheus metrics at /metrics endpoint
+# Point Grafana (or any Prometheus UI) at:
+# http://localhost:8080/metrics
 ```
 
 #### Tracked Metrics

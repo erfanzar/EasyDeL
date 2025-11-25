@@ -29,7 +29,7 @@ Features:
     - **Context Management**: Automatic prompt truncation and token reservation
       with configurable strategies.
     - **Streaming Support**: Real-time token streaming with delta updates.
-    - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console monitor.
+    - **Monitoring**: Built-in Prometheus metrics and console monitor (Grafana-ready).
 
 Usage Example:
     >>> from easydel.inference.esurge import eSurge
@@ -63,6 +63,9 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -227,8 +230,7 @@ class eSurge:
           truncation strategies and token reservation.
         - **Streaming Support**: Efficient incremental decoding with configurable
           intervals for optimal performance.
-        - **Monitoring**: Built-in Prometheus metrics, web dashboard, and console
-          monitoring capabilities.
+        - **Monitoring**: Built-in Prometheus metrics and console monitoring (visualize with Grafana).
 
     Example:
         >>> # Initialize engine
@@ -277,6 +279,7 @@ class eSurge:
         detokenizer_endpoint: str | None = None,
         sampling_params_callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None]
         | None = None,
+        extra_eos_token_ids: list[int] | None = None,
         silent_mode: bool = False,
         **kwargs,
     ):
@@ -329,6 +332,9 @@ class eSurge:
                 SamplingParams instance and request metadata dict containing
                 "request_id", "prompt", and "engine". May return a new instance
                 or mutate the provided one in-place.
+            extra_eos_token_ids: Additional EOS token IDs beyond the tokenizer's default.
+                These will be treated as end-of-sequence tokens for all requests unless
+                overridden in SamplingParams.
             silent_mode: If True, suppress informational eSurge engine logs.
             **kwargs: Additional configuration passed to model loading.
 
@@ -375,10 +381,13 @@ class eSurge:
         self.tokenizer = tokenizer_obj
 
         self._monitoring_server = None
-        self._dashboard = None
-        self._dashboard_thread = None
-        self._dashboard_urls = None
+        self._monitoring_urls: dict[str, str] | None = None
         self._monitoring_initialized = False
+        self._grafana_container_name: str | None = None
+        self._grafana_container_id: str | None = None
+        self._grafana_process: subprocess.Popen | None = None
+        self._grafana_temp_dir: str | None = None
+        self._grafana_url: str | None = None
         self._esurge_name = esurge_name
         self._scheduler_running = False
         self.destroy_pages_on_pause = destroy_pages_on_pause
@@ -457,7 +466,6 @@ class eSurge:
         self.decode_interval_tokens = DEFAULT_DECODE_INTERVAL_TOKENS
         self.decode_interval_secs = DEFAULT_DECODE_INTERVAL_SECS
 
-
         # State
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
@@ -472,6 +480,7 @@ class eSurge:
         self.truncate_mode = truncate_mode
         self.prefer_preserve_prompt = prefer_preserve_prompt
         self.decode_truncated_prompt = decode_truncated_prompt
+        self.extra_eos_token_ids = extra_eos_token_ids or []
         # Locks and signals
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
@@ -541,15 +550,12 @@ class eSurge:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
 
-
             def _scheduler_loop():
                 self._info("Starting background scheduler loop")
                 consecutive_errors = 0
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
 
-
                 if not self._overlap_execution:
-
                     while self._scheduler_running:
                         try:
                             scheduler_output = self.scheduler.schedule()
@@ -571,7 +577,6 @@ class eSurge:
                                 max_consecutive_errors,
                                 e,
                             )
-
 
                             if consecutive_errors >= max_consecutive_errors:
                                 logger.critical(
@@ -626,7 +631,6 @@ class eSurge:
                         logger.error("Error processing pending batch: %s", e)
 
                 self._info("Background scheduler loop stopped")
-
 
             self._scheduler_running = True
             self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
@@ -757,6 +761,17 @@ class eSurge:
             return [segment if isinstance(segment, str) else str(segment) for segment in prompt]
         return [prompt if isinstance(prompt, str) else str(prompt)]
 
+    def _filter_eos_tokens(self, tokens: list[int]) -> list[int]:
+        """Remove eos tokens from a token list before decoding."""
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            return tokens
+        eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
+        eos_set = {int(tid) for tid in eos_ids if tid is not None}
+        if not eos_set:
+            return tokens
+        return [tok for tok in tokens if tok not in eos_set]
+
     def _tokenize_prompt_segments(self, prompt: typing.Any) -> list[list[int]]:
         segments = self._prepare_prompt_segments(prompt)
         token_segments: list[list[int]] = []
@@ -783,9 +798,10 @@ class eSurge:
         finished: bool,
         skip_special_tokens: bool = True,
     ) -> DetokenizerResult:
+        tokens_for_decode = self._filter_eos_tokens(generated_tokens)
         return self._detokenizer_client.decode(
             request_id,
-            generated_tokens,
+            tokens_for_decode,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
         )
@@ -842,7 +858,6 @@ class eSurge:
         max_retries = WORKER_DRAIN_MAX_RETRIES
         retry_delay = WORKER_DRAIN_INITIAL_DELAY
 
-
         for attempt in range(max_retries):
             try:
                 manager.drain_workers()
@@ -866,7 +881,6 @@ class eSurge:
                         reason,
                         exc_info=True,
                     )
-
 
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         try:
@@ -1508,6 +1522,26 @@ class eSurge:
                 delta_seq=0,
             )
 
+        # Prepare EOS token IDs: merge tokenizer default with extra_eos_token_ids
+        eos_token_ids = []
+        if self.tokenizer.eos_token_id is not None:
+            if isinstance(self.tokenizer.eos_token_id, list):
+                eos_token_ids.extend(self.tokenizer.eos_token_id)
+            else:
+                eos_token_ids.append(self.tokenizer.eos_token_id)
+        eos_token_ids.extend(self.extra_eos_token_ids)
+
+        # Use the first EOS token as the primary one for backwards compatibility
+        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else None
+
+        # Add all EOS tokens to sampling_params.stop_token_ids if not already present
+        if eos_token_ids:
+            current_stop_ids = set(sampling_params.stop_token_ids)
+            for eos_id in eos_token_ids:
+                if eos_id not in current_stop_ids:
+                    sampling_params.stop_token_ids.append(eos_id)
+                    sampling_params._all_stop_token_ids.add(eos_id)
+
         # Create n EngineRequest objects for parallel sampling
         for sample_idx in range(n_samples):
             if n_samples == 1:
@@ -1546,7 +1580,7 @@ class eSurge:
                     request_id=child_request_id,
                     prompt_token_ids=token_ids,
                     sampling_params=sampling_params,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=primary_eos_token_id,
                     parent_request_id=parent_id,
                     sample_index=sample_idx,
                 )
@@ -1654,7 +1688,6 @@ class eSurge:
                 "%d detokenizer states still failed to reset",
                 len(self._failed_detokenizer_resets),
             )
-
 
     @property
     def num_pending_requests(self) -> int:
@@ -1805,6 +1838,8 @@ class eSurge:
                     if new_tokens:
                         rd["generated_tokens"].extend(new_tokens)
                         num_generated = len(rd["generated_tokens"])
+                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+                        num_decodable = len(decodable_tokens)
 
                         if rd["first_token_time"] is None and num_generated > 0:
                             rd["first_token_time"] = now - rd["start_time"]
@@ -1816,13 +1851,13 @@ class eSurge:
 
                         last_idx = rd["last_decoded_index"]
                         should_decode = (
-                            num_generated - last_idx >= self.decode_interval_tokens
+                            num_decodable - last_idx >= self.decode_interval_tokens
                             or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
                         )
-                        if should_decode and num_generated > last_idx:
+                        if should_decode and num_decodable > last_idx:
                             pipeline_result = self._decode_with_pipeline(
                                 request_id,
-                                rd["generated_tokens"],
+                                decodable_tokens,
                                 finished=False,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
@@ -1873,11 +1908,13 @@ class eSurge:
                             ro.finished = all_finished
 
                         num_generated = len(rd["generated_tokens"])
+                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+                        num_decodable = len(decodable_tokens)
                         last_idx = rd["last_decoded_index"]
-                        if num_generated > last_idx:
+                        if num_decodable > last_idx:
                             pipeline_result = self._decode_with_pipeline(
                                 request_id,
-                                rd["generated_tokens"],
+                                decodable_tokens,
                                 finished=True,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
@@ -1940,52 +1977,351 @@ class eSurge:
 
         self._output_event.set()
 
+    def _prepare_grafana_provisioning(
+        self,
+        datasource_name: str,
+        datasource_uid: str,
+        datasource_url: str,
+    ) -> str:
+        """Create temporary provisioning config for Grafana."""
+        provisioning_root = tempfile.mkdtemp(prefix="esurge_grafana_")
+        datasources_dir = os.path.join(provisioning_root, "datasources")
+        dashboards_dir = os.path.join(provisioning_root, "dashboards")
+        os.makedirs(datasources_dir, exist_ok=True)
+        os.makedirs(dashboards_dir, exist_ok=True)
+
+        datasource_config = f"""apiVersion: 1
+datasources:
+  - name: "{datasource_name}"
+    uid: "{datasource_uid}"
+    type: prometheus
+    access: proxy
+    url: "{datasource_url}"
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "1s"
+"""
+        with open(os.path.join(datasources_dir, "esurge-prometheus.yaml"), "w", encoding="utf-8") as f:
+            f.write(datasource_config)
+
+        provider_config = """apiVersion: 1
+providers:
+  - name: "esurge-autoprovisioned"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+"""
+        with open(os.path.join(dashboards_dir, "provider.yaml"), "w", encoding="utf-8") as f:
+            f.write(provider_config)
+
+        return provisioning_root
+
+    def _start_local_grafana_service(
+        self,
+        provisioning_root: str,
+        grafana_host: str | None,
+        grafana_port: int,
+        grafana_admin_user: str,
+        grafana_admin_password: str,
+        allow_anonymous: bool,
+    ) -> str | None:
+        """Start Grafana using a locally installed grafana-server binary."""
+        if self._grafana_process:
+            return self._grafana_url
+
+        grafana_exe = shutil.which("grafana-server")
+        if not grafana_exe:
+            return None
+
+        data_dir = os.path.join(provisioning_root, "data")
+        plugins_dir = os.path.join(provisioning_root, "plugins")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(plugins_dir, exist_ok=True)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "GF_PATHS_PROVISIONING": provisioning_root,
+                "GF_PATHS_DATA": data_dir,
+                "GF_PATHS_PLUGINS": plugins_dir,
+                "GF_SECURITY_ADMIN_USER": grafana_admin_user,
+                "GF_SECURITY_ADMIN_PASSWORD": grafana_admin_password,
+                "GF_SERVER_HTTP_PORT": str(grafana_port),
+            }
+        )
+        if allow_anonymous:
+            env["GF_AUTH_ANONYMOUS_ENABLED"] = "true"
+            env["GF_AUTH_ANONYMOUS_ORG_ROLE"] = "Admin"
+
+        possible_homepaths = ["/usr/share/grafana", "/usr/local/share/grafana"]
+        cmd = [grafana_exe, "server"]
+        homepath = next((p for p in possible_homepaths if os.path.isdir(p)), None)
+        if homepath:
+            cmd.extend(["--homepath", homepath])
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            self._info(" Failed to start local Grafana server: %s", exc)
+            return None
+
+        self._grafana_process = proc
+        self._grafana_temp_dir = provisioning_root
+        self._grafana_url = f"http://{grafana_host or 'localhost'}:{grafana_port}"
+        self._info(" Grafana started (local binary) at %s", self._grafana_url)
+        return self._grafana_url
+
+    def _start_docker_grafana_service(
+        self,
+        provisioning_root: str,
+        grafana_host: str | None,
+        grafana_port: int,
+        grafana_image: str,
+        grafana_admin_user: str,
+        grafana_admin_password: str,
+        allow_anonymous: bool,
+        datasource_url: str,
+    ) -> str | None:
+        """Start Grafana using Docker."""
+        if self._grafana_container_name:
+            return self._grafana_url
+
+        docker_exe = shutil.which("docker")
+        if not docker_exe:
+            return None
+
+        container_name = f"esurge-grafana-{uuid.uuid4().hex[:8]}"
+        cmd = [
+            docker_exe,
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            container_name,
+            "-p",
+            f"{grafana_port}:3000",
+            "-v",
+            f"{provisioning_root}:/etc/grafana/provisioning",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-e",
+            f"GF_SECURITY_ADMIN_USER={grafana_admin_user}",
+            "-e",
+            f"GF_SECURITY_ADMIN_PASSWORD={grafana_admin_password}",
+        ]
+        if allow_anonymous:
+            cmd.extend(["-e", "GF_AUTH_ANONYMOUS_ENABLED=true", "-e", "GF_AUTH_ANONYMOUS_ORG_ROLE=Admin"])
+        cmd.append(grafana_image)
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            err_output = exc.stderr.strip() if exc.stderr else str(exc)
+            self._info(" Failed to start Grafana automatically: %s", err_output)
+            return None
+        except Exception as exc:
+            self._info(" Failed to start Grafana automatically: %s", exc)
+            return None
+
+        self._grafana_container_name = container_name
+        self._grafana_container_id = result.stdout.strip() or container_name
+        self._grafana_temp_dir = provisioning_root
+        self._grafana_url = f"http://{grafana_host or 'localhost'}:{grafana_port}"
+        self._info(" Grafana started (Docker) at %s (datasource -> %s)", self._grafana_url, datasource_url)
+        return self._grafana_url
+
+    def _start_grafana_service(
+        self,
+        prometheus_url: str | None,
+        grafana_host: str | None,
+        grafana_port: int,
+        grafana_image: str,
+        grafana_admin_user: str,
+        grafana_admin_password: str,
+        allow_anonymous: bool,
+        datasource_name: str,
+        datasource_uid: str | None,
+        datasource_url: str | None,
+        use_docker: bool,
+    ) -> str | None:
+        """Attempt to launch Grafana wired to the Prometheus endpoint."""
+        if self._grafana_container_name or self._grafana_process:
+            return self._grafana_url
+
+        if not prometheus_url:
+            self._info(" Grafana autostart skipped: Prometheus URL unavailable")
+            return None
+
+        datasource_uid = datasource_uid or "esurge-prometheus"
+        datasource_url = datasource_url or prometheus_url
+        docker_datasource_url = (
+            datasource_url.replace("0.0.0.0", "host.docker.internal")
+            .replace("localhost", "host.docker.internal")
+            .replace("127.0.0.1", "host.docker.internal")
+        )
+
+        provisioning_root = self._prepare_grafana_provisioning(
+            datasource_name=datasource_name,
+            datasource_uid=datasource_uid,
+            datasource_url=docker_datasource_url if use_docker else datasource_url,
+        )
+
+        # Try local grafana-server first
+        local_url = self._start_local_grafana_service(
+            provisioning_root=provisioning_root,
+            grafana_host=grafana_host,
+            grafana_port=grafana_port,
+            grafana_admin_user=grafana_admin_user,
+            grafana_admin_password=grafana_admin_password,
+            allow_anonymous=allow_anonymous,
+        )
+        if local_url:
+            return local_url
+
+        if not use_docker:
+            shutil.rmtree(provisioning_root, ignore_errors=True)
+            self._info(" Grafana autostart skipped: local server unavailable and Docker disabled")
+            return None
+
+        docker_url = self._start_docker_grafana_service(
+            provisioning_root=provisioning_root,
+            grafana_host=grafana_host,
+            grafana_port=grafana_port,
+            grafana_image=grafana_image,
+            grafana_admin_user=grafana_admin_user,
+            grafana_admin_password=grafana_admin_password,
+            allow_anonymous=allow_anonymous,
+            datasource_url=docker_datasource_url,
+        )
+        if docker_url:
+            return docker_url
+
+        shutil.rmtree(provisioning_root, ignore_errors=True)
+        return None
+
+    def _stop_grafana_service(self) -> None:
+        """Stop the Grafana container if it was started by the engine."""
+        container = self._grafana_container_id or self._grafana_container_name
+        docker_exe = shutil.which("docker") if container else None
+        if container and docker_exe:
+            try:
+                subprocess.run(
+                    [docker_exe, "stop", container],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                self._info(" Grafana container stopped")
+            except Exception:
+                self._info(" Failed to stop Grafana container %s", container)
+
+        if self._grafana_temp_dir:
+            shutil.rmtree(self._grafana_temp_dir, ignore_errors=True)
+
+        self._grafana_container_name = None
+        self._grafana_container_id = None
+        if self._grafana_process:
+            try:
+                self._grafana_process.terminate()
+                self._grafana_process.wait(timeout=2)
+                self._info(" Grafana process stopped")
+            except Exception:
+                self._info(" Failed to stop Grafana process gracefully")
+            self._grafana_process = None
+        self._grafana_temp_dir = None
+        self._grafana_url = None
+
     def start_monitoring(
         self,
-        dashboard_port: int = 11481,
+        dashboard_port: int | None = None,
         prometheus_port: int = 11184,
-        dashboard_host: str = "0.0.0.0",
+        dashboard_host: str | None = None,
         enable_prometheus: bool = True,
-        enable_dashboard: bool = True,
+        enable_dashboard: bool | None = None,
         enable_console: bool = False,
         log_file: str | None = None,
         log_interval: float = 10.0,
         history_size: int = 1000,
         enable_detailed_logging: bool = True,
+        start_grafana: bool = True,
+        grafana_port: int = 3000,
+        grafana_host: str | None = None,
+        grafana_image: str = "grafana/grafana-oss:latest",
+        grafana_use_docker: bool = False,
+        grafana_admin_user: str = "admin",
+        grafana_admin_password: str = "admin",
+        grafana_allow_anonymous: bool = True,
+        grafana_datasource_name: str = "eSurge Prometheus",
+        grafana_datasource_uid: str | None = None,
+        grafana_datasource_url: str | None = None,
     ) -> dict[str, str]:
-        """Start monitoring services for the engine.
+        """Start Prometheus-based monitoring for the engine.
 
-        Initializes various monitoring and observability services including
-        Prometheus metrics, web dashboard, and console monitor.
+        Initializes the Prometheus metrics exporter, optional console monitor,
+        and (by default) tries to auto-start a Grafana instance with a
+        pre-provisioned Prometheus data source (local grafana-server first,
+        optionally Docker if enabled).
 
         Args:
-            dashboard_port: Port for web dashboard server.
+            dashboard_port: Deprecated; no longer used (kept for compatibility).
             prometheus_port: Port for Prometheus metrics endpoint.
-            dashboard_host: Host address to bind services to.
+            dashboard_host: Deprecated; no longer used (kept for compatibility).
             enable_prometheus: Start Prometheus metrics server.
-            enable_dashboard: Start web dashboard with real-time metrics.
+            enable_dashboard: Deprecated; no longer used (kept for compatibility).
             enable_console: Start console monitor with rich display.
             log_file: Optional file path for metrics logging.
             log_interval: Interval in seconds between metric logs.
             history_size: Number of historical metrics to retain.
             enable_detailed_logging: Enable detailed metric logging.
+            start_grafana: Auto-start Grafana (via Docker) pointed at the Prometheus endpoint.
+            grafana_port: Host port to expose Grafana.
+            grafana_host: Hostname to use when reporting Grafana URL (defaults to localhost).
+            grafana_image: Docker image for Grafana (used when grafana_use_docker=True).
+            grafana_use_docker: Allow falling back to Docker for Grafana when local server is unavailable.
+            grafana_admin_user: Admin username for Grafana.
+            grafana_admin_password: Admin password for Grafana.
+            grafana_allow_anonymous: Allow anonymous admin access to Grafana (for quick local use).
+            grafana_datasource_name: Display name for the auto-provisioned Prometheus data source.
+            grafana_datasource_uid: UID for the Prometheus data source (auto-generated if None).
+            grafana_datasource_url: Override URL for the Prometheus data source inside Grafana.
 
         Returns:
             Dictionary of service URLs:
             - 'prometheus': Prometheus metrics endpoint
-            - 'dashboard': Web dashboard URL
-            - 'health': Health check endpoint
-            - 'api': API metrics endpoint
-
-        Example:
-            >>> urls = engine.start_monitoring(dashboard_port=8080)
-            >>> print(f"Dashboard: {urls['dashboard']}")
+            - 'grafana': Grafana UI (when auto-start succeeds)
         """
         if self._monitoring_initialized:
+            if start_grafana and not self._grafana_container_name:
+                existing_urls = self._monitoring_urls or {}
+                prometheus_url = existing_urls.get("prometheus")
+                grafana_url = self._start_grafana_service(
+                    prometheus_url=prometheus_url,
+                    grafana_host=grafana_host or dashboard_host,
+                    grafana_port=grafana_port,
+                    grafana_image=grafana_image,
+                    grafana_admin_user=grafana_admin_user,
+                    grafana_admin_password=grafana_admin_password,
+                    allow_anonymous=grafana_allow_anonymous,
+                    datasource_name=grafana_datasource_name,
+                    datasource_uid=grafana_datasource_uid,
+                    datasource_url=grafana_datasource_url,
+                    use_docker=grafana_use_docker,
+                )
+                if grafana_url:
+                    existing_urls["grafana"] = grafana_url
+                    self._monitoring_urls = existing_urls
             self._info("Monitoring already initialized for this eSurge instance")
-            return self._dashboard_urls
+            return self._monitoring_urls or {}
 
-        self._info("Starting eSurge monitoring services...")
+        self._info("Starting eSurge monitoring services (Prometheus exporter)...")
 
         if not get_metrics_collector():
             initialize_metrics(
@@ -1996,47 +2332,47 @@ class eSurge:
             )
             self._info(" Metrics collection initialized")
 
-        urls = {}
+        urls: dict[str, str] = {}
 
         if enable_prometheus:
             try:
                 from .monitoring import start_monitoring_server
 
-                self._monitoring_server = start_monitoring_server(
-                    prometheus_port=prometheus_port,
-                    update_interval=1.0,
-                )
-                urls["prometheus"] = f"http://{dashboard_host}:{prometheus_port}/metrics"
+                self._monitoring_server = start_monitoring_server(prometheus_port=prometheus_port, update_interval=1.0)
+                host_for_logs = dashboard_host or "0.0.0.0"
+                urls["prometheus"] = f"http://{host_for_logs}:{prometheus_port}/metrics"
                 self._info(f" Prometheus metrics: {urls['prometheus']}")
+                self._info(" Point Grafana at the Prometheus endpoint to visualize eSurge metrics.")
             except ImportError:
                 self._info(" Prometheus monitoring unavailable (install prometheus-client)")
             except Exception as e:
                 self._info(f" Failed to start Prometheus server: {e}")
+        elif start_grafana:
+            self._info(" Grafana autostart skipped because Prometheus exporter is disabled")
 
-        if enable_dashboard:
-            try:
-                from .dashboard import create_dashboard
+        if enable_dashboard or dashboard_port or dashboard_host:
+            self._info(
+                " The built-in web dashboard has been removed. "
+                "Use Prometheus + Grafana (or another Prometheus UI) for charts."
+            )
 
-                self._dashboard = create_dashboard(
-                    host=dashboard_host,
-                    port=dashboard_port,
-                    debug=False,
-                )
-
-                def run_dashboard():
-                    self._dashboard.run(log_level="warning")
-
-                self._dashboard_thread = threading.Thread(target=run_dashboard, daemon=True)
-                self._dashboard_thread.start()
-                urls["dashboard"] = f"http://{dashboard_host}:{dashboard_port}"
-                urls["health"] = f"http://{dashboard_host}:{dashboard_port}/health"
-                urls["api"] = f"http://{dashboard_host}:{dashboard_port}/api/metrics"
-                self._info(f" Web dashboard: {urls['dashboard']}")
-                self._info(f" Health check: {urls['health']}")
-            except ImportError:
-                self._info(" Web dashboard unavailable (install fastapi uvicorn)")
-            except Exception as e:
-                self._info(f" Failed to start dashboard: {e}")
+        if start_grafana and enable_prometheus:
+            grafana_url = self._start_grafana_service(
+                prometheus_url=urls.get("prometheus"),
+                grafana_host=grafana_host or dashboard_host,
+                grafana_port=grafana_port,
+                grafana_image=grafana_image,
+                grafana_admin_user=grafana_admin_user,
+                grafana_admin_password=grafana_admin_password,
+                allow_anonymous=grafana_allow_anonymous,
+                datasource_name=grafana_datasource_name,
+                datasource_uid=grafana_datasource_uid,
+                datasource_url=grafana_datasource_url,
+                use_docker=grafana_use_docker,
+            )
+            if grafana_url:
+                urls["grafana"] = grafana_url
+                self._info(f" Grafana UI: {grafana_url}")
 
         if enable_console:
             try:
@@ -2053,17 +2389,15 @@ class eSurge:
         if urls:
             self._info(" Monitoring services started successfully!")
             self._info(" Metrics will be automatically collected during inference")
-            if enable_dashboard:
-                self._info(f" Open {urls['dashboard']} to view real-time metrics")
         else:
             self._info(" No monitoring services were started successfully")
-        self._dashboard_urls = urls
+        self._monitoring_urls = urls
         return urls
 
     def stop_monitoring(self) -> None:
         """Stop all monitoring services.
 
-        Gracefully shuts down Prometheus server, dashboard, and console monitor
+        Gracefully shuts down Prometheus server and console monitor
         if they are running.
         """
         if not self._monitoring_initialized:
@@ -2079,15 +2413,10 @@ class eSurge:
                 self._info(f" Error stopping Prometheus server: {e}")
             self._monitoring_server = None
 
-        if self._dashboard_thread and self._dashboard_thread.is_alive():
-            try:
-                self._info(" Dashboard server will stop with process")
-            except Exception as e:
-                self._info(f" Error stopping dashboard: {e}")
-            self._dashboard_thread = None
-            self._dashboard = None
+        self._stop_grafana_service()
 
         self._monitoring_initialized = False
+        self._monitoring_urls = None
         self._info(" Monitoring services stopped")
 
     def get_metrics_summary(self) -> dict[str, Any]:
@@ -2167,6 +2496,7 @@ class eSurge:
             f"truncate_mode={self.truncate_mode!r}",
             f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
             f"decode_truncated_prompt={self.decode_truncated_prompt}",
+            f"extra_eos_token_ids={self.extra_eos_token_ids}",
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

@@ -58,7 +58,6 @@ from __future__ import annotations
 
 import typing
 
-import jax
 from eformer import common_types
 from eformer.escale import PartitionManager
 from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
@@ -120,7 +119,6 @@ class ParallelMoELinear(nn.Module):
         num_experts: Number of experts.
         in_features: Input feature dimension.
         out_features: Output feature dimension.
-        use_pallas_group_matmul: Whether to use the optimized GMM kernel (TPU-optimized).
         out_first: If True, kernel shape is `(num_experts, out_features, in_features)`;
             otherwise `(num_experts, in_features, out_features)`.
         dtype: Data type for computation. None means inherits from inputs.
@@ -170,12 +168,12 @@ class ParallelMoELinear(nn.Module):
         out_first: bool = False,
         kernel_init: Initializer = default_kernel_init,
         bias_init: Initializer = default_bias_init,
-        use_pallas_group_matmul: bool = False,
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.float32,
         partition_manager: PartitionManager | None = None,
         direction: typing.Literal["row", "column"] | None = None,
         use_expert_tensor_mode: bool = False,
+        weight_modif_fn: typing.Callable[[Array], Array] | None = None,
         rngs: nn.Rngs,
     ):
         """Initializes a `ParallelMoELinear` layer.
@@ -189,7 +187,6 @@ class ParallelMoELinear(nn.Module):
                 otherwise `(num_experts, in_features, out_features)`.
             kernel_init: Initializer for the kernel weights.
             bias_init: Initializer for the bias.
-            use_pallas_group_matmul: Whether to use the TPU-optimized grouped matrix multiplication kernel.
             dtype: Data type for computation. Defaults to None (inherits from inputs).
             param_dtype: Data type for parameters (weights, biases).
             partition_manager: Partition manager for parameter sharding and mapping.
@@ -199,7 +196,6 @@ class ParallelMoELinear(nn.Module):
         self.num_experts = num_experts
         self.in_features = in_features
         self.out_features = out_features
-        self.use_pallas_group_matmul = use_pallas_group_matmul and (jax.default_backend() == "tpu")
         self.out_first = out_first
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -208,7 +204,7 @@ class ParallelMoELinear(nn.Module):
 
         self.kernel_init = kernel_init
         self.bias_init = bias_init
-
+        self.weight_modif_fn = weight_modif_fn
         if direction is not None:
             assert direction in ["row", "column"]
             self._direction = direction
@@ -355,7 +351,8 @@ class ParallelMoELinear(nn.Module):
             Shape: `(total_tokens, out_features)`.
         """
         weight = self.kernel.value
-
+        if self.weight_modif_fn is not None:
+            weight = self.weight_modif_fn(weight)
         if weight.dtype in (
             jnp.float8_e4m3b11fnuz,
             jnp.float8_e4m3fn,

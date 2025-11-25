@@ -594,6 +594,7 @@ dependencies = [
     { name = "flax" },
     { name = "gcsfs" },
     { name = "google-api-python-client" },
+    { name = "grafanalib" },
     { name = "grain" },
     { name = "jax" },
     { name = "jaxlib" },
@@ -642,11 +643,12 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.84" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.16" },
+    { name = "ejkernel", specifier = "==0.0.20" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
     { name = "google-api-python-client", specifier = ">=2.179.0" },
+    { name = "grafanalib", specifier = ">=0.7.1" },
     { name = "grain", specifier = "~=0.2.11" },
     { name = "jax", specifier = ">=0.8.0" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'gpu'", specifier = ">=0.8.0" },
@@ -717,7 +719,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.16"
+version = "0.0.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -729,9 +731,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/39/22/75897dfc7ebffba3f92236cfc51e287400b2f8faa4d131489a977da2dbd6/ejkernel-0.0.16.tar.gz", hash = "sha256:1a86b7cccfb56d4b8d60c03a0e6e2586f178e9d81b02097febc230b69f94a6ca", size = 402322, upload-time = "2025-11-10T14:52:52.281Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/1c/d3d2b1b99130b7130e5de3ad9ef3d1bcb33e2289155ccecba22e987c44ba/ejkernel-0.0.20.tar.gz", hash = "sha256:5667d3c1b1eebcc89b842621214b76f5a7cbf86c854d5c566661e818a35e69b1", size = 407025, upload-time = "2025-11-25T15:25:02.03Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/a1/f49f25626aef6df5c2d3982ed90caeebf28805597555b7a953c318d8808d/ejkernel-0.0.16-py3-none-any.whl", hash = "sha256:aa17fdaa6955679bde13de73ccc23bc812968f4dda049d103a6be110b1d9da56", size = 595039, upload-time = "2025-11-10T14:52:51.021Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/04/e1423ed80dd1d481a168b8887759c606df696e8e52bdef22afb265670c35/ejkernel-0.0.20-py3-none-any.whl", hash = "sha256:e60ead39b2e83737a6ed9185057d4ee0404bf29a64ec5d9fc6591188c71cddc1", size = 599587, upload-time = "2025-11-25T15:25:00.842Z" },
 ]
 
 [[package]]
@@ -1149,6 +1151,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/39/24/33db22342cf4a2ea27c9955e6713140fedd51e8b141b5ce5260897020f1a/googleapis_common_protos-1.70.0.tar.gz", hash = "sha256:0e1b44e0ea153e6594f9f394fef15193a68aaaea2d843f83e2742717ca753257", size = 145903, upload-time = "2025-04-14T10:17:02.924Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/86/f1/62a193f0227cf15a920390abe675f386dec35f7ae3ffe6da582d3ade42c7/googleapis_common_protos-1.70.0-py3-none-any.whl", hash = "sha256:b8bfcca8c25a2bb253e0e0b0adaf8c00773e5e6af6fd92397576680b807e0fd8", size = 294530, upload-time = "2025-04-14T10:17:01.271Z" },
+]
+
+[[package]]
+name = "grafanalib"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b7/a4/e413c2aa91e3ea631b0493f0c1473d6a48afa1fdc2b576ae6364a372bf30/grafanalib-0.7.1.tar.gz", hash = "sha256:3d92bb4e92ae78fe4e21c5b252ab51f4fdcacd8523ba5a44545b897b2a375b83", size = 59616, upload-time = "2024-01-12T10:35:11.018Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/6e/825081b0ae89031ec16de0c57bf6dbb06d26b69dc938c3461c831e409c9b/grafanalib-0.7.1-py3-none-any.whl", hash = "sha256:6fab5d7b837a1f2d1322ef762cd52e565ec0422707a7512765c59f668bdceb58", size = 62780, upload-time = "2024-01-12T10:35:08.788Z" },
 ]
 
 [[package]]

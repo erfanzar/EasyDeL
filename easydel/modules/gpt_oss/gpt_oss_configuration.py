@@ -101,6 +101,7 @@ class GptOssConfig(EasyDeLBaseConfig):
         output_router_logits=False,
         use_cache=True,
         layer_types=None,
+        mlp_activations_limit: float = 7.0,
         **kwargs,
     ):
         """Initialize GPT-OSS configuration.
@@ -165,6 +166,7 @@ class GptOssConfig(EasyDeLBaseConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.output_router_logits = output_router_logits
         self.use_cache = use_cache
+        self.mlp_activations_limit = mlp_activations_limit
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from functools import cached_property, partial
 
 import chex
@@ -29,7 +30,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput, ModelOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput, ModelOutput, MoeCausalLMOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
@@ -42,24 +43,21 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm
 
-from .qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
+from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, Qwen3VLMoeVisionConfig
 
 
 @auto_pytree
-class Qwen3VLCausalLMOutputWithPast(ModelOutput):
-    """Output class for Qwen3-VL causal language model.
-
-    Attributes:
-        loss: Language modeling loss if labels provided.
-        logits: Prediction scores of the language model head.
-        past_key_values: Tuple of past key values for efficient generation.
-        hidden_states: Tuple of hidden states at each layer.
-        attentions: Tuple of attention weights at each layer.
-        rope_deltas: RoPE position deltas for mRoPE.
-        image_hidden_states: Hidden states from image processing.
-    """
+class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
+    """Output class for Qwen3-VL-MoE causal language model."""
 
     loss: chex.Array | None = None
     logits: chex.Array = None
@@ -68,6 +66,13 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     attentions: tuple[chex.Array] | None = None
     rope_deltas: chex.Array | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
+    router_logits: tuple[chex.Array] | None = None
+
+
+def _dbg_tail(x: chex.Array) -> chex.Array:
+    """Return the last 5 flattened elements for compact debug prints."""
+    flat = jnp.ravel(x)
+    return flat[-5:]
 
 
 def get_rope_index(
@@ -87,7 +92,7 @@ def get_rope_index(
     """Calculate 3D RoPE indices for multimodal inputs.
 
     Computes position IDs with temporal, height, and width dimensions for
-    proper 3D rotary position embeddings (mRoPE) in Qwen3-VL.
+    proper 3D rotary position embeddings (mRoPE) in Qwen3-VL-MoE.
 
     Args:
         input_ids: Token IDs of shape (batch_size, sequence_length).
@@ -290,12 +295,12 @@ def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dt
     return attention_mask
 
 
-class Qwen3VLVisionPatchEmbed(nn.Module):
-    """3D convolution-based patch embedding for Qwen3-VL vision encoder."""
+class Qwen3VLMoeVisionPatchEmbed(nn.Module):
+    """3D convolution-based patch embedding for Qwen3-VL-MoE vision encoder."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -337,12 +342,12 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Qwen3VLVisionPatchMerger(nn.Module):
-    """Spatial patch merger with MLP gating for Qwen3-VL."""
+class Qwen3VLMoeVisionPatchMerger(nn.Module):
+    """Spatial patch merger with MLP gating for Qwen3-VL-MoE."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -388,12 +393,12 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         return x
 
 
-class Qwen3VLVisionMLP(nn.Module):
-    """Feed-forward network for Qwen3-VL vision encoder."""
+class Qwen3VLMoeVisionMLP(nn.Module):
+    """Feed-forward network for Qwen3-VL-MoE vision encoder."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -425,12 +430,12 @@ class Qwen3VLVisionMLP(nn.Module):
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
-class Qwen3VLVisionAttention(UnifiedAttention):
-    """Self-attention for Qwen3-VL vision encoder with rotary embeddings."""
+class Qwen3VLMoeVisionAttention(UnifiedAttention):
+    """Self-attention for Qwen3-VL-MoE vision encoder with rotary embeddings."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -456,7 +461,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
 
     def define_network(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         dtype: jnp.dtype,
         param_dtype: jnp.dtype,
         precision: jax.lax.PrecisionLike,
@@ -522,12 +527,12 @@ class Qwen3VLVisionAttention(UnifiedAttention):
         return attn_output
 
 
-class Qwen3VLVisionBlock(nn.Module):
-    """Transformer block for Qwen3-VL vision encoder."""
+class Qwen3VLMoeVisionBlock(nn.Module):
+    """Transformer block for Qwen3-VL-MoE vision encoder."""
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -550,7 +555,7 @@ class Qwen3VLVisionBlock(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attn = Qwen3VLVisionAttention(
+        self.attn = Qwen3VLMoeVisionAttention(
             config=config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -558,7 +563,7 @@ class Qwen3VLVisionBlock(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.mlp = Qwen3VLVisionMLP(
+        self.mlp = Qwen3VLMoeVisionMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -581,15 +586,15 @@ class Qwen3VLVisionBlock(nn.Module):
         return hidden_states
 
 
-@register_module(TaskType.BASE_VISION, config=Qwen3VLConfig, model_type="qwen3_vl")
-class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
-    """Vision transformer encoder for Qwen3-VL."""
+@register_module(TaskType.BASE_VISION, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
+class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
+    """Vision transformer encoder for Qwen3-VL-MoE."""
 
-    config_class = Qwen3VLVisionConfig
+    config_class = Qwen3VLMoeVisionConfig
 
     def __init__(
         self,
-        config: Qwen3VLVisionConfig,
+        config: Qwen3VLMoeVisionConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -604,7 +609,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.patch_embed = Qwen3VLVisionPatchEmbed(
+        self.patch_embed = Qwen3VLMoeVisionPatchEmbed(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -626,7 +631,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         self._head_dim_ro = head_dim // 2
 
         self.blocks = [
-            Qwen3VLVisionBlock(
+            Qwen3VLMoeVisionBlock(
                 config=config,
                 layer_idx=idx,
                 dtype=dtype,
@@ -637,7 +642,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             for idx in range(config.depth)
         ]
 
-        self.merger = Qwen3VLVisionPatchMerger(
+        self.merger = Qwen3VLMoeVisionPatchMerger(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -647,7 +652,7 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         # Deepstack mergers for intermediate feature extraction
         self.deepstack_merger_list = [
-            Qwen3VLVisionPatchMerger(
+            Qwen3VLMoeVisionPatchMerger(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -738,12 +743,12 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         return self.patch_embed
 
 
-class Qwen3VLTextMLP(nn.Module):
-    """SwiGLU feed-forward network for Qwen3-VL text decoder."""
+class Qwen3VLMoeTextMLP(nn.Module):
+    """SwiGLU feed-forward network for Qwen3-VL-MoE text decoder (dense MLP)."""
 
     def __init__(
         self,
-        config: Qwen3VLTextConfig,
+        config: Qwen3VLMoeTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -799,12 +804,186 @@ class Qwen3VLTextMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Qwen3VLTextAttention(UnifiedAttention):
-    """Causal self-attention for Qwen3-VL text decoder with mRoPE and QK-norm support."""
+class Qwen3VLMoeMLPStack(nn.Module):
+    """Qwen3-VL-MoE MoE MLP using the new ParallelMoELinear layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat((gate, up), dim=-1),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,
-        config: Qwen3VLTextConfig,
+        config: Qwen3VLMoeTextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(),
+            use_bias=False,
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+        )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.moe_intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+        )
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_experts,
+            in_features=config.hidden_size,
+            out_features=config.moe_intermediate_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ) -> chex.Array:
+        """Forward pass through MoE MLP."""
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
+            * self.up_proj(hidden_states, group_sizes, sorted_experts),
+            group_sizes,
+            sorted_experts,
+        )
+
+
+class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
+    """Sparse Mixture of Experts (MoE) block for Qwen3-VL-MoE text decoder.
+
+    This block routes input hidden states to a selected subset of experts
+    and combines their outputs.
+
+    Attributes:
+        config (Qwen3VLMoeTextConfig): Configuration object for the model.
+        gate (ParallelLinear): Linear layer for the gating network.
+        experts (Qwen3VLMoeMLPStack): Stack of expert MLP modules.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+        rngs (nn.Rngs): Random number generators.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3VLMoeTextConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        """Initializes the Qwen3VLMoeTextSparseBlock module.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): The configuration object for the model.
+            dtype (jnp.dtype): Data type for computations (default: jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.bfloat16).
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+            rngs (nn.Rngs): Random number generators.
+        """
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            # HF Qwen3-VL-MoE always normalizes the selected expert weights (TOP_K),
+            # regardless of the `norm_topk_prob` flag that exists in other Qwen configs.
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+        self.gate = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_experts,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+        )
+
+        self.experts = Qwen3VLMoeMLPStack(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        # Helps with debug context from decoder layer.
+        self.layer_idx: int | None = None
+
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+        """Forward pass of the Sparse MoE block.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+
+        Returns:
+            tuple[chex.Array, chex.Array]: A tuple containing:
+                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
+                - router_logits (chex.Array): The logits output by the gating network.
+        """
+        out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.gate,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
+        )
+        return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
+
+
+class Qwen3VLMoeTextAttention(UnifiedAttention):
+    """Causal self-attention for Qwen3-VL-MoE text decoder with mRoPE and QK-norm support."""
+
+    def __init__(
+        self,
+        config: Qwen3VLMoeTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -825,13 +1004,26 @@ class Qwen3VLTextAttention(UnifiedAttention):
             use_qk_norm=True,
         )
 
+    def _postprocess_qkv(
+        self,
+        query_states: chex.Array,
+        key_states: chex.Array,
+        value_states: chex.Array,
+    ) -> tuple[chex.Array, chex.Array, chex.Array]:
+        """Apply Q/K RMSNorm like HF before RoPE."""
+        if hasattr(self, "q_norm"):
+            query_states = self.q_norm(query_states)
+        if hasattr(self, "k_norm"):
+            key_states = self.k_norm(key_states)
+        return query_states, key_states, value_states
 
-class Qwen3VLTextDecoderLayer(nn.Module):
-    """Transformer decoder layer for Qwen3-VL text model."""
+
+class Qwen3VLMoeTextDecoderLayer(nn.Module):
+    """Transformer decoder layer for Qwen3-VL-MoE text model with conditional MoE/dense MLP."""
 
     def __init__(
         self,
-        config: Qwen3VLTextConfig,
+        config: Qwen3VLMoeTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -843,12 +1035,15 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.layer_idx = layer_idx
 
-        attn_block = Qwen3VLTextAttention
-        mlp_block = Qwen3VLTextMLP
-        attn_block, mlp_block = auto_remat(
+        attn_block = Qwen3VLMoeTextAttention
+        mlp_block = Qwen3VLMoeTextMLP
+        moe_block = Qwen3VLMoeTextSparseBlock
+        attn_block, mlp_block, moe_block = auto_remat(
             attn_block,
             mlp_block,
+            moe_block,
             policy=config.gradient_checkpointing,
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
@@ -863,14 +1058,28 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            layer_idx=layer_idx,
+        self.is_moe = (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and ((layer_idx + 1) % config.decoder_sparse_step == 0)
         )
+
+        if self.is_moe:
+            self.mlp = moe_block(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+            self.mlp.layer_idx = layer_idx
+        else:
+            self.mlp = mlp_block(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layer_idx=layer_idx,
+            )
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -896,10 +1105,12 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
+        output_router_logits: bool = False,
         frequencies: chex.Array | None = None,
     ) -> DecoderLayerOutput:
+        attn_input = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
+            attn_input,
             mask_info,
             position_ids,
             mode,
@@ -912,7 +1123,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-        if self.config.use_scan_mlp:
+        if self.config.use_scan_mlp and not self.is_moe:
             feed_forward_hidden_states = block_wise_ffn(
                 self.mlp,
                 feed_forward_input,
@@ -920,6 +1131,10 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             )
         else:
             feed_forward_hidden_states = self.mlp(feed_forward_input)
+
+        router_logits = None
+        if self.is_moe:
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
 
         hidden_states = checkpoint_name(hidden_states + feed_forward_hidden_states, "residual")
         hidden_states = apply_logical_sharding(
@@ -931,17 +1146,18 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         return DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),
             attention_weight=attn_outputs.attention_weight,
+            router_logits=router_logits if output_router_logits else None,
             cache_view=attn_outputs.cache_view,
         )
 
 
-@register_module(TaskType.BASE_MODULE, config=Qwen3VLTextConfig, model_type="qwen3_vl")
-class Qwen3VLTextModel(EasyDeLBaseModule):
-    """Text decoder model for Qwen3-VL."""
+@register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
+class Qwen3VLMoeTextModel(EasyDeLBaseModule):
+    """Text decoder model for Qwen3-VL-MoE with MoE support."""
 
     def __init__(
         self,
-        config: Qwen3VLTextConfig,
+        config: Qwen3VLMoeTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -955,6 +1171,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
+
         embed_block = auto_remat(
             nn.Embed,
             policy=config.gradient_checkpointing,
@@ -971,7 +1188,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         )
 
         self.layers = [
-            Qwen3VLTextDecoderLayer(
+            Qwen3VLMoeTextDecoderLayer(
                 config=config,
                 layer_idx=i,
                 dtype=dtype,
@@ -1012,6 +1229,7 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
     ) -> BaseModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify either input_ids or inputs_embeds, but not both.")
@@ -1021,8 +1239,12 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
 
         sequence_length = inputs_embeds.shape[1]
 
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        all_router_logits = () if output_router_logits else None
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached! "
@@ -1070,12 +1292,16 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
+
+            if output_router_logits and layer_outputs.router_logits is not None:
+                all_router_logits += (layer_outputs.router_logits,)
 
             past_key_values[idx] = layer_outputs.cache_view
 
@@ -1085,11 +1311,12 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return BaseModelOutput(
+        return MoeCausalLMOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             past_key_values=past_key_values,
+            router_logits=all_router_logits if output_router_logits else None,
         )
 
     def get_encoder(self):
@@ -1105,24 +1332,24 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-@register_module(TaskType.VISION_LM, config=Qwen3VLConfig, model_type="qwen3_vl")
-class Qwen3VLModel(EasyDeLBaseModule):
-    """Qwen3-VL multimodal model integrating vision encoder and text decoder.
+@register_module(TaskType.VISION_LM, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
+class Qwen3VLMoeModel(EasyDeLBaseModule):
+    """Qwen3-VL-MoE multimodal model integrating vision encoder and text decoder with MoE.
 
     This model handles the fusion of visual and textual information by:
     1. Processing images/videos through the vision encoder
     2. Merging visual embeddings into text embeddings at placeholder positions
     3. Computing 3D position IDs for proper mRoPE handling
-    4. Running the fused embeddings through the text decoder
+    4. Running the fused embeddings through the text decoder with MoE layers
 
-    Architecture matches HuggingFace:
-    - visual: Qwen3VisionTransformerPretrainedModel
-    - language_model: Qwen3VLTextModel
+    Architecture matches HuggingFace pattern:
+    - visual: Qwen3VLMoeVisionTransformerPretrainedModel
+    - language_model: Qwen3VLMoeTextModel
     """
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Qwen3VLMoeConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -1138,7 +1365,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
         )
 
         # Vision encoder
-        self.visual = Qwen3VisionTransformerPretrainedModel(
+        self.visual = Qwen3VLMoeVisionTransformerPretrainedModel(
             config.vision_config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1146,8 +1373,8 @@ class Qwen3VLModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Language model (text decoder)
-        self.language_model = Qwen3VLTextModel(
+        # Language model (text decoder) - use text_config
+        self.language_model = Qwen3VLMoeTextModel(
             config.text_config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1167,6 +1394,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
         pixel_values: chex.Array | None = None,
         pixel_values_videos: chex.Array | None = None,
         image_grid_thw: tuple | None = None,
@@ -1218,6 +1446,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
             cache_metadata=cache_metadata,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
         )
 
     def get_encoder(self):
@@ -1227,18 +1456,18 @@ class Qwen3VLModel(EasyDeLBaseModule):
         return self.language_model
 
     def get_lm_head(self):
-        raise NotImplementedError("Qwen3VLModel does not have a language model head.")
+        raise NotImplementedError("Qwen3VLMoeModel does not have a language model head.")
 
     def get_embedding(self):
         return self.language_model.embed_tokens
 
 
-@register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3VLConfig, model_type="qwen3_vl")
-class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
-    """Qwen3-VL model for conditional generation from images/videos and text.
+@register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
+class Qwen3VLMoeForConditionalGeneration(EasyDeLBaseModule):
+    """Qwen3-VL-MoE model for conditional generation from images/videos and text.
 
     Architecture matches HuggingFace:
-    - model: Qwen3VLModel (contains visual + language_model)
+    - model: Qwen3VLMoeModel (contains visual + language_model with MoE)
     - lm_head: Linear projection to vocab
     """
 
@@ -1246,7 +1475,7 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
 
     def __init__(
         self,
-        config: Qwen3VLConfig,
+        config: Qwen3VLMoeConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -1261,7 +1490,7 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.model = Qwen3VLModel(
+        self.model = Qwen3VLMoeModel(
             config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1301,6 +1530,7 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
         pixel_values: chex.Array | None = None,
         pixel_values_videos: chex.Array | None = None,
         image_grid_thw: tuple | None = None,
@@ -1308,10 +1538,19 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
         rope_deltas: chex.Array | None = None,
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
-    ) -> Qwen3VLCausalLMOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    ) -> Qwen3VLMoeCausalLMOutputWithPast:
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.config.get_text_config().output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.get_text_config().output_hidden_states
+        )
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else self.config.get_text_config().output_router_logits
         )
         tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 2.0)
         second_per_grid_ts = None
@@ -1376,7 +1615,6 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
                 sequence_length = inputs_embeds.shape[1]
                 position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
                 position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
-
         # Forward through model (language_model only since vision is already processed)
         outputs = self.model.language_model(
             input_ids=None,
@@ -1389,6 +1627,7 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
             mask_info=mask_info,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -1403,13 +1642,14 @@ class Qwen3VLForConditionalGeneration(EasyDeLBaseModule):
         if apply_lm_head:
             logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
 
-        return Qwen3VLCausalLMOutputWithPast(
+        return Qwen3VLMoeCausalLMOutputWithPast(
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=rope_deltas,
             image_hidden_states=hidden_states,
+            router_logits=outputs.router_logits if output_router_logits else None,
         )
 
     def get_encoder(self):

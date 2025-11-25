@@ -10,8 +10,7 @@ All notable changes to this project will be documented in this file.
   - New `eSurge` class with batched generation, streaming, and async support
   - Support for dynamic batching, KV caching, and prefix caching optimizations
   - Comprehensive metrics collection system with real-time monitoring
-  - Web dashboard for monitoring inference performance and system status
-  - Prometheus metrics integration for production monitoring
+  - Prometheus metrics integration for production monitoring (Grafana-ready)
   - Function calling support with structured output validation
   - OpenAI-compatible API server implementation
 
@@ -63,6 +62,7 @@ All notable changes to this project will be documented in this file.
 - **Deprecated Components**: Cleaned up old inference implementations
   - Removed outdated `surge_api.py`, `surge_eval.py`, `surge_generation.py` test files
   - Removed obsolete `loss_utils_test.py` from infrastructure
+- **Observability**: Removed the built-in eSurge web dashboard in favor of Prometheus + Grafana.
 
 ### Technical Details
 

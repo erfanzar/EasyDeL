@@ -202,7 +202,6 @@ class eSurgeAdapter(InferenceEngineAdapter):
         return {
             "name": self._model_name,
             "type": "esurge",
-            "architecture": type(self.esurge.model).__name__,
             "max_model_len": self.esurge.max_model_len,
             "max_num_seqs": self.esurge.max_num_seqs,
         }

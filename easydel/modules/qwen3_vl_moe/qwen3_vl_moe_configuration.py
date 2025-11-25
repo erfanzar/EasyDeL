@@ -12,24 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration classes for Qwen3-VL model.
+"""Configuration classes for Qwen3-VL-MoE model.
 
-This module provides configuration classes that mirror the HuggingFace Qwen3-VL
-implementation, with proper separation of vision and text configurations.
+This module provides configuration classes that combine vision-language capabilities
+from Qwen3-VL with Mixture of Experts (MoE) architecture from Qwen3-MoE.
 """
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from eformer.common_types import EMPTY, MODE_TRAIN, TP, ColumnWise, DynamicShardingAxes, Replicated, RowWise
+from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+from easydel.layers.moe.utils import get_moe_partition_spec
+
+logger = get_logger(__name__)
 
 
-@register_config("qwen3_vl_vision")
-class Qwen3VLVisionConfig(EasyDeLBaseConfig):
-    """Configuration class for Qwen3-VL vision encoder.
+class ExpertTensorParallel(DynamicShardingAxes):
+    """Expert Tensor Parallelism (EPxTP) sharding axes."""
+
+    axes: typing.ClassVar = [TP, EMPTY, EMPTY]
+    mode: typing.ClassVar = MODE_TRAIN
+
+
+@register_config("qwen3_vl_moe_vision")
+class Qwen3VLMoeVisionConfig(EasyDeLBaseConfig):
+    """Configuration class for Qwen3-VL-MoE vision encoder.
 
     This configuration controls the vision transformer backbone that processes
     images and videos before they are integrated with the language model.
@@ -51,7 +62,7 @@ class Qwen3VLVisionConfig(EasyDeLBaseConfig):
         initializer_range: Weight initialization std. Defaults to 0.02.
     """
 
-    model_type = "qwen3_vl_vision"
+    model_type = "qwen3_vl_moe_vision"
     base_config_key = "vision_config"
 
     def __init__(
@@ -93,21 +104,21 @@ class Qwen3VLVisionConfig(EasyDeLBaseConfig):
         self.embed_dim = hidden_size
 
 
-@register_config("qwen3_vl_text")
-class Qwen3VLTextConfig(EasyDeLBaseConfig):
-    """Configuration class for Qwen3-VL text/language model.
+@register_config("qwen3_vl_moe_text")
+class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
+    """Configuration class for Qwen3-VL-MoE text/language model with MoE.
 
     This configuration controls the language model decoder that processes
-    text tokens and integrates vision features.
+    text tokens and integrates vision features, with Mixture of Experts layers.
 
     Args:
         vocab_size: Size of vocabulary. Defaults to 151936.
-        hidden_size: Dimensionality of hidden states. Defaults to 4096.
-        intermediate_size: Dimensionality of MLP. Defaults to 22016.
-        num_hidden_layers: Number of decoder layers. Defaults to 32.
-        num_attention_heads: Number of attention heads. Defaults to 32.
-        num_key_value_heads: Number of KV heads for GQA. Defaults to 32.
-        head_dim: Dimension per attention head. Defaults to 128.
+        hidden_size: Dimensionality of hidden states. Defaults to 2048.
+        intermediate_size: Dimensionality of dense MLP. Defaults to 5632.
+        num_hidden_layers: Number of decoder layers. Defaults to 24.
+        num_attention_heads: Number of attention heads. Defaults to 16.
+        num_key_value_heads: Number of KV heads for GQA. Defaults to 16.
+        head_dim: Dimension per attention head. Auto-computed if None.
         hidden_act: Activation function. Defaults to "silu".
         max_position_embeddings: Maximum sequence length. Defaults to 128000.
         initializer_range: Weight initialization std. Defaults to 0.02.
@@ -121,20 +132,29 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         use_sliding_window: Whether to use sliding window attention. Defaults to False.
         sliding_window: Sliding window size. Defaults to 4096.
         max_window_layers: Layers using sliding window. Defaults to 80.
+        decoder_sparse_step: MoE layer frequency. Defaults to 1.
+        moe_intermediate_size: MoE expert hidden dimension. Defaults to 1408.
+        num_experts_per_tok: Active experts per token. Defaults to 4.
+        num_experts: Total number of experts. Defaults to 60.
+        norm_topk_prob: Normalize top-k probabilities. Defaults to False.
+        output_router_logits: Return router logits. Defaults to False.
+        router_aux_loss_coef: Router auxiliary loss coefficient. Defaults to 0.001.
+        mlp_only_layers: Layers using dense MLP instead of MoE. Defaults to None.
+        layer_types: Attention type per layer. Auto-computed if None.
     """
 
-    model_type = "qwen3_vl_text"
+    model_type = "qwen3_vl_moe_text"
     base_config_key = "text_config"
 
     def __init__(
         self,
         vocab_size: int = 151936,
-        hidden_size: int = 4096,
-        intermediate_size: int = 22016,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int = 32,
-        head_dim: int = 128,
+        hidden_size: int = 2048,
+        intermediate_size: int = 5632,
+        num_hidden_layers: int = 24,
+        num_attention_heads: int = 16,
+        num_key_value_heads: int = 16,
+        head_dim: int | None = None,
         hidden_act: str = "silu",
         max_position_embeddings: int = 128000,
         initializer_range: float = 0.02,
@@ -148,6 +168,16 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         use_sliding_window: bool = False,
         sliding_window: int = 4096,
         max_window_layers: int = 80,
+        # MoE-specific parameters
+        decoder_sparse_step: int = 1,
+        moe_intermediate_size: int = 1408,
+        num_experts_per_tok: int = 4,
+        num_experts: int = 60,
+        norm_topk_prob: bool = False,
+        output_router_logits: bool = False,
+        router_aux_loss_coef: float = 0.001,
+        mlp_only_layers: list[int] | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -157,7 +187,7 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
+        self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
@@ -167,31 +197,48 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        if rope_scaling is None:
-            rope_scaling = {}
         self.rope_scaling = rope_scaling
         self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window
+        self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
+
+        # MoE configuration
+        self.decoder_sparse_step = decoder_sparse_step
+        self.moe_intermediate_size = moe_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = num_experts
+        self.norm_topk_prob = norm_topk_prob
+        self.output_router_logits = output_router_logits
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
 
         # Handle rope_scaling type conversion for HF compatibility
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             rtype = self.rope_scaling["type"]
+            # Treat legacy/default+section or explicit mrope as mrope
             if rtype == "mrope" or ("mrope_section" in self.rope_scaling and rtype == "default"):
                 self.rope_scaling["type"] = "mrope"
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
 
-@register_config("qwen3_vl")
-class Qwen3VLConfig(EasyDeLBaseConfig):
-    """Main configuration class for Qwen3-VL multimodal model.
+@register_config("qwen3_vl_moe")
+class Qwen3VLMoeConfig(EasyDeLBaseConfig):
+    """Main configuration class for Qwen3-VL-MoE multimodal model.
 
-    This configuration combines vision and text configurations and provides
-    the top-level parameters for the multimodal model.
+    This configuration combines vision and text configurations with MoE support,
+    providing the top-level parameters for the multimodal model.
 
     Args:
-        vision_config: Vision encoder configuration dict or Qwen3VLVisionConfig.
-        text_config: Text decoder configuration dict or Qwen3VLTextConfig.
+        vision_config: Vision encoder configuration dict or Qwen3VLMoeVisionConfig.
+        text_config: Text decoder configuration dict or Qwen3VLMoeTextConfig.
         image_token_id: Token ID for image placeholders. Defaults to 151655.
         video_token_id: Token ID for video placeholders. Defaults to 151656.
         vision_start_token_id: Token ID for vision sequence start. Defaults to 151652.
@@ -199,17 +246,17 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         tie_word_embeddings: Whether to tie embeddings. Defaults to False.
     """
 
-    model_type = "qwen3_vl"
+    model_type = "qwen3_vl_moe"
     sub_configs: typing.ClassVar = {
-        "vision_config": Qwen3VLVisionConfig,
-        "text_config": Qwen3VLTextConfig,
+        "vision_config": Qwen3VLMoeVisionConfig,
+        "text_config": Qwen3VLMoeTextConfig,
     }
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
         self,
-        vision_config: typing.Mapping[str, typing.Any] | Qwen3VLVisionConfig | None = None,
-        text_config: typing.Mapping[str, typing.Any] | Qwen3VLTextConfig | None = None,
+        vision_config: typing.Mapping[str, typing.Any] | Qwen3VLMoeVisionConfig | None = None,
+        text_config: typing.Mapping[str, typing.Any] | Qwen3VLMoeTextConfig | None = None,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
         vision_start_token_id: int = 151652,
@@ -226,7 +273,6 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
-
         # Token IDs
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
@@ -234,7 +280,7 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         self.vision_end_token_id = vision_end_token_id
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def get_text_config(self, decoder: bool = True) -> Qwen3VLTextConfig:
+    def get_text_config(self, decoder: bool = True) -> Qwen3VLMoeTextConfig:
         """Get the text configuration for the model.
 
         Args:
@@ -246,7 +292,7 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         return self.text_config
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = False):
-        """Get partition rules for model parallelism."""
+        """Get partition rules for model parallelism combining vision and MoE sharding."""
         pmag = self.partition_manager
         return (
             # Text model embeddings
@@ -255,10 +301,40 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            # Text MLP
+            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
+            # Text dense MLP (non-MoE layers)
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+            # MoE router
+            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
+            (r"mlp/gate/bias", pmag.resolve(Replicated)),
+            # MoE experts
+            (
+                r"mlp/experts/(gate_proj|up_proj)/kernel",
+                get_moe_partition_spec(
+                    partition_manager=self.partition_manager,
+                    direction="column",
+                    tensors_are_expert=self.use_expert_tensor_mode,
+                    is_bias=False,
+                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+                    sp_is_ep_bound=self.sp_is_ep_bound,
+                    module_view=True,
+                ),
+            ),
+            (
+                r"mlp/experts/down_proj/kernel",
+                get_moe_partition_spec(
+                    partition_manager=self.partition_manager,
+                    direction="row",
+                    tensors_are_expert=self.use_expert_tensor_mode,
+                    is_bias=False,
+                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
+                    sp_is_ep_bound=self.sp_is_ep_bound,
+                    module_view=True,
+                ),
+            ),
+            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
             # Text norms
             (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
             # LM head
@@ -295,9 +371,16 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         mapping = {}
         if self.sliding_window is not None and self.use_sliding_window:
             for layer_idx in range(self.num_hidden_layers):
-                if layer_idx < self.max_window_layers:
+                if layer_idx >= self.max_window_layers:
                     mapping[layer_idx] = AttnMaskDetail(
                         mask_type=AttnMaskType.SLIDING,
                         size=self.sliding_window,
                     )
         return mapping
+
+
+__all__ = [
+    "Qwen3VLMoeConfig",
+    "Qwen3VLMoeTextConfig",
+    "Qwen3VLMoeVisionConfig",
+]

@@ -228,6 +228,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             causal: Whether to use causal (autoregressive) attention masking
         """
         super().__init__(config=config)
+
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -245,6 +246,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+
         self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -847,8 +849,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=getattr(self, "sliding_window", None),
+            sliding_window=self.sliding_window,
         )
+
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
         # 7. Compute attention
         attentions: AttentionLayerOutput = self.attention_performer.forward(
@@ -862,7 +867,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
-            sliding_window=getattr(self, "sliding_window", None),
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
         if attentions.cache_view is not None:
@@ -987,6 +993,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mask_info=mask_info,
         )
 
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -998,6 +1007,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
         # Merge heads and project output
@@ -1068,6 +1079,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         else:
             alibi_bias = self._compute_alibi_bias(key_states.shape[1])  # Use full KV length after cache
 
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
         # 8. Compute attention with ALiBi bias
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -1080,6 +1094,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
         # 9. Merge heads and output projection

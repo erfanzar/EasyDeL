@@ -1017,6 +1017,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],
             config=self.config,
             dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
             **kwargs,
         )
 
@@ -1317,6 +1318,34 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         self = unwrap_lora_to_layers(self, verbose=verbose)
         return self
 
+    def _get_reform_param(self) -> dict[str, tp.Any]:
+        """
+        Traverses the module tree to collect `reform_param` configurations from sub-modules.
+
+        Returns:
+            dict[str, tp.Any]: A dictionary mapping fully qualified parameter paths to their
+            reform configuration.
+        """
+        from easydel.utils import traversals
+
+        reform_param = {}
+        for path, module in traversals.iter_module_search(self, nn.Module):
+            if hasattr(module, "reform_param") and module.reform_param:
+                path_str = ".".join(map(str, path))
+                for key, value in module.reform_param.items():
+                    full_key = f"{path_str}.{key}" if path_str else key
+                    new_value = value.copy()
+                    new_splits = []
+                    for split in value["splits"]:
+                        new_split = split.copy()
+                        split_name = split["name"]
+                        new_split["name"] = f"{path_str}.{split_name}" if path_str else split_name
+                        new_splits.append(new_split)
+                    new_value["splits"] = new_splits
+
+                    reform_param[full_key] = new_value
+        return reform_param
+
     @property
     def transform_fn(self):
         """Creates a transformation function for converting HuggingFace state dicts to EasyDeL format.
@@ -1346,6 +1375,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             moe_path=moe_path,
             dtype=self.param_dtype,
             shard_fns=self._shard_fns,
+            reform_param=self._get_reform_param(),
         )
 
     @property
@@ -1608,6 +1638,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             moe_block_path=moe_block_path,
             moe_path=moe_path,
             dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
         )
 
     @property

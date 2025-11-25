@@ -493,7 +493,15 @@ _import_structure = {
         "Qwen3VLModel",
         "Qwen3VLTextModel",
         "Qwen3VisionTransformerPretrainedModel",
-        "Qwen3VLCausalLMOutputWithPast",
+    ],
+    "modules.qwen3_vl_moe": [
+        "Qwen3VLMoeConfig",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3VLMoeModel",
+        "Qwen3VLMoeTextConfig",
+        "Qwen3VLMoeTextModel",
+        "Qwen3VLMoeVisionConfig",
+        "Qwen3VLMoeVisionTransformerPretrainedModel",
     ],
     "modules.roberta": [
         "RobertaConfig",
@@ -568,8 +576,6 @@ _import_structure = {
         "SFTTrainer",
         "Trainer",
         "TrainingArguments",
-        "XPOConfig",
-        "XPOTrainer",
         "pack_sequences",
     ],
     "utils.parameters_transformation": [
@@ -748,13 +754,21 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
     from .modules.qwen3_vl import (
         Qwen3VisionTransformerPretrainedModel,
-        Qwen3VLCausalLMOutputWithPast,
         Qwen3VLConfig,
         Qwen3VLForConditionalGeneration,
         Qwen3VLModel,
         Qwen3VLTextConfig,
         Qwen3VLTextModel,
         Qwen3VLVisionConfig,
+    )
+    from .modules.qwen3_vl_moe import (
+        Qwen3VLMoeConfig,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel,
+        Qwen3VLMoeTextConfig,
+        Qwen3VLMoeTextModel,
+        Qwen3VLMoeVisionConfig,
+        Qwen3VLMoeVisionTransformerPretrainedModel,
     )
     from .modules.roberta import (
         RobertaConfig,
@@ -842,7 +856,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.84"]
-    _targeted_ejkernel_versions = ["0.0.17"]
+    _targeted_ejkernel_versions = ["0.0.20"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
