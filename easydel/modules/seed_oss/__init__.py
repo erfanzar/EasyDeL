@@ -17,7 +17,7 @@ from .seed_oss_configuration import SeedOssConfig
 
 __all__ = (
     "SeedOssConfig",
-    "SeedOssModel",
     "SeedOssForCausalLM",
     "SeedOssForSequenceClassification",
+    "SeedOssModel",
 )
