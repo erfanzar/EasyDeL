@@ -637,11 +637,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         Returns:
             EasyQuantizer: The quantizer instance.
         """
-        quant_method: str = self.config.kv_cache_quantization_method
-        block_size: int = self.config.kv_cache_quantization_blocksize
         quantizer_instance: EasyQuantizer = EasyQuantizer(
-            quantization_method=quant_method,
-            block_size=block_size,
+            quantization_config=self.config.kv_cache_quantization_config,
         )
         return quantizer_instance
 

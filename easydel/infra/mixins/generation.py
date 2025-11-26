@@ -330,9 +330,7 @@ class EasyGenerationMixin:
             metadata=metadata,
             partition_manager=self.config.partition_manager,
             quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
+                quantization_config=self.config.kv_cache_quantization_config,
             ),
         )
 
@@ -376,9 +374,7 @@ class EasyGenerationMixin:
                 pad_token_id=pad_token_id,
             ),
             quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
+                quantization_config=self.config.kv_cache_quantization_config,
             ),
             mesh=self.config.mesh,
             starts=starts,

@@ -276,6 +276,7 @@ class BlockSparseAttn(OperationImpl):
             sliding_window=sliding_window,
             causal=causal_computed,
             fused_backward=fused_backward,
+            cfg=self.metadata.get_operation_config("blocksparse"),
             mesh=self.metadata.mesh,
             out_specs=output_sharding,
             in_specs=(

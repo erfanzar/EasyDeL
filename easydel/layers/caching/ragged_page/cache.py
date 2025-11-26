@@ -350,10 +350,9 @@ class RaggedPagesCacheView(BaseCacheView):
         Returns:
             RaggedPagesCacheView: An initialized cache view for the specified layer.
         """
-        from easydel.infra.etils import EasyDeLQuantizationMethods
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
-        quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
+        quantizer = quantizer or EasyQuantizer(quantization_config=None)
         kv_pages_shape, axes = metadata.get_shape_and_axes()
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)

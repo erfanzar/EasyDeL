@@ -29,18 +29,68 @@ from eformer.escale import PartitionAxis
 from jax import numpy as jnp
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
-from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
+from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType
+from easydel.layers.quantization import EasyDeLQuantizationConfig
 
 from .trainer_types import TrainerConfig
 
 if tp.TYPE_CHECKING:
     from easydel.inference.sampling_params import SamplingParams
+    from ejkernel.modules.operations.configs import BaseOperationConfig
 
 DTypeLike = tp.Union[str, jnp.dtype, type, tp.Literal["fp8", "bf16", "fp16", "fp32"]]  # noqa
 PrecisionLike = tp.Union[str, jax.lax.Precision, None, tp.Literal["HIGH", "DEFAULT", "HIGHEST"]]  # noqa
 PartitionRules = tuple[tuple[str, Any], ...]
 DatasetTypeLike = tp.Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "tsv", "txt"]
+
+# Operation config type aliases - must match registered names in OperationRegistry
+OperationImplName = tp.Literal[
+    "flash_attn2",
+    "ring",
+    "blocksparse",
+    "ragged_page_attention_v2",
+    "ragged_page_attention_v3",
+    "sdpa",
+    "cudnn",
+    "cuda_flash_attn2",
+    "vanilla",
+    "autoregressive_decodeattn",
+]
+
+
+class OperationConfigsDict(TypedDict, total=False):
+    """Configuration dictionary for ejkernel operation overrides.
+
+    Maps operation implementation names to their corresponding config objects.
+    Keys must match the names registered in OperationRegistry (via get_impl_name()).
+    When a config is provided for an operation, it overrides ejkernel's autotune.
+    When None or not set, ejkernel will use its default autotune behavior.
+
+    Attributes:
+        flash_attn2: Config for flash attention 2 implementation.
+        ring: Config for ring attention.
+        blocksparse: Config for block sparse attention.
+        ragged_page_attention_v2: Config for ragged page attention v2.
+        ragged_page_attention_v3: Config for ragged page attention v3.
+        sdpa: Config for scaled dot product attention (also registered as cudnn, cuda_flash_attn2).
+        vanilla: Config for vanilla attention.
+
+    Example:
+        >>> from easydel import FlashAttentionConfig, RingAttentionConfig
+        >>> operation_configs: OperationConfigsDict = {
+        ...     "flash_attn2": FlashAttentionConfig(platform="triton"),
+        ...     "ring": RingAttentionConfig(),
+        ... }
+    """
+
+    flash_attn2: NotRequired["BaseOperationConfig | None"]
+    ring: NotRequired["BaseOperationConfig | None"]
+    blocksparse: NotRequired["BaseOperationConfig | None"]
+    ragged_page_attention_v2: NotRequired["BaseOperationConfig | None"]
+    ragged_page_attention_v3: NotRequired["BaseOperationConfig | None"]
+    sdpa: NotRequired["BaseOperationConfig | None"]
+    vanilla: NotRequired["BaseOperationConfig | None"]
 
 
 class ModelCfg(TypedDict, total=False):
@@ -137,31 +187,46 @@ class PlatformCfg(TypedDict, total=False):
     platform: NotRequired[EasyDeLPlatforms | None]
 
 
+class EasyDeLQuantizationCfg(TypedDict, total=False):
+    """Extended quantization config with pattern support for layer selection.
+
+    This config extends eformer's QuantizationConfig with an additional `pattern`
+    field for selecting which layers to quantize.
+
+    Attributes:
+        dtype: The quantization type (NF4, INT8, TERNARY, BINARY).
+        block_size: Block size for block-wise quantization.
+        simulate: If True, uses STE without actual bit packing (QAT mode).
+        use_kernel: If True, uses optimized TPU/GPU kernels when available.
+        pattern: Regex pattern for selecting layers to quantize.
+                Default excludes embedding and norm layers.
+
+    """
+
+    dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary"]]
+    block_size: NotRequired[int]
+    simulate: NotRequired[bool]
+    use_kernel: NotRequired[bool]
+    pattern: NotRequired[str]
+
+
 class QuantizationCfg(TypedDict, total=False):
     """Quantization configuration for model compression.
 
-    Supports both KV cache quantization and linear layer quantization with
-    separate configuration options for each.
+    Supports both KV cache quantization and model layer quantization
+    using EasyDeLQuantizationConfig.
 
     Attributes:
         platform: Target platform for quantization
-        method: KV cache quantization method to use
-        block_size: Block size for KV cache quantization (default: 128)
-        pattern: Custom quantization pattern (deprecated, use linear_pattern)
-        quantize_tensors: Whether to quantize tensors
-        linear_method: Linear layer quantization method
-        linear_pattern: Regex pattern selecting layers to quantize (default: ".*")
-        linear_block_size: Block size for linear layer quantization (default: 64)
+        kv_cache: KV cache quantization config
+        model: model layer quantization config
+        quantize_tensors: Whether to quantize tensors during loading
     """
 
     platform: NotRequired[EasyDeLPlatforms | None]
-    method: NotRequired[EasyDeLQuantizationMethods | None]
-    block_size: NotRequired[int]
-    pattern: NotRequired[str | None]
+    kv_cache: NotRequired[EasyDeLQuantizationConfig | EasyDeLQuantizationCfg | None]
+    model: NotRequired[EasyDeLQuantizationConfig | EasyDeLQuantizationCfg | None]
     quantize_tensors: NotRequired[bool]
-    linear_method: NotRequired[EasyDeLQuantizationMethods | None]
-    linear_pattern: NotRequired[str]
-    linear_block_size: NotRequired[int]
 
 
 class BaseCfg(TypedDict, total=False):
@@ -170,9 +235,13 @@ class BaseCfg(TypedDict, total=False):
     Attributes:
         values: Dictionary of base configuration values that get
                 passed to the model's config during initialization
+        operation_configs: ejkernel operation config overrides.
+                Maps implementation names (e.g., "flash_attn2", "ring") to
+                their config objects. When set, overrides ejkernel autotune.
     """
 
     values: NotRequired[EasyDeLBaseConfigDict | dict[str, Any]]
+    operation_configs: NotRequired[OperationConfigsDict | None]
 
 
 class eSurgeCfg(TypedDict, total=False):
@@ -238,11 +307,10 @@ class eSurgeCfg(TypedDict, total=False):
     detokenizer_max_states: NotRequired[int]
     tokenizer_endpoint: NotRequired[str | None]
     detokenizer_endpoint: NotRequired[str | None]
-    sampling_params_callback: NotRequired[
-        tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None
-    ]
+    sampling_params_callback: NotRequired[tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None]
     extra_eos_token_ids: NotRequired[list[int] | None]
     silent_mode: NotRequired[bool]
+
 
 class TextDatasetInformCfg(TypedDict, total=False):
     """Text dataset information configuration.

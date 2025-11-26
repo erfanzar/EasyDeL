@@ -40,7 +40,7 @@ class RunTimeConfig:
         default=None,
         metadata={"help": "The repository ID for the processor. If None, defaults to repo_id."},
     )
-    kv_cache_quantization: ed.EasyDeLQuantizationMethods = field(default=ed.EasyDeLQuantizationMethods.NONE)
+    kv_cache_quantization_config: ed.EasyDeLQuantizationConfig | None = field(default=None)
 
     dataset_use_rate: int = field(
         default=100,
@@ -121,11 +121,11 @@ def main():
             mask_max_position_embeddings=max_sequence_length,
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
-            kv_cache_quantization_method=runtime_config.kv_cache_quantization,
+            kv_cache_quantization_config=runtime_config.kv_cache_quantization_config,
             attn_mechanism=runtime_config.attn_mechanism,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        
         param_dtype=runtime_config.param_dtype,
         dtype=runtime_config.dtype,
         precision=jax.lax.Precision.DEFAULT,

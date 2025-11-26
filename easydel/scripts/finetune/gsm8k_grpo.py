@@ -43,7 +43,7 @@ class RunTimeConfig:
     xml_full_match_reward: float = field(default=0.5)
     xml_full_match_reject: float = field(default=0.0)
     correctness_reward: float = field(default=2.0)
-    kv_cache_quantization: ed.EasyDeLQuantizationMethods = field(default=ed.EasyDeLQuantizationMethods.NONE)
+    kv_cache_quantization_config: ed.EasyDeLQuantizationConfig | None = field(default=None)
 
     sharding_axis: str = field(
         default="1, -1, 1, 1, 1",
@@ -104,11 +104,11 @@ def main():
             mask_max_position_embeddings=grpo_config.max_sequence_length,
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
-            kv_cache_quantization_method=runtime_config.kv_cache_quantization,
+            kv_cache_quantization_config=runtime_config.kv_cache_quantization_config,
             attn_mechanism=runtime_config.attn_mechanism,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        
         param_dtype=runtime_config.param_dtype,
         dtype=runtime_config.dtype,
         precision=jax.lax.Precision.DEFAULT,

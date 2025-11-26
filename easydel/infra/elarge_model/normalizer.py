@@ -27,6 +27,7 @@ from typing import Any, cast
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.factory import TaskType
+from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
 
 from .defaults import DEFAULTS
 from .types import ELMConfig
@@ -161,17 +162,15 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
     set_maybe("fsdp_is_ep_bound", sharding.get("fsdp_is_ep_bound"))
     set_maybe("sp_is_ep_bound", sharding.get("sp_is_ep_bound"))
 
-    # KV cache quantization
-    if quant.get("method") is not None:
-        set_maybe("kv_cache_quantization_method", quant.get("method"))
-    set_maybe("kv_cache_quantization_blocksize", int(quant.get("block_size", 128)))
+    kv_quant = quant.get("kv_cache")
+    if kv_quant is not None:
+        kv_quant = EasyDeLQuantizationConfig(**kv_quant)
 
-    # Linear layer quantization
-    if quant.get("linear_method") is not None:
-        set_maybe("quantization_method", quant.get("linear_method"))
-    set_maybe("quantization_pattern", quant.get("linear_pattern"))
-    if quant.get("linear_block_size") is not None:
-        set_maybe("quantization_blocksize", int(quant.get("linear_block_size")))
+    # KV cache quantization config
+    set_maybe("kv_cache_quantization_config", kv_quant)
+
+    # model layer quantization config
+    set_maybe("quantization_config", quant.get("model"))
 
     base.setdefault("hardware_abstraction", True)
 
@@ -179,6 +178,10 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
         mlen = int(esurge["max_model_len"])
         set_maybe("mask_max_position_embeddings", mlen)
         set_maybe("freq_max_position_embeddings", mlen)
+
+    # Operation configs for ejkernel overrides
+    op_configs = cfg.get("base_config", {}).get("operation_configs")
+    set_maybe("operation_configs", op_configs)
 
     return cast(EasyDeLBaseConfigDict, base)
 

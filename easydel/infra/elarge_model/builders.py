@@ -28,6 +28,7 @@ from typing import Any
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
+from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
 from easydel.modules.auto import (
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,
@@ -76,7 +77,9 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
     config_kwargs.pop("partition_axis", None)
     config_kwargs.pop("backend", None)
     config_kwargs.pop("platform", None)
-
+    quant_model = quant.get("model")
+    if quant_model is not None:
+        quant_model = EasyDeLQuantizationConfig(**quant_model)
     return dict(
         pretrained_model_name_or_path=model["name_or_path"],
         device=loader.get("device"),
@@ -93,11 +96,8 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         config_kwargs=config_kwargs,
         auto_shard_model=bool(sharding.get("auto_shard_model", True)),
         partition_rules=sharding.get("partition_rules"),
-        quantization_platform=quant.get("platform"),
-        quantization_method=quant.get("method"),
-        quantization_block_size=int(quant.get("block_size", 128)),
-        quantization_pattern=quant.get("pattern"),
-        quantize_tensors=bool(quant.get("quantize_tensors", True)),
+        quantization_config=quant_model,
+        quantize_tensors=bool(quant.get("quantize_tensors", False)),
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
         **(model.get("extra_kwargs") or {}),

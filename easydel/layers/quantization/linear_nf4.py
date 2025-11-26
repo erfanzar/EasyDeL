@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+from eformer.ops.quantization import ArrayNF4
 from flax import nnx
 from flax.nnx import rnglib
-from flax.nnx.nn import dtypes, initializers
+from flax.nnx.nn import initializers
 from flax.typing import DotGeneralT, Dtype, Initializer, PrecisionLike
 from jax import lax
-
-from easydel.utils.compiling_utils import ejit
 
 from .base_quant import QauntModule
 
@@ -34,110 +33,18 @@ default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
 
-@ejit(static_argnames=["block_size"])
-def single_quantize_and_pack_nf4(blocks, block_size=64):
-    """
-    Combined quantization and packing for better performance.
-    Handles normalization, quantization, and packing in a single operation.
-    """
-    # Pad and reshape into blocks
-    blocks = blocks.reshape(-1, block_size)
-
-    # Compute absolute maximum for each block
-    absmax = jnp.max(jnp.abs(blocks), axis=1)
-
-    # Normalize blocks
-    normalized = blocks / absmax[:, None]
-
-    # Quantize using vectorized operations
-    quantized = (
-        jnp.searchsorted(
-            jnp.array(
-                [
-                    -float("inf"),
-                    -0.8480964004993439,
-                    -0.6106329262256622,
-                    -0.4599952697753906,
-                    -0.33967943489551544,
-                    -0.23460740596055984,
-                    -0.13791173323988914,
-                    -0.045525018125772476,
-                    0.03979014977812767,
-                    0.1202552504837513,
-                    0.2035212516784668,
-                    0.2920137718319893,
-                    0.3893125355243683,
-                    0.5016634166240692,
-                    0.6427869200706482,
-                    0.8614784181118011,
-                ],
-                dtype=jnp.float32,
-            ),
-            normalized.reshape(-1),
-        )
-        - 1
-    )
-
-    # Pack pairs efficiently using bit operations
-    quantized = quantized.reshape(-1, 2)
-    packed = (quantized[:, 0] << 4) | quantized[:, 1]
-
-    return packed.astype(jnp.uint8), absmax
-
-
-@ejit(static_argnames=["block_size"])
-def single_dequantize_nf4(packed_values, absmax, block_size):
-    """
-    Optimized dequantization combining unpacking and scaling in fewer operations.
-    """
-    high = (packed_values >> 4) & 0xF
-    low = packed_values & 0xF
-    unpacked = jnp.stack([high, low], axis=1).reshape(-1)
-
-    dequantized = jnp.array(
-        [
-            -1.0,
-            -0.6961928009986877,
-            -0.5250730514526367,
-            -0.39491748809814453,
-            -0.28444138169288635,
-            -0.18477343022823334,
-            -0.09105003625154495,
-            0.0,
-            0.07958029955625534,
-            0.16093020141124725,
-            0.24611230194568634,
-            0.33791524171829224,
-            0.44070982933044434,
-            0.5626170039176941,
-            0.7229568362236023,
-            1.0,
-        ],
-        dtype=jnp.float32,
-    )[unpacked]
-
-    num_blocks = len(absmax)
-    dequantized = dequantized.reshape(num_blocks, block_size)
-    scaled = dequantized * absmax[:, None]
-    return scaled
-
-
-@ejit(static_argnames=["block_size"])
-def quantize_and_pack_nf4(blocks, block_size=64):
-    if blocks.ndim > 2:
-        return jax.vmap(quantize_and_pack_nf4, in_axes=(0, None), out_axes=(0, 0))(blocks, block_size)
-    return single_quantize_and_pack_nf4(blocks, block_size)
-
-
-@ejit(static_argnames=["block_size"])
-def dequantize_nf4(packed_values, absmax, block_size):
-    if packed_values.ndim > 2:
-        return jax.vmap(dequantize_nf4, in_axes=(0, 0, None), out_axes=(0,))(packed_values, absmax, block_size)
-    return single_dequantize_nf4(packed_values, absmax, block_size)
+def _compute_padded_size(size: int, block_size: int) -> int:
+    """Compute the padded size to make it divisible by block_size."""
+    if size % block_size == 0:
+        return size
+    return size + (block_size - size % block_size)
 
 
 class LinearNF4(QauntModule):
-    """A 4-bit quantized version of the linear transformation using NF4 quantization."""
+    """A 4-bit quantized version of the linear transformation using NF4 quantization.
+
+    Uses eformer's ArrayNF4 implicit array for efficient 4-bit NormalFloat quantization.
+    """
 
     def __init__(
         self,
@@ -160,11 +67,10 @@ class LinearNF4(QauntModule):
             param_dtype=param_dtype,
             precision=precision,
         )
-        # Initialize the quant_kernel
         if do_init:
             kernel_key = rngs.params()
-            quant_kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
-            quant_kernel, quant_scales = self._quantize_kernel(quant_kernel)
+            kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
+            quant_kernel, quant_scales = self._quantize_kernel(kernel, block_size)
         else:
             quant_kernel, quant_scales = None, None
 
@@ -187,15 +93,18 @@ class LinearNF4(QauntModule):
         self.bias_init = bias_init
         self.dot_general = dot_general
         self.block_size = block_size
+        # Store padded dimensions for proper dequantization
+        self._padded_out_features = _compute_padded_size(out_features, block_size)
 
     @classmethod
     def from_linear(
         cls,
         linear: nnx.Linear,
         rngs: rnglib.Rngs | None = None,
-        block_size: int = 128,
+        block_size: int = 64,
         **kwargs,
     ) -> LinearNF4:
+        """Create a LinearNF4 module from a regular Linear module."""
         if rngs is None:
             rngs = nnx.Rngs(0)
 
@@ -225,6 +134,7 @@ class LinearNF4(QauntModule):
         return instance
 
     def to_linear(self, rngs: rnglib.Rngs | None = None) -> nnx.Linear:
+        """Convert this LinearNF4 module back to a regular Linear module."""
         if rngs is None:
             rngs = nnx.Rngs(0)
 
@@ -244,7 +154,7 @@ class LinearNF4(QauntModule):
         )
 
         dequantized_kernel = self._dequantize_kernel()
-        linear.quant_kernel = nnx.Param(dequantized_kernel)
+        linear.kernel = nnx.Param(dequantized_kernel)
 
         if self.use_bias:
             linear.bias = nnx.Param(self.bias.value)
@@ -252,56 +162,71 @@ class LinearNF4(QauntModule):
         return linear
 
     @staticmethod
-    def _quantize_kernel(quant_kernel, block_size):
-        """Quantize the quant_kernel weights using NF4."""
-        if quant_kernel is None or isinstance(quant_kernel, jax.ShapeDtypeStruct):
+    def _quantize_kernel(kernel, block_size):
+        """Quantize the kernel weights using eformer's ArrayNF4."""
+        if kernel is None or isinstance(kernel, jax.ShapeDtypeStruct):
             return None, None
-        return quantize_and_pack_nf4(quant_kernel, block_size)
+        quantized = ArrayNF4.quantize(kernel, block_size=block_size)
+        return quantized.packed, quantized.absmax
 
-    def _dequantize_kernel(self):  # in case someone's using tie word embedding.
-        """Dequantize the quant_kernel weights from NF4."""
-        if self.quant_kernel.value is None and self.quant_scales.value is None and self.block_size is None:
+    def _dequantize_kernel(self):
+        """Dequantize the kernel weights from NF4."""
+        if self.quant_kernel.value is None and self.quant_scales.value is None:
             return None
-        elif self.quant_scales.value is None and self.block_size is None:
-            return self.quant_kernel
-        return dequantize_nf4(
-            self.quant_kernel.value,
-            self.quant_scales.value,
-            self.block_size,
-        ).reshape(self.in_features, self.out_features)
+        elif self.quant_scales.value is None:
+            return self.quant_kernel.value
+
+        # Use padded shape for proper reconstruction
+        quantized = ArrayNF4(
+            packed=self.quant_kernel.value,
+            absmax=self.quant_scales.value,
+            block_size=self.block_size,
+            shape=(self.in_features, self._padded_out_features),
+            dtype=self.param_dtype,
+        )
+        dequantized = quantized.materialize()
+
+        # Slice back to original dimensions if padding was applied
+        if self._padded_out_features != self.out_features:
+            dequantized = dequantized[:, : self.out_features]
+
+        return dequantized
 
     @jax.named_scope("easydel-linear-nf4-call")
     def __call__(self, inputs: Array) -> Array:
         """Applies a quantized linear transformation to the inputs along the last dimension."""
-        quant_kernel = self._dequantize_kernel()
+        kernel = self._dequantize_kernel()
 
-        assert quant_kernel is not None, (
-            "loaded and dequantized quant_kernel is None, which means it have been loaded "
+        assert kernel is not None, (
+            "loaded and dequantized kernel is None, which means it has been loaded "
             "from another None Kernel Linear"
         )
 
-        bias = self.bias.value
+        if self.dtype is not None:
+            inputs = inputs.astype(self.dtype)
+            kernel = kernel.astype(self.dtype)
 
-        inputs, quant_kernel, bias = dtypes.promote_dtype((inputs, quant_kernel, bias), dtype=self.dtype)
-
-        y = self.dot_general(
+        out = self.dot_general(
             inputs,
-            quant_kernel,
+            kernel,
             (((inputs.ndim - 1,), (0,)), ((), ())),
             precision=self.precision,
         )
 
-        assert self.use_bias == (bias is not None)
-        if bias is not None:
-            y += jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
-        return y
+        if self.use_bias and self.bias.value is not None:
+            bias = self.bias.value
+            if self.dtype is not None:
+                bias = bias.astype(self.dtype)
+            out = out + jnp.reshape(bias, (1,) * (out.ndim - 1) + (-1,))
+
+        return out
 
     def get_kernel(self):
-        """Get the dequantized quant_kernel weights."""
+        """Get the dequantized kernel weights."""
         return self._dequantize_kernel()
 
     def get_quantized_kernel(self):
-        """Get the quantized quant_kernel weights and quant_scales."""
+        """Get the quantized kernel weights and scales."""
         return self.quant_kernel.value, self.quant_scales.value
 
     @staticmethod

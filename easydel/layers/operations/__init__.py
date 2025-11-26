@@ -47,6 +47,17 @@ Example:
     ... )
 """
 
+from ejkernel.modules.operations.configs import (
+    AttentionConfig,
+    BaseOperationConfig,
+    BlockSparseAttentionConfig,
+    FlashAttentionConfig,
+    RaggedPageAttentionv2Config,
+    RaggedPageAttentionv3Config,
+    RingAttentionConfig,
+    ScaledDotProductAttentionConfig,
+)
+
 from ._attention_outputs import AttentionOutput
 from ._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from .modules import (
@@ -61,16 +72,24 @@ from .modules import (
 )
 
 __all__ = (
+    "AttentionConfig",
     "AttentionOutput",
     "AutoRegressiveDecodeAttn",
+    "BaseOperationConfig",
+    "BlockSparseAttentionConfig",
     "BlockSparseAttn",
+    "FlashAttentionConfig",
     "FlashAttn",
     "OperationImpl",
     "OperationMetadata",
     "OperationRegistry",
+    "RaggedPageAttentionv2Config",
+    "RaggedPageAttentionv3Config",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
+    "RingAttentionConfig",
     "RingAttn",
+    "ScaledDotProductAttentionConfig",
     "ScaledDotProductAttn",
     "VanillaAttn",
 )

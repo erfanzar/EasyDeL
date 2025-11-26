@@ -93,13 +93,14 @@ from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
-from .etils import EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
+from .etils import EasyDeLGradientCheckPointers
 from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
     from easydel.layers.linear import ParallelLinear
+    from easydel.layers.quantization import EasyDeLQuantizationConfig
 
 
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
@@ -928,9 +929,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
 
     def quantize(
         self: Self,
-        method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
-        block_size: int = 128,
-        quantization_pattern: str | None = None,
+        quantization_config: EasyDeLQuantizationConfig | None = None,
         quantize_tensors: bool = True,
         verbose: bool | None = None,
     ) -> Self:
@@ -938,39 +937,34 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         Applies quantization to the module's linear layers or tensors.
 
         Args:
-            method (EasyDeLQuantizationMethods, optional): The quantization algorithm to use
-                (e.g., A8BIT, NF4). Defaults to EasyDeLQuantizationMethods.A8BIT.
-            block_size (int, optional): The block size for quantization methods that support it.
-                Defaults to 128.
-            quantization_pattern (tp.Optional[str], optional): A regular expression to match
-                parameter names that should be quantized. If None, uses a default pattern.
-                Defaults to None.
-            quantize_tensors (bool, optional): If True, quantizes the tensor values directly.
-                If False (currently default behavior in implementation), replaces Linear layers
-                with their quantized equivalents. Defaults to True (though implementation differs).
-            verbose (tp.Optional[bool], optional): If True, logs information during the quantization process.
+            quantization_config: The quantization configuration specifying dtype,
+                block_size, and pattern. If None, uses default INT8 quantization.
+            quantize_tensors: If True, quantizes the tensor values directly.
+                If False, replaces Linear layers with their quantized equivalents.
+            verbose: If True, logs information during the quantization process.
                 Defaults to True only on process index 0.
 
         Returns:
             Self: The quantized model instance.
-        """
-        from easydel.layers.quantization.quantizers import EasyQuantizer
 
-        quantizer = EasyQuantizer(
-            quantization_method=method,
-            block_size=block_size,
-            quantization_pattern=quantization_pattern,
-        )
+        Example:
+            >>> from easydel.layers.quantization import EasyDeLQuantizationConfig, QuantizationType
+            >>> config = EasyDeLQuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
+            >>> quantized_model = model.quantize(quantization_config=config)
+        """
+        from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
+
+        if quantization_config is None:
+            quantization_config = EasyDeLQuantizationConfig(dtype=QuantizationType.INT8)
+
+        quantizer = EasyQuantizer(quantization_config=quantization_config)
+
         if verbose is None:
             verbose = jax.process_index() == 0
         if quantize_tensors:
             ...
         else:
-            self = quantizer.quantize_linears(
-                self,
-                quantization_pattern=quantization_pattern,
-                verbose=verbose,
-            )
+            self = quantizer.quantize_linears(self, verbose=verbose)
         return self
 
     def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
@@ -1262,6 +1256,18 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         """
         for _, tensor in nn.iter_graph(self):
             if isinstance(tensor, nn.LoRAParam):
+                return True
+        return False
+
+    @property
+    def is_quantized(self):
+        from easydel.layers.quantization import Array8B, ArrayNF4, Linear8bit, LinearNF4
+
+        for _, tensor in nn.iter_graph(self):
+            if isinstance(tensor, (Linear8bit, LinearNF4)):
+                return True
+
+            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):
                 return True
         return False
 

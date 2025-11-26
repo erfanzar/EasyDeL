@@ -85,8 +85,9 @@ from jax.sharding import Mesh
 
 from easydel.layers.linear import ParallelLinear
 
+from easydel.layers.quantization import EasyDeLQuantizationConfig
+
 from ..base_config import EasyDeLBaseConfig
-from ..etils import EasyDeLQuantizationMethods
 from ..loss_utils import LossConfig, LossMetrics
 from ..modeling_outputs import (
     CausalLMOutput,
@@ -739,21 +740,19 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def quantize(
         self: Self,
-        method: EasyDeLQuantizationMethods,
-        skip_modules: list[str] | None = None,
-        verbose: bool = False,
-        **kwargs,
+        quantization_config: EasyDeLQuantizationConfig | None = None,
+        quantize_tensors: bool = True,
+        verbose: bool | None = None,
     ):
         """Quantizes the model's linear layers.
 
         Args:
-            method (EasyDeLQuantizationMethods, optional): The quantization method to use.
-            skip_modules (list[str] | None, optional): List of module names to skip.
-            verbose (bool, optional): Whether to print verbose output.
-            **kwargs: Additional keyword arguments.
+            quantization_config: Quantization configuration. Pass None to use default INT8.
+            quantize_tensors: Whether to quantize tensors directly.
+            verbose: Whether to print verbose output.
 
         Returns:
-            nn.Module: The quantized model.
+            The quantized model.
         """
 
     @abstractmethod

@@ -244,6 +244,7 @@ class RingAttn(OperationImpl):
             dtype=dtype_runtime,
             pdrop=pdrop,
             policy=policy,
+            cfg=self.metadata.get_operation_config("ring"),
             mesh=self.metadata.mesh,
             in_specs=(
                 query_sharding,

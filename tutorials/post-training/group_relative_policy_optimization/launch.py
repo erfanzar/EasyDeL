@@ -133,11 +133,11 @@ def main():
             attn_dtype=jnp.bfloat16,
             attn_softmax_dtype=jnp.bfloat16,
             kvdtype=jnp.bfloat16,
-            # kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
+            #  # Default
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
         ),
-        # quantization_method=ed.EasyDeLQuantizationMethods.NONE, # Default
+        #  # Default
         param_dtype=jnp.bfloat16,
         dtype=jnp.bfloat16,
         precision=jax.lax.Precision.DEFAULT,

@@ -56,7 +56,9 @@ model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
     "openai/whisper-large-v3",
     dtype=jnp.bfloat16,
     param_dtype=jnp.bfloat16,
-    quantization_method=ed.EasyDeLQuantizationMethods.A8BIT  # 8-bit quantization
+    quantization_config=ed.EasyDeLQuantizationConfig(
+        dtype=ed.QuantizationType.INT8  # 8-bit quantization
+    )
 )
 
 tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-large-v3")
@@ -254,7 +256,7 @@ ed.eSurgeApiServer(llava_engine, max_workers=4).fire(
 
 To optimize Whisper inference performance:
 
-1. **Quantization**: Use `quantization_method=ed.EasyDeLQuantizationMethods.A8BIT` for faster inference with minimal quality loss
+1. **Quantization**: Use `quantization_config=ed.EasyDeLQuantizationConfig(dtype=ed.QuantizationType.INT8)` for faster inference with minimal quality loss
 
 2. **Mixed Precision**: Use `dtype=jnp.bfloat16` and `param_dtype=jnp.bfloat16` for efficient computation
 

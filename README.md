@@ -268,7 +268,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # Create eSurge engine for high-performance inference
@@ -315,7 +314,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # Configure trainer
@@ -382,7 +380,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     ),
     partition_axis=ed.PartitionAxis(),  # Default partitioning
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # DPO is used to align models with human preferences (e.g., Llama 3, GPT-4)
@@ -435,7 +432,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # GRPO: Generate multiple completions and learn from relative rewards
@@ -501,8 +497,8 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         # MoE configuration (for MoE models)
         moe_method=ed.MoEMethods.FUSED_MOE,  # FUSED_MOE or STANDARD_MOE
 
-        # Quantization (for inference)
-        kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        # Quantization configs (optional - use EasyDeLQuantizationConfig for NF4/INT8)
+        # kv_cache_quantization_config=ed.EasyDeLQuantizationConfig(dtype=ed.QuantizationType.NF4),
     ),
     partition_axis=ed.PartitionAxis(
         batch_axis="dp",
@@ -510,7 +506,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         head_axis="tp",
         kv_head_axis="tp",
     ),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,  # or NF4, A8BIT
+    # quantization_config for model weights (optional - use EasyDeLQuantizationConfig)
 )
 ```
 
@@ -600,7 +596,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # Apply LoRA to specific layers (using regex)
@@ -652,13 +647,14 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         attn_mechanism=ed.AttentionMechanisms.AUTO,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # Quantize to 4-bit (NF4) by replacing linear layers
 model = model.quantize(
-    method=ed.EasyDeLQuantizationMethods.NF4,
-    block_size=256,
+    quantization_config=ed.EasyDeLQuantizationConfig(
+        dtype=ed.QuantizationType.NF4,
+        block_size=256,
+    ),
     quantize_tensors=False,
 )
 
@@ -720,7 +716,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         mask_max_position_embeddings=8192,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 # Create eSurge engine
@@ -1106,7 +1101,6 @@ model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
         attn_dtype=jnp.bfloat16,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 processor = AutoProcessor.from_pretrained(model_id)
@@ -1155,7 +1149,6 @@ model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
         attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
     ),
     partition_axis=ed.PartitionAxis(),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 )
 
 processor = AutoProcessor.from_pretrained(model_id)

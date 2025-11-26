@@ -11,8 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Re-export eformer quantization types for convenience
+from eformer.ops.quantization import Array8B, ArrayNF4, QuantizationConfig, QuantizationType, quantize, straight_through
+
 from .linear_8bit import Linear8bit
 from .linear_nf4 import LinearNF4
-from .quantizers import EasyQuantizer
+from .quantizers import EasyDeLQuantizationConfig, EasyQuantizer
 
-__all__ = "EasyQuantizer", "Linear8bit", "LinearNF4"
+__all__ = (
+    "Array8B",
+    "ArrayNF4",
+    "EasyDeLQuantizationConfig",
+    "EasyQuantizer",
+    "Linear8bit",
+    "LinearNF4",
+    "QuantizationConfig",
+    "QuantizationType",
+    "quantize",
+    "straight_through",
+)

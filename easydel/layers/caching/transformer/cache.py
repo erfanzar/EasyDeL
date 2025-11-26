@@ -581,10 +581,9 @@ class TransformerCache(BaseCache):
         quantizer: EasyQuantizer | None = None,
         mask_type_details: dict[int, AttnMaskDetail] | None = None,
     ):
-        from easydel.infra.etils import EasyDeLQuantizationMethods
         from easydel.layers.quantization.quantizers import EasyQuantizer
 
-        quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
+        quantizer = quantizer or EasyQuantizer(quantization_config=None)
         if dtype is None:
             dtype = jnp.bfloat16
         with mesh:

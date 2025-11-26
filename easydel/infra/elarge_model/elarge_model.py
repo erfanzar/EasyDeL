@@ -446,6 +446,56 @@ class eLargeModel:
         quant.update(kwargs)
         return self
 
+    def set_operation_configs(
+        self,
+        configs: Mapping[str, Any] | None = None,
+        **kwargs,
+    ) -> eLargeModel:
+        """Configure ejkernel operation overrides.
+
+        Allows overriding ejkernel's autotune behavior for specific attention
+        operations by providing explicit configuration objects. When a config
+        is provided, it's passed directly to the operation instead of using
+        ejkernel's autotune.
+
+        Args:
+            configs: Dictionary mapping operation names to config objects.
+                Valid operation names (must match OperationRegistry):
+                - "flash_attn2": Flash attention 2
+                - "ring": Ring attention
+                - "blocksparse": Block sparse attention
+                - "ragged_page_attention_v2": Ragged page attention v2
+                - "ragged_page_attention_v3": Ragged page attention v3
+                - "sdpa": Scaled dot product attention
+                - "vanilla": Vanilla attention
+            **kwargs: Individual operation configs as keyword arguments.
+                These are merged with the configs dict.
+
+        Returns:
+            Self for method chaining
+
+        Example:
+            >>> from easydel import FlashAttentionConfig, RingAttentionConfig
+            >>>
+            >>> # Using dict
+            >>> elm.set_operation_configs({
+            ...     "flash_attn2": FlashAttentionConfig(platform="triton"),
+            ...     "ring": RingAttentionConfig(),
+            ... })
+            >>>
+            >>> # Using kwargs
+            >>> elm.set_operation_configs(
+            ...     flash_attn2=FlashAttentionConfig(platform="pallas"),
+            ... )
+        """
+        base_cfg = self._config.setdefault("base_config", {})
+        op_configs = base_cfg.setdefault("operation_configs", {})
+
+        if configs is not None:
+            op_configs.update(configs)
+        op_configs.update(kwargs)
+        return self
+
     def set_esurge(
         self,
         max_model_len: int | None = None,

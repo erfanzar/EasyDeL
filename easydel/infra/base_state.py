@@ -81,7 +81,8 @@ if tp.TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from easydel.infra.base_config import EasyDeLBaseConfigDict
-    from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
+    from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+    from easydel.layers.quantization import EasyDeLQuantizationConfig
 
     from .base_module import EasyDeLBaseModule, PartitionLike
 
@@ -607,10 +608,7 @@ class EasyDeLState(struct.PyTreeNode):
         model_task: TaskType = TaskType.AUTO_BIND,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_platform: EasyDeLPlatforms | None = None,
-        quantization_method: EasyDeLQuantizationMethods | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
+        quantization_config: "EasyDeLQuantizationConfig | None" = None,
         quantize_tensors: bool = True,
         verbose: bool = True,
         tx_template: optax.GradientTransformation | None = None,
@@ -661,14 +659,8 @@ class EasyDeLState(struct.PyTreeNode):
             partition_rules:
                 Optional tuple of partition rules (regex, PartitionSpec) to explicitly define sharding.
                 Defaults to None (uses model config).
-            quantization_platform:
-                Platform for quantization (e.g., EasyDeLPlatforms.TPU). Defaults to None.
-            quantization_method:
-                Quantization method (e.g., EasyDeLQuantizationMethods.AQT). Defaults to None.
-            quantization_block_size:
-                Block size for quantization methods like GPTQ. Defaults to 128.
-            quantization_pattern:
-                Regex pattern to match tensor names for quantization. Defaults to None.
+            quantization_config:
+                Quantization configuration. Pass None to disable quantization.
             quantize_tensors:
                 If True, applies quantization to the loaded tensors. Defaults to True.
             verbose:
@@ -723,10 +715,7 @@ class EasyDeLState(struct.PyTreeNode):
             config_kwargs=config_kwargs,
             auto_shard_model=auto_shard_model,
             partition_rules=partition_rules,
-            quantization_platform=quantization_platform,
-            quantization_method=quantization_method,
-            quantization_block_size=quantization_block_size,
-            quantization_pattern=quantization_pattern,
+            quantization_config=quantization_config,
             quantize_tensors=quantize_tensors,
             verbose=verbose,
             **kwargs,

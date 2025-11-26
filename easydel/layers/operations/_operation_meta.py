@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import typing as tp
 from typing import NamedTuple
 
@@ -12,8 +13,16 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+if tp.TYPE_CHECKING:
+    from ejkernel.modules.operations.configs import BaseOperationConfig
+
+    from easydel.infra.base_config import EasyDeLBaseConfig
+    from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+else:
+    EasyDeLPlatforms = enum.Enum | str
+    EasyDeLBackends = enum.Enum | str
+    EasyDeLBaseConfig = object
+    BaseOperationConfig = object
 
 logger = get_logger("EasyDeL-OperationOperator")
 NOT_GIVEN = common_types.NOT_GIVEN
@@ -103,6 +112,7 @@ class OperationMetadata:
     partition_manager: PartitionManager = NOT_GIVEN
 
     base_config: EasyDeLBaseConfig | None = None
+    operation_configs: dict[str, BaseOperationConfig] | None = None
 
     _stored_mesh: jax.sharding.Mesh | None = NOT_GIVEN
 
@@ -116,6 +126,9 @@ class OperationMetadata:
         Finally, it performs a safety check to ensure no essential attributes remain
         uninitialized (as Ellipsis).
         """
+
+        from easydel.infra.etils import EasyDeLBackends
+
         # fmt:off
         self.set_attrs_carefully("runtime_dtype",  jnp.float32, "attn_dtype")
         self.set_attrs_carefully("runtime_softmax_dtype", jnp.float32, "attn_softmax_dtype")
@@ -126,6 +139,7 @@ class OperationMetadata:
         self.set_attrs_carefully("backend", jax.default_backend(), "backend")
         self.set_attrs_carefully("platform", NOT_GIVEN, "platform")
         self.set_attrs_carefully("_stored_mesh", NOT_GIVEN, "mesh")
+        self.set_attrs_carefully("operation_configs", None, "operation_configs")
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
             mesh: jax.sharding.Mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
@@ -171,6 +185,7 @@ class OperationMetadata:
             backend=config.backend,
             partition_axis=config.partition_axis,
             base_config=config,
+            operation_configs=getattr(config, "operation_configs", None),
         )
 
     @property
@@ -301,3 +316,33 @@ class OperationMetadata:
             should_use_default: bool = self.base_config is None or not use_base_config
             new_value: tp.Any = default if should_use_default else getattr(self.base_config, pn, default)
             setattr(self, attr_name, new_value)
+
+    def get_operation_config(self, impl_name: str) -> "BaseOperationConfig | None":
+        """Get ejkernel config for a specific operation by its registered name.
+
+        Args:
+            impl_name: The operation implementation name (must match OperationRegistry).
+                Valid names:
+                - "flash_attn2": Flash attention 2 implementation
+                - "ring": Ring attention
+                - "blocksparse": Block sparse attention
+                - "ragged_page_attention_v2": Ragged page attention v2
+                - "ragged_page_attention_v3": Ragged page attention v3
+                - "sdpa": Scaled dot product attention
+                - "vanilla": Vanilla attention
+
+        Returns:
+            The operation config if set, otherwise None (which enables ejkernel autotune).
+
+        Example:
+            >>> cfg = metadata.get_operation_config("flash_attn2")
+            >>> if cfg is not None:
+            ...     # Use explicit config
+            ...     flash_attention(..., cfg=cfg)
+            >>> else:
+            ...     # Use autotune
+            ...     flash_attention(..., cfg=None)
+        """
+        if self.operation_configs is None:
+            return None
+        return self.operation_configs.get(impl_name)
