@@ -278,8 +278,6 @@ engine = ed.eSurge(
     max_num_seqs=8,  # Continuous batching with 8 sequences
 )
 
-# Start the background scheduler
-engine.initiate()
 
 # Stream tokens (delta text updates)
 for output in engine.stream(
@@ -668,7 +666,6 @@ engine = ed.eSurge(
     max_num_seqs=4,
 )
 
-engine.initiate()
 ```
 
 ### Gradient Checkpointing
@@ -725,8 +722,6 @@ engine = ed.eSurge(
     max_model_len=4096,
     max_num_seqs=16,  # Handle 16 concurrent requests
 )
-
-engine.initiate()
 
 # Create and run API server
 api_server = ed.eSurgeApiServer(
@@ -837,7 +832,6 @@ tools = [
 ]
 
 # Stream a chat response that is aware of tools (tool execution is up to you)
-# Assumes `engine.initiate()` has been called
 messages = [{"role": "user", "content": "What's the weather in Paris?"}]
 for chunk in engine.chat(
     messages,
@@ -915,36 +909,13 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 )
 ```
 
-### 🚀 Custom Training Loops
-
-```python
-# Not locked into trainer APIs - write custom training loops
-import easydel as ed
-import jax
-
-def custom_train_step(state, batch):
-    def loss_fn(params):
-        logits = state.apply_fn(params, batch["input_ids"])
-        # Your custom loss logic here
-        return your_custom_loss(logits, batch["labels"])
-
-    grad_fn = jax.value_and_grad(loss_fn)
-    loss, grads = grad_fn(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss
-
-# Full control over optimization
-for batch in dataloader:
-    state, loss = custom_train_step(state, batch)
-```
-
 ### 🔮 Flexible Configuration
 
 ```python
 # Every aspect is configurable
-from easydel import EasyDeLBaseConfigDict
+from easydel import LlamaConfig
 
-config = EasyDeLBaseConfigDict(
+config = LlamaConfig(
     attn_mechanism="flash_attn2",        # Choose attention
     gradient_checkpointing="checkpoint_dots",  # Memory strategy
     platform="triton",                   # Kernel backend
@@ -953,7 +924,7 @@ config = EasyDeLBaseConfigDict(
     # ... and 50+ more options
 )
 
-    model = LlamaForCausalLM(config=config, rngs=rngs)
+model = LlamaForCausalLM(config=config, rngs=rngs)
 ```
 
 ### Performance Without Complexity
@@ -1221,7 +1192,7 @@ EasyDeL is released under the Apache License 2.0. See the [LICENSE](LICENSE) fil
 
 - Built on top of [JAX](https://github.com/google/jax), [Flax](https://github.com/google/flax), and [Flax NNX](https://flax.readthedocs.io/en/latest/nnx/index.html)
 - Base idea of Model implementations inspired by [HuggingFace Transformers](https://github.com/huggingface/transformers)
-- Trainer implementations based on [TRL](https://github.com/huggingface/trl)
+- Trainer implementations are inspired from [TRL](https://github.com/huggingface/trl)
 - Inference optimizations inspired by [vLLM](https://github.com/vllm-project/vllm)
 
 ---
