@@ -33,7 +33,7 @@ def main():
     processor = AutoTokenizer.from_pretrained(model_id)
     processor.pad_token_id = processor.eos_token_id
 
-    # Create eSurge instance instead of vSurge
+    # Create eSurge instance for evaluation
     surge = ed.eSurge(
         model=model_id,
         tokenizer=processor,
@@ -43,7 +43,6 @@ def main():
         reserve_tokens=800,  # Reserve tokens for generation safety
         auto_truncate_prompt=True,  # Auto-truncate if prompt too long
         auto_cap_new_tokens=True,  # Auto-cap generation to fit context
-        bytecode_decode=True,  # Enable smart UTF-8 handling
         compile_runner=True,  # Pre-compile for better performance
         esurge_name="esurge-eval",
         runner_verbose=False,

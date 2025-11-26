@@ -54,7 +54,7 @@ class SFTConfig(TrainingArguments):
         metadata={"help": "default prefix name for trainer."},
     )
     dataset_text_field: str | None = field(
-        default=None,
+        default="text",
         metadata={"help": "Name of the text field of the dataset."},
     )
     add_special_tokens: bool = field(

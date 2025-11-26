@@ -84,7 +84,7 @@ Here's a simple example to get started with eSurge:
         auto_shard_model=True,
         sharding_axis_dims=(1, 1, 1, -1, 1),
         config_kwargs=ed.EasyDeLBaseConfigDict(
-            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
+            attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
             attn_dtype=jnp.bfloat16,
         ),
     )
@@ -224,8 +224,16 @@ Starting the Server
     # Start monitoring (optional)
     engine.start_monitoring()
 
-    # Launch API server
-    server = ed.eSurgeApiServer(engine)
+    # Launch API server (API keys optional)
+    server = ed.eSurgeApiServer(
+        engine,
+        require_api_key=True,                 # Optional: enforce keys at runtime
+        api_keys={"demo-key": {"label": "UI"}},  # Pre-provisioned keys
+    )
+
+    # Additional keys can be issued programmatically
+    print("Generated key:", server.generate_api_key(label="notebook"))
+
     server.fire(host="0.0.0.0", port=8000)
 
 The server provides OpenAI-compatible endpoints:
@@ -247,7 +255,7 @@ Once the server is running, you can use any OpenAI-compatible client:
 
     client = openai.OpenAI(
         base_url="http://localhost:8000/v1",
-        api_key="not-required",  # eSurge doesn't require API keys
+        api_key="demo-key",  # Matches the key configured on the server
     )
 
     response = client.chat.completions.create(
@@ -263,18 +271,27 @@ Once the server is running, you can use any OpenAI-compatible client:
     for chunk in response:
         print(chunk.choices[0].delta.content, end="")
 
+API keys may be supplied via ``Authorization: Bearer <key>``, ``X-API-Key``, or
+an ``api_key`` query parameter. If ``require_api_key`` is ``False`` (the
+default), clients can still connect without a key, but registered keys will
+collect per-client prompt/completion token usage.
+
 Monitoring and Metrics
 ----------------------
 
 eSurge provides comprehensive monitoring capabilities:
+
+When API key enforcement is enabled, the ``/metrics`` endpoint includes an
+``api_key_usage`` section that reports prompt and completion token totals for
+each registered key, making it easy to attribute usage per client.
 
 Console Monitoring
 ~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
-    # Start console monitoring
-    engine.start_monitoring()
+    # Start Prometheus exporter and console monitor
+    engine.start_monitoring(enable_console=True)
 
     # The console will display:
     # - Request throughput
@@ -283,31 +300,18 @@ Console Monitoring
     # - Cache hit rates
     # - Active request count
 
-Web Dashboard
-~~~~~~~~~~~~~
+Grafana / Prometheus
+~~~~~~~~~~~~~~~~~~~~
 
-Launch an interactive web dashboard:
-
-.. code-block:: python
-
-    from easydel.inference.esurge import eSurgeWebDashboard
-
-    dashboard = eSurgeWebDashboard(engine)
-    dashboard.launch(port=7860)
-
-Prometheus Metrics
-~~~~~~~~~~~~~~~~~~
-
-Export metrics for Prometheus:
+Export metrics for Prometheus and visualize in Grafana:
 
 .. code-block:: python
-
-    from easydel.inference.esurge import start_monitoring_server
 
     # Start Prometheus metrics server
-    monitoring_server = start_monitoring_server(engine, port=9090)
+    engine.start_monitoring(prometheus_port=9090)
 
     # Access metrics at http://localhost:9090/metrics
+    # Add this URL as a Prometheus data source in Grafana
 
 Performance Tuning
 ------------------
@@ -447,7 +451,7 @@ Improve performance by:
 Handle long-running requests:
 
 - Increase timeout values in sampling parameters
-- Monitor request queue with dashboard
+- Monitor request queue with Prometheus + Grafana
 - Implement request preemption for fairness
 
 Best Practices
@@ -516,7 +520,7 @@ Complete example of a chat application:
             param_dtype=jnp.bfloat16,
             auto_shard_model=True,
             config_kwargs=ed.EasyDeLBaseConfigDict(
-                attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION,
+                attn_mechanism=ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
             ),
         )
 
@@ -684,43 +688,6 @@ Example of a batch processing service:
     if __name__ == "__main__":
         asyncio.run(main())
 
-Migration Guide
----------------
-
-From vInference to eSurge
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-If you're migrating from vInference to eSurge:
-
-.. code-block:: python
-
-    # Old vInference code
-    from easydel.inference import vInference
-
-    engine = vInference(
-        model=model,
-        processor=tokenizer,
-        generation_config=config,
-    )
-
-    # New eSurge code
-    from easydel.inference.esurge import eSurge
-
-    engine = eSurge(
-        model=model,
-        tokenizer=tokenizer,
-        max_model_len=config.max_length,
-        max_num_seqs=16,  # New parameter for concurrency
-        hbm_utilization=0.9,  # Better memory control
-    )
-
-Key differences:
-
-- eSurge uses ``tokenizer`` instead of ``processor``
-- More granular configuration options
-- Built-in support for continuous batching
-- Improved memory management with paged attention
-
 Performance Comparison
 ----------------------
 
@@ -729,19 +696,19 @@ eSurge vs Other Engines
 
 Performance characteristics compared to other inference engines:
 
-+------------------+----------+----------+-----------+-------------+
-| Metric           | eSurge   | vLLM     | TGI       | vInference  |
-+==================+==========+==========+===========+=============+
-| TPU Support      | ✅ Native| ⚠️ Limited  | ❌ None   | ✅ Native   |
-+------------------+----------+----------+-----------+-------------+
-| Paged Attention  | ✅ Yes   | ✅ Yes   | ✅ Yes    | ❌ No       |
-+------------------+----------+----------+-----------+-------------+
-| Prefix Caching   | ✅ Yes   | ✅ Yes   | ⚠️ Limited| ❌ No       |
-+------------------+----------+----------+-----------+-------------+
-| JAX/Flax Native  | ✅ Yes   | ❌ No    | ❌ No     | ✅ Yes      |
-+------------------+----------+----------+-----------+-------------+
-| Continuous Batch | ✅ Yes   | ✅ Yes   | ✅ Yes    | ⚠️ Limited  |
-+------------------+----------+----------+-----------+-------------+
++------------------+----------+----------+-----------+
+| Metric           | eSurge   | vLLM     | TGI       |
++==================+==========+==========+===========+
+| TPU Support      | ✅ Native| ⚠️ Limited  | ❌ None   |
++------------------+----------+----------+-----------+
+| Paged Attention  | ✅ Yes   | ✅ Yes   | ✅ Yes    |
++------------------+----------+----------+-----------+
+| Prefix Caching   | ✅ Yes   | ✅ Yes   | ⚠️ Limited|
++------------------+----------+----------+-----------+
+| JAX/Flax Native  | ✅ Yes   | ❌ No    | ❌ No     |
++------------------+----------+----------+-----------+
+| Continuous Batch | ✅ Yes   | ✅ Yes   | ✅ Yes    |
++------------------+----------+----------+-----------+
 
 Future Roadmap
 --------------

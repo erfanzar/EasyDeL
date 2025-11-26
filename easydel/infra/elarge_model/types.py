@@ -22,7 +22,7 @@ system, providing type safety and documentation for configuration schemas.
 from __future__ import annotations
 
 import typing as tp
-from typing import Any, NotRequired, Required, TypedDict
+from typing import Any, Literal, NotRequired, Required, TypedDict
 
 import jax
 from eformer.escale import PartitionAxis
@@ -33,6 +33,9 @@ from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuanti
 from easydel.infra.factory import TaskType
 
 from .trainer_types import TrainerConfig
+
+if tp.TYPE_CHECKING:
+    from easydel.inference.sampling_params import SamplingParams
 
 DTypeLike = tp.Union[str, jnp.dtype, type, tp.Literal["fp8", "bf16", "fp16", "fp32"]]  # noqa
 PrecisionLike = tp.Union[str, jax.lax.Precision, None, tp.Literal["HIGH", "DEFAULT", "HIGHEST"]]  # noqa
@@ -52,7 +55,25 @@ class ModelCfg(TypedDict, total=False):
 
     name_or_path: Required[str]
     tokenizer: NotRequired[str]
-    task: NotRequired[TaskType | str]
+    task: NotRequired[
+        TaskType
+        | str
+        | Literal[
+            "causal-language-model",
+            "vision-language-model",
+            "diffusion-language-model",
+            "image-text-to-text",
+            "base-module",
+            "vision-module",
+            "sequence-to-sequence",
+            "speech-sequence-to-sequence",
+            "zero-shot-image-classification",
+            "sequence-classification",
+            "audio-classification",
+            "image-classification",
+            "auto-bind",
+        ]
+    ]
     extra_kwargs: NotRequired[dict[str, Any]]
 
 
@@ -84,20 +105,24 @@ class ShardingCfg(TypedDict, total=False):
         dcn_axis_dims: Data center network axis dimensions
         axis_names: Names for sharding axes (e.g., ("dp", "fsdp", "ep", "tp", "sp"))
         partition_axis: Custom partition axis configuration
-        shard_attention_computation: Whether to shard attention computation
         shard_fns: Custom sharding functions
         auto_shard_model: Enable automatic model sharding
         partition_rules: Custom partition rules for layer names
+        use_ring_of_experts: Whether to dispatch experts with ring topology
+        fsdp_is_ep_bound: Fold FSDP axis into expert axis when building expert meshes
+        sp_is_ep_bound: Fold sequence-parallel axis into expert axis for MoE
     """
 
     axis_dims: NotRequired[tp.Sequence[int]]
     dcn_axis_dims: NotRequired[tp.Sequence[int]]
     axis_names: NotRequired[tp.Sequence[str]]
     partition_axis: NotRequired[PartitionAxis | None]
-    shard_attention_computation: NotRequired[bool]
     shard_fns: NotRequired[tp.Mapping[tuple, tp.Callable[..., Any]] | dict]
     auto_shard_model: NotRequired[bool]
     partition_rules: NotRequired[PartitionRules]
+    use_ring_of_experts: NotRequired[bool]
+    fsdp_is_ep_bound: NotRequired[bool]
+    sp_is_ep_bound: NotRequired[bool]
 
 
 class PlatformCfg(TypedDict, total=False):
@@ -115,12 +140,18 @@ class PlatformCfg(TypedDict, total=False):
 class QuantizationCfg(TypedDict, total=False):
     """Quantization configuration for model compression.
 
+    Supports both KV cache quantization and linear layer quantization with
+    separate configuration options for each.
+
     Attributes:
         platform: Target platform for quantization
-        method: Quantization method to use
-        block_size: Block size for block-wise quantization (default: 128)
-        pattern: Custom quantization pattern
+        method: KV cache quantization method to use
+        block_size: Block size for KV cache quantization (default: 128)
+        pattern: Custom quantization pattern (deprecated, use linear_pattern)
         quantize_tensors: Whether to quantize tensors
+        linear_method: Linear layer quantization method
+        linear_pattern: Regex pattern selecting layers to quantize (default: ".*")
+        linear_block_size: Block size for linear layer quantization (default: 64)
     """
 
     platform: NotRequired[EasyDeLPlatforms | None]
@@ -128,6 +159,9 @@ class QuantizationCfg(TypedDict, total=False):
     block_size: NotRequired[int]
     pattern: NotRequired[str | None]
     quantize_tensors: NotRequired[bool]
+    linear_method: NotRequired[EasyDeLQuantizationMethods | None]
+    linear_pattern: NotRequired[str]
+    linear_block_size: NotRequired[int]
 
 
 class BaseCfg(TypedDict, total=False):
@@ -145,52 +179,70 @@ class eSurgeCfg(TypedDict, total=False):
     """eSurge inference engine configuration.
 
     Attributes:
-        max_model_len: Maximum sequence length for the model
-        min_input_pad: Minimum padding for input sequences (default: 16)
-        max_num_seqs: Maximum number of concurrent sequences (default: 32)
-        hbm_utilization: HBM memory utilization ratio (default: 0.80)
-        page_size: Page size for paged attention (default: 128)
-        enable_prefix_caching: Enable prefix caching optimization
-        verbose: Enable verbose eSurge output
+        max_model_len: Maximum sequence length for the model.
+        min_input_pad: Minimum padding for input sequences (default: 16).
+        max_num_seqs: Maximum number of concurrent sequences (default: 256).
+        max_num_batched_tokens: Optional cap on total tokens per batch.
+        hbm_utilization: HBM memory utilization ratio (default: 0.85).
+        page_size: Page size for paged attention (default: 128).
+        use_aot_forward: Use ahead-of-time compiled forward pass.
+        enable_prefix_caching: Enable prefix caching optimization.
+        auto_shard_model: Enable automatic model sharding.
+        sharding_axis_dims: Sharding axis dimensions (default: (1, 1, 1, -1, 1)).
+        compile_runner: Compile the runner helpers on startup.
+        runner_verbose: Enable verbose runner logs (alias: verbose).
+        verbose: Legacy alias for runner_verbose.
+        overlap_execution: Enable overlapping scheduler and execution (experimental).
+        sampler_metrics: Enable sampler-side metrics collection.
+        esurge_name: Optional engine display name.
+        reserve_tokens: Tokens reserved from the context budget.
+        auto_truncate_prompt: Allow automatic prompt truncation.
+        auto_cap_new_tokens: Cap requested new tokens to fit context.
+        strict_context: Raise on context violations instead of auto-fixing.
+        truncate_mode: Truncation strategy ("left", "right", "middle").
+        prefer_preserve_prompt: Prefer preserving prompt before truncating it.
+        decode_truncated_prompt: Re-decode truncated prompts for text fidelity.
+        destroy_pages_on_pause: Destroy cache pages when pausing the engine.
+        detokenizer_max_states: Maximum states kept in the detokenizer worker.
+        tokenizer_endpoint: External tokenizer worker endpoint.
+        detokenizer_endpoint: External detokenizer worker endpoint.
+        sampling_params_callback: Optional hook to mutate SamplingParams per request.
+        extra_eos_token_ids: Additional EOS token IDs applied globally.
+        silent_mode: Suppress informational eSurge engine logs.
     """
 
     max_model_len: NotRequired[int]
     min_input_pad: NotRequired[int]
     max_num_seqs: NotRequired[int]
+    max_num_batched_tokens: NotRequired[int | None]
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]
-    enable_prefix_caching: NotRequired[bool]
     use_aot_forward: NotRequired[bool]
+    enable_prefix_caching: NotRequired[bool]
+    auto_shard_model: NotRequired[bool]
+    sharding_axis_dims: NotRequired[tp.Sequence[int]]
+    compile_runner: NotRequired[bool]
+    runner_verbose: NotRequired[bool]
     verbose: NotRequired[bool]
-
-
-class vSurgeCfg(TypedDict, total=False):
-    """vSurge inference engine configuration.
-
-    Attributes:
-        max_concurrent_decodes: Maximum number of concurrent decode calls (default: device count)
-        max_concurrent_prefill: Maximum number of concurrent prefill steps (default: 1)
-        prefill_lengths: Custom prefill lengths as int or list of ints
-        max_prefill_length: Maximum tokens during prefill phase (default: max_length // 2)
-        max_length: Maximum sequence length for decoding
-        interleaved_mode: Enable interleaved decoding and prefill scheduling
-        slot_clear_steps: Steps after which stale memory slots are cleared (default: 0)
-        bytecode_decode: Enable bytecode decoding for handling malformed UTF-8
-        verbose: Enable verbose vSurge output
-        seed: Random seed for consistent decoding (default: 894)
-    """
-
-    max_concurrent_decodes: NotRequired[int]
-    max_concurrent_prefill: NotRequired[int]
-    prefill_lengths: NotRequired[int | list[int]]
-    max_prefill_length: NotRequired[int]
-    max_length: NotRequired[int]
-    interleaved_mode: NotRequired[bool]
-    slot_clear_steps: NotRequired[int]
-    bytecode_decode: NotRequired[bool]
-    verbose: NotRequired[bool]
-    seed: NotRequired[int]
-
+    overlap_execution: NotRequired[bool]
+    sampler_metrics: NotRequired[bool]
+    esurge_name: NotRequired[str | None]
+    reserve_tokens: NotRequired[int | None]
+    auto_truncate_prompt: NotRequired[bool]
+    auto_cap_new_tokens: NotRequired[bool]
+    strict_context: NotRequired[bool]
+    truncate_mode: NotRequired[tp.Literal["left", "right", "middle"]]
+    prefer_preserve_prompt: NotRequired[bool]
+    decode_truncated_prompt: NotRequired[bool]
+    destroy_pages_on_pause: NotRequired[bool]
+    detokenizer_max_states: NotRequired[int]
+    tokenizer_endpoint: NotRequired[str | None]
+    detokenizer_endpoint: NotRequired[str | None]
+    sampling_params_callback: NotRequired[
+        tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None
+    ]
+    extra_eos_token_ids: NotRequired[list[int] | None]
+    silent_mode: NotRequired[bool]
 
 class TextDatasetInformCfg(TypedDict, total=False):
     """Text dataset information configuration.
@@ -383,7 +435,6 @@ class ELMConfig(TypedDict, total=False):
         base_config: Base model configuration values
         mixture: Data mixture configuration for training/evaluation datasets
         esurge: eSurge inference engine configuration
-        vsurge: vSurge inference engine configuration
         trainer: Training configuration
         eval: Evaluation configuration for lm-evaluation-harness
 
@@ -408,7 +459,7 @@ class ELMConfig(TypedDict, total=False):
         ...     "teacher_model": {"name_or_path": "meta-llama/Llama-2-13b"},  # For distillation
         ...     "reference_model": {"name_or_path": "meta-llama/Llama-2-7b-instruct"},  # For DPO
         ...     "loader": {"dtype": "bf16", "param_dtype": "fp32"},
-        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1), "shard_attention_computation": True},
+        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)},
         ...     "mixture": {
         ...         "informs": [
         ...             {"type": "json", "data_files": "train/*.json", "format_fields": {"prompt": "text"}},
@@ -436,6 +487,5 @@ class ELMConfig(TypedDict, total=False):
     base_config: NotRequired[BaseCfg]
     mixture: NotRequired[DataMixtureCfg]
     esurge: NotRequired[eSurgeCfg]
-    vsurge: NotRequired[vSurgeCfg]
     trainer: NotRequired[TrainerConfig]
     eval: NotRequired[EvalKwargs]

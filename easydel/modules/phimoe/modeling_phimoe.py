@@ -24,14 +24,13 @@ from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import PartitionSpec
 from jaxtyping import Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits, with_sharding_constraint
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.caching import (
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -131,223 +130,29 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         return checkpoint_name(down, "mlp_output")
 
 
-class PhiMoEAttention(AttentionModule):
-    """PhiMoE Attention module.
-
-    This module implements the multi-head attention mechanism used in the PhiMoE model,
-    which is similar to the one in Phi-3. It supports Grouped Query Attention (GQA)
-    and Rotary Position Embeddings (RoPE), including scaling options.
-
-    Attributes:
-        config (PhiMoeConfig): Configuration object for the model.
-        layer_idx (int): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        attention_dropout (float): Dropout probability for attention scores.
-        hidden_size (int): Dimensionality of the hidden states.
-        num_heads (int): Number of attention query heads.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_heads (int): Number of attention key/value heads (for GQA).
-        num_key_value_groups (int): Number of query head groups for each key/value head.
-        max_position_embeddings (int): Maximum sequence length supported by RoPE.
-        original_max_position_embeddings (int): Original max sequence length for RoPE scaling.
-        rope_theta (float): Base value for RoPE frequency calculation.
-        rope_scaling (dict): Configuration for RoPE scaling.
-        is_causal (bool): Whether the attention is causal (always True for this implementation).
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for the output projection.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        rotary (RoPE): Rotary position embedding module.
-    """
+class PhiMoEAttention(UnifiedAttention):
+    """PhiMoE attention powered by UnifiedAttention with optional sharding constraint."""
 
     def __init__(
         self,
         config: PhiMoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the PhiMoEAttention module.
-
-        Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            layer_idx (int): Index of the current layer.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            ValueError: If `hidden_size` is not divisible by `num_heads`.
-        """
-        super().__init__(config=config)
-        self.layer_idx = layer_idx
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.original_max_position_embeddings = config.rope_scaling.get("original_max_position_embeddings", None)
-        self.rope_theta = config.rope_theta
-        self.rope_scaling = config.rope_scaling
-        self.is_causal = True
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-
-        column_parallel_linear = functools.partial(
-            ColumnParallelLinear,
+        super().__init__(
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        row_parallel_linear = functools.partial(
-            RowParallelLinear,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-
-        self.q_proj = column_parallel_linear(config.hidden_size, config.num_attention_heads * self.head_dim, rngs=rngs)
-        self.k_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.v_proj = column_parallel_linear(config.hidden_size, config.num_key_value_heads * self.head_dim, rngs=rngs)
-        self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
-
-        self.sliding_window = config.sliding_window
-
-        self.attention_performer = FlexibleAttentionModule(
             rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=config.attention_dropout,
-        )
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=config.hidden_size // config.num_attention_heads,
-            rotary_dim=config.hidden_size // config.num_attention_heads,
-            is_neox_style=True,
-        )
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the PhiMoEAttention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
-            checkpoint_name(self.q_proj(hidden_states), "attn_query"),
-            checkpoint_name(self.k_proj(hidden_states), "attn_key"),
-            checkpoint_name(self.v_proj(hidden_states), "attn_value"),
-        )
-
-        query_states = query_states.reshape(batch_size, sequence_length, self.config.num_attention_heads, self.head_dim)
-        key_states = key_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim)
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-            sliding_window=self.sliding_window,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
+            layer_idx=layer_idx,
+            attention_type="standard",
             causal=True,
-            sliding_window=self.sliding_window,
-        )
-
-        attn_output = self._merge_heads(attentions.attention_outputs)
-        if self.config.shard_attention_computation:
-            attn_output = with_sharding_constraint(
-                arr=attn_output,
-                sharding=PartitionSpec(
-                    self.config.partition_axis.batch_axis,
-                    (self.config.partition_axis.sequence_axis if attn_output.shape[1] != 1 else None),
-                    self.config.partition_axis.hidden_state_axis,
-                ),
-            )
-        attn_output = checkpoint_name(self.o_proj(attn_output), "attn_output")
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+            sliding_window=config.sliding_window,
         )
 
 
@@ -372,12 +177,12 @@ class PhiMoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
         config: PhiMoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the PhiMoeSparseMoeBlock module.
 
@@ -498,12 +303,12 @@ class PhiMoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: PhiMoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the PhiMoeDecoderLayer.
 
@@ -530,19 +335,19 @@ class PhiMoeDecoderLayer(nn.Module):
         )
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.block_sparse_moe = mlp_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size,
@@ -770,7 +575,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -785,10 +590,7 @@ class PhiMoeModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (

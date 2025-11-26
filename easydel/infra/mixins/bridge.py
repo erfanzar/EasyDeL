@@ -658,9 +658,6 @@ class EasyBridgeMixin(PushToHubMixin):
             fns.update(shard_fns)
             shard_fns = fns
 
-        elif auto_shard_model and shard_fns is not None:
-            logger.warning("`auto_shard_model` will be ignored since `shard_fns` is provided.")
-
         resolved_archive_file = None
         if pretrained_model_name_or_path:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
@@ -750,12 +747,24 @@ class EasyBridgeMixin(PushToHubMixin):
                             except Exception as e:
                                 raise RuntimeError(f"Downloaded sharded index but failed to fetch shards: {e}") from e
 
+            if not local_files_only and not is_local:
+                api.snapshot_download(
+                    repo_id=pretrained_model_name_or_path,
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    token=token,
+                    local_files_only=local_files_only,
+                )
+
             if is_local:
                 logger.debug(f"loading weights file {archive_file}")
                 resolved_archive_file = str(archive_file)
                 filename = os.path.basename(str(archive_file))
             else:
                 logger.debug(f"loading weights file {filename} from cache at {resolved_archive_file}")
+
         cls = get_modules_by_type(config.model_type, cls._model_task)[1]
         model = cls.lazy_init(
             config=config,
@@ -764,7 +773,6 @@ class EasyBridgeMixin(PushToHubMixin):
             precision=precision,
             rngs=nn.Rngs(0),
         )
-
         model = cls._load_model_weights(
             resolved_archive_file,
             model,
@@ -803,7 +811,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 )
             except OSError:
                 logger.info("Generation config file not found, using a generation config created from the model config.")
-
+        if auto_shard_model:
+            # double check to make sure weights are correct or just a simple non-op.
+            model = model.shard_model(partition_rules=partition_rules)
         return model
 
     @classmethod
@@ -818,7 +828,6 @@ class EasyBridgeMixin(PushToHubMixin):
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -884,7 +893,6 @@ class EasyBridgeMixin(PushToHubMixin):
             partition_axis=partition_axis,
             backend=backend,
             platform=platform,
-            shard_attention_computation=shard_attention_computation,
             **config_kwargs,
         )
 
@@ -917,7 +925,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
                 partition_axis=partition_axis,
-                shard_attention_computation=shard_attention_computation,
                 backend=backend,
                 platform=platform,
                 config_kwargs=config_kwargs,

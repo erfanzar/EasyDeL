@@ -90,7 +90,6 @@ class BaseAutoEasyModel:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -121,7 +120,6 @@ class BaseAutoEasyModel:
             sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for the
                 model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
             platform (tp.Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
@@ -166,7 +164,6 @@ class BaseAutoEasyModel:
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
                 partition_axis=partition_axis,
-                shard_attention_computation=shard_attention_computation,
                 shard_fns=shard_fns,
                 backend=backend,
                 platform=platform,
@@ -193,7 +190,6 @@ class BaseAutoEasyModel:
                 sharding_dcn_axis_dims=sharding_dcn_axis_dims,
                 sharding_axis_names=sharding_axis_names,
                 partition_axis=partition_axis,
-                shard_attention_computation=shard_attention_computation,
                 shard_fns=shard_fns,
                 backend=backend,
                 platform=platform,
@@ -221,7 +217,6 @@ class BaseAutoEasyModel:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -254,7 +249,6 @@ class BaseAutoEasyModel:
             sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions.
                 Defaults to None.
             backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
@@ -289,7 +283,6 @@ class BaseAutoEasyModel:
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
             partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
             shard_fns=shard_fns,
             backend=backend,
             platform=platform,
@@ -317,7 +310,6 @@ class BaseAutoEasyModel:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -350,7 +342,6 @@ class BaseAutoEasyModel:
             sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions.
                 Defaults to None.
             backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
@@ -385,7 +376,6 @@ class BaseAutoEasyModel:
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
             partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
             shard_fns=shard_fns,
             backend=backend,
             platform=platform,
@@ -541,7 +531,6 @@ class BaseAutoEasyState:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -568,7 +557,6 @@ class BaseAutoEasyState:
             sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
             shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for
                 the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
             backend (tp.Optional[str], optional): Backend to use for the model. Defaults to None.
@@ -609,7 +597,6 @@ class BaseAutoEasyState:
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             config_kwargs=config_kwargs,
             device=device,
-            shard_attention_computation=shard_attention_computation,
             from_torch=from_torch,
             **kwargs,
         )
@@ -659,6 +646,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 
 
 class AutoStateForCausalLM(BaseAutoEasyState):
+    """Loads saved states for causal language modeling tasks."""
+
     _base = AutoEasyDeLModelForCausalLM
 
 
@@ -677,6 +666,8 @@ class AutoEasyDeLModelForDiffusionLM(BaseAutoEasyModel):
 
 
 class AutoStateForDiffusionLM(BaseAutoEasyState):
+    """Loads saved states for diffusion-based language models."""
+
     _base = AutoEasyDeLModelForDiffusionLM
 
 
@@ -695,6 +686,8 @@ class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
 
 
 class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
+    """Loads saved states for zero-shot image classification models."""
+
     _base = AutoEasyDeLModelForZeroShotImageClassification
 
 
@@ -737,6 +730,8 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 
 
 class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
+    """Loads saved states for speech-to-text sequence-to-sequence models."""
+
     _base = AutoEasyDeLModelForSpeechSeq2Seq
 
 
@@ -754,6 +749,8 @@ class AutoEasyDeLModelForSeq2SeqLM(BaseAutoEasyModel):
 
 
 class AutoStateForSeq2SeqLM(BaseAutoEasyState):
+    """Loads saved states for text-to-text sequence-to-sequence models."""
+
     _base = AutoEasyDeLModelForSeq2SeqLM
 
 
@@ -771,6 +768,8 @@ class AutoEasyDeLModelForImageTextToText(BaseAutoEasyModel):
 
 
 class AutoStateForImageTextToText(BaseAutoEasyState):
+    """Loads saved states for image-conditioned text-to-text models."""
+
     _base = AutoEasyDeLModelForImageTextToText
 
 
@@ -788,6 +787,8 @@ class AutoEasyDeLModelForSequenceClassification(BaseAutoEasyModel):
 
 
 class AutoStateForImageSequenceClassification(BaseAutoEasyState):
+    """Loads saved states for image-conditioned sequence classification."""
+
     _base = AutoEasyDeLModelForSequenceClassification
 
 
@@ -805,6 +806,8 @@ class AutoEasyDeLModel(BaseAutoEasyModel):
 
 
 class AutoState(BaseAutoEasyState):
+    """Loads saved states for generic text-only EasyDeL modules."""
+
     _base = AutoEasyDeLModel
 
 
@@ -822,4 +825,6 @@ class AutoEasyDeLVisionModel(BaseAutoEasyModel):
 
 
 class AutoStateVisionModel(BaseAutoEasyState):
+    """Loads saved states for vision-only EasyDeL modules."""
+
     _base = AutoEasyDeLVisionModel

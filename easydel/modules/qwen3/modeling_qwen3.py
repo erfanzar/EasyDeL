@@ -26,10 +26,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    BaseModelOutput,
-    DecoderLayerOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -179,8 +176,6 @@ class Qwen3Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-
         super().__init__(
             config,
             dtype,
@@ -189,10 +184,10 @@ class Qwen3Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
             use_qk_norm=True,
+            layer_idx=layer_idx,
         )
-
-        self.layer_idx = layer_idx
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
@@ -263,11 +258,11 @@ class Qwen3DecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -490,7 +485,7 @@ class Qwen3Model(EasyDeLBaseModule):
             inputs_embeds: Float[Array, "batch seq_len hidden_dim"] = checkpoint_name(
                 self.embed_tokens(input_ids.astype("i4")), "embeddings"
             )
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions: tuple[Float[Array, ...], ...] | None = () if output_attentions else None
         all_hidden_states: tuple[Float[Array, "batch seq_len hidden_dim"], ...] | None = (
@@ -508,10 +503,7 @@ class Qwen3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states: Float[Array, "batch seq_len hidden_dim"] = inputs_embeds
         if mode is None:

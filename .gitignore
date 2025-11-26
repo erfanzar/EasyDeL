@@ -8,6 +8,7 @@ execute_command.sh
 *.so
 *.slurm
 *.gz
+*.txt
 env.ipynb
 env.py
 exp.py

@@ -207,8 +207,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: str | jax.lax.Precision | None = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
         attention_type: Literal["standard", "mla", "alibi"] = "standard",
         causal: bool = True,
+        sliding_window: int | tuple[int, int] | None = None,
         use_qk_norm: bool = False,
         use_fused_qkv: bool = False,
         use_gqa: bool = False,
@@ -226,13 +228,17 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             causal: Whether to use causal (autoregressive) attention masking
         """
         super().__init__(config=config)
+
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
 
+        self.layer_idx = layer_idx
+
         self.attention_type = attention_type
         self.causal = causal
+        self.sliding_window = sliding_window
         self.use_qk_norm = use_qk_norm
         self.use_fused_qkv = use_fused_qkv
         self.use_gqa = use_gqa
@@ -240,6 +246,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+
         self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -736,9 +743,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         """
         batch_size: int = hidden_states.shape[0]
         seq_len: int = hidden_states.shape[1]
-        merged: Float[Array, "batch_size seq_len hidden_dim"] = hidden_states.reshape(
-            batch_size, seq_len, self.num_heads * self.head_dim
-        )
+        merged = hidden_states.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         return merged
 
     def forward(
@@ -827,9 +832,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
         # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
-
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         (
@@ -846,8 +849,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=getattr(self, "sliding_window", None),
+            sliding_window=self.sliding_window,
         )
+
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
         # 7. Compute attention
         attentions: AttentionLayerOutput = self.attention_performer.forward(
@@ -861,19 +867,17 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
-            sliding_window=getattr(self, "sliding_window", None),
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
+        if attentions.cache_view is not None:
+            cache_view = attentions.cache_view
+
         # 8. Merge heads and output projection
-        attention_out_merged: Float[Array, "batch_size seq_len hidden_dim"] = self._merge_heads(
-            attentions.attention_outputs
-        )
-        attn_output_sharded: Float[Array, "batch_size seq_len hidden_dim"] = self.shard_attention_prod(
-            attention_out_merged
-        )
-        attn_output: Float[Array, "batch_size seq_len hidden_dim"] = checkpoint_name(
-            self.output_projection(attn_output_sharded), "attn_output"
-        )
+        attention_out = self._merge_heads(attentions.attention_outputs)
+        attn_output = self.shard_attention_prod(attention_out)
+        attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
         # 9. Optional residual dropout
         if hasattr(self, "resid_dropout"):
@@ -989,6 +993,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mask_info=mask_info,
         )
 
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -1000,6 +1007,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
         # Merge heads and project output
@@ -1070,6 +1079,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         else:
             alibi_bias = self._compute_alibi_bias(key_states.shape[1])  # Use full KV length after cache
 
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
         # 8. Compute attention with ALiBi bias
         attentions = self.attention_performer.forward(
             query_states=query_states,
@@ -1082,6 +1094,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=self.causal,
+            sliding_window=self.sliding_window,
+            softmax_aux=softmax_aux,
         )
 
         # 9. Merge heads and output projection

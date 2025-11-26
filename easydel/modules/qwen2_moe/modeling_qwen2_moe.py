@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from functools import partial
 
 import chex
@@ -62,6 +63,22 @@ from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig as 
 class Qwen2MoeMLPStack(nn.Module):
     """Qwen2Moe MoE MLP using the new ParallelMoELinear layers."""
 
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
+
     def __init__(
         self,
         config: Qwen2MoeConfig,
@@ -70,6 +87,7 @@ class Qwen2MoeMLPStack(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         self.config = config
@@ -222,6 +240,7 @@ class Qwen2MoeAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen2MoeAttention module.
 
@@ -232,16 +251,17 @@ class Qwen2MoeAttention(UnifiedAttention):
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
             rngs (nn.Rngs): Random number generators.
         """
-        # Set sliding window before super().__init__ so it's available during network definition
-        self.sliding_window = config.sliding_window if config.use_sliding_window else None
+
         super().__init__(
             config,
             dtype,
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window if config.use_sliding_window else None,
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -465,12 +485,12 @@ class Qwen2MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen2MoeDecoderLayer module.
 
@@ -508,6 +528,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -738,7 +759,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         all_hidden_states = ()
         all_router_logits = ()
         all_self_attns = ()
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -750,10 +771,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (

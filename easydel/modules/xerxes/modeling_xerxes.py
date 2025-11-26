@@ -48,18 +48,24 @@ logger = get_logger(__name__)
 
 
 class Identity(nn.Module):
+    """No-op module used as a placeholder when optional layers are disabled."""
+
     def __init__(self): ...
     def __call__(self, x):
         return x
 
 
 class PostCross(nn.Module):
+    """Applies a bounded tanh transform after cross attention."""
+
     def __init__(self): ...
     def __call__(self, x):
         return jax.nn.tanh(x / 30.0) * 30.0
 
 
 class XerxesMLP(nn.Module):
+    """Feed-forward network for Xerxes decoder blocks."""
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -155,12 +161,12 @@ class XerxesAttention(UnifiedAttention):
     ):
         # Set sliding window BEFORE super().__init__()
         self.is_local_attn = False
-        self.sliding_window = None
+        sliding_window = None
         if not config.xe_kvnorm:
-            self.sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
+            sliding_window = 4096 if bool((layer_idx % 2) == 0) else None
         if config.window_pattern is not None:
             self.is_local_attn = bool((layer_idx + 1) % config.window_pattern)
-            self.sliding_window = config.sliding_window if self.is_local_attn else None
+            sliding_window = config.sliding_window if self.is_local_attn else None
 
         self.xe_kvnorm = config.xe_kvnorm
 
@@ -170,8 +176,10 @@ class XerxesAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=sliding_window,
             use_qk_norm=True,
         )
 
@@ -220,6 +228,8 @@ class XerxesAttention(UnifiedAttention):
 
 
 class XerxesSparseMoeBlock(nn.Module):
+    """Sparse mixture-of-experts feed-forward block used in selected layers."""
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -287,6 +297,8 @@ class XerxesSparseMoeBlock(nn.Module):
 
 
 class XerxesDecoderLayer(nn.Module):
+    """Transformer decoder block with optional cross-attention and MoE."""
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -420,6 +432,8 @@ class XerxesDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=XerxesConfig, model_type="xerxes")
 class XerxesModel(EasyDeLBaseModule):
+    """Xerxes decoder stack wiring embeddings, decoder layers, and final norm."""
+
     def __init__(
         self,
         config: XerxesConfig,
@@ -524,7 +538,7 @@ class XerxesModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         inputs_embeds = inputs_embeds * self.embedding_scale
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -539,10 +553,7 @@ class XerxesModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (
@@ -629,6 +640,8 @@ class XerxesModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=XerxesConfig, model_type="xerxes")
 class XerxesForCausalLM(EasyDeLBaseModule):
+    """Xerxes language model with LM head for causal generation."""
+
     def __init__(
         self,
         config: XerxesConfig,

@@ -72,6 +72,7 @@ class InternLM2Attention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize InternLM2 attention."""
         super().__init__(
@@ -80,6 +81,7 @@ class InternLM2Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
             use_fused_qkv=True,
@@ -153,6 +155,7 @@ class InternLM2MLP(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the InternLM2MLP module.
 
@@ -235,6 +238,7 @@ class InternLM2Block(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the InternLM2Block module.
 
@@ -265,6 +269,7 @@ class InternLM2Block(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.feed_forward = mlp_block(
@@ -273,6 +278,7 @@ class InternLM2Block(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.attention_norm = RMSNorm(
             dim=config.hidden_size,
@@ -415,6 +421,7 @@ class InternLM2Model(EasyDeLBaseModule):
         self.layers = [
             InternLM2Block(
                 config=config,
+                layer_idx=i,
                 rngs=rngs,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -474,7 +481,7 @@ class InternLM2Model(EasyDeLBaseModule):
             inputs_embeds = self.tok_embeddings(input_ids.astype("i4"))
         else:
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
-        batch_size, sequence_length = inputs_embeds.shape[:2]
+        sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -483,10 +490,7 @@ class InternLM2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "

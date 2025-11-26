@@ -46,7 +46,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -457,12 +457,11 @@ class OPTLearnedPositionalEmbedding(nn.Module):
 
         # Create embedding parameter directly to match HuggingFace structure
         # HuggingFace uses 'weight' (PyTorch) which becomes 'kernel' in Flax
-        self.kernel = nn.Param(
-            embedding_init(
-                rngs.params(),
-                (num_embeddings + offset, features),
-                param_dtype,
-            )
+        self.kernel = ArrayParam.bound(
+            shape=(num_embeddings + offset, features),
+            dtype=param_dtype,
+            init_fn=embedding_init,
+            key=rngs.params(),
         )
 
     def __call__(self, inputs: chex.Array) -> chex.Array:

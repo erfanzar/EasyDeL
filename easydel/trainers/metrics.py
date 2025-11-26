@@ -129,10 +129,13 @@ class StepMetrics:
         Note:
             In performance mode, detailed metrics are skipped for efficiency.
         """
+
         step_time = time.time() - self.step_start_time
         total_time = time.time() - self.start_time
-
-        execution_time = metrics.execution_time
+        preprocessing_time = 0
+        if metrics.other_metrics is not None:
+            preprocessing_time = metrics.other_metrics.get("preprocessing_time", 0)
+        execution_time = metrics.execution_time - preprocessing_time
         flops = flops_per_token * seq_length
         total_flops = flops * batch_size
 

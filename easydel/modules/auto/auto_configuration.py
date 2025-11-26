@@ -58,6 +58,8 @@ def is_flatten(pytree: dict):
 
 
 class AutoEasyDeLConfig:
+    """Factory helpers to load EasyDeL configs from identifiers or checkpoints."""
+
     @staticmethod
     def bind_model_task(model_task: TaskType, architectures: list[str] | str):
         if model_task == TaskType.AUTO_BIND:
@@ -79,7 +81,6 @@ class AutoEasyDeLConfig:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         model_task: TaskType = TaskType.CAUSAL_LM,
@@ -95,7 +96,6 @@ class AutoEasyDeLConfig:
             pretrained_model_name_or_path: str: Identify the model in the huggingface model hub.
             sharding_axis_dims: tp.Sequence[int]: Specify the dimension of each axis in the sharded
                 model_tasking arrays in easydel.
-            shard_attention_computation: bool: whenever to use shard_map for attention.
             backend: tp.Optional[EasyDeLBackends] : backend to use for model.
                         model_task (TaskType): Task type of model load and find.
             from_torch: should config be loaded from torch models or not.
@@ -129,7 +129,6 @@ class AutoEasyDeLConfig:
             partition_axis=partition_axis,
             backend=backend,
             platform=platform,
-            shard_attention_computation=shard_attention_computation,
         )
         for k, v in kwargs.items():
             setattr(config, k, v)
@@ -222,7 +221,6 @@ class AutoShardAndGatherFunctions:
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
@@ -240,7 +238,6 @@ class AutoShardAndGatherFunctions:
             sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1, 1).
             sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_attention_computation: Whether to shard the attention computation. Defaults to True.
             backend: The backend to use for custom kernels. Defaults to None.
             partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
                 If None, uses the default partition rules from the `config`.
@@ -260,7 +257,6 @@ class AutoShardAndGatherFunctions:
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
             partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
             backend=backend,
             platform=platform,
             from_torch=from_torch,

@@ -42,7 +42,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     RaggedPagesCache,
@@ -173,7 +173,7 @@ class GiddAttention(AttentionModule):
         head_dim (int): Dimensionality of each attention head.
         use_qk_norm (bool): Whether to apply normalization to query and key vectors.
         qk_norm_eps (float): Epsilon value for numerical stability in QK normalization.
-        qk_scale (float or nn.Param): Scaling factor for attention scores.
+        qk_scale (float or ArrayParam): Scaling factor for attention scores.
         q_proj (ParallelLinear): Linear projection for queries.
         k_proj (ParallelLinear): Linear projection for keys.
         v_proj (ParallelLinear): Linear projection for values.
@@ -218,12 +218,15 @@ class GiddAttention(AttentionModule):
 
         if self.use_qk_norm:
             # Initialize learnable scale parameter for QK normalization
-            self.qk_scale = nn.Param(
-                jnp.full(
-                    (1, 1, self.config.num_attention_heads, 1),
+            self.qk_scale = ArrayParam.bound(
+                shape=(1, 1, self.config.num_attention_heads, 1),
+                dtype=self.param_dtype,
+                init_fn=lambda key, shape, dtype: jnp.full(
+                    shape,
                     2 * jnp.log(config.max_position_embeddings),
-                    dtype=self.param_dtype,
+                    dtype=dtype,
                 ),
+                key=rngs.params(),
             )
         else:
             # Fixed scale based on head dimension
@@ -504,7 +507,7 @@ class GiddRMSNorm(nn.Module):
         epsilon (float): Small constant for numerical stability.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        kernel (nn.Param): Learnable scale parameter.
+        kernel (ArrayParam): Learnable scale parameter.
     """
 
     kernel_init = staticmethod(nn.initializers.ones)
@@ -527,7 +530,12 @@ class GiddRMSNorm(nn.Module):
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
         self.param_dtype = param_dtype
-        self.kernel = nn.Param(jnp.zeros(self.config.hidden_size, dtype=param_dtype))
+        self.kernel = ArrayParam.bound(
+            shape=(self.config.hidden_size,),
+            dtype=param_dtype,
+            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            key=None,
+        )
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -832,7 +840,7 @@ class GiddModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         # Initialize outputs
         all_attentions = () if output_attentions else None
@@ -854,10 +862,7 @@ class GiddModel(EasyDeLBaseModule):
 
         # Generate position IDs if not provided
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         # Start with input embeddings
         hidden_states = inputs_embeds

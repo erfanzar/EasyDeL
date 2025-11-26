@@ -215,9 +215,9 @@ For more detailed output with timestamps:
 }
 ```
 
-## Running Whisper and vInference Together
+## Running Whisper and eSurge Together
 
-You can run both Whisper and vInference API servers together by using the respective server implementations:
+You can run both Whisper and eSurge API servers together by using the respective server implementations:
 
 ```python
 import easydel as ed
@@ -236,15 +236,15 @@ whisper_thread = threading.Thread(
 )
 whisper_thread.start()
 
-# Run the vInference server for other models
-llava_inference = ed.vInference(
+# Run the eSurge server for other models
+llava_engine = ed.eSurge(
     model=llava_model,
-    processor_class=llava_processor,
-    generation_config=ed.vInferenceConfig(max_new_tokens=1024),
-    inference_name="llava"
+    tokenizer=llava_processor,
+    max_model_len=4096,
+    max_num_seqs=8,
 )
 
-ed.vInferenceApiServer(llava_inference, max_workers=4).fire(
+ed.eSurgeApiServer(llava_engine, max_workers=4).fire(
     host="0.0.0.0",
     port=8001  # Different port from the Whisper server
 )

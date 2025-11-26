@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import typing
+
 import chex
 import jax
 from eformer import common_types
@@ -72,18 +74,20 @@ class MixtralAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize Mixtral attention with sliding window configuration."""
-        # Set sliding window before super().__init__ so it's available during network definition
-        self.sliding_window = config.sliding_window
+
         super().__init__(
             config,
             dtype,
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=config.sliding_window,
         )
 
     def _create_rotary(self, config: MixtralConfig, dtype: jnp.dtype):
@@ -93,6 +97,22 @@ class MixtralAttention(UnifiedAttention):
 
 class MixtralMoEMlp(nn.Module):
     """Mixtral MoE MLP using the new ParallelMoELinear layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "w1.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "w3.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "w2.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,
@@ -226,6 +246,7 @@ class MixtralDecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -250,6 +271,7 @@ class MixtralDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.block_sparse_moe = mlp_block(
@@ -391,8 +413,9 @@ class MixtralModel(EasyDeLBaseModule):
                 param_dtype=param_dtype,
                 precision=precision,
                 rngs=rngs,
+                layer_idx=idx,
             )
-            for _ in range(config.num_hidden_layers)
+            for idx in range(config.num_hidden_layers)
         ]
 
         self.norm = RMSNorm(
@@ -467,7 +490,7 @@ class MixtralModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -482,10 +505,7 @@ class MixtralModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

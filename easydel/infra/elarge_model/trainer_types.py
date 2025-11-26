@@ -60,7 +60,9 @@ class LossConfig(TypedDict, total=False):
 class BaseTrainerCfg(TypedDict, total=False):
     """Base configuration shared by all trainers (TrainingArguments)."""
 
-    trainer_type: NotRequired[Literal["sft", "base", "dpo", "grpo", "orpo", "reward", "distillation"]]
+    trainer_type: NotRequired[
+        Literal["sft", "base", "dpo", "grpo", "orpo", "reward", "distillation", "bco", "cpo", "gkd", "kto", "nash_md", "xpo"]
+    ]
     learning_rate: NotRequired[float]
     learning_rate_end: NotRequired[float | None]
     num_train_epochs: NotRequired[int]
@@ -151,6 +153,33 @@ class BaseTrainerCfg(TypedDict, total=False):
     pruning_module: NotRequired[Any]
 
     tx_mu_dtype: NotRequired[Any]
+
+    # Generation preview configuration
+    generation_top_p: NotRequired[float | None]
+    generation_top_k: NotRequired[int | None]
+    generation_temperature: NotRequired[float | None]
+    generation_do_sample: NotRequired[bool | None]
+    generation_num_return_sequences: NotRequired[int | None]
+    generation_max_new_tokens: NotRequired[int | None]
+    generation_shard_inputs: NotRequired[bool]
+    generation_interval: NotRequired[int | None]
+    generation_prompts: NotRequired[list[str | dict[str, Any]]]
+    generation_use_train_prompts: NotRequired[bool]
+    generation_num_prompts: NotRequired[int]
+    generation_dataset_prompt_field: NotRequired[str | None]
+    generation_extra_kwargs: NotRequired[dict[str, Any] | None]
+    generation_config_overrides: NotRequired[dict[str, Any] | None]
+    generation_seed: NotRequired[int | None]
+    generation_preview_print: NotRequired[bool]
+    generation_log_to_wandb: NotRequired[bool]
+
+    # eSurge integration for generation
+    use_esurge_generation: NotRequired[bool]
+    esurge_hbm_utilization: NotRequired[float | None]
+    esurge_max_num_seqs: NotRequired[int | None]
+    esurge_min_input_pad: NotRequired[int | None]
+    esurge_page_size: NotRequired[int | None]
+    esurge_silent_mode: NotRequired[bool]
 
 
 class DPOTrainerCfg(BaseTrainerCfg):
@@ -255,15 +284,373 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     alpha: NotRequired[float]
 
 
+class KTOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Kahneman-Tversky Optimization trainer (KTOConfig)."""
+
+    beta: NotRequired[float]
+    desirable_weight: NotRequired[float]
+    undesirable_weight: NotRequired[float]
+    loss_type: NotRequired[Literal["kto", "apo_zero_unpaired"]]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    is_encoder_decoder: NotRequired[bool | None]
+    disable_dropout: NotRequired[bool]
+    dataset_num_proc: NotRequired[int | None]
+    precompute_ref_log_probs: NotRequired[bool]
+
+
+class BCOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Binary Classifier Optimization trainer (BCOConfig)."""
+
+    beta: NotRequired[float]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    disable_dropout: NotRequired[bool]
+    generate_during_eval: NotRequired[bool]
+    is_encoder_decoder: NotRequired[bool | None]
+    precompute_ref_log_probs: NotRequired[bool]
+    model_init_kwargs: NotRequired[dict[str, Any] | None]
+    ref_model_init_kwargs: NotRequired[dict[str, Any] | None]
+    dataset_num_proc: NotRequired[int | None]
+    prompt_sample_size: NotRequired[int]
+    min_density_ratio: NotRequired[float]
+    max_density_ratio: NotRequired[float]
+
+
+class CPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Contrastive Preference Optimization trainer (CPOConfig)."""
+
+    beta: NotRequired[float]
+    label_smoothing: NotRequired[float]
+    loss_type: NotRequired[Literal["sigmoid", "hinge", "ipo", "simpo", "alphapo"]]
+    disable_dropout: NotRequired[bool]
+    cpo_alpha: NotRequired[float]
+    simpo_gamma: NotRequired[float]
+    alpha: NotRequired[float]
+    label_pad_token_id: NotRequired[int]
+    padding_value: NotRequired[int | None]
+    max_length: NotRequired[int | None]
+    max_prompt_length: NotRequired[int | None]
+    max_completion_length: NotRequired[int | None]
+    is_encoder_decoder: NotRequired[bool | None]
+    dataset_num_proc: NotRequired[int | None]
+
+
+class GKDTrainerCfg(SFTTrainerCfg):
+    """Configuration for Generalized Knowledge Distillation trainer (GKDConfig)."""
+
+    temperature: NotRequired[float]
+    lmbda: NotRequired[float]
+    beta: NotRequired[float]
+    max_new_tokens: NotRequired[int]
+    disable_dropout: NotRequired[bool]
+    seq_kd: NotRequired[bool]
+
+
+class NashMDTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Nash Mixture-of-Decoders trainer (NashMDConfig)."""
+
+    beta: NotRequired[float | list[float]]
+    mixture_coef: NotRequired[float | list[float]]
+    missing_eos_penalty: NotRequired[float | None]
+
+
+class XPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Exploratory Preference Optimization trainer (XPOConfig)."""
+
+    loss_type: NotRequired[Literal["sigmoid", "ipo"]]
+    beta: NotRequired[float | list[float]]
+    alpha: NotRequired[float | list[float]]
+    missing_eos_penalty: NotRequired[float | None]
+
+
 class TrainerConfig(
     ORPOTrainerCfg,
     GRPOTrainerCfg,
     SFTTrainerCfg,
     RewardTrainerCfg,
     DistillationTrainerCfg,
+    KTOTrainerCfg,
+    BCOTrainerCfg,
+    CPOTrainerCfg,
+    GKDTrainerCfg,
+    NashMDTrainerCfg,
+    XPOTrainerCfg,
     BaseTrainerCfg,
     DPOTrainerCfg,
 ): ...
+
+
+# =============================================================================
+# Modular Defaults Registry
+# =============================================================================
+
+BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
+    "learning_rate": 5e-5,
+    "num_train_epochs": 10,
+    "total_batch_size": 32,
+    "gradient_accumulation_steps": 1,
+    "optimizer": "adamw",
+    "scheduler": "none",
+    "warmup_steps": 0,
+    "weight_decay": 0.01,
+    "dataloader_num_workers": 0,
+    "dataloader_pin_memory": False,
+    "remove_unused_columns": True,
+    "shuffle_train_dataset": True,
+    "shuffle_seed_train": 64871,
+    "use_data_collactor": True,
+    "use_grain": True,
+    "offload_dataset": False,
+    "offload_device_type": "cpu",
+    "offload_device_index": 0,
+    "do_train": True,
+    "do_eval": False,
+    "do_last_save": True,
+    "is_fine_tuning": True,
+    "init_tx": True,
+    "train_on_inputs": True,
+    "aux_loss_enabled": False,
+    "resume_if_possible": True,
+    "truncation_mode": "keep_end",
+    "max_sequence_length": 4096,
+    "save_directory": "EasyDeL-Checkpoints",
+    "save_optimizer_state": True,
+    "remove_ckpt_after_load": False,
+    "log_steps": 10,
+    "report_steps": 5,
+    "log_all_workers": False,
+    "log_grad_norms": True,
+    "report_metrics": True,
+    "progress_bar_type": "tqdm",
+    "weight_distribution_pattern": r".*",
+    "weight_distribution_log_steps": 50,
+    "verbose": True,
+    "process_zero_is_admin": True,
+    "use_wandb": True,
+    "auto_shard_states": True,
+    "performance_mode": False,
+    "track_memory": False,
+    "low_mem_usage": True,
+    "sparsify_module": False,
+    "sparse_module_type": "bcoo",
+    # Generation preview defaults
+    "generation_shard_inputs": True,
+    "generation_use_train_prompts": False,
+    "generation_num_prompts": 1,
+    "generation_dataset_prompt_field": "prompt",
+    "generation_preview_print": False,
+    "generation_log_to_wandb": True,
+    # eSurge integration defaults
+    "use_esurge_generation": True,
+    "esurge_hbm_utilization": 0.45,
+    "esurge_page_size": 32,
+    "esurge_silent_mode": True,
+}
+
+# Trainer-specific defaults (only overrides, not full configs)
+TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
+    "dpo": {
+        "trainer_prefix": "dpotrainer",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_smoothing": 0.0,
+        "loss_type": "sigmoid",
+        "use_weighting": False,
+        "label_pad_token_id": -100,
+        "max_length": 512,
+        "max_prompt_length": 256,
+        "disable_dropout": True,
+        "precompute_ref_log_probs": False,
+        "reference_free": False,
+        "force_use_ref_model": False,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+    },
+    "orpo": {
+        "trainer_prefix": "orpotrainer",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "disable_dropout": True,
+        "label_pad_token_id": -100,
+        "generate_during_eval": False,
+    },
+    "grpo": {
+        "trainer_prefix": "grpotrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "sft": {
+        "trainer_prefix": "sfttrainer",
+        "learning_rate": 2e-5,
+        "add_special_tokens": False,
+        "packing": False,
+        "dataset_batch_size": 1000,
+        "num_of_sequences": 1024,
+    },
+    "reward": {
+        "trainer_prefix": "rewardtrainer",
+        "max_sequence_length": 1024,
+        "disable_dropout": True,
+        "center_rewards_coefficient": 0.1,
+        "remove_unused_columns": False,
+    },
+    "distillation": {
+        "trainer_prefix": "distillationtrainer",
+        "temperature": 2.0,
+        "alpha": 0.9,
+    },
+    "kto": {
+        "trainer_prefix": "ktotrainer",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "desirable_weight": 1.0,
+        "undesirable_weight": 1.0,
+        "loss_type": "kto",
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "disable_dropout": True,
+        "precompute_ref_log_probs": False,
+    },
+    "bco": {
+        "trainer_prefix": "bcotrainer",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+        "disable_dropout": True,
+        "generate_during_eval": False,
+        "precompute_ref_log_probs": False,
+        "prompt_sample_size": 1024,
+        "min_density_ratio": 0.5,
+        "max_density_ratio": 10.0,
+    },
+    "cpo": {
+        "trainer_prefix": "cpotrainer",
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "label_smoothing": 0.0,
+        "loss_type": "sigmoid",
+        "disable_dropout": True,
+        "cpo_alpha": 1.0,
+        "simpo_gamma": 0.5,
+        "alpha": 0.0,
+        "label_pad_token_id": -100,
+        "max_length": 1024,
+        "max_prompt_length": 512,
+    },
+    "gkd": {
+        "trainer_prefix": "gkdtrainer",
+        "learning_rate": 2e-5,
+        "temperature": 0.9,
+        "lmbda": 0.5,
+        "beta": 0.5,
+        "max_new_tokens": 128,
+        "disable_dropout": True,
+        "seq_kd": False,
+        "add_special_tokens": False,
+        "packing": False,
+        "dataset_batch_size": 1000,
+        "num_of_sequences": 1024,
+    },
+    "nash_md": {
+        "trainer_prefix": "nashmdtrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.1,
+        "mixture_coef": 0.5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "xpo": {
+        "trainer_prefix": "xpotrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "loss_type": "sigmoid",
+        "beta": 0.1,
+        "alpha": 1e-5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+}
+
+# Trainers that need max_completion_length auto-computed
+_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo"})
+
+
+def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> None:
+    """Register default configuration for a trainer type.
+
+    This allows external modules to register their own trainer defaults
+    without modifying this module directly.
+
+    Args:
+        trainer_type: The trainer type identifier (lowercase)
+        defaults: Dictionary of default values for this trainer
+
+    Example:
+        >>> register_trainer_defaults("my_trainer", {
+        ...     "trainer_prefix": "mytrainer",
+        ...     "learning_rate": 1e-5,
+        ...     "custom_param": 42,
+        ... })
+    """
+    TRAINER_SPECIFIC_DEFAULTS[trainer_type.lower()] = defaults
+
+
+def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
+    """Get merged defaults for a trainer type.
+
+    Merges base defaults with trainer-specific defaults.
+
+    Args:
+        trainer_type: The trainer type identifier
+
+    Returns:
+        Complete defaults dictionary for the trainer
+    """
+    defaults = dict(BASE_TRAINER_DEFAULTS)
+    if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
+        defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
+    return defaults  # type: ignore[return-value]
 
 
 def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
@@ -271,6 +658,9 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
 
     This function takes raw trainer configuration and applies appropriate defaults
     based on the trainer type, ensuring all required fields are present.
+
+    Uses the modular `BASE_TRAINER_DEFAULTS` and `TRAINER_SPECIFIC_DEFAULTS` registry
+    to apply defaults. New trainer types can be registered using `register_trainer_defaults`.
 
     Args:
         config: Raw trainer configuration dictionary
@@ -289,156 +679,30 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
     config = deepcopy(config)
     trainer_type = config.get("trainer_type", "sft").lower()
 
-    defaults = {
-        "learning_rate": 5e-5,
-        "num_train_epochs": 10,
-        "total_batch_size": 32,
-        "gradient_accumulation_steps": 1,
-        "optimizer": "adamw",
-        "scheduler": "none",
-        "warmup_steps": 0,
-        "weight_decay": 0.01,
-        "dataloader_num_workers": 0,
-        "dataloader_pin_memory": False,
-        "remove_unused_columns": True,
-        "shuffle_train_dataset": True,
-        "shuffle_seed_train": 64871,
-        "use_data_collactor": True,
-        "use_grain": True,
-        "offload_dataset": False,
-        "offload_device_type": "cpu",
-        "offload_device_index": 0,
-        "do_train": True,
-        "do_eval": False,
-        "do_last_save": True,
-        "is_fine_tuning": True,
-        "init_tx": True,
-        "train_on_inputs": True,
-        "aux_loss_enabled": False,
-        "resume_if_possible": True,
-        "truncation_mode": "keep_end",
-        "max_sequence_length": 4096,
-        "save_directory": "EasyDeL-Checkpoints",
-        "save_optimizer_state": True,
-        "remove_ckpt_after_load": False,
-        "log_steps": 10,
-        "report_steps": 5,
-        "log_all_workers": False,
-        "log_grad_norms": True,
-        "report_metrics": True,
-        "progress_bar_type": "tqdm",
-        "weight_distribution_pattern": r".*",
-        "weight_distribution_log_steps": 50,
-        "verbose": True,
-        "process_zero_is_admin": True,
-        "use_wandb": True,
-        "auto_shard_states": True,
-        "performance_mode": False,
-        "track_memory": False,
-        "low_mem_usage": True,
-        "sparsify_module": False,
-        "sparse_module_type": "bcoo",
-    }
+    # Get merged defaults from registry
+    defaults = get_trainer_defaults(trainer_type)
 
-    if trainer_type == "dpo":
-        defaults.update(
-            {
-                "trainer_prefix": "dpotrainer",
-                "learning_rate": 1e-6,
-                "beta": 0.1,
-                "label_smoothing": 0.0,
-                "loss_type": "sigmoid",
-                "use_weighting": False,
-                "label_pad_token_id": -100,
-                "max_length": 512,
-                "max_prompt_length": 256,
-                "disable_dropout": True,
-                "precompute_ref_log_probs": False,
-                "reference_free": False,
-                "force_use_ref_model": False,
-                "sync_ref_model": False,
-                "ref_model_mixup_alpha": 0.9,
-                "ref_model_sync_steps": 64,
-            }
-        )
-    elif trainer_type == "orpo":
-        defaults.update(
-            {
-                "trainer_prefix": "orpotrainer",
-                "learning_rate": 1e-6,
-                "beta": 0.1,
-                "max_length": 1024,
-                "max_prompt_length": 512,
-                "disable_dropout": True,
-                "label_pad_token_id": -100,
-                "generate_during_eval": False,
-            }
-        )
-    elif trainer_type == "grpo":
-        defaults.update(
-            {
-                "trainer_prefix": "grpotrainer",
-                "learning_rate": 1e-6,
-                "remove_unused_columns": False,
-                "max_prompt_length": 512,
-                "max_completion_length": 256,
-                "beta": 0.04,
-                "sync_ref_model": False,
-                "ref_model_mixup_alpha": 0.9,
-                "ref_model_sync_steps": 64,
-                "skip_apply_chat_template": False,
-                "num_return_sequences": 1,
-                "top_p": 0.95,
-                "top_k": 50,
-                "temperature": 0.7,
-            }
-        )
-    elif trainer_type == "sft":
-        defaults.update(
-            {
-                "trainer_prefix": "sfttrainer",
-                "learning_rate": 2e-5,
-                "add_special_tokens": False,
-                "packing": False,
-                "dataset_batch_size": 1000,
-                "num_of_sequences": 1024,
-            }
-        )
-    elif trainer_type == "reward":
-        defaults.update(
-            {
-                "trainer_prefix": "rewardtrainer",
-                "max_sequence_length": 1024,
-                "disable_dropout": True,
-                "center_rewards_coefficient": 0.1,
-                "remove_unused_columns": False,
-            }
-        )
-    elif trainer_type == "distillation":
-        defaults.update(
-            {
-                "trainer_prefix": "distillationtrainer",
-                "temperature": 2.0,
-                "alpha": 0.9,
-            }
-        )
-
+    # Apply defaults (config values take precedence)
     for key, value in defaults.items():
         config.setdefault(key, value)
 
     config["trainer_type"] = trainer_type
 
-    if "max_completion_length" not in config and trainer_type in ["dpo", "orpo"]:
+    # Auto-compute max_completion_length for applicable trainers
+    if "max_completion_length" not in config and trainer_type in _TRAINERS_WITH_COMPLETION_LENGTH:
         if "max_length" in config and "max_prompt_length" in config:
             config["max_completion_length"] = config["max_length"] - config["max_prompt_length"]
 
+    # Default eval_batch_size to total_batch_size
     if "eval_batch_size" not in config:
         config["eval_batch_size"] = config.get("total_batch_size", 32)
 
-    if "loss_config" in config:
+    # Convert loss_config dict to LossConfig instance
+    if "loss_config" in config and isinstance(config["loss_config"], dict):
         from easydel.infra.loss_utils import LossConfig
 
         config["loss_config"] = LossConfig(**config["loss_config"])
+
     return config
 
 

@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     EncoderLayerOutput,
     ImageClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ColumnParallelLinear
 
@@ -98,12 +98,11 @@ class CLIPVisionEmbeddings(nn.Module):
         image_size = config.image_size
         patch_size = config.patch_size
 
-        self.class_embedding = nn.Param(
-            jax.nn.initializers.normal(stddev=0.02)(
-                rngs.params(),
-                shape=(embed_dim,),
-                dtype=param_dtype,
-            ),
+        self.class_embedding = ArrayParam.bound(
+            shape=(embed_dim,),
+            dtype=param_dtype,
+            init_fn=jax.nn.initializers.normal(stddev=0.02),
+            key=rngs.params(),
         )
 
         self.patch_embedding = nn.Conv(
@@ -1266,6 +1265,8 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 
 @register_module(config=CLIPConfig, model_type="clip", task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION)
 class CLIPModel(EasyDeLBaseModule):
+    """Contrastive CLIP model wiring together text and vision towers with projection heads."""
+
     def __init__(
         self,
         config: CLIPConfig,
@@ -1314,7 +1315,12 @@ class CLIPModel(EasyDeLBaseModule):
         self.visual_projection = linear_class(config.vision_config.hidden_size, self.projection_dim)
         self.text_projection = linear_class(config.get_text_config().hidden_size, self.projection_dim)
 
-        self.logit_scale = nn.Param(jnp.ones([]) * self.config.logit_scale_init_value)
+        self.logit_scale = ArrayParam.bound(
+            shape=(),
+            dtype=jnp.float32,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype) * self.config.logit_scale_init_value,
+            key=None,
+        )
 
     def __call__(
         self,

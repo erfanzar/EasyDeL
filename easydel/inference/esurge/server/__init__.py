@@ -12,12 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Import auth components from workers
+from easydel.workers.esurge.auth import (
+    ApiKeyMetadata,
+    ApiKeyPermissions,
+    ApiKeyRole,
+    ApiKeyStatus,
+    AuthStorage,
+    EnhancedApiKeyManager,
+    PermissionDenied,
+    QuotaConfig,
+    QuotaExceeded,
+    RateLimitConfig,
+    RateLimitExceeded,
+)
+
 from .api_server import ErrorResponse, ServerMetrics, ServerStatus, create_error_response, eSurgeAdapter, eSurgeApiServer
+from .auth_endpoints import AuthEndpointsMixin, CreateApiKeyRequest, UpdateApiKeyRequest
 
 __all__ = (
+    "ApiKeyMetadata",
+    "ApiKeyPermissions",
+    "ApiKeyRole",
+    "ApiKeyStatus",
+    "AuthEndpointsMixin",
+    "AuthStorage",
+    "CreateApiKeyRequest",
+    "EnhancedApiKeyManager",
     "ErrorResponse",
+    "PermissionDenied",
+    "QuotaConfig",
+    "QuotaExceeded",
+    "RateLimitConfig",
+    "RateLimitExceeded",
     "ServerMetrics",
     "ServerStatus",
+    "ToolParserWorkerClient",
+    "ToolParserWorkerManager",
+    "UpdateApiKeyRequest",
     "create_error_response",
     "eSurgeAdapter",
     "eSurgeApiServer",

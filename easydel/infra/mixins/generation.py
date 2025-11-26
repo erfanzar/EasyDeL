@@ -46,7 +46,9 @@ Example:
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
+import pprint
 import typing as tp
 import warnings
 from functools import cached_property, partial
@@ -59,7 +61,6 @@ from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
@@ -81,8 +82,9 @@ from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
 
 if tp.TYPE_CHECKING:
-    from easydel.inference import vInference, vInferenceConfig, vInferencePreCompileConfig
-    from easydel.infra.utils import ProcessingClassType
+    from transformers import PreTrainedTokenizerBase
+
+    from easydel.inference.sampling_params import SamplingParams
     from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
 
 logger = get_logger(__name__)
@@ -201,8 +203,20 @@ class EasyGenerationMixin:
             num_key_value_heads = num_attention_heads
 
         head_dim = _safepick(self.config, "head_dim")
+
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
+
+        from easydel.layers.attention import AttentionMechanisms
+
+        match self.config.attn_mechanism:
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
+                version = "v3"
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
+                version = "v2"
+            case _:
+                version = "v3"
+                logger.warn("couldn't retrive version from attention mechanism we will set v3 for default")
 
         return RaggedPagesCacheMetaData.create(
             mesh=self.mesh,
@@ -216,6 +230,7 @@ class EasyGenerationMixin:
             v_headdim=None,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            version=version,
         )
 
     def create_cache_metadata(
@@ -406,15 +421,10 @@ class EasyGenerationMixin:
     @staticmethod
     def compute_prefill_length_from_mask(mask) -> chex.Array:
         """
-        Calculates the number of padding tokens at the beginning of each sequence.
-
-        This is useful for determining the actual starting position in a KV cache when
-        dealing with left-padded inputs.
-
-        Returns:
-            chex.Array: An array of shape (batch_size,) containing the number of leading
-                padding tokens for each sequence in the batch.
+        Calculates the number of padding tokens at the beginning of each sequence
+        from a 0/1 or boolean mask.
         """
+        mask = mask.astype(jnp.bool_)
         return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
 
     def _make_mask_info(
@@ -505,21 +515,16 @@ class EasyGenerationMixin:
             else:
                 mask_info = MaskInfo.from_attention_mask(attention_mask)
 
-        base_mask_info = self._pad_maskinfo_to_maxlen(
-            mask_info,
-            max_length=max_length,
-            make_causal=not self.config.is_encoder_decoder,
-        )
+        mask_info = self._pad_maskinfo_to_maxlen(mask_info, max_length=max_length, make_causal=True)
+
         if attention_mask is not None:
-            position_ids = attention_mask.astype(jnp.bool_).cumsum(axis=-1) - 1
+            am = attention_mask.astype(jnp.bool_)
+            position_ids = jnp.where(am, am.astype(jnp.int32).cumsum(axis=-1) - 1, 0)
         else:
             position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype=jnp.int32)[None, :], (batch_size, seq_length))
 
-        calldict = dict(
-            past_key_values=past_key_values,
-            mask_info=base_mask_info,  # store padded + causal; slice per step at call-time
-            position_ids=position_ids,
-        )
+        calldict = dict(past_key_values=past_key_values, mask_info=mask_info, position_ids=position_ids)
+
         if token_type_ids is not None:
             calldict["token_type_ids"] = token_type_ids
 
@@ -537,36 +542,23 @@ class EasyGenerationMixin:
 
         q_ids = jnp.asarray(mask_info.q_segment_ids, jnp.int32)  # (B, Q0)
         kv_ids = jnp.asarray(mask_info.kv_segment_ids, jnp.int32)  # (B, K0)
-        _B, Q0 = q_ids.shape
+        B, Q0 = q_ids.shape
         K0 = kv_ids.shape[-1]
 
-        def _last_seg(ids):
-            valid = ids >= 0
-            has_any = valid.any(axis=-1, keepdims=True)
-            rev = jnp.flip(valid, axis=-1)
-            last_from_end = jnp.argmax(rev, axis=-1)  # idx from end
-            last_idx = (ids.shape[-1] - 1) - last_from_end
-            last_val = jnp.take_along_axis(ids, last_idx[:, None], axis=-1).squeeze(-1)
-            return jnp.where(has_any.squeeze(-1), last_val, jnp.int32(0))
-
-        last_q = _last_seg(q_ids)
-        last_kv = _last_seg(kv_ids)
-
         if Q0 < max_length:
-            q_pad = jnp.tile(last_q[:, None], (1, max_length - Q0))
+            q_pad = jnp.full((B, max_length - Q0), 0)
             q_ids = jnp.concatenate([q_ids, q_pad], axis=-1)
+        else:
+            q_ids = q_ids[:, :max_length]
         if K0 < max_length:
-            kv_pad = jnp.tile(last_kv[:, None], (1, max_length - K0))
+            kv_pad = jnp.full((B, max_length - K0), 0)
             kv_ids = jnp.concatenate([kv_ids, kv_pad], axis=-1)
+        else:
+            kv_ids = kv_ids[:, :max_length]
 
         base = MaskInfo.from_segments(q_ids, kv_ids)
-
         if make_causal:
             base = base.apply_causal(offset=0)
-
-        base = base.materialize_attention_mask(dtype=jnp.bool_)
-        if base.attention_mask.ndim == 3:
-            base = base.replace(attention_mask=base.attention_mask[:, None, :, :])
         return base
 
     def update_inputs_for_generation(
@@ -595,8 +587,7 @@ class EasyGenerationMixin:
         return model_kwargs
 
     def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, chex.Array],
+        self, model_kwargs: dict[str, chex.Array]
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         """
         Placeholder method to extract or create properties required for specific model types
@@ -651,9 +642,12 @@ class EasyGenerationMixin:
             dict: A dictionary containing dummy keyword arguments suitable for model compilation.
         """
         deteshape = (batch_size, input_tokens_length)
+        # Return a dummy MaskInfo instead of attention_mask for compilation
+        seg = jnp.zeros((batch_size, input_tokens_length), dtype=jnp.int32)  # all valid
+        mi = MaskInfo.from_segments(seg).apply_causal()
         return dict(
             input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
-            attention_mask=jnp.ones(deteshape, dtype="b1", device=input_sharding),
+            mask_info=mi,
             rng=rngs,
         )
 
@@ -1310,7 +1304,9 @@ class EasyGenerationMixin:
 
         def greedy_search_body_fn(state):
             """state update fn."""
-            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            call_kwargs = {
+                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
+            }
             model_outputs = model(state.running_token, **call_kwargs)
             logits = model_outputs.logits[:, -1]
 
@@ -1406,7 +1402,9 @@ class EasyGenerationMixin:
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
 
-            call_kwargs = {k: v for k, v in state.model_kwargs.items() if k != "attention_mask"}
+            call_kwargs = {
+                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
+            }
             model_outputs = model(state.running_token, **call_kwargs)
 
             logits = model_outputs.logits[:, -1]
@@ -1431,10 +1429,7 @@ class EasyGenerationMixin:
                 next_token,
                 (0, state.cur_len),
             )
-            next_model_kwargs = self.update_inputs_for_generation(
-                model_outputs,
-                state.model_kwargs,
-            )
+            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
 
             return SampleState(
                 cur_len=state.cur_len + 1,
@@ -1609,6 +1604,7 @@ class EasyGenerationMixin:
                     (batch_size, num_beams, input_ids_length),
                 )
             )
+            # Leave mask_info as the base; cache layer will compute step-specific mask
             model_outputs = model(input_token, **state.model_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
@@ -1699,55 +1695,587 @@ class EasyGenerationMixin:
 
         return BeamSearchOutput(sequences=sequences, scores=scores)
 
-    def create_vinference(
-        self,
-        processor: ProcessingClassType,
-        generation_config: vInferenceConfig,
-        compile_config: vInferencePreCompileConfig | None = None,
-        input_partition_spec: PartitionSpec | None = None,
-        seed: int | None = None,
-    ) -> vInference:
-        from easydel import SamplingParams, vInference, vInferenceConfig
+    @property
+    def esurge_graphdef(self):
+        """Returns a graph definition compatible with eSurge inference engine.
 
-        if hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                sampling_params = generation_config.sampling_params
-                generation_config = vInferenceConfig(
-                    bos_token_id=generation_config.bos_token_id or self.generation_config.bos_token_id,
-                    eos_token_id=generation_config.eos_token_id or self.generation_config.eos_token_id,
-                    pad_token_id=generation_config.pad_token_id or self.generation_config.pad_token_id,
-                    max_new_tokens=generation_config.max_new_tokens or self.generation_config.max_new_tokens,
-                    streaming_chunks=generation_config.streaming_chunks or 64,
-                    sampling_params=SamplingParams(
-                        max_tokens=sampling_params.max_tokens or self.generation_config.max_new_tokens,
-                        temperature=sampling_params.temperature or self.generation_config.temperature,
-                        top_k=sampling_params.top_k or self.generation_config.top_k,
-                        top_p=sampling_params.top_p or self.generation_config.top_p,
-                    ),
-                )
-        num_params = sum(n.size for n in jax.tree_util.tree_flatten(self.graphstate)[0])
-        size_in_billions = num_params / 1e9
-        size_in_billions = f"{size_in_billions:.2f}b"
-        vinference = vInference(
-            model=None,
-            processor_class=processor,
-            generation_config=generation_config,
-            graphdef=self.graphdef,
-            mesh=self.mesh,
-            partition_axis=self.config.partition_axis,
-            inference_name=str(getattr(self._model_task, "value", self._model_task))
-            + "-"
-            + str(self._model_type)
-            + ":"
-            + size_in_billions,
-            input_partition_spec=input_partition_spec,
-            seed=seed,
-            report_metrics=False,
+        eSurge requires models to use ragged page attention mechanisms (v2 or v3).
+        If the current model uses a different attention mechanism, this property
+        creates a new graph definition with ragged_page_attention_v3.
+
+        Returns:
+            nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
+
+        Note:
+            This creates only the graph structure, not a complete model. Use
+            `esurge_compatible_model` if you need a full model instance.
+
+        Example:
+            >>> gdef = model.esurge_graphdef
+            >>> # Use gdef for creating eSurge-compatible model instances
+        """
+        gdef = self.graphdef
+        if self.config.attn_mechanism not in ["ragged_page_attention_v2", "ragged_page_attention_v3"]:
+            gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+        return gdef
+
+    @property
+    def esurge_compatible_model(self):
+        """Returns a model instance compatible with eSurge inference engine.
+
+        eSurge requires models to use ragged page attention mechanisms (v2 or v3).
+        If the current model uses a different attention mechanism, this property
+        returns a new model instance with ragged_page_attention_v3 while preserving
+        all parameters and state.
+
+        Returns:
+            Self: Model instance with eSurge-compatible attention mechanism.
+
+        Note:
+            If the model already uses a compatible attention mechanism, returns self.
+            Otherwise, builds a new graph definition with ragged_page_attention_v3 and
+            merges the existing parameters/state, leaving the original model unchanged.
+
+        Example:
+            >>> # Get eSurge-compatible version of model
+            >>> esurge_model = model.esurge_compatible_model
+            >>> # Now safe to use with eSurge inference
+            >>> outputs = esurge_model.esurge_generate("Hello world")
+        """
+        if self.config.attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]:
+            return self
+        compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+        return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
+
+    def pause_esurge(self, engine_id: str | None = None) -> None:
+        """Pause eSurge engine(s) for this model.
+
+        Pauses the background scheduler of eSurge engines without clearing queued state.
+        This is useful for temporarily freeing resources while keeping the engine ready
+        for quick resumption.
+
+        Args:
+            engine_id: Optional specific engine cache key to pause. If None, pauses all
+                engines associated with this model.
+
+        Example:
+            >>> # Pause all engines for this model
+            >>> model.pause_esurge()
+            >>>
+            >>> # Later, generate will auto-resume
+            >>> outputs = model.esurge_generate("prompt")  # Auto-resumes!
+        """
+        model_hash = self.static_hash(["attn_mechanism"])
+
+        if engine_id is not None:
+            # Pause specific engine
+            if engine_id in _ESURGE_MAP_CACHE:
+                eng = _ESURGE_MAP_CACHE[engine_id]
+                eng.pause()
+                if not getattr(eng, "silent_mode", False):
+                    logger.info(f"Paused eSurge engine: {engine_id}")
+            else:
+                logger.warning(f"Engine not found: {engine_id}")
+        else:
+            # Pause all engines for this model
+            paused_count = 0
+            should_log = False
+            for cache_key, engine in _ESURGE_MAP_CACHE.items():
+                if cache_key.startswith(f"{model_hash}-"):
+                    engine.pause()
+                    paused_count += 1
+                    should_log = should_log or not getattr(engine, "silent_mode", False)
+            if paused_count > 0:
+                if should_log:
+                    logger.info(f"Paused {paused_count} eSurge engine(s) for this model")
+            else:
+                logger.info("No eSurge engines found to pause for this model")
+
+    def resume_esurge(self, engine_id: str | None = None) -> None:
+        """Resume paused eSurge engine(s) for this model.
+
+        Resumes the background scheduler of paused eSurge engines, making them
+        ready to process generation requests again.
+
+        Args:
+            engine_id: Optional specific engine cache key to resume. If None, resumes all
+                engines associated with this model.
+
+        Example:
+            >>> # Pause engines to free resources
+            >>> model.pause_esurge()
+            >>>
+            >>> # Manually resume when needed
+            >>> model.resume_esurge()
+            >>> outputs = model.esurge_generate("prompt")
+        """
+        model_hash = self.static_hash(["attn_mechanism"])
+
+        if engine_id is not None:
+            # Resume specific engine
+            if engine_id in _ESURGE_MAP_CACHE:
+                eng = _ESURGE_MAP_CACHE[engine_id]
+                eng.resume()
+                if not getattr(eng, "silent_mode", False):
+                    logger.info(f"Resumed eSurge engine: {engine_id}")
+            else:
+                logger.warning(f"Engine not found: {engine_id}")
+        else:
+            # Resume all engines for this model
+            resumed_count = 0
+            should_log = False
+            for cache_key, engine in _ESURGE_MAP_CACHE.items():
+                if cache_key.startswith(f"{model_hash}-"):
+                    engine.resume()
+                    resumed_count += 1
+                    should_log = should_log or not getattr(engine, "silent_mode", False)
+            if resumed_count > 0:
+                if should_log:
+                    logger.info(f"Resumed {resumed_count} eSurge engine(s) for this model")
+            else:
+                logger.info("No eSurge engines found to resume for this model")
+
+    def list_esurge_engines(self) -> list[dict]:
+        """List all cached eSurge engines for this model.
+
+        Returns a list of dictionaries containing information about each cached engine,
+        including its status (running/paused), number of requests, and configuration hash.
+
+        Returns:
+            List of dicts with engine information:
+                - cache_key: The cache key for this engine
+                - paused: Whether the engine is paused
+                - running_requests: Number of currently running requests
+                - pending_requests: Number of pending requests
+                - max_num_seqs: Maximum concurrent sequences
+
+        Example:
+            >>> engines = model.list_esurge_engines()
+            >>> for engine in engines:
+            ...     print(f"Engine {engine['cache_key']}: "
+            ...           f"Paused={engine['paused']}, "
+            ...           f"Running={engine['running_requests']}")
+        """
+        model_hash = self.static_hash(["attn_mechanism"])
+        engines_info = []
+
+        for cache_key, engine in _ESURGE_MAP_CACHE.items():
+            if cache_key.startswith(f"{model_hash}-"):
+                info = {
+                    "cache_key": cache_key,
+                    "paused": getattr(engine, "_paused", False),
+                    "running_requests": getattr(engine, "num_running_requests", 0),
+                    "pending_requests": getattr(engine, "num_pending_requests", 0),
+                    "max_num_seqs": getattr(engine, "_max_num_seqs", None),
+                }
+                engines_info.append(info)
+
+        return engines_info
+
+    def get_relevant_esurge(
+        self,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_num_seqs: int | None = None,
+    ):
+        """Retrieves a relevant eSurge engine instance from the cache.
+
+        This method searches for an existing eSurge engine in the cache that matches
+        the current model. If tokenizer or max_num_seqs are None, it returns the most
+        recently created engine for this model. If no engine exists and parameters are
+        missing, it uses sensible defaults.
+
+        Args:
+            tokenizer: Optional tokenizer path or instance. If None, retrieves from
+                the most recent cached engine for this model.
+            max_num_seqs: Optional maximum number of concurrent sequences. If None,
+                uses value from cached engine or defaults to 32 if no cache exists.
+
+        Returns:
+            eSurge engine instance if found in cache, None otherwise.
+
+        Example:
+            >>> # Try to get existing engine with default params
+            >>> engine = model.get_relevant_esurge()
+            >>> if engine:
+            ...     outputs = engine.generate("Hello world")
+            >>>
+            >>> # Get engine with specific tokenizer
+            >>> engine = model.get_relevant_esurge(tokenizer="gpt2")
+        """
+        model_hash = self.static_hash(["attn_mechanism"])
+
+        # Search for any cached engine matching this model
+        matching_engines = []
+        for cache_key, engine in _ESURGE_MAP_CACHE.items():
+            if cache_key.startswith(f"{model_hash}-"):
+                matching_engines.append(engine)
+
+        if not matching_engines:
+            return None
+
+        # If tokenizer and max_num_seqs are both provided, try exact match
+        if tokenizer is not None and max_num_seqs is not None:
+            # Try to find exact match based on parameters
+            for engine in matching_engines:
+                if (
+                    hasattr(engine, "tokenizer")
+                    and hasattr(engine, "_max_num_seqs")
+                    and engine._max_num_seqs == max_num_seqs
+                ):
+                    return engine
+
+        # Return the most recently added engine (last in cache)
+        return matching_engines[-1]
+
+    def get_esurge(
+        self,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_model_len: int | None = None,
+        min_input_pad: int | None = None,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
+        hbm_utilization: float | None = None,
+        page_size: int | None = None,
+        enable_prefix_caching: bool | None = None,
+        runner_verbose: bool | None = None,
+        decode_truncated_prompt: bool | None = None,
+        destroy_pages_on_pause: bool | None = None,
+        silent_mode: bool | None = None,
+    ):
+        """Gets or creates an eSurge engine with the specified parameters.
+
+        This method intelligently retrieves an existing cached engine or creates a new one.
+        For any parameter that is None, it will:
+        1. Try to retrieve the value from a cached engine
+        2. If no cached engine exists, use sensible defaults
+        3. Only require tokenizer if no cached engine is available
+
+        Args:
+            tokenizer: Tokenizer path or instance. If None, retrieves from cached engine.
+                Required only if no cached engine exists.
+            max_model_len: Maximum sequence length. Defaults to model's max position embeddings.
+            min_input_pad: Minimum padding for input sequences. Defaults to 16.
+            max_num_seqs: Maximum number of concurrent sequences. Defaults to 32.
+            max_num_batched_tokens: Maximum tokens per batch. Defaults to None.
+            hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
+            page_size: Size of memory pages for paged attention. Defaults to 128.
+            enable_prefix_caching: Enable prefix caching. Defaults to True.
+            runner_verbose: Enable verbose logging. Defaults to False.
+            decode_truncated_prompt: Decode truncated prompts. Defaults to True.
+            destroy_pages_on_pause: Free memory on pause. Defaults to True.
+
+        Returns:
+            eSurge engine instance, either from cache or newly created.
+
+        Raises:
+            ValueError: If tokenizer is required but not provided and no cached engine exists.
+
+        Example:
+            >>> # First call with tokenizer (creates new engine)
+            >>> engine = model.get_esurge(tokenizer="meta-llama/Llama-2-7b-hf")
+            >>>
+            >>> # Subsequent calls without parameters (reuses cached engine)
+            >>> engine = model.get_esurge()
+            >>>
+            >>> # Override specific parameters
+            >>> engine = model.get_esurge(max_num_seqs=128)
+        """
+        # Check if all configurable parameters are None (user wants cached engine)
+        all_none = all(
+            param is None
+            for param in [
+                tokenizer,
+                max_model_len,
+                min_input_pad,
+                max_num_seqs,
+                max_num_batched_tokens,
+                hbm_utilization,
+                page_size,
+                enable_prefix_caching,
+                runner_verbose,
+                decode_truncated_prompt,
+                destroy_pages_on_pause,
+                silent_mode,
+            ]
         )
-        if compile_config is not None:
-            vinference.precompile(
-                config=compile_config,
-                graphother=self.graphother,
-                graphstate=self.graphstate,
+
+        # If all params are None, try to return cached engine directly
+        if all_none:
+            cached_engine = self.get_relevant_esurge()
+            if cached_engine is not None:
+                # Auto-resume if paused
+                if hasattr(cached_engine, "_paused") and cached_engine._paused:
+                    if not getattr(cached_engine, "silent_mode", False):
+                        logger.info("Auto-resuming paused eSurge engine")
+                    cached_engine.resume()
+                return cached_engine
+            # No cache exists, will use defaults below
+
+        # Set default for max_model_len
+        if max_model_len is None:
+            max_model_len = self.config.granted_freq_max_position_embedding
+
+        # Try to get a relevant cached engine if any parameter is None
+        any_none = any(
+            param is None
+            for param in [
+                tokenizer,
+                min_input_pad,
+                max_num_seqs,
+                max_num_batched_tokens,
+                hbm_utilization,
+                page_size,
+                enable_prefix_caching,
+                runner_verbose,
+                decode_truncated_prompt,
+                destroy_pages_on_pause,
+                silent_mode,
+            ]
+        )
+
+        cached_engine = None
+        if any_none:
+            cached_engine = self.get_relevant_esurge(tokenizer=tokenizer, max_num_seqs=max_num_seqs)
+
+        # Extract parameters from cached engine or use defaults
+        if tokenizer is None:
+            if cached_engine is not None:
+                tokenizer = cached_engine.tokenizer
+            else:
+                raise ValueError(
+                    "tokenizer is required when no cached eSurge engine exists. "
+                    "Either provide a tokenizer or create an engine first by calling get_esurge with a tokenizer."
+                )
+
+        # Set defaults for other parameters
+        if min_input_pad is None:
+            min_input_pad = getattr(cached_engine, "_min_input_pad", 16) if cached_engine else 16
+        if max_num_seqs is None:
+            max_num_seqs = getattr(cached_engine, "_max_num_seqs", 32) if cached_engine else 32
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = getattr(cached_engine, "_max_num_batched_tokens", None) if cached_engine else None
+        if hbm_utilization is None:
+            hbm_utilization = getattr(cached_engine, "_hbm_utilization", 0.85) if cached_engine else 0.85
+        if page_size is None:
+            page_size = getattr(cached_engine, "_page_size", 128) if cached_engine else 128
+        if enable_prefix_caching is None:
+            enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
+        if runner_verbose is None:
+            runner_verbose = getattr(cached_engine, "_runner_verbose", False) if cached_engine else False
+        if decode_truncated_prompt is None:
+            decode_truncated_prompt = getattr(cached_engine, "_decode_truncated_prompt", True) if cached_engine else True
+        if destroy_pages_on_pause is None:
+            destroy_pages_on_pause = getattr(cached_engine, "_destroy_pages_on_pause", True) if cached_engine else True
+        if silent_mode is None:
+            silent_mode = getattr(cached_engine, "silent_mode", False) if cached_engine else False
+
+        # Build the configuration dict
+        model_hash = self.static_hash(["attn_mechanism"])
+        extra_dict = dict(
+            tokenizer=tokenizer,
+            max_model_len=max_model_len,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            runner_verbose=runner_verbose,
+            decode_truncated_prompt=decode_truncated_prompt,
+            destroy_pages_on_pause=destroy_pages_on_pause,
+            silent_mode=silent_mode,
+        )
+
+        # Check if this exact configuration exists in cache
+        extra_dict_str = pprint.pformat(extra_dict)
+        bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
+        extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
+        esurge_hash = f"{model_hash}-{extra_dict_hash}"
+
+        if esurge_hash in _ESURGE_MAP_CACHE:
+            esurge = _ESURGE_MAP_CACHE[esurge_hash]
+            # Auto-resume if paused
+            if hasattr(esurge, "_paused") and esurge._paused:
+                if not getattr(esurge, "silent_mode", False):
+                    logger.info("Auto-resuming paused eSurge engine")
+                esurge.resume()
+        else:
+            # Create new engine
+            from easydel.inference import eSurge
+
+            esurge = eSurge(model=self, **extra_dict)
+            _ESURGE_MAP_CACHE[esurge_hash] = esurge
+
+        if esurge.num_running_requests == 0 and esurge.num_pending_requests == 0:
+            esurge.update_model_weights(self)
+
+        return esurge
+
+    def _call_esurge_engine(
+        self,
+        engine,
+        prompts: list[dict[str, str]] | list[str] | str,
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+    ):
+        """Internal helper to call an eSurge engine with the appropriate method.
+
+        Determines whether to use chat or completion mode and calls the
+        corresponding engine method.
+
+        Args:
+            engine: The eSurge engine instance to use.
+            prompts: Input prompts (string, list of strings, or list of message dicts).
+            tools: Optional tool definitions for chat mode.
+            sampling_params: Generation parameters.
+            request_id: Optional request ID.
+            stream: Whether to stream results.
+            chat_template: Optional chat template.
+
+        Returns:
+            Generation results from the engine.
+        """
+        # Determine if prompts is chat format (list of message dicts)
+        is_chat_mode = isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], dict)
+
+        if is_chat_mode:
+            # Chat mode: use engine.chat()
+            return engine.chat(
+                messages=prompts,
+                tools=tools,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                stream=stream,
+                chat_template=chat_template,
             )
-        return vinference
+        else:
+            # Completion mode: use engine.stream() or engine.generate()
+            if stream:
+                return engine.stream(
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+            else:
+                return engine.generate(
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    use_tqdm=False,
+                )
+
+    def esurge_generate(
+        self,
+        prompts: list[dict[str, str]] | list[str] | str,
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+        *,
+        tokenizer: str | PreTrainedTokenizerBase | None = None,
+        max_model_len: int | None = None,
+        min_input_pad: int | None = None,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
+        hbm_utilization: float | None = None,
+        page_size: int | None = None,
+        enable_prefix_caching: bool | None = None,
+        runner_verbose: bool | None = None,
+        decode_truncated_prompt: bool | None = None,
+        destroy_pages_on_pause: bool | None = None,
+        silent_mode: bool | None = None,
+    ):
+        """High-level interface for text generation using eSurge engine.
+
+        This method provides a convenient way to generate text using the eSurge inference
+        engine with automatic caching and configuration management. It supports both chat
+        and completion modes, with optional streaming.
+
+        All engine configuration parameters are optional. When omitted, the method will:
+        1. Try to retrieve values from a cached engine for this model
+        2. Fall back to sensible defaults if no cached engine exists
+        3. Only require tokenizer on the first call when no cache exists
+
+        Args:
+            prompts: Input prompts. Can be:
+                - Single string for simple completion
+                - List of strings for batch completion
+                - List of dicts with 'role' and 'content' keys for chat mode
+            tools: Optional list of tool/function definitions for function calling in chat mode.
+            sampling_params: Generation parameters (temperature, top_p, max_tokens, etc.).
+                Defaults to SamplingParams(max_tokens=128) if None.
+            request_id: Optional unique identifier for tracking. Auto-generated if None.
+            stream: If True, returns an iterator for streaming generation.
+                If False, returns complete results.
+            chat_template: Optional custom Jinja2 template for chat formatting.
+            tokenizer: Tokenizer path or instance. Required only on first call if no cached
+                engine exists. Subsequent calls can omit this to reuse the cached tokenizer.
+            max_model_len: Maximum sequence length. Defaults to model's max position embeddings.
+            min_input_pad: Minimum padding for input sequences. Defaults to 16.
+            max_num_seqs: Maximum number of concurrent sequences. Defaults to 32.
+            max_num_batched_tokens: Maximum tokens per batch. Defaults to None (auto-calculate).
+            hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
+            page_size: Size of memory pages for paged attention. Defaults to 128.
+            enable_prefix_caching: Enable prefix caching for shared prompts. Defaults to True.
+            runner_verbose: Enable verbose logging in the model runner. Defaults to False.
+            decode_truncated_prompt: Decode and display truncated prompts. Defaults to True.
+            destroy_pages_on_pause: Free memory pages when requests are paused. Defaults to True.
+
+        Returns:
+            - For chat mode (prompts is list[dict]):
+                - If stream=True: Iterator[RequestOutput] with delta updates
+                - If stream=False: RequestOutput with complete response
+            - For completion mode (prompts is str or list[str]):
+                - If stream=True: Iterator[RequestOutput] with delta updates
+                - If stream=False: list[RequestOutput] with complete responses
+
+        Example:
+            >>> # Simple completion
+            >>> outputs = model.esurge_generate("Tell me about AI")
+            >>> print(outputs[0].get_text())
+            >>>
+            >>> # Streaming completion
+            >>> for chunk in model.esurge_generate("Tell me a story", stream=True):
+            ...     print(chunk.delta_text, end="", flush=True)
+            >>>
+            >>> # Chat mode
+            >>> messages = [
+            ...     {"role": "system", "content": "You are helpful."},
+            ...     {"role": "user", "content": "What is 2+2?"}
+            ... ]
+            >>> response = model.esurge_generate(messages)
+            >>> print(response.get_text())
+        """
+        # Get or create eSurge engine with specified parameters
+        esurge = self.get_esurge(
+            tokenizer=tokenizer,
+            max_model_len=max_model_len,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            runner_verbose=runner_verbose,
+            decode_truncated_prompt=decode_truncated_prompt,
+            destroy_pages_on_pause=destroy_pages_on_pause,
+            silent_mode=silent_mode,
+        )
+
+        # Call the engine with the appropriate method
+        return self._call_esurge_engine(
+            esurge,
+            prompts=prompts,
+            tools=tools,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=stream,
+            chat_template=chat_template,
+        )
+
+
+_ESURGE_MAP_CACHE = {}

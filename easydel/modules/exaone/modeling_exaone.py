@@ -28,10 +28,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    BaseModelOutput,
-    DecoderLayerOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -52,6 +49,8 @@ logger = get_logger(__name__)
 
 
 class ExaoneGatedMLP(nn.Module):
+    """Gated feed-forward block used inside Exaone decoder layers."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -110,6 +109,27 @@ class ExaoneAttentionInner(UnifiedAttention):
         "qkv_projection": "qkv_proj",
     }
 
+    def __init__(
+        self,
+        config: ExaoneConfig,
+        layer_idx: int,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: str | jax.lax.Precision | None = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        super().__init__(
+            config,
+            dtype,
+            param_dtype,
+            precision,
+            rngs=rngs,
+            layer_idx=layer_idx,
+            attention_type="standard",
+            causal=True,
+        )
+
     def _create_rotary(self, config: ExaoneConfig, dtype: jnp.dtype):
         """Override to use partial rotary factor."""
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
@@ -141,6 +161,8 @@ class ExaoneAttentionInner(UnifiedAttention):
 
 
 class ExaoneAttention(nn.Module):
+    """Wrapper around ExaoneAttentionInner to wire it into decoder layers."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -149,6 +171,7 @@ class ExaoneAttention(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.attention = ExaoneAttentionInner(
@@ -157,6 +180,7 @@ class ExaoneAttention(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
     def __call__(
@@ -183,6 +207,8 @@ class ExaoneAttention(nn.Module):
 
 
 class ExaoneDecoderLayer(nn.Module):
+    """Single Exaone decoder block combining attention and gated MLP."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -191,6 +217,7 @@ class ExaoneDecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -214,6 +241,7 @@ class ExaoneDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = mlp_block(
             config=config,
@@ -289,6 +317,8 @@ class ExaoneDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, ExaoneConfig, model_type="exaone")
 class ExaoneModel(EasyDeLBaseModule):
+    """Decoder-only Exaone transformer composed of embedding, stacked blocks, and final norm."""
+
     def __init__(
         self,
         config: ExaoneConfig,
@@ -319,6 +349,7 @@ class ExaoneModel(EasyDeLBaseModule):
         self.h = [
             ExaoneDecoderLayer(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -365,7 +396,7 @@ class ExaoneModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -378,10 +409,7 @@ class ExaoneModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
 
         hidden_states = self.drop(inputs_embeds)
 

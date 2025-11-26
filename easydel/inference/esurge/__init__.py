@@ -79,8 +79,8 @@ from .core import (
     SlidingWindowManager,
     SlidingWindowSpec,
     UnitaryCacheCoordinator,
+    create_kv_cache_specs_from_config,
 )
-from .dashboard import create_dashboard, eSurgeWebDashboard
 from .esurge_engine import CompletionOutput, RequestOutput, eSurge
 from .metrics import (
     CacheMetrics,
@@ -160,12 +160,11 @@ __all__ = (
     "SlidingWindowSpec",
     "SystemMetrics",
     "UnitaryCacheCoordinator",
-    "create_dashboard",
+    "create_kv_cache_specs_from_config",
     "eSurge",
     "eSurgeApiServer",
     "eSurgeMonitoringServer",
     "eSurgeRunner",
-    "eSurgeWebDashboard",
     "get_metrics_collector",
     "initialize_metrics",
     "log_metrics_summary",

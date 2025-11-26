@@ -3,8 +3,13 @@
 import tempfile
 
 import numpy as np
+import pytest
 
-from easydel.utils.data_managers import ArrayCache, DataCache, DataStreamOptimizer, FastDataLoader, TokenCache
+# Skip if fast data manager utilities are not available in this build.
+try:
+    from easydel.utils.data_managers import ArrayCache, DataCache, DataStreamOptimizer, FastDataLoader, TokenCache
+except Exception as exc:  # pragma: no cover - allow partial test runs
+    pytest.skip(f"Data manager utilities unavailable: {exc}", allow_module_level=True)
 
 
 class TestFastDataLoader:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import typing
 from functools import partial
 from typing import ClassVar
 
@@ -35,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -62,6 +63,8 @@ from .deepseek_configuration import DeepseekV3Config
 
 
 class DeepseekV3MLP(nn.Module):
+    """Standard DeepSeek V3 feed-forward network used in dense decoder layers."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -116,6 +119,8 @@ class DeepseekV3MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """Top-k routing gate that scores tokens for the mixture-of-experts blocks."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -145,14 +150,19 @@ class MoEGate(nn.Module):
             param_dtype,
         )
 
-        self.kernel = nn.Param(kernel)
+        self.kernel = ArrayParam.bound(
+            shape=kernel.shape,
+            dtype=param_dtype,
+            init_fn=nn.initializers.kaiming_uniform(),
+            key=rngs.param(),
+            value=kernel,
+        )
         if self.topk_method == "noaux_tc":
-            self.e_score_correction_bias = nn.Param(
-                nn.initializers.zeros(
-                    rngs.params(),
-                    (self.n_routed_experts,),
-                    param_dtype,
-                )
+            self.e_score_correction_bias = ArrayParam.bound(
+                shape=(self.n_routed_experts,),
+                dtype=param_dtype,
+                init_fn=nn.initializers.zeros,
+                key=rngs.params(),
             )
 
     def __call__(self, hidden_states):
@@ -199,6 +209,24 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV3MLPMoE(nn.Module):
+    """Mixture-of-experts feed-forward module parameterized by the DeepSeek V3 config."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -279,9 +307,12 @@ class DeepseekV3MLPMoE(nn.Module):
 
 
 class DeepseekV3MoE(BaseMoeModule):
+    """Wraps gating and expert networks to apply DeepSeek V3 MoE feed-forward processing."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -366,6 +397,7 @@ class DeepseekV3Attention(UnifiedAttention):
     def __init__(
         self,
         config: DeepseekV3Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -387,6 +419,7 @@ class DeepseekV3Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="mla",
             causal=True,
             use_mla_lora=config.q_lora_rank is not None,
@@ -549,6 +582,8 @@ class DeepseekV3Attention(UnifiedAttention):
 
 
 class DeepseekV3DecoderLayer(nn.Module):
+    """Single DeepSeek V3 transformer block with MLA attention and optional MoE MLP."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -586,11 +621,13 @@ class DeepseekV3DecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = (
             mlp_moe_block(
                 config=config,
+                layer_idx=layer_idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -700,6 +737,8 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3Model(EasyDeLBaseModule):
+    """Full DeepSeek V3 decoder-only transformer composed of MLA blocks and MoE feed-forward layers."""
+
     def __init__(
         self,
         config: DeepseekV3Config,
@@ -797,7 +836,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -813,10 +852,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
 

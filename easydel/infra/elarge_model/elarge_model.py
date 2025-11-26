@@ -23,7 +23,7 @@ Key Features:
     - Unified configuration management for models, training, and inference
     - Automatic model and tokenizer initialization from HuggingFace or local paths
     - Support for multiple training paradigms (SFT, DPO, ORPO, GRPO, distillation)
-    - Integration with eSurge and vSurge inference engines
+    - Integration with the eSurge inference engine
     - Built-in evaluation with lm-evaluation-harness
     - Flexible dataset mixture configuration
     - Model sharding and quantization support
@@ -38,7 +38,6 @@ import typing
 from collections.abc import Mapping
 from typing import Any, NotRequired, Unpack
 
-import jax
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from transformers import AutoTokenizer
@@ -52,11 +51,9 @@ from .builders import (
     build_dataset,
     build_esurge,
     build_model,
-    build_vsurge,
     to_data_mixture_kwargs,
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
-    to_vsurge_kwargs,
 )
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
 from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
@@ -101,7 +98,7 @@ class eLargeModel:
     - Configuration management (load, save, create)
     - Model building and initialization (including teacher/reference models)
     - Training orchestration with multiple paradigms (SFT, DPO, ORPO, etc.)
-    - eSurge and vSurge inference engine integration
+    - eSurge inference engine integration
     - Tokenizer management
     - Dataset mixture configuration
     - Model evaluation with lm-evaluation-harness
@@ -181,12 +178,25 @@ class eLargeModel:
 
         Args:
             model_name_or_path: HuggingFace model ID or local path
-            task: Optional task type (auto-detected if not provided)
+            task: Optional task type (auto-detected if not provided or AUTO_BIND)
             **kwargs: Additional configuration options
 
         Returns:
             eLargeModel instance with configuration
         """
+        from .utils import infer_task_from_hf_config, normalize_task
+
+        # Auto-detect task if None or AUTO_BIND
+        if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":
+            inferred_task = infer_task_from_hf_config(model_name_or_path)
+            if inferred_task is not None:
+                task = inferred_task
+                logger.info(f"Auto-detected task type: {task.value}")
+        else:
+            normalized = normalize_task(task)
+            if normalized is not None:
+                task = normalized
+
         config = {
             "model": {
                 "name_or_path": model_name_or_path,
@@ -382,9 +392,7 @@ class eLargeModel:
                 - tp: Tensor parallel
                 - pp: Pipeline parallel
                 - sp: Sequence parallel
-            **kwargs: Additional sharding options:
-                - shard_attention_computation: Whether to shard attention (default: True)
-                - backend: Sharding backend ("jax" or "torch")
+            **kwargs: Additional sharding options.
 
         Returns:
             Self for method chaining
@@ -480,50 +488,6 @@ class eLargeModel:
         esurge["max_num_seqs"] = max_num_seqs
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
-        return self
-
-    def set_vsurge(
-        self,
-        max_concurrent_decodes: int | None = None,
-        max_concurrent_prefill: int = 1,
-        bytecode_decode: bool = False,
-        **kwargs,
-    ) -> eLargeModel:
-        """Configure vSurge inference settings.
-
-        vSurge is a low-latency inference engine optimized for interactive
-        applications. It supports streaming and provides better per-request
-        latency compared to eSurge.
-
-        Args:
-            max_concurrent_decodes: Maximum concurrent decode calls.
-                If None, defaults to number of devices.
-            max_concurrent_prefill: Maximum concurrent prefill operations.
-                Higher values can improve throughput for mixed workloads.
-            bytecode_decode: Enable JAX bytecode compilation for decode step.
-                Can improve performance but increases compilation time.
-            **kwargs: Additional vSurge options:
-                - interleaved_mode: Enable interleaved prefill/decode
-                - ring_buffer_size: Size of internal ring buffer
-                - enable_streaming: Enable token streaming (default: True)
-                - compile_prefill: Compile prefill function (default: False)
-
-        Returns:
-            Self for method chaining
-
-        Example:
-            >>> elm.set_vsurge(
-            ...     max_concurrent_decodes=8,
-            ...     bytecode_decode=True,
-            ...     interleaved_mode=True
-            ... )
-        """
-        vsurge = self._config.setdefault("vsurge", {})
-        if max_concurrent_decodes is not None:
-            vsurge["max_concurrent_decodes"] = max_concurrent_decodes
-        vsurge["max_concurrent_prefill"] = max_concurrent_prefill
-        vsurge["bytecode_decode"] = bytecode_decode
-        vsurge.update(kwargs)
         return self
 
     def set_mixture(
@@ -791,24 +755,6 @@ class eLargeModel:
         """
         return to_esurge_kwargs(self._config)
 
-    def get_vsurge_kwargs(self) -> dict[str, Any]:
-        """Get kwargs for vSurge initialization.
-
-        Extracts and formats the configuration options for creating a
-        vSurge engine instance.
-
-        Returns:
-            Dictionary of vSurge arguments including max_concurrent_decodes,
-            bytecode_decode, and other engine settings
-
-        Example:
-            >>> kwargs = elm.get_vsurge_kwargs()
-            >>> # Can be used directly:
-            >>> from easydel.inference import vSurge
-            >>> engine = vSurge(model, **kwargs)
-        """
-        return to_vsurge_kwargs(self._config)
-
     def get_base_config(self, prefer: str = "base") -> dict[str, Any]:
         """Get materialized base configuration.
 
@@ -903,27 +849,6 @@ class eLargeModel:
         """
         self.build_model()
         return build_esurge(self._config, self._model)
-
-    def build_vsurge(self):
-        """Build the vSurge inference engine.
-
-        Creates a vSurge engine instance configured with the current settings.
-        Automatically builds the model if not already built.
-
-        Returns:
-            vSurge instance ready for streaming inference
-
-        Example:
-            >>> elm.set_vsurge(max_concurrent_decodes=4, bytecode_decode=True)
-            >>> engine = elm.build_vsurge()
-            >>> # Use engine for streaming inference
-            >>> stream = engine.generate_stream(prompt, max_tokens=100)
-            >>> for token in stream:
-            ...     print(token, end="")
-        """
-
-        self.build_model()
-        return build_vsurge(self._config, self._model)
 
     def build_teacher_model(self) -> EasyDeLBaseModule | None:
         """Build the teacher model for distillation training.
@@ -1363,14 +1288,14 @@ class eLargeModel:
     def eval(
         self,
         tasks: str | list[str],
-        engine: typing.Literal["esurge", "vsurge", "auto"] | Any = "auto",
+        engine: typing.Literal["esurge", "auto"] | Any = "auto",
         num_fewshot: int = 0,
         output_path: str | None = None,
     ) -> dict[str, Any]:
         """Run evaluation on specified tasks using lm-evaluation-harness.
 
-        This method provides a unified interface for evaluating models using either
-        eSurge or vSurge engines with the lm-evaluation-harness framework.
+        This method provides a unified interface for evaluating models using the
+        eSurge engine with the lm-evaluation-harness framework.
 
         Args:
             tasks: Task name(s) to evaluate on. Can be a single task string or list of tasks.
@@ -1383,10 +1308,9 @@ class eLargeModel:
                 - Coding: "humaneval", "mbpp"
                 Full list: https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks
             engine: Inference engine to use. Options:
-                - "esurge": Use eSurge engine (better for large batches, high throughput)
-                - "vsurge": Use vSurge engine (better for streaming, low latency)
+                - "esurge": Use eSurge engine (high throughput)
                 - "auto": Automatically select based on configuration (default)
-                - An existing eSurge/vSurge instance for custom configuration
+                - An existing eSurge instance for custom configuration
             num_fewshot: Number of few-shot examples to use (default: 0 for zero-shot).
                 Different tasks may have different recommended values:
                 - MMLU: typically 5-shot
@@ -1426,13 +1350,9 @@ class eLargeModel:
             >>> for task, metrics in results["results"].items():
             ...     print(f"{task}: {metrics.get('acc', metrics.get('exact_match')):.2%}")
 
-            Using pre-built engine with custom config:
-            >>> engine = elm.build_vsurge()
-            >>> results = elm.eval("arc_easy", engine=engine, num_fewshot=25)
-
             Evaluation with custom settings:
             >>> elm.set_eval(
-            ...     max_new_tokens=512,
+                ...     max_new_tokens=512,
             ...     temperature=0.0,  # Greedy decoding
             ...     batch_size=32
             ... )
@@ -1469,12 +1389,7 @@ class eLargeModel:
 
         if isinstance(engine, str):
             if engine == "auto":
-                if self._config.get("esurge"):
-                    engine = "esurge"
-                elif self._config.get("vsurge"):
-                    engine = "vsurge"
-                else:
-                    engine = "esurge"
+                engine = "esurge"
 
             if engine == "esurge":
                 from easydel.inference.evaluations import eSurgeLMEvalAdapter
@@ -1490,23 +1405,6 @@ class eLargeModel:
                     max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
                     max_new_tokens=max_new_tokens,
                     batch_size=batch_size,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
-
-            elif engine == "vsurge":
-                from easydel.inference.evaluations import vSurgeLMEvalAdapter
-
-                engine_instance = self.build_vsurge()
-
-                if batch_size is None:
-                    batch_size = self._config.get("vsurge", {}).get("max_concurrent_decodes", jax.device_count())
-
-                eval_adapter = vSurgeLMEvalAdapter(
-                    surge=engine_instance,
-                    processor=self._tokenizer,
-                    max_length=self._model.config.granted_mask_max_position_embedding if self._model else 8192,
-                    max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                 )
@@ -1532,20 +1430,6 @@ class eLargeModel:
                     top_p=top_p,
                 )
 
-            elif "vSurge" in engine_type:
-                from easydel.inference.evaluations import vSurgeLMEvalAdapter
-
-                if batch_size is None:
-                    batch_size = getattr(engine.driver, "max_concurrent_decodes", jax.device_count())
-
-                eval_adapter = vSurgeLMEvalAdapter(
-                    surge=engine,
-                    processor=self._tokenizer,
-                    max_length=getattr(engine.driver.engine.model.config, "granted_mask_max_position_embedding", 8192),
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
             else:
                 raise ValueError(f"Unknown engine instance type: {engine_type}")
 
@@ -1611,102 +1495,112 @@ class eLargeModel:
             components including model, loading options, sharding,
             quantization, training, and inference settings.
         """
-        lines = ["╭─── eLargeModel Configuration ───╮"]
+        w = 53  # inner width (content area)
 
-        lines.append("│ 📦 Model")
-        lines.append(f"│   • Name: {self.model_name or 'Not set'}")
-        lines.append(f"│   • Task: {self.task.name if self.task else 'Auto-detect'}")
-        tokenizer = self._config.get("model", {}).get("tokenizer")
-        if tokenizer and tokenizer != self.model_name:
-            lines.append(f"│   • Tokenizer: {tokenizer}")
+        def _fmt(val: Any) -> str:
+            """Format a value for display, handling enums and special types."""
+            if val is None:
+                return "none"
+            if hasattr(val, "value"):
+                return str(val.value) if val.value else "none"
+            if hasattr(val, "name"):
+                return val.name.lower()
+            return str(val)
 
+        def _line(content: str) -> str:
+            """Create a padded line within the box."""
+            return f"║ {content:<{w}}║"
+
+        def _sep() -> str:
+            """Create a separator line."""
+            return f"╟{'─' * (w + 1)}╢"
+
+        lines = []
+        lines.append(f"╔{'═' * (w + 1)}╗")
+        lines.append(f"║{'eLargeModel':^{w + 1}}║")
+        lines.append(f"║{self.model_name or 'not set':^{w + 1}}║")
+        lines.append(f"╠{'═' * (w + 1)}╣")
+
+        # Loader & Task
         loader = self._config.get("loader", {})
-        if loader:
-            lines.append("│ ⚙️  Loading")
-            lines.append(f"│   • Dtype: {loader.get('dtype', 'default')}")
-            if loader.get("param_dtype") and loader["param_dtype"] != loader.get("dtype"):
-                lines.append(f"│   • Param dtype: {loader['param_dtype']}")
-            if loader.get("precision"):
-                lines.append(f"│   • Precision: {loader['precision']}")
-            if loader.get("from_torch") is not None:
-                lines.append(f"│   • From PyTorch: {loader['from_torch']}")
+        dtype_str = loader.get("dtype", "default")
+        prec_str = loader.get("precision", "default")
+        task_str = self.task.name.lower() if self.task else "auto"
+        lines.append(_line(f"▸ dtype: {dtype_str:<12} ▸ task: {task_str}"))
+        lines.append(_line(f"▸ precision: {prec_str}"))
 
+        # Sharding
         sharding = self._config.get("sharding", {})
-        if sharding.get("axis_dims") and sharding["axis_dims"] != (1, 1, 1, -1, 1):
-            lines.append("│ 🔀 Sharding")
-            lines.append(f"│   • Dimensions: {sharding['axis_dims']}")
-            if sharding.get("axis_names"):
-                lines.append(f"│   • Axis names: {sharding['axis_names']}")
-            if sharding.get("shard_attention_computation") is False:
-                lines.append(f"│   • Shard attention: {sharding['shard_attention_computation']}")
+        if sharding.get("axis_dims"):
+            dims = sharding["axis_dims"]
+            auto = "auto" if sharding.get("auto_shard_model") else "manual"
+            dims_str = ",".join(str(d) for d in dims)
+            lines.append(_line(f"▸ shard: ({dims_str}) {auto}"))
 
+        lines.append(_sep())
+
+        # Config section
+        base_cfg = self._config.get("base_config", {}).get("values", {})
+        if base_cfg:
+            if "attn_mechanism" in base_cfg:
+                lines.append(_line(f"▸ attn: {_fmt(base_cfg['attn_mechanism'])}"))
+            if "moe_method" in base_cfg:
+                lines.append(_line(f"▸ moe:  {_fmt(base_cfg['moe_method'])}"))
+            if "gradient_checkpointing" in base_cfg:
+                gc = base_cfg["gradient_checkpointing"]
+                gc_str = _fmt(gc) or "disabled"
+                lines.append(_line(f"▸ grad_ckpt: {gc_str}"))
+
+        # Quantization
         quant = self._config.get("quantization", {})
         if quant.get("method"):
-            lines.append("│ 📉 Quantization")
-            lines.append(f"│   • Method: {quant['method']}")
-            if quant.get("block_size"):
-                lines.append(f"│   • Block size: {quant['block_size']}")
-            if quant.get("platform"):
-                lines.append(f"│   • Platform: {quant['platform']}")
+            lines.append(_line(f"▸ quant: {quant['method']} (block:{quant.get('block_size', 128)})"))
 
+        # eSurge
         esurge = self._config.get("esurge", {})
-        if esurge:
-            has_esurge_config = any(
-                esurge.get(k) is not None for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]
-            )
-            if has_esurge_config:
-                lines.append("│ 🚀 eSurge")
-                if esurge.get("max_model_len"):
-                    lines.append(f"│   • Max length: {esurge['max_model_len']:,}")
-                if esurge.get("max_num_seqs"):
-                    lines.append(f"│   • Max sequences: {esurge['max_num_seqs']}")
-                if esurge.get("hbm_utilization"):
-                    lines.append(f"│   • HBM utilization: {esurge['hbm_utilization']:.0%}")
-                if esurge.get("page_size") and esurge["page_size"] != 128:
-                    lines.append(f"│   • Page size: {esurge['page_size']}")
+        if esurge and any(esurge.get(k) for k in ["max_model_len", "max_num_seqs", "hbm_utilization"]):
+            lines.append(_sep())
+            lines.append(_line("eSurge"))
 
+            ctx = esurge.get("max_model_len", 0)
+            seqs = esurge.get("max_num_seqs", 0)
+            hbm = esurge.get("hbm_utilization", 0)
+            lines.append(_line(f"▸ {ctx:,} context x {seqs} sequences"))
+
+            parts = []
+            if hbm:
+                parts.append(f"{hbm:.0%} HBM")
+            if esurge.get("page_size"):
+                parts.append(f"page:{esurge['page_size']}")
+            if esurge.get("enable_prefix_caching"):
+                parts.append("prefix_cache")
+            if esurge.get("min_input_pad"):
+                parts.append(f"pad:{esurge['min_input_pad']}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
+
+        # Training
         trainer = self._config.get("trainer", {})
         if trainer.get("trainer_type"):
-            lines.append("│ 🎯 Training")
-            lines.append(f"│   • Type: {trainer['trainer_type'].upper()}")
+            lines.append(_sep())
+            lines.append(_line(f"Training: {trainer['trainer_type'].upper()}"))
+            parts = []
             if trainer.get("learning_rate"):
-                lines.append(f"│   • Learning rate: {trainer['learning_rate']:.2e}")
+                parts.append(f"lr:{trainer['learning_rate']:.2e}")
             if trainer.get("num_train_epochs"):
-                lines.append(f"│   • Epochs: {trainer['num_train_epochs']}")
+                parts.append(f"epochs:{trainer['num_train_epochs']}")
             if trainer.get("total_batch_size"):
-                lines.append(f"│   • Batch size: {trainer['total_batch_size']}")
-            if trainer.get("output_dir"):
-                lines.append(f"│   • Output: {trainer['output_dir']}")
+                parts.append(f"batch:{trainer['total_batch_size']}")
+            if parts:
+                lines.append(_line(f"▸ {' │ '.join(parts)}"))
 
-        platform = self._config.get("platform", {})
-        if platform:
-            if platform.get("backend") or platform.get("platform"):
-                lines.append("│ 💻 Platform")
-                if platform.get("backend"):
-                    lines.append(f"│   • Backend: {platform['backend']}")
-                if platform.get("platform"):
-                    lines.append(f"│   • Hardware: {platform['platform']}")
-
-        vsurge = self._config.get("vsurge", {})
-        if vsurge:
-            has_vsurge_config = any(
-                vsurge.get(k) is not None for k in ["max_concurrent_decodes", "bytecode_decode", "interleaved_mode"]
-            )
-            if has_vsurge_config:
-                lines.append("│ ⚡ vSurge")
-                if vsurge.get("max_concurrent_decodes"):
-                    lines.append(f"│   • Max decodes: {vsurge['max_concurrent_decodes']}")
-                if vsurge.get("max_concurrent_prefill"):
-                    lines.append(f"│   • Max prefill: {vsurge['max_concurrent_prefill']}")
-                if vsurge.get("bytecode_decode"):
-                    lines.append(f"│   • Bytecode decode: {vsurge['bytecode_decode']}")
-                if vsurge.get("interleaved_mode"):
-                    lines.append(f"│   • Interleaved mode: {vsurge['interleaved_mode']}")
-
-        lines.append("│ 📊 Status")
-        lines.append(f"│   • Model loaded: {'✓' if self._model is not None else '✗'}")
-        lines.append(f"│   • Tokenizer loaded: {'✓' if self._tokenizer is not None else '✗'}")
-
-        lines.append("╰────────────────────────────────╯")
+        # Status
+        lines.append(_sep())
+        model_icon = "●" if self._model is not None else "○"
+        tok_icon = "●" if self._tokenizer is not None else "○"
+        model_status = "loaded" if self._model is not None else "not loaded"
+        tok_status = "loaded" if self._tokenizer is not None else "not loaded"
+        lines.append(_line(f"{model_icon} model: {model_status}   {tok_icon} tokenizer: {tok_status}"))
+        lines.append(f"╚{'═' * (w + 1)}╝")
 
         return "\n".join(lines)

@@ -32,9 +32,9 @@ classifiers = [
 dependencies = [
 	"jax>=0.8.0",
 	"jaxlib>=0.8.0",
-	"ray[default]==2.34.0",
-	"eformer>=0.0.81",
-	"ejkernel>=0.0.11",
+	"ray[default]==2.51.0",
+	"eformer==0.0.84",
+	"ejkernel==0.0.21",
 	"einops~=0.8.0",
 	"transformers>=4.57.1,<5.0.0",
 	"flax==0.11.2",
@@ -51,6 +51,8 @@ dependencies = [
 	"partial-json-parser>=0.2.1.1.post6",
 	"google-api-python-client>=2.179.0",
 	"cryptography>=45.0.6",
+	"pyzmq>=27.1.0",
+	"grafanalib>=0.7.1",
 ]
 
 [project.urls]

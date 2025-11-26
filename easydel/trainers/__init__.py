@@ -13,9 +13,14 @@
 # limitations under the License.
 
 from .base_trainer import BaseTrainer
+from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
+from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
+from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
+from .kto_trainer import KTOConfig, KTOTrainer
+from .nash_md_trainer import NashMDConfig, NashMDTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .packer import pack_sequences
 from .ray_scaler import RayDistributedTrainer
@@ -23,15 +28,26 @@ from .reward_trainer import RewardConfig, RewardTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
+from .xpo_trainer import XPOConfig, XPOTrainer
 
 __all__ = (
+    "BCOConfig",
+    "BCOTrainer",
     "BaseTrainer",
+    "CPOConfig",
+    "CPOTrainer",
     "DPOConfig",
     "DPOTrainer",
     "DistillationConfig",
     "DistillationTrainer",
+    "GKDConfig",
+    "GKDTrainer",
     "GRPOConfig",
     "GRPOTrainer",
+    "KTOConfig",
+    "KTOTrainer",
+    "NashMDConfig",
+    "NashMDTrainer",
     "ORPOConfig",
     "ORPOTrainer",
     "RayDistributedTrainer",
@@ -41,5 +57,7 @@ __all__ = (
     "SFTTrainer",
     "Trainer",
     "TrainingArguments",
+    "XPOConfig",
+    "XPOTrainer",
     "pack_sequences",
 )

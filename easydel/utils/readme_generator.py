@@ -37,7 +37,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "flash_attn2": "FLASH_ATTN2", "flash_attention2": "FLASH_ATTN2", "flashattn2": "FLASH_ATTN2",
     "blocksparse": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
     "ring": "RING", "ring_attn": "RING", "ring_attention": "RING",
-    "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention": "PAGED",
+    "paged": "PAGED", "paged_attn": "PAGED", "ragged_page_attention_v3": "PAGED", "ragged_page_attention_v2": "PAGED",
     "mistral": "MISTRAL"
 } %}
 {%- set attn_enum = attn_enum_map.get(model.attn_mechanism_str.lower(), "VANILLA") %}
@@ -172,6 +172,7 @@ JINJA_TEMPLATE = """
 } %}
 {% set auto_class = auto_class_map.get(model.model_task, "AutoEasyDeLModelForCausalLM") %}
 {% set attn_enum_map = {
+    "auto": "AUTO",
     "vanilla": "VANILLA",
     "flash": "FLASH",
     "flash_attn": "FLASH",
@@ -188,7 +189,8 @@ JINJA_TEMPLATE = """
     "ring_attention": "RING",
     "paged": "PAGED",
     "paged_attn": "PAGED",
-    "ragged_page_attention": "PAGED",
+    "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
+    "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3",
     "mistral": "MISTRAL"
 } %}
 {% set attn_enum = attn_enum_map.get(model.attn_mechanism.lower(), "VANILLA") %}
@@ -246,7 +248,7 @@ This model is built using [EasyDeL](https://github.com/erfanzar/EasyDeL), an ope
 - **Multi-Device Support**: Optimized to run on TPU, GPU, and CPU environments.
 - **Sharded Model Parallelism**: Supports model parallelism across multiple devices for scalability (using `auto_shard_model=True`).
 - **Customizable Precision**: Allows specification of `dtype`, `param_dtype`, and `precision`.
-- **Advanced Serving**: Includes `vInference` engine and OpenAI-compatible API server.
+- **Advanced Serving**: Includes `eSurge` LLM serving engine, `vWhisper` speech endpoints, and OpenAI-compatible APIs.
 - **Optimized Kernels**: Integrates multiple attention mechanisms (like `{{ model.attn_mechanism }}`) and platform-specific optimizations.
 
 ## Installation

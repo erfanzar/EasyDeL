@@ -271,6 +271,11 @@ class MetricsCollector:
             )
             self.cache_metrics.append(metrics)
 
+    def record_cache_event(self, event: str, details: dict[str, Any] | None = None) -> None:
+        """Record lifecycle events for the KV cache."""
+        with self._lock:
+            self.counters[f"cache_event_{event}"] += 1
+
     def get_system_metrics(self, window_seconds: float = 60.0) -> SystemMetrics:
         """Get aggregated system metrics for the specified time window."""
         current_time = time.time()

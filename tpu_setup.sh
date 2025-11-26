@@ -202,7 +202,7 @@ log_info "Uninstalling existing easydel on TPU hosts (if any)..."
 # Use PEP 508 direct URL so extras are preserved:
 # 'easydel[extras] @ git+https://...'
 install_package_on_tpu "'easydel[tpu,torch,lm_eval] @ git+https://github.com/erfanzar/easydel.git'"
-install_package_on_tpu "ray[default]==2.34.0"
+install_package_on_tpu "ray[default]==2.51.0"
 # Configure Ray (use the actual eopod binary we installed locally, not uv run)
 log_info "Configuring Ray..."
 export RAY_EXECUTABLE_PATH="${REMOTE_VENV_PATH}/bin/ray"

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from functools import cached_property
 
 import jax
@@ -26,9 +27,9 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     RaggedPagesCache,
@@ -44,67 +45,75 @@ from easydel.layers.norms import RMSNorm
 from .openelm_configuration import OpenELMConfig, make_divisible
 
 
-class OpenELMMultiHeadCausalAttention(AttentionModule):
-    """OpenELM Multi-Head Causal Attention module.
+class OpenELMMultiHeadCausalAttention(UnifiedAttention):
+    """OpenELM causal attention based on UnifiedAttention with per-layer head configuration."""
 
-    This module implements the multi-head causal self-attention mechanism used in the OpenELM model.
-    It supports Grouped Query Attention (GQA) and optional RMS Normalization of query and key projections.
-
-    Attributes:
-        config (OpenELMConfig): Configuration object for the model.
-        layer_idx (int): The index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        qkv_proj (ParallelLinear): Combined linear layer for query, key, and value projections.
-        q_norm (RMSNorm, optional): RMS Normalization applied to the query projection if enabled.
-        k_norm (RMSNorm, optional): RMS Normalization applied to the key projection if enabled.
-        out_proj (ParallelLinear): Linear layer for the output projection.
-        head_dim (int): Dimensionality of each attention head.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
-        num_q_heads (int): Number of query heads.
-        num_k_heads (int): Number of key heads.
-        num_v_heads (int): Number of value heads.
-        transformer_dim (int): Dimensionality of the transformer model.
-        num_groups (int): Number of query groups for GQA.
-        rotary (RoPE): Rotary position embedding module.
-    """
+    projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
+    projection_mapping.update(
+        {
+            "query_key_value_projection": "qkv_proj",
+            "output_projection": "out_proj",
+        }
+    )
 
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        """Initializes the OpenELMMultiHeadCausalAttention module.
-
-        Args:
-            config (OpenELMConfig): The configuration object for the OpenELM model.
-            layer_idx (int): The index of the current decoder layer.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-        """
-        super().__init__(config=config)
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.precision = precision
-        self.rngs = rngs
         self.layer_idx = layer_idx
-        head_dim = config.head_dim
-        q_heads = config.num_query_heads[layer_idx]
-        k_heads = config.num_kv_heads[layer_idx]
-        v_heads = config.num_kv_heads[layer_idx]
+        self.num_q_heads = config.num_query_heads[layer_idx]
+        self.num_k_heads = config.num_kv_heads[layer_idx]
+        self.num_v_heads = config.num_kv_heads[layer_idx]
+        self.head_dim = config.head_dim
+        original_num_heads = getattr(config, "num_attention_heads", None)
+        original_num_kv_heads = getattr(config, "num_key_value_heads", None)
+        config.num_attention_heads = self.num_q_heads
+        config.num_key_value_heads = self.num_k_heads
+        try:
+            super().__init__(
+                config=config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                layer_idx=layer_idx,
+                attention_type="standard",
+                causal=True,
+                use_fused_qkv=True,
+                use_gqa=True,
+            )
+        finally:
+            if original_num_heads is None:
+                delattr(config, "num_attention_heads")
+            else:
+                config.num_attention_heads = original_num_heads
+            if original_num_kv_heads is None:
+                delattr(config, "num_key_value_heads")
+            else:
+                config.num_key_value_heads = original_num_kv_heads
+        # Override base head bookkeeping with per-layer values
+        self.num_heads = self.num_q_heads
+        self.num_key_value_heads = self.num_k_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.transformer_dim = config.model_dim
 
+    def define_network(
+        self,
+        config: OpenELMConfig,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        precision: jax.lax.PrecisionLike,
+        rngs: nn.Rngs,
+    ) -> None:
         self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
-            (q_heads + k_heads + v_heads) * head_dim,
+            (self.num_q_heads + self.num_k_heads + self.num_v_heads) * self.head_dim,
             dtype=dtype,
             param_dtype=param_dtype,
             use_bias=False,
@@ -113,18 +122,31 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             rngs=rngs,
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
+
+        self.out_proj = RowParallelLinear(
+            self.num_q_heads * self.head_dim,
+            config.model_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            use_bias=False,
+            precision=precision,
+            rngs=rngs,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            **get_dot_general_by_bits(config.bits, config.easy_method),
+        )
+
         if config.normalize_qk_projections:
             self.q_norm = RMSNorm(
-                dim=config.head_dim,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
+                dim=self.head_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
                 eps=1e-6,
                 rngs=rngs,
             )
             self.k_norm = RMSNorm(
-                dim=config.head_dim,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
+                dim=self.head_dim,
+                dtype=dtype,
+                param_dtype=param_dtype,
                 eps=1e-6,
                 rngs=rngs,
             )
@@ -132,176 +154,24 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
             self.q_norm = None
             self.k_norm = None
 
-        self.out_proj = RowParallelLinear(
-            q_heads * head_dim,
-            config.model_dim,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
-        self.head_dim = head_dim
-
-        self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
-            base_config=config,
-            softmax_scale=self.head_dim**-0.5,
-            dropout_prob=0.0,
-        )
-
-        self.head_dim = config.head_dim
-        self.num_q_heads = q_heads
-        self.num_k_heads = k_heads
-        self.num_v_heads = v_heads
-        self.transformer_dim = config.model_dim
-        self.num_groups = self.num_q_heads // self.num_k_heads
-
-        self.rotary = self.config.get_basic_rope(
-            self.dtype,
-            head_size=self.config.head_dim,
-            rotary_dim=self.config.head_dim,
-            base=self.config.rope_freq_constant,
-        )
-
-    def _merge_heads(self, hidden_states):
-        """
-        Merges the attention heads into a single hidden state tensor.
-
-        Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-        Returns:
-            chex.Array: The hidden states with merged head dimensions.
-        """
-        return hidden_states.reshape((*hidden_states.shape[:2], self.num_q_heads * self.head_dim))
-
-    def __call__(
+    def _postprocess_qkv(
         self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> AttentionLayerOutput:
-        """
-        Forward pass of the OpenELMMultiHeadCausalAttention module.
-
-        Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
-
-        Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
-        """
-        batch_size, sequence_length = hidden_states.shape[:2]
-
-        # [B, S, d] --> [B, S, (q_h + k_h + v_h) * h]
-        qkv = checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv")
-        # [B, S, (q_h + k_h + v_h) * h] --> [B, S, (q_h + k_h + v_h), h]
-        qkv = qkv.reshape(
-            batch_size,
-            sequence_length,
-            self.num_q_heads + self.num_k_heads + self.num_v_heads,
-            self.head_dim,
-        )
-        # [B, S, (q_h + k_h + v_h), h] --> [B, (q_h + k_h + v_h), S, h]
-        qkv = qkv.transpose(0, 2, 1, 3)
-        # [B, (q_h + k_h + v_h), S, h] --> [B, q_h, S h], [B, k_h, S, h], [B, v_h, S, h]
-        query_states = qkv[
-            :,
-            : self.num_q_heads,
-            :,
-            :,
-        ]
-        key_states = qkv[
-            :,
-            self.num_q_heads : self.num_k_heads + self.num_q_heads,
-            :,
-            :,
-        ]
-        value_states = qkv[
-            :,
-            self.num_k_heads + self.num_q_heads :,
-            :,
-            :,
-        ]
+        query_states: jnp.ndarray,
+        key_states: jnp.ndarray,
+        value_states: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         if self.q_norm is not None:
-            query_states = checkpoint_name(self.q_norm(query_states), "attn_query")
-        else:
-            query_states = checkpoint_name(query_states, "attn_query")
-
+            query_states = self.q_norm(query_states)
         if self.k_norm is not None:
-            key_states = checkpoint_name(self.k_norm(key_states), "attn_key")
-        else:
-            key_states = checkpoint_name(key_states, "attn_key")
+            key_states = self.k_norm(key_states)
+        return query_states, key_states, value_states
 
-        value_states = checkpoint_name(value_states, "attn_value")
-        query_states, key_states, value_states = map(
-            lambda x: x.transpose(0, 2, 1, 3),
-            [query_states, key_states, value_states],
-        )
-
-        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
-
-        query_states, key_states = self.rotary(
-            positions=position_ids,
-            query=query_states,
-            key=key_states,
-            frequencies=frequencies,
-        )
-
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            mask_info=mask_info,
-        )
-
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=True,
-        )
-
-        attn_output = checkpoint_name(
-            self.out_proj(self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))), "attn_output"
-        )
-
-        return AttentionLayerOutput(
-            attention_output=attn_output,
-            attention_weight=attentions.attention_weights if output_attentions else None,
-            cache_view=cache_view,
+    def _create_rotary(self, config: OpenELMConfig, dtype: jnp.dtype):
+        return config.get_basic_rope(
+            dtype,
+            head_size=config.head_dim,
+            rotary_dim=config.head_dim,
+            base=config.rope_freq_constant,
         )
 
 
@@ -328,12 +198,12 @@ class OpenELMFeedForwardNetwork(nn.Module):
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the OpenELMFeedForwardNetwork module.
 
@@ -459,12 +329,12 @@ class OpenELMDecoderLayer(nn.Module):
     def __init__(
         self,
         config: OpenELMConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the OpenELMDecoderLayer.
 
@@ -495,19 +365,19 @@ class OpenELMDecoderLayer(nn.Module):
 
         self.attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.ffn = mlp_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.ffn_norm = RMSNorm(
             self.config.model_dim,
@@ -732,7 +602,7 @@ class OpenELMModel(EasyDeLBaseModule):
             inputs_embeds = checkpoint_name(self.token_embeddings(input_ids.astype("i4")), "embeddings")
         else:
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert (
             sequence_length <= self.config.max_context_length
@@ -745,10 +615,7 @@ class OpenELMModel(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         if mode is None:
             mode = (

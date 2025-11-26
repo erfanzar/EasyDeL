@@ -34,7 +34,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -65,7 +65,12 @@ class GemmaRMSNorm(nn.Module):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
-        self.kernel = nn.Param(jnp.ones(self.config.hidden_size, dtype=dtype))
+        self.kernel = ArrayParam.bound(
+            shape=(self.config.hidden_size,),
+            dtype=dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
@@ -100,6 +105,7 @@ class GemmaAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize Gemma attention."""
         super().__init__(
@@ -108,6 +114,7 @@ class GemmaAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
         )
@@ -135,6 +142,7 @@ class GemmaMLP(nn.Module):
     def __init__(
         self,
         config: GemmaConfig,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: str | jax.lax.Precision | None = None,
@@ -236,6 +244,7 @@ class GemmaDecoderLayer(nn.Module):
         precision: str | jax.lax.Precision | None = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         self.config = config
         self.dtype = dtype
@@ -261,6 +270,7 @@ class GemmaDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = mlp_block(
             config=config,
@@ -268,6 +278,7 @@ class GemmaDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
     def __call__(
@@ -347,6 +358,8 @@ class GemmaDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GemmaConfig, model_type="gemma")
 class GemmaModel(EasyDeLBaseModule):
+    """Decoder-only Gemma transformer wiring embeddings, decoder blocks, and output norm."""
+
     def __init__(
         self,
         config: GemmaConfig,
@@ -381,6 +394,7 @@ class GemmaModel(EasyDeLBaseModule):
         self.layers = [
             GemmaDecoderLayer(
                 self.config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -438,10 +452,7 @@ class GemmaModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -644,6 +655,8 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GemmaConfig, model_type="gemma")
 class GemmaForSequenceClassification(EasyDeLBaseModule):
+    """Gemma encoder stack with a linear classification head for sequence labels."""
+
     def __init__(
         self,
         config: GemmaConfig,

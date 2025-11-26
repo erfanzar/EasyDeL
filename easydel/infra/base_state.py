@@ -600,7 +600,6 @@ class EasyDeLState(struct.PyTreeNode):
         sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
         sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_attention_computation: bool = True,
         shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -646,8 +645,6 @@ class EasyDeLState(struct.PyTreeNode):
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis:
                 Configuration object for partitioning specific axes. Defaults to None.
-            shard_attention_computation:
-                If True, shards the attention computation across devices. Defaults to True.
             shard_fns:
                 Optional mapping of parameter path tuples to custom sharding functions. Defaults to None.
             backend:
@@ -720,7 +717,6 @@ class EasyDeLState(struct.PyTreeNode):
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
             partition_axis=partition_axis,
-            shard_attention_computation=shard_attention_computation,
             shard_fns=shard_fns,
             backend=backend,
             platform=platform,

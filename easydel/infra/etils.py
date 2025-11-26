@@ -212,7 +212,8 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "blockwise",
     "sdpa",
     "autoregressive_decodeattn",
-    "ragged_page_attention",
+    "ragged_page_attention_v2",
+    "ragged_page_attention_v3",
     "page_attention",
 ]
 AVAILABLE_QUANTIZATION_METHODS = tp.Literal[None, "nf4", "8bit"]

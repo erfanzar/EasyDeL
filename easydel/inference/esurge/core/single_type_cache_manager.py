@@ -154,7 +154,7 @@ class SingleTypeCacheManager(ABC):
         self.num_cached_page.pop(request_id, None)
 
     @abstractmethod
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> int:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
         """
         Get the number of common prefix pages for a request.
 
@@ -253,11 +253,14 @@ class FullAttentionManager(SingleTypeCacheManager):
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
         pass
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> int:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
         pages = self.req_to_pages[request_id]
         num_common_pages = 0
         for page in pages:
-            if page.ref_cnt == num_running_requests:
+            # For the scheduled batch, consider a page common if at least all
+            # scheduled requests share it. This tolerates additional RUNNING
+            # requests holding the page.
+            if page.ref_cnt >= num_scheduled_requests:
                 num_common_pages += 1
             else:
                 break
@@ -325,7 +328,7 @@ class SlidingWindowManager(SingleTypeCacheManager):
             pages[i] = self._null_page
         self.page_pool.free_pages(removed_pages)
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> int:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
         """
         NOTE(Chen): The prefix pages are null pages for sliding window layers.
         So it's not correct to count ref_cnt like FullAttentionManager. Return
@@ -424,7 +427,7 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
             pages[i] = self._null_page
         self.page_pool.free_pages(removed_pages)
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> int:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
         """
         cascade attention is not supported by chunked local attention.
         """
@@ -450,7 +453,7 @@ class MambaManager(SingleTypeCacheManager):
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
         pass
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> int:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
         return 0
 
     def allocate_new_pages(self, request_id: str, num_tokens: int) -> list[CachePage]:

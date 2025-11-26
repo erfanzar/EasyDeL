@@ -12,36 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Execution manager for efficient model inference with precompiled fused step functions.
+"""Execution manager for high-performance model inference with fused step functions.
 
-This module provides the ExecutionManager class that handles compilation and caching
-of fused step execution functions for different batch sizes and token counts. It uses
-AOT (Ahead-of-Time) compilation for optimal performance in production environments.
+This module implements the ExecutionManager class, which handles compilation, caching,
+and execution of fused inference steps. The manager pre-compiles functions for multiple
+input configurations to eliminate runtime compilation overhead during serving.
 
-The manager uses a fused execution mode where a single function combines:
-    - Input preparation (prepare_inputs)
-    - Model forward pass
-    - Token sampling
-    - State updates (apply_token)
+Architecture:
+    The manager uses a fused execution model where a single JIT-compiled function
+    combines four sequential operations:
 
-This provides maximum performance by minimizing host-device communication and
-maximizing kernel fusion opportunities.
+    1. Input preparation: Token gathering and position calculation
+    2. Model forward pass: Transformer execution with paged attention
+    3. Token sampling: Stochastic sampling with temperature/top-k/top-p
+    4. State updates: Token buffer updates and sequence tracking
+
+    This fusion minimizes host-device communication (single dispatch per step) and
+    maximizes kernel fusion opportunities within JAX/XLA.
+
+Compilation Modes:
+    - AOT (Ahead-of-Time): Pre-compiles all configurations using lower().compile()
+      for predictable latency and minimal warmup. Default for production.
+    - JIT (Just-in-Time): Defers compilation to first execution. Faster initial
+      setup but unpredictable first-step latency.
+
+Performance Characteristics:
+    - Single host-device round-trip per inference step
+    - Automatic kernel fusion via XLA compiler
+    - Bucketed compilation: O(log N) unique compilations for N request sizes
+    - LRU cache with capacity of 64 compiled variants
 
 Example:
     >>> from easydel.inference.esurge.runners import ExecutionManager
     >>> executor = ExecutionManager(
-    ...     model=my_model,
-    ...     mesh=device_mesh,
-    ...     kv_pages=cache_pages,
+    ...     model=model,
+    ...     mesh=jax.sharding.Mesh(devices, ('dp', 'tp')),
+    ...     kv_pages=cache,
     ...     use_aot_forward=True,
     ... )
-    >>> executor.compile(token_paddings, ...)
-    >>> result = executor.execute(...)
+    >>> executor.compile(
+    ...     num_tokens_paddings=[128, 256, 512, 1024],
+    ...     num_reqs_max_model_len=16,
+    ...     max_pages_per_req=64,
+    ...     max_num_reqs=32,
+    ...     metadata=cache_metadata,
+    ... )
+    >>> result = executor.execute(
+    ...     num_tokens=256,
+    ...     device_state=state,
+    ...     scheduled_full=scheduled,
+    ...     req_num_tokens_full=req_tokens,
+    ...     active_mask_full=active_mask,
+    ...     input_ids_buf=input_buf,
+    ...     position_ids_buf=pos_buf,
+    ...     padded_num_reqs=16,
+    ... )
 """
 
 from __future__ import annotations
 
 import hashlib
+import time
 import typing
 from collections import OrderedDict
 from functools import partial
@@ -58,9 +89,13 @@ from jax._src import pjit
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils import ejit
 
-from ...sampling_funcs import sample_top_p_efficient
+from ..core.sampler import sample_tokens
+from ..core.sampling_metadata import SamplingMetadata
 from ..page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
-from .sequence_buffer import DeviceSequenceState, SequenceBuffer
+from .execution_types import BatchMetadata, MinimalDeviceState, ModelStepOutputs, StepFunctionInputs
+from .sequence_buffer import SequenceBuffer
+
+DEBUG_MODE = False
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -138,74 +173,120 @@ def _tree_hash(tree):
         )
 
     return jax.tree_util.tree_map_with_path(
-        _map, tree, is_leaf=lambda x: isinstance(x, jax.Array | numpy.ndarray | int | float | bool)
+        _map,
+        tree,
+        is_leaf=lambda x: isinstance(
+            x,
+            jax.Array | numpy.ndarray | int | float | bool | None,
+        ),
     )
 
 
-def _tree_hash_diff(tree_hash1, tree_hash2):
+def _tree_hash_diff(orgin, new):
     def _map(p, t1, t2):
         p = key_path_to_str(p)
         oo = t1 == t2
         if not oo:
-            print(f"p : {p} oo : {oo} t1 : {t1} t2 : {t2}")
+            print(f"path: {p} out: {oo} orgin: {t1} new: {t2}")
         return oo
 
-    return jax.tree_util.tree_map_with_path(_map, tree_hash1, tree_hash2, is_leaf=lambda x: isinstance(x, str))
+    return jax.tree_util.tree_map_with_path(_map, orgin, new, is_leaf=lambda x: isinstance(x, str))
 
 
 class ExecutionManager:
-    """Manages precompiled fused step execution functions for efficient model inference.
+    """Compilation and execution manager for fused inference step functions.
 
-    This class handles the compilation and caching of fused step execution functions
-    for different token counts. The fused step combines input preparation, model
-    forward pass, token sampling, and state updates into a single compiled function
-    for maximum performance.
+    The ExecutionManager pre-compiles and caches fused step functions for multiple
+    input configurations, enabling low-latency serving without runtime compilation.
+    It uses bucketed compilation (powers of 2) to reduce the number of unique
+    variants while maintaining good hardware utilization.
 
-    The manager uses AOT (Ahead-of-Time) compilation, pre-compiling functions using
-    JAX's lower/compile API for optimal performance in production environments.
+    Architecture:
+        The manager splits the model into (graphdef, graphstate, graphother) for
+        efficient functional transformations. The graphstate (weights) can be
+        updated without recompilation. Compiled functions are cached in an LRU
+        structure with 64-entry capacity.
 
-    The manager pre-compiles functions for various token count configurations to avoid
-    runtime compilation overhead, enabling seamless switching between different
-    batch sizes during inference.
+    Compilation Strategy:
+        Request counts are bucketed into powers of 2 (up to min_input_pad, then
+        nearest power of 2 above). Token counts use explicit padding values provided
+        during compile(). This produces O(log N * M) compilations for N request
+        sizes and M token configurations.
 
     Attributes:
-        model: The EasyDeL model being managed.
-        mesh: JAX sharding mesh for distributed execution.
-        kv_pages: KV cache pages for attention.
-        use_aot_forward: Whether to use AOT compilation (default: True).
-        graphdef, graphstate, graphother: Split model components for JAX.
-        _step_fn: The compiled fused step function.
-        _lowerd_history: Cache of compiled functions.
+        model: EasyDeL model instance (EasyDeLBaseModule).
+        mesh: JAX sharding mesh for distributed execution across devices.
+        kv_pages: Paged KV cache storage (RaggedPagesCache).
+        use_aot_forward: If True, use AOT compilation via lower().compile().
+            If False, use JIT compilation on first call. Default: True.
+        min_input_pad: Minimum request count padding for bucketing. Default: 8.
+        max_model_len: Maximum sequence length supported by model.
+        max_num_reqs: Maximum concurrent requests.
+        max_num_tokens: Maximum tokens per batch (defaults to max_model_len).
+        metadata: KV cache metadata (RaggedPagesCacheView).
+        graphdef: Model graph definition (static structure).
+        graphstate: Model graph state (weights, device-resident).
+        graphother: Auxiliary model state (buffers, etc.).
+        rng_key: JAX random key for sampling, threaded through steps.
+
+    Private Attributes:
+        _model_step_fn: Model-only forward function (ejit-decorated).
+        _sampling_fn: Sampler/update function (ejit-decorated).
+        _model_lowerd_history: OrderedDict LRU cache of compiled model functions.
+        _sampler_lowerd_history: OrderedDict cache for compiled sampler function.
+        _cache_capacity: Maximum cache entries (64).
+        _debug_baselines: Hash baselines for debugging recompilations.
+        _empty_sharding: Default sharding (replicated across mesh).
 
     Example:
+        >>> # Initialize manager
         >>> executor = ExecutionManager(
-        ...     model=my_model,
-        ...     mesh=device_mesh,
-        ...     kv_pages=cache_pages,
+        ...     model=model,
+        ...     kv_pages=cache,
         ...     use_aot_forward=True,
+        ...     min_input_pad=8,
+        ...     max_model_len=8192,
+        ...     max_num_reqs=32,
         ... )
-        >>> executor.compile(token_paddings, ...)
-        >>> result = executor.execute(...)
+        >>>
+        >>> # Pre-compile for expected configurations
+        >>> executor.compile(
+        ...     num_tokens_paddings=[128, 256, 512, 1024, 2048],
+        ...     num_reqs_max_model_len=16,
+        ...     max_pages_per_req=128,
+        ...     max_num_reqs=32,
+        ...     metadata=cache.metadata,
+        ... )
+        >>>
+        >>> # Execute steps during serving
+        >>> results = executor.execute(
+        ...     num_tokens=512,
+        ...     device_state=state,
+        ...     scheduled_full=scheduled,
+        ...     req_num_tokens_full=req_tokens,
+        ...     active_mask_full=active,
+        ...     input_ids_buf=input_buf,
+        ...     position_ids_buf=pos_buf,
+        ...     padded_num_reqs=16,
+        ... )
     """
 
     def __init__(
         self,
         model: EasyDeLBaseModule,
-        mesh: jax.sharding.Mesh,
-        kv_pages: RaggedPagesCache,
         use_aot_forward: bool = True,
         min_input_pad: int = 8,
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
         max_num_tokens: int | None = None,
         metadata: RaggedPagesCacheView = None,
+        verbose: bool = False,
     ):
         """Initialize the executor manager.
 
         Args:
             model: The EasyDeL model instance.
             mesh: JAX sharding mesh for distributed execution.
-            kv_pages: Pages cache for KV cache management.
             use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
                 execution. When True (default), functions are pre-compiled for better
                 performance. When False, uses Just-In-Time (JIT) compilation with
@@ -216,56 +297,155 @@ class ExecutionManager:
             max_num_tokens: Maximum number of tokens for batching.
             metadata: Pages cache metadata.
         """
-        logger.info("Initializing ExecutionManager")
+        logger.info(f"initializing eSurge-ExecutionManager Version {metadata.version}")
         self.model = model
-        self.mesh = mesh
-        self.kv_pages = kv_pages
+        self.mesh = model.mesh
+        self.kv_pages = model.init_ragged_pages(metadata)
         self.use_aot_forward = use_aot_forward
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens if max_num_tokens is not None else max_model_len
         self.metadata = metadata
+        self._metadata_version = metadata.version
+        self._use_slot_mapping = metadata.version == "v2"
+        self._use_request_distribution = not self._use_slot_mapping
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
-        self._empty_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        self.log_it = logger.info if verbose else logger.debug
+
+        self._empty_sharding = jax.NamedSharding(model.mesh, jax.sharding.PartitionSpec())
 
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
 
-        self._step_fn: None | pjit.JitWrapped = None
+        self._model_step_fn: None | pjit.JitWrapped = None
+        self._sampling_fn = self.get_sampling_fn()
+        self._sampling_impl = self._sampling_fn
         self._cache_capacity = 64
-        self._lowerd_history = OrderedDict()
+        self._model_lowerd_history = OrderedDict()
+        self._sampler_lowerd_history = OrderedDict()
         self._debug_baselines = {}
 
+        # Pre-allocate CPU buffers for fast batch metadata preparation
+        self._input_ids_cpu = numpy.zeros((max_num_tokens,), dtype=numpy.int32)
+        self._positions_cpu = numpy.zeros((max_num_tokens,), dtype=numpy.int32)
+        self._query_start_loc_cpu = numpy.zeros((max_num_reqs + 1,), dtype=numpy.int32)
+        self._seq_lens_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
+        self._logits_indices_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
+        self._scheduled_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
+        self._arange_cpu = numpy.arange(max_num_tokens, dtype=numpy.int32)
+        self._request_distribution_placeholder = numpy.zeros((3,), dtype=numpy.int32)
+        self._slot_mapping_placeholder = numpy.zeros((3, 1), dtype=numpy.int32)
+        self._num_kv_update_placeholder = numpy.zeros((1,), dtype=numpy.int32)
+
+        if self._use_slot_mapping and metadata is not None:
+            self._slices_per_page = metadata.num_slices_per_kv_cache_update_page
+            self._max_padded_slices = int(metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
+            self._slot_mapping_cpu = numpy.full(
+                (3, self._max_padded_slices),
+                SLOT_MAPPING_PADDING_VAL,
+                dtype=numpy.int32,
+            )
+            self._slot_mapping_indices = numpy.arange(self._max_padded_slices, dtype=numpy.int32)
+        else:
+            self._max_padded_slices = None
+            self._slot_mapping_cpu = None
+            self._slices_per_page = None
+            self._slot_mapping_indices = None
         self.init_fns()
 
-    def _cache_put(self, key, value):
-        self._lowerd_history[key] = value
-        self._lowerd_history.move_to_end(key)
-        if len(self._lowerd_history) > self._cache_capacity:
-            self._lowerd_history.popitem(last=False)
+    def _model_cache_put(self, key, value):
+        self._model_lowerd_history[key] = value
+        self._model_lowerd_history.move_to_end(key)
+        if len(self._model_lowerd_history) > self._cache_capacity:
+            self._model_lowerd_history.popitem(last=False)
 
-    def _cache_get(self, key):
-        value = self._lowerd_history[key]
-        self._lowerd_history.move_to_end(key)
+    def _model_cache_get(self, key):
+        value = self._model_lowerd_history[key]
+        self._model_lowerd_history.move_to_end(key)
+        return value
+
+    def _sampler_cache_put(self, key, value):
+        self._sampler_lowerd_history[key] = value
+        self._sampler_lowerd_history.move_to_end(key)
+        if len(self._sampler_lowerd_history) > self._cache_capacity:
+            self._sampler_lowerd_history.popitem(last=False)
+
+    def _sampler_cache_get(self, key):
+        value = self._sampler_lowerd_history[key]
+        self._sampler_lowerd_history.move_to_end(key)
         return value
 
     def clear_cache(self):
-        self._lowerd_history.clear()
+        self._model_lowerd_history.clear()
+        self._sampler_lowerd_history.clear()
+
+    def update_graphs(
+        self,
+        model: EasyDeLBaseModule | None = None,
+        *,
+        graphdef=None,
+        graphstate=None,
+        graphother=None,
+    ) -> None:
+        """Update the graph components (weights) used by the fused executor.
+
+        Args:
+            model: Optional EasyDeL module to source new graph parts from. When
+                provided, graphdef/graphstate/graphother are pulled from this
+                model unless explicitly overridden via the keyword arguments.
+            graphdef: Optional graph definition replacement.
+            graphstate: Optional graph state replacement (typically the weights).
+            graphother: Optional auxiliary graph data replacement.
+
+        Raises:
+            ValueError: If neither a model nor explicit graph components are
+                provided.
+        """
+
+        if model is not None:
+            self.model = model
+            new_graphdef, new_graphstate, new_graphother = model.split_module()
+            graphdef = new_graphdef if graphdef is None else graphdef
+            graphstate = new_graphstate if graphstate is None else graphstate
+            graphother = new_graphother if graphother is None else graphother
+
+        if graphdef is None and graphstate is None and graphother is None:
+            raise ValueError("No graph components supplied for update")
+
+        if graphdef is not None:
+            self.graphdef = graphdef
+
+        if graphstate is not None:
+            shardings = es.extract_shardings(self.graphstate, self.mesh)
+            self.graphstate = _device_put_tree_with_shardings(graphstate, shardings)
+
+        if graphother is not None:
+            shardings = es.extract_shardings(self.graphother, self.mesh)
+            self.graphother = _device_put_tree_with_shardings(graphother, shardings)
+
+        # Clear cached baselines so future diagnostics re-hash with new weights.
+        self._debug_baselines.clear()
 
     def execute(
         self,
         num_tokens: int,
-        dev_state: DeviceSequenceState,
-        scheduled_full: jax.Array,
+        scheduled_full_cpu: numpy.ndarray,  # CPU array
         req_num_tokens_full: jax.Array,
-        active_mask_full: jax.Array,
+        active_mask_full_cpu: numpy.ndarray,  # CPU array
         input_ids_buf: jax.Array,
         position_ids_buf: jax.Array,
-        slot_mapping_buf: jax.Array,
         padded_num_reqs: int,
+        token_ids_cpu: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        temperature_cpu: numpy.ndarray,
+        top_p_cpu: numpy.ndarray,
+        top_k_cpu: numpy.ndarray,
+        min_p_cpu: numpy.ndarray,
+        page_table_cpu: numpy.ndarray,
     ) -> tuple[
-        DeviceSequenceState,
+        MinimalDeviceState,
+        jax.Array,
         jax.Array,
         jax.Array,
         jax.Array,
@@ -275,93 +455,145 @@ class ExecutionManager:
         jax.Array,
         jax.Array,
     ]:
-        """Execute the fused step function.
+        """Execute a single fused inference step.
 
-        This method runs a single fused execution step that combines input preparation,
-        model forward pass, token sampling, and state updates into a single compiled
-        function for maximum efficiency.
+        Runs a pre-compiled fused function that combines input preparation, model
+        forward pass, token sampling, and state updates in a single device dispatch.
 
         Args:
-            num_tokens: Number of tokens to process in this batch.
-            dev_state: Current device sequence state containing token IDs and metadata.
-            scheduled_full: Array of scheduled tokens per request [max_num_reqs].
-            req_num_tokens_full: Array of required number of tokens per request [max_num_reqs].
-            active_mask_full: Boolean mask indicating active requests [max_num_reqs].
-            input_ids_buf: Buffer for input token IDs [max_num_tokens].
-            position_ids_buf: Buffer for position IDs [max_num_tokens].
-            query_start_loc_buf: Buffer for query start locations [max_num_reqs+1].
-            seq_lens_buf: Buffer for sequence lengths [max_num_reqs].
-            pages_tables_buf: Buffer for page tables [num_reqs_max_model_len, max_pages_per_req].
-            slot_mapping_buf: Buffer for slot mapping [3, max_padded_slices].
-            padded_num_reqs: Padded number of requests for compilation efficiency.
+            num_tokens: Total tokens to process across all requests in this step.
+                Must match a value from num_tokens_paddings used during compile().
+            device_state: Current device-side sequence state (DeviceSequenceState).
+                Contains token buffers, position tracking, and sampling parameters.
+            scheduled_full: Number of tokens scheduled per request [max_num_reqs].
+                Determines how many tokens from each request enter this step.
+            req_num_tokens_full: Target token count per request [max_num_reqs].
+                Used to determine when requests have generated enough tokens.
+            active_mask_full: Boolean mask for active requests [max_num_reqs].
+                Inactive requests are skipped during processing.
+            input_ids_buf: Contiguous token ID buffer [max_num_tokens]. Flattened
+                across requests for efficient batch processing.
+            position_ids_buf: Contiguous position ID buffer [max_num_tokens].
+                Parallel to input_ids_buf with position indices.
+            padded_num_reqs: Bucketed request count for compilation lookup. Must
+                be a power of 2 (or min_input_pad) matching a compiled variant.
 
         Returns:
-            A tuple containing:
-                - dev_state: Updated device sequence state.
-                - out_tokens_full: Generated token IDs for each request.
-                - valid_mask_full: Mask indicating which tokens are valid.
-                - input_ids_buf: Updated input IDs buffer.
-                - position_ids_buf: Updated position IDs buffer.
-                - query_start_loc_buf: Updated query start locations buffer.
-                - seq_lens_buf: Updated sequence lengths buffer.
-                - pages_tables_buf: Updated page tables buffer.
-                - slot_mapping_buf: Updated slot mapping buffer.
+            Tuple of 10 elements:
+                - device_state: Updated sequence state with new tokens written.
+                - out_tokens_full: Generated tokens [max_num_reqs], -1 for invalid.
+                - valid_mask_full: Boolean mask for valid generations [max_num_reqs].
+                - input_ids_buf: Updated input buffer (may contain new tokens).
+                - position_ids_buf: Updated position buffer.
+                - query_start_loc_buf: Query start locations [max_num_reqs+1].
+                - seq_lens_buf: Sequence lengths [max_num_reqs].
+                - pages_tables_buf: Page tables [num_reqs, max_pages].
+                - hidden_states: Last layer hidden states [num_tokens, hidden_dim].
+                - logits: Output logits [padded_num_reqs, vocab_size].
 
         Raises:
-            KeyError: If no compiled function exists for the given configuration.
+            KeyError: If no compiled function exists for (num_tokens, padded_num_reqs).
+                This indicates the configuration wasn't included in compile() call.
 
+        Note:
+            The KV cache (self.kv_pages) and random key (self.rng_key) are updated
+            in-place on self after execution completes.
+
+        Example:
+            >>> results = executor.execute(
+            ...     num_tokens=256,
+            ...     device_state=state,
+            ...     scheduled_full=jnp.array([4, 8, 2, ...]),
+            ...     req_num_tokens_full=jnp.array([512, 256, 128, ...]),
+            ...     active_mask_full=jnp.array([True, True, False, ...]),
+            ...     input_ids_buf=input_buf,
+            ...     position_ids_buf=pos_buf,
+            ...     padded_num_reqs=16,
+            ... )
+            >>> new_state, tokens, valid, *rest = results
         """
-        fn = self.get_compiled_key(num_tokens, padded_num_reqs)
+        model_fn, sampler_fn = self.get_compiled_key(num_tokens, padded_num_reqs)
+        start_prep = time.time()
+        batch_metadata, input_ids_buf, position_ids_buf = self.prepare_batch_metadata(
+            num_tokens_static=num_tokens,
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            token_ids_cpu=token_ids_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            temperature_cpu=temperature_cpu,
+            top_p_cpu=top_p_cpu,
+            top_k_cpu=top_k_cpu,
+            min_p_cpu=min_p_cpu,
+            page_table_cpu=page_table_cpu,
+            padded_num_reqs_in=padded_num_reqs,
+        )
+        prep_took = time.time() - start_prep
 
-        # comp_hash = self._debug_baselines[f"{num_tokens}_hash_in"]
-        # new_hash = _tree_hash(
-        #     (
-        #         self.graphstate,
-        #         self.graphother,
-        #         dev_state,
-        #         self.kv_pages,
-        #         scheduled_full,
-        #         req_num_tokens_full,
-        #         active_mask_full,
-        #         input_ids_buf,
-        #         position_ids_buf,
-        #         slot_mapping_buf,
-        #         self.rng_key,
-        #     )
-        # )
-        # _ = _tree_hash_diff(comp_hash, new_hash)
-        result = fn(
-            self.graphstate,
-            self.graphother,
-            dev_state,
-            self.kv_pages,
-            scheduled_full,
+        # Convert CPU arrays to device for model execution
+        scheduled_full = jnp.array(scheduled_full_cpu, device=self._empty_sharding)
+        active_mask_full = jnp.array(active_mask_full_cpu, device=self._empty_sharding)
+
+        # Create minimal device state from CPU arrays (only what sampler needs to update)
+        device_state = MinimalDeviceState(
+            token_ids=jnp.array(token_ids_cpu, device=self._empty_sharding),
+            num_tokens=jnp.array(num_computed_tokens_cpu, device=self._empty_sharding),
+        )
+
+        inputs = StepFunctionInputs(
+            device_state=device_state,
+            kv_pages=self.kv_pages,
+            scheduled_full=scheduled_full,
+            req_num_tokens_full=req_num_tokens_full,
+            active_mask_full=active_mask_full,
+            rng_key=self.rng_key,
+            batch_metadata=batch_metadata,
+        )
+        if DEBUG_MODE:
+            model_hash = _tree_hash((self.graphstate, self.graphother, inputs))
+            model_hash_baseline = self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"]
+            _tree_hash_diff(model_hash_baseline, model_hash)
+
+        start_exec = time.time()
+        model_outputs = model_fn(self.graphstate, self.graphother, inputs)
+        exec_took = time.time() - start_exec
+
+        self.kv_pages = model_outputs.kv_pages
+
+        sampler_inputs = (
+            batch_metadata,
+            device_state,
             req_num_tokens_full,
             active_mask_full,
-            input_ids_buf,
-            position_ids_buf,
-            slot_mapping_buf,
+            model_outputs.logits,
             self.rng_key,
         )
 
-        (
-            dev_state,
-            self.kv_pages,
-            input_ids_buf,
-            position_ids_buf,
-            query_start_loc_buf,
-            seq_lens_buf,
-            pages_tables_buf,
-            slot_mapping_buf,
-            self.rng_key,
-            out_tokens_full,
-            valid_mask_full,
-            hidden_states,
-            logits,
-        ) = result
+        if DEBUG_MODE:
+            sampler_hash = _tree_hash(sampler_inputs)
+            sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"]
+            _tree_hash_diff(sampler_hash_baseline, sampler_hash)
+
+        start_sample = time.time()
+        device_state, self.rng_key, out_tokens_full, valid_mask_full = sampler_fn(*sampler_inputs)
+        sample_took = time.time() - start_sample
+        buckets_processed = batch_metadata.input_ids_buf.shape[-1]
+        metrics = {
+            "exec_time": exec_took,
+            "sample_time": sample_took,
+            "prep_time": prep_took,
+            "buckets_processed": buckets_processed,
+        }
+
+        query_start_loc_buf = batch_metadata.query_start_loc
+        seq_lens_buf = batch_metadata.seq_lens
+        pages_tables_buf = batch_metadata.pages_tables
+        hidden_states = model_outputs.hidden_states
+        logits = model_outputs.logits
 
         return (
-            dev_state,
+            device_state,
             out_tokens_full,
             valid_mask_full,
             input_ids_buf,
@@ -369,9 +601,9 @@ class ExecutionManager:
             query_start_loc_buf,
             seq_lens_buf,
             pages_tables_buf,
-            slot_mapping_buf,
             hidden_states,
             logits,
+            metrics,
         )
 
     def compile(
@@ -381,6 +613,7 @@ class ExecutionManager:
         max_pages_per_req: int,
         max_num_reqs: int,
         metadata: RaggedPagesCacheView,
+        num_reqs_paddings: list[int] | None = None,
     ) -> None:
         """Compile model execution functions for various input configurations.
 
@@ -412,8 +645,13 @@ class ExecutionManager:
 
         if self.use_aot_forward:
             self.clear_cache()
-        ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
-        reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
+        if num_reqs_paddings:
+            reqs_padds = sorted({int(n) for n in num_reqs_paddings if 0 < int(n) <= max_num_reqs})
+        else:
+            ufn = partial(_get_padded_num_reqs_with_upper_limit, min_input_pad=self.min_input_pad)
+            reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
+        if not reqs_padds:
+            reqs_padds = [max_num_reqs]
         total_compilations = len(num_tokens_paddings) * len(reqs_padds)
         compilation_count = 0
         progress = ProgressLogger("eSurge", logger)
@@ -471,385 +709,627 @@ class ExecutionManager:
             padded_num_reqs,
             metadata,
         )
-        self.compile_key(num_tokens, padded_num_reqs, compargs)
+        # compargs already contains properly prepared metadata from get_compile_configurations
+        inputs = compargs[3]
+        self._compile_model_step(num_tokens, padded_num_reqs, compargs)
+        self._compile_sampler(num_tokens, padded_num_reqs, inputs, inputs.batch_metadata)
 
     def init_fns(self) -> None:
         """Initialize the fused step execution function.
 
-        Creates the fused execution function that combines input preparation,
-        model forward pass, token sampling, and state updates. The function
-        is wrapped with ejit for efficient execution.
+        Initializes the model-only execution function. Sampling/state updates are
+        handled by a separate ejit generated during initialization.
 
         Note:
             Called automatically during initialization. Should not be called
             directly by users.
         """
-        self._step_fn = self.get_step_fn()
+        self._model_step_fn = self.get_model_step_fn()
 
-    def get_step_fn(self) -> typing.Callable:
-        """Create the fused step function.
+    def _compute_slot_mapping_v2(
+        self,
+        num_requests: int,
+        scheduled: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        page_table_cpu: numpy.ndarray,
+    ) -> tuple[numpy.ndarray, int]:
+        """Rebuild slot_mapping tensor for ragged-page attention v2."""
 
-        Creates a single function that combines input preparation, model forward pass,
-        token sampling, and state updates. This provides the best performance by
-        minimizing host-device communication and maximizing kernel fusion.
+        slot_mapping = self._slot_mapping_cpu
+        slot_mapping.fill(SLOT_MAPPING_PADDING_VAL)
 
-        Returns:
-            A callable that performs a complete inference step. The function is
-            wrapped with ejit for efficient execution.
+        if num_requests <= 0:
+            return slot_mapping.copy(), 0
 
-        """
-        max_num_reqs = int(self.max_num_reqs)
+        # Slice arrays to active requests
+        scheduled_active = numpy.asarray(scheduled[:num_requests], dtype=numpy.int32)
+        num_computed_active = numpy.asarray(num_computed_tokens_cpu[:num_requests], dtype=numpy.int32)
+        if not numpy.any(scheduled_active):
+            return slot_mapping.copy(), 0
+
         page_size = int(self.metadata.page_size)
         max_pages_per_req = int(self.metadata.max_num_pages_per_req)
-        num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
-        slices_per_page = int(self.metadata.num_slices_per_kv_cache_update_page)
-        page_table_pad = jnp.int32(PAGE_TABLE_PADDING_VAL)
-        slot_mapping_pad = jnp.int32(SLOT_MAPPING_PADDING_VAL)
-        max_num_tokens = int(self.max_num_tokens)
-        max_padded_slices = int(self.metadata.get_padded_num_slices(max_num_tokens, max_num_reqs))
+        slices_per_page = int(self._slices_per_page)
 
-        i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
-        i_rows_pt = jnp.arange(num_reqs_max_model_len, dtype=jnp.int32)
-        i_slices = jnp.arange(max_padded_slices, dtype=jnp.int32)
+        # Compute per-request page spans
+        start_tokens = num_computed_active
+        end_tokens = num_computed_active + scheduled_active
+        lps = start_tokens // page_size
+        lpe = (numpy.maximum(end_tokens, 1) - 1) // page_size
+        page_lens = numpy.where(scheduled_active > 0, lpe - lps + 1, 0).astype(numpy.int32)
+
+        if not numpy.any(page_lens):
+            return slot_mapping.copy(), 0
+
+        page_cum = numpy.cumsum(page_lens, dtype=numpy.int32)
+        total_pages = int(page_cum[-1])
+
+        max_padded_slices = int(self._max_padded_slices)
+        padded_num_slices = min(
+            ((total_pages + slices_per_page - 1) // slices_per_page) * slices_per_page,
+            max_padded_slices,
+        )
+
+        indices = self._slot_mapping_indices
+        if indices is None:
+            return slot_mapping.copy(), total_pages
+
+        slice_active_mask = (indices < total_pages) & (indices < padded_num_slices)
+        active_positions = indices[slice_active_mask]
+        if active_positions.size == 0:
+            return slot_mapping.copy(), total_pages
+
+        page_cum_prev = numpy.concatenate(([0], page_cum[:-1]))
+        req_for_slice = numpy.searchsorted(page_cum, active_positions, side="right").astype(numpy.int32)
+        local_off = active_positions - page_cum_prev[req_for_slice]
+
+        pt = numpy.asarray(page_table_cpu[:num_requests, :max_pages_per_req], dtype=numpy.int32)
+        pt_flat = pt.reshape(-1)
+        gather_idx = req_for_slice * max_pages_per_req + lps[req_for_slice] + local_off
+        numpy.clip(gather_idx, 0, pt_flat.size - 1, out=gather_idx)
+        page_numbers = pt_flat[gather_idx]
+
+        s_mod = start_tokens % page_size
+        e_mod = ((numpy.maximum(end_tokens, 1) - 1) % page_size) + 1
+        lens_rep = page_lens
+
+        is_first = local_off == 0
+        is_last = local_off == (lens_rep[req_for_slice] - 1)
+
+        kv_local_st = numpy.where(is_first, s_mod[req_for_slice], 0)
+        kv_local_en = numpy.where(is_last, e_mod[req_for_slice], page_size)
+        slice_lens = numpy.maximum(kv_local_en - kv_local_st, 0).astype(numpy.int32)
+        kv_cache_start = kv_local_st + page_numbers * page_size
+
+        # Prefix sums for new_kv_start
+        new_kv_start = numpy.cumsum(slice_lens, dtype=numpy.int32)
+        if new_kv_start.size:
+            new_kv_start = numpy.roll(new_kv_start, 1)
+            new_kv_start[0] = 0
+
+        slot_mapping[0, active_positions] = kv_cache_start
+        slot_mapping[1, active_positions] = new_kv_start
+        slot_mapping[2, active_positions] = slice_lens
+
+        return slot_mapping.copy(), total_pages
+
+    def prepare_batch_metadata(
+        self,
+        num_tokens_static: int,
+        scheduled_full_cpu: numpy.ndarray,  # CPU array instead of device
+        active_mask_full_cpu: numpy.ndarray,  # CPU array instead of device
+        input_ids_buf: jax.Array,
+        position_ids_buf: jax.Array,
+        token_ids_cpu: numpy.ndarray,
+        num_computed_tokens_cpu: numpy.ndarray,
+        temperature_cpu: numpy.ndarray,
+        top_p_cpu: numpy.ndarray,
+        top_k_cpu: numpy.ndarray,
+        min_p_cpu: numpy.ndarray,
+        page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
+        padded_num_reqs_in: int,
+    ) -> tuple[BatchMetadata, jax.Array, jax.Array]:
+        """Precompute batch metadata using CPU-first approach.
+
+        Performs all metadata computation on CPU using NumPy for speed,
+        then transfers to device in a single operation.
+
+        Args:
+            num_tokens_static: Number of tokens to process
+            device_state: Device sequence state (for page tables and sampling params)
+            scheduled_full: Tokens scheduled per request
+            active_mask_full: Active request mask
+            input_ids_buf: Input buffer (will be replaced)
+            position_ids_buf: Position buffer (will be replaced)
+            token_ids_cpu: NumPy array of token IDs [max_num_reqs, max_model_len]
+            num_computed_tokens_cpu: NumPy array of computed tokens [max_num_reqs]
+            padded_num_reqs_in: Caller-selected padded request bucket
+
+        Returns:
+            Tuple of (BatchMetadata, input_ids_buf, position_ids_buf)
+        """
+
+        max_num_reqs = int(self.max_num_reqs)
+        num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
+
+        # ========== NO DEVICE TRANSFERS! Everything on CPU ==========
+        # scheduled_full_cpu and active_mask_full_cpu are already CPU arrays from scheduler
+        scheduled_cpu = scheduled_full_cpu
+        active_mask_cpu = active_mask_full_cpu
+
+        # ========== All metadata computation on CPU using NumPy (FAST!) ==========
+
+        # Compute num_requests
+        num_requests = min(int(numpy.sum(active_mask_cpu)), max_num_reqs)
+        mask_reqs = numpy.arange(max_num_reqs) < num_requests
+        self._scheduled_cpu[:] = numpy.where(mask_reqs, scheduled_cpu, 0)
+        scheduled = self._scheduled_cpu
+
+        # Cumsum on CPU (much faster than device!)
+        self._query_start_loc_cpu[0] = 0
+        numpy.cumsum(scheduled[:num_requests], out=self._query_start_loc_cpu[1 : num_requests + 1])
+        self._query_start_loc_cpu[num_requests + 1 :] = self._query_start_loc_cpu[num_requests]
+
+        # Token gathering
+        # Get request indices: [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        req_indices = numpy.repeat(numpy.arange(num_requests, dtype=numpy.int32), scheduled[:num_requests])
+
+        # Get batched arange: [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        arange = numpy.concatenate([self._arange_cpu[:n] for n in scheduled[:num_requests]])
+
+        # Actual number of tokens being processed (may be less than padded num_tokens_static)
+        actual_num_tokens = len(req_indices)
+
+        # Compute positions on CPU (use actual size for computation)
+        positions_np = self._positions_cpu[:actual_num_tokens]
+        numpy.add(num_computed_tokens_cpu[req_indices], arange, out=positions_np)
+
+        # Token gathering on CPU
+        token_indices = positions_np + req_indices * token_ids_cpu.shape[1]  # max_model_len
+        numpy.take(token_ids_cpu.ravel(), token_indices, out=self._input_ids_cpu[:actual_num_tokens])
+
+        # Pad remaining positions with zeros if actual < static
+        if actual_num_tokens < num_tokens_static:
+            self._input_ids_cpu[actual_num_tokens:num_tokens_static] = 0
+            self._positions_cpu[actual_num_tokens:num_tokens_static] = 0
+
+        # Sequence lengths on CPU
+        self._seq_lens_cpu[:num_requests] = num_computed_tokens_cpu[:num_requests] + scheduled[:num_requests]
+        self._seq_lens_cpu[num_requests:] = 0
+
+        # Logits indices on CPU
+        self._logits_indices_cpu[:num_requests] = self._query_start_loc_cpu[1 : num_requests + 1] - 1
+
+        # Compute padded_num_reqs on CPU, honoring caller-selected bucket
+        nr_safe = max(num_requests, 1)
+        requested_bucket = max(int(padded_num_reqs_in), nr_safe)
+        next_pow2 = 1 << (nr_safe - 1).bit_length()
+        fallback_bucket = self.min_input_pad if nr_safe <= self.min_input_pad else next_pow2
+        padded_num_reqs = min(max(requested_bucket, fallback_bucket), max_num_reqs)
+
+        # Page table already on CPU
+        pt_src = page_table_cpu[: min(page_table_cpu.shape[0], num_reqs_max_model_len), :]
+        mask_rows = numpy.arange(num_reqs_max_model_len) < min(num_requests, num_reqs_max_model_len)
+        pages_tables_cpu = numpy.where(mask_rows[:, None], pt_src, PAGE_TABLE_PADDING_VAL)
+
+        # Request distribution (v3)
+        request_distribution = None
+        if self._use_request_distribution:
+            active_num_computed = numpy.where(mask_reqs, num_computed_tokens_cpu, 0)
+            is_decode = (scheduled == 1) & (active_num_computed > 0)
+            decode_count = int(numpy.sum(is_decode))
+            request_distribution = numpy.array([decode_count, decode_count, num_requests], dtype=numpy.int32)
+
+        slot_mapping_cpu = None
+        num_kv_update_cpu = None
+        if self._use_slot_mapping:
+            slot_mapping_cpu, total_pages = self._compute_slot_mapping_v2(
+                num_requests=num_requests,
+                scheduled=scheduled,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                page_table_cpu=page_table_cpu,
+            )
+            num_kv_update_cpu = numpy.array([total_pages], dtype=numpy.int32)
+
+        # ========== STEP 3: Single batch device transfer (consolidate all arrays) ==========
+        # Transfer all CPU-computed arrays to device in ONE operation to minimize overhead
+        host_payload = (
+            self._input_ids_cpu[:num_tokens_static],
+            self._positions_cpu[:num_tokens_static],
+            self._query_start_loc_cpu,
+            self._seq_lens_cpu,
+            self._logits_indices_cpu,
+            pages_tables_cpu,
+            scheduled,
+            temperature_cpu,
+            top_p_cpu,
+            top_k_cpu,
+            min_p_cpu,
+            numpy.int32(num_requests),
+            numpy.int32(padded_num_reqs),
+            request_distribution if request_distribution is not None else self._request_distribution_placeholder,
+            slot_mapping_cpu if slot_mapping_cpu is not None else self._slot_mapping_placeholder,
+            num_kv_update_cpu if num_kv_update_cpu is not None else self._num_kv_update_placeholder,
+        )
+        (
+            input_ids_buf,
+            position_ids_buf,
+            qsl,
+            seq_lens,
+            logits_indices,
+            pt,
+            scheduled_dev,
+            temperature_dev,
+            top_p_dev,
+            top_k_dev,
+            min_p_dev,
+            num_requests_dev,
+            padded_num_reqs_dev,
+            req_dist_dev,
+            slot_mapping_dev,
+            num_kv_update_dev,
+        ) = jax.device_put(host_payload, self._empty_sharding)
+
+        # ========== STEP 4: Build BatchMetadata from transferred arrays ==========
+        metadata = BatchMetadata(
+            scheduled=scheduled_dev,
+            query_start_loc=qsl,
+            seq_lens=seq_lens,
+            pages_tables=pt,
+            padded_num_reqs=padded_num_reqs_dev,
+            logits_indices=logits_indices,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            num_requests=num_requests_dev,
+            temperature=temperature_dev,
+            top_p=top_p_dev,
+            top_k=top_k_dev,
+            min_p=min_p_dev,
+            positions=position_ids_buf,
+            request_distribution=req_dist_dev if self._use_request_distribution else None,
+            slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
+            num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
+        )
+
+        return metadata, input_ids_buf, position_ids_buf
+
+    def get_model_step_fn(self) -> typing.Callable:
+        """Create the model-only ejit that consumes precomputed metadata."""
+
+        max_num_reqs = int(self.max_num_reqs)
+        num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
+
+        metadata_sharding = BatchMetadata(
+            scheduled=self._empty_sharding,
+            query_start_loc=self._empty_sharding,
+            seq_lens=self._empty_sharding,
+            pages_tables=self._empty_sharding,
+            padded_num_reqs=self._empty_sharding,
+            request_distribution=self._empty_sharding,
+            logits_indices=self._empty_sharding,
+            input_ids_buf=self._empty_sharding,
+            position_ids_buf=self._empty_sharding,
+            num_requests=self._empty_sharding,
+            temperature=self._empty_sharding,
+            top_p=self._empty_sharding,
+            top_k=self._empty_sharding,
+            min_p=self._empty_sharding,
+            positions=self._empty_sharding,
+            # v2-specific shardings (None if not used)
+            slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
+            num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
+        )
+
+        inputs_shardings = StepFunctionInputs(
+            device_state=self._empty_sharding,
+            kv_pages=es.extract_shardings(self.kv_pages, self.mesh),
+            scheduled_full=self._empty_sharding,
+            req_num_tokens_full=self._empty_sharding,
+            active_mask_full=self._empty_sharding,
+            rng_key=self._empty_sharding,
+            batch_metadata=metadata_sharding,
+        )
+
+        outputs_shardings = ModelStepOutputs(
+            kv_pages=es.extract_shardings(self.kv_pages, self.mesh),
+            hidden_states=self._empty_sharding,
+            logits=self._empty_sharding,
+        )
 
         @ejit(
-            static_argnums=(0, 1),
-            donate_argnames=[
-                "dev_state",
-                "kv_pages",
-                "input_ids_buf",
-                "position_ids_buf",
-                "slot_mapping_buf",
-            ],
+            static_argnums=(0,),
+            donate_argnames=["inputs"],
             in_shardings=(
-                es.extract_shardings(self.graphstate, self.mesh),  # graphstate
-                es.extract_shardings(self.graphother, self.mesh),  # graphother
-                self._empty_sharding,  # dev_state (PyTree)
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # scheduled_full
-                self._empty_sharding,  # req_num_tokens_full
-                self._empty_sharding,  # active_mask_full
-                self._empty_sharding,  # input_ids_buf
-                self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # slot_mapping_buf
-                self._empty_sharding,  # rng_key
+                es.extract_shardings(self.graphstate, self.mesh),
+                es.extract_shardings(self.graphother, self.mesh),
+                inputs_shardings,
             ),
-            out_shardings=(
-                self._empty_sharding,  # dev_state (updated)
-                es.extract_shardings(self.kv_pages, self.mesh),  # kv_pages
-                self._empty_sharding,  # input_ids_buf
-                self._empty_sharding,  # position_ids_buf
-                self._empty_sharding,  # query_start_loc_buf
-                self._empty_sharding,  # seq_lens_buf
-                self._empty_sharding,  # pages_tables_buf
-                self._empty_sharding,  # slot_mapping_buf
-                self._empty_sharding,  # rng_key
-                self._empty_sharding,  # out_tokens (full-size, masked)
-                self._empty_sharding,  # valid_mask (full-size)
-                self._empty_sharding,  # hidden_states
-                self._empty_sharding,  # logits
-            ),
+            out_shardings=outputs_shardings,
         )
-        def _fn(
-            num_tokens_static: int,  # STATIC: padded_total bucket
+        def _model_step(
             graphdef,
             graphstate,
             graphother,
-            dev_state: DeviceSequenceState,
-            kv_pages: RaggedPagesCache,
-            scheduled_full: jax.Array,  # [max_num_reqs] int32
-            req_num_tokens_full: jax.Array,  # [max_num_reqs] int32
-            active_mask_full: jax.Array,  # [max_num_reqs] bool
-            input_ids_buf: jax.Array,  # [max_num_tokens]
-            position_ids_buf: jax.Array,  # [max_num_tokens]
-            slot_mapping_buf: jax.Array,  # [3, max_padded_slices]
-            rng_key: jax.Array,
-        ):
+            inputs: StepFunctionInputs,
+        ) -> ModelStepOutputs:
+            metadata = inputs.batch_metadata
+            kv_pages = inputs.kv_pages
+
             with self.model.mesh:
-                nr = jnp.minimum(jnp.int32(jnp.sum(active_mask_full)), jnp.int32(max_num_reqs))
-                mask_reqs = i_reqs < nr
-                scheduled = jnp.where(mask_reqs, scheduled_full, 0)
-
-                cum = jnp.cumsum(scheduled)
-                total = cum[-1]
-
-                it = jnp.arange(num_tokens_static, dtype=jnp.int32)
-                valid_tok = it < total
-                req_for_tok = jnp.searchsorted(cum, it, side="right")
-                req_for_tok = jnp.where(valid_tok, req_for_tok, 0)
-                cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), cum[:-1]])
-                base_pos = dev_state.num_computed_tokens[req_for_tok]
-                off_in_req = it - cum_prev[req_for_tok]
-                positions = base_pos + off_in_req
-                positions = jnp.where(valid_tok, positions, 0)
-
-                in_ids = dev_state.token_ids[req_for_tok, positions]
-                in_ids = jnp.where(valid_tok, in_ids, 0)
-                input_ids_buf = input_ids_buf.at[:num_tokens_static].set(in_ids)
-                position_ids_buf = position_ids_buf.at[:num_tokens_static].set(positions)
-                qsl = jnp.zeros((max_num_reqs + 1,), dtype=jnp.int32).at[1:].set(cum)
-                seq_lens = jnp.where(mask_reqs, dev_state.num_computed_tokens + scheduled, 0)
-
-                pt_array = dev_state.page_table[0].get_array()
-                pt_src = pt_array[: min(pt_array.shape[0], num_reqs_max_model_len), :]
-                mask_rows = i_rows_pt < jnp.minimum(nr, jnp.int32(num_reqs_max_model_len))
-                pt = jnp.where(mask_rows[:, None], pt_src, page_table_pad)
-
-                s = dev_state.num_computed_tokens
-                e = s + scheduled
-                lps = s // page_size
-                lpe = (jnp.maximum(e, 1) - 1) // page_size
-                page_lens = jnp.where(scheduled > 0, lpe - lps + 1, 0)
-                page_cum = jnp.cumsum(page_lens)
-                total_pages = page_cum[-1]
-                sp = jnp.int32(slices_per_page)
-                padded_num_slices = jnp.minimum(((total_pages + sp - 1) // sp) * sp, jnp.int32(max_padded_slices))
-
-                valid_slice = i_slices < total_pages
-                within_pad = i_slices < padded_num_slices
-                slice_active = valid_slice & within_pad
-
-                page_cum_prev = jnp.concatenate([jnp.zeros((1,), jnp.int32), page_cum[:-1]])
-                req_for_slice = jnp.searchsorted(page_cum, i_slices, side="right")
-                req_for_slice = jnp.where(slice_active, req_for_slice, 0)
-                local_off = i_slices - page_cum_prev[req_for_slice]
-                pt_full = pt.reshape((-1,))
-                gpi = req_for_slice * jnp.int32(max_pages_per_req) + lps[req_for_slice] + local_off
-                gpi_safe = jnp.clip(gpi, 0, jnp.int32(pt_full.size - 1))
-                page_numbers = jnp.where(slice_active, pt_full[gpi_safe], 0)
-
-                s_mod = s % page_size
-                e_mod = ((jnp.maximum(e, 1) - 1) % page_size) + 1
-                lens_rep = page_lens[req_for_slice]
-
-                is_first = local_off == 0
-                is_last = local_off == (lens_rep - 1)
-
-                kv_local_st = jnp.where(is_first, s_mod[req_for_slice], 0)
-                kv_local_en = jnp.where(is_last, e_mod[req_for_slice], jnp.int32(page_size))
-                slice_lens = jnp.maximum(kv_local_en - kv_local_st, 0)
-                kv_cache_start = kv_local_st + page_numbers * page_size
-
-                slice_lens_masked = jnp.where(slice_active, slice_lens, 0)
-                csl = jnp.cumsum(slice_lens_masked)
-                new_kv_start = jnp.where(slice_active, jnp.roll(csl, 1).at[0].set(0), 0)
-                slot_mapping_buf = slot_mapping_buf.at[0, :].set(
-                    jnp.where(slice_active, kv_cache_start, slot_mapping_pad)
-                )
-                slot_mapping_buf = slot_mapping_buf.at[1, :].set(jnp.where(slice_active, new_kv_start, slot_mapping_pad))
-                slot_mapping_buf = slot_mapping_buf.at[2, :].set(jnp.where(slice_active, slice_lens, slot_mapping_pad))
-
-                nr_safe = jnp.maximum(nr, 1)
-                next_pow2 = jnp.left_shift(1, jnp.ceil(jnp.log2(nr_safe)).astype(jnp.int32))
-                padded_num_reqs = jnp.where(
-                    nr <= jnp.int32(self.min_input_pad), jnp.int32(self.min_input_pad), next_pow2
-                )
-                padded_num_reqs = jnp.minimum(padded_num_reqs, jnp.int32(max_num_reqs))
-
-                tmp_logits = cum - 1
-                mask_logits = i_reqs < padded_num_reqs
-                logits_indices = jnp.where(mask_logits, tmp_logits, 0)
-
-                input_ids_view = input_ids_buf[:num_tokens_static]
-                position_ids_view = position_ids_buf[:num_tokens_static]
-
                 model: EasyDeLBaseModule = nn.merge(graphdef, graphstate, graphother)
+                input_ids_view = metadata.input_ids_buf
+                position_ids_view = metadata.position_ids_buf
+
+                # Build RaggedPagesMetadata with conditional v2/v3 fields
+                cache_metadata = RaggedPagesMetadata(
+                    pages_tables=metadata.pages_tables,
+                    context_lens=metadata.seq_lens[:num_reqs_max_model_len],
+                    query_start_loc=metadata.query_start_loc[: num_reqs_max_model_len + 1],
+                    num_seqs=jnp.array([metadata.num_requests], dtype=jnp.int32),
+                    num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
+                    page_size=self.metadata.page_size,
+                    # v3 field: always populated
+                    request_distribution=metadata.request_distribution,
+                    # v2 fields: only populated when version="v2"
+                    slot_mapping=metadata.slot_mapping,
+                    num_kv_update_slices=metadata.num_kv_update_slices,
+                    # Pass version from metadata
+                    version=self._metadata_version,
+                )
+
                 output = model(
                     input_ids=jnp.expand_dims(input_ids_view, 0),
                     position_ids=jnp.expand_dims(position_ids_view, 0),
                     past_key_values=kv_pages,
-                    cache_metadata=RaggedPagesMetadata(
-                        pages_tables=pt,
-                        slot_mapping=slot_mapping_buf,
-                        context_lens=seq_lens[:num_reqs_max_model_len],
-                        query_start_loc=qsl[: num_reqs_max_model_len + 1],
-                        num_seqs=jnp.array([nr], dtype=jnp.int32),
-                        num_kv_update_slices=jnp.array([total_pages], dtype=jnp.int32),
-                        num_slices_per_kv_cache_update_page=self.metadata.num_slices_per_kv_cache_update_page,
-                        page_size=self.metadata.page_size,
-                    ),
+                    cache_metadata=cache_metadata,
                     apply_lm_head=False,
                 )
                 hs = output.last_hidden_state.squeeze(0)
-                logits = model.apply_lm_head(hs[logits_indices])
+                logits = model.apply_lm_head(hs[metadata.logits_indices])
 
-                temp = dev_state.temperature[:max_num_reqs].astype(logits.dtype)
-                topp = dev_state.top_p[:max_num_reqs].astype(logits.dtype)
-
-                is_all_greedy = jnp.all(temp <= 0.0)
-
-                def do_greedy(_):
-                    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
-
-                def do_sample(_):
-                    B = logits.shape[0]
-                    row_keys = jax.vmap(lambda i: jax.random.fold_in(rng_key, i))(jnp.arange(B, dtype=jnp.int32))
-                    samples = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, 0, None), out_axes=0)(
-                        logits, topp, temp, row_keys, 64
-                    )
-                    return samples.reshape(-1)
-
-                sampled_flat = jax.lax.cond(is_all_greedy, do_greedy, do_sample, operand=None).reshape(-1)
-                rng_key = jax.random.fold_in(rng_key, jnp.int32(num_tokens_static))
-
-                seq_lens_now_full = dev_state.num_computed_tokens + scheduled
-                meets_len_full = seq_lens_now_full >= req_num_tokens_full
-                valid_mask_full = (i_reqs < nr) & active_mask_full & (scheduled > 0) & meets_len_full
-
-                j_pos_full = jnp.clip(seq_lens_now_full, 0, self.max_model_len - 1)
-                curr_vals_full = dev_state.token_ids[i_reqs, j_pos_full]
-                delta_full = jnp.where(valid_mask_full, sampled_flat - curr_vals_full, 0)
-
-                token_ids = dev_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
-                num_tokens = dev_state.num_tokens + valid_mask_full.astype(dev_state.num_tokens.dtype)
-
-                dev_state = dev_state.with_updates(token_ids=token_ids, num_tokens=num_tokens)
-
-                out_tokens_full = jnp.where(valid_mask_full, sampled_flat, -1)
-                return (
-                    dev_state,
-                    output.past_key_values,
-                    input_ids_buf,
-                    position_ids_buf,
-                    qsl,
-                    seq_lens,
-                    pt,
-                    slot_mapping_buf,
-                    rng_key,
-                    out_tokens_full,
-                    valid_mask_full,
-                    hs,
-                    logits,
+                return ModelStepOutputs(
+                    kv_pages=output.past_key_values,
+                    hidden_states=hs,
+                    logits=logits,
                 )
 
-        return _fn
+        return _model_step
 
-    def compile_key(self, num_tokens: int, padded_num_reqs: int, compargs):
-        """Compile fused step execution function for specific input dimensions.
+    def get_sampling_fn(self) -> typing.Callable:
+        """Create the sampler/update ejit executed after model forward."""
 
-        Handles both AOT and JIT compilation modes based on use_aot_forward flag.
-        For AOT mode (default), pre-compiles functions using JAX's lower/compile API.
-        For JIT mode, executes the function once to trigger JIT compilation and caches
-        the wrapped function.
+        max_num_reqs = int(self.max_num_reqs)
+        i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
 
-        Args:
-            num_tokens: Number of tokens in the input batch.
-            padded_num_reqs: Padded number of requests for batching (unused in fused mode).
-            compargs: Compilation arguments tuple where compargs contains fused step args.
-        """
+        @ejit
+        def _sampling_fn(
+            metadata: BatchMetadata,
+            device_state: MinimalDeviceState,
+            req_num_tokens_full: jax.Array,
+            active_mask_full: jax.Array,
+            logits: jax.Array,
+            rng_key: jax.Array,
+        ):
+            temp = metadata.temperature.reshape(-1, 1).astype(logits.dtype)
+            topp = metadata.top_p.astype(logits.dtype)
+            topk = metadata.top_k.astype(jnp.int32)
+            minp = metadata.min_p.astype(logits.dtype)
+
+            is_all_greedy = jnp.all(temp <= 0.0)
+            need_min_p_sampling = jnp.any(minp > 0.0)
+
+            sampling_metadata = SamplingMetadata(
+                temperatures=temp,
+                top_ps=topp,
+                top_ks=topk,
+                min_ps=minp,
+                sampling_seeds=None,
+                is_all_greedy=is_all_greedy,
+                need_min_p_sampling=need_min_p_sampling,
+                do_penalties=False,
+                linear_penalty=None,
+            )
+
+            sampled_flat = sample_tokens(logits, sampling_metadata, metadata.positions, rng_key)
+            total_tokens = metadata.query_start_loc[-1]
+            rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
+
+            # num_tokens in MinimalDeviceState represents num_computed_tokens
+            seq_lens_now_full = device_state.num_tokens + metadata.scheduled
+            meets_len_full = seq_lens_now_full >= req_num_tokens_full
+            valid_mask_full = (
+                (i_reqs < metadata.num_requests) & active_mask_full & (metadata.scheduled > 0) & meets_len_full
+            )
+
+            j_pos_full = jnp.clip(seq_lens_now_full, 0, self.max_model_len - 1)
+            curr_vals_full = device_state.token_ids[i_reqs, j_pos_full]
+            delta_full = jnp.where(valid_mask_full, sampled_flat - curr_vals_full, 0)
+
+            token_ids = device_state.token_ids.at[(i_reqs, j_pos_full)].add(delta_full)
+            num_tokens = device_state.num_tokens + valid_mask_full.astype(device_state.num_tokens.dtype)
+
+            # MinimalDeviceState is a frozen pytree, use replace to create updated version
+            from dataclasses import replace
+
+            new_state = replace(device_state, token_ids=token_ids, num_tokens=num_tokens)
+            out_tokens = jnp.where(valid_mask_full, sampled_flat, -1)
+            return new_state, rng_key, out_tokens, valid_mask_full
+
+        return _sampling_fn
+
+    def _compile_model_step(self, num_tokens: int, padded_num_reqs: int, compargs):
+        """Compile the model-only ejit for specific token buckets."""
         mode = "aot" if self.use_aot_forward else "jit"
-        fused_key = (num_tokens, "fused", mode)
+        key = (num_tokens, padded_num_reqs, "model", mode)
 
-        if fused_key not in self._lowerd_history:
+        if key not in self._model_lowerd_history:
             if self.use_aot_forward:
-                compiled = self._step_fn.lower(num_tokens, *compargs).compile()
-                self._cache_put(fused_key, compiled)
-                warm_args = (
-                    compargs[1],  # graphstate
-                    compargs[2],  # graphother
-                    compargs[3],  # dev_state (PartitionSpec())
-                    compargs[4],  # kv_pages   (per-leaf sharding)
-                    compargs[5],  # scheduled_full (PartitionSpec())
-                    compargs[6],  # req_num_tokens_full (PartitionSpec())
-                    compargs[7],  # active_mask_full (PartitionSpec())
-                    compargs[8],  # input_ids_buf (PartitionSpec())
-                    compargs[9],  # position_ids_buf (PartitionSpec())
-                    compargs[10],  # slot_mapping_buf (PartitionSpec())
-                    compargs[11],  # rng_key (None)
-                )
-                self._debug_baselines[f"{num_tokens}_hash_in"] = _tree_hash(warm_args)
+                compiled = self._model_step_fn.lower(*compargs).compile()
+                self._model_cache_put(key, compiled)
+                warm_args = (compargs[1], compargs[2], compargs[3])
+                self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"] = _tree_hash(warm_args)
             else:
-                partial_fn = partial(self._step_fn, num_tokens, self.graphdef)
 
-                result = partial_fn(self.graphstate, self.graphother, *compargs[3:])
-                (
-                    _dev_state,
-                    self.kv_pages,
-                    _input_ids_buf,
-                    _position_ids_buf,
-                    _query_start_loc_buf,
-                    _seq_lens_buf,
-                    _pages_tables_buf,
-                    _slot_mapping_buf,
-                    _rng_key,
-                    _out_tokens_full,
-                    _valid_mask_full,
-                    _hidden_states,
-                    _logits,
-                ) = result
+                def wrapped(graphstate, graphother, inputs):
+                    return self._model_step_fn(self.graphdef, graphstate, graphother, inputs)
 
-                self._cache_put(fused_key, partial_fn)
+                _ = wrapped(self.graphstate, self.graphother, compargs[3])
+                self._model_cache_put(key, wrapped)
+
+    def _compile_sampler(
+        self, num_tokens: int, padded_num_reqs: int, inputs: StepFunctionInputs, metadata: BatchMetadata
+    ):
+        """Compile the sampler/update ejit."""
+        mode = "aot" if self.use_aot_forward else "jit"
+        key = (num_tokens, padded_num_reqs, "sampler", mode)
+
+        if key in self._sampler_lowerd_history:
+            return
+
+        vocab_size = self.model.config.get_text_config().vocab_size
+        dummy_logits = jax.device_put(
+            jnp.zeros(
+                (self.max_num_reqs, vocab_size),
+                dtype=self.model.dtype,
+            ),
+            self._empty_sharding,
+        )
+        sampler_args = (
+            metadata,
+            inputs.device_state,
+            inputs.req_num_tokens_full,
+            inputs.active_mask_full,
+            dummy_logits,
+            inputs.rng_key,
+        )
+
+        if self.use_aot_forward:
+            compiled = self._sampling_fn.lower(*sampler_args).compile()
+            self._sampler_cache_put(key, compiled)
+            self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(sampler_args)
+        else:
+            _ = self._sampling_fn(*sampler_args)
+            self._sampler_cache_put(key, self._sampling_fn)
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
-        """Retrieve pre-compiled fused step function for given input dimensions.
+        """Retrieve pre-compiled model step function for given input dimensions.
 
         Args:
             num_tokens: Number of tokens in the input batch.
-            padded_num_reqs: Padded number of requests for batching (unused in fused mode).
+            padded_num_reqs: Padded number of requests for batching.
 
         Returns:
             Compiled fused step function for the specified number of tokens.
         """
 
         mode = "aot" if self.use_aot_forward else "jit"
-        key = (num_tokens, "fused", mode)
-
-        if key in self._lowerd_history:
-            ...
+        model_key = (num_tokens, padded_num_reqs, "model", mode)
+        sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
+        if model_key in self._model_lowerd_history:
+            logger.debug(f"[CACHE HIT] model_key={model_key}")
         else:
-            logger.warning(f"Cache miss for key={key}! Will trigger recompilation")
-            logger.warning(f"Available keys in cache: {list(self._lowerd_history.keys())}")
-        return self._cache_get(key)
+            logger.warning(f"[CACHE MISS] key={model_key}! Will trigger recompilation (model)")
+            logger.warning(f"Available keys in cache: {list(self._model_lowerd_history.keys())}")
+        if sampler_key in self._sampler_lowerd_history:
+            logger.debug(f"[CACHE HIT] sampler_key={sampler_key}")
+        else:
+            logger.warning(f"[CACHE MISS] key={sampler_key}! Will trigger recompilation (sampler)")
+            logger.warning(f"Available keys in cache: {list(self._sampler_lowerd_history.keys())}")
+        return self._model_cache_get(model_key), self._sampler_cache_get(sampler_key)
 
     def get_compile_configurations(
         self,
         kv_pages: RaggedPagesCache,
         rng_key: jax.random.PRNGKey,
-        num_tokens: int,  # unused - kept for API compatibility
-        num_reqs_max_model_len: int,  # unused - kept for API compatibility
-        max_pages_per_req: int,  # unused - kept for API compatibility
+        num_tokens: int,
+        num_reqs_max_model_len: int,
+        max_pages_per_req: int,
         max_num_reqs: int,
-        padded_num_reqs: int,  # unused - kept for API compatibility
+        padded_num_reqs: int,
         metadata: RaggedPagesCacheView,
     ):
-        """Generate example arguments for fused step function compilation.
+        """Generate compilation arguments for step function.
 
-        Creates mock input arguments with the correct shapes and types for
-        compiling the fused step execution function. These arguments are used
-        to trace through the function during compilation. All arrays are
-        device_put to the exact shardings used at runtime to prevent AOT
-        variant recompiles.
+        Creates dummy input structures with correct shapes, dtypes, and shardings
+        for tracing the step function during AOT/JIT compilation. All arrays are
+        device-resident with appropriate sharding annotations to prevent XLA from
+        generating multiple compilation variants.
+
+        Args:
+            kv_pages: KV cache pages (used as-is in compilation args).
+            rng_key: Random key for sampling (device-placed with empty sharding).
+            num_tokens: Token count (unused, for API compatibility).
+            num_reqs_max_model_len: Max requests at model length (unused).
+            max_pages_per_req: Max pages per request (unused).
+            max_num_reqs: Maximum concurrent requests for buffer sizing.
+            padded_num_reqs: Target padded request count for this compilation variant.
+            metadata: KV cache metadata for buffer initialization.
+
+        Returns:
+            List of compilation arguments: [graphdef, graphstate, graphother, inputs]
+            where inputs is a StepFunctionInputs PyTree with dummy values.
+
+        Note:
+            Dummy values use simple patterns (ones, zeros) since compilation only
+            traces shapes/dtypes. The returned structures must match runtime
+            shardings exactly to avoid recompilation.
         """
 
-        temp_buffer = SequenceBuffer.create(
+        # Create temporary buffer to generate dummy inputs
+        temp_buffer = SequenceBuffer(
             max_num_reqs=max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             vocab_size=self.model.config.get_text_config().vocab_size,
             page_sizes=[metadata.page_size],
+            sharding=self._empty_sharding,
         )
-        dev_state = temp_buffer.to_device_state()
 
-        max_padded_slices = metadata.get_padded_num_slices(self.max_num_tokens, max_num_reqs)
+        # Create minimal device state for compilation (only what sampler needs)
+        device_state = MinimalDeviceState(
+            token_ids=jax.device_put(jnp.asarray(temp_buffer.token_ids), self._empty_sharding),
+            num_tokens=jax.device_put(jnp.asarray(temp_buffer.num_computed_tokens), self._empty_sharding),
+        )
 
-        fused_args = [
-            self.graphdef,
-            self.graphstate,
-            self.graphother,
-            dev_state,
-            kv_pages,
-            jnp.ones((max_num_reqs,), dtype=jnp.int32),
-            jnp.full((max_num_reqs,), 10, dtype=jnp.int32),
-            jnp.ones((max_num_reqs,), dtype=bool),
-            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            jnp.zeros((self.max_num_tokens,), dtype=jnp.int32),
-            jnp.full((3, max_padded_slices), SLOT_MAPPING_PADDING_VAL, dtype=jnp.int32),
-            rng_key,
-        ]
+        scheduled_full_cpu = numpy.zeros((max_num_reqs,), dtype=numpy.int32)
+        active_mask_full_cpu = numpy.zeros((max_num_reqs,), dtype=bool)
+        active_reqs = max(1, min(padded_num_reqs, max_num_reqs))
+        scheduled_full_cpu[:active_reqs] = 1
+        active_mask_full_cpu[:active_reqs] = True
+        input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
+        position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 
-        fused_args[3] = _device_put_tree_uniform(fused_args[3], self._empty_sharding)
-        for idx in (5, 6, 7, 8, 9, 10, 11):
-            if hasattr(fused_args[idx], "dtype"):
-                fused_args[idx] = jax.device_put(fused_args[idx], self._empty_sharding)
+        # Get page table as CPU array
+        page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
 
-        return fused_args
+        dummy_metadata, input_ids_buf, position_ids_buf = self.prepare_batch_metadata(
+            num_tokens_static=num_tokens,
+            scheduled_full_cpu=scheduled_full_cpu,
+            active_mask_full_cpu=active_mask_full_cpu,
+            input_ids_buf=input_ids_buf,
+            position_ids_buf=position_ids_buf,
+            token_ids_cpu=temp_buffer.token_ids,  # NumPy arrays from SequenceBuffer
+            num_computed_tokens_cpu=temp_buffer.num_computed_tokens,
+            temperature_cpu=temp_buffer.temperature,
+            top_p_cpu=temp_buffer.top_p,
+            top_k_cpu=temp_buffer.top_k,
+            min_p_cpu=temp_buffer.min_p,
+            page_table_cpu=page_table_cpu_dummy,
+            padded_num_reqs_in=padded_num_reqs,
+        )
+
+        # Convert to device for StepFunctionInputs
+        scheduled_full = jax.device_put(jnp.asarray(scheduled_full_cpu), self._empty_sharding)
+        active_mask_full = jax.device_put(jnp.asarray(active_mask_full_cpu), self._empty_sharding)
+
+        inputs = StepFunctionInputs(
+            device_state=device_state,
+            kv_pages=kv_pages,
+            scheduled_full=scheduled_full,
+            req_num_tokens_full=jax.device_put(jnp.full((max_num_reqs,), 10, dtype=jnp.int32), self._empty_sharding),
+            active_mask_full=active_mask_full,
+            rng_key=jax.device_put(rng_key, self._empty_sharding),
+            batch_metadata=dummy_metadata,
+        )
+
+        return [self.graphdef, self.graphstate, self.graphother, inputs]

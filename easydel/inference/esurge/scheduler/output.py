@@ -98,3 +98,5 @@ class SchedulerOutput:
     scheduled_spec_decode_tokens: dict[str, list[int]]
     num_common_prefix_pages: list[int]
     finished_req_ids: set[str]
+    suggested_bucket: int | None = None  # Optimal bucket size hint for runner
+    async_scheduling: bool = False  # Enable async token sampling

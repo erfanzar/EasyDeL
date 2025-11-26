@@ -29,7 +29,6 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
-    CausalLMOutput,
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
@@ -169,12 +168,12 @@ class Qwen2Attention(UnifiedAttention):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize Qwen2Attention with sliding window configuration.
 
@@ -187,7 +186,7 @@ class Qwen2Attention(UnifiedAttention):
             rngs: Random number generators
         """
         # Set sliding window before super().__init__ so it's available during network definition
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+
         super().__init__(
             config,
             dtype,
@@ -196,6 +195,8 @@ class Qwen2Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
+            layer_idx=layer_idx,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -297,12 +298,12 @@ class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen2DecoderLayer.
 
@@ -329,11 +330,11 @@ class Qwen2DecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         self.mlp = mlp_block(
@@ -554,7 +555,7 @@ class Qwen2Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -569,10 +570,7 @@ class Qwen2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = self.dropout(inputs_embeds)
         if mode is None:
@@ -676,78 +674,6 @@ class Qwen2ForCausalLM(BaseCausalLMModule[Qwen2Model, Qwen2Config]):
             precision=precision,
             rngs=rngs,
             lm_head_bias=False,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "batch seq_len"] | None = None,
-        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Int[Array, "batch seq_len"] | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
-        """Forward pass of the Qwen2ForCausalLM model.
-
-        Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
-
-        Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-            inputs_embeds=inputs_embeds,
-        )
-
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
-        lm_logits = None
-        if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        return CausalLMOutput(
-            logits=lm_logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            past_key_values=outputs.past_key_values,
         )
 
     def get_encoder(self):
