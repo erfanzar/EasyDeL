@@ -77,10 +77,9 @@ from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
 from transformers.utils.hub import PushToHubMixin
 
+from easydel.layers.quantization import EasyDeLQuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
-
-from easydel.layers.quantization import EasyDeLQuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from ..etils import EasyDeLBackends, EasyDeLPlatforms

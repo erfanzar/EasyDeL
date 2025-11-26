@@ -71,12 +71,11 @@ from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
-from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
-
 from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
 
 warnings.filterwarnings(
