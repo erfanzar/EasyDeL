@@ -28,6 +28,11 @@ TPU/GPU clusters.
 - [Key Features](#performance--hackability)
 - [Supported Models](#supported-models)
 - [Quick Start](#quick-start)
+- [eLargeModel](#elargemodel---unified-model-management)
+  - [Configuration Sections](#configuration-sections)
+  - [Creating an eLargeModel](#creating-an-elargemodel)
+  - [Training with eLargeModel](#training-with-elargemodel)
+  - [Evaluation with eLargeModel](#evaluation-with-elargemodel)
 - [Advanced Capabilities](#advanced-capabilities)
 - [Advanced Recipes](#advanced-recipes)
 - [Production Deployment](#production-deployment)
@@ -236,6 +241,9 @@ uv pip install easydel[torch]
 uv pip install easydel[lm_eval]
 ```
 
+> [!NOTE]
+> Choose `[gpu]` for NVIDIA GPUs with Triton kernels, or `[tpu]` for Google TPUs with Pallas kernels. The `[torch]` extra enables PyTorch model conversion via `from_torch=True`.
+
 ### Inference Example
 
 ```python
@@ -289,6 +297,330 @@ for output in engine.stream(
 print(f"\n\nTokens/s: {output.tokens_per_second:.2f}")
 ```
 
+## eLargeModel - Unified Model Management
+
+`eLargeModel` is the easy master class for working with large VLM/LLM/DLM/... models in EasyDeL. It provides a single, unified interface that combines:
+
+- **Configuration Management** - Model, sharding, quantization, and inference settings in one place
+- **Model Building** - Automatic model, tokenizer, and inference engine initialization
+- **Training Orchestration** - Support for SFT, DPO, ORPO, GRPO, distillation, and more
+- **Evaluation** - Built-in lm-evaluation-harness integration
+- **Serialization** - Save/load configurations as JSON for reproducibility
+
+> [!TIP]
+> `eLargeModel` is designed for common use cases and quick setup - perfect for getting started fast or when you want a simple, unified API. However, it doesn't expose all of EasyDeL's capabilities. For full modularity, fine-grained control, and access to advanced features, work directly with EasyDeL's underlying components (`AutoEasyDeLModelForCausalLM`, `eSurge`, trainers, etc.). The real power of EasyDeL lies in its hackable, composable architecture.
+
+### Why eLargeModel?
+
+Instead of managing multiple configuration objects and manually wiring components together, eLargeModel lets you define everything in one place:
+
+```python
+import easydel as ed
+
+# Traditional approach - multiple configuration objects
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+tokenizer = AutoTokenizer.from_pretrained(...)
+engine = ed.eSurge(model=model, tokenizer=tokenizer, ...)
+
+# eLargeModel approach - unified configuration
+elm = ed.eLargeModel({...})  # Define everything once
+engine = elm.build_esurge()   # Build what you need
+```
+
+### Configuration Sections
+
+eLargeModel accepts a dictionary with the following sections:
+
+| Section | Purpose | Key Options |
+|---------|---------|-------------|
+| `model` | Model identification | `name_or_path`, `tokenizer`, `task` |
+| `loader` | Loading options | `dtype`, `param_dtype`, `precision`, `verbose` |
+| `sharding` | Distributed setup | `axis_dims`, `axis_names`, `auto_shard_model` |
+| `base_config` | Model configuration | `attn_mechanism`, `gradient_checkpointing`, `moe_method` |
+| `esurge` | Inference engine | `max_model_len`, `max_num_seqs`, `hbm_utilization`, `page_size` |
+| `quantization` | Model quantization | `dtype` (nf4/a8bit), `block_size` |
+| `trainer` | Training settings | `trainer_type`, `learning_rate`, `num_train_epochs` |
+| `mixture` | Dataset configuration | `informs`, `batch_size`, `streaming` |
+| `eval` | Evaluation settings | `max_new_tokens`, `temperature`, `batch_size` |
+
+### Creating an eLargeModel
+
+#### Method 1: Dictionary Configuration
+
+```python
+import easydel as ed
+
+max_model_len = 2**15
+
+elm = ed.eLargeModel(
+    {
+        "model": {"name_or_path": "EasyDeL/gpt-oss-20b", "tokenizer": "EasyDeL/gpt-oss-20b", "task": "auto-bind"},
+        "loader": {"dtype": "bf16", "param_dtype": "bf16", "precision": "default"},
+        "sharding": {
+            "axis_dims": (1, 1, 2, -1, 1),
+            "axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
+            "auto_shard_model": True,
+        },
+        "base_config": {
+            "values": {
+                "freq_max_position_embeddings": max_model_len,
+                "mask_max_position_embeddings": max_model_len,
+                "attn_mechanism": ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
+                "attn_dtype": "bf16",
+                "gradient_checkpointing": ed.EasyDeLGradientCheckPointers.NONE,
+                "moe_method": ed.MoEMethods.FUSED_MOE,  # For MoE models
+                # "operation_configs": {
+                #     ed.AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3: ed.RaggedPageAttentionv3Config(
+                #         num_queries_per_block=4,
+                #         num_kv_pages_per_block=16,
+                #         platform="pallas",
+                #         backend="any",
+                #     )
+                # },
+            }
+        },
+        "esurge": {
+            "max_model_len": max_model_len,
+            "max_num_seqs": 32,
+            "hbm_utilization": 0.75,
+            "page_size": 128,
+            "enable_prefix_caching": True,
+        },
+        "quantization": {"model": {"dtype": "nf4", "block_size": 128}, "quantize_tensors": False},
+    }
+)
+
+# Print configuration overview
+print(elm)
+```
+
+#### Method 2: Builder Pattern (Fluent API)
+
+```python
+import easydel as ed
+
+elm = (
+    ed.eLargeModel.from_pretrained("EasyDeL/gpt-oss-20b")
+    .set_dtype("bf16")
+    .set_sharding(axis_dims=(1, 1, 2, -1, 1), axis_names=("dp", "fsdp", "ep", "tp", "sp"))
+    .set_esurge(
+        max_model_len=4096,
+        max_num_seqs=32,
+        hbm_utilization=0.75,
+        page_size=128,
+        enable_prefix_caching=True,
+    )
+)
+```
+
+#### Method 3: Load from JSON
+
+```python
+# Save configuration for reproducibility
+elm.to_json("my_config.json")
+
+# Load configuration later
+elm = ed.eLargeModel.from_json("my_config.json")
+```
+
+### Building Components
+
+eLargeModel provides builder methods to create the components you need:
+
+```python
+# Build inference engine (includes model + tokenizer)
+esurge = elm.build_esurge()
+
+# Or build components separately
+model = elm.build_model()
+tokenizer = elm.build_tokenizer()
+
+# For training with reference/teacher models
+reference_model = elm.build_reference_model()  # For DPO/ORPO
+teacher_model = elm.build_teacher_model()      # For distillation
+
+# Build dataset from mixture configuration
+dataset = elm.build_dataset()
+```
+
+### Inference with eLargeModel
+
+```python
+import easydel as ed
+
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-8B")
+    .set_dtype("bf16")
+    .set_sharding(axis_dims=(1, 1, 1, -1, 1))
+    .set_esurge(max_model_len=4096, max_num_seqs=32)
+)
+
+# Build and use eSurge engine
+esurge = elm.build_esurge()
+
+for output in esurge.chat(
+    [{"role": "user", "content": "Explain quantum computing"}],
+    sampling_params=ed.SamplingParams(max_tokens=512),
+    stream=True,
+):
+    print(output.delta_text, end="", flush=True)
+
+print(f"\nTokens/s: {output.tokens_per_second:.2f}")
+```
+
+### Training with eLargeModel
+
+eLargeModel supports multiple training paradigms through a unified interface:
+
+#### SFT Training
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-8B")
+    .set_dtype("bf16")
+    .set_sharding(axis_dims=(1, 1, 1, -1, 1))
+    .set_trainer(
+        "sft",
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        total_batch_size=32,
+        gradient_accumulation_steps=4,
+        max_sequence_length=2048,
+    )
+    .add_dataset("train.json", dataset_type="json", content_field="text")
+)
+
+results = elm.train()
+```
+
+#### DPO Training
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-8B")
+    .set_dtype("bf16")
+    .set_sharding(axis_dims=(1, 1, 1, -1, 1))
+    .set_reference_model("Qwen/Qwen3-8B")  # Reference model for KL constraint
+    .set_trainer(
+        "dpo",
+        beta=0.1,
+        learning_rate=5e-7,
+        num_train_epochs=1,
+        total_batch_size=16,
+    )
+)
+
+results = elm.train(train_dataset=preference_dataset)
+```
+
+#### GRPO Training
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-8B")
+    .set_dtype("bf16")
+    .set_trainer(
+        "grpo",
+        num_generations=4,
+        beta=0.04,
+        learning_rate=1e-6,
+        temperature=0.9,
+    )
+)
+
+results = elm.train(train_dataset=prompts_dataset, reward_funcs=your_reward_fn)
+```
+
+#### Distillation Training
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-1B")  # Student model
+    .set_teacher_model("Qwen/Qwen3-8B")               # Teacher model
+    .set_dtype("bf16")
+    .set_trainer(
+        "distillation",
+        temperature=3.0,
+        alpha=0.5,
+        learning_rate=2e-5,
+    )
+)
+
+results = elm.train(train_dataset=your_dataset)
+```
+
+### Evaluation with eLargeModel
+
+Run standard benchmarks using lm-evaluation-harness:
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("google/gemma-3-27b-it")
+    .set_dtype("bf16")
+    .set_esurge(max_model_len=4096, max_num_seqs=64)
+    .set_eval(max_new_tokens=512, temperature=0.0, batch_size=32)
+)
+
+# Evaluate on benchmarks
+results = elm.eval(
+    tasks=["hellaswag", "mmlu", "gsm8k"],
+    engine="esurge",
+    num_fewshot=5,
+    output_path="eval_results.json",
+)
+
+# Print results
+for task, metrics in results["results"].items():
+    print(f"{task}: {metrics.get('acc', metrics.get('exact_match')):.2%}")
+```
+
+### Dataset Mixtures
+
+Configure multiple datasets for training:
+
+```python
+elm = (
+    ed.eLargeModel.from_pretrained("Qwen/Qwen3-VL-8B-Thinking")
+    .set_mixture(batch_size=32, streaming=True, shuffle=True)
+    .add_dataset("train.json", dataset_type="json", content_field="text", weight=0.5)
+    .add_dataset("code/*.parquet", dataset_type="parquet", content_field="content", weight=0.3)
+    .add_dataset("imdb", dataset_type="imdb", split="train", weight=0.2)
+)
+
+dataset = elm.build_dataset()
+```
+
+### Available Builder Methods
+
+| Method | Description |
+|--------|-------------|
+| `set_model(path)` | Set model name/path |
+| `set_dtype(dtype)` | Set computation dtype (bf16, fp16, fp32) |
+| `set_sharding(axis_dims, axis_names)` | Configure distributed sharding |
+| `set_quantization(method, block_size)` | Enable quantization (nf4, a8bit) |
+| `set_esurge(...)` | Configure eSurge inference engine |
+| `set_trainer(type, ...)` | Configure training paradigm |
+| `set_mixture(...)` | Configure dataset mixture |
+| `set_eval(...)` | Configure evaluation settings |
+| `set_teacher_model(path)` | Set teacher model for distillation |
+| `set_reference_model(path)` | Set reference model for DPO/ORPO |
+| `add_dataset(...)` | Add dataset to mixture |
+| `update_config(dict)` | Deep merge configuration updates |
+
+### Build Methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `build_model()` | `EasyDeLBaseModule` | Build the model |
+| `build_tokenizer()` | `AutoTokenizer` | Build the tokenizer |
+| `build_esurge()` | `eSurge` | Build inference engine |
+| `build_trainer()` | `Trainer` | Build configured trainer |
+| `build_dataset()` | `Dataset` | Build dataset from mixture |
+| `build_teacher_model()` | `EasyDeLBaseModule` | Build teacher model |
+| `build_reference_model()` | `EasyDeLBaseModule` | Build reference model |
+| `train()` | Training results | Run full training pipeline |
+| `eval(tasks)` | Eval results | Run lm-eval benchmarks |
+
 ### Training Example - Supervised Fine-Tuning
 
 ```python
@@ -297,7 +629,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 
 # Load model with configuration
-model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+model_id = "Qwen/Qwen3-VL-8B-Thinking"
 
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     model_id,
@@ -348,6 +680,9 @@ model.save_pretrained("./my-finetuned-model")
 ```
 
 ### Training Example - Preference Optimization (DPO)
+
+> [!NOTE]
+> DPO aligns models with human preferences without requiring a reward model. The `beta` parameter controls the KL divergence penalty - lower values allow more deviation from the reference model.
 
 ```python
 import easydel as ed
@@ -522,6 +857,9 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 
 ### Sharding Recipes
 
+> [!NOTE]
+> The sharding axes are `(dp, fsdp, ep, tp, sp)`. Use `-1` to automatically use remaining devices. The product of all dimensions must equal your total device count.
+
 EasyDeL supports multiple parallelism strategies:
 
 ```python
@@ -571,6 +909,9 @@ trainer = ed.SFTTrainer(
 ```
 
 ### LoRA (Low-Rank Adaptation)
+
+> [!TIP]
+> LoRA significantly reduces memory usage by only training low-rank adapter weights. Use a higher learning rate (2e-4 to 1e-3) compared to full fine-tuning.
 
 Efficient fine-tuning with LoRA:
 
@@ -623,6 +964,9 @@ model.save_pretrained("./merged-model")
 
 ### Quantization Workflow
 
+> [!IMPORTANT]
+> Quantization reduces memory usage but may impact model accuracy. NF4 (4-bit) offers the best compression, while A8BIT (8-bit) provides a balance between size and quality.
+
 Reduce memory footprint with post-training quantization:
 
 ```python
@@ -670,6 +1014,9 @@ engine = ed.eSurge(
 
 ### Gradient Checkpointing
 
+> [!TIP]
+> Use `NOTHING_SAVEABLE` for maximum memory savings (recomputes everything), or `CHECKPOINT_DOTS` to only checkpoint matrix multiplications (good balance).
+
 Save memory during training:
 
 ```python
@@ -684,6 +1031,9 @@ config_kwargs = ed.EasyDeLBaseConfigDict(
 ```
 
 ## Production Deployment
+
+> [!IMPORTANT]
+> For production deployments, use `RAGGED_PAGE_ATTENTION_V3` for optimal inference performance with paged KV cache. Enable monitoring with `engine.start_monitoring()` for observability.
 
 ### Deploy eSurge API Server
 
@@ -763,6 +1113,9 @@ for chunk in response:
 ```
 
 ### Authentication & RBAC
+
+> [!WARNING]
+> Store API keys securely and never commit them to version control. The `admin_key` has full access - use it only for key management operations.
 
 Enable API key authentication:
 
@@ -909,6 +1262,12 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 )
 ```
 
+> [!NOTE]
+> Use `from_torch=None` to automatically detect checkpoints type!.
+
+> [!TIP]
+> Use `from_torch=True` to automatically convert PyTorch checkpoints to EasyDeL. This enables using any HuggingFace model even if there's no native EasyDeL checkpoint.
+
 ### 🔮 Flexible Configuration
 
 ```python
@@ -937,7 +1296,8 @@ EasyDeL aims for MaxText-style performance while maintaining code clarity:
 | **HF Transformers** | 🐌 Slower      | ✅ Very readable     | ✅ Easy       |
 | **EasyDeL**         | ⚡⚡+ Fast     | ✅ Readable          | ✅ Easy       |
 
-Performance depends on hardware, sharding choices, and model size.
+> [!NOTE]
+> Performance depends on hardware, sharding choices, and model size. Benchmark on your specific setup for accurate comparisons.
 
 ### Real Example: Custom MoE Layer
 
