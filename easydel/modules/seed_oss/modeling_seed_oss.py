@@ -52,7 +52,23 @@ from .seed_oss_configuration import SeedOssConfig
 
 
 class SeedOssMLP(nn.Module):
-    """Seed OSS gated MLP with SiLU activation."""
+    """Seed OSS gated MLP with SiLU activation.
+
+    This implements a gated feed-forward network using the SwiGLU activation pattern,
+    where the hidden representation is computed as: down_proj(act_fn(gate_proj(x)) * up_proj(x)).
+    Uses column-parallel projections for gate and up, and row-parallel for down projection.
+
+    Attributes:
+        config: Model configuration object.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: JAX precision setting for matrix multiplications.
+        gate_proj: Column-parallel linear projection for gating.
+        up_proj: Column-parallel linear projection for values.
+        down_proj: Row-parallel linear projection to hidden size.
+        dropout: Dropout layer for residual dropout.
+        act_fn: Activation function (default: SiLU).
+    """
 
     def __init__(
         self,
@@ -63,6 +79,16 @@ class SeedOssMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssMLP layer.
+
+        Args:
+            config: Model configuration containing hidden_size, intermediate_size,
+                initializer_range, and other settings.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -95,7 +121,17 @@ class SeedOssMLP(nn.Module):
         self.dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Float[Array, "batch seq_len hidden_dim"]:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply the gated MLP transformation.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Output tensor of shape (batch, seq_len, hidden_dim) after gated MLP transformation.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -114,7 +150,17 @@ class SeedOssMLP(nn.Module):
 
 
 class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
-    """Seed OSS attention with biased QKV projections and bias-free output projection."""
+    """Seed OSS attention with biased QKV projections and bias-free output projection.
+
+    This attention module extends UnifiedAttention with Seed OSS-specific features including:
+    - Support for sliding window attention based on layer type configuration
+    - Bias-free output projection
+    - Standard causal attention with optional sliding window
+
+    Attributes:
+        layer_idx: Index of this layer in the transformer stack.
+        sliding_window: Sliding window size if this layer uses sliding attention, None otherwise.
+    """
 
     def __init__(
         self,
@@ -126,11 +172,20 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssAttention layer.
+
+        Args:
+            config: Model configuration containing attention settings.
+            layer_idx: Index of this layer in the transformer stack, used to determine
+                whether sliding window attention should be applied.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         self.layer_idx = layer_idx
         if config.layer_types is not None and layer_idx < len(config.layer_types):
-            self.sliding_window = (
-                config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-            )
+            self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         else:
             self.sliding_window = None
 
@@ -152,7 +207,18 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> RowParallelLinear:
-        """Use bias-free output projection."""
+        """Create the output projection layer without bias.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+
+        Returns:
+            A RowParallelLinear layer for output projection.
+        """
         return RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -167,7 +233,25 @@ class SeedOssAttention(UnifiedAttention[SeedOssConfig]):
 
 
 class SeedOssDecoderLayer(nn.Module):
-    """Single transformer layer for Seed OSS."""
+    """Single transformer decoder layer for Seed OSS.
+
+    Implements a standard transformer decoder block with pre-normalization (Pre-LN),
+    consisting of:
+    1. RMSNorm -> Self-Attention -> Residual connection
+    2. RMSNorm -> MLP -> Residual connection
+
+    Supports gradient checkpointing through auto_remat for memory efficiency.
+
+    Attributes:
+        config: Model configuration object.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: JAX precision setting for matrix multiplications.
+        self_attn: Self-attention module.
+        mlp: Feed-forward network module.
+        input_layernorm: RMSNorm applied before attention.
+        post_attention_layernorm: RMSNorm applied before MLP.
+    """
 
     def __init__(
         self,
@@ -179,6 +263,16 @@ class SeedOssDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssDecoderLayer.
+
+        Args:
+            config: Model configuration containing layer settings.
+            layer_idx: Index of this layer in the transformer stack.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -238,6 +332,22 @@ class SeedOssDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
+        """Process input through attention and MLP sublayers.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info: Attention mask information for causal masking.
+            position_ids: Position indices of shape (batch, seq_len).
+            mode: Runtime mode (train, decode, etc.).
+            cache_view: Optional KV cache view for incremental decoding.
+            cache_metadata: Optional metadata for cache management.
+            output_attentions: Whether to return attention weights.
+            frequencies: Optional rotary embedding frequencies.
+
+        Returns:
+            DecoderLayerOutput containing hidden states, optional attention weights,
+            and updated cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -275,7 +385,24 @@ class SeedOssDecoderLayer(nn.Module):
 
 
 class SeedOssModel(EasyDeLBaseModule):
-    """Base Seed OSS transformer without task-specific heads."""
+    """Base Seed OSS transformer model without task-specific heads.
+
+    This is the core transformer model that processes input tokens through
+    embedding, multiple decoder layers, and final normalization. It serves
+    as the backbone for task-specific models like SeedOssForCausalLM.
+
+    The architecture follows a decoder-only transformer with:
+    - Token embeddings with optional gradient checkpointing
+    - Stack of SeedOssDecoderLayer blocks
+    - Final RMSNorm layer
+
+    Attributes:
+        config: Model configuration object.
+        embed_tokens: Token embedding layer.
+        dropout: Embedding dropout layer.
+        layers: List of decoder layers.
+        norm: Final RMSNorm layer.
+    """
 
     def __init__(
         self,
@@ -286,6 +413,16 @@ class SeedOssModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssModel.
+
+        Args:
+            config: Model configuration containing vocab_size, hidden_size,
+                num_hidden_layers, and other architecture settings.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -341,6 +478,30 @@ class SeedOssModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Process input through the transformer encoder stack.
+
+        Args:
+            input_ids: Input token IDs of shape (batch, seq_len). Mutually exclusive
+                with inputs_embeds.
+            inputs_embeds: Pre-computed input embeddings of shape (batch, seq_len, hidden_dim).
+                Mutually exclusive with input_ids.
+            attention_mask: Boolean mask of shape (batch, seq_len) indicating valid tokens.
+            mask_info: Precomputed mask information for attention.
+            position_ids: Position indices of shape (batch, seq_len). Auto-computed if None.
+            mode: Runtime mode (train, decode, etc.). Auto-inferred if None.
+            past_key_values: Cached key-value states for incremental decoding.
+            cache_metadata: Metadata for cache management.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput containing last hidden state, optional all hidden states,
+            optional attention weights, and updated cache.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
+            AssertionError: If sequence length exceeds max_position_embeddings.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must provide exactly one of `input_ids` or `inputs_embeds`.")
 
@@ -421,21 +582,50 @@ class SeedOssModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Get the encoder module.
+
+        Raises:
+            NotImplementedError: SeedOssModel is decoder-only and has no encoder.
+        """
         raise NotImplementedError("SeedOssModel is decoder-only.")
 
     def get_decoder(self):
+        """Get the decoder module.
+
+        Returns:
+            The model itself, as it is a decoder-only architecture.
+        """
         return self
 
     def get_lm_head(self):
+        """Get the language modeling head.
+
+        Raises:
+            NotImplementedError: Base model does not define an LM head.
+        """
         raise NotImplementedError("Base model does not define an LM head.")
 
     def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            The embed_tokens layer used for input token embeddings.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, config=SeedOssConfig, model_type="seed_oss")
 class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
-    """Seed OSS model with a causal LM head."""
+    """Seed OSS model with a causal language modeling head.
+
+    This model extends the base SeedOssModel with a linear head for next-token
+    prediction. It is suitable for text generation, completion, and other
+    autoregressive language modeling tasks.
+
+    Attributes:
+        model: The underlying SeedOssModel transformer.
+        lm_head: Linear projection from hidden states to vocabulary logits.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "seed_oss"
@@ -450,6 +640,16 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssForCausalLM model.
+
+        Args:
+            config: Model configuration containing vocab_size, hidden_size,
+                and other architecture settings.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         super().__init__(
             config=config,
             base_model_class=SeedOssModel,
@@ -474,7 +674,26 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         past_key_values: TransformerCache | RaggedPagesCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> CausalLMOutput:
+    ) -> CausalLMOutput:  # type:ignore
+        """Perform forward pass for causal language modeling.
+
+        Args:
+            input_ids: Input token IDs of shape (batch, seq_len).
+            inputs_embeds: Pre-computed input embeddings of shape (batch, seq_len, hidden_dim).
+            attention_mask: Boolean mask of shape (batch, seq_len) indicating valid tokens.
+            mask_info: Precomputed mask information for attention.
+            position_ids: Position indices of shape (batch, seq_len).
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for incremental decoding.
+            cache_metadata: Metadata for cache management.
+            apply_lm_head: Whether to apply the LM head to compute logits.
+
+        Returns:
+            CausalLMOutput containing logits, last hidden state, optional all hidden states,
+            optional attention weights, and updated cache.
+        """
         outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -508,21 +727,54 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         )
 
     def get_encoder(self):
+        """Get the encoder module.
+
+        Raises:
+            NotImplementedError: SeedOssForCausalLM is decoder-only and has no encoder.
+        """
         raise NotImplementedError("SeedOssForCausalLM is decoder-only.")
 
     def get_decoder(self):
+        """Get the decoder module.
+
+        Returns:
+            The decoder from the underlying model.
+        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
+        """Get the language modeling head.
+
+        Returns:
+            The lm_head layer used for vocabulary projection.
+        """
         return self.lm_head
 
     def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            The embed_tokens layer from the underlying model.
+        """
         return self.model.get_embedding()
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=SeedOssConfig, model_type="seed_oss")
 class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssModel, SeedOssConfig]):
-    """Seed OSS model with a pooling classifier head."""
+    """Seed OSS model with a sequence classification head.
+
+    This model extends the base SeedOssModel with a linear classification head
+    for sequence-level predictions. It pools the last hidden state using the
+    last valid token position (determined by padding) and projects to the
+    number of classes.
+
+    Suitable for tasks like sentiment analysis, text classification, and
+    natural language inference.
+
+    Attributes:
+        model: The underlying SeedOssModel transformer.
+        score: Linear projection from hidden states to class logits.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "seed_oss"
@@ -537,6 +789,16 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SeedOssForSequenceClassification model.
+
+        Args:
+            config: Model configuration containing hidden_size, num_labels,
+                and other architecture settings.
+            dtype: Data type for computation (default: bfloat16).
+            param_dtype: Data type for parameters (default: bfloat16).
+            precision: JAX precision setting for matrix multiplications.
+            rngs: Random number generators for initialization.
+        """
         super().__init__(
             config=config,
             base_model_class=SeedOssModel,
@@ -564,6 +826,30 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
+        """Perform forward pass for sequence classification.
+
+        Args:
+            input_ids: Input token IDs of shape (batch, seq_len).
+            inputs_embeds: Pre-computed input embeddings of shape (batch, seq_len, hidden_dim).
+            attention_mask: Boolean mask of shape (batch, seq_len) indicating valid tokens.
+            mask_info: Precomputed mask information for attention.
+            position_ids: Position indices of shape (batch, seq_len).
+            segment_ids: Segment IDs for multi-segment inputs (currently unused).
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for incremental decoding.
+            cache_metadata: Metadata for cache management.
+            apply_lm_head: Whether to apply the classification head to compute logits.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput containing logits, optional hidden states,
+            optional attention weights, and updated cache.
+
+        Raises:
+            ValueError: If neither input_ids nor inputs_embeds are provided for classification.
+            ValueError: If batch_size > 1 and no pad_token_id is defined in config.
+        """
         transformer_outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -609,20 +895,40 @@ class SeedOssForSequenceClassification(BaseSequenceClassificationModule[SeedOssM
         )
 
     def get_encoder(self):
+        """Get the encoder module.
+
+        Raises:
+            NotImplementedError: SeedOssForSequenceClassification is decoder-only and has no encoder.
+        """
         raise NotImplementedError("SeedOssForSequenceClassification is decoder-only.")
 
     def get_decoder(self):
+        """Get the decoder module.
+
+        Returns:
+            The decoder from the underlying model.
+        """
         return self.model.get_decoder()
 
     def get_lm_head(self):
+        """Get the classification head.
+
+        Returns:
+            The score layer used for classification projection.
+        """
         return self.score
 
     def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            The embed_tokens layer from the underlying model.
+        """
         return self.model.get_embedding()
 
 
 __all__ = [
-    "SeedOssModel",
     "SeedOssForCausalLM",
     "SeedOssForSequenceClassification",
+    "SeedOssModel",
 ]
