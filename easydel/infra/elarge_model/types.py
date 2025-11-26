@@ -36,8 +36,9 @@ from easydel.layers.quantization import EasyDeLQuantizationConfig
 from .trainer_types import TrainerConfig
 
 if tp.TYPE_CHECKING:
-    from easydel.inference.sampling_params import SamplingParams
     from ejkernel.modules.operations.configs import BaseOperationConfig
+
+    from easydel.inference.sampling_params import SamplingParams
 
 DTypeLike = tp.Union[str, jnp.dtype, type, tp.Literal["fp8", "bf16", "fp16", "fp32"]]  # noqa
 PrecisionLike = tp.Union[str, jax.lax.Precision, None, tp.Literal["HIGH", "DEFAULT", "HIGHEST"]]  # noqa

@@ -84,7 +84,6 @@ from jax import numpy as jnp
 from jax.sharding import Mesh
 
 from easydel.layers.linear import ParallelLinear
-
 from easydel.layers.quantization import EasyDeLQuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
