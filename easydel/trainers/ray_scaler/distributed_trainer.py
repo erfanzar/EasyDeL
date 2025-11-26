@@ -59,7 +59,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from easydel.infra import EasyDeLBaseConfig, EasyDeLBaseModule, EasyDeLState
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import TaskType
-from easydel.layers.attention import AttentionMechanisms
 from easydel.modules.auto.auto_configuration import get_modules_by_type
 from easydel.utils import Registry
 
@@ -193,7 +192,7 @@ class RayDistributedTrainer:
         "gradient_checkpointing": EasyDeLGradientCheckPointers.NONE,
         "initializer_range": 0.02,
         "partition_axis": PartitionAxis(),
-        "attn_mechanism": AttentionMechanisms.AUTO,
+        "attn_mechanism": "auto",
         "attn_dtype": jnp.bfloat16,
         "attn_softmax_dtype": jnp.bfloat16,
         "sharding_axis_names": ("dp", "fsdp", "ep", "tp", "sp"),
@@ -237,9 +236,9 @@ class RayDistributedTrainer:
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
         if model_task is None or model_type is None:
-            assert (
-                model_task is None and model_type is None
-            ), "If one of model_task or model_type is None, both must be None."
+            assert model_task is None and model_type is None, (
+                "If one of model_task or model_type is None, both must be None."
+            )
             assert model_class is not None, "model_class must be provided when model_task/model_type are omitted."
             model_type = model_class._model_type
             model_task = model_class._model_task
@@ -251,9 +250,9 @@ class RayDistributedTrainer:
             model_task = model_class._model_task
 
         if model_class is None:
-            assert (
-                model_type is not None and model_task is not None
-            ), "model_type and model_task must be provided if model_class is not specified."
+            assert model_type is not None and model_task is not None, (
+                "model_type and model_task must be provided if model_class is not specified."
+            )
             _, resolved_class = get_modules_by_type(model_type=model_type, task_type=model_task)
             assert resolved_class is not None, f"Could not resolve model class for {model_type}/{model_task}"
             self.model_class = resolved_class
@@ -624,14 +623,12 @@ class RayDistributedTrainer:
                     config_kwargs=ed.EasyDeLBaseConfigDict(
                         freq_max_position_embeddings=self.config_variables["max_position_embeddings"],
                         mask_max_position_embeddings=self.config_variables["max_position_embeddings"],
-                        kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
                         attn_mechanism=self.config_variables["attn_mechanism"],
                         attn_dtype=self.config_variables["attn_dtype"],
                         attn_softmax_dtype=self.config_variables["attn_softmax_dtype"],
                         gradient_checkpointing=self.config_variables["gradient_checkpointing"],
                     ),
                     partition_axis=self.config_variables["partition_axis"],
-                    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
                 )
             else:
                 logger.info(f"No model/state/checkpoint. Creating a new model (scaling_index={scaling_index}).")

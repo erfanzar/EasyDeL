@@ -23,7 +23,6 @@ Enumerations:
     EasyDeLOptimizers: Available optimization algorithms
     EasyDeLSchedulers: Learning rate scheduling strategies
     EasyDeLGradientCheckPointers: Gradient checkpointing methods
-    EasyDeLQuantizationMethods: Model quantization techniques
     EasyDeLPlatforms: Kernel execution platforms
     EasyDeLBackends: JAX backend hardware targets
 
@@ -128,24 +127,6 @@ class EasyDeLGradientCheckPointers(str, Enum):
     SAVE_FROM_BOTH_POLICIES = "save_from_both_policies"
 
 
-class EasyDeLQuantizationMethods(str, Enum):
-    """
-    Enumeration of quantization methods supported by EasyDeL.
-
-    Quantization reduces the precision of model weights and/or activations to save
-    memory and potentially speed up inference.
-
-    Attributes:
-        NONE: No quantization is applied.
-        NF4: Represents NormalFloat 4-bit quantization.
-        A8BIT: Represents 8-bit affine quantization.
-    """
-
-    NONE = None
-    NF4 = "nf4"
-    A8BIT = "8bit"
-
-
 class EasyDeLPlatforms(str, Enum):
     """
     Enumeration of platforms or kernel execution backends supported by EasyDeL.
@@ -216,7 +197,6 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "ragged_page_attention_v3",
     "page_attention",
 ]
-AVAILABLE_QUANTIZATION_METHODS = tp.Literal[None, "nf4", "8bit"]
 
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]

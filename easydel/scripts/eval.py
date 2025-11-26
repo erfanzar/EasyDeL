@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import typing as tp
 
 import jax
 from eformer.aparser import DataClassArgumentParser
@@ -23,6 +22,7 @@ from lm_eval import evaluator
 from transformers import AutoTokenizer
 
 import easydel as ed
+
 
 @auto_pytree
 class EvaluationConfig:
@@ -152,12 +152,10 @@ def main():
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=eval_config.max_length,
             mask_max_position_embeddings=eval_config.max_length,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
             attn_dtype=param_dtype,
             attn_mechanism=eval_config.attn_mechanism,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         param_dtype=param_dtype,
         dtype=dtype,
         partition_axis=partition_axis,

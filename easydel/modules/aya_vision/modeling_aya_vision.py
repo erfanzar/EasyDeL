@@ -30,10 +30,10 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.linear import RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig

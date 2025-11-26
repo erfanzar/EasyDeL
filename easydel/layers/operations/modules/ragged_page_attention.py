@@ -99,7 +99,7 @@ class _RaggedPageAttn(OperationImpl):
         else:
             dtype_for_compute = compute_dtype
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
-        cfg = None  # AutoTune
+        cfg = self.metadata.get_operation_config("ragged_page_attention_v2")
 
         if platform == "pallas":
             if query.shape[-1] not in [128, 256]:
@@ -176,7 +176,7 @@ class _RaggedPageAttn(OperationImpl):
         )
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
-        cfg = None  # AutoTune
+        cfg = self.metadata.get_operation_config("ragged_page_attention_v3")
         call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,

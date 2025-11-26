@@ -138,10 +138,10 @@ def main():
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
             gradient_checkpointing=runtime_config.gradient_checkpointing,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+            
             attn_mechanism=runtime_config.attn_mechanism,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+        
         platform=ed.EasyDeLPlatforms.JAX,
         param_dtype=runtime_config.param_dtype,
         dtype=runtime_config.dtype,

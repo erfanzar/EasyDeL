@@ -80,8 +80,10 @@ from transformers.utils.hub import PushToHubMixin
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
+from easydel.layers.quantization import EasyDeLQuantizationConfig
+
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
-from ..etils import EasyDeLBackends, EasyDeLPlatforms, EasyDeLQuantizationMethods
+from ..etils import EasyDeLBackends, EasyDeLPlatforms
 
 if tp.TYPE_CHECKING:
     from ..base_module import EasyDeLBaseModule
@@ -425,10 +427,7 @@ class EasyBridgeMixin(PushToHubMixin):
         param_dtype: jnp.dtype,
         mesh: jax.sharding.Mesh,
         shard_fns: dict[tp.Callable] | None,
-        quantization_method: EasyDeLQuantizationMethods | None,
-        quantization_platform: EasyDeLQuantizationMethods | None,
-        quantization_block_size: int,
-        quantization_pattern: str | None,
+        quantization_config: EasyDeLQuantizationConfig | None,
         quantize_tensors: bool,
         vebose: bool,
     ) -> EasyDeLBaseModule:
@@ -437,23 +436,19 @@ class EasyBridgeMixin(PushToHubMixin):
         Args:
             resolved_archive_file: The path to the checkpoint file.
             model: an easydel model.
-            mismatch_allowed: If True, allows mismatch in parameters while loading.
-            verbose: Whether to print verbose messages.
+            quantization_config: Quantization configuration for loading.
+            quantize_tensors: Whether to quantize tensors during loading.
             shard_fns: Custom shard functions for loading checkpoint.
+            vebose: Whether to print verbose messages.
 
         Returns:
             an easydel, with loaded parameter.
         """
         callback = None
-        if quantize_tensors:
+        if quantize_tensors and quantization_config is not None:
             from easydel.layers.quantization.quantizers import EasyQuantizer
 
-            quantizer = EasyQuantizer(
-                quantization_method=quantization_method,
-                quantization_platform=quantization_platform,
-                quantization_pattern=quantization_pattern,
-                block_size=quantization_block_size,
-            )
+            quantizer = EasyQuantizer(quantization_config=quantization_config)
             if quantize_tensors:
 
                 def callback(x, p):
@@ -508,8 +503,7 @@ class EasyBridgeMixin(PushToHubMixin):
             unexpected_keys = set(state.keys()) - required_params
             if any([k[-1].startswith("quant_") for k in state.keys()]):
                 model = model.quantize(
-                    method=quantization_method,
-                    block_size=quantization_block_size,
+                    quantization_config=quantization_config,
                     verbose=vebose,
                 )
             for unexpected_key in unexpected_keys:
@@ -550,38 +544,30 @@ class EasyBridgeMixin(PushToHubMixin):
         token: str | bool | None = None,
         revision: str = "main",
         vebose: bool = True,
-        quantization_platform: EasyDeLPlatforms | None = None,
-        quantization_method: EasyDeLQuantizationMethods | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
+        quantization_config: EasyDeLQuantizationConfig | None = None,
         quantize_tensors: bool = True,
         **kwargs,
     ):
         """Loads an EasyDeL model from a pretrained model or path.
 
         Args:
-            pretrained_model_name_or_path (str, optional): The name or path of the pretrained model.
-            sharding_axis_dims (Sequence[int], optional): The dimensions of sharding axes.
-            sharding_axis_names (Sequence[str], optional): The names of sharding axes.
-            partition_axis (PartitionAxis, optional): The partition axis configuration.
-            dtype (dtype, optional): The data type of the model.
-            param_dtype (dtype, optional): The data type of the parameters.
-            precision (PrecisionLike, optional): The computation precision.
-            config_kwargs (dict[str, Any], optional): Additional configuration parameters.
-            partition_rules (tuple, optional): Custom partitioning rules for sharding.
-            backend (EasyDeLBackends, optional): The backend to use.
-            platform (EasyDeLPlatforms, optional): The platform to use.
-            shard_fns (dict[Callable], optional): Custom shard functions for loading checkpoint.
-            auto_shard_model (bool, optional): Whether to automatically shard the model.
-            verbose (bool, optional): Whether to print verbose messages. Defaults to True.
-            mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
-            *model_args: Additional arguments for the model.
-            config (str, optional): configuration for the model.
-            cache_dir (str, optional): The cache directory for the pretrained model.
-            force_download (bool, optional): Whether to force download the model.
-            local_files_only (bool, optional): Whether to use only local files.
-            token (str, optional): The Hugging Face Hub token.
-            revision (str, optional): The revision of the model to load.
+            pretrained_model_name_or_path: The name or path of the pretrained model.
+            sharding_axis_dims: The dimensions of sharding axes.
+            sharding_axis_names: The names of sharding axes.
+            partition_axis: The partition axis configuration.
+            dtype: The data type of the model.
+            param_dtype: The data type of the parameters.
+            precision: The computation precision.
+            config_kwargs: Additional configuration parameters.
+            partition_rules: Custom partitioning rules for sharding.
+            backend: The backend to use.
+            platform: The platform to use.
+            shard_fns: Custom shard functions for loading checkpoint.
+            auto_shard_model: Whether to automatically shard the model.
+            verbose: Whether to print verbose messages. Defaults to True.
+            mismatch_allowed: If True, allows mismatch in parameters while loading. Defaults to True.
+            quantization_config: Quantization config for loading. Pass None to disable.
+            quantize_tensors: Whether to quantize tensors during loading.
             **kwargs: Additional keyword arguments.
 
         Returns:
@@ -779,18 +765,14 @@ class EasyBridgeMixin(PushToHubMixin):
             param_dtype,
             model.mesh,
             shard_fns,
-            quantization_method,
-            quantization_platform,
-            quantization_block_size,
-            quantization_pattern,
+            quantization_config,
             quantize_tensors,
             vebose,
         )
 
-        if not quantize_tensors:  # already quantized
+        if not quantize_tensors and quantization_config is not None:
             model = model.quantize(
-                method=quantization_method,
-                block_size=quantization_block_size,
+                quantization_config=quantization_config,
                 quantize_tensors=quantize_tensors,
                 verbose=vebose,
             )
@@ -834,10 +816,7 @@ class EasyBridgeMixin(PushToHubMixin):
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_platform: EasyDeLPlatforms | None = None,
-        quantization_method: EasyDeLQuantizationMethods | None = None,
-        quantization_block_size: int = 128,
-        quantization_pattern: str | None = None,
+        quantization_config: EasyDeLQuantizationConfig | None = None,
         quantize_tensors: bool = True,
         verbose: bool = True,
         **kwargs,
@@ -935,15 +914,10 @@ class EasyBridgeMixin(PushToHubMixin):
         params_pattern_selection = None
         uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
 
-        quantizer = EasyQuantizer(
-            quantization_method=quantization_method,
-            block_size=quantization_block_size,
-            quantization_platform=quantization_platform,
-            quantization_pattern=quantization_pattern,
-        )
+        quantizer = EasyQuantizer(quantization_config=quantization_config)
         callback = None
         passed_shard_fns = shard_fns
-        if quantize_tensors:
+        if quantize_tensors and quantization_config is not None:
             passed_shard_fns = None
 
             def callback(x, p):
@@ -975,16 +949,10 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
         logger.debug("model and parameters pytree merged.")
-        if (
-            quantization_method is not None
-            and quantization_method != EasyDeLQuantizationMethods.NONE
-            and not quantize_tensors
-        ):
+        if quantization_config is not None and not quantize_tensors:
             logger.debug("quantizing model.")
             model = model.quantize(
-                method=quantization_method,
-                block_size=quantization_block_size,
-                quantization_pattern=quantization_pattern,
+                quantization_config=quantization_config,
                 verbose=verbose,
             )
         logger.debug("returning model.")

@@ -444,7 +444,7 @@ class GemmaModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+        _batch_size, sequence_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -575,7 +575,7 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:
+    ) -> CausalLMOutput:  # type:ignore
         """
         Forward pass through the Gemma module.
 

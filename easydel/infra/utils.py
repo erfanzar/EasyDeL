@@ -75,7 +75,9 @@ from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
+from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
+
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
 
 warnings.filterwarnings(
     "ignore",
@@ -427,9 +429,7 @@ def quantize_linear_layers(
     model: nn.Module,
     /,
     *,
-    method: EasyDeLQuantizationMethods | None = None,
-    block_size: int = 256,
-    quantization_pattern: str | None = None,
+    quantization_config: EasyDeLQuantizationConfig | None = None,
     verbose: bool = True,
 ) -> nn.Module:
     """
@@ -437,56 +437,17 @@ def quantize_linear_layers(
 
     Args:
         model: The model to quantize.
-        method (EasyDeLQuantizationMethods): quantization method for params.
-        quantization_pattern (str): re pattern for layers to be quantized.
-        verbose (bool): whenever to use tqdm for logging stuff.
+        quantization_config: Quantization config specifying dtype, block_size, and pattern.
+        verbose: Whether to use tqdm for logging.
 
     Returns:
         Quantized parameters in the same structure as the input.
     """
-    if method == EasyDeLQuantizationMethods.NONE or method is None:
+    if quantization_config is None:
         return model
 
-    from easydel.layers.quantization import Linear8bit, LinearNF4
-    from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
-
-    quantizer: Linear8bit = {
-        EasyDeLQuantizationMethods.NF4: LinearNF4,
-        EasyDeLQuantizationMethods.A8BIT: Linear8bit,
-        EasyDeLQuantizationMethods.A4Q: LinearNF4,
-        EasyDeLQuantizationMethods.A8Q: Linear8bit,
-    }.get(method, None)
-    if quantizer is None:
-        raise NotImplementedError("Requested Quantizer is not Supported")
-    if quantization_pattern is None:
-        quantization_pattern = ".*"
-
-    if hasattr(model, "config"):
-        model.config.quantization_method = method
-        model.config.quantization_block_size = block_size
-        model.config.quantization_pattern = quantization_pattern
-
-    pattern = re.compile(quantization_pattern)
-
-    with tqdm(
-        total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
-        desc=f"Quantizing to {method}",
-        disable=not verbose,
-    ) as pbar:
-        for path, _ in iter_module_search(model, ParallelLinear):
-            if pattern.search(".".join([str(p) for p in path])):
-                set_module_from_path(
-                    model=model,
-                    path=path,
-                    new_value=quantizer.from_linear(
-                        linear=get_module_from_path(model=model, path=path),
-                        rngs=None,
-                        block_size=block_size,
-                    ),
-                )
-            pbar.update(1)
-
-    return model
+    quantizer = EasyQuantizer(quantization_config=quantization_config)
+    return quantizer.quantize_linears(model, verbose=verbose)
 
 
 def apply_lora_to_layers(

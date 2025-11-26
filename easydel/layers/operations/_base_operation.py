@@ -17,13 +17,13 @@ Defines the base class for operations within EasyDeL that may have
 backend-specific implementations (CPU, GPU, TPU).
 """
 
+import functools
 import typing as tp
 from abc import ABC, abstractmethod
 
 import jax
 from eformer.loggings import get_logger
 
-from easydel.infra.etils import EasyDeLBackends
 from easydel.utils.helpers import check_bool_flag
 
 from ._operation_meta import OperationMetadata
@@ -218,20 +218,26 @@ class BaseOperation(ABC):
             return self.forward_native(*args, **kwargs)
 
         match self.metadata.backend:
-            case EasyDeLBackends.TPU:
+            case self.EasyDeLBackends.TPU:
                 logger.debug("Calling into TPU exec")
                 return self.forward_tpu(*args, **kwargs)
-            case EasyDeLBackends.GPU:
+            case self.EasyDeLBackends.GPU:
                 logger.debug("Calling into GPU exec")
                 return self.forward_gpu(*args, **kwargs)
-            case EasyDeLBackends.TT:
+            case self.EasyDeLBackends.TT:
                 logger.debug("Calling into TT exec")
                 return self.forward_tt(*args, **kwargs)
-            case EasyDeLBackends.CPU:
+            case self.EasyDeLBackends.CPU:
                 logger.debug("Calling into CPU exec")
                 return self.forward_native(*args, **kwargs)
             case _:
                 raise RuntimeError(f"unknown backend at OperationImpl! {self.metadata.backend}")
+
+    @functools.cached_property
+    def EasyDeLBackends(self):
+        from easydel.infra.etils import EasyDeLBackends
+
+        return EasyDeLBackends
 
 
 _I = tp.TypeVar("ICa", bound=BaseOperation)
@@ -307,7 +313,7 @@ class OperationRegistry:
         if not is_registered:
             available_impls: list[str] = list(cls._registry.keys())
             raise ValueError(
-                f"Operation implementation '{impl_name}' not found. Available " f"implementations: {available_impls}"
+                f"Operation implementation '{impl_name}' not found. Available implementations: {available_impls}"
             )
         impl_class: type[BaseOperation] = cls._registry[impl_name]
         return impl_class

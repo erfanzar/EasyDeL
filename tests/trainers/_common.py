@@ -78,7 +78,6 @@ def _load_model_kwargs() -> dict[str, Any]:
         config_kwargs=ed.EasyDeLBaseConfigDict(
             freq_max_position_embeddings=MAX_TOTAL_LENGTH,
             mask_max_position_embeddings=MAX_TOTAL_LENGTH,
-            kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
             attn_mechanism=ed.AttentionMechanisms.AUTO,
             attn_dtype=jnp.bfloat16,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
@@ -86,7 +85,6 @@ def _load_model_kwargs() -> dict[str, Any]:
             moe_force_xla_gmm=True,
         ),
         partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
     )
 
 

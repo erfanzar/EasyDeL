@@ -69,6 +69,7 @@ from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
 from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
 from transformers.utils.generic import is_timm_config_dict
 
+from easydel.layers.quantization import EasyDeLQuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
 
@@ -77,15 +78,15 @@ from .etils import (
     AVAILABLE_GRADIENT_CHECKPOINT_TARGETS,
     AVAILABLE_GRADIENT_CHECKPOINTS,
     AVAILABLE_MOE_METHODS,
-    AVAILABLE_QUANTIZATION_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
     EasyDeLBackends,
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
-    EasyDeLQuantizationMethods,
 )
 
 if tp.TYPE_CHECKING:
+    from ejkernel.modules.operations.configs import BaseOperationConfig
+
     from easydel.layers.rotary_embedding import RopeConfig
 
     from .utils import AttnMaskDetail, ModuleCaches
@@ -319,8 +320,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     sequence_axis_name: NotRequired[str]
     gradient_checkpointing: NotRequired[EasyDeLGradientCheckPointers | str | AVAILABLE_GRADIENT_CHECKPOINTS]
     gradient_checkpointing_targets: NotRequired[list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None]
-    kv_cache_quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
-    kv_cache_quantization_blocksize: NotRequired[int]
+    kv_cache_quantization_config: NotRequired[EasyDeLQuantizationConfig | None]
     kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
     flash_attention_backward_pass_impl: NotRequired[tp.Literal["triton", "xla"]]
     attn_dtype: NotRequired[jnp.dtype]
@@ -338,9 +338,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     use_ring_of_experts: NotRequired[bool]
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]
-    quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
-    quantization_pattern: NotRequired[str]
-    quantization_blocksize: NotRequired[int]
+    quantization_config: NotRequired[EasyDeLQuantizationConfig | None]
+    operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
@@ -386,11 +385,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing_targets: Optional list of target names to include or
             exclude when using selective checkpointing policies.
         precompute_masks: Whether to precompute and cache causal masks on the mesh.
-        kv_cache_quantization_method: Quantization method for KV cache tensors.
-        kv_cache_quantization_blocksize: Block size for KV cache quantization. Defaults to ``64``.
-        quantization_method: Quantization method for linear layers.
-        quantization_pattern: Regex pattern selecting modules to quantize. Defaults to ``".*"``.
-        quantization_blocksize: Block size for linear-layer quantization. Defaults to ``64``.
+        kv_cache_quantization_config: Quantization config for KV cache tensors. Pass ``None`` to disable.
+        quantization_config: Quantization config for linear layers. Pass ``None`` to disable.
         kv_cache_sharding_sequence_axis_name: Axis (or axes) used when sharding the KV cache.
         flash_attention_backward_pass_impl: Backward kernel for flash attention
             (``"triton"`` or ``"xla"``). Defaults to ``"triton"``.
@@ -446,11 +442,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
         precompute_masks: bool = True,
-        kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
-        kv_cache_quantization_blocksize: int = 64,
-        quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
-        quantization_pattern: str = ".*",
-        quantization_blocksize: int = 64,
+        kv_cache_quantization_config: EasyDeLQuantizationConfig | None = None,
+        quantization_config: EasyDeLQuantizationConfig | None = None,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
         attn_dtype: jnp.dtype = jnp.bfloat16,
@@ -468,6 +461,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         use_ring_of_experts: bool = RING_EXPERTS,
         fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
         sp_is_ep_bound: bool = SP_IS_EP_BOUND,
+        operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
     ):
         """Initialize base EasyDeL config fields and honor user overrides."""
@@ -512,13 +506,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
         self.precompute_masks = getattr(self, "precompute_masks", precompute_masks)
 
-        self.kv_cache_quantization_method = getattr(self, "kv_cache_quantization_method", kv_cache_quantization_method)
-        self.kv_cache_quantization_blocksize = getattr(
-            self, "kv_cache_quantization_blocksize", kv_cache_quantization_blocksize
-        )
-        self.quantization_method = getattr(self, "quantization_method", quantization_method)
-        self.quantization_blocksize = getattr(self, "quantization_blocksize", quantization_blocksize)
-        self.quantization_pattern = getattr(self, "quantization_pattern", quantization_pattern)
+        self.kv_cache_quantization_config = getattr(self, "kv_cache_quantization_config", kv_cache_quantization_config)
+        self.quantization_config = getattr(self, "quantization_config", quantization_config)
         self.flash_attention_backward_pass_impl = getattr(
             self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
         )
@@ -537,12 +526,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
+        self.operation_configs = getattr(self, "operation_configs", operation_configs)
 
         self.pretraining_tp = 1  # it's for pytorch models.
-        if self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE and self.use_sharded_kv_caching:
+        if self.kv_cache_quantization_config is not None and self.use_sharded_kv_caching:
             use_sharded_kv_caching = self.use_sharded_kv_caching
             warnings.warn(
-                f"`{self.kv_cache_quantization_method=}` and `{use_sharded_kv_caching=}`"
+                f"`kv_cache_quantization_config={self.kv_cache_quantization_config}` and `{use_sharded_kv_caching=}`"
                 " can't be used together at the moment.",
                 stacklevel=1,
             )
@@ -865,11 +855,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "gradient_checkpointing",
             "gradient_checkpointing_targets",
             "precompute_masks",
-            "kv_cache_quantization_method",
-            "kv_cache_quantization_blocksize",
-            "quantization_method",
-            "quantization_blocksize",
-            "quantization_pattern",
+            "kv_cache_quantization_config",
+            "quantization_config",
             "kv_cache_sharding_sequence_axis_name",
             "flash_attention_backward_pass_impl",
             "attn_dtype",
@@ -918,11 +905,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = NOT_GIVEN,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = NOT_GIVEN,
         precompute_masks: bool = NOT_GIVEN,
-        kv_cache_quantization_method: EasyDeLQuantizationMethods = NOT_GIVEN,
-        kv_cache_quantization_blocksize: int = NOT_GIVEN,
-        quantization_method: EasyDeLQuantizationMethods = NOT_GIVEN,
-        quantization_blocksize: int = NOT_GIVEN,
-        quantization_pattern: str = NOT_GIVEN,
+        kv_cache_quantization_config: EasyDeLQuantizationConfig | None = NOT_GIVEN,
+        quantization_config: EasyDeLQuantizationConfig | None = NOT_GIVEN,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = NOT_GIVEN,
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
         attn_dtype: jnp.dtype = NOT_GIVEN,
@@ -978,12 +962,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             gradient_checkpointing: Gradient checkpointing policy (default ``EasyDeLGradientCheckPointers.NONE``).
             gradient_checkpointing_targets: Optional list of checkpoint targets to include/exclude (default ``None``).
             precompute_masks: Whether to precompute and cache masks (default ``True``).
-            kv_cache_quantization_method: KV cache quantization method (default ``EasyDeLQuantizationMethods.NONE``).
-            kv_cache_quantization_blocksize: KV cache quantization block size (default ``128``).
-            quantization_method: Linear-layer quantization method (default ``EasyDeLQuantizationMethods.NONE``).
-            quantization_blocksize: Block size for linear quantization. Defaults to the historical
-                fallback used in this helper (`EasyDeLQuantizationMethods.NONE`) unless explicitly set.
-            quantization_pattern: Regex selecting layers to quantize (default ``".*"``).
+            kv_cache_quantization_config: KV cache quantization config (default ``None`` = no quantization).
+            quantization_config: Linear-layer quantization config (default ``None`` = no quantization).
             kv_cache_sharding_sequence_axis_name: Axis name(s) for KV cache sharding (default ``"sp"``).
             flash_attention_backward_pass_impl: Backward kernel for flash attention (default ``"triton"``).
             attn_dtype: Attention activation dtype (default ``jnp.float32``).
@@ -1027,17 +1007,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
         set_attrs_smartly(self, "sequence_axis_name", "sp", sequence_axis_name)
-        set_attrs_smartly(self, "kv_cache_quantization_blocksize", 128, kv_cache_quantization_blocksize)
         set_attrs_smartly(self, "kv_cache_sharding_sequence_axis_name", "sp", kv_cache_sharding_sequence_axis_name)
         set_attrs_smartly(self, "gradient_checkpointing", EasyDeLGradientCheckPointers.NONE, gradient_checkpointing)
         set_attrs_smartly(self, "gradient_checkpointing_targets", None, gradient_checkpointing_targets)
         set_attrs_smartly(self, "precompute_masks", True, precompute_masks)
-        set_attrs_smartly(
-            self, "kv_cache_quantization_method", EasyDeLQuantizationMethods.NONE, kv_cache_quantization_method
-        )
-        set_attrs_smartly(self, "quantization_method", EasyDeLQuantizationMethods.NONE, quantization_method)
-        set_attrs_smartly(self, "quantization_blocksize", EasyDeLQuantizationMethods.NONE, quantization_blocksize)
-        set_attrs_smartly(self, "quantization_pattern", ".*", quantization_pattern)
+        set_attrs_smartly(self, "kv_cache_quantization_config", None, kv_cache_quantization_config)
+        set_attrs_smartly(self, "quantization_config", None, quantization_config)
         set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
         set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)

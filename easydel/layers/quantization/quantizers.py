@@ -12,83 +12,142 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 import chex
 import jax
-from eformer.ops.quantization import Array8B, ArrayNF4
+from eformer.ops.quantization import QuantizationConfig, QuantizationType, quantize
 from flax import nnx as nn
 from tqdm.autonotebook import tqdm
-
-from easydel.infra.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
-from easydel.layers.linear import ParallelLinear
 
 from .linear_8bit import Linear8bit
 from .linear_nf4 import LinearNF4
 
-DEFAULT_QUANTIZATION_PATTERN = (
-    "(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
-    "gate_proj|up_proj|down_proj|dense_4h_to_h|dense_h_to_4h|query_key_value|wqkv|Wqkv|"
-    "dense|proj_1|proj_2|out_proj|qkv_proj)"
-)
+DEFAULT_QUANTIZATION_PATTERN = r"^(?!.*(?:embedding|norm)).*$"
 
-METHOD_TO_LINEAR_MAPPING = {
-    EasyDeLQuantizationMethods.NF4: LinearNF4,
-    EasyDeLQuantizationMethods.A8BIT: Linear8bit,
-}
+_MAP_LINEARS = {QuantizationType.INT8: Linear8bit, QuantizationType.NF4: LinearNF4}
+
+
+@dataclass
+class EasyDeLQuantizationConfig(QuantizationConfig):
+    """Extended quantization config with pattern support for layer selection.
+
+    This config extends eformer's QuantizationConfig with an additional `pattern`
+    field for selecting which layers to quantize.
+
+    Attributes:
+        dtype: The quantization type (NF4, INT8, TERNARY, BINARY).
+        block_size: Block size for block-wise quantization.
+        simulate: If True, uses STE without actual bit packing (QAT mode).
+        use_kernel: If True, uses optimized TPU/GPU kernels when available.
+        pattern: Regex pattern for selecting layers to quantize.
+                Default excludes embedding and norm layers.
+
+    Example:
+        >>> from easydel.layers.quantization import EasyDeLQuantizationConfig, QuantizationType
+        >>> config = EasyDeLQuantizationConfig(
+        ...     dtype=QuantizationType.NF4,
+        ...     block_size=64,
+        ...     pattern=r".*proj.*"  # Only quantize projection layers
+        ... )
+    """
+
+    pattern: str = field(default=DEFAULT_QUANTIZATION_PATTERN)
 
 
 class EasyQuantizer:
+    """Unified quantization interface for EasyDeL models.
+
+    Uses eformer's quantization infrastructure for efficient quantization.
+    Supports NF4 (4-bit) and INT8 (8-bit) quantization methods.
+
+    Args:
+        quantization_config: The quantization configuration. Pass None to disable quantization.
+
+    Example:
+        >>> from easydel.layers.quantization import EasyQuantizer, EasyDeLQuantizationConfig, QuantizationType
+        >>> config = EasyDeLQuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
+        >>> quantizer = EasyQuantizer(quantization_config=config)
+        >>> quantized_model = quantizer.quantize_linears(model)
+    """
+
     def __init__(
         self,
-        quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NF4,
-        quantization_platform: EasyDeLPlatforms | None = EasyDeLPlatforms.JAX,
-        quantization_pattern: str | None = None,
-        block_size: int = 256,
-        **kwargs,
+        quantization_config: EasyDeLQuantizationConfig | QuantizationConfig | None = None,
     ) -> None:
-        self.block_size = block_size
-        self.quantization_method = quantization_method
-        self.quantization_platform = quantization_platform
-        if quantization_pattern is None:
-            quantization_pattern = r"^(?!.*(?:embedding|norm)).*$"
-        self.quantization_pattern = quantization_pattern
+        self._config = quantization_config
+
+    @property
+    def config(self) -> EasyDeLQuantizationConfig | QuantizationConfig | None:
+        """Get the quantization configuration."""
+        return self._config
+
+    @property
+    def pattern(self) -> str:
+        """Get the quantization pattern."""
+        if self._config is None:
+            return DEFAULT_QUANTIZATION_PATTERN
+        if isinstance(self._config, EasyDeLQuantizationConfig):
+            return self._config.pattern
+        return DEFAULT_QUANTIZATION_PATTERN
 
     @jax.named_scope("easydel-easyquantize-call")
     def __call__(
         self,
-        array,
+        array: jax.Array,
         path: str | tuple[str] | None = None,
     ) -> chex.Array:
+        """Quantize an array using the configured quantization method.
+
+        Args:
+            array: The array to quantize.
+            path: Optional path for pattern matching to determine if quantization should be applied.
+
+        Returns:
+            Quantized array (as ImplicitArray) or original array if quantization is skipped.
+        """
+        if self._config is None:
+            return array
+
         should_be_quantized = True
         if path is not None:
             if isinstance(path, list):
                 path = tuple(path)
             if isinstance(path, tuple):
-                path = map(str, path)
-                path = ".".join(path)
-            if self.quantization_pattern is not None:
-                should_be_quantized = bool(re.match(self.quantization_pattern, path))
+                path = ".".join(map(str, path))
+            if self.pattern is not None:
+                should_be_quantized = bool(re.match(self.pattern, path))
+
         if not should_be_quantized:
             return array
-        match self.quantization_method:
-            case EasyDeLQuantizationMethods.A8BIT:
-                return Array8B.quantize(array=array)
-            case EasyDeLQuantizationMethods.NF4:
-                should_be_quantized = True
-                if array.size % self.block_size != 0:
-                    should_be_quantized = False
-                if should_be_quantized:
-                    return ArrayNF4.quantize(array=array, block_size=self.block_size)
 
-                return array
-            case EasyDeLQuantizationMethods.NONE:
-                return array
-            case None:
-                return array
-            case _:
-                raise ValueError(f"unknown quantization_method {self.quantization_method}.")
+        return quantize(array, self._config)
+
+    def quantize_array(
+        self,
+        array: jax.Array,
+        simulate: bool = False,
+    ) -> jax.Array:
+        """Quantize an array using eformer's unified quantize function.
+
+        Args:
+            array: The array to quantize.
+            simulate: If True, uses STE simulation mode (materializes immediately).
+
+        Returns:
+            Quantized array.
+        """
+        if self._config is None:
+            return array
+
+        return quantize(
+            array,
+            config=self._config,
+            simulate=simulate,
+        )
 
     def quantize_linears(
         self,
@@ -98,38 +157,47 @@ class EasyQuantizer:
         quantization_pattern: str | None = None,
         verbose: bool = True,
     ) -> nn.Module:
-        """
-        Quantize parameters to requested precision, excluding specified layers.
+        """Quantize linear layers in a model to the configured precision.
 
         Args:
-                        model: The model to quantize.
-                        quantization_pattern (str): re pattern for layers to be quantized.
-                        verbose (bool): whenever to use tqdm for logging stuff.
+            model: The model to quantize.
+            quantization_pattern: Regex pattern for layers to be quantized.
+                                 Overrides the pattern in config if provided.
+            verbose: Whether to use tqdm for progress logging.
 
         Returns:
-                        Quantized parameters in the same structure as the input.
+            Model with quantized linear layers.
         """
-        if self.quantization_method == EasyDeLQuantizationMethods.NONE or self.quantization_method is None:
+        if self._config is None:
             return model
 
-        from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
+        from easydel.layers.linear import ParallelLinear
+        from easydel.utils.traversals import (
+            get_module_from_path,
+            iter_module_search,
+            set_module_from_path,
+        )
 
-        quantizer = METHOD_TO_LINEAR_MAPPING.get(self.quantization_method, None)
-        if quantizer is None:
-            raise NotImplementedError("Requested Quantizer is not Supported")
         if quantization_pattern is None:
-            quantization_pattern = self.quantization_pattern
+            quantization_pattern = self.pattern
 
+        # Update model config if it exists
         if hasattr(model, "config"):
-            model.config.quantization_method = self.quantization_method
-            model.config.quantization_block_size = self.block_size
-            model.config.quantization_pattern = quantization_pattern
+            model.config.quantization_config = self._config
 
         pattern = re.compile(quantization_pattern)
+        dtype = self._config.dtype
+        block_size = self._config.block_size
+
+        linear_class = _MAP_LINEARS.get(dtype)
+        if linear_class is None:
+            raise NotImplementedError(f"Quantization not supported for dtype: {dtype}")
+
+        dtype_name = dtype.value if isinstance(dtype, QuantizationType) else str(dtype)
 
         with tqdm(
             total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
-            desc=f"Quantizing to {self.quantization_method}",
+            desc=f"Quantizing to {dtype_name}",
             disable=not verbose,
         ) as pbar:
             for path, _ in iter_module_search(model, ParallelLinear):
@@ -137,22 +205,16 @@ class EasyQuantizer:
                     set_module_from_path(
                         model=model,
                         path=path,
-                        new_value=quantizer.from_linear(
+                        new_value=linear_class.from_linear(
                             linear=get_module_from_path(model=model, path=path),
                             rngs=None,
-                            block_size=self.block_size,
+                            block_size=block_size,
                         ),
                     )
                 pbar.update(1)
         return model
 
     def __str__(self):
-        return (
-            self.__class__.__name__
-            + f"(\n\tblock_size = {self.block_size}"
-            + f"\n\tquantization_method = {self.quantization_method}"
-            + f"\n\tquantization_platform = {self.quantization_platform}"
-            + f"\n\tquantization_pattern = {self.quantization_pattern}\n)"
-        )
+        return self.__class__.__name__ + f"(\n\tconfig = {self._config}\n)"
 
     __repr__ = __str__

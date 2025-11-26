@@ -33,7 +33,6 @@ def main():
             decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),
-        quantization_method=ed.EasyDeLQuantizationMethods.NONE,
         precision=jax.lax.Precision.DEFAULT,
     )
     model.eval()

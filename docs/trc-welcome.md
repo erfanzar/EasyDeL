@@ -204,7 +204,7 @@ eopod run python -m easydel.scripts.finetune.gsm8k_grpo \
   --do_last_save \
   --save_steps 1000 \
   --use_wandb \
-  --kv-cache-quantization 8bit
+  --kv-cache-quantization int8
 ```
 
 ### Reward Model Training
@@ -245,7 +245,7 @@ The fine-tuning scripts share many parameters:
 - `--learning_rate` & `--learning_rate_end`: Initial and final learning rates for scheduling
 - `--auto_shard_states`: Automatically shard model parameters across TPU devices
 - `--save_steps`: Number of steps between model checkpoints
-- `--kv-cache-quantization`: Enable KV cache quantization (e.g., 8bit) to reduce memory usage
+- `--kv-cache-quantization`: Enable KV cache quantization (e.g., int8) to reduce memory usage
 
 ## Advanced Usage
 

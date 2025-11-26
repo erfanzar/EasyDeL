@@ -80,6 +80,7 @@ from functools import partial
 import jax
 import numpy
 from eformer import escale as es
+from eformer.jaximus import implicit
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
 from flax import nnx as nn
@@ -1046,6 +1047,7 @@ class ExecutionManager:
             ),
             out_shardings=outputs_shardings,
         )
+        @self.maybe_implicit
         def _model_step(
             graphdef,
             graphstate,
@@ -1102,6 +1104,7 @@ class ExecutionManager:
         i_reqs = jnp.arange(max_num_reqs, dtype=jnp.int32)
 
         @ejit
+        @self.maybe_implicit
         def _sampling_fn(
             metadata: BatchMetadata,
             device_state: MinimalDeviceState,
@@ -1333,3 +1336,13 @@ class ExecutionManager:
         )
 
         return [self.graphdef, self.graphstate, self.graphother, inputs]
+
+    @property
+    def maybe_implicit(self):
+        def no_implicit(fn):
+            return fn
+
+        if self.model.is_quantized:
+            return implicit
+
+        return no_implicit

@@ -160,7 +160,6 @@ _import_structure = {
         "EasyDeLGradientCheckPointers",
         "EasyDeLOptimizers",
         "EasyDeLPlatforms",
-        "EasyDeLQuantizationMethods",
         "EasyDeLSchedulers",
     ],
     "infra.factory": [
@@ -170,18 +169,31 @@ _import_structure = {
         "register_module",
     ],
     "layers": [],
+    "layers.quantization": [
+        "EasyDeLQuantizationConfig",
+        "EasyQuantizer",
+        "QuantizationType",
+    ],
     "layers.operations": [
+        "AttentionConfig",
         "AttentionOutput",
         "AutoRegressiveDecodeAttn",
+        "BaseOperationConfig",
         "BlockSparseAttn",
+        "BlockSparseAttentionConfig",
         "FlashAttn",
+        "FlashAttentionConfig",
         "OperationImpl",
         "OperationMetadata",
         "OperationRegistry",
         "RaggedPageAttnV2",
         "RaggedPageAttnV3",
+        "RaggedPageAttentionv2Config",
+        "RaggedPageAttentionv3Config",
         "RingAttn",
+        "RingAttentionConfig",
         "ScaledDotProductAttn",
+        "ScaledDotProductAttentionConfig",
         "VanillaAttn",
     ],
     "layers.attention": [
@@ -626,26 +638,34 @@ if _tp.TYPE_CHECKING:
         EasyDeLGradientCheckPointers,
         EasyDeLOptimizers,
         EasyDeLPlatforms,
-        EasyDeLQuantizationMethods,
         EasyDeLSchedulers,
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
     from .layers.moe import MoEMethods
     from .layers.operations import (
+        AttentionConfig,
         AttentionOutput,
         AutoRegressiveDecodeAttn,
+        BaseOperationConfig,
+        BlockSparseAttentionConfig,
         BlockSparseAttn,
+        FlashAttentionConfig,
         FlashAttn,
         OperationImpl,
         OperationMetadata,
         OperationRegistry,
+        RaggedPageAttentionv2Config,
+        RaggedPageAttentionv3Config,
         RaggedPageAttnV2,
         RaggedPageAttnV3,
+        RingAttentionConfig,
         RingAttn,
+        ScaledDotProductAttentionConfig,
         ScaledDotProductAttn,
         VanillaAttn,
     )
+    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLConfig,
@@ -855,9 +875,8 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.84"]
-    _targeted_ejkernel_versions = ["0.0.21"]
-
+    _targeted_eformer_versions = ["0.0.85"]
+    _targeted_ejkernel_versions = ["0.0.22"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

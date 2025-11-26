@@ -945,9 +945,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
                 pad_token_id=pad_token_id,
             ),
             quantizer=self._quant_class(
-                quantization_method=self.config.kv_cache_quantization_method,
-                block_size=self.config.kv_cache_quantization_blocksize,
-                quantization_platform=self.config.platform,
+                quantization_config=self.config.kv_cache_quantization_config,
             ),
             mesh=self.config.mesh,
             starts=starts,

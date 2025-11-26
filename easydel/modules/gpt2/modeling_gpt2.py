@@ -13,22 +13,6 @@
 # limitations under the License.
 
 
-# coding=utf-8
-# Copyright 2021 The Google Flax Team Authors and The HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -745,7 +729,7 @@ class GPT2Model(EasyDeLBaseModule):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            batch_size, sequence_length = input_ids.shape
+            _batch_size, sequence_length = input_ids.shape
         elif inputs_embeds is not None:
             sequence_length = inputs_embeds.shape[1]
         else:
