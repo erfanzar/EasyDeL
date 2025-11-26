@@ -1,54 +1,67 @@
-import jax
-from datasets import load_dataset
-from jax import numpy as jnp
-from transformers import AutoTokenizer
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import easydel as ed
 
-repo_id = "Qwen/Qwen2-0.5B-Instruct"
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from _common import (  # type: ignore
+        build_reward_dataset,
+        get_logger,
+        get_tokenizer,
+        load_sequence_classifier_model,
+        make_config,
+    )
+else:
+    from ._common import (
+        build_reward_dataset,
+        get_logger,
+        get_tokenizer,
+        load_sequence_classifier_model,
+        make_config,
+    )
 
-processing_class = AutoTokenizer.from_pretrained(repo_id)
-model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
-    repo_id,
-    auto_shard_model=True,
-    sharding_axis_dims=(1, 1, 1, 1, -1),
-    config_kwargs=ed.EasyDeLBaseConfigDict(
-        freq_max_position_embeddings=1024,
-        mask_max_position_embeddings=1024,
-        attn_dtype=jnp.bfloat16,
-        attn_softmax_dtype=jnp.float32,
-        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
-        kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-        attn_mechanism=ed.AttentionMechanisms.VANILLA,
-    ),
-    quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-    platform=ed.EasyDeLPlatforms.JAX,
-    param_dtype=jnp.bfloat16,
-    dtype=jnp.bfloat16,
-    precision=jax.lax.Precision.DEFAULT,
-    partition_axis=ed.PartitionAxis(),
-)
 
-model.config.pad_token_id = processing_class.pad_token_id
+def main():
+    logger = get_logger(__name__)
+    tokenizer = get_tokenizer()
+    model = load_sequence_classifier_model()
 
-dataset = load_dataset("trl-lib/ultrafeedback_binarized")
+    trainer_args = make_config(
+        ed.RewardConfig,
+        "reward-modeling",
+        overrides={"total_batch_size": 1},
+    )
 
-trainer = ed.RewardTrainer(
-    model=model,
-    processing_class=processing_class,
-    arguments=ed.RewardConfig(
-        max_sequence_length=1024,
-        num_train_epochs=1,
-        total_batch_size=4,
-        log_steps=1,
-        do_last_save=True,
-        use_wandb=False,
-        save_optimizer_state=False,
-        progress_bar_type="json",
-        save_steps=1000,
-        save_total_limit=1,
-    ),
-    train_dataset=dataset["train"],
-    eval_dataset=None,
-)
-trainer.train()
+    dataset = build_reward_dataset()
+
+    logger.info("Initializing RewardTrainer.")
+    trainer = ed.RewardTrainer(
+        model=model,
+        processing_class=tokenizer,
+        arguments=trainer_args,
+        train_dataset=dataset,
+    )
+    logger.info("Starting reward model training.")
+    trainer.train()
+    logger.info("Reward training complete.")
+
+
+if __name__ == "__main__":
+    main()

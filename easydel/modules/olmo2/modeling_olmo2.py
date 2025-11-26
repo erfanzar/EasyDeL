@@ -159,6 +159,7 @@ class Olmo2Attention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initialize OLMo-2 attention with Q/K normalization."""
         super().__init__(
@@ -167,6 +168,7 @@ class Olmo2Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
             use_qk_norm=True,  # Enable Q/K normalization
@@ -221,6 +223,7 @@ class Olmo2DecoderLayer(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Olmo2DecoderLayer.
 
@@ -235,12 +238,15 @@ class Olmo2DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Olmo2Attention
-        mlp_block = Olmo2MLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
+        attn_block = auto_remat(
+            Olmo2Attention,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
+        mlp_block = auto_remat(
+            Olmo2MLP,
             policy=config.gradient_checkpointing,
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
@@ -251,6 +257,7 @@ class Olmo2DecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.mlp = mlp_block(
             config=config,
@@ -403,12 +410,13 @@ class Olmo2Model(EasyDeLBaseModule):
         self.layers = [
             Olmo2DecoderLayer(
                 config=config,
+                layer_idx=idx,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
                 rngs=rngs,
             )
-            for i in range(self.config.num_hidden_layers)
+            for idx in range(self.config.num_hidden_layers)
         ]
         self.norm = RMSNorm(
             config.hidden_size,
@@ -464,7 +472,7 @@ class Olmo2Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -479,10 +487,7 @@ class Olmo2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:

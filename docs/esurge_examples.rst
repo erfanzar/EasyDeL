@@ -204,7 +204,7 @@ Loading Custom Models
         config_kwargs=EasyDeLBaseConfigDict(
             freq_max_position_embeddings=16384,
             mask_max_position_embeddings=16384,
-            attn_mechanism=AttentionMechanisms.RAGGED_PAGE_ATTENTION,
+            attn_mechanism=AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
             attn_dtype=jnp.bfloat16,
         ),
     )
@@ -242,8 +242,12 @@ Starting the Server
     # Enable monitoring
     engine.start_monitoring()
 
-    # Launch API server
-    server = ed.eSurgeApiServer(engine)
+    # Launch API server (keys optional)
+    server = ed.eSurgeApiServer(
+        engine,
+        require_api_key=True,
+        api_keys={"demo-key": {"label": "dashboard"}},
+    )
     server.fire(host="0.0.0.0", port=8000)
 
 Using with OpenAI Client
@@ -256,7 +260,7 @@ Using with OpenAI Client
     # Configure client
     client = openai.OpenAI(
         base_url="http://localhost:8000/v1",
-        api_key="not-required",
+        api_key="demo-key",
     )
 
     # Chat completion
@@ -276,6 +280,10 @@ Using with OpenAI Client
         if chunk.choices[0].delta.content:
             print(chunk.choices[0].delta.content, end="")
 
+API keys may be sent via ``Authorization`` (Bearer), ``X-API-Key``, or the
+``api_key`` query parameter, and per-key token usage is surfaced under
+``/metrics`` when the feature is enabled.
+
 Performance Monitoring
 ----------------------
 
@@ -286,15 +294,13 @@ Metrics Collection
 
     # Start monitoring
     urls = engine.start_monitoring(
-        dashboard_port=8080,
         prometheus_port=9090,
-        enable_dashboard=True,
         enable_prometheus=True,
         enable_console=False,
     )
 
-    print(f"Dashboard: {urls['dashboard']}")
     print(f"Prometheus: {urls['prometheus']}")
+    print("Grafana: add the Prometheus endpoint as a data source.")
 
     # Generate some requests
     for i in range(10):
@@ -477,4 +483,3 @@ See Also
 
 - :doc:`esurge` - Main eSurge documentation
 - :doc:`api_docs/inference_esurge` - API reference
-- :doc:`vinference_api` - Alternative inference engine

@@ -17,6 +17,7 @@ def main():
     max_model_len = 2048
 
     pretrained_model_name_or_path = "Qwen/Qwen3-0.6B"
+    # pretrained_model_name_or_path = "Qwen/Qwen2.5-0.5B-Instruct"
 
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path,
@@ -28,7 +29,7 @@ def main():
             freq_max_position_embeddings=max_model_len,
             mask_max_position_embeddings=max_model_len,
             kvdtype=jnp.bfloat16,
-            attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+            attn_mechanism=ed.AttentionMechanisms.AUTO,
             decode_attn_mechanism=ed.AttentionMechanisms.REGRESSIVE_DECODE,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),
@@ -60,6 +61,8 @@ def main():
         padding="max_length",
         padding_side="left",
         add_generation_prompt=True,
+        truncation=True,
+        truncation_side="left",
     )
 
     model.generation_config.max_new_tokens = max_model_len // 2
@@ -92,7 +95,7 @@ def main():
         model.generation_config,
     )
 
-    print(tokenizer.decode(output.sequences[0], skip_special_tokens=True))
+    print(tokenizer.decode(output.sequences[0][max_model_len // 2 :], skip_special_tokens=True))
     time_spent = time.time()
     output = generate(
         *model.split_module(),
@@ -101,9 +104,9 @@ def main():
         model.generation_config,
     )
     time_spent = time.time() - time_spent
-    tokens = jnp.sum(output.sequences[0][max_model_len - 1024 :] != 128001)
-    print(tokens / time_spent)
-    print(tokens)
+    tokens = jnp.sum(output.sequences[0][max_model_len // 2 :] != tokenizer.pad_token_id)
+    print("TPS:", tokens / time_spent)
+    print("Num Tokens Generated", tokens)
 
 
 if __name__ == "__main__":

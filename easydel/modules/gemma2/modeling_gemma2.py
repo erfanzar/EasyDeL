@@ -33,7 +33,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -65,7 +65,12 @@ class Gemma2RMSNorm(nn.Module):
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
-        self.kernel = nn.Param(jnp.ones(self.config.hidden_size, dtype=dtype))
+        self.kernel = ArrayParam.bound(
+            shape=(self.config.hidden_size,),
+            dtype=dtype,
+            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            key=None,
+        )
 
     def __call__(self, hidden_states):
         variance = hidden_states.astype(jnp.float32)
@@ -98,9 +103,7 @@ class Gemma2Attention(UnifiedAttention):
     ):
         """Initialize Gemma2 attention with sliding window configuration."""
         # Set layer-specific attributes before super().__init__
-        self.layer_idx = layer_idx
         self.is_cross_attention = is_cross_attention
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
         super().__init__(
             config,
@@ -108,8 +111,10 @@ class Gemma2Attention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=causal,
+            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
         )
 
         # Gemma2-specific attributes
@@ -353,6 +358,8 @@ class Gemma2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma2Config, model_type="gemma2")
 class Gemma2Model(EasyDeLBaseModule):
+    """Decoder-only Gemma2 transformer composed of embedding, decoder stack, and final norm."""
+
     def __init__(
         self,
         config: Gemma2Config,
@@ -434,7 +441,7 @@ class Gemma2Model(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -443,10 +450,7 @@ class Gemma2Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            )
+            position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -655,6 +659,8 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma2Config, model_type="gemma2")
 class Gemma2ForSequenceClassification(EasyDeLBaseModule):
+    """Gemma2 text encoder with a classification head for sequence-level tasks."""
+
     def __init__(
         self,
         config: Gemma2Config,

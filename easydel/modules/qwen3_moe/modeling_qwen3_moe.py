@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import typing
 from functools import partial
 
 import chex
@@ -60,6 +61,22 @@ from .qwen3_moe_configuration import Qwen3MoeConfig
 
 class Qwen3MoeMLPStack(nn.Module):
     """Qwen3Moe MoE MLP using the new ParallelMoELinear layers."""
+
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
 
     def __init__(
         self,
@@ -153,8 +170,8 @@ class Qwen3MoeMLP(nn.Module):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -243,8 +260,8 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+            dtype (jnp.dtype): Data type for computations (default: jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default: jnp.bfloat16).
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
             rngs (nn.Rngs): Random number generators.
         """
@@ -317,20 +334,20 @@ class Qwen3MoeAttention(UnifiedAttention):
     def __init__(
         self,
         config: Qwen3MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
-        self.sliding_window = config.sliding_window
+        sliding_window = config.sliding_window
         if not (
             config.use_sliding_window
             and getattr(config, "sliding_window", None) is not None
             and layer_idx >= config.max_window_layers
         ):
-            self.sliding_window = None
+            sliding_window = None
 
         super().__init__(
             config,
@@ -338,8 +355,10 @@ class Qwen3MoeAttention(UnifiedAttention):
             param_dtype,
             precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
+            sliding_window=sliding_window,
             use_qk_norm=True,
         )
 
@@ -372,20 +391,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeConfig,
-        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the Qwen3MoeDecoderLayer.
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
             layer_idx (int): The index of the layer in the model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -407,11 +426,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.self_attn = attn_block(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.is_moe = (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
@@ -539,8 +558,8 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
         """
@@ -633,7 +652,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             )
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
@@ -654,10 +673,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -842,8 +858,8 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
         Args:
             config (Qwen3MoeConfig): The configuration object for the Qwen3Moe model.
                 Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
 

@@ -56,7 +56,7 @@ import jax
 import jax.extend
 import jax.tree_util
 from eformer import common_types
-from eformer.common_types import NOT_GIVEN
+from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
 from eformer.escale import PartitionAxis, PartitionManager
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
@@ -111,8 +111,10 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
-DEFAULT_MOE_METHOD = "standard_moe"
+DEFAULT_MOE_METHOD = "fused_moe"
 EXPERT_TP_MODE = False
+FSDP_IS_EP_BOUND = True
+SP_IS_EP_BOUND = True
 RING_EXPERTS = False
 ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
@@ -124,6 +126,68 @@ if ED_DEFAULT_HARDWARE_ABSTRACTION:
 
 if DEFAULT_HARDWARE_ABSTRACTION:
     logger.info("HARDWARE_ABSTRACTION is ON by default")
+
+
+def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
+    """Derive flattened mesh shape and axis names for expert-parallel layouts."""
+    # Resolve Names
+    dpname, fsdpname, epname, tpname, spname = (
+        _resolve_eformer_axis(DP, pm),
+        _resolve_eformer_axis(FSDP, pm),
+        _resolve_eformer_axis(EP, pm),
+        _resolve_eformer_axis(TP, pm),
+        _resolve_eformer_axis(SP, pm),
+    )
+
+    # Resolve sizes
+    odpsize, ofsdpsize, oepsize, otpsize, ospsize = (
+        mesh.shape.get(dpname, 1),
+        mesh.shape.get(fsdpname, 1),
+        mesh.shape.get(epname, 1),
+        mesh.shape.get(tpname, 1),
+        mesh.shape.get(spname, 1),
+    )
+
+    epsize = oepsize
+    if fsdp_is_ep_bound:
+        epsize *= ofsdpsize
+    else:
+        odpsize *= ofsdpsize
+
+    if sp_is_ep_bound:
+        epsize *= ospsize
+    else:
+        odpsize *= ospsize
+    return (odpsize, epsize, otpsize), (dpname, epname, tpname)
+
+
+def _resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
+    """Resolve logical axis name(s) to the concrete mesh axis names for training.
+
+    Axis labels such as ``"tp"`` or ``"ep"`` are symbolic and need to be translated
+    into the actual mesh axis names chosen by the `PartitionManager`. This helper
+    keeps the caller agnostic to how axes are laid out on the physical device mesh.
+
+    Args:
+        axis: Single axis name or a list/tuple of axis names to resolve (for example
+            ``"tp"``, ``"ep"``, ``"dp"``, ``"fsdp"``, ``"sp"``).
+        manager: Partition manager that owns the axis resolution rules.
+
+    Returns:
+        Resolved axis name(s). A string is returned for a single input, otherwise a
+        list preserving the provided order.
+
+    Example:
+        >>> _resolve_eformer_axis("tp", partition_manager)
+        >>> _resolve_eformer_axis(["tp", "ep"], partition_manager)
+    """
+    was_list = isinstance(axis, list | tuple)
+    if not was_list:
+        axis = [axis]
+    out = manager.paxis.resolve_axis(axes=axis, mode=MODE_TRAIN)
+    if not was_list:
+        return out[0]
+    return out
 
 
 def extract_commit_hash(resolved_file: str | None, commit_hash: str | None) -> str | None:
@@ -242,10 +306,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     moe_tiling_size_seqlen: NotRequired[int]
     moe_tiling_size_dim: NotRequired[int]
     partition_axis: NotRequired[PartitionAxis]
-    shard_attention_computation: NotRequired[bool]
     use_sharded_kv_caching: NotRequired[bool]
     use_sharding_constraint: NotRequired[bool]
-    use_pallas_group_matmul: NotRequired[bool]
     backend: NotRequired[EasyDeLBackends | str | None]
     platform: NotRequired[EasyDeLPlatforms | str | None]
     easy_method: NotRequired[tp.Literal["train", "serve", "convert"]]
@@ -273,72 +335,84 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     use_expert_tensor_mode: NotRequired[bool]
     moe_method: NotRequired[AVAILABLE_MOE_METHODS]
     moe_force_xla_gmm: NotRequired[bool]
+    use_ring_of_experts: NotRequired[bool]
+    fsdp_is_ep_bound: NotRequired[bool]
+    sp_is_ep_bound: NotRequired[bool]
+    quantization_method: NotRequired[EasyDeLQuantizationMethods | str | AVAILABLE_QUANTIZATION_METHODS]
+    quantization_pattern: NotRequired[str]
+    quantization_blocksize: NotRequired[int]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
-    """Base configuration class for all EasyDeL models.
+    """Base configuration shared across EasyDeL models.
 
-    Extends HuggingFace's PretrainedConfig with EasyDeL-specific features
-    for distributed training, custom attention mechanisms, quantization,
-    and hardware optimization.
+    Extends `transformers.PretrainedConfig` with distributed sharding metadata,
+    attention kernel selection, quantization knobs, RoPE helpers, and hardware
+    abstraction flags used for both training and serving.
+
     Args:
-        sharding_axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1, 1).
-        sharding_axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp",  "ep", "tp", "sp").
-        attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use.
-            Default is DEFAULT_ATTENTION_MECHANISM.
-        decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase.
-            Default is None.
-        blocksize_k (int): Block size for key. Default is 128.
-        blocksize_q (int): Block size for query. Default is 128.
-        blocksize_b (int): Block size for batch. Default is 1.
-        moe_tiling_size_batch (int): Block Size for batch in MoE tiling. Default is 4.
-        moe_tiling_size_seqlen (int): Block Size for sequence length in MoE tiling. Default is 128.
-        moe_tiling_size_dim (int): Block Size for dimension in MoE tiling. Default is 128.
-        partition_axis (PartitionAxis): Partition axis configuration. Default is PartitionAxis().
-        shard_attention_computation (bool): Whether to shard attention computation. Default is True.
-        use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
-        use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
-        use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
-        backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
-        platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
-        easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
-        bits (tp.Optional[int]): Number of bits for quantization. Default is None.
-        scan_ring_attention (bool): Whether to scan ring attention. Default is True.
-        scan_attention_layers (bool): Whether to scan attention layers. Default is False.
-        use_scan_mlp (bool): Whether to use scan MLP. Default is False.
-        scan_mlp_chunk_size (int): Chunk size for scan MLP. Default is 1024.
-        sequence_axis_name (str): Name of the attention axis. Default is "sp".
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method.
-            Default is EasyDeLGradientCheckPointers.NONE.
-        gradient_checkpointing_targets (tp.Optional[tp.List[str]]): List of checkpoint names to save when
-            using save_only_these_names or save_any_names_but_these gradient checkpointing policies.
-            Default is None.
-        kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method.
-            Default is EasyDeLQuantizationMethods.NONE.
-        kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
-        quantization_method (EasyDeLQuantizationMethods): Quantization method.
-            Default is EasyDeLQuantizationMethods.NONE.
-        quantization_pattern (str): Pattern for quantization. Default is ".*".
-        quantization_blocksize (int): Block size for quantization. Default is 64.
-        kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache
-            sharding sequence axis. Default is "sp".
-        flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention
-            backward pass. Default is "triton".
-        attn_dtype (jnp.dtype): Data type for attention. Default is float32.
-        kvdtype (jnp.dtype): Data type for attention kv cache. Default is bfloat16.
-        attn_softmax_dtype (jnp.dtype): Data type for softmax ops in attention. Default is jnp.float32.
-        fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
-        fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
-        hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
-        pallas_m_block_size (int): Block size for Pallas M. Default is DEFAULT_PALLAS_M_BLOCK_SIZE.
-        pallas_k_block_size (int): Block size for Pallas K. Default is DEFAULT_PALLAS_K_BLOCK_SIZE.
-        pallas_n_block_size (int): Block size for Pallas N. Default is DEFAULT_PALLAS_N_BLOCK_SIZE.
-        **kwargs: Additional keyword arguments.
+        sharding_axis_dims: Parallelism sizes for ``(dp, fsdp, ep, tp, sp)``.
+            ``-1`` consumes all remaining devices. Defaults to ``(1, -1, 1, 1, 1)``.
+        sharding_dcn_axis_dims: Optional mesh sizes for DCN slices when running
+            multi-host or multi-slice setups.
+        sharding_axis_names: Logical mesh axis names, defaults to
+            ``("dp", "fsdp", "ep", "tp", "sp")``.
+        attn_mechanism: Attention implementation to use during training/forward passes.
+        decode_attn_mechanism: Attention implementation to use during decoding
+            (falls back to ``attn_mechanism`` if left as ``None``).
+        blocksize_k: Key block size for attention kernels. Defaults to ``128``.
+        blocksize_q: Query block size for attention kernels. Defaults to ``128``.
+        blocksize_b: Batch/block size used by some attention backends. Defaults to ``1``.
+        moe_tiling_size_batch: Batch tiling used by MoE kernels. Defaults to ``4``.
+        moe_tiling_size_seqlen: Sequence length tiling for MoE kernels. Defaults to ``128``.
+        moe_tiling_size_dim: Hidden dimension tiling for MoE kernels. Defaults to ``128``.
+        partition_axis: `PartitionAxis` describing how logical axes map to the mesh.
+        use_sharded_kv_caching: Whether to shard KV cache placement instead of replicating.
+        use_sharding_constraint: Insert explicit sharding constraints during model build.
+        backend: Explicit JAX backend (falls back to ``jax.default_backend()``).
+        platform: Platform hint for kernel selection (defaults to ``"triton"`` on GPU,
+            otherwise ``"jax"``).
+        easy_method: Workflow context (``"train"``, ``"serve"``, or ``"convert"``).
+        bits: Optional quantization bit width for weights.
+        scan_ring_attention: Use scanning for ring attention implementations.
+        scan_attention_layers: Apply scan to attention blocks to save memory.
+        use_scan_mlp: Apply scan to MLP blocks.
+        scan_mlp_chunk_size: Chunk size when scanning MLPs. Defaults to ``1024``.
+        sequence_axis_name: Name of the sequence/attention axis. Defaults to ``"sp"``.
+        gradient_checkpointing: Gradient checkpointing policy enum/string.
+        gradient_checkpointing_targets: Optional list of target names to include or
+            exclude when using selective checkpointing policies.
+        precompute_masks: Whether to precompute and cache causal masks on the mesh.
+        kv_cache_quantization_method: Quantization method for KV cache tensors.
+        kv_cache_quantization_blocksize: Block size for KV cache quantization. Defaults to ``64``.
+        quantization_method: Quantization method for linear layers.
+        quantization_pattern: Regex pattern selecting modules to quantize. Defaults to ``".*"``.
+        quantization_blocksize: Block size for linear-layer quantization. Defaults to ``64``.
+        kv_cache_sharding_sequence_axis_name: Axis (or axes) used when sharding the KV cache.
+        flash_attention_backward_pass_impl: Backward kernel for flash attention
+            (``"triton"`` or ``"xla"``). Defaults to ``"triton"``.
+        attn_dtype: Attention activation dtype. Defaults to ``jnp.bfloat16``.
+        kvdtype: KV cache dtype. Defaults to ``attn_dtype`` when ``None``.
+        attn_softmax_dtype: Softmax computation dtype. Defaults to ``jnp.float32``.
+        fcm_max_ratio: Maximum ratio used when sampling forgetful causal masks.
+        fcm_min_ratio: Minimum ratio used when sampling forgetful causal masks.
+        hardware_abstraction: Enable EasyDeL hardware abstraction and custom kernels.
+        pallas_m_block_size: Matmul M dimension block size for Pallas kernels.
+        pallas_k_block_size: Matmul K dimension block size for Pallas kernels.
+        pallas_n_block_size: Matmul N dimension block size for Pallas kernels.
+        moe_method: Mixture-of-experts implementation to use.
+        moe_force_xla_gmm: Force XLA GMM kernels for MoE even when fused kernels exist.
+        use_ring_of_experts: Whether to dispatch experts with a ring topology.
+        use_expert_tensor_mode: Treat experts as an additional tensor-parallel axis.
+        fsdp_is_ep_bound: Fold the FSDP axis into the expert axis when building expert meshes.
+        sp_is_ep_bound: Fold the sequence-parallel axis into the expert axis when building expert meshes.
+        **kwargs: Forwarded to `PretrainedConfig`.
+
     Raises:
-      Warning: If `kv_cache_quantization_method` is not NONE and `use_sharded_kv_caching` is True.
+        UserWarning: If KV-cache quantization is requested together with sharded KV caching.
     """
 
     _show_private_attrs: bool = False
@@ -358,10 +432,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_seqlen: int = 128,
         moe_tiling_size_dim: int = 128,
         partition_axis: PartitionAxis = PartitionAxis(),
-        shard_attention_computation: bool = True,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
-        use_pallas_group_matmul: bool = True,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
@@ -394,8 +466,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_force_xla_gmm: bool = False,
         use_expert_tensor_mode: bool = EXPERT_TP_MODE,
         use_ring_of_experts: bool = RING_EXPERTS,
+        fsdp_is_ep_bound: bool = FSDP_IS_EP_BOUND,
+        sp_is_ep_bound: bool = SP_IS_EP_BOUND,
         **kwargs,
     ):
+        """Initialize base EasyDeL config fields and honor user overrides."""
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
         self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
         self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
@@ -420,7 +495,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
         self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
         self.partition_axis = getattr(self, "partition_axis", partition_axis)
-        self.shard_attention_computation = getattr(self, "shard_attention_computation", shard_attention_computation)
         self.bits = getattr(self, "bits", bits)
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
         self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
@@ -428,7 +502,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
         self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
         self.use_sharding_constraint = getattr(self, "use_sharding_constraint", use_sharding_constraint)
-        self.use_pallas_group_matmul = getattr(self, "use_pallas_group_matmul", use_pallas_group_matmul)
         self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
         self.kv_cache_sharding_sequence_axis_name = getattr(
             self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
@@ -462,6 +535,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_force_xla_gmm = getattr(self, "moe_force_xla_gmm", moe_force_xla_gmm)
         self.use_ring_of_experts = getattr(self, "use_ring_of_experts", use_ring_of_experts)
         self.use_expert_tensor_mode = getattr(self, "use_expert_tensor_mode", use_expert_tensor_mode)
+        self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
+        self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
 
         self.pretraining_tp = 1  # it's for pytorch models.
         if self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE and self.use_sharded_kv_caching:
@@ -607,6 +682,50 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         return mesh
 
+    @property
+    def expert_mesh(self):
+        """Mesh with expert-parallel axes folded according to config flags."""
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.partition_manager,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        return jax.sharding.Mesh(
+            self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
+            axis_names=(dpname, epname, tpname),
+            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+        )
+
+    @property
+    def expert_abstract_mesh(self):
+        """Abstract mesh descriptor matching `expert_mesh` axis sizes and names."""
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.partition_manager,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        return self.expert_mesh.abstract_mesh.update(
+            axis_sizes=(odpsize, epsize, otpsize),
+            axis_names=(dpname, epname, tpname),
+        )
+
+    @property
+    def auto_expert_mesh(self):
+        """Mesh with auto axis types for expert parallelism."""
+        (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
+            self.mesh,
+            self.partition_manager,
+            self.fsdp_is_ep_bound,
+            self.sp_is_ep_bound,
+        )
+        return jax.sharding.Mesh(
+            self.mesh.devices.flatten().reshape(odpsize, epsize, otpsize),
+            axis_names=(dpname, epname, tpname),
+            axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+        )
+
     def set_model_mesh(self, mesh: common_types.Mesh):
         """Sets a custom mesh for the model, overriding the auto-generated one.
 
@@ -732,7 +851,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_tiling_size_seqlen",
             "moe_tiling_size_dim",
             "partition_axis",
-            "shard_attention_computation",
             "use_sharded_kv_caching",
             "backend",
             "platform",
@@ -741,7 +859,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "scan_ring_attention",
             "scan_attention_layers",
             "use_sharding_constraint",
-            "use_pallas_group_matmul",
             "use_scan_mlp",
             "scan_mlp_chunk_size",
             "sequence_axis_name",
@@ -766,6 +883,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "moe_force_xla_gmm",
             "use_ring_of_experts",
             "use_expert_tensor_mode",
+            "fsdp_is_ep_bound",
+            "sp_is_ep_bound",
         ]
         for key in base_reads:
             if hasattr(config, key):
@@ -785,7 +904,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_seqlen: int = NOT_GIVEN,
         moe_tiling_size_dim: int = NOT_GIVEN,
         partition_axis: PartitionAxis = NOT_GIVEN,
-        shard_attention_computation: bool = NOT_GIVEN,
         use_sharded_kv_caching: bool = NOT_GIVEN,
         backend: EasyDeLBackends | None = NOT_GIVEN,
         platform: EasyDeLPlatforms | None = NOT_GIVEN,
@@ -794,7 +912,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         scan_ring_attention: bool = NOT_GIVEN,
         scan_attention_layers: bool = NOT_GIVEN,
         use_sharding_constraint: bool = NOT_GIVEN,
-        use_pallas_group_matmul: bool = NOT_GIVEN,
         use_scan_mlp: bool = NOT_GIVEN,
         scan_mlp_chunk_size: int = NOT_GIVEN,
         sequence_axis_name: str = NOT_GIVEN,
@@ -819,76 +936,70 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_force_xla_gmm: bool = NOT_GIVEN,
         use_ring_of_experts: bool = NOT_GIVEN,
         use_expert_tensor_mode: bool = NOT_GIVEN,
+        fsdp_is_ep_bound: bool = NOT_GIVEN,
+        sp_is_ep_bound: bool = NOT_GIVEN,
         **kwargs,
     ):
         """
-        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+        Populate baseline EasyDeL attributes on an existing config instance.
+
+        Each argument mirrors the constructor but is optional: passing `NOT_GIVEN`
+        leaves any existing attribute untouched, while a provided value overwrites
+        the current setting. If an attribute is missing entirely, a sensible default
+        is applied via `set_attrs_smartly`. This helper is used by derived configs
+        (and their `sub_configs`) to keep sharding/attention/quantization knobs in
+        sync without re-implementing initialization logic.
 
         Args:
-            sharding_axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis.
-                Defaults to (1, -1, 1, 1, 1).
-            sharding_axis_names (tp.Sequence[str], optional): Set the names of the axes.
-                Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
-            attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use.
-                Defaults to DEFAULT_ATTENTION_MECHANISM.
-            decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase.
-                Default is None.
-            blocksize_k (int, optional): block size of key_states. Defaults to 128.
-            blocksize_q (int, optional): block size of query_states. Defaults to 128.
-            blocksize_b (int, optional): block size of bias. Defaults to 1.
-            moe_tiling_size_batch (int, optional): Block Size for batch in MoE tiling. Default is 4.
-            moe_tiling_size_seqlen (int, optional): Block Size for sequence length in MoE tiling. Default is 128.
-            moe_tiling_size_dim (int, optional): Block Size for dimension in MoE tiling. Default is 128.
-            partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays
-                in easydel. Defaults to PartitionAxis().
-            shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
-            use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value.
-                Defaults to True.
-            backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-            platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-            easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied
-                for. Defaults to EasyMethod.TRAIN.
-            bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
-            scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
-            scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
-            use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays.
-                Defaults to False.
-            use_pallas_group_matmul (bool): Whether to use pallas group matmul. Default is True.
-            use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
-            scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
-            sequence_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
-            gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for
-                created or loaded module (applied on mlp and attn layers most of the times).
-            gradient_checkpointing_targets (tp.Optional[tp.List[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS]], optional):
-                List of checkpoint names to save when using save_only_these_names or save_any_names_but_these
-                gradient checkpointing policies. Valid names include: 'attn_query', 'attn_key', 'attn_value',
-                'attn_output', 'mlp_gate', 'mlp_up', 'mlp_down', 'mlp_output', etc. Default is None.
-            kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization
-                type. Defaults to EasyDeLQuantizationMethods.NONE.
-            kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
-            quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type.
-                Defaults to EasyDeLQuantizationMethods.NONE.
-            quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
-            quantization_pattern (str): re pattern to be used for quantizing layers.
-            kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target
-                for sharding sequences. Defaults to "sp".
-            flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward
-                pass kernel for flash attention. Defaults to "triton".
-            attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to float32.
-            kvdtype (jnp.dtype, optional): Data type for attention kv cache. Default is bfloat16.
-            attn_softmax_dtype (jnp.dtype, optional): Data type for softmax in attention op computations.
-                Defaults to jnp.float32.
-            fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
-            fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
-            hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults
-                to DEFAULT_HARDWARE_ABSTRACTION.
-            pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-                Defaults to DEFAULT_PALLAS_M_BLOCK_SIZE.
-            pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-                Defaults to DEFAULT_PALLAS_K_BLOCK_SIZE.
-            pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-                Defaults to DEFAULT_PALLAS_N_BLOCK_SIZE.
-
+            sharding_axis_dims: Fallback mesh sizes for ``(dp, fsdp, ep, tp, sp)``,
+                defaulting to ``(1, -1, 1, 1, 1)``.
+            sharding_dcn_axis_dims: Optional DCN mesh sizes (default ``None``).
+            sharding_axis_names: Mesh axis labels, default ``("dp", "fsdp", "ep", "tp", "sp")``.
+            attn_mechanism: Attention mechanism to use (default ``"vanilla"``).
+            decode_attn_mechanism: Optional decode-time attention mechanism.
+            blocksize_k: Attention key block size, default ``512`` when unset.
+            blocksize_q: Attention query block size, default ``512`` when unset.
+            blocksize_b: Batch/block size used by attention kernels (default ``1``).
+            moe_tiling_size_batch: Batch tiling for MoE kernels (default ``4``).
+            moe_tiling_size_seqlen: Sequence tiling for MoE kernels (default ``128``).
+            moe_tiling_size_dim: Hidden-dim tiling for MoE kernels (default ``128``).
+            partition_axis: PartitionAxis describing logical mesh layout (default ``PartitionAxis()``).
+            use_sharded_kv_caching: Whether to shard KV caches (default ``False``).
+            backend: Backend string, default ``None`` (falls back to JAX default).
+            platform: Platform hint, default ``"jax"``.
+            easy_method: EasyDeL execution mode, default ``EasyMethod.TRAIN``.
+            bits: Optional quantization bit width, default ``None``.
+            scan_ring_attention: Enable scan for ring attention (default ``True``).
+            scan_attention_layers: Enable scan for attention blocks (default ``True``).
+            use_sharding_constraint: Insert sharding constraints (default ``False``).
+            use_scan_mlp: Enable scan for MLPs (default ``False``).
+            scan_mlp_chunk_size: Chunk size for scanned MLPs (default ``1024``).
+            sequence_axis_name: Label for the sequence/attention axis (default ``"sp"``).
+            gradient_checkpointing: Gradient checkpointing policy (default ``EasyDeLGradientCheckPointers.NONE``).
+            gradient_checkpointing_targets: Optional list of checkpoint targets to include/exclude (default ``None``).
+            precompute_masks: Whether to precompute and cache masks (default ``True``).
+            kv_cache_quantization_method: KV cache quantization method (default ``EasyDeLQuantizationMethods.NONE``).
+            kv_cache_quantization_blocksize: KV cache quantization block size (default ``128``).
+            quantization_method: Linear-layer quantization method (default ``EasyDeLQuantizationMethods.NONE``).
+            quantization_blocksize: Block size for linear quantization. Defaults to the historical
+                fallback used in this helper (`EasyDeLQuantizationMethods.NONE`) unless explicitly set.
+            quantization_pattern: Regex selecting layers to quantize (default ``".*"``).
+            kv_cache_sharding_sequence_axis_name: Axis name(s) for KV cache sharding (default ``"sp"``).
+            flash_attention_backward_pass_impl: Backward kernel for flash attention (default ``"triton"``).
+            attn_dtype: Attention activation dtype (default ``jnp.float32``).
+            kvdtype: KV cache dtype (defaults to `attn_dtype` when unset).
+            attn_softmax_dtype: Softmax computation dtype (default ``jnp.float32``).
+            hardware_abstraction: Toggle EasyDeL hardware abstraction (default ``DEFAULT_HARDWARE_ABSTRACTION``).
+            pallas_m_block_size: Pallas matmul M block size (default ``DEFAULT_PALLAS_M_BLOCK_SIZE``).
+            pallas_k_block_size: Pallas matmul K block size (default ``DEFAULT_PALLAS_K_BLOCK_SIZE``).
+            pallas_n_block_size: Pallas matmul N block size (default ``DEFAULT_PALLAS_N_BLOCK_SIZE``).
+            moe_method: MoE implementation to use (default ``DEFAULT_MOE_METHOD``).
+            moe_force_xla_gmm: Force XLA GMM kernels for MoE (default ``False``).
+            use_ring_of_experts: Dispatch experts with a ring topology (default ``RING_EXPERTS``).
+            use_expert_tensor_mode: Treat experts as a tensor-parallel axis (default ``EXPERT_TP_MODE``).
+            fsdp_is_ep_bound: Fold FSDP into the expert axis when building expert meshes.
+            sp_is_ep_bound: Fold sequence-parallel into the expert axis when building expert meshes.
+            **kwargs: Extra attributes to attach to this config and any defined ``sub_configs``.
         """
 
         set_attrs_smartly(self, "sharding_axis_dims", (1, -1, 1, 1, 1), sharding_axis_dims)
@@ -902,11 +1013,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_tiling_size_dim", 128, moe_tiling_size_dim)
         set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
         set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
-        set_attrs_smartly(self, "use_pallas_group_matmul", True, use_pallas_group_matmul)
 
         set_attrs_smartly(self, "backend", None, backend)
         set_attrs_smartly(self, "platform", "jax", platform)
-        set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
         set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
         set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
@@ -941,6 +1050,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "moe_force_xla_gmm", False, moe_force_xla_gmm)
         set_attrs_smartly(self, "use_ring_of_experts", RING_EXPERTS, use_ring_of_experts)
         set_attrs_smartly(self, "use_expert_tensor_mode", EXPERT_TP_MODE, use_expert_tensor_mode)
+        set_attrs_smartly(self, "fsdp_is_ep_bound", FSDP_IS_EP_BOUND, fsdp_is_ep_bound)
+        set_attrs_smartly(self, "sp_is_ep_bound", SP_IS_EP_BOUND, sp_is_ep_bound)
 
         for key_, value_ in kwargs.items():
             setattr(self, key_, value_)
@@ -951,16 +1062,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
                     setattr(getattr(self, name), key_, value_)
 
     def __repr__(self):
-        """The __repr__ function is used to generate a string representation of an object.
-        This function should return a string that can be parsed by the Python interpreter
-        to recreate the object. The __repr__ function is called when you use print() on an
-        object, or when you type its name in the REPL.
+        """Return a multi-line summary of public config fields.
 
-        Args:
-            self: Refer to the instance of the class
-
-        Returns:
-            A string representation of the object
+        The output lists non-private attributes on separate lines and truncates
+        long values to keep the representation readable.
         """
 
         string = f"{self.__class__.__name__}(\n"
@@ -974,6 +1079,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return string + ")"
 
     def to_dict(self) -> dict[str, tp.Any]:
+        """Serialize config to a dictionary while temporarily hiding forbidden types."""
         sd = self.__dict__
         forbidden_types = ["_ScalarMeta"]
         extracted_values = {k: sd.pop(k) for k in list(sd.keys()) if sd.get(k).__class__.__name__ in forbidden_types}
@@ -992,15 +1098,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             set_attrs_smartly(self, k, v, v)
 
     def __str__(self):
-        """The __str__ function is called when you use the print function or when str() is used.
-        It should return a string representation of the object.
-
-        Args:
-            self: Refer to the instance of the class
-
-        Returns:
-            The object's string representation
-        """
+        """Alias for `__repr__` to provide a readable config summary."""
         return self.__repr__()
 
     @classmethod  # From HF.
@@ -1193,6 +1291,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pretrained_model_name_or_path: str | os.PathLike,
         **kwargs,
     ) -> tuple[dict[str, tp.Any], dict[str, tp.Any]]:
+        """Load a configuration dictionary from local path or Hub, handling gguf."""
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", None)
@@ -1283,14 +1382,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def granted_freq_max_position_embedding(self) -> int:
+        """Return the max position embedding allowed for frequency-based caches."""
         return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
+        """Return the max position embedding allowed for mask precomputation."""
         return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
 
     def _get_rope_config(self) -> RopeConfig:
-        """Get RoPE configuration from the instance attributes."""
+        """Build a `RopeConfig` from the config fields.
+
+        If ``rope_scaling`` is provided, it is converted to a `RopeConfig` and
+        missing ``original_max_position_embeddings`` values are filled from the
+        base config. Otherwise a default `RopeConfig` instance is returned.
+        """
         from easydel.layers.rotary_embedding import RopeConfig
 
         if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
@@ -1311,18 +1417,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         is_neox_style: bool = True,
         base: float | None = None,
     ):
-        """
-        Get basic rotary position embeddings.
+        """Return a rotary position embedding function configured for this model.
 
         Args:
-            dtype: Data type for the embeddings
-            head_size: Size of attention heads
-            rotary_dim: Dimension for rotary embeddings (defaults to head_size)
-            is_neox_style: Whether to use NeoX style embeddings
-            base: Base value for frequency computation (defaults to self.rope_theta)
+            dtype: Target dtype for the generated embeddings.
+            head_size: Attention head size used to derive the rotary dimension.
+            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
+            is_neox_style: Whether to generate NeoX-style rotary embeddings.
+            base: Optional base used for frequency computation (defaults to ``self.rope_theta``).
 
         Returns:
-            Rotary position embeddings func
+            Callable from `get_rope` ready to be applied to query/key tensors.
         """
         from easydel.layers.rotary_embedding import get_rope
 
@@ -1345,16 +1450,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
         base: float | None = None,
         partial_rotary_factor: float = 1.0,
     ) -> ModuleCaches:
-        """
-        Get basic inv frequencies for rotary embeddings.
+        """Compute inverse frequencies for rotary embeddings.
 
         Args:
-            head_size: Size of attention heads (defaults to self.head_dim)
-            rotary_dim: Dimension for rotary embeddings (defaults to head_size)
-            base: Base value for frequency computation (defaults to self.rope_theta)
+            head_size: Attention head size (defaults to ``self.head_dim``).
+            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
+            base: Optional base for frequency computation (defaults to ``self.rope_theta``).
+            partial_rotary_factor: Ratio of the head dimension to apply RoPE to.
 
         Returns:
-            ModuleCaches instance containing computed frequencies
+            `ModuleCaches` wrapping the computed frequency tensor.
         """
         from easydel.layers.rotary_embedding import get_inv_frequencies
 
@@ -1381,16 +1486,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
         rotary_dim: int | None = None,
         base: float | None = None,
     ) -> ModuleCaches:
-        """
-        Get basic frequencies for rotary embeddings.
+        """Compute frequencies for rotary embeddings placed on the configured mesh.
 
         Args:
-            head_size: Size of attention heads (defaults to self.head_dim)
-            rotary_dim: Dimension for rotary embeddings (defaults to head_size)
-            base: Base value for frequency computation (defaults to self.rope_theta)
+            head_size: Attention head size (defaults to ``self.head_dim``).
+            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
+            base: Optional base for frequency computation (defaults to ``self.rope_theta``).
 
         Returns:
-            ModuleCaches instance containing computed frequencies
+            `ModuleCaches` containing the frequencies sharded with `NamedSharding`.
         """
         from easydel.layers.rotary_embedding import get_frequencies
 
@@ -1447,8 +1551,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
             Dictionary mapping sequence lengths to mask details,
             or None if not applicable.
         """
-        if hasattr(self, "text_config"):
-            return self.get_text_config().get_mask_details()
+        config = self.get_text_config().get_mask_details()
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None:
+            from easydel.infra.utils import AttnMaskDetail, AttnMaskType
+
+            mapping = {}
+            for layer_idx, layer_type in enumerate(layer_types):
+                mapping[layer_idx] = AttnMaskDetail(
+                    mask_type=AttnMaskType.from_hf(layer_type),
+                    size=getattr(config, "sliding_window", getattr(config, "sliding_windows", None)),
+                    chunks=getattr(config, "attention_chunk_size", None),
+                )
+            return mapping
         return None
 
     def get_basic_causal_mask(self, *args, **kwargs):
@@ -1527,5 +1642,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
     __hash__ = hash_fn
 
 
+EasyDeLBaseConfig.__init__.__doc__ = EasyDeLBaseConfig.__doc__
 EasyDeLBaseConfigDict.__doc__ = EasyDeLBaseConfig.__init__.__doc__
 EasyDeLBaseConfigDict.__annotations__ = EasyDeLBaseConfig.__annotations__

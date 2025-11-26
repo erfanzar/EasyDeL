@@ -101,7 +101,6 @@ class TestGradientFlow:
         # Prepare EasyDeL config
         config.attach_custom_arguments()
         config.add_basic_configurations(
-            shard_attention_computation=config_dict["shard_attention_computation"],
             use_sharding_constraint=config_dict["use_sharding_constraint"],
             scan_mlp_chunk_size=config_dict.get("scan_mlp_chunk_size", 64),
         )
@@ -205,7 +204,6 @@ class TestGradientConsistency:
 
         config.attach_custom_arguments()
         config.add_basic_configurations(
-            shard_attention_computation=config_dict["shard_attention_computation"],
             use_sharding_constraint=config_dict["use_sharding_constraint"],
             scan_mlp_chunk_size=config_dict.get("scan_mlp_chunk_size", 64),
         )

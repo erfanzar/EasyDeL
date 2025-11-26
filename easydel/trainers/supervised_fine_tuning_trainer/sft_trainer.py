@@ -155,6 +155,7 @@ class SFTTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=model,
             data_collator=data_collator,
+            processing_class=processing_class,
         )
 
     def _prepare_dataset(
@@ -218,12 +219,11 @@ class SFTTrainer(Trainer):
             if is_conversational_from_value(first_example):
                 if isinstance(dataset, Dataset):
                     map_kwargs["desc"] = "Converting dataset to ChatML"
+                remove_columns = "conversations" if "conversations" in column_names else None
+                if remove_columns is None:
+                    remove_columns = "conversation" if "conversation" in column_names else None
                 column_names = next(iter(dataset)).keys()
-                dataset = dataset.map(
-                    maybe_convert_to_chatml,
-                    remove_columns="conversations" if "conversations" in column_names else None,
-                    **map_kwargs,
-                )
+                dataset = dataset.map(maybe_convert_to_chatml, remove_columns=remove_columns, **map_kwargs)
 
             first_example = next(iter(dataset))
             if not is_conversational(first_example):
@@ -311,13 +311,25 @@ class SFTTrainer(Trainer):
                             )
                         output = processed
                     else:
-                        output = processing_class(
-                            text=example[dataset_text_field],
-                            return_dict=True,
-                            return_attention_mask=True,
-                            truncation=True,
-                            max_length=self.arguments.max_sequence_length,
-                        )
+                        try:
+                            output = processing_class(
+                                text=example[dataset_text_field],
+                                return_dict=True,
+                                return_attention_mask=True,
+                                truncation=True,
+                                max_length=self.arguments.max_sequence_length,
+                            )
+                        except TypeError as e:
+                            if "keyword argument 'return_dict'" in str(e):
+                                output = processing_class(
+                                    text=example[dataset_text_field],
+                                    return_attention_mask=True,
+                                    truncation=True,
+                                    max_length=self.arguments.max_sequence_length,
+                                )
+                            else:
+                                raise e
+
                 return output
 
             dataset = dataset.map(

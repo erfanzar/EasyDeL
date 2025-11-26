@@ -63,6 +63,7 @@ between EasyDeL and HuggingFace model formats.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import typing as tp
 import warnings
@@ -87,6 +88,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from easydel.infra.utils import ArrayParam
 from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
@@ -98,6 +100,7 @@ from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
     from easydel.layers.linear import ParallelLinear
+
 
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
 
@@ -1014,6 +1017,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             base_huggingface_module=self.get_torch_loader()._model_mapping[type(self.config)],
             config=self.config,
             dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
             **kwargs,
         )
 
@@ -1122,7 +1126,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         rng = kwargs.get("rngs", flax.nnx.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
         partition_rules = lazy_model.config.get_partition_rules()
-        for path, module in iter_module_search(lazy_model, flax.nnx.Module):
+        for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
             if path:
                 joined_path = "/".join([str(p) for p in path])
                 a = jnp.ones((1,))
@@ -1135,16 +1139,17 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
                             joined_path + "/bias": a,
                             joined_path + "/embedding": a,
                             joined_path + "/scale": a,
+                            joined_path: a,
                         },
                         strict=False,
                     ),
                 )
-
                 shardings = {
                     "kernel": partition_spec[joined_path + "/kernel"],
                     "bias": partition_spec[joined_path + "/bias"],
                     "embedding": partition_spec[joined_path + "/embedding"],
                     "scale": partition_spec[joined_path + "/scale"],
+                    "raw": partition_spec[joined_path],
                 }
             if hasattr(module, "kernel") and hasattr(module, "kernel_init"):
                 arr = module.kernel_init(
@@ -1186,9 +1191,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
 
             if hasattr(module, "rngs"):
                 module.rngs = rng.fork()
+            if hasattr(module, "resure"):
+                module.resure(rng.param(), shard_fn=jax.jit(_shard, out_shardings=shardings["raw"]))
         for path, module in iter_module_search(lazy_model, nn.Param):
             if path and type(module.value) is jax.ShapeDtypeStruct:
-                logger.warning("found empty array at " + ("/".join([str(s) for s in path])))
+                logger.warning(f"({type(module).__name__}) found empty array at " + ("/".join([str(s) for s in path])))
 
         return lazy_model
 
@@ -1311,6 +1318,34 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         self = unwrap_lora_to_layers(self, verbose=verbose)
         return self
 
+    def _get_reform_param(self) -> dict[str, tp.Any]:
+        """
+        Traverses the module tree to collect `reform_param` configurations from sub-modules.
+
+        Returns:
+            dict[str, tp.Any]: A dictionary mapping fully qualified parameter paths to their
+            reform configuration.
+        """
+        from easydel.utils import traversals
+
+        reform_param = {}
+        for path, module in traversals.iter_module_search(self, nn.Module):
+            if hasattr(module, "reform_param") and module.reform_param:
+                path_str = ".".join(map(str, path))
+                for key, value in module.reform_param.items():
+                    full_key = f"{path_str}.{key}" if path_str else key
+                    new_value = value.copy()
+                    new_splits = []
+                    for split in value["splits"]:
+                        new_split = split.copy()
+                        split_name = split["name"]
+                        new_split["name"] = f"{path_str}.{split_name}" if path_str else split_name
+                        new_splits.append(new_split)
+                    new_value["splits"] = new_splits
+
+                    reform_param[full_key] = new_value
+        return reform_param
+
     @property
     def transform_fn(self):
         """Creates a transformation function for converting HuggingFace state dicts to EasyDeL format.
@@ -1340,6 +1375,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             moe_path=moe_path,
             dtype=self.param_dtype,
             shard_fns=self._shard_fns,
+            reform_param=self._get_reform_param(),
         )
 
     @property
@@ -1602,6 +1638,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
             moe_block_path=moe_block_path,
             moe_path=moe_path,
             dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
         )
 
     @property
@@ -1732,3 +1769,74 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         )
         self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
         return self
+
+    def new_graphdef(self, **kwargs: Unpack[EasyDeLBaseConfigDict]):
+        """create the module configuration and reinitializes the structure.
+
+        Creates a new lazy module with updated configuration while preserving
+        the current parameter state.
+
+        Args:
+            **kwargs: Configuration parameters to update.
+
+        Returns:
+            new create graphdef with new configuration.
+        """
+        config = deepcopy(self.config)
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        module = self.lazy_init(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+        return module.graphdef
+
+    def __hash__(self):
+        """Computes a hash of the module for caching and comparison purposes.
+
+        Returns:
+            Hash value based on the module's state and configuration.
+        """
+        return self.static_hash(None)
+
+    def static_hash(self, pop_things: list[str] | None = None):
+        """Computes a deterministic hash of the module's state and configuration.
+
+        This method creates a hash based on the module's parameters (graphstate),
+        non-parameter state (graphother), and configuration dictionary. It's useful
+        for caching compiled functions or identifying when model states differ.
+
+        Args:
+            pop_things: Optional list of configuration keys to exclude from the hash.
+                Useful when you want to ignore certain config fields (e.g., 'attn_mechanism')
+                that shouldn't affect the cache key.
+
+        Returns:
+            A signed integer hash value computed from the model's state and configuration.
+
+        Example:
+            >>> # Hash without excluding any config keys
+            >>> hash1 = model.static_hash()
+            >>>
+            >>> # Hash excluding attention mechanism from consideration
+            >>> hash2 = model.static_hash(["attn_mechanism"])
+            >>>
+            >>> # These may be equal if only attn_mechanism differs
+            >>> hash1 == hash2  # True if configs match except attn_mechanism
+
+        Note:
+            The hash is computed using MD5 on the serialized state signature and
+            configuration dictionary, ensuring deterministic results for identical states.
+        """
+        from ejkernel.callib._ejit import _get_args_signature
+
+        dict_config = self.config.to_dict()
+        if pop_things:
+            for pops in pop_things:
+                dict_config.pop(pops)
+        tree_hash = _get_args_signature((self.graphstate, self.graphother), dict_config)
+        bytes_in = hashlib.md5((tree_hash).encode("utf-8")).digest()
+        return int.from_bytes(bytes_in, byteorder="big", signed=True)

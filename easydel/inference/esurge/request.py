@@ -54,6 +54,8 @@ class EngineRequest:
         client_index: Index of the client making request.
         arrival_time: Timestamp when request arrived.
         priority: Request priority for scheduling.
+        parent_request_id: ID of parent request for n>1 sampling (None for n=1).
+        sample_index: Index of this sample (0 to n-1) for n>1 sampling.
         status: Current request status.
         events: List of events during processing.
         stop_reason: Reason for stopping generation.
@@ -76,6 +78,8 @@ class EngineRequest:
         client_index: int = 0,
         arrival_time: float | None = None,
         priority: int = 0,
+        parent_request_id: str | None = None,
+        sample_index: int = 0,
     ) -> None:
         """Initialize EngineRequest.
 
@@ -87,10 +91,14 @@ class EngineRequest:
             client_index: Client index.
             arrival_time: Request arrival time.
             priority: Request priority.
+            parent_request_id: Parent request ID for n>1 sampling.
+            sample_index: Sample index (0 to n-1) for n>1 sampling.
         """
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        self.parent_request_id = parent_request_id
+        self.sample_index = sample_index
         self.sampling_params = sampling_params
         self.eos_token_id = eos_token_id
         self.arrival_time = arrival_time if arrival_time is not None else time.time()

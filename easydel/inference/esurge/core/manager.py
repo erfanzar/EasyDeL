@@ -245,7 +245,7 @@ class CacheManager:
     def get_num_common_prefix_pages(
         self,
         request: EngineRequest,
-        num_running_requests: int,
+        num_scheduled_requests: int,
     ) -> list[int]:
         """Calculate the number of common prefix pages shared by all requests
         in the RUNNING state for each kv cache group.
@@ -282,7 +282,7 @@ class CacheManager:
             group.
         """
         assert request.status == EngineRequestStatus.RUNNING
-        return self.coordinator.get_num_common_prefix_pages(request.request_id, num_running_requests)
+        return self.coordinator.get_num_common_prefix_pages(request.request_id, num_scheduled_requests)
 
     def free_page_hashes(self, request: EngineRequest) -> None:
         """Discard the page hashes for the request.

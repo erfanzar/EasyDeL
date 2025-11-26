@@ -132,19 +132,10 @@ _import_structure = {
         "eSurge",
         "eSurgeApiServer",
         "eSurgeRunner",
-        "vDriver",
-        "vEngine",
-        "vInference",
-        "vInferenceApiServer",
-        "vInferenceConfig",
-        "vInferencePreCompileConfig",
-        "vSurge",
-        "vSurgeApiServer",
-        "vSurgeRequest",
         "vWhisperInference",
         "vWhisperInferenceConfig",
     ],
-    "inference.evaluations": ["eSurgeLMEvalAdapter", "vSurgeLMEvalAdapter"],
+    "inference.evaluations": ["eSurgeLMEvalAdapter"],
     "infra": [
         "EasyDeLBaseConfig",
         "EasyDeLBaseConfigDict",
@@ -187,7 +178,8 @@ _import_structure = {
         "OperationImpl",
         "OperationMetadata",
         "OperationRegistry",
-        "RaggedPageAttn",
+        "RaggedPageAttnV2",
+        "RaggedPageAttnV3",
         "RingAttn",
         "ScaledDotProductAttn",
         "VanillaAttn",
@@ -493,6 +485,24 @@ _import_structure = {
         "Qwen3MoeForSequenceClassification",
         "Qwen3MoeModel",
     ],
+    "modules.qwen3_vl": [
+        "Qwen3VLConfig",
+        "Qwen3VLTextConfig",
+        "Qwen3VLVisionConfig",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLModel",
+        "Qwen3VLTextModel",
+        "Qwen3VisionTransformerPretrainedModel",
+    ],
+    "modules.qwen3_vl_moe": [
+        "Qwen3VLMoeConfig",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3VLMoeModel",
+        "Qwen3VLMoeTextConfig",
+        "Qwen3VLMoeTextModel",
+        "Qwen3VLMoeVisionConfig",
+        "Qwen3VLMoeVisionTransformerPretrainedModel",
+    ],
     "modules.roberta": [
         "RobertaConfig",
         "RobertaForCausalLM",
@@ -539,12 +549,24 @@ _import_structure = {
     ],
     "trainers": [
         "BaseTrainer",
+        "BCOConfig",
+        "BCOTrainer",
+        "CPOConfig",
+        "CPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
         "DPOConfig",
         "DPOTrainer",
+        "GKDConfig",
+        "GKDTrainer",
         "GRPOConfig",
         "GRPOTrainer",
+        "KTOConfig",
+        "KTOTrainer",
+        "NashMDConfig",
+        "NashMDTrainer",
+        "XPOConfig",
+        "XPOTrainer",
         "ORPOConfig",
         "ORPOTrainer",
         "RayDistributedTrainer",
@@ -580,19 +602,10 @@ if _tp.TYPE_CHECKING:
         eSurge,
         eSurgeApiServer,
         eSurgeRunner,
-        vDriver,
-        vEngine,
-        vInference,
-        vInferenceApiServer,
-        vInferenceConfig,
-        vInferencePreCompileConfig,
-        vSurge,
-        vSurgeApiServer,
-        vSurgeRequest,
         vWhisperInference,
         vWhisperInferenceConfig,
     )
-    from .inference.evaluations import eSurgeLMEvalAdapter, vSurgeLMEvalAdapter
+    from .inference.evaluations import eSurgeLMEvalAdapter
     from .infra import (
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
@@ -627,7 +640,8 @@ if _tp.TYPE_CHECKING:
         OperationImpl,
         OperationMetadata,
         OperationRegistry,
-        RaggedPageAttn,
+        RaggedPageAttnV2,
+        RaggedPageAttnV3,
         RingAttn,
         ScaledDotProductAttn,
         VanillaAttn,
@@ -738,6 +752,24 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
+    from .modules.qwen3_vl import (
+        Qwen3VisionTransformerPretrainedModel,
+        Qwen3VLConfig,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLModel,
+        Qwen3VLTextConfig,
+        Qwen3VLTextModel,
+        Qwen3VLVisionConfig,
+    )
+    from .modules.qwen3_vl_moe import (
+        Qwen3VLMoeConfig,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeModel,
+        Qwen3VLMoeTextConfig,
+        Qwen3VLMoeTextModel,
+        Qwen3VLMoeVisionConfig,
+        Qwen3VLMoeVisionTransformerPretrainedModel,
+    )
     from .modules.roberta import (
         RobertaConfig,
         RobertaForCausalLM,
@@ -767,12 +799,22 @@ if _tp.TYPE_CHECKING:
     from .modules.xerxes2 import Xerxes2Config, Xerxes2ForCausalLM, Xerxes2Model
     from .trainers import (
         BaseTrainer,
+        BCOConfig,
+        BCOTrainer,
+        CPOConfig,
+        CPOTrainer,
         DistillationConfig,
         DistillationTrainer,
         DPOConfig,
         DPOTrainer,
+        GKDConfig,
+        GKDTrainer,
         GRPOConfig,
         GRPOTrainer,
+        KTOConfig,
+        KTOTrainer,
+        NashMDConfig,
+        NashMDTrainer,
         ORPOConfig,
         ORPOTrainer,
         RayDistributedTrainer,
@@ -782,6 +824,8 @@ if _tp.TYPE_CHECKING:
         SFTTrainer,
         Trainer,
         TrainingArguments,
+        XPOConfig,
+        XPOTrainer,
         pack_sequences,
     )
     from .utils import (
@@ -811,8 +855,9 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.81", "0.0.82", "0.0.83", "0.0.84", "0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.11", "0.0.12"]
+    _targeted_eformer_versions = ["0.0.84"]
+    _targeted_ejkernel_versions = ["0.0.21"]
+
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

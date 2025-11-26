@@ -629,7 +629,6 @@ class RayDistributedTrainer:
                         attn_dtype=self.config_variables["attn_dtype"],
                         attn_softmax_dtype=self.config_variables["attn_softmax_dtype"],
                         gradient_checkpointing=self.config_variables["gradient_checkpointing"],
-                        use_pallas_group_matmul=self.config_variables.get("use_pallas_group_matmul", False),
                     ),
                     partition_axis=self.config_variables["partition_axis"],
                     quantization_method=ed.EasyDeLQuantizationMethods.NONE,

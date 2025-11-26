@@ -645,7 +645,7 @@ class MaskedLMOutput(ModelOutput):
 
 
 CausalLMOutput = MaskedLMOutput
-
+# type:ignore
 
 @auto_pytree
 class Seq2SeqLMOutput(ModelOutput):
@@ -1018,6 +1018,59 @@ class MoeCausalLMOutput(MaskedLMOutput):
     aux_loss: chex.Array | None = None
     router_logits: tuple[chex.Array] | None = None
     all_router_losses: tuple[chex.Array] | None = None
+    loss: chex.Array | None = None
+
+
+@auto_pytree
+class VLMCausalLMOutput(ModelOutput):
+    """Unified output class for Vision-Language Models (VLMs).
+
+    Provides a standardized output structure for all VLM models including
+    LLaVA, Qwen2-VL, Qwen3-VL, Gemma3, AyaVision, Mistral3, and Llama4.
+
+    Args:
+        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (before SoftMax).
+        past_key_values (`TransformerCache`, *optional*):
+            Pre-computed hidden-states (key and values in attention blocks) for
+            efficient autoregressive generation.
+        hidden_states (`tuple(chex.Array)`, *optional*):
+            Tuple of hidden-states at output of each layer plus embeddings.
+            Shape: `(batch_size, sequence_length, hidden_size)`.
+        last_hidden_state (`chex.Array`, *optional*):
+            Hidden-state at output of the last layer.
+            Shape: `(batch_size, sequence_length, hidden_size)`.
+        attentions (`tuple(chex.Array)`, *optional*):
+            Attention weights after softmax. Shape: `(batch_size, num_heads,
+            sequence_length, sequence_length)`.
+        image_hidden_states (`chex.Array`, *optional*):
+            Projected image features from the vision encoder after the multimodal
+            projector. Shape varies by model.
+        video_hidden_states (`chex.Array`, *optional*):
+            Projected video features for models supporting video input (Qwen2-VL,
+            Qwen3-VL, Llama4). Shape varies by model.
+        rope_deltas (`chex.Array`, *optional*):
+            Position embedding deltas for multi-dimensional RoPE (mRoPE) used in
+            Qwen2-VL and Qwen3-VL models.
+        router_logits (`tuple(chex.Array)`, *optional*):
+            Router logits for MoE VLMs (Qwen3-VL-MoE). Shape:
+            `(batch_size, sequence_length, num_experts)`.
+        aux_loss (`chex.Array`, *optional*):
+            Auxiliary loss for MoE load balancing.
+        loss (`chex.Array`, *optional*):
+            Language modeling loss when labels are provided.
+    """
+
+    logits: chex.Array = None
+    past_key_values: TransformerCache | None = None
+    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: chex.Array | None = None
+    attentions: tuple[chex.Array] | None = None
+    image_hidden_states: chex.Array | None = None
+    video_hidden_states: chex.Array | None = None
+    rope_deltas: chex.Array | None = None
+    router_logits: tuple[chex.Array] | None = None
+    aux_loss: chex.Array | None = None
     loss: chex.Array | None = None
 
 

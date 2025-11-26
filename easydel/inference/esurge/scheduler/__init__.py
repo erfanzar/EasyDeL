@@ -20,6 +20,7 @@ output structures.
 
 Classes:
     Scheduler: Main request scheduler
+    AsyncScheduler: Async scheduler with placeholder-based token sampling
     SchedulerInterface: Abstract scheduler interface
     RequestQueue: Abstract request queue
     FCFSRequestQueue: First-come-first-served queue
@@ -39,14 +40,27 @@ Example:
     ... )
     >>> scheduler = Scheduler(config)
     >>> output = scheduler.schedule()
+    >>>
+    >>> # For async scheduling:
+    >>> config_async = SchedulerConfig(
+    ...     max_num_seqs=16,
+    ...     max_num_batched_tokens=2048,
+    ...     max_model_len=8192,
+    ...     async_scheduling=True
+    ... )
+    >>> async_scheduler = AsyncScheduler(config_async)
+    >>> output = async_scheduler.schedule()
 """
 
+from .async_scheduler import AsyncScheduler
 from .interface import SchedulerInterface
 from .output import CachedRequestData, NewRequestData, SchedulerOutput
 from .request_queue import FCFSRequestQueue, PriorityRequestQueue, RequestQueue
 from .scheduler import Scheduler
+from .token_budget import TokenBudgetManager
 
 __all__ = (
+    "AsyncScheduler",
     "CachedRequestData",
     "FCFSRequestQueue",
     "NewRequestData",

@@ -9,7 +9,7 @@ Key Features
 - **Diverse Model Support**: Seamlessly support for Transformers, Mamba, RWKV, Vision Models and more
 - **Advanced Trainers**: Specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer
 - **Vision Model Support**: Comprehensive support for vision-to-vision tasks, image-text-to-image generation, and image-to-text processing
-- **Production-Ready Serving**: Includes vInference engine for efficient LLM inference and API endpoints compatible with OpenAI standards
+- **Production-Ready Serving**: Includes eSurge and vWhisper engines plus OpenAI-compatible endpoints
 - **Quantization and Bit Operations**: Supports various quantization methods including NF4, A8BIT, A8Q, and A4Q for optimized inference and training
 - **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features
 - **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models
@@ -55,8 +55,6 @@ Inference and Serving Solutions
 EasyDeL provides powerful, production-ready serving solutions:
 
 - **eSurge Engine**: High-performance inference engine with advanced KV cache management and paged attention
-- **vInference Engine**: Optimized for efficient inference of large language models
-- **vInference API Server**: Provides OpenAI-compatible endpoints for easy integration
 - **vWhisper Inference**: Specialized inference engine for audio transcription and translation
 - **Multimodal Support**: Process text, images, and audio with unified APIs
 - **Streaming Generation**: Optimized for low-latency response streaming
@@ -128,17 +126,12 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    esurge
    esurge_examples
    whisper_api.md
-   vinference_api.md
-	 vsurge_example
-   vsurge_api_server_example
    trainers/dpo.md
    trainers/grpo.md
    trainers/orpo.md
    trainers/sft.md
    trainers/reward.md
-   multimodality/vision_language.md
    multimodality/audio_language.md
-   multimodality/inference.md
    trc-welcome.md
 
 

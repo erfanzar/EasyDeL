@@ -4,6 +4,7 @@ from eformer.pytree import auto_pytree
 from jax import Array
 from jaxtyping import Float
 
+from ..caching import RaggedPagesCacheView, TransformerCacheView
 from ._operation_impl import OperationOutput
 
 
@@ -15,3 +16,4 @@ class AttentionOutput(OperationOutput):
 
     attention_weights: Float[Array, "batch num_heads seq_len seq_len"] | None = None
     attention_outputs: Float[Array, "batch seq_len num_heads head_dim"] | None = None
+    cache_view: TransformerCacheView | RaggedPagesCacheView | None = None

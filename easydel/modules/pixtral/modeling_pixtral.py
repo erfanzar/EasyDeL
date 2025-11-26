@@ -660,7 +660,7 @@ class PixtralTransformer(nn.Module):
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        sequence_length = inputs_embeds.shape[1]
 
         assert sequence_length <= self.config.max_position_embeddings, (
             f"Maximum Position Embedding Reached ! "
@@ -675,10 +675,7 @@ class PixtralTransformer(nn.Module):
         )
 
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         hidden_states = inputs_embeds
         for _idx, block in enumerate(self.layers):

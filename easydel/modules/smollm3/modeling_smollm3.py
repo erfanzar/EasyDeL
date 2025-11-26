@@ -88,7 +88,6 @@ class SmolLM3Attention(UnifiedAttention):
 
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
-        self.sliding_window = config.sliding_window if self.is_sliding else None
 
         super().__init__(
             config=config,
@@ -96,8 +95,10 @@ class SmolLM3Attention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",  # SmolLM3 uses standard RoPE-based attention
             causal=True,  # Causal language modeling
+            sliding_window=config.sliding_window if self.is_sliding else None,
             use_qk_norm=False,  # SmolLM3 doesn't use Q/K normalization
             use_fused_qkv=False,  # Separate Q/K/V projections
             use_gqa=True,  # SmolLM3 uses Grouped Query Attention
@@ -162,11 +163,11 @@ class SmolLM3DecoderLayer(nn.Module):
         # Self-attention
         self.self_attn = SmolLM3Attention(
             config=config,
-            layer_idx=layer_idx,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
 
         # MLP
@@ -461,7 +462,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
-        batch_size, sequence_length = inputs_embeds.shape[:2]
+        sequence_length = inputs_embeds.shape[1]
 
         # Create MaskInfo dynamically if not provided
         mask_info = MaskInfo.dynamic_init(
@@ -473,10 +474,7 @@ class SmolLM3Model(EasyDeLBaseModule):
 
         # Compute position_ids from mask_info if not provided
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         # Set mode
         if mode is None:

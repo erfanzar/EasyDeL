@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -89,6 +89,7 @@ class DbrxAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         """Initializes the DbrxAttention module.
 
@@ -105,6 +106,7 @@ class DbrxAttention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
         )
@@ -294,6 +296,7 @@ class DbrxNormAttentionNorm(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -314,6 +317,7 @@ class DbrxNormAttentionNorm(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.norm_2 = nn.LayerNorm(
             self.config.hidden_size,
@@ -400,6 +404,7 @@ class DbrxExpertGLU(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         self.config = config
@@ -412,9 +417,9 @@ class DbrxExpertGLU(nn.Module):
             self.config.d_model,
         )
         init_fn = nn.initializers.normal(dtype=self.dtype)
-        self.w1 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
-        self.v1 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
-        self.w2 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
+        self.w1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
+        self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
+        self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
     def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:
@@ -646,6 +651,7 @@ class DbrxBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
+        layer_idx: int,
     ):
         super().__init__()
         self.config = config
@@ -670,6 +676,7 @@ class DbrxBlock(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.ffn = ffn_block(
             config=config,
@@ -780,6 +787,7 @@ class DbrxModel(EasyDeLBaseModule):
         self.blocks = [
             DbrxBlock(
                 config=config,
+                layer_idx=i,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -849,7 +857,7 @@ class DbrxModel(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids.astype("i4"))
 
-        batch_size, sequence_length = inputs_embeds.shape[:2]
+        sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -857,10 +865,7 @@ class DbrxModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0),
-                (batch_size, sequence_length),
-            ).astype(jnp.int32)
+            position_ids = mask_info.q_position_ids
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (

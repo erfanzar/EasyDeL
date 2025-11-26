@@ -110,6 +110,7 @@ class DistillationTrainer(Trainer):
             dataset_eval=eval_dataset,
             model_state=student_model,
             data_collator=data_collator,
+            processing_class=processing_class,
         )
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
@@ -128,6 +129,9 @@ class DistillationTrainer(Trainer):
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
+        hidden_layers = self.arguments.hidden_state_layers
+        attention_layers = self.arguments.attention_layers
+
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
@@ -136,9 +140,15 @@ class DistillationTrainer(Trainer):
             True,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
+            float(self.arguments.hidden_state_loss_weight),
+            hidden_layers,
+            self.arguments.hidden_state_loss,
+            float(self.arguments.attention_loss_weight),
+            attention_layers,
+            bool(self.arguments.attention_normalize),
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -155,6 +165,12 @@ class DistillationTrainer(Trainer):
             False,  # is_train
             self.arguments.temperature,
             self.arguments.alpha,
+            float(self.arguments.hidden_state_loss_weight),
+            hidden_layers,
+            self.arguments.hidden_state_loss,
+            float(self.arguments.attention_loss_weight),
+            attention_layers,
+            bool(self.arguments.attention_normalize),
         )
 
         sharded_evaluation_step_function = ejit(

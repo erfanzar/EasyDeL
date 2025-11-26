@@ -69,6 +69,20 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "The beta parameter for GRPO."},
     )
+    epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Lower clipping bound for importance sampling weights."},
+    )
+    epsilon_high: float | None = field(
+        default=None,
+        metadata={"help": "Upper clipping bound for importance sampling weights. If None, defaults to `epsilon`."},
+    )
+    delta: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional two-sided clipping bound. If set, importance weights are additionally clipped to `delta`."
+        },
+    )
     sync_ref_model: bool = field(
         default=False,
         metadata={"help": "Whether to periodically sync the reference model with the policy model."},
@@ -81,6 +95,30 @@ class GRPOConfig(TrainingArguments):
         default=64,
         metadata={"help": "The number of steps between syncing the reference model."},
     )
+    num_iterations: int = field(
+        default=1,
+        metadata={"help": "How many optimizer updates to perform per generated batch."},
+    )
+    loss_type: str = field(
+        default="dapo",
+        metadata={"help": "Loss variant to use. One of ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo']."},
+    )
+    importance_sampling_level: str = field(
+        default="token",
+        metadata={"help": "Importance sampling applied per 'token' or aggregated per 'sequence'."},
+    )
+    reward_weights: list[float] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional weights for each reward function. Must match the number of reward functions if set."
+        },
+    )
+    scale_rewards: str | bool = field(
+        default="group",
+        metadata={
+            "help": "Reward scaling strategy: 'group', 'batch', 'none', or the booleans True/False for group/none."
+        },
+    )
     tools: list[dict | tp.Callable] | None = field(
         default=None,
         metadata={"help": "Additional tools for training."},
@@ -90,37 +128,69 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "whenever to skip extracting prompt from dataset."},
     )
     num_return_sequences: int = field(
-        default=False,
+        default=4,
         metadata={
             "help": "The number of sequences to return for each input prompt. Used during sampling to "
             "generate multiple completions per prompt."
         },
     )
-
-    top_p: float = field(
-        default=0.95,
-        metadata={
-            "help": "Top-p (nucleus) sampling threshold. Tokens are sampled from the smallest possible set whose "
-            "cumulative probability exceeds this value."
-        },
+    num_generations: int | None = field(
+        default=None,
+        metadata={"help": "Alias for num_return_sequences to keep parity with TRL's interface."},
     )
-
-    top_k: int = field(
-        default=50,
-        metadata={"help": "Top-k sampling threshold. Limits sampling to the top-k most probable tokens at each step."},
-    )
-
     temperature: float = field(
-        default=0.7,
-        metadata={
-            "help": "Sampling temperature. Higher values (e.g., >1.0) produce more random outputs, while "
-            "lower values (e.g., <1.0) make the output more deterministic."
-        },
+        default=1.0,
+        metadata={"help": "Sampling temperature used during generation."},
+    )
+    top_p: float = field(
+        default=1.0,
+        metadata={"help": "Top-p nucleus sampling parameter."},
+    )
+    top_k: int | None = field(
+        default=None,
+        metadata={"help": "Top-k sampling parameter. None disables top-k."},
+    )
+    min_p: float | None = field(
+        default=None,
+        metadata={"help": "Minimum token probability threshold (see HF top-p-min sampling)."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
+    )
+    generation_kwargs: dict | None = field(
+        default=None,
+        metadata={"help": "Additional generation kwargs forwarded to the generation config."},
+    )
+    chat_template_kwargs: dict | None = field(
+        default=None,
+        metadata={"help": "Extra kwargs forwarded to chat template application during generation."},
+    )
+    mask_truncated_completions: bool = field(
+        default=False,
+        metadata={"help": "If True, drop completions that do not terminate with EOS from the loss calculation."},
+    )
+    top_entropy_quantile: float = field(
+        default=1.0,
+        metadata={"help": "Keep only the top quantile of tokens by entropy in the loss (1.0 disables filtering)."},
     )
 
     def __post_init__(self):
         """Post initialization to set dependent parameters."""
         self.max_sequence_length = self.max_prompt_length + self.max_completion_length
+
+        if self.num_generations is None:
+            self.num_generations = self.num_return_sequences
+        else:
+            self.num_return_sequences = self.num_generations
+
+        if self.epsilon_high is None:
+            self.epsilon_high = self.epsilon
+
+        if self.scale_rewards is True:
+            self.scale_rewards = "group"
+        elif self.scale_rewards is False:
+            self.scale_rewards = "none"
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__()

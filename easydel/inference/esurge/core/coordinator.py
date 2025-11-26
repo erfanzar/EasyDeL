@@ -124,7 +124,7 @@ class CacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> list[int]:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> list[int]:
         """
         Get the number of common prefix pages for a request.
 
@@ -136,7 +136,7 @@ class CacheCoordinator(ABC):
             The number of common prefix pages.
         """
         num_pages_per_group = [
-            manager.get_num_common_prefix_pages(request_id, num_running_requests)
+            manager.get_num_common_prefix_pages(request_id, num_scheduled_requests)
             for manager in self.single_type_managers
         ]
         return num_pages_per_group
@@ -186,7 +186,7 @@ class CacheCoordinatorNoPrefixCache(CacheCoordinator):
         super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, False)
         self.num_single_type_manager = len(self.single_type_managers)
 
-    def get_num_common_prefix_pages(self, request_id: str, num_running_requests: int) -> list[int]:
+    def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> list[int]:
         return [0] * self.num_single_type_manager
 
     def find_longest_cache_hit(

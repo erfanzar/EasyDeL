@@ -846,6 +846,128 @@ class RotaryEmbedding(nn.Module):
             )
 
 
+@rope_wraper("mrope")
+class MultiModalRotaryEmbedding(RotaryEmbedding):
+    """Multi-dimensional RoPE (MRoPE) with interleaved THW layout for Qwen2/3-VL models.
+
+    MRoPE (Multi-dimensional Rotary Position Embedding) extends standard RoPE to handle
+    3D position information (Temporal, Height, Width) for vision-language models.
+
+    The interleaving pattern reorganizes frequencies from chunked [TTT...HHH...WWW] to
+    interleaved [T₀,H₀,W₀, T₁,H₁,W₁, ...], preserving frequency continuity for each
+    spatial/temporal dimension.
+
+    Attributes:
+        mrope_section: Tuple of (T, H, W) dimensions specifying how many frequency
+            components are allocated to each dimension. Default: (24, 20, 20) for
+            64-dim rotary embeddings (128 head_dim / 2).
+        attention_scaling: Post-processing scaling factor applied to cos/sin.
+            Default 1.0 for standard mRoPE. Can be set for advanced RoPE types.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        mrope_section: tuple[int, int, int] | None = None,
+        attention_scaling: float = 1.0,
+    ):
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+        self.mrope_section = mrope_section if mrope_section is not None else (24, 20, 20)
+        self.attention_scaling = attention_scaling
+
+    def _apply_interleaved_mrope(self, freqs: jax.Array) -> jax.Array:
+        """Interleave THW frequencies from chunked layout."""
+        freqs_t = freqs[0]
+        for dim_idx, offset in enumerate((1, 2), start=1):
+            section_size = self.mrope_section[dim_idx] * 3
+            idx = slice(offset, section_size, 3)
+            freqs_t = freqs_t.at[..., idx].set(freqs[dim_idx, ..., idx])
+        return freqs_t
+
+    @jax.named_scope("easydel-mrope")
+    def __call__(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+        offsets: jax.Array | None = None,
+        frequencies: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Apply interleaved THW MRoPE to query/key.
+
+        Args:
+            positions: Position IDs with shape (batch, seq) or (3, batch, seq).
+                If 2D, broadcasts to 3D with same positions for T, H, W.
+                For vision-language tasks, should be (3, batch, seq) with separate
+                T, H, W positions computed via get_rope_index.
+            query: Query tensor to apply rotary embedding to.
+            key: Key tensor to apply rotary embedding to.
+            offsets: Optional position offsets (e.g., for KV cache).
+            frequencies: Optional pre-computed frequency cache.
+
+        Returns:
+            Tuple of (rotated_query, rotated_key) with same dtype as input.
+        """
+        # Normalize positions to (3, batch, seq)
+        if positions.ndim == 2:
+            positions = jnp.broadcast_to(positions[jnp.newaxis, ...], (3, *positions.shape))
+        elif positions.ndim != 3 or positions.shape[0] != 3:
+            raise ValueError(f"Position IDs must have shape (batch, seq) or (3, batch, seq); got {positions.shape}.")
+
+        if offsets is not None:
+            positions = positions + offsets
+
+        if frequencies is not None:
+            freq_cache = getattr(frequencies, "value", frequencies)
+            # freq_cache expected shape: [max_pos, rotary_dim] containing [cos, sin] concat
+            freq_cache = jnp.asarray(freq_cache)
+            freqs_full = jnp.stack(
+                [
+                    freq_cache[positions[0]],
+                    freq_cache[positions[1]],
+                    freq_cache[positions[2]],
+                ],
+                axis=0,
+            )  # (3, b, seq, rotary_dim)
+            cos_half, sin_half = jnp.split(freqs_full, 2, axis=-1)  # each (3, b, seq, dim/2)
+            cos_half = self._apply_interleaved_mrope(cos_half)
+            sin_half = self._apply_interleaved_mrope(sin_half)
+            cos = jnp.concatenate([cos_half, cos_half], axis=-1)
+            sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+        else:
+            inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)  # (rotary_dim//2,)
+            inv_freq = inv_freq[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+            freqs = positions[..., jnp.newaxis].astype(jnp.float32) * inv_freq  # (3, b, seq, dim/2)
+            freqs = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
+            cos_half = jnp.cos(freqs)
+            sin_half = jnp.sin(freqs)
+            cos = jnp.concatenate([cos_half, cos_half], axis=-1)
+            sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+
+        # Apply attention scaling (typically 1.0 for standard mRoPE, can be different for advanced types)
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        cos = cos[:, :, jnp.newaxis, :]
+        sin = sin[:, :, jnp.newaxis, :]
+
+        q_embed = (query * cos) + (_rotate_neox(query) * sin)
+        k_embed = (key * cos) + (_rotate_neox(key) * sin)
+        return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
+
+
 @rope_wraper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
     """
@@ -1390,6 +1512,9 @@ def get_rope(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
+        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+            scaling_type = "mrope"
+
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
@@ -1491,6 +1616,16 @@ def get_rope(
                 short_factor=short_factor,
                 long_factor=long_factor,
             )
+        elif scaling_type == "mrope":
+            rotary_emb = MultiModalRotaryEmbedding(
+                head_size=head_size,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position,
+                base=base,
+                is_neox_style=is_neox_style,
+                dtype=dtype,
+                mrope_section=rope_scaling.get("mrope_section"),
+            )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
@@ -1552,6 +1687,8 @@ def get_frequencies(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
+        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+            scaling_type = "mrope"
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
@@ -1657,6 +1794,13 @@ def get_frequencies(
                 original_max_position_embeddings=original_max_position,
                 short_factor=short_factor,
                 long_factor=long_factor,
+            )
+        elif scaling_type == "mrope":
+            # Use basic cache; interleaving handled inside the MRoPE class
+            frequencies = compute_basic_frequencies(
+                base=base,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -1855,6 +1999,8 @@ class RopeConfig:
     beta_slow: int | None = None
     mscale: int | None = None
     mscale_all_dim: int | None = None
+    mrope_interleaved: bool | None = None
+    mrope_section: list[int] | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, tp.Any]) -> RopeConfig:
@@ -1884,6 +2030,8 @@ class RopeConfig:
             beta_slow=config_dict.get("beta_slow"),
             mscale=config_dict.get("mscale"),
             mscale_all_dim=config_dict.get("mscale_all_dim"),
+            mrope_interleaved=config_dict.get("mrope_interleaved"),
+            mrope_section=config_dict.get("mrope_section"),
         )
 
     def to_dict(self) -> dict[str, tp.Any]:

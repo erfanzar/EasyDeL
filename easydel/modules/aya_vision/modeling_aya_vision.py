@@ -29,8 +29,9 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
@@ -507,10 +508,11 @@ class AyaVisionModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=AyaVisionConfig, model_type="aya_vision")
-class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
-    """
-    AyaVision model for conditional text generation based on image inputs.
+class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel, AyaVisionConfig]):
+    """AyaVision model for conditional text generation based on image inputs.
+
     Combines a vision tower and a language model with a multi-modal projector.
+    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
 
     Attributes:
         config (AyaVisionConfig): Configuration object.
@@ -518,7 +520,26 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): JAX precision level.
         rngs (nn.Rngs): Random number generators.
+
+    Class Attributes:
+        _task_type: IMAGE_TEXT_TO_TEXT task type
+        _model_type: "aya_vision" model identifier
+        _supports_video: False (AyaVision is image-only)
+        _uses_mrope: False (uses standard RoPE)
     """
+
+    # Class attributes for registration and capabilities
+    _task_type = TaskType.IMAGE_TEXT_TO_TEXT
+    _model_type = "aya_vision"
+    _config_class = AyaVisionConfig
+    _auto_register = False  # Already registered via decorator
+    _supports_video = False
+    _uses_mrope = False
+
+    # Component name mapping
+    _vision_tower_name = "vision_tower"
+    _projector_name = "multi_modal_projector"
+    _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
 
@@ -534,36 +555,41 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         """Initializes the AyaVisionForConditionalGeneration model."""
         super().__init__(
             config=config,
+            base_model_class=AyaVisionModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            # VLM-specific configuration
+            vision_feature_layer=getattr(config, "vision_feature_layer", -1),
+            vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
+            image_token_index=config.image_token_id,
+            # LM head configuration
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            lm_head_bias=False,
         )
-        self.model = AyaVisionModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.get_text_config().hidden_size,
-            config.get_text_config().vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nn.initializers.normal(config.get_text_config().initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
-        )
+
+    def get_image_features(
+        self,
+        pixel_values: Float[Array, "batch channels height width"],
+        **kwargs,
+    ) -> Float[Array, "batch num_patches hidden"]:
+        """Extract and project image features from pixel values.
+
+        Delegates to the base model's get_image_features implementation which:
+        1. Passes pixel_values through the vision tower
+        2. Applies pixel shuffling for downsampling
+        3. Applies the multimodal projector with gating
+
+        Args:
+            pixel_values: Input image pixel values
+            **kwargs: Additional arguments (unused for AyaVision)
+
+        Returns:
+            Projected image features ready for merging with text embeddings
+        """
+        return self.base_model.get_image_features(pixel_values)
 
     def __call__(
         self,
@@ -580,25 +606,26 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
-    ):
+    ) -> VLMCausalLMOutput:
         """Forward pass for the AyaVision model.
 
         Args:
-            input_ids (chex.Array): Input token IDs. (batch_size, sequence_length)
-            pixel_values (chex.Array): Input pixel values for images. (batch_size, num_channels, height, width)
-            attention_mask (Optional[chex.Array]): Mask for text attention.
-            position_ids (Optional[chex.Array]): Position IDs for text.
-            segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            **lm_kwargs: Additional arguments passed to the language model.
+            input_ids: Input token IDs (batch_size, sequence_length)
+            pixel_values: Input pixel values for images (batch_size, channels, height, width)
+            attention_mask: Attention mask
+            mask_info: Mask information
+            position_ids: Position IDs for text
+            mode: Runtime mode
+            past_key_values: Cached keys/values for language model
+            cache_metadata: Metadata for paged attention
+            apply_lm_head: Whether to apply the LM head
+            inputs_embeds: Input embeddings (alternative to input_ids)
+            output_attentions: Whether to output attentions
+            output_hidden_states: Whether to output hidden states
+            **lm_kwargs: Additional arguments passed to the language model
 
         Returns:
-            AyaVisionCausalLMOutputWithPast: Model outputs including logits and potentially past key/values,
-                hidden states, attentions, and image hidden states.
+            VLMCausalLMOutput: Model outputs including logits and optional states
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -608,7 +635,8 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        outputs = self.model(
+        # Forward through base model
+        outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             mask_info=mask_info,
@@ -625,18 +653,20 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 
         hidden_states = outputs.last_hidden_state
 
+        # Apply logical sharding
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
+        # Apply LM head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), name="lm_head_output")
+            lm_logits = self.apply_logit_cap(lm_logits)
 
-        return AyaVisionCausalLMOutputWithPast(
-            loss=None,
+        return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -653,119 +683,21 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
         shardings=None,
         pad_token_id=None,
     ):
-        return self.model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
+        """Initialize KV cache for generation."""
+        return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        """Helper function to get keyword arguments for model compilation, potentially including vision inputs.
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head."""
+        return self.lm_head(hidden_states)
 
-        Args:
-            batch_size (int): Batch size for text inputs.
-            input_tokens_length (int): Sequence length for text inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
-            rngs (jax.random.PRNGKey): Random number generator key.
-            vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
-            vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
-            vision_channels (int): Number of channels for vision inputs. Defaults to 3.
-            vision_height (Optional[int]): Height for vision inputs (defaults to config).
-            vision_width (Optional[int]): Width for vision inputs (defaults to config).
-            required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
-            **kwargs: Additional arguments passed to the language model's compile kwargs method.
+    def get_vision_tower(self) -> nn.Module:
+        """Returns the vision tower component."""
+        return self.base_model.vision_tower
 
-        Returns:
-            dict: Keyword arguments for model compilation.
-        """
-        basics = self.model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-        return basics
+    def get_projector(self) -> nn.Module:
+        """Returns the multimodal projector component."""
+        return self.base_model.multi_modal_projector
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: Int[Array, "batch seq_len"],
-        max_length: int,
-        pad_token_id: int,
-        starts: int | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    ):
-        """Prepares inputs for text generation, including pixel values if provided.
-
-        Args:
-            input_ids (chex.Array): Initial input token IDs.
-            max_length (int): Maximum generation length.
-            pixel_values (Optional[chex.Array]): Pixel values for image input.
-            attention_mask (Optional[chex.Array]): Attention mask.
-
-        Returns:
-            dict: Model inputs ready for generation.
-        """
-        model_inputs = self.model.prepare_inputs_for_generation(
-            input_ids=input_ids,
-            max_length=max_length,
-            pad_token_id=pad_token_id,
-            starts=starts,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-        )
-        return model_inputs
-
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        """Updates model inputs for the next step of generation, removing pixel values after the first step.
-
-        Args:
-            model_outputs: Outputs from the previous generation step.
-            model_kwargs: Current keyword arguments for the model.
-
-        Returns:
-            dict: Updated model keyword arguments.
-        """
-        model_kwargs = self.model.update_inputs_for_generation(model_outputs, model_kwargs)
-        return model_kwargs
-
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
-        """
-        return self.model.vision_tower
-
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
-        return self.model.get_decoder()
-
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
-        return self.lm_head
-
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the language model (decoder).
-        """
-        return self.model.get_embedding()
+    def get_language_model(self) -> nn.Module:
+        """Returns the language model component."""
+        return self.base_model.language_model

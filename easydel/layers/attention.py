@@ -46,7 +46,7 @@ Example:
 
 import typing as tp
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, partial
 
 import einops
 import flax.nnx as nn
@@ -120,7 +120,8 @@ class AttentionMechanisms(str, Enum):
         BLOCKWISE: Blockwise computation for memory efficiency.
         SDPA: Scaled Dot Product Attention (JAX native).
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
-        RAGGED_PAGE_ATTENTION: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
+        RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -134,7 +135,8 @@ class AttentionMechanisms(str, Enum):
     BLOCKWISE: str = "blockwise"
     SDPA: str = "sdpa"
     CUDA_FLASH_ATTN2: str = "cuda_flash_attn2"
-    RAGGED_PAGE_ATTENTION: str = "ragged_page_attention"
+    RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
+    RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
     REGRESSIVE_DECODE: str = "autoregressive_decodeattn"
 
@@ -393,8 +395,12 @@ class FlexibleAttentionModule(nn.Module):
         """
         is_ragged_page_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
         if is_ragged_page_cache:
-            mechanism_is_ragged_page: bool = self.config.attn_mechanism == AttentionMechanisms.RAGGED_PAGE_ATTENTION
+            mechanism_is_ragged_page = self.config.attn_mechanism in [
+                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
+                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
+            ]
             assert mechanism_is_ragged_page
+
         # NOTE: Attention Dropout is disabled for now.
         # try:
         #     rngs = self.rngs()
@@ -405,14 +411,13 @@ class FlexibleAttentionModule(nn.Module):
         # if dropout_rng is None:
 
         # Use provided deterministic or self.deterministic
-        deterministic_computed: bool
+
         if deterministic is None:
             deterministic_computed = self.deterministic
         else:
             deterministic_computed = deterministic
 
         # Use provided softmax_scale or self.softmax_scale
-        softmax_scale_computed: float
         if softmax_scale is None:
             softmax_scale_computed = self.softmax_scale
         else:
@@ -422,14 +427,12 @@ class FlexibleAttentionModule(nn.Module):
         dropout_rng_final: tp.Any | None = None
 
         # Use provided precision or default
-        precision_computed: lax.PrecisionLike
         if precision is None:
             precision_computed = lax.Precision.DEFAULT
         else:
             precision_computed = precision
 
         # Use provided policy or default
-        policy_computed: tp.Any
         if policy is None:
             policy_computed = jax.checkpoint_policies.nothing_saveable
         else:
@@ -743,57 +746,85 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | None,
-        sliding_window: int,
+        sliding_window: int | tuple[int, int],
         query_length: int,
         masking_details: AttnMaskDetail | None,
         cache_metadata: TransformerMetadata | None,
     ) -> tuple[Array, Array, MaskInfo, TransformerMetadata | None]:
         """Applies sliding window masking and slicing to KV and mask."""
+        if isinstance(sliding_window, int):
+            if sliding_window < 0:
+                raise ValueError(
+                    f"Invalid sliding_window: expected a non-negative integer, but got {sliding_window}. "
+                    f"Window size must be >= 0."
+                )
+            left_window = right_window = sliding_window
+        else:
+            left_window, right_window = sliding_window
+            if left_window < 0 or right_window < 0:
+                raise ValueError(
+                    f"Invalid sliding_window: expected non-negative values, but got ({left_window}, {right_window}). "
+                    f"Both left and right window sizes must be >= 0."
+                )
 
-        # offsets = jnp.zeros((key.shape[0],), "i4")
-        # krange = key.shape[1] if masking_details is None else mask_info.kv_len
-        # if mode == common_types.MODE_DECODE and cache_view is not None:
-        #     indexs = cache_view.indexs
-        #     # offsets = indexs - 1
-        # elif mode == common_types.MODE_PREFILL and masking_details is not None:
-        #     indexs = jnp.array([query_length], "i4").repeat(key.shape[0], axis=0).reshape(-1)
-        # else:
-        #     indexs = jnp.zeros((key.shape[0],), "i4") + 1
+        attn = mask_info.attention_mask.astype(jnp.bool_)  # (B, H, Q, K)
+        B, _H, Q, K = attn.shape
+        if query_length != Q:
+            query_length = Q
 
-        # @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0, 0))
-        # def _select_slices(ikey, ival, imsk, offset, index):
-        #     row_ids_sliding = offset + jax.lax.broadcasted_iota(jnp.int32, (query_length, 1), 0)
-        #     col_ids_sliding = jax.lax.broadcasted_iota(jnp.int32, (1, krange), 1)
-        #     rhm = col_ids_sliding <= row_ids_sliding
-        #     lhm = col_ids_sliding > (row_ids_sliding - sliding_window)
+        if mode == common_types.MODE_DECODE and cache_view is not None:
+            indexs = cache_view.indexs.reshape(-1)  # (B,)
+        elif mode == common_types.MODE_PREFILL:
+            indexs = jnp.full((B,), Q - 1, dtype=jnp.int32)  # last query row
+        else:
+            indexs = jnp.zeros((B,), dtype=jnp.int32)
 
-        #     imsk = (lhm & rhm) & imsk.astype(jnp.bool_)
-        #     if mode == common_types.MODE_DECODE and masking_details is not None:
-        #         start_index = jax.lax.max(0, index - sliding_window)
-        #         if imsk.shape[-1] > sliding_window:
-        #             imsk = jax.lax.dynamic_slice_in_dim(imsk, start_index, sliding_window, 2)
-        #         if ikey.shape[0] > sliding_window:
-        #             ikey = jax.lax.dynamic_slice_in_dim(ikey, start_index, sliding_window, 0)
-        #             ival = jax.lax.dynamic_slice_in_dim(ival, start_index, sliding_window, 0)
-        #     elif mode == common_types.MODE_PREFILL:
-        #         imsk = jax.lax.dynamic_slice_in_dim(imsk, max(0, query_length - sliding_window), sliding_window, 2)
+        offsets = jnp.zeros((B,), dtype=jnp.int32)
+        width = min(left_window + right_window + 1, K)
 
-        #     return ikey, ival, imsk
+        @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
+        def _select_slices(ikey, ival, imsk, offset, index, mode_):
+            row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
 
-        # key, value, attention_mask = _select_slices(key, value, attention_mask, offsets, indexs)
+            col = jax.lax.broadcasted_iota(jnp.int32, (1, K), 1)  # (1,K)
+            win = (col >= (row - left_window)) & (col <= (row + right_window))  # (Q,K)
 
-        # if cache_metadata is not None and mode == common_types.MODE_DECODE:
-        #     passed = cache_metadata.indexs - cache_metadata.starts
-        #     cache_metadata = TransformerMetadata(
-        #         starts=jax.lax.max(0, sliding_window - passed),
-        #         indexs=jnp.full((attention_mask.shape[0],), attention_mask.shape[-1]),
-        #     )
+            imsk = imsk & win[None, :, :]  # (H=1, Q, K)
 
-        key_result: Array = key
-        value_result: Array = value
-        mask_info_result: MaskInfo = mask_info
-        cache_metadata_result: TransformerMetadata | None = cache_metadata
-        return key_result, value_result, mask_info_result, cache_metadata_result
+            if mode_ == common_types.MODE_DECODE:
+                # Slice to a centered (as possible) window at 'index'
+                start_k = jnp.clip(index - left_window, 0, jnp.maximum(K - width, 0))
+                # Reduce Q to the current row (Q->1)
+                imsk = jax.lax.dynamic_slice_in_dim(imsk, index, 1, axis=1)  # (H,1,K)
+                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
+                # Slice KV tensors along K
+                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
+                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
+                return ikey, ival, imsk
+
+            elif mode_ == common_types.MODE_PREFILL:
+                # Trailing window on K, keep full Q
+                start_k = jnp.maximum(K - width, 0)
+                imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,Q,width)
+                ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
+                ival = jax.lax.dynamic_slice_in_dim(ival, start_k, width, axis=0)  # (width, ...)
+                return ikey, ival, imsk
+
+            else:
+                return ikey, ival, imsk
+
+        key, value, attn = _select_slices(key, value, attn, offsets, indexs, mode)
+
+        mask_info = mask_info.replace(attention_mask=attn)
+
+        if cache_metadata is not None and mode == common_types.MODE_DECODE:
+            passed = cache_metadata.indexs - cache_metadata.starts
+            cache_metadata = TransformerMetadata(
+                starts=jax.lax.max(0, width - passed),
+                indexs=jnp.full((attn.shape[0],), attn.shape[-1]),
+            )
+
+        return key, value, mask_info, cache_metadata
 
     @jax.named_scope("easydel-flax-attention-concatenate")
     def concatenate(
@@ -923,7 +954,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             masking_details_final: AttnMaskDetail | None = cache_view.masking_details if is_transformer_cache else None
             has_masking_details: bool = masking_details_final is not None
             is_sliding_type: bool = has_masking_details and masking_details_final.mask_type == AttnMaskType.SLIDING
-            sliding_window_computed: int
+            sliding_window_computed: int | tuple[int, int]
             if is_sliding_type:
                 sliding_window_computed = sliding_window or masking_details_final.size
             else:

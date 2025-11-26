@@ -362,6 +362,7 @@ class SamplingParams:
         seed: Random seed for reproducibility
         stop: List of stop strings
         stop_token_ids: List of stop token IDs
+        stop_pattern: Regex pattern string for stopping generation
         bad_words: List of strings to avoid generating
         ignore_eos: Whether to ignore end-of-sequence token
         max_tokens: Maximum number of tokens to generate
@@ -402,6 +403,7 @@ class SamplingParams:
     # Stopping Conditions
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
+    stop_pattern: str | None = None  # Regex pattern for stopping generation
     bad_words: list[str] = field(default_factory=list)
     ignore_eos: bool = False
     max_tokens: int | None = 16
@@ -450,6 +452,10 @@ class SamplingParams:
             self.temperature = 1e-2
         if self.seed == -1:
             self.seed = None
+
+        if self.max_tokens is not None and self.max_tokens < 0:
+            logger.debug("Received negative max_tokens (%s); treating as auto-infer.", self.max_tokens)
+            self.max_tokens = None
 
         if isinstance(self.stop, str):
             self.stop = [self.stop]

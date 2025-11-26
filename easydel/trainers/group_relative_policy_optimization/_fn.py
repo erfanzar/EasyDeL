@@ -100,6 +100,24 @@ def compute_per_token_logps(logits, input_ids, prompt_length):
     return token_log_probs
 
 
+def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_length):
+    """Return per-token log probabilities and entropies for the completion portion."""
+    logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits[:, prompt_length - 1 :]
+    logits = logits[:, :-1, :]
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    token_log_probs = jnp.take_along_axis(
+        log_probs,
+        jnp.expand_dims(input_ids[:, prompt_length:], axis=-1),
+        axis=-1,
+    )
+    token_log_probs = jnp.squeeze(token_log_probs, axis=-1)
+    entropies = -jnp.sum(jnp.exp(log_probs) * log_probs, axis=-1)
+    return token_log_probs, entropies
+
+
 def grpo_step(
     state: EasyDeLState,
     batch: tp.Mapping[str, jax.Array],
@@ -110,6 +128,12 @@ def grpo_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     is_training: bool = True,
+    loss_type: str = "dapo",
+    epsilon: float = 0.2,
+    epsilon_high: float = 0.2,
+    delta: float | None = None,
+    importance_sampling_level: str = "token",
+    top_entropy_quantile: float = 1.0,
 ) -> tuple[EasyDeLState, LossMetrics]:
     # Determine batch size, minibatch size, and enforce partition spec.
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -138,28 +162,118 @@ def grpo_step(
 
         input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
         attention_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
+        prompt_len = prompt_ids.shape[-1]
 
-        per_token_logps = get_per_token_logps(module, input_ids, attention_mask, prompt_ids.shape[-1])
-
-        ref_per_token_logps = minibatch["ref_per_token_logps"]
-        per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-
-        per_token_loss = jnp.exp(per_token_logps - jax.lax.stop_gradient(per_token_logps)) * jnp.expand_dims(
-            advantages, 1
+        per_token_logps, entropies = get_per_token_logps_and_entropies(
+            module,
+            input_ids,
+            attention_mask,
+            prompt_len,
         )
-        per_token_loss = -(per_token_loss - beta * per_token_kl)
-        comps = jnp.sum(completion_mask, axis=1)
-        loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / comps)
-        mean_kl = jnp.mean(jnp.sum(per_token_kl * completion_mask, axis=1) / comps)
+
+        if beta != 0.0:
+            ref_per_token_logps = minibatch["ref_per_token_logps"]
+            per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (
+                ref_per_token_logps - per_token_logps
+            ) - 1
+        else:
+            per_token_kl = jnp.zeros_like(per_token_logps)
+
+        advantages = minibatch["advantages"]
+        if advantages.ndim == 1:
+            advantages = advantages[:, None]
+
+        old_per_token_logps = minibatch.get("old_per_token_logps")
+        if old_per_token_logps is None:
+            old_per_token_logps = jax.lax.stop_gradient(per_token_logps)
+
+        log_ratio = per_token_logps - old_per_token_logps
+        if importance_sampling_level == "token":
+            log_importance_weights = log_ratio
+        elif importance_sampling_level == "sequence":
+            log_importance_weights = (
+                (log_ratio * completion_mask).sum(axis=-1) / jnp.maximum(completion_mask.sum(axis=-1), 1.0)
+            )
+            log_importance_weights = log_importance_weights[:, None]
+        else:
+            raise ValueError(
+                f"Unknown importance sampling level: {importance_sampling_level}. "
+                "Possible values are 'token' and 'sequence'."
+            )
+
+        coef_1 = jnp.exp(log_importance_weights)
+
+        if loss_type == "cispo":
+            clamped_ratios = jnp.minimum(coef_1, epsilon_high)
+            per_token_loss = -clamped_ratios * advantages * per_token_logps
+        elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+            coef_2 = jnp.clip(coef_1, 1 - epsilon, 1 + epsilon_high)
+            if delta is not None:
+                coef_1 = jnp.minimum(coef_1, delta)
+
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -jnp.minimum(per_token_loss1, per_token_loss2)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+        if top_entropy_quantile < 1.0:
+            masked_entropies = jnp.where(completion_mask > 0, entropies, jnp.nan)
+            entropy_threshold = jnp.nanquantile(masked_entropies, 1 - top_entropy_quantile)
+            entropy_mask = (entropies >= entropy_threshold).astype(completion_mask.dtype) * completion_mask
+            per_token_loss = per_token_loss * entropy_mask
+
+        if beta != 0.0:
+            per_token_loss = per_token_loss + beta * per_token_kl
+
+        completion_token_count = jnp.sum(completion_mask)
+        completion_lengths = jnp.sum(completion_mask, axis=1)
+
+        if loss_type == "grpo":
+            loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / jnp.maximum(completion_lengths, 1.0))
+        elif loss_type == "bnpo":
+            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(completion_token_count, 1.0)
+        elif loss_type == "dr_grpo":
+            loss = jnp.sum(per_token_loss * completion_mask) / (per_token_loss.shape[0] * per_token_loss.shape[1])
+        elif loss_type in ["cispo", "dapo"]:
+            normalizer = minibatch.get("num_items_in_batch", completion_token_count)
+            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+        def masked_mean(x):
+            if x.shape[1] == 1:
+                return jnp.mean(x)
+            return jnp.sum(x * completion_mask) / jnp.maximum(completion_token_count, 1.0)
+
+        other_metrics: dict[str, jax.Array] = {
+            "mean_entropy": masked_mean(entropies),
+            "advantages": jnp.mean(advantages),
+        }
+
+        if beta != 0.0:
+            mean_kl = masked_mean(per_token_kl)
+            other_metrics["mean_kl"] = mean_kl
+            other_metrics["ref_per_token_logps"] = jnp.mean(minibatch["ref_per_token_logps"])
+        else:
+            mean_kl = None
+
+        if loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+            is_low_clipped = (coef_1 < 1 - epsilon) & (advantages < 0)
+            is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
+
+            other_metrics["clip_ratio/low_mean"] = masked_mean(is_low_clipped.astype(jnp.float32))
+            other_metrics["clip_ratio/high_mean"] = masked_mean(is_high_clipped.astype(jnp.float32))
+            other_metrics["clip_ratio/region_mean"] = masked_mean(is_region_clipped.astype(jnp.float32))
+        elif loss_type == "cispo":
+            is_cispo_clipped = (coef_1 > epsilon_high) & (advantages > 0)
+            other_metrics["cispo_clip_ratio"] = masked_mean(is_cispo_clipped.astype(jnp.float32))
 
         return loss, LossMetrics(
             loss=loss,
             accuracy=1,
-            other_metrics={
-                "mean_kl": mean_kl,
-                "ref_per_token_logps": jnp.mean(ref_per_token_logps),
-                "advantages": jnp.mean(advantages),
-            },
+            other_metrics=other_metrics,
         )
 
     # Compute gradients and metrics across minibatches.
