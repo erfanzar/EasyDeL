@@ -523,6 +523,12 @@ _import_structure = {
         "RobertaForSequenceClassification",
         "RobertaForTokenClassification",
     ],
+    "modules.seed_oss": [
+        "SeedOssConfig",
+        "SeedOssForCausalLM",
+        "SeedOssForSequenceClassification",
+        "SeedOssModel",
+    ],
     "modules.siglip": [
         "SiglipConfig",
         "SiglipForImageClassification",
@@ -798,6 +804,7 @@ if _tp.TYPE_CHECKING:
         RobertaForSequenceClassification,
         RobertaForTokenClassification,
     )
+    from .modules.seed_oss import SeedOssConfig, SeedOssForCausalLM, SeedOssForSequenceClassification, SeedOssModel
     from .modules.siglip import (
         SiglipConfig,
         SiglipForImageClassification,
