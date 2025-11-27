@@ -173,6 +173,10 @@ class StateDictConverter:
     @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
         """Process a single tensor and return its processed key and value."""
+        # Check if tensor is None or invalid
+        if tensor is None:
+            return None
+
         new_key = key
 
         reform_param = config.get("reform_param", None)
@@ -218,6 +222,9 @@ class StateDictConverter:
 
         elif "weight" in key:
             is_moe_expert = key in config.get("consolidated_moe_keys", set())
+            # Check if tensor has shape attribute
+            if not hasattr(tensor, "shape") or tensor.shape is None:
+                return None
             ndim = len(tensor.shape)
             if not is_moe_expert:
                 if ndim == 2:
@@ -290,10 +297,20 @@ class StateDictConverter:
                 for key in keys:
                     tensor = state_dict.get(key)
                     try:
-                        bytesi = {
-                            i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
-                            for i in range(jax.local_device_count())
-                        }
+                        # Safely get memory stats - CPU devices may not support memory_stats()
+                        bytesi = {}
+                        bytesn = {}
+                        try:
+                            for i in range(jax.local_device_count()):
+                                stats = jax.local_devices()[i].memory_stats()
+                                if stats is not None:
+                                    bytesi[i] = stats.get("bytes_in_use", 0)
+                                else:
+                                    bytesi[i] = 0
+                        except (AttributeError, KeyError, TypeError):
+                            # CPU devices may not support memory_stats()
+                            bytesi = {i: 0 for i in range(jax.local_device_count())}
+
                         results = StateDictConverter.process_tensor(key, tensor, config)
                         if results is not None:
                             for key_tuple, jax_array in results:
@@ -301,16 +318,26 @@ class StateDictConverter:
                                     jax_array = shard_fns[key_tuple](jax_array)
                                 if callback is not None:
                                     jax_array = callback(jax_array, key_tuple)
-                                bytesn = {
-                                    i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
-                                    for i in range(jax.local_device_count())
-                                }
-                                change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
-                                divider = 1024**3
-                                change_gb = {i: round(change[i] / divider, 4) for i in change}
-                                usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
-                                strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
-                                logger.debug(strm)
+
+                                # Safely get memory stats after processing
+                                try:
+                                    for i in range(jax.local_device_count()):
+                                        stats = jax.local_devices()[i].memory_stats()
+                                        if stats is not None:
+                                            bytesn[i] = stats.get("bytes_in_use", 0)
+                                        else:
+                                            bytesn[i] = 0
+                                except (AttributeError, KeyError, TypeError):
+                                    bytesn = {i: 0 for i in range(jax.local_device_count())}
+
+                                # Only log memory stats if we have valid data
+                                if any(bytesi.values()) or any(bytesn.values()):
+                                    change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
+                                    divider = 1024**3
+                                    change_gb = {i: round(change[i] / divider, 4) for i in change}
+                                    usage_gb = {i: round(bytesn[i] / divider, 4) for i in bytesn}
+                                    strm = f"Sharding {'.'.join([str(i) for i in key_tuple])} change_gb: {change_gb} current_gb: {usage_gb}"
+                                    logger.debug(strm)
                                 flax_dict[key_tuple] = jax_array
                     except Exception as e:
                         logger.error(f"Error processing key {key}: {e!s}")
@@ -665,7 +692,9 @@ class StateDictConverter:
                                 for p in inspect.signature(inverse_spliter).parameters.values()
                                 if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
                             ]
-                            wants_torch = len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
+                            wants_torch = (
+                                len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
+                            )
                             if wants_torch:
                                 merged_tensor = inverse_spliter(torch_module, *tensors_to_merge)
                             else:
