@@ -106,16 +106,10 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 _import_structure = {
     "utils": [
-        "DatasetLoadError",
-        "DatasetMixture",
-        "DatasetType",
-        "TextDatasetInform",
-        "VisualDatasetInform",
-        "block_mixture_interleave",
-        "build_dataset",
-        "create_data_iterator",
-        "pack_constant_length",
-        "pack_pre_tokenized",
+        "ModelConverter",
+        "Registry",
+        "StateDictConverter",
+        "TensorConverter",
         "ejit",
         "ePath",
         "ePathLike",
@@ -596,19 +590,11 @@ _import_structure = {
         "TrainingArguments",
         "pack_sequences",
     ],
-    "utils.parameters_transformation": [
-        "ModelConverter",
-        "StateDictConverter",
-        "TensorConverter",
-    ],
-    "utils.registery": [
-        "Registry",
-    ],
 }
 
 
 if _tp.TYPE_CHECKING:
-    from . import utils
+    from . import data, utils
     from .inference import (
         EngineRequest,
         EngineRequestStatus,
@@ -856,23 +842,15 @@ if _tp.TYPE_CHECKING:
         pack_sequences,
     )
     from .utils import (
-        DatasetLoadError,
-        DatasetMixture,
-        DatasetType,
-        TextDatasetInform,
-        VisualDatasetInform,
-        block_mixture_interleave,
-        build_dataset,
-        create_data_iterator,
+        ModelConverter,
+        Registry,
+        StateDictConverter,
+        TensorConverter,
         ejit,
         ePath,
         ePathLike,
-        pack_constant_length,
-        pack_pre_tokenized,
         traversals,
     )
-    from .utils.parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
-    from .utils.registery import Registry
 else:
     _sys.modules[__name__] = _LazyModule(
         __name__,

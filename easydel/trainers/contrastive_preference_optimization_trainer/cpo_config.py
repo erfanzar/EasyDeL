@@ -122,8 +122,7 @@ class CPOConfig(TrainingArguments):
         default=None,
         metadata={
             "help": (
-                "Maximum number of completion tokens. Defaults to `max_length - max_prompt_length` "
-                "when not specified."
+                "Maximum number of completion tokens. Defaults to `max_length - max_prompt_length` when not specified."
             )
         },
     )
@@ -153,4 +152,3 @@ class CPOConfig(TrainingArguments):
             super().__post_init__()
 
     __hash__ = hash_fn
-

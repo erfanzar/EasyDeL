@@ -19,8 +19,7 @@ from eformer.ops.quantization import ArrayNF4
 from flax import nnx
 from flax.nnx import rnglib
 from flax.nnx.nn import initializers
-from flax.typing import DotGeneralT, Dtype, Initializer, PrecisionLike
-from jax import lax
+from flax.typing import Dtype, Initializer, PrecisionLike
 
 from .base_quant import QauntModule
 
@@ -58,7 +57,6 @@ class LinearNF4(QauntModule):
         do_init: bool = False,
         kernel_init: Initializer = default_kernel_init,
         bias_init: Initializer = default_bias_init,
-        dot_general: DotGeneralT = lax.dot_general,
         rngs: rnglib.Rngs,
         block_size: int = 64,
     ):
@@ -91,7 +89,6 @@ class LinearNF4(QauntModule):
         self.precision = precision
         self.kernel_init = kernel_init
         self.bias_init = bias_init
-        self.dot_general = dot_general
         self.block_size = block_size
         # Store padded dimensions for proper dequantization
         self._padded_out_features = _compute_padded_size(out_features, block_size)
@@ -118,7 +115,6 @@ class LinearNF4(QauntModule):
                 precision=linear.precision,
                 kernel_init=linear.kernel_init,
                 bias_init=linear.bias_init,
-                dot_general=linear.dot_general,
                 block_size=block_size,
                 rngs=rngs,
             )
@@ -148,7 +144,6 @@ class LinearNF4(QauntModule):
                 precision=self.precision,
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
-                dot_general=self.dot_general,
                 rngs=rngs,
             )
         )
@@ -198,15 +193,14 @@ class LinearNF4(QauntModule):
         kernel = self._dequantize_kernel()
 
         assert kernel is not None, (
-            "loaded and dequantized kernel is None, which means it has been loaded "
-            "from another None Kernel Linear"
+            "loaded and dequantized kernel is None, which means it has been loaded from another None Kernel Linear"
         )
 
         if self.dtype is not None:
             inputs = inputs.astype(self.dtype)
             kernel = kernel.astype(self.dtype)
 
-        out = self.dot_general(
+        out = jax.lax.dot_general(
             inputs,
             kernel,
             (((inputs.ndim - 1,), (0,)), ((), ())),

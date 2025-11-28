@@ -1145,6 +1145,43 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
 
 
 @auto_pytree
+class GRPODataCollatorTFDS:
+    """Data collator for GRPO training with TFDS backends.
+
+    GRPO only needs prompts since completions are generated online.
+    """
+
+    max_prompt_length: int
+    pad_token_id: int = 0
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        input_ids = [np.asarray(f["input_ids"], dtype=np.int32) for f in features]
+        attention_mask = [np.asarray(f["attention_mask"], dtype=np.int32) for f in features]
+
+        return {
+            "input_ids": pad(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
+            "attention_mask": pad(attention_mask, self.max_prompt_length, 0, "left"),
+        }
+
+
+@auto_pytree
+class GRPODataCollatorGrain:
+    """Grain-compatible GRPO data collator."""
+
+    max_prompt_length: int
+    pad_token_id: int = 0
+
+    def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        input_ids = np.asarray(feature["input_ids"], dtype=np.int32)
+        attention_mask = np.asarray(feature["attention_mask"], dtype=np.int32)
+
+        return {
+            "input_ids": pad_single(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
+            "attention_mask": pad_single(attention_mask, self.max_prompt_length, 0, "left"),
+        }
+
+
+@auto_pytree
 class DPODataCollatorWithPaddingTFDS:
     """Advanced data collator for DPO training with TFDS.
 

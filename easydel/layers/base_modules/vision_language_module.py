@@ -213,10 +213,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         # Store router aux loss coefficient for MoE models
         self._router_aux_loss_coef = router_aux_loss_coef
 
-    # =========================================================================
-    # Abstract Methods - Must be implemented by subclasses
-    # =========================================================================
-
     @abstractmethod
     def get_image_features(
         self,
@@ -238,10 +234,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             Projected image features ready for merging with text embeddings
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement get_image_features()")
-
-    # =========================================================================
-    # Optional Methods - Override for video/mRoPE support
-    # =========================================================================
 
     def get_video_features(
         self,
@@ -265,10 +257,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             f"{self.__class__.__name__} does not support video input. "
             "Override get_video_features() to add video support."
         )
-
-    # =========================================================================
-    # Common Utilities
-    # =========================================================================
 
     @staticmethod
     def merge_multimodal_embeddings(
@@ -345,10 +333,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         """
         return self._multimodal_merge_feature.create_multimodal_mask(input_ids)
 
-    # =========================================================================
-    # Component Accessors
-    # =========================================================================
-
     def get_vision_tower(self) -> nn.Module:
         """Returns the vision encoder/tower component.
 
@@ -414,10 +398,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             The language model module
         """
         return self.get_language_model()
-
-    # =========================================================================
-    # Forward Pass
-    # =========================================================================
 
     def __call__(
         self,
@@ -524,10 +504,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             router_logits=router_logits,
             aux_loss=aux_loss,
         )
-
-    # =========================================================================
-    # Generation Helpers
-    # =========================================================================
 
     def _get_compile_model_kwargs(
         self,

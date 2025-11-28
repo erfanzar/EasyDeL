@@ -35,7 +35,8 @@ from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger
 from easydel.utils.traversals import deepcopy_model
 
-from ..prompt_utils import apply_chat_template, is_conversational, maybe_apply_chat_template, maybe_extract_prompt
+from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
+from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
@@ -49,6 +50,8 @@ except ImportError:
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
+
+    from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
 RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
@@ -113,8 +116,8 @@ class GRPOTrainer(Trainer):
         arguments: GRPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None,
         reward_funcs: RewardFunc | list[RewardFunc],
-        train_dataset: Dataset | None = None,
-        eval_dataset: Dataset | dict[str, Dataset] | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
         reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
@@ -200,9 +203,7 @@ class GRPOTrainer(Trainer):
             arguments.reward_weights if arguments.reward_weights is not None else [1.0] * len(reward_funcs),
             dtype="f4",
         )
-        self.reward_func_names = [
-            getattr(func, "__name__", None) or func.__class__.__name__ for func in reward_funcs
-        ]
+        self.reward_func_names = [getattr(func, "__name__", None) or func.__class__.__name__ for func in reward_funcs]
 
         self.num_generations = arguments.num_generations
         self.reward_processing_classes = reward_processing_classes
@@ -227,23 +228,21 @@ class GRPOTrainer(Trainer):
         ):
             if value is not None and key not in self.arguments.generation_extra_kwargs:
                 self.arguments.generation_extra_kwargs[key] = value
+        # Check if datasets are conversational before passing to BaseTrainer
         self.train_is_conversational = False
         self.eval_is_conversational = False
-        self.data_tokenize_fn = data_tokenize_fn
         if train_dataset is not None:
-            train_dataset = self._prepare_dataset(
-                dataset=train_dataset,
-                processing_class=processing_class,
-                arguments=arguments,
-                dataset_name="train",
-            )
+            try:
+                self.train_is_conversational = is_conversational(train_dataset[0])
+            except (IndexError, KeyError):
+                pass
         if eval_dataset is not None:
-            eval_dataset = self._prepare_dataset(
-                dataset=eval_dataset,
-                processing_class=processing_class,
-                arguments=arguments,
-                dataset_name="eval",
-            )
+            try:
+                self.eval_is_conversational = is_conversational(eval_dataset[0])
+            except (IndexError, KeyError):
+                pass
+
+        self.data_tokenize_fn = data_tokenize_fn
         log_table = None
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
             log_table = wandb.Table(columns=["generated_result", "input_prompt", "took", "length", "step"])
@@ -258,66 +257,53 @@ class GRPOTrainer(Trainer):
             processing_class=processing_class,
         )
 
-    def _prepare_dataset(
+    def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
+        """Get GRPO preprocessing transform for ShardedDataSource."""
+
+        if self._is_pretokenized():
+            return None
+        return GRPOPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_prompt_length=self.arguments.max_prompt_length,
+            tools=getattr(self.arguments, "tools", None),
+            skip_apply_chat_template=self.arguments.skip_apply_chat_template,
+        )
+
+    def _is_pretokenized(self) -> bool:
+        """Check if dataset already has tokenized fields."""
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
+
+    def create_grain_collect_function(
         self,
-        dataset: Dataset | IterableDataset,
-        processing_class: ProcessingClassType,
-        arguments: GRPOConfig,
-        dataset_name: str,
-    ) -> Dataset | IterableDataset:
-        map_kwargs = {"writer_batch_size": 10}
-        from datasets import Dataset
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Create data collator for Grain data loading."""
+        from ..utils import GRPODataCollatorGrain
 
-        if isinstance(dataset, Dataset):
-            map_kwargs["num_proc"] = arguments.dataset_num_proc
+        return GRPODataCollatorGrain(
+            max_prompt_length=self.arguments.max_prompt_length,
+            pad_token_id=self.padding_value,
+        )
 
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"Extracting prompt in {dataset_name} dataset"
-        if dataset_name == "train":
-            self.train_is_conversational = is_conversational(dataset[0])
-        else:
-            self.eval_is_conversational = is_conversational(dataset[0])
+    def create_tfds_collect_function(
+        self,
+        max_sequence_length: int,
+        truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+    ) -> tp.Callable:
+        """Create data collator for TFDS data loading."""
+        from ..utils import GRPODataCollatorTFDS
 
-        dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
-
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
-        if not self.arguments.skip_apply_chat_template:
-            dataset = dataset.map(
-                maybe_apply_chat_template,
-                fn_kwargs={"tokenizer": processing_class, "tools": arguments.tools},
-                **map_kwargs,
-            )
-
-        def _tokenize(example):
-            tools = example.get("tools", None)
-            extra = {}
-            if tools is not None:
-                extra = dict(tools=tools)
-            return processing_class(
-                example["prompt"],
-                return_tensors="np",
-                padding="max_length",
-                padding_side="left",
-                max_length=arguments.max_prompt_length,
-                truncation=True,
-                add_special_tokens=False,
-                return_attention_mask=True,
-                **extra,
-            )
-
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"tokenizing {dataset_name} dataset"
-        if self.data_tokenize_fn is not None:
-            dataset = dataset.map(
-                self.data_tokenize_fn,
-                batched=True,
-                fn_kwargs={"tokenizer": processing_class, "tools": arguments.tools},
-                **map_kwargs,
-            )
-        else:
-            dataset = dataset.map(_tokenize, batched=True, **map_kwargs)
-        return dataset
+        return GRPODataCollatorTFDS(
+            max_prompt_length=self.arguments.max_prompt_length,
+            pad_token_id=self.padding_value,
+        )
 
     @property
     def step_sharding(self):
@@ -429,6 +415,8 @@ class GRPOTrainer(Trainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
+        # Purify batch first to handle list of dicts (uncollated batch)
+        batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 

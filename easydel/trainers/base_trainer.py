@@ -42,6 +42,10 @@ from transformers import GenerationConfig, ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from easydel import __version__
+
+# Import ShardedDataSource for trainer integration
+from easydel.data.core.protocols import ShardedDataSource
+from easydel.data.sources.hf_wrapper import wrap_hf_dataset
 from easydel.inference import SamplingParams
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -73,6 +77,7 @@ except ImportError:
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
 
+    from easydel.data.transforms.base import Transform
     from easydel.inference.esurge.esurge_engine import RequestOutput
 
 logger = get_logger(__name__)
@@ -129,15 +134,21 @@ class BaseTrainer(BaseTrainerProtocol):
         finetune: Whether this is a fine-tuning run
         mesh: Device mesh for distributed computation
         checkpoint_manager: Manager for saving/loading checkpoints
+        _train_source: Internal ShardedDataSource for training data
+        _eval_source: Internal ShardedDataSource for evaluation data
     """
+
+    # Type annotations for internal data sources
+    _train_source: ShardedDataSource | None
+    _eval_source: ShardedDataSource | None
 
     def __init__(
         self,
         arguments: TrainingArguments | None = None,
         model_state: EasyDeLState | None = None,
         model: tp.type[EasyDeLBaseModule] | None = None,
-        dataset_train: Dataset | None = None,
-        dataset_eval: Dataset | None = None,
+        dataset_train: Dataset | IterableDataset | ShardedDataSource | None = None,
+        dataset_eval: Dataset | IterableDataset | ShardedDataSource | None = None,
         data_collator: tp.Callable | None = None,
         finetune: bool = True,
         processing_class: PreTrainedTokenizerBase | None = None,
@@ -150,8 +161,8 @@ class BaseTrainer(BaseTrainerProtocol):
             arguments: Training configuration and hyperparameters
             model_state: Pre-initialized model state (mutually exclusive with model)
             model: Model class to initialize (mutually exclusive with model_state)
-            dataset_train: Training dataset
-            dataset_eval: Evaluation dataset
+            dataset_train: Training dataset (HF Dataset, IterableDataset, or ShardedDataSource)
+            dataset_eval: Evaluation dataset (HF Dataset, IterableDataset, or ShardedDataSource)
             data_collator: Function to collate batches of data
             finetune: Whether this is a fine-tuning run (affects initialization)
             processing_class: Tokenizer or processor for handling text encoding/decoding
@@ -216,6 +227,14 @@ class BaseTrainer(BaseTrainerProtocol):
         self.data_collator = data_collator
         self.finetune = finetune
         self.processing_class = processing_class
+
+        # Convert datasets to ShardedDataSource for unified internal handling
+        self._train_source = self._to_sharded_source(dataset_train)
+        self._eval_source = self._to_sharded_source(dataset_eval)
+
+        # Apply trainer-specific preprocessing transform if available
+        self._apply_preprocess_transforms()
+
         self._initialize_attributes()
         self.initialize_trainer_utils()
 
@@ -438,6 +457,72 @@ class BaseTrainer(BaseTrainerProtocol):
             )[:, None]
         ).astype(jnp.int32)
 
+    def _to_sharded_source(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> ShardedDataSource | None:
+        """Convert any dataset type to ShardedDataSource.
+
+        This enables trainers to work with a unified data interface internally
+        while accepting various input types from users.
+
+        Args:
+            dataset: Input dataset (HF Dataset, IterableDataset, or ShardedDataSource).
+
+        Returns:
+            ShardedDataSource wrapping the input, or None if input is None.
+
+        Raises:
+            TypeError: If dataset type is not supported.
+        """
+        if dataset is None:
+            return None
+        if isinstance(dataset, ShardedDataSource):
+            return dataset
+        # Use wrap_hf_dataset for HF datasets
+        return wrap_hf_dataset(dataset)
+
+    def _apply_preprocess_transforms(self) -> None:
+        """Apply preprocessing transforms to data sources.
+
+        Gets the trainer-specific transform via _get_preprocess_transform()
+        and applies it to both train and eval sources if available.
+        """
+        transform = self._get_preprocess_transform()
+        if transform is None:
+            return
+
+        if self._train_source is not None:
+            self._train_source = self._train_source.transform(transform)
+        if self._eval_source is not None:
+            self._eval_source = self._eval_source.transform(transform)
+
+    def _get_preprocess_transform(self) -> Transform | None:
+        """Get trainer-specific preprocessing transform.
+
+        Override in subclasses to return a Transform that will be applied
+        to the ShardedDataSource during data loading.
+
+        Returns:
+            Transform instance or None if no preprocessing needed.
+            Return None if data is already preprocessed (e.g., has input_ids).
+        """
+        return None
+
+    def _is_pretokenized(self) -> bool:
+        """Check if the training dataset is already tokenized.
+
+        Returns:
+            True if dataset already contains 'input_ids' field.
+        """
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
+
     def _initialize_attributes(self):
         """Initialize all trainer attributes with default values.
 
@@ -652,8 +737,82 @@ class BaseTrainer(BaseTrainerProtocol):
         -----
         This method can be overridden to implement custom preprocessing
         such as data augmentation, masking, or format conversion.
+        The batch is automatically purified to remove non-array fields.
         """
+        # Purify batch to keep only JAX-compatible array fields
+        batch = self._purify_batch(batch)
         return batch, {}
+
+    def _purify_batch(self, batch: dict) -> dict:
+        """Remove non-JAX-compatible fields from a batch.
+
+        Filters out fields that cannot be passed to JAX JIT-compiled functions,
+        such as strings, lists of strings, or other non-array types.
+
+        Parameters
+        ----------
+        batch : dict
+            The batch dictionary to purify
+
+        Returns
+        -------
+        dict
+            Purified batch with only JAX-compatible array fields
+        """
+        import numpy as np
+
+        # Handle list of dicts (uncollated batch)
+        if isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
+            # Collate list of dicts into dict of arrays with padding
+            collated = {}
+            for key in batch[0].keys():
+                values = [example.get(key) for example in batch]
+                # Skip None values
+                if any(v is None for v in values):
+                    continue
+                try:
+                    arrays = [np.asarray(v) for v in values]
+                    # Check if arrays have same shape
+                    if all(arr.shape == arrays[0].shape for arr in arrays):
+                        collated[key] = np.stack(arrays)
+                    else:
+                        # Pad sequences to same length (for 1D arrays like input_ids)
+                        if all(arr.ndim == 1 for arr in arrays):
+                            max_len = max(len(arr) for arr in arrays)
+                            # Determine pad value (0 for input_ids, typically)
+                            pad_value = 0
+                            padded = []
+                            for arr in arrays:
+                                if len(arr) < max_len:
+                                    padded.append(np.pad(arr, (0, max_len - len(arr)), constant_values=pad_value))
+                                else:
+                                    padded.append(arr)
+                            collated[key] = np.stack(padded)
+                        else:
+                            # Can't handle multi-dimensional arrays with different shapes
+                            pass
+                except (ValueError, TypeError):
+                    pass  # Skip non-stackable values
+            batch = collated
+
+        purified = {}
+        for key, value in batch.items():
+            # Keep only numeric arrays (numpy or JAX)
+            if isinstance(value, (np.ndarray, jax.Array)):
+                # Check if it's a numeric dtype (not object/string)
+                if hasattr(value, "dtype") and np.issubdtype(value.dtype, np.number):
+                    purified[key] = value
+                elif hasattr(value, "dtype") and value.dtype == np.bool_:
+                    purified[key] = value
+            elif isinstance(value, (list, tuple)):
+                # Try to convert to array - will fail for strings
+                try:
+                    arr = np.asarray(value)
+                    if np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_:
+                        purified[key] = arr
+                except (ValueError, TypeError):
+                    pass  # Skip non-convertible values
+        return purified
 
     def _ensure_functions_compiled(self):
         """Ensure training and evaluation functions are compiled.
@@ -1820,6 +1979,44 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         raise NotImplementedError
 
+    def _create_dataloader_from_source(
+        self,
+        source: "ShardedDataSource",
+        batch_size: int,
+        is_train: bool = True,
+        shuffle: bool = False,
+        num_epochs: int = 1,
+        drop_remainder: bool = True,
+    ) -> tp.Iterator:
+        """Create dataloader iterator from ShardedDataSource.
+
+        Iterates over the transformed source (with tokenization applied).
+        Yields lists of examples (batches) that will be collated by the
+        training loop's data_collator.
+
+        Args:
+            source: ShardedDataSource to iterate over.
+            batch_size: Batch size for batching examples.
+            is_train: Whether this is for training (affects logging).
+            shuffle: Whether to shuffle (currently not implemented for sources).
+            num_epochs: Number of epochs to iterate.
+            drop_remainder: Whether to drop the last incomplete batch.
+
+        Yields:
+            Lists of examples (pre-tokenized dicts) to be collated.
+        """
+        for _ in range(num_epochs):
+            batch = []
+            for shard_name in source.shard_names:
+                for example in source.open_shard(shard_name):
+                    batch.append(example)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+            # Handle remainder
+            if batch and not drop_remainder:
+                yield batch
+
     def _configure_grain_dataloader(self):
         """Configure Grain dataloaders for training and evaluation.
 
@@ -1917,12 +2114,35 @@ class BaseTrainer(BaseTrainerProtocol):
             return steps
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
-        dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
+
+        # Use _train_source if available (has transforms applied)
+        if self._train_source is not None:
+            dataloader_train = self._create_dataloader_from_source(
+                source=self._train_source,
+                batch_size=self.training_batch_size,
+                is_train=True,
+                shuffle=self.arguments.shuffle_train_dataset,
+                num_epochs=self.arguments.num_train_epochs,
+                drop_remainder=True,
+            )
+        else:
+            dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
 
         dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
             max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
-            dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
+            # Use _eval_source if available (has transforms applied)
+            if self._eval_source is not None:
+                dataloader_eval = self._create_dataloader_from_source(
+                    source=self._eval_source,
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    shuffle=False,
+                    num_epochs=1,
+                    drop_remainder=True,
+                )
+            else:
+                dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
 
         return TrainerConfigureDataloaderOutput(
             dataloader_train=dataloader_train,
@@ -2090,11 +2310,33 @@ class BaseTrainer(BaseTrainerProtocol):
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
 
-        dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
+        # Use _train_source if available (has transforms applied)
+        if self._train_source is not None:
+            dataloader_train = self._create_dataloader_from_source(
+                source=self._train_source,
+                batch_size=self.training_batch_size,
+                is_train=True,
+                shuffle=self.arguments.shuffle_train_dataset,
+                num_epochs=self.arguments.num_train_epochs,
+                drop_remainder=True,
+            )
+        else:
+            dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
         if self.dataset_eval is not None and self.arguments.do_eval:
             max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
-            dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
+            # Use _eval_source if available (has transforms applied)
+            if self._eval_source is not None:
+                dataloader_eval = self._create_dataloader_from_source(
+                    source=self._eval_source,
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    shuffle=False,
+                    num_epochs=1,
+                    drop_remainder=True,
+                )
+            else:
+                dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
         else:
             dataloader_eval, max_evaluation_steps = None, 0
 

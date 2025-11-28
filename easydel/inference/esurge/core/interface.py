@@ -71,9 +71,9 @@ class CacheSpec:
         """
         Merge a list of CacheSpec objects into a single CacheSpec object.
         """
-        assert all(
-            spec.type_id == specs[0].type_id for spec in specs[1:]
-        ), "All layers in the same KV cache group must share the same type_id."
+        assert all(spec.type_id == specs[0].type_id for spec in specs[1:]), (
+            "All layers in the same KV cache group must share the same type_id."
+        )
         return copy.deepcopy(specs[0])
 
 
@@ -132,9 +132,9 @@ class FullAttentionSpec(AttentionSpec):
 
         merged_spec.sliding_window = cls.merge_window_sizes(sliding_window)
         merged_spec.attention_chunk_size = cls.merge_window_sizes(attention_chunk_size)
-        assert (merged_spec.sliding_window is not None) + (
-            merged_spec.attention_chunk_size is not None
-        ) <= 1, "Model with both sliding window layers and chunked local attention layers is not supported."
+        assert (merged_spec.sliding_window is not None) + (merged_spec.attention_chunk_size is not None) <= 1, (
+            "Model with both sliding window layers and chunked local attention layers is not supported."
+        )
         return merged_spec
 
 
@@ -319,15 +319,19 @@ def create_kv_cache_specs_from_config(
         else:
             raise ValueError(f"Unknown attention mask type: {mask_type}")
 
-    return specs if specs else [
-        CacheGroupSpec(
-            kv_cache_spec=FullAttentionSpec(
-                page_size=page_size,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-                dtype=dtype,
-                use_mla=use_mla,
-            ),
-            layer_names=None,
-        )
-    ]
+    return (
+        specs
+        if specs
+        else [
+            CacheGroupSpec(
+                kv_cache_spec=FullAttentionSpec(
+                    page_size=page_size,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    dtype=dtype,
+                    use_mla=use_mla,
+                ),
+                layer_names=None,
+            )
+        ]
+    )

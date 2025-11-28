@@ -367,6 +367,68 @@ class VisualDatasetInformCfg(TypedDict, total=False):
     format_fields: NotRequired[dict[str, str] | None]
 
 
+class TokenizationCfg(TypedDict, total=False):
+    """Tokenization configuration for dataset preprocessing.
+
+    Attributes:
+        tokenizer: HuggingFace tokenizer name/path (defaults to model's tokenizer)
+        max_length: Maximum sequence length for tokenization (default: 2048)
+        truncation: Whether to truncate sequences exceeding max_length (default: True)
+        padding: Padding strategy - "max_length", "longest", False (default: False)
+        add_special_tokens: Whether to add special tokens like BOS/EOS (default: True)
+        return_attention_mask: Whether to return attention masks (default: True)
+        text_field: Field name containing text to tokenize (default: "text")
+        output_field: Field name for tokenized output (default: "tokens")
+        num_proc: Number of processes for parallel tokenization (default: None, auto)
+        batched: Whether to process examples in batches (default: True)
+        batch_size: Batch size for batched processing (default: 1000)
+        remove_columns: Columns to remove after tokenization (default: None, auto-detect)
+        keep_in_memory: Keep processed dataset in memory (default: False)
+    """
+
+    tokenizer: NotRequired[str | None]
+    max_length: NotRequired[int]
+    truncation: NotRequired[bool]
+    padding: NotRequired[bool | Literal["max_length", "longest"]]
+    add_special_tokens: NotRequired[bool]
+    return_attention_mask: NotRequired[bool]
+    text_field: NotRequired[str]
+    output_field: NotRequired[str]
+    num_proc: NotRequired[int | None]
+    batched: NotRequired[bool]
+    batch_size: NotRequired[int]
+    remove_columns: NotRequired[list[str] | None]
+    keep_in_memory: NotRequired[bool]
+
+
+class DatasetSaveCfg(TypedDict, total=False):
+    """Configuration for saving processed/tokenized datasets.
+
+    Attributes:
+        output_path: Path to save the dataset (required)
+        format: Output format - "parquet", "arrow", "json", "jsonl" (default: "parquet")
+        num_shards: Number of shards to split the dataset into (default: None, auto)
+        compression: Compression algorithm - "snappy", "gzip", "zstd", None (default: "snappy")
+        max_shard_size: Maximum shard size in bytes or string like "500MB" (default: "500MB")
+        overwrite: Whether to overwrite existing files (default: False)
+        push_to_hub: Whether to push to HuggingFace Hub (default: False)
+        hub_repo_id: HuggingFace Hub repository ID (required if push_to_hub=True)
+        hub_private: Whether to make the Hub repository private (default: False)
+        hub_token: HuggingFace token for authentication (default: None, use env)
+    """
+
+    output_path: Required[str]
+    format: NotRequired[Literal["parquet", "arrow", "json", "jsonl"]]
+    num_shards: NotRequired[int | None]
+    compression: NotRequired[Literal["snappy", "gzip", "zstd"] | None]
+    max_shard_size: NotRequired[str | int]
+    overwrite: NotRequired[bool]
+    push_to_hub: NotRequired[bool]
+    hub_repo_id: NotRequired[str | None]
+    hub_private: NotRequired[bool]
+    hub_token: NotRequired[str | None]
+
+
 class DataMixtureCfg(TypedDict, total=False):
     """Data mixture configuration for training/evaluation datasets.
 
@@ -398,6 +460,17 @@ class DataMixtureCfg(TypedDict, total=False):
         mixture_block_size: Number of examples per block (default: 2048)
         stop_strategy: Strategy when dataset exhausted - "restart" or "first_exhausted" (default: "restart")
         mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None)
+
+        # Tokenization configuration
+        tokenization: Configuration for tokenizing the dataset (default: None)
+
+        # Save configuration
+        save: Configuration for saving the processed dataset (default: None)
+
+        # ShardedDataSource configuration (new data pipeline)
+        use_sharded_source: Use new ShardedDataSource architecture (default: False)
+            When True, builds a ShardedDataSource instead of HF Dataset for more
+            efficient streaming and lazy transforms.
 
         # Legacy/deprecated attributes (kept for compatibility)
         use_fast_loader: Enable fast data loading with fsspec (deprecated)
@@ -433,6 +506,15 @@ class DataMixtureCfg(TypedDict, total=False):
     mixture_block_size: NotRequired[int]
     stop_strategy: NotRequired[str]
     mixture_weights: NotRequired[dict[str, float] | None]
+
+    # Tokenization configuration
+    tokenization: NotRequired[TokenizationCfg | None]
+
+    # Save configuration
+    save: NotRequired[DatasetSaveCfg | None]
+
+    # ShardedDataSource configuration (new data pipeline)
+    use_sharded_source: NotRequired[bool]
 
     # Legacy/deprecated (kept for compatibility)
     use_fast_loader: NotRequired[bool]

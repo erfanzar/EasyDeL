@@ -665,7 +665,9 @@ class StateDictConverter:
                                 for p in inspect.signature(inverse_spliter).parameters.values()
                                 if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
                             ]
-                            wants_torch = len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
+                            wants_torch = (
+                                len(positional_params) > len(tensors_to_merge) and positional_params[0].name == "torch"
+                            )
                             if wants_torch:
                                 merged_tensor = inverse_spliter(torch_module, *tensors_to_merge)
                             else:

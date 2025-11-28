@@ -15,14 +15,109 @@
 """Utility functions for dataset operations.
 
 This module provides helper functions for common dataset operations including
-file globbing, format detection, and column alignment.
+file globbing, format detection, column alignment, and cloud storage utilities.
 """
 
 from __future__ import annotations
 
+import time
 import warnings
+from collections.abc import Callable
+from functools import wraps
+from pathlib import Path
 
 import fsspec
+
+
+def with_retry(
+    max_retries: int = 3,
+    initial_delay: float = 0.1,
+    max_delay: float = 10.0,
+    backoff_factor: float = 2.0,
+    retryable_exceptions: tuple = (IOError, OSError, TimeoutError),
+) -> Callable:
+    """Decorator for retry with exponential backoff on transient errors.
+
+    Args:
+        max_retries: Maximum number of retry attempts.
+        initial_delay: Initial delay between retries in seconds.
+        max_delay: Maximum delay between retries.
+        backoff_factor: Multiplier for delay after each retry.
+        retryable_exceptions: Tuple of exception types to retry on.
+
+    Returns:
+        Decorated function with retry logic.
+
+    Example:
+        >>> @with_retry(max_retries=3)
+        ... def fetch_data(url):
+        ...     return requests.get(url)
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        time.sleep(min(delay, max_delay))
+                        delay *= backoff_factor
+                    else:
+                        raise
+            raise last_exception
+
+        return wrapper
+
+    return decorator
+
+
+def get_cached_filesystem(
+    protocol: str,
+    cache_dir: str | Path,
+    cache_type: str = "filecache",
+    expiry_time: int = 86400,
+    storage_options: dict | None = None,
+):
+    """Get a cached fsspec filesystem for remote protocols.
+
+    Args:
+        protocol: Remote protocol (gs, s3, etc.).
+        cache_dir: Local directory for cached files.
+        cache_type: Cache type - "filecache", "simplecache", or "blockcache".
+        expiry_time: Cache expiry time in seconds (default: 24 hours).
+        storage_options: Additional options for the underlying filesystem.
+
+    Returns:
+        Cached filesystem instance, or regular filesystem for local protocols.
+
+    Example:
+        >>> fs = get_cached_filesystem("gs", "/tmp/cache")
+        >>> with fs.open("bucket/file.parquet", "rb") as f:
+        ...     data = f.read()
+    """
+    if protocol in ("file", "local", ""):
+        return fsspec.filesystem("file")
+
+    cache_path = Path(cache_dir) / "fsspec_cache" / protocol
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    target_options = (storage_options or {}).get(protocol, {})
+
+    return fsspec.filesystem(
+        cache_type,
+        target_protocol=protocol,
+        target_options=target_options,
+        cache_storage=str(cache_path),
+        check_files=False,
+        expiry_time=expiry_time,
+        same_names=False,
+    )
 
 
 def is_streaming(ds) -> bool:
@@ -74,12 +169,18 @@ def glob_files(pattern: str, recursive: bool = True) -> list[str]:
         >>> print(f"Found {len(files)} JSON files")
     """
     so = fsspec.utils.infer_storage_options(pattern)
-    fs = fsspec.filesystem(so.get("protocol", "file"))
+    proto = so.get("protocol", "file")
+    fs = fsspec.filesystem(proto)
     path = so.get("path", pattern)
     matches = fs.glob(path, recursive=recursive)
-    proto = so.get("protocol")
-    if proto and not proto.startswith("file"):
-        matches = [f"{proto}://{m}" if not m.startswith(f"{proto}://") else m for m in matches]
+
+    # Restore full URIs for remote protocols
+    if proto not in ("file", "local", ""):
+        # Use fsspec's built-in method if available
+        if hasattr(fs, "unstrip_protocol"):
+            matches = [fs.unstrip_protocol(m) for m in matches]
+        else:
+            matches = [f"{proto}://{m}" if "://" not in m else m for m in matches]
     return matches
 
 

@@ -113,6 +113,7 @@ def create_tuple_parser(
     n: int,
 ) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
     """Ensure a scalar or sequence is expanded into a tuple of length ``n``."""
+
     def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
         if isinstance(x, tp.Sequence):
             if len(x) == n:
@@ -319,9 +320,9 @@ class Mamba2Mixer(nn.Module):
         self.A_log = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.log(
-                jnp.arange(1, self.num_heads + 1, dtype=jnp.float32)
-            ).astype(dtype),
+            init_fn=lambda key, shape, dtype: jnp.log(jnp.arange(1, self.num_heads + 1, dtype=jnp.float32)).astype(
+                dtype
+            ),
             key=None,
         )
         self.D = ArrayParam.bound(
