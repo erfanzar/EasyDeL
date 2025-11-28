@@ -29,7 +29,7 @@ from enum import Enum
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree, field
 
-from ..helpers import get_cache_dir
+from easydel.utils.helpers import get_cache_dir
 
 
 class DatasetType(str, Enum):
@@ -104,7 +104,7 @@ class BaseDatasetInform:
     """
 
     type: DatasetType | str | None = None
-    data_files: os.PathLike | str = None
+    data_files: os.PathLike | str | None = None
     num_rows: int | None = None
     dataset_split_name: str | None = None
     split: str = "train"
@@ -113,7 +113,12 @@ class BaseDatasetInform:
 
     def __post_init__(self):
         if self.type is None:
-            inferred_type = DatasetType.infer_from_path(self.data_files)
+            # Convert PathLike to string for type inference
+            if self.data_files is not None:
+                path_str = str(self.data_files)
+                inferred_type = DatasetType.infer_from_path(path_str)
+            else:
+                inferred_type = None
             if inferred_type:
                 self.type = inferred_type
             assert self.type is not None, (
@@ -220,7 +225,7 @@ class DatasetMixture:
         mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None).
 
     Example:
-        >>> from easydel.utils.data_managers import DatasetMixture, TextDatasetInform
+        >>> from easydel.data import DatasetMixture, TextDatasetInform
         >>>
         >>> # Simple mixture
         >>> mixture = DatasetMixture(
@@ -262,6 +267,16 @@ class DatasetMixture:
 
     pack_on_the_fly: bool = False
     tokenize_callback: tp.Callable[[dict], list[int]] | None = None
+
+    # Prefetch configuration
+    prefetch_workers: int = 2
+    prefetch_buffer_size: int = 4
+
+    # Cloud storage options
+    cloud_max_retries: int = 3
+    cloud_retry_delay: float = 0.1
+    cache_remote_files: bool = True
+    cache_expiry_seconds: int = 86400
 
     block_mixture: bool = True
     mixture_block_size: int = 2048
@@ -348,7 +363,7 @@ class DatasetMixture:
             >>> for batch in dataset:
             ...     process(batch)
         """
-        from .pipeline import build_dataset
+        from ..execution.pipeline import build_dataset
 
         return build_dataset(self)
 

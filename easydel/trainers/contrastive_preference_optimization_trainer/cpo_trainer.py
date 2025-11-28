@@ -29,7 +29,7 @@ from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
 from ..base_trainer import TrainerConfigureFunctionOutput
-from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..prompt_transforms import CPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
 from ..utils import (
@@ -41,7 +41,8 @@ from .cpo_config import CPOConfig
 
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
-    from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
+
+    from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
 
@@ -69,8 +70,8 @@ class CPOTrainer(Trainer):
         arguments: CPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None,
         processing_class: ProcessingClassType,
-        train_dataset: Dataset | IterableDataset | None = None,
-        eval_dataset: Dataset | dict[str, Dataset] | IterableDataset | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         data_collator: DataCollatorForPreferenceTFDS | DataCollatorForPreferenceGrain | None = None,
     ):
         if not isinstance(arguments, CPOConfig):
@@ -135,138 +136,39 @@ class CPOTrainer(Trainer):
         if arguments.disable_dropout:
             model_state.model.eval()
 
-        prepared_train = (
-            self._prepare_dataset(
-                train_dataset,
-                processing_class,
-                arguments,
-                dataset_name="train",
-            )
-            if train_dataset is not None
-            else None
-        )
-
-        prepared_eval: Dataset | IterableDataset | dict[str, Dataset] | None
-        if eval_dataset is None:
-            prepared_eval = None
-        elif isinstance(eval_dataset, dict):
-            prepared_eval = {
-                key: self._prepare_dataset(dataset, processing_class, arguments, dataset_name=key)
-                for key, dataset in eval_dataset.items()
-            }
-        else:
-            prepared_eval = self._prepare_dataset(
-                eval_dataset,
-                processing_class,
-                arguments,
-                dataset_name="eval",
-            )
-
-        self.train_dataset = prepared_train
-        self.eval_dataset = prepared_eval
         self.model_state = model_state
 
         super().__init__(
             model_state=model_state,
             arguments=arguments,
-            dataset_train=prepared_train,
-            dataset_eval=prepared_eval,
+            dataset_train=train_dataset,
+            dataset_eval=eval_dataset,
             data_collator=None,
             processing_class=processing_class,
         )
 
-    def _prepare_dataset(
-        self,
-        dataset: Dataset | IterableDataset,
-        processing_class: PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin,
-        arguments: CPOConfig,
-        dataset_name: str,
-    ) -> Dataset | IterableDataset:
-        """Prepare dataset by extracting prompts, applying templates, and tokenizing.
+    def _get_preprocess_transform(self) -> CPOPreprocessTransform | None:
+        """Get CPO preprocessing transform for ShardedDataSource."""
 
-        Args:
-            dataset: Raw dataset to process.
-            processing_class: Tokenizer or processor.
-            arguments: Training configuration.
-            dataset_name: Name for logging.
-
-        Returns:
-            Processed dataset with tokenized fields.
-        """
-        map_kwargs: dict[str, tp.Any] = {}
-        from datasets import Dataset
-
-        if isinstance(dataset, Dataset):
-            map_kwargs["num_proc"] = arguments.dataset_num_proc
-
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"Extracting prompt for {dataset_name}"
-        dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
-
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"Applying chat template to {dataset_name}"
-        dataset = dataset.map(
-            maybe_apply_chat_template,
-            fn_kwargs={"tokenizer": processing_class, "tools": getattr(arguments, "tools", None)},
-            **map_kwargs,
+        if self._is_pretokenized():
+            return None
+        return CPOPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_prompt_length=self.arguments.max_prompt_length,
+            max_completion_length=self.arguments.max_completion_length,
+            tools=getattr(self.arguments, "tools", None),
+            label_pad_token_id=self.arguments.label_pad_token_id,
         )
 
-        if isinstance(dataset, Dataset):
-            map_kwargs["desc"] = f"Tokenising {dataset_name}"
-        dataset = dataset.map(
-            self.tokenize_row,
-            remove_columns=["prompt", "chosen", "rejected"],
-            fn_kwargs={
-                "processing_class": processing_class,
-                "max_prompt_length": arguments.max_prompt_length,
-                "max_completion_length": arguments.max_completion_length,
-            },
-            **map_kwargs,
-        )
-        return dataset
-
-    @staticmethod
-    def tokenize_row(
-        features: dict[str, str],
-        processing_class,
-        max_prompt_length: int | None,
-        max_completion_length: int | None,
-    ) -> dict[str, list[int]]:
-        """Tokenize a single row with prompt, chosen, and rejected completions.
-
-        Args:
-            features: Dictionary with 'prompt', 'chosen', and 'rejected' fields.
-            processing_class: Tokenizer.
-            max_prompt_length: Maximum prompt length.
-            max_completion_length: Maximum completion length.
-
-        Returns:
-            Dictionary with tokenized fields.
-        """
-        tokenizer = processing_class
-        prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
-        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
-        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
-
-        if tokenizer.bos_token_id is not None:
-            prompt_input_ids = [tokenizer.bos_token_id, *prompt_input_ids]
-        if tokenizer.eos_token_id is not None:
-            prompt_input_ids = [*prompt_input_ids, tokenizer.eos_token_id]
-
-        chosen_input_ids = [*chosen_input_ids, tokenizer.eos_token_id]
-        rejected_input_ids = [*rejected_input_ids, tokenizer.eos_token_id]
-
-        if max_prompt_length is not None:
-            prompt_input_ids = prompt_input_ids[-max_prompt_length:]
-        if max_completion_length is not None:
-            chosen_input_ids = chosen_input_ids[:max_completion_length]
-            rejected_input_ids = rejected_input_ids[:max_completion_length]
-
-        return {
-            "prompt_input_ids": prompt_input_ids,
-            "chosen_input_ids": chosen_input_ids,
-            "rejected_input_ids": rejected_input_ids,
-        }
+    def _is_pretokenized(self) -> bool:
+        """Check if dataset already has tokenized fields."""
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "prompt_input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure JIT-compiled training and evaluation functions.

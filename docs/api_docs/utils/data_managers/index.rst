@@ -1,4 +1,4 @@
-easydel.utils.data_managers package
+easydel.data package
 ===================================
 
 .. toctree::

@@ -173,9 +173,7 @@ def grpo_step(
 
         if beta != 0.0:
             ref_per_token_logps = minibatch["ref_per_token_logps"]
-            per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (
-                ref_per_token_logps - per_token_logps
-            ) - 1
+            per_token_kl = jnp.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
         else:
             per_token_kl = jnp.zeros_like(per_token_logps)
 
@@ -191,8 +189,8 @@ def grpo_step(
         if importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif importance_sampling_level == "sequence":
-            log_importance_weights = (
-                (log_ratio * completion_mask).sum(axis=-1) / jnp.maximum(completion_mask.sum(axis=-1), 1.0)
+            log_importance_weights = (log_ratio * completion_mask).sum(axis=-1) / jnp.maximum(
+                completion_mask.sum(axis=-1), 1.0
             )
             log_importance_weights = log_importance_weights[:, None]
         else:

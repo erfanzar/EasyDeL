@@ -1,7 +1,7 @@
-easydel.utils.data_managers.cache
+easydel.data.cache
 =================================
 
-.. automodule:: easydel.utils.data_managers.cache
+.. automodule:: easydel.data.cache
    :members:
    :undoc-members:
    :show-inheritance:

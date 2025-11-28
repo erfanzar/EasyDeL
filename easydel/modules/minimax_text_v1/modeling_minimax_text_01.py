@@ -53,6 +53,7 @@ _lightning_attention = None  # TODO:FIX
 
 def compute_slops(nhd):
     """Generate ALiBi-style slopes for the provided number of attention heads."""
+
     def get_slopes(n):
         def get_slopes_power_of_2(n):
             start = 2 ** (-(2 ** -(math.log2(n) - 3)))

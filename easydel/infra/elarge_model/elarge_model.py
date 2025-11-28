@@ -51,6 +51,7 @@ from .builders import (
     build_dataset,
     build_esurge,
     build_model,
+    build_sharded_source,
     to_data_mixture_kwargs,
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
@@ -63,6 +64,7 @@ from .utils import load_elm_config, save_elm_config
 if typing.TYPE_CHECKING:
     from datasets import Dataset
 
+    from easydel.data.core.protocols import ShardedDataSource
     from easydel.trainers import Trainer
 logger = get_logger("eLargeModel")
 
@@ -965,6 +967,51 @@ class eLargeModel:
         """
         return build_dataset(self._config)
 
+    def build_sharded_source(self) -> "ShardedDataSource | None":
+        """Build dataset as ShardedDataSource for use with new data pipeline.
+
+        Creates a ShardedDataSource from the configured mixture of data sources.
+        This uses the new data architecture that supports lazy transforms,
+        efficient streaming, and better integration with trainers.
+
+        Returns:
+            ShardedDataSource: The data source ready for training, or None
+                if no mixture is configured
+
+        Example:
+            >>> elm = eLargeModel()
+            >>> elm.add_dataset("train.json", dataset_type="json", content_field="text")
+            >>> elm.set_mixture(use_sharded_source=True)
+            >>> source = elm.build_sharded_source()
+            >>> for batch in source.open_shard(source.shard_names[0]):
+            ...     process(batch)
+        """
+        return build_sharded_source(self._config)
+
+    def get_train_source(self) -> "ShardedDataSource | Dataset | None":
+        """Get training data as ShardedDataSource or Dataset.
+
+        Automatically selects the appropriate data format based on the
+        `use_sharded_source` configuration option.
+
+        Returns:
+            ShardedDataSource if use_sharded_source=True in mixture config,
+            otherwise HuggingFace Dataset. Returns None if no mixture configured.
+
+        Example:
+            >>> elm = eLargeModel()
+            >>> elm.add_dataset("train.json", dataset_type="json")
+            >>> elm.set_mixture(use_sharded_source=True)  # Use new pipeline
+            >>> data = elm.get_train_source()  # Returns ShardedDataSource
+            >>>
+            >>> elm.set_mixture(use_sharded_source=False)  # Use legacy pipeline
+            >>> data = elm.get_train_source()  # Returns HF Dataset
+        """
+        mixture_cfg = self._config.get("mixture", {})
+        if mixture_cfg.get("use_sharded_source", True):
+            return self.build_sharded_source()
+        return self.build_dataset()
+
     def get_data_mixture_kwargs(self) -> dict[str, Any]:
         """Get kwargs for DatasetMixture initialization.
 
@@ -1054,8 +1101,8 @@ class eLargeModel:
 
     def train(
         self,
-        train_dataset: Dataset | None = None,
-        eval_dataset: Dataset | None = None,
+        train_dataset: Dataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | ShardedDataSource | None = None,
         base_state_class: type[EasyDeLState] | None = None,
         args_class: type[TrainingArguments] | None = None,
         trainer_class: type[Trainer] | None = None,
@@ -1073,8 +1120,8 @@ class eLargeModel:
         6. Runs training and returns results
 
         Args:
-            train_dataset: Optional training dataset. If None, will build from
-                mixture configuration.
+            train_dataset: Optional training dataset (Dataset or ShardedDataSource).
+                If None, will build from mixture configuration.
             eval_dataset: Optional evaluation dataset for validation during training.
             base_state_class: Optional custom EasyDeLState class for model state
                 management. Use for custom model implementations.
@@ -1169,8 +1216,8 @@ class eLargeModel:
 
     def build_trainer(
         self,
-        train_dataset: Dataset | None = None,
-        eval_dataset: Dataset | None = None,
+        train_dataset: Dataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | ShardedDataSource | None = None,
         reference_model: EasyDeLBaseModule | None = None,
         reward_model: EasyDeLBaseModule | None = None,
         teacher_model: EasyDeLBaseModule | None = None,
@@ -1186,7 +1233,8 @@ class eLargeModel:
         Automatically builds required models and datasets if not provided.
 
         Args:
-            train_dataset: Training dataset. If None, builds from mixture config.
+            train_dataset: Training dataset (Dataset or ShardedDataSource).
+                If None, builds from mixture config using get_train_source().
             eval_dataset: Evaluation dataset for validation metrics.
             reference_model: Reference model for DPO/ORPO. If None, builds from
                 reference_model configuration if present.
@@ -1237,7 +1285,8 @@ class eLargeModel:
         training_args = self.build_training_arguments(args_class=args_class, **kwargs)
 
         if train_dataset is None and "mixture" in self._config:
-            train_dataset = self.build_dataset()
+            # Use new get_train_source() which auto-selects based on use_sharded_source
+            train_dataset = self.get_train_source()
 
         trainer_kwargs = {}
         model = self._model
