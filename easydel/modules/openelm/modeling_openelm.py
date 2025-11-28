@@ -604,9 +604,9 @@ class OpenELMModel(EasyDeLBaseModule):
             raise ValueError("you should specify inputs_embeds or input_ids one of them")
         sequence_length = inputs_embeds.shape[1]
 
-        assert (
-            sequence_length <= self.config.max_context_length
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+        assert sequence_length <= self.config.max_context_length, (
+            f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+        )
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,

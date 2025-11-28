@@ -647,6 +647,7 @@ class MaskedLMOutput(ModelOutput):
 CausalLMOutput = MaskedLMOutput
 # type:ignore
 
+
 @auto_pytree
 class Seq2SeqLMOutput(ModelOutput):
     """

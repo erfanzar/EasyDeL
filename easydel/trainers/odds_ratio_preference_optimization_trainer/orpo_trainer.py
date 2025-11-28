@@ -18,10 +18,8 @@ from collections import defaultdict
 from functools import partial
 
 import jax
-import numpy as np
 from eformer.loggings import get_logger
 from jax import jit
-from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -31,19 +29,17 @@ from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
 from ..base_trainer import TrainerConfigureFunctionOutput
-from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
-from ..utils import (
-    DPODataCollatorWithPaddingGrain,
-    DPODataCollatorWithPaddingTFDS,
-    add_bos_token_if_needed,
-    add_eos_token_if_needed,
-)
+from ..utils import DPODataCollatorWithPaddingGrain, DPODataCollatorWithPaddingTFDS
 from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset, IterableDataset
+
+    from easydel.data.core.protocols import ShardedDataSource
+
 logger = get_logger(__name__)
 
 
@@ -56,22 +52,13 @@ class ORPOTrainer(Trainer):
     Unlike DPO, ORPO doesn't require a reference model, making it more
     memory-efficient while maintaining competitive performance.
 
-    Key features:
-    - Reference-free optimization (no KL divergence term)
-    - Direct odds ratio maximization
-    - Memory-efficient training
-    - Support for both encoder-decoder and decoder-only models
-
-    The ORPO loss combines:
-    1. Supervised fine-tuning loss on preferred responses
-    2. Odds ratio preference loss between chosen and rejected pairs
+    The trainer uses lazy preprocessing transforms that are applied during
+    iteration, providing better performance than eager HF .map() calls.
 
     Attributes:
         arguments: ORPOConfig with training hyperparameters
-        truncation_mode: How to truncate sequences ("keep_end" or "keep_start")
         processing_class: Tokenizer or processor for text encoding
         padding_value: Token ID used for padding
-        is_encoder_decoder: Whether the model is encoder-decoder architecture
 
     Example:
         >>> config = ORPOConfig(
@@ -97,21 +84,23 @@ class ORPOTrainer(Trainer):
         arguments: ORPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None = None,
         data_collator: DPODataCollatorWithPaddingTFDS | DPODataCollatorWithPaddingGrain | None = None,
-        train_dataset: Dataset | None = None,
-        eval_dataset: Dataset | dict[str, Dataset] | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType = None,
     ):
-        assert (
-            arguments is not None
-        ), "You Have to pass arguments that will be used for training but you have passed`arguments=None`"
-        assert isinstance(arguments, ORPOConfig), f"arguments type must be `ORPOConfig` but got {type(arguments)}"
+        if arguments is None:
+            raise ValueError("arguments cannot be None")
+        if not isinstance(arguments, ORPOConfig):
+            raise TypeError(f"arguments must be ORPOConfig, got {type(arguments)}")
+        if processing_class is None:
+            raise ValueError("processing_class must be specified to tokenize an ORPO dataset.")
 
-        assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
         self.is_encoder_decoder = arguments.is_encoder_decoder
 
+        # Determine padding value
         if arguments.padding_value is not None:
             self.padding_value = arguments.padding_value
         else:
@@ -122,12 +111,12 @@ class ORPOTrainer(Trainer):
             else:
                 raise ValueError(
                     "`padding_value` is not specified in `ORPOConfig`, and `pad_token_id` is missing in the "
-                    "`processing_class`. Please either set the `padding_value` argument in `ORPOConfig`, or set "
-                    "`tokenizer.pad_token` (e.g., `tokenizer.pad_token = tokenizer.eos_token`) before instantiating "
-                    "the trainer."
+                    "`processing_class`. Please set `tokenizer.pad_token` before instantiating the trainer."
                 )
         arguments.padding_value = self.padding_value
-        input_data_collator_tfds = (
+
+        # Setup data collators
+        self.input_data_collator_tfds = (
             DPODataCollatorWithPaddingTFDS(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
@@ -139,7 +128,7 @@ class ORPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-        input_data_collator_grain = (
+        self.input_data_collator_grain = (
             DPODataCollatorWithPaddingGrain(
                 max_prompt_length=arguments.max_prompt_length,
                 max_completion_length=arguments.max_completion_length,
@@ -151,38 +140,12 @@ class ORPOTrainer(Trainer):
             if data_collator is None
             else data_collator
         )
-        self.input_data_collator_grain = input_data_collator_grain
-        self.input_data_collator_tfds = input_data_collator_tfds
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
-        processing_class = processing_class
-
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
-        kwargs_mp = dict()
 
-        from datasets import Dataset
-
-        if isinstance(train_dataset, Dataset):
-            kwargs_mp = dict(num_proc=arguments.dataset_num_proc)
-        train_dataset = train_dataset.map(maybe_extract_prompt, **kwargs_mp)
-        train_dataset = train_dataset.map(
-            maybe_apply_chat_template,
-            fn_kwargs={"tokenizer": processing_class},
-            **kwargs_mp,
-        )
-        train_dataset = train_dataset.map(self.tokenize_row, **kwargs_mp)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(maybe_extract_prompt, **kwargs_mp)
-            eval_dataset = eval_dataset.map(
-                maybe_apply_chat_template,
-                fn_kwargs={"tokenizer": processing_class},
-                **kwargs_mp,
-            )
-            eval_dataset = eval_dataset.map(self.tokenize_row, **kwargs_mp)
-        self.arguments = arguments
-        self.processing_class = processing_class
         super().__init__(
             model_state=model,
             arguments=arguments,
@@ -192,232 +155,31 @@ class ORPOTrainer(Trainer):
             processing_class=processing_class,
         )
 
-    def build_tokenized_answer(
-        self,
-        prompt: str,
-        answer: str,
-    ) -> dict[str, np.ndarray]:
-        """
-        Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
+    def _get_preprocess_transform(self) -> ORPOPreprocessTransform | None:
+        """Get ORPO preprocessing transform for ShardedDataSource."""
 
-        Args:
-            prompt (str): The prompt text.
-            answer (str): The answer text.
+        if self._is_pretokenized():
+            return None
 
-        Returns:
-            tp.Dict[str, np.ndarray]: A dictionary containing the tokenized prompt and answer,
-                along with attention masks.
-
-        Raises:
-            ValueError: If there's a mismatch in token lengths.
-        """
-        full_tokenized = self.processing_class(
-            prompt + answer,
-            add_special_tokens=False,
-        )
-        prompt_input_ids = self.processing_class(
-            prompt,
-            add_special_tokens=False,
-        )["input_ids"]
-
-        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
-        answer_attention_mask = full_tokenized["attention_mask"][len(prompt_input_ids) :]
-        full_concat_input_ids = np.concatenate([prompt_input_ids, answer_input_ids])
-        full_input_ids = np.array(full_tokenized["input_ids"])
-
-        if len(full_input_ids) != len(full_concat_input_ids):
-            raise ValueError("Prompt input ids and answer input ids should have the same length.")
-        response_token_ids_start_idx = len(prompt_input_ids)
-        if prompt_input_ids != full_tokenized["input_ids"][:response_token_ids_start_idx]:
-            response_token_ids_start_idx -= 1
-
-        prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
-        prompt_attention_mask = full_tokenized["attention_mask"][:response_token_ids_start_idx]
-        if len(prompt_input_ids) != len(prompt_attention_mask):
-            raise ValueError("Prompt input ids and attention mask should have the same length.")
-        answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
-        answer_attention_mask = full_tokenized["attention_mask"][response_token_ids_start_idx:]
-        return dict(
-            prompt_input_ids=prompt_input_ids,
-            prompt_attention_mask=prompt_attention_mask,
-            input_ids=answer_input_ids,
-            attention_mask=answer_attention_mask,
+        return ORPOPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_prompt_length=self.arguments.max_prompt_length,
+            max_completion_length=self.arguments.max_completion_length,
+            label_pad_token_id=self.arguments.label_pad_token_id,
         )
 
-    def tokenize_row(self, feature: dict[str, str], state: object | None = None) -> dict[str, np.ndarray]:
-        """
-        Tokenizes a single row of data from the ORPO dataset.
-
-        This method tokenizes the prompt, chosen response, and rejected response,
-        handles padding and truncation, and prepares the data for input to the DPO model.
-
-        Args:
-            feature (tp.Dict): A dictionary containing the "prompt", "chosen", and "rejected" texts.
-            state (EasyDeLState, optional): Not used in this implementation. Defaults to None.
-
-        Returns:
-            tp.Dict: A dictionary containing the tokenized prompt, chosen response, and rejected response,
-                  along with attention masks and labels.
-
-        Raises:
-            ValueError: If the input data types are incorrect.
-        """
-        batch = {}
-        prompt = feature["prompt"]
-        chosen = feature["chosen"]
-        rejected = feature["rejected"]
-
-        if not self.is_encoder_decoder:
-            if not isinstance(prompt, str):
-                raise ValueError(f"prompt should be an str but got {type(prompt)}")
-            prompt_tokens = self.processing_class(prompt, add_special_tokens=False)
-            prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
-
-            if not isinstance(chosen, str):
-                raise ValueError(f"chosen should be an str but got {type(chosen)}")
-            chosen_tokens = self.build_tokenized_answer(prompt, chosen)
-
-            if not isinstance(rejected, str):
-                raise ValueError(f"rejected should be an str but got {type(rejected)}")
-            rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-            prompt_len_input_ids = len(prompt_tokens["prompt_input_ids"])
-
-            chosen_prompt_len_input_ids = len(chosen_tokens["prompt_input_ids"])
-            rejected_prompt_len_input_ids = len(rejected_tokens["prompt_input_ids"])
-            prompt_len_input_ids = min(chosen_prompt_len_input_ids, rejected_prompt_len_input_ids)
-
-            for k, v in prompt_tokens.items():
-                prompt_tokens[k] = v[:prompt_len_input_ids]
-            num_diff_tokens = sum(
-                [
-                    a != b
-                    for a, b in zip(chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"], strict=False)
-                ]
-            )
-            num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
-            if num_diff_tokens > 1 or num_diff_len > 1:
-                raise ValueError(
-                    "Chosen and rejected prompt_input_ids might only differ on the "
-                    "last token due to tokenizer merge ops."
-                )
-            prompt_tokens, chosen_tokens, rejected_tokens = add_bos_token_if_needed(
-                self.processing_class.bos_token_id,
-                prompt_len_input_ids,
-                prompt_tokens,
-                chosen_prompt_len_input_ids,
-                chosen_tokens,
-                rejected_prompt_len_input_ids,
-                rejected_tokens,
-            )
-
-            chosen_tokens, rejected_tokens = add_eos_token_if_needed(
-                self.processing_class.eos_token_id,
-                chosen_tokens,
-                rejected_tokens,
-            )
-
-            longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
-
-            for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-                if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.arguments.max_length:
-                    if self.truncation_mode == "keep_start":
-                        for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                            answer_tokens[k] = answer_tokens[k][: self.arguments.max_prompt_length]
-                    elif self.truncation_mode == "keep_end":
-                        for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                            answer_tokens[k] = answer_tokens[k][-self.arguments.max_prompt_length :]
-                    else:
-                        raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-            for answer_tokens in [chosen_tokens, rejected_tokens]:
-                if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.arguments.max_length:
-                    for k in ["input_ids", "attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][
-                            : self.arguments.max_length - self.arguments.max_prompt_length
-                        ]
-            chosen_sequence_tokens = {
-                k: chosen_tokens[f"prompt_{k}"] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]
-            }
-            rejected_sequence_tokens = {
-                k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
-            }
-            chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-            chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
-                self.arguments.label_pad_token_id
-            ] * len(chosen_tokens["prompt_input_ids"])
-            rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-            rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
-                self.arguments.label_pad_token_id
-            ] * len(rejected_tokens["prompt_input_ids"])
-
-            for k, toks in {
-                "chosen_": chosen_sequence_tokens,
-                "rejected_": rejected_sequence_tokens,
-                "": prompt_tokens,
-            }.items():
-                for type_key, tokens in toks.items():
-                    if type_key == "token_type_ids":
-                        continue
-                    batch[f"{k}{type_key}"] = tokens
-
-        else:
-            chosen_tokens = self.processing_class(
-                chosen,
-                truncation=True,
-                max_length=self.arguments.max_completion_length,
-                add_special_tokens=True,
-            )
-            rejected_tokens = self.processing_class(
-                rejected,
-                truncation=True,
-                max_length=self.arguments.max_completion_length,
-                add_special_tokens=True,
-            )
-            prompt_tokens = self.processing_class(
-                prompt,
-                truncation=True,
-                max_length=self.arguments.max_prompt_length,
-                add_special_tokens=True,
-            )
-
-            batch["chosen_labels"] = chosen_tokens["input_ids"]
-            batch["rejected_labels"] = rejected_tokens["input_ids"]
-            batch["prompt_input_ids"] = prompt_tokens["input_ids"]
-            batch["prompt_attention_mask"] = prompt_tokens["attention_mask"]
-
-            if state is not None and hasattr(
-                state.model,
-                "prepare_decoder_input_ids_from_labels",
-            ):
-                model = state.model
-                batch["rejected_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=jnp.asarray(batch["rejected_labels"])
-                )
-                batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                    labels=jnp.asarray(batch["chosen_labels"])
-                )
-
-        for k in batch:
-            if "labels" in k or self.is_encoder_decoder:
-                pad_value = self.arguments.label_pad_token_id
-            elif k.endswith("_input_ids"):
-                pad_value = self.padding_value
-            elif k.endswith("_attention_mask"):
-                pad_value = 0
-            batch[k] = batch[k] + [pad_value] * (self.arguments.max_length - len(batch[k]))
-        return batch
+    def _is_pretokenized(self) -> bool:
+        """Check if dataset already has tokenized fields."""
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "prompt_input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """
-        Configures and JIT-compiles the training and evaluation step functions.
-
-        This method sets up the necessary functions for training and evaluation, including:
-            - Initialization of the model state.
-            - Sharding of the model parameters and optimizer state.
-            - JIT-compilation of the training and evaluation step functions.
-
-        Returns:
-            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
-        """
+        """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
@@ -489,20 +251,7 @@ class ORPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """
-        Creates a data collection function for batching.
-
-        For DPO training, this method simply returns the pre-configured `data_collator`.
-
-        Args:
-            max_sequence_length (int): The maximum sequence length (not used in this implementation).
-            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-                The truncation mode (not used in this implementation). Defaults to "keep_end".
-
-        Returns:
-            tp.Callable: The data collator function.
-        """
-        del max_sequence_length, truncation_mode  # Unused but required by interface
+        """Create data collection function for Grain batching."""
         return self.input_data_collator_grain
 
     def create_tfds_collect_function(
@@ -510,18 +259,5 @@ class ORPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """
-        Creates a data collection function for batching.
-
-        For DPO training, this method simply returns the pre-configured `data_collator`.
-
-        Args:
-            max_sequence_length (int): The maximum sequence length (not used in this implementation).
-            truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-                The truncation mode (not used in this implementation). Defaults to "keep_end".
-
-        Returns:
-            tp.Callable: The data collator function.
-        """
-        del max_sequence_length, truncation_mode  # Unused but required by interface
+        """Create data collection function for TFDS batching."""
         return self.input_data_collator_tfds

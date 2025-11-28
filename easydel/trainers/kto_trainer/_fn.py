@@ -196,9 +196,7 @@ def training_step(
         if calculate_kl:
             kl_batch = _build_kl_batch(minibatch)
             policy_kl_logps = jax.lax.stop_gradient(forward_fn(module, kl_batch)["completion_logps"])
-            reference_kl_logps = jax.lax.stop_gradient(
-                forward_fn(reference_state.model, kl_batch)["completion_logps"]
-            )
+            reference_kl_logps = jax.lax.stop_gradient(forward_fn(reference_state.model, kl_batch)["completion_logps"])
         else:
             policy_kl_logps = reference_kl_logps = None
 

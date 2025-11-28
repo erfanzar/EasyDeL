@@ -43,18 +43,20 @@ Example:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import typing as tp
 import warnings
-from typing import NotRequired
+from typing import Any, NotRequired
 
 import chex
 import huggingface_hub
 import jax
 import jax.extend
 import jax.tree_util
+import transformers
 from eformer import common_types
 from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
 from eformer.escale import PartitionAxis, PartitionManager
@@ -64,7 +66,9 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
-from transformers.configuration_utils import PretrainedConfig
+
+# .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
+from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
 from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
 from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
 from transformers.utils.generic import is_timm_config_dict
@@ -1053,12 +1057,71 @@ class EasyDeLBaseConfig(PretrainedConfig):
                     pass
         return string + ")"
 
+    def to_diff_dict(self) -> dict[str, Any]:
+        """
+        Removes all attributes from the configuration that correspond to the default config attributes for
+        better readability, while always retaining the `config` attribute from the class. Serializes to a
+        Python dictionary.
+
+        Returns:
+            dict[str, Any]: Dictionary of all the attributes that make up this configuration instance.
+        """
+        config_dict = self.to_dict()
+        default_config_dict = PretrainedConfig().to_dict()
+        class_config_dict = self.__class__().to_dict() if not self.has_no_defaults_at_init else {}
+
+        serializable_config_dict = {}
+
+        for key, value in config_dict.items():
+            if (
+                isinstance(getattr(self, key, None), PretrainedConfig)
+                and key in class_config_dict
+                and isinstance(class_config_dict[key], dict)
+            ) or key in self.sub_configs:
+                diff = recursive_diff_dict(value, default_config_dict, config_obj=getattr(self, key, None))
+                if "model_type" in value:
+                    diff["model_type"] = value["model_type"]
+
+                serializable_config_dict[key] = diff
+            elif (
+                key not in default_config_dict
+                or key == "transformers_version"
+                or key == "vocab_file"
+                or value != default_config_dict[key]
+                or (key in default_config_dict and value != class_config_dict.get(key, value))
+            ):
+                serializable_config_dict[key] = value
+
+        self._remove_keys_not_serialized(serializable_config_dict)
+
+        serializable_config_dict.pop("_name_or_path", None)
+
+        self.dict_dtype_to_str(serializable_config_dict)
+
+        return serializable_config_dict
+
     def to_dict(self) -> dict[str, tp.Any]:
         """Serialize config to a dictionary while temporarily hiding forbidden types."""
         sd = self.__dict__
         forbidden_types = ["_ScalarMeta"]
         extracted_values = {k: sd.pop(k) for k in list(sd.keys()) if sd.get(k).__class__.__name__ in forbidden_types}
-        result = super().to_dict()
+
+        result = copy.deepcopy(self.__dict__)
+        if hasattr(self.__class__, "model_type"):
+            result["model_type"] = self.__class__.model_type
+
+        result["transformers_version"] = transformers.__version__
+
+        for key, value in result.items():
+            if isinstance(value, PretrainedConfig):
+                value = value.to_dict()
+                del value["transformers_version"]
+
+            result[key] = value
+
+        self._remove_keys_not_serialized(result)
+        self.dict_dtype_to_str(result)
+
         for k, v in extracted_values.items():
             sd[k] = v
         return result

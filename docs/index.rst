@@ -117,21 +117,51 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    :caption: Contents:
 
    getting_started
+   install.md
+   contributing
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Data Management:
+
+   easydata/README.md
+   easydata/quickstart.md
+   easydata/sources.md
+   easydata/transforms.md
+   easydata/mixing.md
+   easydata/pretokenization.md
+   easydata/streaming.md
+   easydata/pipeline.md
+   easydata/caching.md
+   easydata/trainer_integration.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Trainers:
+
    trainers/base_trainer
    trainers/trainer_protocol
    trainers/ray_distributed_trainer.md
-   install.md
-   contributing
-   api_docs/apis
-   esurge
-   esurge_examples
-   whisper_api.md
+   trainers/sft.md
    trainers/dpo.md
    trainers/grpo.md
    trainers/orpo.md
-   trainers/sft.md
    trainers/reward.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Inference:
+
+   esurge
+   esurge_examples
+   whisper_api.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced:
+
    multimodality/audio_language.md
+   api_docs/apis
    trc-welcome.md
 
 

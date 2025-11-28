@@ -64,9 +64,7 @@ class CompilationContext(tp.NamedTuple):
 
 ContextPayload = tp.TypeVar("ContextPayload", bound=tuple)
 
-_context_var: contextvars.ContextVar[ContextPayload | None] = contextvars.ContextVar(
-    "easydeL_jit_context", default=None
-)
+_context_var: contextvars.ContextVar[ContextPayload | None] = contextvars.ContextVar("easydeL_jit_context", default=None)
 _context_generation = 0
 
 try:
@@ -74,9 +72,7 @@ try:
 except AttributeError:  # pragma: no cover - older JAX fallback
     _JAX_USER_CONTEXT = None
 
-_JIT_CONTEXT_STATE = (
-    getattr(_JAX_USER_CONTEXT, "_obj", None) if _JAX_USER_CONTEXT is not None else None
-)
+_JIT_CONTEXT_STATE = getattr(_JAX_USER_CONTEXT, "_obj", None) if _JAX_USER_CONTEXT is not None else None
 if _JIT_CONTEXT_STATE is None:
     _JIT_CONTEXT_STATE = config_ext.Config("easydeL_jit_context_state", None, include_in_jit_key=True)
 
@@ -137,13 +133,9 @@ def get_jit_context(expected_type: type[ContextPayload] | None = None) -> Contex
 
     context = _get_state_value()
     if context is None:
-        raise RuntimeError(
-            "JIT context is not available. Use `jit_context(...)` before tracing."
-        )
+        raise RuntimeError("JIT context is not available. Use `jit_context(...)` before tracing.")
     if expected_type is not None and not isinstance(context, expected_type):
-        raise TypeError(
-            f"Active JIT context is {type(context)!r}, expected {expected_type!r}"
-        )
+        raise TypeError(f"Active JIT context is {type(context)!r}, expected {expected_type!r}")
     return context
 
 

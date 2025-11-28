@@ -306,9 +306,7 @@ class SequenceBuffer:
             def put(a):
                 return jax.device_put(a, sharding)
 
-            self.page_table = jax.tree_util.tree_map(
-                lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table
-            )
+            self.page_table = jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table)
 
         # Python bookkeeping
         self._req_ids: list[str | None] = []
@@ -452,9 +450,7 @@ class SequenceBuffer:
             output_tokens_to_copy = request.output_token_ids[:max_output_tokens]
             if output_tokens_to_copy:
                 end_idx = min(start_idx + len(output_tokens_to_copy), self.max_model_len)
-                new_token_ids[req_index, start_idx:end_idx] = np.array(
-                    output_tokens_to_copy, dtype=np.int32
-                )
+                new_token_ids[req_index, start_idx:end_idx] = np.array(output_tokens_to_copy, dtype=np.int32)
 
         capped_num_tokens = min(int(request.num_tokens), self.max_model_len)
         new_num_tokens = self.num_tokens.copy()
@@ -704,7 +700,9 @@ class SequenceBuffer:
         self.logit_bias[from_idx] = None
 
         if self.allowed_token_ids_mask is not None:
-            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[to_idx].set(self.allowed_token_ids_mask[from_idx])
+            self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[to_idx].set(
+                self.allowed_token_ids_mask[from_idx]
+            )
             self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[from_idx].set(False)
 
     def _process_sampling_params(self, sampling_params: SamplingParams, req_id: str, req_index: int) -> None:

@@ -1,7 +1,7 @@
-easydel.utils.data_managers.manager
+easydel.data.manager
 ===================================
 
-.. automodule:: easydel.utils.data_managers.manager
+.. automodule:: easydel.data.manager
    :members:
    :undoc-members:
    :show-inheritance:

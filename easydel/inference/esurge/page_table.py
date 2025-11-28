@@ -372,9 +372,7 @@ class MultiGroupPageTable:
         num_groups = len(self.page_tables)
         for req_idx, page_ids_for_req in zip(req_indices, page_ids_per_req, strict=True):
             for group_idx in range(num_groups):
-                self.page_tables[group_idx].append_row(
-                    page_ids_for_req[group_idx], req_idx
-                )
+                self.page_tables[group_idx].append_row(page_ids_for_req[group_idx], req_idx)
 
     def __getitem__(self, idx: int) -> PageTable:
         """Get a specific group's page table.
