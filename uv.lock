@@ -641,9 +641,9 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.84" },
+    { name = "eformer", specifier = "==0.0.85" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.21" },
+    { name = "ejkernel", specifier = "==0.0.22" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -681,7 +681,7 @@ provides-extras = ["torch", "gpu", "tpu", "tensorflow", "lm-eval", "profile"]
 
 [[package]]
 name = "eformer"
-version = "0.0.84"
+version = "0.0.85"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -703,9 +703,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/78/6ffb17bd7a8015f75a26de70504c55fc9bcd22f50e613dbf78287fd3c6b9/eformer-0.0.84.tar.gz", hash = "sha256:bcf6ae89b94e55074915befacbdf7b87eba1bff142ef26f0be71d14d49fe53bc", size = 214259, upload-time = "2025-11-17T19:25:20.959Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/ee/7a0acbe85853185c9946da51e0aeccd7e963f4f1911b2046ccb8337431d7/eformer-0.0.85.tar.gz", hash = "sha256:651de5bb7611d1a22d5a55f4e17c4085ff52bb1b775cc7829786ef572ba1efdd", size = 215730, upload-time = "2025-11-26T17:47:22.198Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/36/d55db2e4baef1db9a62ea173d7cbf3a34e8511bdf5f26b30a464a7d8b124/eformer-0.0.84-py3-none-any.whl", hash = "sha256:f8526eb1266c6d6ee11527126e29d1bcf7c269d6d1313b9b8586da08944092cf", size = 268841, upload-time = "2025-11-17T19:25:19.941Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/df/8c842c02c1cc007a1fdacb8eba95a525dc3a35558cb2791b5ad20a17aab2/eformer-0.0.85-py3-none-any.whl", hash = "sha256:aacf06aa24f4169dc3001cd8840393b5c4d44da27c56d5d5b983945cccc2a1f0", size = 270762, upload-time = "2025-11-26T17:47:21.223Z" },
 ]
 
 [[package]]
@@ -719,7 +719,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.21"
+version = "0.0.22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -731,9 +731,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/9d/8cabfeb5be8afc07c615218fe46576d0c3cfd0b1a92a6b096c514208a0fe/ejkernel-0.0.21.tar.gz", hash = "sha256:22d3ce91db403f5ead98f74574d1204fe9ed3a69ae4dacb5602692e8e7a167bf", size = 406973, upload-time = "2025-11-25T15:45:43.451Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/e7/5ad7e599e1b1b2f2210b7399deb46df1ad1624204e44dfbbfa2970875793/ejkernel-0.0.22.tar.gz", hash = "sha256:3b6457c692de1dd44d3be47d6c3fa2b1d449d2358e6a4503d24d037c4aac4630", size = 407297, upload-time = "2025-11-26T16:05:26.472Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/28/9e/7daaefab416dac577fc43beccc309441008591a47d3b56c2f55dfaecfeed/ejkernel-0.0.21-py3-none-any.whl", hash = "sha256:fa82a3faf5675d110bac990d53655104be1c2a8ab0ce56ae2cdf2bb9174e4b9d", size = 599573, upload-time = "2025-11-25T15:45:42.235Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/08/e2174818e2996c3db2c30c12d63b65b2e16ffaa849f85b9cff5d9489bddd/ejkernel-0.0.22-py3-none-any.whl", hash = "sha256:d38a2273d57a297c069619663404cb9502e1da9988342df0323526013d913dfc", size = 599943, upload-time = "2025-11-26T16:05:25.305Z" },
 ]
 
 [[package]]
