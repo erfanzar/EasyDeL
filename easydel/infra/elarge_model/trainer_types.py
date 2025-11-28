@@ -61,7 +61,9 @@ class BaseTrainerCfg(TypedDict, total=False):
     """Base configuration shared by all trainers (TrainingArguments)."""
 
     trainer_type: NotRequired[
-        Literal["sft", "base", "dpo", "grpo", "orpo", "reward", "distillation", "bco", "cpo", "gkd", "kto", "nash_md", "xpo"]
+        Literal[
+            "sft", "base", "dpo", "grpo", "orpo", "reward", "distillation", "bco", "cpo", "gkd", "kto", "nash_md", "xpo"
+        ]
     ]
     learning_rate: NotRequired[float]
     learning_rate_end: NotRequired[float | None]
@@ -386,10 +388,6 @@ class TrainerConfig(
     DPOTrainerCfg,
 ): ...
 
-
-# =============================================================================
-# Modular Defaults Registry
-# =============================================================================
 
 BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "learning_rate": 5e-5,

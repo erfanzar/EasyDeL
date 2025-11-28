@@ -48,6 +48,7 @@ class MinimalDeviceState:
         token_ids: Token IDs buffer [max_num_reqs, max_model_len] for sampler updates.
         num_tokens: Total token count per request [max_num_reqs] for sampler increments.
     """
+
     token_ids: jax.Array
     num_tokens: jax.Array
 

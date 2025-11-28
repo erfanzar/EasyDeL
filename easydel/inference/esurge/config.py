@@ -84,7 +84,9 @@ class SchedulerConfig:
             )
 
         if self.long_prefill_token_threshold < 0:
-            raise ValueError(f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}")
+            raise ValueError(
+                f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}"
+            )
 
         if self.token_safety_margin is not None and self.token_safety_margin < 0:
             raise ValueError(f"token_safety_margin must be non-negative, got {self.token_safety_margin}")
@@ -135,7 +137,6 @@ class CacheConfig:
 
         if self.num_pages is not None and self.num_pages <= 0:
             raise ValueError(f"num_pages must be positive when specified, got {self.num_pages}")
-
 
 
 @dataclass

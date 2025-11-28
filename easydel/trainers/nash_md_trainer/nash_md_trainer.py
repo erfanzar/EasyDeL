@@ -317,6 +317,8 @@ class NashMDTrainer(GRPOTrainer):
         Returns:
             Processed batch with completions and rewards, and metrics dictionary.
         """
+        # Purify batch first to handle list of dicts (uncollated batch)
+        batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids = batch["input_ids"]
             prompt_mask = batch["attention_mask"]

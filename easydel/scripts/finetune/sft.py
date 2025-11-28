@@ -151,10 +151,8 @@ def main():
             attn_dtype=runtime_config.attn_dtype,
             attn_softmax_dtype=runtime_config.attn_softmax_dtype,
             gradient_checkpointing=runtime_config.gradient_checkpointing,
-
             attn_mechanism=runtime_config.attn_mechanism,
         ),
-
         platform=ed.EasyDeLPlatforms.JAX,
         param_dtype=runtime_config.param_dtype,
         dtype=runtime_config.dtype,

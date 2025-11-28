@@ -464,7 +464,7 @@ class GiddAttention(AttentionModule):
             value=value_states,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             noise_mask=noise_mask,
         )
 

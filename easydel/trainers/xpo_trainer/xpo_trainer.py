@@ -346,6 +346,8 @@ class XPOTrainer(GRPOTrainer):
             all necessary tensors for the XPO step and metrics_dict contains
             generation times, rewards, and other preprocessing metrics.
         """
+        # Purify batch first to handle list of dicts (uncollated batch)
+        batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids = batch["input_ids"]
             prompt_mask = batch["attention_mask"]

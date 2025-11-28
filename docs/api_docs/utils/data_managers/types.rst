@@ -1,7 +1,7 @@
-easydel.utils.data_managers.types
+easydel.data.types
 =================================
 
-.. automodule:: easydel.utils.data_managers.types
+.. automodule:: easydel.data.types
    :members:
    :undoc-members:
    :show-inheritance:

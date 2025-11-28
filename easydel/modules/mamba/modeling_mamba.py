@@ -69,6 +69,7 @@ def create_tuple_parser(
     n: int,
 ) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
     """Normalize a scalar or sequence into a tuple of length ``n``."""
+
     def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
         if isinstance(x, tp.Sequence):
             if len(x) == n:
