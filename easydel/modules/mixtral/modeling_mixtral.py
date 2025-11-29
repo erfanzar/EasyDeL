@@ -137,6 +137,8 @@ class MixtralMoEMlp(nn.Module):
             use_bias=False,
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.w2 = RowParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -147,6 +149,8 @@ class MixtralMoEMlp(nn.Module):
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.w3 = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -157,6 +161,8 @@ class MixtralMoEMlp(nn.Module):
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.act_fn = ACT2FN[config.hidden_act]
 

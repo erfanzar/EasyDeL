@@ -604,6 +604,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             should_sort_granules_by_key=should_sort_granules_by_key,
             allow_split_physical_axes=allow_split_physical_axes,
             backend=backend,
+            use_jax=not check_bool_flag("ED_CREATE_MESH", default=False),
         )
         return mesh
 

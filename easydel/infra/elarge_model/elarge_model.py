@@ -65,6 +65,7 @@ if typing.TYPE_CHECKING:
     from datasets import Dataset
 
     from easydel.data.core.protocols import ShardedDataSource
+    from easydel.inference import eSurge
     from easydel.trainers import Trainer
 logger = get_logger("eLargeModel")
 
@@ -884,7 +885,7 @@ class eLargeModel:
             self._tokenizer = AutoTokenizer.from_pretrained(tok_path)
         return self._tokenizer
 
-    def build_esurge(self):
+    def build_esurge(self) -> "eSurge":
         """Build the eSurge inference engine.
 
         Creates an eSurge engine instance configured with the current settings.

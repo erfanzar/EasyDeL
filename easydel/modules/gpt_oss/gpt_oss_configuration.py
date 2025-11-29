@@ -209,10 +209,16 @@ class GptOssConfig(EasyDeLBaseConfig):
                 pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
             ),
             (r".*mlp/gate/bias", pmag.resolve(Replicated)),
+            # Legacy paths (original HuggingFace parameter names)
             (r".*mlp/experts/gate_up_proj$", eck),
             (r".*mlp/experts/down_proj$", erk),
-            (r".*mlp/experts/gate_up_proj_bias", ecb),
-            (r".*mlp/experts/down_proj_bias", erb),
+            (r".*mlp/experts/gate_up_proj_bias$", ecb),
+            (r".*mlp/experts/down_proj_bias$", erb),
+            # New split paths (after reform_param transformation)
+            (r".*mlp/experts/(gate_proj|up_proj)/kernel", eck),
+            (r".*mlp/experts/down_proj/kernel", erk),
+            (r".*mlp/experts/(gate_proj|up_proj)/bias", ecb),
+            (r".*mlp/experts/down_proj/bias", erb),
             (r".*layernorm/scale", pmag.resolve(Replicated)),
             (r".*rms_norm/scale", pmag.resolve(Replicated)),
             (r".*norm/scale", pmag.resolve(Replicated)),
