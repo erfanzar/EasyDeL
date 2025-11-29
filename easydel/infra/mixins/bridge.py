@@ -493,25 +493,23 @@ class EasyBridgeMixin(PushToHubMixin):
                 **extraargs,
             )
             params = state.get("params", None)
+
             if params is not None:
                 state = params
+
             state = flatten_dict(state)
             state = string_key_to_int(state)
 
             required_params = set(flatten_dict(model.graphtree_params_shape))
             unexpected_keys = set(state.keys()) - required_params
             if any([k[-1].startswith("quant_") for k in state.keys()]):
-                model = model.quantize(
-                    quantization_config=quantization_config,
-                    verbose=vebose,
-                )
+                model = model.quantize(quantization_config=quantization_config, verbose=vebose)
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
-            return merge_model_and_tree(
-                model=model,
-                tree=unflatten_dict(state),
-            )
+            state = jax.tree_util.tree_map(lambda x: x.astype(param_dtype) if hasattr(x, "astype") else x, state)
+
+            return merge_model_and_tree(model=model, tree=unflatten_dict(state))
 
         else:
             return model

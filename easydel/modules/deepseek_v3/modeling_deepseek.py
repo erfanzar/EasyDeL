@@ -244,9 +244,9 @@ class DeepseekV3MLPMoE(nn.Module):
         imz = intermediate_size or config.intermediate_size
         hs = hidden_size or config.hidden_size
         self.gate_proj = ColumnParallelMoELinear(
-            config.n_routed_experts,
-            hs,
-            imz,
+            num_experts=config.n_routed_experts,
+            in_features=hs,
+            out_features=imz,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -256,9 +256,9 @@ class DeepseekV3MLPMoE(nn.Module):
             rngs=rngs,
         )
         self.up_proj = ColumnParallelMoELinear(
-            config.n_routed_experts,
-            hs,
-            imz,
+            num_experts=config.n_routed_experts,
+            in_features=hs,
+            out_features=imz,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -268,9 +268,9 @@ class DeepseekV3MLPMoE(nn.Module):
             rngs=rngs,
         )
         self.down_proj = RowParallelMoELinear(
-            config.n_routed_experts,
-            imz,
-            hs,
+            num_experts=config.n_routed_experts,
+            in_features=imz,
+            out_features=hs,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,

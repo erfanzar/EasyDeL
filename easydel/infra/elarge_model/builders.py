@@ -804,16 +804,23 @@ def _extract_dataset_name(inform_cfg: dict, fallback_index: int = 0) -> str:
             if name:
                 return name
 
-    # Handle HuggingFace repo format (e.g., "owner/repo-name")
-    # Must not start with / . ~ and have exactly one / with no file extensions
     if "/" in data_files and not data_files.startswith(("/", ".", "~")):
         parts = data_files.split("/")
-        # Check if it looks like HF repo (2 parts, no file extensions)
-        if len(parts) == 2 and not any(p.endswith((".json", ".parquet", ".arrow", ".csv", ".txt", ".jsonl")) for p in parts):
+        if len(parts) == 2 and not any(
+            p.endswith(
+                (
+                    ".json",
+                    ".parquet",
+                    ".arrow",
+                    ".csv",
+                    ".txt",
+                    ".jsonl",
+                )
+            )
+            for p in parts
+        ):
             return parts[-1]
 
-    # Handle local file paths - extract filename or directory name
-    # Remove glob patterns and get base name
     clean_path = data_files.rstrip("*").rstrip("/")
     base_name = os.path.basename(clean_path)
     if base_name:

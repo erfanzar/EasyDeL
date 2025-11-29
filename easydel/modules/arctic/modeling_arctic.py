@@ -218,9 +218,9 @@ class ArcticMLPMoE(nn.Module):
         self.ffn_dim = config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
 
         self.w1 = ColumnParallelMoELinear(
-            config.num_local_experts,
-            self.hidden_dim,
-            self.ffn_dim,
+            num_experts=config.num_local_experts,
+            in_features=self.hidden_dim,
+            out_features=self.ffn_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -230,9 +230,9 @@ class ArcticMLPMoE(nn.Module):
             rngs=rngs,
         )
         self.w3 = ColumnParallelMoELinear(
-            config.num_local_experts,
-            self.hidden_dim,
-            self.ffn_dim,
+            num_experts=config.num_local_experts,
+            in_features=self.hidden_dim,
+            out_features=self.ffn_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -242,9 +242,9 @@ class ArcticMLPMoE(nn.Module):
             rngs=rngs,
         )
         self.w2 = RowParallelMoELinear(
-            config.num_local_experts,
-            self.ffn_dim,
-            self.hidden_dim,
+            num_experts=config.num_local_experts,
+            in_features=self.ffn_dim,
+            out_features=self.hidden_dim,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,

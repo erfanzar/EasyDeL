@@ -117,6 +117,8 @@ class GptOssExperts(nn.Module):
             use_bias=True,
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -127,6 +129,8 @@ class GptOssExperts(nn.Module):
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.num_local_experts,
@@ -137,6 +141,8 @@ class GptOssExperts(nn.Module):
             kernel_init=nn.initializers.normal(),
             partition_manager=config.partition_manager,
             use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
         self.alpha = 1.702
         self.act_fn = ACT2FN[config.hidden_act]
