@@ -101,7 +101,8 @@ class CLIPVisionEmbeddings(nn.Module):
         self.class_embedding = ArrayParam.bound(
             shape=(embed_dim,),
             dtype=param_dtype,
-            init_fn=jax.nn.initializers.normal(stddev=0.02),
+            init_method="normal",
+            init_kwargs={"stddev": 0.02},
             key=rngs.params(),
         )
 
@@ -1318,8 +1319,9 @@ class CLIPModel(EasyDeLBaseModule):
         self.logit_scale = ArrayParam.bound(
             shape=(),
             dtype=jnp.float32,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype) * self.config.logit_scale_init_value,
+            init_method="ones",
             key=None,
+            value=jnp.ones((), dtype=jnp.float32) * self.config.logit_scale_init_value,
         )
 
     def __call__(

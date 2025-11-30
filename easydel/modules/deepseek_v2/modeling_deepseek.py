@@ -250,7 +250,7 @@ class MoEGate(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.n_routed_experts, self.gating_dim),
             dtype=self.param_dtype,
-            init_fn=nn.initializers.kaiming_uniform(dtype=self.param_dtype),
+            init_method="kaiming_uniform",
             key=rngs.params(),
         )
         self.dp = nn.Dropout(0, rngs=rngs)

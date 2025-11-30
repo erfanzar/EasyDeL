@@ -146,7 +146,7 @@ class Gemma3RMSNorm(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(dim,),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            init_method="ones",
             key=None,
         )
 
@@ -935,7 +935,7 @@ class Gemma3MultiModalProjector(nn.Module):
                 config.vision_config.hidden_size,
             ),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            init_method="zeros",
             key=None,
         )
         self.mm_soft_emb_norm = Gemma3RMSNorm(

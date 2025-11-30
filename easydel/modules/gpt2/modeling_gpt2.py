@@ -80,7 +80,8 @@ class Conv1D(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(out_features, in_features),
             dtype=param_dtype,
-            init_fn=nn.initializers.normal(stddev=0.02),
+            init_method="normal",
+            init_kwargs={"stddev": 0.02},
             key=rngs.params(),
         )
 
@@ -88,7 +89,7 @@ class Conv1D(nn.Module):
             ArrayParam.bound(
                 shape=(in_features,),
                 dtype=param_dtype,
-                init_fn=nn.initializers.zeros,
+                init_method="zeros",
                 key=rngs.params(),
             )
             if use_bias

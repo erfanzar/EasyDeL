@@ -114,7 +114,7 @@ class MambaConv1D(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=kernel_shape,
             dtype=param_dtype,
-            init_fn=nn.initializers.lecun_normal(dtype=param_dtype),
+            init_method="lecun_normal",
             key=rngs.params(),
         )
 
@@ -122,7 +122,7 @@ class MambaConv1D(nn.Module):
             self.bias = ArrayParam.bound(
                 shape=(features,),
                 dtype=param_dtype,
-                init_fn=nn.initializers.zeros,
+                init_method="zeros",
                 key=rngs.params(),
             )
 
@@ -264,14 +264,14 @@ class MambaMixer(nn.Module):
         self.A_log = ArrayParam.bound(
             shape=A.shape,
             dtype=A.dtype,
-            init_fn=lambda key, shape, dtype: jnp.log(A).astype(dtype),
+            init_method="zeros",
             key=None,
             value=jnp.log(A),
         )
         self.D = ArrayParam.bound(
             shape=(intermediate_size,),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            init_method="ones",
             key=None,
         )
 

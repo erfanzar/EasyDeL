@@ -72,6 +72,7 @@ from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
+from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
@@ -1654,40 +1655,87 @@ class OverWriteWithGradient(nn.Param):
     """
 
 
+class hashable_dict(dict):
+    __hash__ = hash_fn
+
+
 class ArrayParam(nn.Param):
+    """Parameterized array with serializable initialization.
+
+    A parameter container that stores initialization metadata (method name
+    and kwargs) as strings/dicts instead of functions, making it pickleable
+    and serializable. This is particularly useful for checkpointing and
+    distributed training.
+
+    Attributes:
+        shape: The shape of the parameter array.
+        dtype: The data type of the parameter array.
+        init_method: Name of the JAX initializer (e.g., "normal", "zeros", "ones").
+        init_kwargs: Optional kwargs passed to the initializer.
+    """
+
     shape: Sequence[int]
     dtype: DTypeLike
-    init_fn: tp.Callable[[PRNGKeyArray, Sequence[int], DTypeLike], Array]
+    init_method: str = "normal"
+    init_kwargs: hashable_dict | None = None
 
     @classmethod
     def bound(
         cls,
         shape: Sequence[int],
         dtype: DTypeLike,
-        init_fn: tp.Callable[[PRNGKeyArray, Sequence[int], DTypeLike], Array],
+        init_method: str,
+        init_kwargs: hashable_dict | None = None,
         *,
         key: PRNGKeyArray | None = None,
         value: Array | None = None,
         use_ref: bool | None = None,
         **metadata,
     ):
+        """Create an ArrayParam with initialized value.
+
+        Args:
+            shape: Shape of the parameter array.
+            dtype: Data type for the parameter.
+            init_method: Name of JAX initializer (e.g., "normal", "zeros", "kaiming_uniform").
+            init_kwargs: Optional keyword arguments for the initializer.
+            key: PRNG key for random initialization. Required if value is None.
+            value: Pre-computed value. If provided, skips initialization.
+            use_ref: Whether to use reference semantics.
+            **metadata: Additional metadata to store with the parameter.
+
+        Returns:
+            ArrayParam: An initialized ArrayParam instance.
+        """
+        if init_kwargs is None:
+            init_kwargs = {}
+        init_kwargs = hashable_dict(init_kwargs)
+        init_fn = getattr(jax.nn.initializers, init_method, jax.nn.initializers.normal)(**init_kwargs)
         if value is None:
             value = init_fn(key, shape, dtype)
         return cls(
             shape=shape,
             dtype=dtype,
-            init_fn=init_fn,
+            init_method=init_method,
+            init_kwargs=init_kwargs,
             value=value,
             use_ref=use_ref,
             **metadata,
         )
 
-    def resure(
-        self,
-        key: PRNGKeyArray,
-        shard_fn: tp.Callable[[Array], Array] | None = None,
-    ) -> None:
-        val = self.init_fn(key, self.shape, self.dtype)
+    def resure(self, key: PRNGKeyArray, shard_fn: tp.Callable[[Array], Array] | None = None) -> None:
+        """Reinitialize the parameter value with a new random key.
+
+        Regenerates the parameter value using the stored initialization method
+        and optional sharding function. Useful for resetting parameters or
+        applying sharding after initialization.
+
+        Args:
+            key: PRNG key for random initialization.
+            shard_fn: Optional function to apply sharding to the reinitialized value.
+        """
+        init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**self.init_kwargs)
+        val = init_fn(key, self.shape, self.dtype)
 
         if shard_fn is not None:
             val = shard_fn(val)

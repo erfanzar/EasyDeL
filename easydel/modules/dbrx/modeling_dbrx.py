@@ -416,10 +416,9 @@ class DbrxExpertGLU(nn.Module):
             self.config.ffn_config.moe_num_experts * self.config.ffn_config.ffn_hidden_size,
             self.config.d_model,
         )
-        init_fn = nn.initializers.normal(dtype=self.dtype)
-        self.w1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
-        self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
-        self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_fn=init_fn, key=rngs.params())
+        self.w1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
+        self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
+        self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
     def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:

@@ -68,7 +68,7 @@ class GemmaRMSNorm(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.config.hidden_size,),
             dtype=dtype,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            init_method="ones",
             key=None,
         )
 

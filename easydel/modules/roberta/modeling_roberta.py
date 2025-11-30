@@ -737,7 +737,7 @@ class RobertaLMHead(nn.Module):
         self.bias = ArrayParam.bound(
             shape=(self.config.vocab_size,),
             dtype=self.param_dtype,
-            init_fn=jax.nn.initializers.zeros,
+            init_method="zeros",
             key=rngs.params(),
         )
 
