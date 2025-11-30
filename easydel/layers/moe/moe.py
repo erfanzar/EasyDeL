@@ -761,7 +761,7 @@ class BaseMoeModule(nn.Module, ABC):
             gate_logits = hooks.before_topk(gate_logits)
 
         # Use expert_mesh (3D: dp, ep, tp) for cleaner sharding
-        expert_mesh = self.expert_mesh
+        expert_mesh = self.auto_expert_mesh
         pm = self.partition_manager
 
         # Resolve axis names from partition_manager (not directly from mesh)
