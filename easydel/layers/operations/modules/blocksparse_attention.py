@@ -188,12 +188,8 @@ class BlockSparseAttn(OperationImpl):
         is_tpu: bool = current_backend == "tpu"
         is_gpu: bool = current_backend == "gpu"
 
-        # TPU constraints: dimensions divisible by 128, causal=True, seq_len > 1
-        query_dim_mod_128: int = query_dim % 128
-        value_dim_mod_128: int = value_dim % 128
-        tpu_constraints_failed: bool = query_dim_mod_128 != 0 or value_dim_mod_128 != 0 or query_length == 1
+        tpu_constraints_failed: bool = query_length == 1
 
-        # GPU constraints: dimensions divisible by 16
         query_dim_mod_16: int = query_dim % 16
         value_dim_mod_16: int = value_dim % 16
         gpu_constraints_failed: bool = query_dim_mod_16 != 0 or value_dim_mod_16 != 0
@@ -221,7 +217,8 @@ class BlockSparseAttn(OperationImpl):
         model_mode = self.get_mode(query=query, BTHD=False)
         is_decode_mode = model_mode == common_types.MODE_DECODE
         causal_computed: bool = causal if not is_decode_mode else False
-
+        if softmax_aux is not None:
+            softmax_aux = softmax_aux.reshape(-1)
         shardings = self.metadata.get_shardings(
             mode=model_mode,
             layout="bhtd",
