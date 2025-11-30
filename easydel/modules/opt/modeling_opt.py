@@ -442,13 +442,6 @@ class OPTLearnedPositionalEmbedding(nn.Module):
                 Defaults to `jax.nn.initializers.normal(stddev=1.0)`.
             rngs (nn.Rngs): Random number generators.
         """
-        if embedding_init is None:
-            embedding_init = nn.initializers.variance_scaling(
-                1.0,
-                "fan_in",
-                "normal",
-                out_axis=0,
-            )
         self.offset = offset
         self.num_embeddings = num_embeddings
         self.features = features
@@ -457,12 +450,24 @@ class OPTLearnedPositionalEmbedding(nn.Module):
 
         # Create embedding parameter directly to match HuggingFace structure
         # HuggingFace uses 'weight' (PyTorch) which becomes 'kernel' in Flax
-        self.kernel = ArrayParam.bound(
-            shape=(num_embeddings + offset, features),
-            dtype=param_dtype,
-            init_fn=embedding_init,
-            key=rngs.params(),
-        )
+        if embedding_init is not None:
+            value = embedding_init(rngs.params(), (num_embeddings + offset, features), param_dtype)
+            self.kernel = ArrayParam.bound(
+                shape=(num_embeddings + offset, features),
+                dtype=param_dtype,
+                init_method="variance_scaling",
+                init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
+                key=rngs.params(),
+                value=value,
+            )
+        else:
+            self.kernel = ArrayParam.bound(
+                shape=(num_embeddings + offset, features),
+                dtype=param_dtype,
+                init_method="variance_scaling",
+                init_kwargs={"scale": 1.0, "mode": "fan_in", "distribution": "normal"},
+                key=rngs.params(),
+            )
 
     def __call__(self, inputs: chex.Array) -> chex.Array:
         """Apply learned positional embeddings with offset.

@@ -845,23 +845,17 @@ class MultiheadAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
-        def normal_init(*shape):
-            return nn.initializers.xavier_uniform()(rngs.param(), shape, param_dtype)
-
-        def ze_init(*shape):
-            return jnp.zeros(shape, param_dtype)
-
         self.in_proj_weight = ArrayParam.bound(
             shape=(embed_dim * 3, embed_dim),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: normal_init(*shape),
-            key=None,
+            init_method="xavier_uniform",
+            key=rngs.param(),
         )
         self.in_proj_bias = ArrayParam.bound(
             shape=(3 * embed_dim,),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: ze_init(*shape),
-            key=None,
+            init_method="zeros",
+            key=rngs.param(),
         )
         self.out_proj = RowParallelLinear(
             embed_dim,
@@ -919,7 +913,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         self.probe = ArrayParam.bound(
             shape=(1, 1, config.hidden_size),
             dtype=param_dtype,
-            init_fn=jax.random.normal,
+            init_method="normal",
             key=rngs.param(),
         )
         self.attention = MultiheadAttention(
@@ -1074,13 +1068,13 @@ class SiglipModel(EasyDeLBaseModule):
         self.logit_scale = ArrayParam.bound(
             shape=(1,),
             dtype=param_dtype,
-            init_fn=jax.random.normal,
+            init_method="normal",
             key=rngs.param(),
         )
         self.logit_bias = ArrayParam.bound(
             shape=(1,),
             dtype=param_dtype,
-            init_fn=jax.random.normal,
+            init_method="normal",
             key=rngs.param(),
         )
 

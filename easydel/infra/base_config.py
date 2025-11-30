@@ -678,8 +678,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return mesh
 
     @property
-    def expert_mesh(self):
-        """Mesh with expert-parallel axes folded according to config flags."""
+    def expert_mesh(self) -> jax.sharding.Mesh:
+        """Get the mesh configuration for expert parallelism.
+
+        Creates a mesh with expert-parallel axes folded according to the
+        `fsdp_is_ep_bound` and `sp_is_ep_bound` configuration flags. This mesh
+        is used for MoE (Mixture of Experts) models to distribute experts
+        across devices with explicit axis types.
+
+        Returns:
+            jax.sharding.Mesh: A mesh with explicit axis types configured for
+                expert parallelism with (dp, ep, tp) axis ordering.
+        """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
             self.partition_manager,
@@ -693,8 +703,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
 
     @property
-    def expert_abstract_mesh(self):
-        """Abstract mesh descriptor matching `expert_mesh` axis sizes and names."""
+    def expert_abstract_mesh(self) -> jax.sharding.AbstractMesh:
+        """Get the abstract mesh descriptor for expert parallelism.
+
+        Returns an abstract mesh that matches the `expert_mesh` axis sizes
+        and names. Abstract meshes are lightweight representations used for
+        sharding specification without device assignment.
+
+        Returns:
+            jax.sharding.AbstractMesh: An abstract mesh descriptor with the same
+                axis configuration as `expert_mesh`.
+        """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
             self.partition_manager,
@@ -707,8 +726,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         )
 
     @property
-    def auto_expert_mesh(self):
-        """Mesh with auto axis types for expert parallelism."""
+    def auto_expert_mesh(self) -> jax.sharding.Mesh:
+        """Get the mesh for expert parallelism with automatic axis types.
+
+        Similar to `expert_mesh`, but uses `jax.sharding.AxisType.Auto` for
+        all axes, allowing JAX to automatically determine the optimal sharding
+        strategy based on the computation graph.
+
+        Returns:
+            jax.sharding.Mesh: A mesh with auto axis types configured for
+                expert parallelism with (dp, ep, tp) axis ordering.
+        """
         (odpsize, epsize, otpsize), (dpname, epname, tpname) = _mesh_shape_ep(
             self.mesh,
             self.partition_manager,
@@ -1584,13 +1612,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return causal_mask_bool
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail] | None:
-        """Gets attention mask details for different sequence lengths.
+        """Get attention mask details for each layer.
+
+        Retrieves layer-specific attention mask configurations, which is
+        particularly useful for models with heterogeneous attention patterns
+        (e.g., models using different attention types per layer like sliding
+        window attention in some layers and full attention in others).
 
         Returns:
-            Dictionary mapping sequence lengths to mask details,
-            or None if not applicable.
+            dict[int, AttnMaskDetail] | None: A dictionary mapping layer indices
+                to their corresponding AttnMaskDetail configurations, or None
+                if the model doesn't define layer-specific mask types.
         """
-        config = self.get_text_config().get_mask_details()
+        config = self.get_text_config()
         layer_types = getattr(config, "layer_types", None)
         if layer_types is not None:
             from easydel.infra.utils import AttnMaskDetail, AttnMaskType

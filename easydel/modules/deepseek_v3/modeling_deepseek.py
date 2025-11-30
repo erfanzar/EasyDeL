@@ -153,7 +153,7 @@ class MoEGate(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=kernel.shape,
             dtype=param_dtype,
-            init_fn=nn.initializers.kaiming_uniform(),
+            init_method="kaiming_uniform",
             key=rngs.param(),
             value=kernel,
         )
@@ -161,7 +161,7 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = ArrayParam.bound(
                 shape=(self.n_routed_experts,),
                 dtype=param_dtype,
-                init_fn=nn.initializers.zeros,
+                init_method="zeros",
                 key=rngs.params(),
             )
 

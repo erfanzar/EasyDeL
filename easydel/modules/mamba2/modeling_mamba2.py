@@ -148,7 +148,7 @@ class Conv1D(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(kernel_size, 1, features),
             dtype=param_dtype,
-            init_fn=nn.initializers.lecun_normal(dtype=param_dtype),
+            init_method="lecun_normal",
             key=rngs.params(),
         )
 
@@ -156,7 +156,7 @@ class Conv1D(nn.Module):
             self.bias = ArrayParam.bound(
                 shape=(features,),
                 dtype=param_dtype,
-                init_fn=nn.initializers.zeros,
+                init_method="zeros",
                 key=rngs.params(),
             )
 
@@ -209,7 +209,7 @@ class MambaRMSNormGated(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.hidden_size,),
             dtype=self.dtype,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            init_method="ones",
             key=None,
         )
 
@@ -312,23 +312,23 @@ class Mamba2Mixer(nn.Module):
         self.dt_bias = ArrayParam.bound(
             shape=inv_dt.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: inv_dt.astype(dtype),
+            init_method="zeros",
             key=None,
             value=inv_dt.astype(self.param_dtype),
         )
 
+        A_log_value = jnp.log(jnp.arange(1, self.num_heads + 1, dtype=jnp.float32)).astype(self.param_dtype)
         self.A_log = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.log(jnp.arange(1, self.num_heads + 1, dtype=jnp.float32)).astype(
-                dtype
-            ),
+            init_method="zeros",
             key=None,
+            value=A_log_value,
         )
         self.D = ArrayParam.bound(
             shape=(self.num_heads,),
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.ones(shape, dtype=dtype),
+            init_method="ones",
             key=None,
         )
 

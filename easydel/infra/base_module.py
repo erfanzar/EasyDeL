@@ -968,14 +968,18 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         return self
 
     def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
-        """
-        Converts the current module instance into an `EasyDeLState` object.
+        """Convert the current module instance into an EasyDeLState object.
 
         This is useful for saving and managing the model's state, including parameters
         and potentially optimizer state (though optimizer state is typically added later).
 
+        Args:
+            state_class: Optional custom state class to use. If None, defaults to
+                EasyDeLState. Must be a subclass of EasyDeLState.
+
         Returns:
-            EasyDeLState: An EasyDeLState object representing the current model state.
+            EasyDeLState: An EasyDeLState object representing the current model state,
+                with step initialized to 0.
         """
         if state_class is None:
             from easydel.infra.base_state import EasyDeLState
@@ -1044,38 +1048,60 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         return ()
 
     def get_encoder(self: Self) -> nn.Module | EasyDeLBaseModule:
-        """
-        Returns the encoder part of the model's graph definition.
+        """Return the encoder component of the model.
 
-        This is useful for models that have a distinct encoder component, such as
-        encoder-decoder architectures. The base implementation returns the full graph definition..
+        This method should be overridden by encoder-decoder models to return
+        their encoder component. Useful for tasks that only need the encoder,
+        such as feature extraction or embedding generation.
+
+        Returns:
+            nn.Module | EasyDeLBaseModule: The encoder module.
+
+        Raises:
+            NotImplementedError: If the model does not implement an encoder.
         """
         raise NotImplementedError()
 
     def get_decoder(self: Self) -> nn.Module | EasyDeLBaseModule:
-        """
-        Returns the decoder part of the model's graph definition.
+        """Return the decoder component of the model.
 
-        This is useful for models that have a distinct decoder component, such as
-        encoder-decoder architectures. The base implementation returns the full graph definition.
+        This method should be overridden by encoder-decoder models to return
+        their decoder component. Useful for tasks that need access to the
+        decoder separately from the encoder.
+
+        Returns:
+            nn.Module | EasyDeLBaseModule: The decoder module.
+
+        Raises:
+            NotImplementedError: If the model does not implement a decoder.
         """
         raise NotImplementedError()
 
     def get_lm_head(self: Self) -> ParallelLinear:
-        """
-        Returns the language model head of the module.
+        """Return the language model head of the model.
 
-        This is useful for models that have a separate head for language modeling tasks.
-        The base implementation returns the full graph definition.
+        This method should be overridden by language models to return their
+        output projection layer that maps hidden states to vocabulary logits.
+
+        Returns:
+            ParallelLinear: The language model head layer.
+
+        Raises:
+            NotImplementedError: If the model does not have a language model head.
         """
         raise NotImplementedError()
 
     def get_embedding(self: Self) -> nn.Module | nn.Embed:
-        """
-        Returns the embedding layer of the module.
+        """Return the input embedding layer of the model.
 
-        This is useful for models that have a separate embedding layer for input tokens.
-        The base implementation returns the full graph definition.
+        This method should be overridden by models to return their token
+        embedding layer. Useful for weight tying or accessing embeddings directly.
+
+        Returns:
+            nn.Module | nn.Embed: The embedding layer.
+
+        Raises:
+            NotImplementedError: If the model does not have an embedding layer.
         """
         raise NotImplementedError()
 
@@ -1260,7 +1286,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         return False
 
     @property
-    def is_quantized(self):
+    def is_quantized(self) -> bool:
+        """Check if the model contains any quantized layers or parameters.
+
+        Iterates through the model graph to detect quantized components,
+        including 8-bit linear layers, NF4 linear layers, and quantized arrays.
+
+        Returns:
+            bool: True if the model contains any quantized components, False otherwise.
+        """
         from easydel.layers.quantization import Array8B, ArrayNF4, Linear8bit, LinearNF4
 
         for _, tensor in nn.iter_graph(self):
@@ -1777,16 +1811,19 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         return self
 
     def new_graphdef(self, **kwargs: Unpack[EasyDeLBaseConfigDict]):
-        """create the module configuration and reinitializes the structure.
+        """Create a new module with updated configuration.
 
         Creates a new lazy module with updated configuration while preserving
-        the current parameter state.
+        the current parameter state. This is useful for modifying model behavior
+        without reinitializing weights.
 
         Args:
-            **kwargs: Configuration parameters to update.
+            **kwargs: Configuration parameters to update. These will be applied
+                to a copy of the current configuration.
 
         Returns:
-            new create graphdef with new configuration.
+            EasyDeLBaseModule: A new module instance with updated configuration
+                and the same parameter values.
         """
         config = deepcopy(self.config)
         for k, v in kwargs.items():

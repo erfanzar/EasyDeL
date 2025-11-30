@@ -82,7 +82,7 @@ class Cohere2LayerNorm(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.dim,) if isinstance(self.dim, int) else self.dim,
             dtype=self.param_dtype,
-            init_fn=nn.initializers.ones,
+            init_method="ones",
             key=rngs.params(),
         )
 

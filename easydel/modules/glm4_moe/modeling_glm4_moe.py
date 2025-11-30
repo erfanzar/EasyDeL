@@ -222,13 +222,14 @@ class Glm4MoeTopKRouter(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.n_routed_experts, config.hidden_size),
             dtype=param_dtype,
-            init_fn=jax.nn.initializers.normal(stddev=config.initializer_range),
+            init_method="normal",
+            init_kwargs={"stddev": config.initializer_range},
             key=rngs.param(),
         )
         self.e_score_correction_bias = ArrayParam.bound(
             shape=(self.n_routed_experts,),
             dtype=jnp.float32,
-            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            init_method="zeros",
             key=None,
         )
 

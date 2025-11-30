@@ -288,7 +288,8 @@ class GptOssAttention(UnifiedAttention):
         self.sinks = ArrayParam.bound(
             shape=(config.num_attention_heads,),
             dtype=param_dtype,
-            init_fn=jax.nn.initializers.normal(config.initializer_range),
+            init_method="normal",
+            init_kwargs={"stddev": config.initializer_range},
             key=rngs.param(),
         )
 

@@ -218,15 +218,17 @@ class GiddAttention(AttentionModule):
 
         if self.use_qk_norm:
             # Initialize learnable scale parameter for QK normalization
+            qk_scale_value = jnp.full(
+                (1, 1, self.config.num_attention_heads, 1),
+                2 * jnp.log(config.max_position_embeddings),
+                dtype=self.param_dtype,
+            )
             self.qk_scale = ArrayParam.bound(
                 shape=(1, 1, self.config.num_attention_heads, 1),
                 dtype=self.param_dtype,
-                init_fn=lambda key, shape, dtype: jnp.full(
-                    shape,
-                    2 * jnp.log(config.max_position_embeddings),
-                    dtype=dtype,
-                ),
+                init_method="zeros",
                 key=rngs.params(),
+                value=qk_scale_value,
             )
         else:
             # Fixed scale based on head dimension
@@ -533,7 +535,7 @@ class GiddRMSNorm(nn.Module):
         self.kernel = ArrayParam.bound(
             shape=(self.config.hidden_size,),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype),
+            init_method="zeros",
             key=None,
         )
 

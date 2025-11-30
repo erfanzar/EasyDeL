@@ -172,18 +172,18 @@ class Llama4TextExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
 
-        kernel_init = jax.nn.initializers.normal(config.initializer_range)
-
         self.gate_up_proj = ArrayParam.bound(
             shape=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
             dtype=self.param_dtype,
-            init_fn=kernel_init,
+            init_method="normal",
+            init_kwargs={"stddev": config.initializer_range},
             key=rngs.params(),
         )
         self.down_proj = ArrayParam.bound(
             shape=(self.num_experts, self.expert_dim, self.hidden_size),
             dtype=self.param_dtype,
-            init_fn=kernel_init,
+            init_method="normal",
+            init_kwargs={"stddev": config.initializer_range},
             key=rngs.params(),
         )
 
@@ -1419,13 +1419,15 @@ class Llama4VisionModel(EasyDeLBaseModule):
         self.class_embedding = ArrayParam.bound(
             shape=(self.hidden_size,),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: self.scale * jax.random.normal(key, shape, dtype),
+            init_method="normal",
+            init_kwargs={"stddev": self.scale},
             key=rngs.params(),
         )
         self.positional_embedding_vlm = ArrayParam.bound(
             shape=(self.num_patches, self.hidden_size),
             dtype=param_dtype,
-            init_fn=lambda key, shape, dtype: self.scale * jax.random.normal(key, shape, dtype),
+            init_method="normal",
+            init_kwargs={"stddev": self.scale},
             key=rngs.params(),
         )
         self.layernorm_pre = nn.LayerNorm(

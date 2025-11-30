@@ -147,35 +147,35 @@ class RwkvSelfAttention(nn.Module):
         self.time_decay = ArrayParam.bound(
             shape=time_decay.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_decay.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_decay.astype(self.param_dtype),
         )
         self.time_first = ArrayParam.bound(
             shape=time_first.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_first.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_first.astype(self.param_dtype),
         )
         self.time_mix_key = ArrayParam.bound(
             shape=time_mix_key.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_mix_key.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_mix_key.astype(self.param_dtype),
         )
         self.time_mix_value = ArrayParam.bound(
             shape=time_mix_value.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_mix_value.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_mix_value.astype(self.param_dtype),
         )
         self.time_mix_receptance = ArrayParam.bound(
             shape=time_mix_receptance.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_mix_receptance.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_mix_receptance.astype(self.param_dtype),
         )
@@ -289,14 +289,14 @@ class RwkvFeedForward(nn.Module):
         self.time_mix_key = ArrayParam.bound(
             shape=time_mix_key.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_mix_key.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_mix_key.astype(self.param_dtype),
         )
         self.time_mix_receptance = ArrayParam.bound(
             shape=time_mix_receptance.shape,
             dtype=self.param_dtype,
-            init_fn=lambda key, shape, dtype: time_mix_receptance.astype(dtype),
+            init_method="zeros",
             key=None,
             value=time_mix_receptance.astype(self.param_dtype),
         )
