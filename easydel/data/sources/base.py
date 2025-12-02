@@ -244,6 +244,14 @@ class ParquetShardedSource(ShardedDataSource[dict]):
                 for i in range(start_i, n):
                     yield {k: v[i] for k, v in cols.items()}
 
+    def __len__(self) -> int:
+        """Return total number of rows across all parquet files."""
+        total = 0
+        for shard_name in self._files:
+            info = self.get_shard_info(shard_name)
+            total += info.num_rows
+        return total
+
     def __repr__(self) -> str:
         return f"ParquetShardedSource(files={len(self._files)}, columns={self._columns})"
 
@@ -321,6 +329,19 @@ class JsonShardedSource(ShardedDataSource[dict]):
                 elif row == 0:
                     yield data
 
+    def __len__(self) -> int:
+        """Return total number of records across all JSON files.
+
+        Note: First call may be slow as it counts all records.
+        """
+        if not hasattr(self, "_cached_len"):
+            total = 0
+            for shard_name in self._files:
+                for _ in self.open_shard(shard_name):
+                    total += 1
+            self._cached_len = total
+        return self._cached_len
+
     def __repr__(self) -> str:
         fmt = "jsonl" if self._jsonl else "json"
         return f"JsonShardedSource(files={len(self._files)}, format={fmt!r})"
@@ -367,6 +388,19 @@ class ArrowShardedSource(ShardedDataSource[dict]):
                 for i in range(n):
                     yield {k: v[i] for k, v in cols.items()}
 
+    def __len__(self) -> int:
+        """Return total number of records across all Arrow files.
+
+        Note: First call may be slow as it counts all records.
+        """
+        if not hasattr(self, "_cached_len"):
+            total = 0
+            for shard_name in self._files:
+                for _ in self.open_shard(shard_name):
+                    total += 1
+            self._cached_len = total
+        return self._cached_len
+
     def __repr__(self) -> str:
         return f"ArrowShardedSource(files={len(self._files)})"
 
@@ -409,6 +443,19 @@ class CsvShardedSource(ShardedDataSource[dict]):
             reader = csv.DictReader(fh, delimiter=self._delimiter)
             yield from reader
 
+    def __len__(self) -> int:
+        """Return total number of records across all CSV files.
+
+        Note: First call may be slow as it counts all records.
+        """
+        if not hasattr(self, "_cached_len"):
+            total = 0
+            for shard_name in self._files:
+                for _ in self.open_shard(shard_name):
+                    total += 1
+            self._cached_len = total
+        return self._cached_len
+
     def __repr__(self) -> str:
         return f"CsvShardedSource(files={len(self._files)}, delimiter={self._delimiter!r})"
 
@@ -450,6 +497,19 @@ class TextShardedSource(ShardedDataSource[dict]):
         with fsspec.open(shard_name, "r", **self._storage_options) as fh:
             for line in fh:
                 yield {self._text_field: line.rstrip("\n\r")}
+
+    def __len__(self) -> int:
+        """Return total number of lines across all text files.
+
+        Note: First call may be slow as it counts all lines.
+        """
+        if not hasattr(self, "_cached_len"):
+            total = 0
+            for shard_name in self._files:
+                for _ in self.open_shard(shard_name):
+                    total += 1
+            self._cached_len = total
+        return self._cached_len
 
     def __repr__(self) -> str:
         return f"TextShardedSource(files={len(self._files)}, text_field={self._text_field!r})"
@@ -524,6 +584,17 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             # Non-streaming: use select
             yield from ds.select(range(row, len(ds)))
 
+    def __len__(self) -> int:
+        """Return number of examples in the dataset.
+
+        Raises:
+            TypeError: If dataset is in streaming mode.
+        """
+        if self._streaming:
+            raise TypeError("Streaming HuggingFace datasets don't support len()")
+        ds = self._load_dataset()
+        return len(ds)
+
     def __repr__(self) -> str:
         subset_str = f", subset={self._subset!r}" if self._subset else ""
         return f"HuggingFaceShardedSource({self._dataset_name!r}, split={self._split!r}{subset_str})"
@@ -568,6 +639,10 @@ class CompositeShardedSource(ShardedDataSource[dict]):
         idx = self._shard_names.index(shard_name)
         src_idx, _ = self._shard_map[idx]
         return self._sources[src_idx].open_shard_at_row(shard_name, row)
+
+    def __len__(self) -> int:
+        """Return total number of examples across all sources."""
+        return sum(len(source) for source in self._sources)
 
     def __repr__(self) -> str:
         return f"CompositeShardedSource(sources={len(self._sources)}, shards={len(self._shard_names)})"

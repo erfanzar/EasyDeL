@@ -16,6 +16,7 @@
 
 This module provides:
 - Transform: Abstract base class for all transforms
+- ExpandTransform: Transform that can produce multiple examples from one input
 - ChainedTransform: Chain of transforms applied sequentially
 """
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import typing as tp
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 Example = dict[str, tp.Any]
 
@@ -65,6 +67,51 @@ class Transform(ABC):
     def is_filter(self) -> bool:
         """Whether this transform can filter out examples (return None)."""
         return False
+
+    @property
+    def is_expand(self) -> bool:
+        """Whether this transform can produce multiple examples from one input."""
+        return False
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"
+
+
+class ExpandTransform(ABC):
+    """Transform that can produce multiple examples from a single input.
+
+    Unlike Transform which returns Example | None, ExpandTransform
+    yields zero or more examples via a generator. This is useful for
+    operations like unpairing preference data (1 pair → 2 examples).
+
+    Example:
+        >>> class UnpairTransform(ExpandTransform):
+        ...     def __call__(self, example):
+        ...         yield {"text": example["chosen"], "label": True}
+        ...         yield {"text": example["rejected"], "label": False}
+    """
+
+    @abstractmethod
+    def __call__(self, example: Example) -> Iterator[Example]:
+        """Apply transform, yielding zero or more examples.
+
+        Args:
+            example: Input example dictionary.
+
+        Yields:
+            Transformed examples. Can yield 0, 1, or many examples.
+        """
+        ...
+
+    @property
+    def is_expand(self) -> bool:
+        """Always True for ExpandTransform."""
+        return True
+
+    @property
+    def is_filter(self) -> bool:
+        """ExpandTransform can filter by yielding nothing."""
+        return True
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}()"

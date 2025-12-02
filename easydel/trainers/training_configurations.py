@@ -331,6 +331,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to use eSurge engine for preview generation instead of compiled functions."},
     )
+    esurge_use_tqdm: bool = field(
+        default=True,
+        metadata={"help": "Whether to use tqdm progress bars for eSurge generations."},
+    )
     esurge_hbm_utilization: float | None = field(
         default=0.45,
         metadata={"help": "HBM memory utilization target for eSurge engine (0.0-1.0). None uses eSurge default."},

@@ -19,7 +19,9 @@ from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
+from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
+from .group_sequence_policy_optimization import GSPOConfig, GSPOTrainer
 from .kto_trainer import KTOConfig, KTOTrainer
 from .nash_md_trainer import NashMDConfig, NashMDTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
@@ -54,11 +56,15 @@ __all__ = (
     "DPOTrainer",
     "DistillationConfig",
     "DistillationTrainer",
+    "GFPOConfig",
+    "GFPOTrainer",
     "GKDConfig",
     "GKDTrainer",
     "GRPOConfig",
     "GRPOPreprocessTransform",
     "GRPOTrainer",
+    "GSPOConfig",
+    "GSPOTrainer",
     "KTOConfig",
     "KTOPreprocessTransform",
     "KTOTrainer",

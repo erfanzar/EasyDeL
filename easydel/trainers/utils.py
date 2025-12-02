@@ -1047,11 +1047,20 @@ class _BCODataCollatorMixin:
     label_pad_token_id: int
     is_encoder_decoder: bool
 
+    @property
+    def max_length(self) -> int:
+        """Return max sequence length (prompt + completion)."""
+        return self.max_prompt_length + self.max_completion_length
+
     def _pad_prompt(self, arrays: list[np.ndarray], padding_value: int, side: str = "left") -> jnp.ndarray:
         return pad(arrays, self.max_prompt_length, padding_value=padding_value, padding_side=side)
 
     def _pad_completion(self, arrays: list[np.ndarray], padding_value: int) -> jnp.ndarray:
         return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
+
+    def _pad_full_sequence(self, arrays: list[np.ndarray], padding_value: int, side: str = "right") -> jnp.ndarray:
+        """Pad full sequence (prompt + completion) to max_length."""
+        return pad(arrays, self.max_length, padding_value=padding_value, padding_side=side)
 
     def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
         return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
@@ -1071,15 +1080,10 @@ class BCODataCollatorTFDS(_BCODataCollatorMixin):
         batch: dict[str, jnp.ndarray] = {}
         batch["prompt_input_ids"] = self._pad_prompt(prompt_input_ids, self.pad_token_id)
         batch["prompt_attention_mask"] = self._pad_prompt(prompt_attention_mask, 0)
-        batch["completion_input_ids"] = self._pad_optional(
-            completion_input_ids, self.max_completion_length, self.pad_token_id, "right"
-        )
-        batch["completion_attention_mask"] = self._pad_optional(
-            completion_attention_mask, self.max_completion_length, 0, "right"
-        )
-        batch["completion_labels"] = self._pad_optional(
-            completion_labels, self.max_completion_length, self.label_pad_token_id, "right"
-        )
+        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
+        batch["completion_input_ids"] = self._pad_full_sequence(completion_input_ids, self.pad_token_id)
+        batch["completion_attention_mask"] = self._pad_full_sequence(completion_attention_mask, 0)
+        batch["completion_labels"] = self._pad_full_sequence(completion_labels, self.label_pad_token_id)
         batch["label"] = jnp.asarray(labels, dtype=jnp.bool_)
 
         if "embedding_input_ids" in features[0]:
@@ -1118,19 +1122,20 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
             padding_value=0,
             padding_side="left",
         )
+        # completion_input_ids contains full sequence (prompt + completion), pad to max_length
         batch["completion_input_ids"] = pad_single(
             completion_input_ids,
-            self.max_completion_length,
+            self.max_length,
             padding_value=self.pad_token_id,
         )
         batch["completion_attention_mask"] = pad_single(
             completion_attention_mask,
-            self.max_completion_length,
+            self.max_length,
             padding_value=0,
         )
         batch["completion_labels"] = pad_single(
             completion_labels,
-            self.max_completion_length,
+            self.max_length,
             padding_value=self.label_pad_token_id,
         )
         batch["label"] = np.asarray([feature["label"]], dtype=np.bool_)
