@@ -156,6 +156,16 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         """Return estimated number of examples, if known."""
         return self._length
 
+    def __len__(self) -> int:
+        """Return number of examples in the dataset.
+
+        Raises:
+            TypeError: If dataset is streaming (IterableDataset) and length is unknown.
+        """
+        if self._length is not None:
+            return self._length
+        raise TypeError("Streaming HuggingFace datasets don't support len()")
+
     def __repr__(self) -> str:
         ds_type = "IterableDataset" if self._is_iterable else "Dataset"
         length_str = f", length={self._length}" if self._length else ""
