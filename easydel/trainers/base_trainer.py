@@ -713,7 +713,10 @@ class BaseTrainer(BaseTrainerProtocol):
         return state, metrics
 
     def _preprocess_batch_input(
-        self, state: EasyDeLState, batch: dict[str, jax.Array], is_train: bool
+        self,
+        state: EasyDeLState,
+        batch: dict[str, jax.Array],
+        is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
         """Preprocess a batch of input data before feeding to the model.
 
@@ -759,7 +762,6 @@ class BaseTrainer(BaseTrainerProtocol):
         dict
             Purified batch with only JAX-compatible array fields
         """
-        import numpy as np
 
         # Handle list of dicts (uncollated batch)
         if isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
@@ -1212,6 +1214,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     prompts=prompts,
                     sampling_params=sampling_params,
                     stream=False,
+                    use_tqdm=args.esurge_use_tqdm,
                     **esurge_kwargs,
                 )
 
@@ -2091,9 +2094,9 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         def calculate_steps(dataset, is_train: bool) -> int:
-            if hasattr(dataset, "__len__"):
+            try:
                 total_data_len = len(dataset)
-            else:
+            except TypeError as e:
                 total_data_len = (
                     self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
                 )
@@ -2101,7 +2104,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     raise ValueError(
                         f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
                         "steps for a generator/streaming dataset."
-                    )
+                    ) from e
             batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
             num_steps = (
                 (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
@@ -2270,9 +2273,9 @@ class BaseTrainer(BaseTrainerProtocol):
             Raises:
               ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
             """
-            if hasattr(dataset, "__len__"):
+            try:
                 total_data_len = len(dataset)
-            else:
+            except TypeError as e:
                 total_data_len = (
                     self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
                 )
@@ -2280,7 +2283,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     raise ValueError(
                         f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
                         "steps for a generator/streaming dataset."
-                    )
+                    ) from e
             batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
             num_steps = (
                 (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)

@@ -22,11 +22,16 @@ from __future__ import annotations
 
 import json
 import typing as tp
+from collections.abc import Iterator
 
 # Re-export base classes from data_managers
-from easydel.data.transforms.base import Example, Transform
+from easydel.data.transforms.base import Example, ExpandTransform, Transform
 
-from .prompt_utils import maybe_extract_prompt
+from .prompt_utils import (
+    maybe_apply_chat_template,
+    maybe_convert_to_chatml,
+    maybe_extract_prompt,
+)
 
 _TOKENIZED_FIELDS = {
     "input_ids",
@@ -128,9 +133,17 @@ def convert_to_chatml(example: dict) -> dict:
 
     Returns:
         Example with 'messages' field in role/content format.
+
+    Raises:
+        KeyError: If neither 'conversations' nor 'conversation' field exists.
     """
-    conversations_key = "conversations" if "conversations" in example else "conversation"
-    conversations = example.get(conversations_key, [])
+    if "conversations" in example:
+        conversations_key = "conversations"
+    elif "conversation" in example:
+        conversations_key = "conversation"
+    else:
+        raise KeyError("Example must have 'conversations' or 'conversation' field")
+    conversations = example[conversations_key]
 
     role_mapping = {
         "human": "user",
@@ -190,12 +203,16 @@ def apply_chat_template_to_preference(
 
     Returns:
         Example with text formatted using chat template.
+
+    Raises:
+        KeyError: If required fields (prompt, chosen, rejected) are missing.
     """
     result = dict(example)
 
-    prompt = example.get("prompt", "")
-    chosen = example.get("chosen", "")
-    rejected = example.get("rejected", "")
+    # Strict field access - will raise KeyError if missing
+    prompt = example["prompt"]
+    chosen = example["chosen"]
+    rejected = example["rejected"]
 
     # Handle message list format
     if isinstance(prompt, list):
@@ -274,12 +291,14 @@ class GRPOPreprocessTransform(Transform):
         if "input_ids" in example:
             return example
 
-        result = dict(example)
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
 
         # Extract prompt from preference data if needed (chosen/rejected → prompt)
-        result = extract_prompt_from_preference(result)
+        result = extract_prompt_from_preference(example)
 
-        prompt = result.get("prompt", "")
+        # Strict field access - will raise KeyError if prompt is missing
+        prompt = result["prompt"]
 
         # Apply chat template if conversational format
         if isinstance(prompt, list) and not self._skip_apply_chat_template:
@@ -377,15 +396,23 @@ class KTOPreprocessTransform(Transform):
 
         Returns:
             Preprocessed example with all tokenized fields.
+
+        Raises:
+            KeyError: If required fields (prompt, completion, label) are missing.
         """
         # Skip if already tokenized
         if "prompt_input_ids" in example:
             return example
 
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
         result = dict(example)
 
-        prompt = example.get("prompt", "")
-        completion = example.get("completion", "")
+        # Strict field access - will raise KeyError if missing
+        prompt = example["prompt"]
+        completion = example["completion"]
+        label = example["label"]
 
         # Handle conversational format
         if isinstance(prompt, list):
@@ -435,7 +462,7 @@ class KTOPreprocessTransform(Transform):
         result["completion_input_ids"] = full_ids
         result["completion_attention_mask"] = full_mask
         result["completion_labels"] = full_labels
-        result["label"] = bool(example.get("label", True))
+        result["label"] = bool(label)
 
         # Add embedding tokens for BCO UDM if embedding tokenizer is provided
         if self._embedding_tokenizer is not None:
@@ -456,8 +483,209 @@ class KTOPreprocessTransform(Transform):
         )
 
 
-# BCO uses the same preprocessing as KTO
-BCOPreprocessTransform = KTOPreprocessTransform
+class BCOPreprocessTransform(ExpandTransform):
+    """Preprocessing transform for Binary Classifier Optimization.
+
+    BCO works with unpaired preference data (prompt + completion + label).
+    This transform handles the full preprocessing pipeline per-example:
+    1. Extract shared prompt from chosen/rejected conversations
+    2. Apply chat template to convert conversations to text
+    3. Unpair: yield TWO examples from one paired input (chosen + rejected)
+    4. Tokenize prompt and completion with proper masking
+
+    As an ExpandTransform, this yields multiple examples from each input:
+    - For paired data (chosen/rejected): yields 2 examples
+    - For unpaired data (prompt/completion/label): yields 1 example
+
+    Produces per example:
+        - prompt_input_ids, prompt_attention_mask: Just the prompt
+        - completion_input_ids, completion_attention_mask, completion_labels: Full sequence
+        - label: Boolean indicating desirable (True) or undesirable (False)
+
+    Args:
+        tokenizer: Tokenizer for text encoding.
+        max_prompt_length: Maximum tokens for prompt.
+        max_completion_length: Maximum tokens for completion.
+        add_special_tokens: Whether to add BOS/EOS tokens.
+        label_pad_token_id: Token ID for masking prompt tokens in labels.
+        embedding_tokenizer: Optional tokenizer for BCO UDM embeddings.
+        tools: Optional tools for function calling in chat template.
+
+    Example:
+        >>> transform = BCOPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_prompt_length=512,
+        ...     max_completion_length=256,
+        ... )
+        >>> # Paired input yields 2 examples
+        >>> for result in transform({"chosen": [...], "rejected": [...]}):
+        ...     print(result["label"])  # True, then False
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_prompt_length: int | None = None,
+        max_completion_length: int | None = None,
+        add_special_tokens: bool = False,
+        label_pad_token_id: int = -100,
+        embedding_tokenizer: tp.Any = None,
+        tools: list | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._max_prompt_length = max_prompt_length
+        self._max_completion_length = max_completion_length
+        self._add_special_tokens = add_special_tokens
+        self._label_pad_token_id = label_pad_token_id
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._embedding_tokenizer = embedding_tokenizer
+        self._tools = tools
+
+    def __call__(self, example: Example) -> Iterator[Example]:
+        """Process example and yield one or more tokenized examples.
+
+        For paired data (chosen/rejected): yields 2 examples.
+        For unpaired data (prompt/completion/label): yields 1 example.
+
+        Args:
+            example: Input example with either:
+                - chosen/rejected fields (paired preference data)
+                - prompt/completion/label fields (unpaired data)
+
+        Yields:
+            Tokenized examples with prompt_input_ids, completion_input_ids, label, etc.
+
+        Raises:
+            KeyError: If required fields are missing from the example.
+        """
+        # Skip if already tokenized
+        if "prompt_input_ids" in example:
+            yield example
+            return
+
+        # Check if already unpaired (has prompt/completion/label)
+        if "completion" in example and "label" in example:
+            # Already unpaired - just tokenize and yield single example
+            yield self._tokenize_unpaired(example)
+            return
+
+        # Paired data: extract prompt, apply chat template, yield 2 examples
+
+        # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
+        # Step 2: Extract prompt from chosen/rejected if needed
+        example = extract_prompt_from_preference(example)
+
+        # Step 3: Apply chat template if conversational (uses maybe_apply_chat_template)
+        example = maybe_apply_chat_template(example, self._tokenizer, self._tools)
+
+        # Step 4: Get fields with strict access - missing fields will raise KeyError
+        prompt = example["prompt"]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
+
+        # Step 5: Yield TWO tokenized examples (unpair operation)
+        # Chosen example (label=True)
+        yield self._tokenize_unpaired({
+            "prompt": prompt,
+            "completion": chosen,
+            "label": True,
+        })
+
+        # Rejected example (label=False)
+        yield self._tokenize_unpaired({
+            "prompt": prompt,
+            "completion": rejected,
+            "label": False,
+        })
+
+    def _tokenize_unpaired(self, example: dict) -> dict:
+        """Tokenize a single unpaired example.
+
+        Args:
+            example: Dict with prompt, completion, label fields.
+
+        Returns:
+            Tokenized example with prompt_input_ids, completion_input_ids, etc.
+
+        Raises:
+            KeyError: If required fields (prompt, completion, label) are missing.
+        """
+        result = dict(example)
+
+        # Strict field access - will raise KeyError if missing
+        prompt = example["prompt"]
+        completion = example["completion"]
+        label = example["label"]
+
+        # Handle conversational format for prompt (if not already converted)
+        if isinstance(prompt, list):
+            prompt = self._tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        # Tokenize prompt and completion separately
+        prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        completion_ids = self._tokenizer(completion, add_special_tokens=False)["input_ids"]
+
+        # Add BOS to prompt if requested
+        bos_token_id = self._tokenizer.bos_token_id
+        eos_token_id = self._tokenizer.eos_token_id
+
+        if self._add_special_tokens and bos_token_id is not None:
+            prompt_ids = [bos_token_id, *prompt_ids]
+
+        # Add EOS to completion
+        if eos_token_id is not None:
+            completion_ids = [*completion_ids, eos_token_id]
+
+        # Truncate prompt (from left, keep most recent context)
+        if self._max_prompt_length is not None:
+            prompt_ids = prompt_ids[-self._max_prompt_length:]
+
+        # Truncate completion (from right)
+        if self._max_completion_length is not None:
+            completion_ids = completion_ids[:self._max_completion_length]
+
+        # Build full sequence: prompt + completion
+        full_ids = prompt_ids + completion_ids
+        prompt_len = len(prompt_ids)
+
+        # Create labels: mask prompt tokens with label_pad_token_id
+        full_labels = [self._label_pad_token_id] * prompt_len + completion_ids
+
+        # Create attention masks (all 1s for actual tokens)
+        prompt_mask = [1] * len(prompt_ids)
+        full_mask = [1] * len(full_ids)
+
+        # Set outputs
+        result["prompt_input_ids"] = prompt_ids
+        result["prompt_attention_mask"] = prompt_mask
+        result["completion_input_ids"] = full_ids
+        result["completion_attention_mask"] = full_mask
+        result["completion_labels"] = full_labels
+        result["label"] = bool(label)
+
+        # Add embedding tokens for BCO UDM if embedding tokenizer is provided
+        if self._embedding_tokenizer is not None:
+            emb_tokenized = self._embedding_tokenizer(
+                prompt,
+                truncation=True,
+                add_special_tokens=False,
+            )
+            result["embedding_input_ids"] = emb_tokenized["input_ids"]
+            result["embedding_attention_mask"] = emb_tokenized["attention_mask"]
+
+        # Remove non-tokenized fields
+        return purify_example(result)
+
+    def __repr__(self) -> str:
+        return (
+            f"BCOPreprocessTransform(max_prompt={self._max_prompt_length}, max_completion={self._max_completion_length})"
+        )
 
 
 class DPOPreprocessTransform(Transform):
@@ -521,20 +749,21 @@ class DPOPreprocessTransform(Transform):
         if "prompt_input_ids" in example:
             return example
 
-        result = dict(example)
+        # Step 1: Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
 
-        # Step 1: Extract prompt if needed
-        result = extract_prompt_from_preference(result)
+        # Step 2: Extract prompt if needed
+        result = extract_prompt_from_preference(example)
 
-        # Step 2: Apply chat template if conversational
-        if isinstance(result.get("prompt"), list):
+        # Step 3: Apply chat template if conversational
+        if isinstance(result["prompt"], list):
             result = apply_chat_template_to_preference(
                 result,
                 self._tokenizer,
                 self._tools,
             )
 
-        # Step 3: Tokenize
+        # Step 4: Tokenize
         return self._tokenize(result)
 
     def _tokenize(self, example: dict) -> dict:
@@ -546,12 +775,16 @@ class DPOPreprocessTransform(Transform):
             - rejected_input_ids, rejected_attention_mask, rejected_labels: Full rejected sequence
 
         Labels have prompt tokens masked with label_pad_token_id (-100).
+
+        Raises:
+            KeyError: If required fields (prompt, chosen, rejected) are missing.
         """
         result = dict(example)
 
-        prompt = example.get("prompt", "")
-        chosen = example.get("chosen", "")
-        rejected = example.get("rejected", "")
+        # Strict field access - will raise KeyError if missing
+        prompt = example["prompt"]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
 
         # Tokenize each part separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -692,15 +925,23 @@ class RewardPreprocessTransform(Transform):
         self._truncation = truncation
 
     def __call__(self, example: Example) -> Example:
-        """Apply reward model preprocessing."""
+        """Apply reward model preprocessing.
+
+        Raises:
+            KeyError: If required fields (chosen, rejected) are missing.
+        """
         # Skip if already tokenized
         if "input_ids_chosen" in example:
             return example
 
+        # Convert from/value format to role/content if needed (ShareGPT → ChatML)
+        example = maybe_convert_to_chatml(example)
+
         result = dict(example)
 
-        chosen = example.get("chosen", "")
-        rejected = example.get("rejected", "")
+        # Strict field access - will raise KeyError if missing
+        chosen = example["chosen"]
+        rejected = example["rejected"]
 
         # Handle conversational format
         if isinstance(chosen, list):

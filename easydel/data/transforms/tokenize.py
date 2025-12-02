@@ -233,6 +233,10 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         for example in self._source.open_shard_at_row(shard_name, row):
             yield self._tokenize_example(example)
 
+    def __len__(self) -> int:
+        """Return length of underlying source."""
+        return len(self._source)
+
     def __repr__(self) -> str:
         max_len = self._tokenizer_config.max_length if self._tokenizer_config else "?"
         return f"TokenizedShardedSource({self._source!r}, max_length={max_len}, content_field={self._content_field!r})"

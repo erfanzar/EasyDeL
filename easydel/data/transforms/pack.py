@@ -517,6 +517,21 @@ class PackedShardedSource(ShardedDataSource[dict]):
             random.shuffle(shuffle_buffer)
             yield from shuffle_buffer
 
+    def __len__(self) -> int:
+        """Return estimated number of packed sequences.
+
+        Note: This is an estimate based on source length. Actual count
+        depends on token distribution and packing efficiency.
+
+        Raises:
+            TypeError: If the underlying source doesn't support len().
+        """
+        # Estimate based on average sequence length ratio
+        # Assume ~70% packing efficiency as a rough heuristic
+        source_len = len(self._source)
+        # Rough estimate: each packed sequence contains ~1.4 original sequences on average
+        return max(1, int(source_len / 1.4))
+
     def __repr__(self) -> str:
         return (
             f"PackedShardedSource(seq_length={self._seq_length}, "

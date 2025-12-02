@@ -2116,6 +2116,7 @@ class EasyGenerationMixin:
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
+        use_tqdm: bool = False,
     ):
         """Internal helper to call an eSurge engine with the appropriate method.
 
@@ -2160,7 +2161,7 @@ class EasyGenerationMixin:
                     prompts=prompts,
                     sampling_params=sampling_params,
                     request_id=request_id,
-                    use_tqdm=False,
+                    use_tqdm=use_tqdm,
                 )
 
     def esurge_generate(
@@ -2184,6 +2185,7 @@ class EasyGenerationMixin:
         decode_truncated_prompt: bool | None = None,
         destroy_pages_on_pause: bool | None = None,
         silent_mode: bool | None = None,
+        use_tqdm: bool = False,
     ):
         """High-level interface for text generation using eSurge engine.
 
@@ -2271,6 +2273,7 @@ class EasyGenerationMixin:
             request_id=request_id,
             stream=stream,
             chat_template=chat_template,
+            use_tqdm=use_tqdm,
         )
 
 
