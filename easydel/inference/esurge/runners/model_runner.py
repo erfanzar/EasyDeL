@@ -939,26 +939,16 @@ class eSurgeRunner:
                 page_table_cpu=page_table_cpu,
             )
 
-            # account for device time
-            jax.block_until_ready(valid_mask_win)
+            # Start async copy to host (non-blocking) - overlaps with post-processing
+            token_ids_async = jax.copy_to_host_async(minimal_device_state.token_ids)
+            num_tokens_async = jax.copy_to_host_async(minimal_device_state.num_tokens)
+
+            # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
             # host copies once
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
             logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
-
-            # Sync back minimal device state to CPU SequenceBuffer
-            sq_utime = time.time()
-            token_ids_updated = np.asarray(jax.device_get(minimal_device_state.token_ids))
-            num_tokens_updated = np.asarray(jax.device_get(minimal_device_state.num_tokens))
-            if not token_ids_updated.flags.writeable:
-                token_ids_updated = token_ids_updated.copy()
-            if not num_tokens_updated.flags.writeable:
-                num_tokens_updated = num_tokens_updated.copy()
-            self.sequence_buffer.token_ids = token_ids_updated
-            self.sequence_buffer.num_computed_tokens = num_tokens_updated
-            sq_utime_took = time.time() - sq_utime
-            total_sync_time += sq_utime_took
 
             # Track for async scheduling
             request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
@@ -1001,6 +991,19 @@ class eSurgeRunner:
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
 
+            # Complete async sync-back (should be done by now, overlapped with post-processing)
+            sq_utime = time.time()
+            token_ids_updated = np.asarray(token_ids_async)
+            num_tokens_updated = np.asarray(num_tokens_async)
+            if not token_ids_updated.flags.writeable:
+                token_ids_updated = token_ids_updated.copy()
+            if not num_tokens_updated.flags.writeable:
+                num_tokens_updated = num_tokens_updated.copy()
+            self.sequence_buffer.token_ids = token_ids_updated
+            self.sequence_buffer.num_computed_tokens = num_tokens_updated
+            sq_utime_took = time.time() - sq_utime
+            total_sync_time += sq_utime_took
+
             start_index = end_index
 
         metrics_collector = get_metrics_collector()
@@ -1020,12 +1023,11 @@ class eSurgeRunner:
         self.log_it(
             f"[execute] "
             f"step={total_step_time:.3f}s "
-            f"model_fwd={exec_took:.3f}s "
+            f"fwd={exec_took:.3f}s "
             f"sample={sample_took:.3f}s "
-            f"prep={sample_took:.3f}s "
-            f"post={prep_took:.3f}s "
+            f"prep={prep_took:.3f}s "
             f"p-bs={buckets_processed}s "
-            f"upd_states={updating_states_time:.3f}s "
+            f"update={updating_states_time:.3f}s "
             f"total={total_time:.3f}s"
         )
 
