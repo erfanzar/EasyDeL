@@ -273,6 +273,14 @@ class MixedShardedSource(ShardedDataSource[dict]):
         for shard_name in source.shard_names:
             yield from source.open_shard(shard_name)
 
+    def __len__(self) -> int:
+        """Return total number of examples across all sources.
+
+        Note: For 'restart' stop_strategy, this returns the sum of all source lengths.
+        Actual iteration may be infinite with 'restart' strategy.
+        """
+        return sum(len(source) for source in self._sources.values())
+
     def __repr__(self) -> str:
         weights_str = ", ".join(f"{k}={v:.2f}" for k, v in self._weights.items())
         return f"MixedShardedSource(sources={len(self._sources)}, weights=[{weights_str}], block_size={self._block_size})"

@@ -36,9 +36,9 @@ else:
 
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
 PREFERENCE_SPLIT = "train[:50%]"
-MAX_PROMPT_LENGTH = 512
-MAX_COMPLETION_LENGTH = 512
-MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH
+MAX_PROMPT_LENGTH = 256
+MAX_COMPLETION_LENGTH = 256
+MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 512, divisible by 128
 MAX_TRAINING_STEP = 512
 SAVE_ROOT = Path("tmp-files") / "trainer-smoke-tests"
 
@@ -162,7 +162,7 @@ def make_config(
         "max_sequence_length": MAX_TOTAL_LENGTH,
         "save_steps": 1_000,
         "save_total_limit": 1,
-        "save_optimizer_state": False,
+        "save_optimizer_state": True,
         "do_last_save": True,
         "use_wandb": True,
         "wandb_entity": "erfanzar",

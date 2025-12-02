@@ -159,12 +159,19 @@ class BCOTrainer(Trainer):
         self._precomputed_eval_ref_log_probs = False
         self.clf_weights: tuple[np.ndarray, float] | None = None
 
+        # BCOPreprocessTransform is an ExpandTransform that handles:
+        # - Extract prompts from chosen/rejected
+        # - Unpair preference data (1 pair → 2 examples)
+        # - Apply chat template
+        # - Tokenize
+        # All preprocessing is done lazily via the transform during iteration.
+
         super().__init__(
             arguments=arguments,
             dataset_train=train_dataset,
             dataset_eval=eval_dataset,
             model_state=model_state,
-            data_collator=None,
+            data_collator=self.input_data_collator_tfds,
             processing_class=processing_class,
         )
 
@@ -173,8 +180,12 @@ class BCOTrainer(Trainer):
             self._train_density_ratio_classifier()
 
     def _get_preprocess_transform(self) -> BCOPreprocessTransform | None:
-        """Get BCO preprocessing transform for ShardedDataSource."""
+        """Get BCO preprocessing transform for ShardedDataSource.
 
+        BCOPreprocessTransform is an ExpandTransform that handles the full
+        preprocessing pipeline: extract prompts, unpair preference data,
+        apply chat template, and tokenize.
+        """
         if self._is_pretokenized():
             return None
         return BCOPreprocessTransform(
@@ -183,6 +194,7 @@ class BCOTrainer(Trainer):
             max_completion_length=self.arguments.max_completion_length,
             label_pad_token_id=self.arguments.label_pad_token_id,
             embedding_tokenizer=self.embedding_tokenizer,
+            tools=getattr(self.arguments, "tools", None),
         )
 
     def _is_pretokenized(self) -> bool:

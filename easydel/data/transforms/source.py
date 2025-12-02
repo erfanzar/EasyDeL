@@ -24,7 +24,7 @@ import typing as tp
 from collections.abc import Iterator, Sequence
 
 from ..core.protocols import ShardedDataSource
-from .base import Transform
+from .base import ExpandTransform, Transform
 
 
 class TransformedShardedSource(ShardedDataSource[dict]):
@@ -32,6 +32,7 @@ class TransformedShardedSource(ShardedDataSource[dict]):
 
     Supports lazy evaluation - transforms are applied as examples are yielded.
     Handles filter transforms by skipping filtered examples.
+    Handles expand transforms that yield multiple examples from one input.
 
     Example:
         >>> source = JsonShardedSource("data.jsonl")
@@ -41,7 +42,7 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         ...     process(example)
     """
 
-    def __init__(self, source: ShardedDataSource[dict], transform: Transform):
+    def __init__(self, source: ShardedDataSource[dict], transform: Transform | ExpandTransform):
         """Initialize TransformedShardedSource.
 
         Args:
@@ -69,16 +70,22 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
+        is_expand = getattr(self._transform, "is_expand", False)
         for example in self._source.open_shard(shard_name):
-            result = self._transform(example)
-            if result is not None:  # Handle filter transforms
-                yield result
+            if is_expand:
+                # ExpandTransform: yields multiple examples
+                yield from self._transform(example)
+            else:
+                # Regular Transform: yields single example or None
+                result = self._transform(example)
+                if result is not None:  # Handle filter transforms
+                    yield result
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
         """Open a shard at a specific row and apply transforms.
 
         Note: Row counting is based on the underlying source, not the
-        transformed output. Filtered examples may affect row alignment.
+        transformed output. Filtered/expanded examples may affect row alignment.
 
         Args:
             shard_name: Name of the shard to open.
@@ -87,14 +94,27 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
+        is_expand = getattr(self._transform, "is_expand", False)
         for example in self._source.open_shard_at_row(shard_name, row):
-            result = self._transform(example)
-            if result is not None:
-                yield result
+            if is_expand:
+                # ExpandTransform: yields multiple examples
+                yield from self._transform(example)
+            else:
+                # Regular Transform: yields single example or None
+                result = self._transform(example)
+                if result is not None:
+                    yield result
 
     def get_shard_info(self, shard_name: str) -> tp.Any:
         """Get shard info from underlying source."""
         return self._source.get_shard_info(shard_name)
+
+    def __len__(self) -> int:
+        """Return length of underlying source.
+
+        Warning: This may be inaccurate if filter transforms are applied.
+        """
+        return len(self._source)
 
     def __repr__(self) -> str:
         return f"TransformedShardedSource({self._source!r}, {self._transform!r})"

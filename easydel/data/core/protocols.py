@@ -162,6 +162,14 @@ class ShardedDataSource(ABC, Generic[T_co]):
 
         return TransformedShardedSource(self, FilterTransform(predicate))
 
+    def __len__(self) -> int:
+        """Return total number of examples across all shards.
+
+        Raises:
+            TypeError: If the source doesn't support length (streaming).
+        """
+        raise TypeError(f"{type(self).__name__} has no len()")
+
     def transform(
         self,
         transform: "tp.Any",  # Transform type
@@ -276,6 +284,10 @@ class MappedShardedDataSource(ShardedDataSource[T], Generic[T]):
     def open_shard(self, shard_name: str) -> Iterator[T]:
         for example in self._source.open_shard(shard_name):
             yield self._fn(example)
+
+    def __len__(self) -> int:
+        """Return length of underlying source."""
+        return len(self._source)
 
 
 @runtime_checkable

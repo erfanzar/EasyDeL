@@ -21,7 +21,7 @@ This module provides a comprehensive transform system for data pipelines:
 - Chat template application for conversational data
 """
 
-from .base import ChainedTransform, Transform
+from .base import ChainedTransform, ExpandTransform, Transform
 from .chat_template import (
     DEFAULT_ROLE_MAPPING,
     ChatTemplateTransform,
@@ -95,6 +95,7 @@ __all__ = [
     "BCOPreprocessTransform",
     "CPOPreprocessTransform",
     "ChainedTransform",
+    "ExpandTransform",
     "ChatTemplateTransform",
     "CombineFields",
     "ConvertInputOutputToChatML",
