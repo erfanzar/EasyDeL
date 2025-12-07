@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import typing as tp
 
 import flax
 from eformer.escale import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
+from eformer.paths import ePath
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig, EasyDeLBaseModule
@@ -57,6 +59,170 @@ def is_flatten(pytree: dict):
     return True if isinstance(mpl, tuple) else False
 
 
+TASK_ALIASES: dict[str, TaskType] = {
+    "causal_lm": TaskType.CAUSAL_LM,
+    "lm": TaskType.CAUSAL_LM,
+    "seq2seq": TaskType.SEQUENCE_TO_SEQUENCE,
+    "sequence_to_sequence": TaskType.SEQUENCE_TO_SEQUENCE,
+    "speech_seq2seq": TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
+    "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
+    "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
+    "diffusion_lm": TaskType.DIFFUSION_LM,
+    "base": TaskType.BASE_MODULE,
+}
+
+
+def normalize_task(t: TaskType | str | None) -> TaskType | None:
+    """Normalize task type specification to TaskType enum.
+
+    Handles string aliases, case variations, and hyphen/underscore differences.
+
+    Args:
+        t: Task type specification (TaskType, string alias, or None)
+
+    Returns:
+        Normalized TaskType or None if not recognized
+
+    Example:
+        >>> normalize_task("causal-lm")
+        <TaskType.CAUSAL_LM: 'causal_lm'>
+        >>> normalize_task("LM")
+        <TaskType.CAUSAL_LM: 'causal_lm'>
+    """
+    if t is None:
+        return None
+    if isinstance(t, TaskType):
+        return t
+    return TASK_ALIASES.get(str(t).strip().lower().replace("-", "_"))
+
+
+def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
+    """Infer task type from HuggingFace model config without downloading the model.
+
+    Fetches the config.json from HuggingFace Hub and determines the task type
+    based on the model architecture. Supports gated models through HF authentication.
+
+    Args:
+        model_name_or_path: HuggingFace model ID or local path
+
+    Returns:
+        Inferred TaskType, or None if unable to determine (will trigger fallback to CAUSAL_LM)
+
+    Example:
+        >>> infer_task_from_hf_config("meta-llama/Llama-2-7b")
+        <TaskType.CAUSAL_LM: 'causal-language-model'>
+        >>> infer_task_from_hf_config("Qwen/Qwen2-VL-7B")
+        <TaskType.IMAGE_TEXT_TO_TEXT: 'image-text-to-text'>
+    """
+    try:
+        # Try loading from local path first
+        local_path = ePath(model_name_or_path)
+        if local_path.is_dir():
+            config_file = local_path / "config.json"
+            if config_file.exists():
+                config = json.loads(config_file.read_text())
+            else:
+                logger.warning(
+                    f"No config.json found in local path: {model_name_or_path}. Task type will fallback to CAUSAL_LM."
+                )
+                return None
+        else:
+            # Try using huggingface_hub first (handles authentication for gated models)
+            try:
+                from huggingface_hub import hf_hub_download
+
+                config_path = hf_hub_download(
+                    repo_id=model_name_or_path,
+                    filename="config.json",
+                    repo_type="model",
+                )
+                config = json.loads(ePath(config_path).read_text())
+            except Exception as hf_error:
+                # Fallback to requests (for non-gated models)
+                try:
+                    import requests
+                except ImportError:
+                    logger.warning(
+                        f"Cannot fetch config for {model_name_or_path}: "
+                        f"Neither huggingface_hub nor requests library available. "
+                        f"Task type will fallback to CAUSAL_LM."
+                    )
+                    return None
+
+                config_url = f"https://huggingface.co/{model_name_or_path}/raw/main/config.json"
+                try:
+                    response = requests.get(config_url, timeout=10)
+                    response.raise_for_status()
+                    config = response.json()
+                except requests.exceptions.RequestException as req_error:
+                    # Check if it's a gated model (401 error)
+                    if "401" in str(hf_error) or "gated" in str(hf_error).lower():
+                        logger.warning(
+                            f"Cannot access config for {model_name_or_path}: Model is gated and requires authentication. "
+                            f"Run 'huggingface-cli login' to authenticate. Task type will fallback to CAUSAL_LM."
+                        )
+                    else:
+                        logger.warning(
+                            f"Failed to fetch config for {model_name_or_path}. "
+                            f"Task type will fallback to CAUSAL_LM. Error: {req_error}"
+                        )
+                    return None
+
+        architectures = config.get("architectures", [])
+        model_type = config.get("model_type", "").lower()
+
+        if not architectures:
+            logger.warning(
+                f"No architectures found in config for {model_name_or_path}. Task type will fallback to CAUSAL_LM."
+            )
+            return None
+
+        arch = architectures[0]
+        if "ForCausalLM" in arch:
+            return TaskType.CAUSAL_LM
+
+        elif "Omni" in arch:
+            return TaskType.ANY_TO_ANY
+
+        elif "ForConditionalGeneration" in arch:
+            if any(x in model_type for x in ["whisper", "speech2text"]):
+                return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
+            else:
+                return TaskType.IMAGE_TEXT_TO_TEXT
+
+        elif "ForSequenceClassification" in arch:
+            return TaskType.SEQUENCE_CLASSIFICATION
+
+        elif "ForAudioClassification" in arch:
+            return TaskType.AUDIO_CLASSIFICATION
+
+        elif "ForImageClassification" in arch:
+            return TaskType.IMAGE_CLASSIFICATION
+
+        elif any(x in arch for x in ["ForSpeechSeq2Seq", "Whisper"]):
+            return TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
+
+        elif "ForZeroShotImageClassification" in arch:
+            return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
+
+        if "vision" in model_type or "clip" in model_type:
+            return TaskType.BASE_VISION
+        elif "diffusion" in model_type:
+            return TaskType.DIFFUSION_LM
+
+        logger.warning(
+            f"Could not map architecture '{arch}' to a TaskType for {model_name_or_path}. "
+            f"Task type will fallback to CAUSAL_LM."
+        )
+        return None
+
+    except Exception as e:
+        logger.warning(
+            f"Unexpected error inferring task for {model_name_or_path}: {e}. Task type will fallback to CAUSAL_LM."
+        )
+        return None
+
+
 class AutoEasyDeLConfig:
     """Factory helpers to load EasyDeL configs from identifiers or checkpoints."""
 
@@ -83,7 +249,7 @@ class AutoEasyDeLConfig:
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
-        model_task: TaskType = TaskType.CAUSAL_LM,
+        model_task: TaskType = TaskType.AUTO_BIND,
         from_torch: bool = False,
         **kwargs,
     ) -> EasyDeLBaseConfig:
@@ -112,13 +278,19 @@ class AutoEasyDeLConfig:
         cls_main = AutoConfig if from_torch else EasyDeLBaseConfig
         config = cls_main.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+        ovo_model_type: str = config.model_type
 
+        if model_type != ovo_model_type:
+            model_type = ovo_model_type
+
+        if model_task == TaskType.AUTO_BIND:
+            model_task = infer_task_from_hf_config(pretrained_model_name_or_path)
         config_class = get_modules_by_type(
             model_type,
             cls.bind_model_task(model_task, config.architectures),
         )[0]
         config = config_class.from_pretrained(pretrained_model_name_or_path)
-
         if hasattr(config, "attach_custom_arguments"):
             config.attach_custom_arguments()
 

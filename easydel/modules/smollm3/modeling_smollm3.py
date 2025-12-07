@@ -537,6 +537,14 @@ class SmolLM3Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.embed_tokens
+
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self
+
 
 @register_module(TaskType.CAUSAL_LM, config=SmolLM3Config, model_type="smollm3")
 class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):

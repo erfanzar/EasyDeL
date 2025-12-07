@@ -137,12 +137,14 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
         self.tie_word_embeddings = tie_word_embeddings
 
-        # Rope scaling / parameters compatibility with HF naming
         self.rope_scaling = rope_scaling or rope_parameters
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            if self.rope_scaling["type"] == "mrope":
-                self.rope_scaling["type"] = "default"
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        if self.rope_scaling is not None:
+            rtype = self.rope_scaling.get("type") or self.rope_scaling.get("rope_type", "default")
+            if "mrope_section" in self.rope_scaling or rtype == "mrope":
+                self.rope_scaling["type"] = "mrope"
+                self.rope_scaling["rope_type"] = "mrope"
+            elif "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         self.head_dim = hidden_size // num_attention_heads
         self.layer_types = layer_types
@@ -178,10 +180,7 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
     """
 
     model_type = "qwen2_vl"
-    sub_configs: typing.ClassVar = {
-        "vision_config": Qwen2VLVisionConfig,
-        "text_config": Qwen2VLTextConfig,
-    }
+    sub_configs: typing.ClassVar = {"vision_config": Qwen2VLVisionConfig, "text_config": Qwen2VLTextConfig}
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
@@ -196,53 +195,20 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
     ):
         super().__init__(**kwargs)
 
-        if vision_config is None:
-            vision_config = {}
         if isinstance(vision_config, dict):
-            self.vision_config = Qwen2VLVisionConfig(**vision_config)
-        elif isinstance(vision_config, Qwen2VLVisionConfig):
-            self.vision_config = vision_config
-        else:
-            raise ValueError("vision_config must be a dict or Qwen2VLVisionConfig.")
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+        elif vision_config is None:
+            self.vision_config = self.sub_configs["vision_config"]()
 
-        if text_config is None:
-            text_config = {}
         if isinstance(text_config, dict):
-            self.text_config = Qwen2VLTextConfig(**text_config)
-        elif isinstance(text_config, Qwen2VLTextConfig):
-            self.text_config = text_config
-        else:
-            raise ValueError("text_config must be a dict or Qwen2VLTextConfig.")
+            self.text_config = self.sub_configs["text_config"](**text_config)
+        elif text_config is None:
+            self.text_config = self.sub_configs["text_config"](**kwargs)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
-
-        # Sync fields for convenience access on self
-        self._sync_text_config_fields()
-
-    def _sync_text_config_fields(self):
-        """Expose text config fields on the top-level config for compatibility."""
-        self.vocab_size = self.text_config.vocab_size
-        self.max_position_embeddings = self.text_config.max_position_embeddings
-        self.hidden_size = self.text_config.hidden_size
-        self.intermediate_size = self.text_config.intermediate_size
-        self.num_hidden_layers = self.text_config.num_hidden_layers
-        self.num_attention_heads = self.text_config.num_attention_heads
-        self.num_key_value_heads = self.text_config.num_key_value_heads
-        self.hidden_act = self.text_config.hidden_act
-        self.initializer_range = self.text_config.initializer_range
-        self.rms_norm_eps = self.text_config.rms_norm_eps
-        self.use_cache = self.text_config.use_cache
-        self.rope_theta = self.text_config.rope_theta
-        self.attention_dropout = self.text_config.attention_dropout
-        self.rope_scaling = self.text_config.rope_scaling
-        self.head_dim = self.text_config.head_dim
-        self.layer_types = self.text_config.layer_types
-        self.use_sliding_window = self.text_config.use_sliding_window
-        self.sliding_window = self.text_config.sliding_window
-        self.max_window_layers = self.text_config.max_window_layers
 
     def get_partition_rules(self, *args, **kwargs):
         """
@@ -264,7 +230,7 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
                 pmag.resolve(Replicated),
             ),
             (r"norm/kernel", pmag.resolve(Replicated)),
-            (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),  #
+            (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
             (r"attn/qkv/kernel", pmag.resolve(ColumnWise)),
             (r"attn/qkv/bias", pmag.resolve(Replicated)),
             (r"attn/proj/kernel", pmag.resolve(RowWise)),

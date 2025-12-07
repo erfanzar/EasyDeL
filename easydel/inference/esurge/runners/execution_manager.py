@@ -450,6 +450,11 @@ class ExecutionManager:
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        # Vision-language model data (optional)
+        pixel_values: numpy.ndarray | None = None,
+        image_grid_thw: numpy.ndarray | None = None,
+        pixel_values_videos: numpy.ndarray | None = None,
+        video_grid_thw: numpy.ndarray | None = None,
     ) -> tuple[
         MinimalDeviceState,
         jax.Array,
@@ -543,6 +548,11 @@ class ExecutionManager:
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
             padded_num_reqs_in=padded_num_reqs,
+            # Vision-language model data
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
         )
 
         # Create minimal device state from already-transferred arrays (no separate device transfer needed)
@@ -842,6 +852,11 @@ class ExecutionManager:
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
+        # Vision-language model data (optional)
+        pixel_values: numpy.ndarray | None = None,
+        image_grid_thw: numpy.ndarray | None = None,
+        pixel_values_videos: numpy.ndarray | None = None,
+        video_grid_thw: numpy.ndarray | None = None,
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Precompute batch metadata using CPU-first approach.
 
@@ -865,12 +880,9 @@ class ExecutionManager:
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
 
-        # ========== NO DEVICE TRANSFERS! Everything on CPU ==========
         # scheduled_full_cpu and active_mask_full_cpu are already CPU arrays from scheduler
         scheduled_cpu = scheduled_full_cpu
         active_mask_cpu = active_mask_full_cpu
-
-        # ========== All metadata computation on CPU using NumPy (FAST!) ==========
 
         # Compute num_requests
         num_requests = min(int(numpy.sum(active_mask_cpu)), max_num_reqs)
@@ -944,7 +956,6 @@ class ExecutionManager:
             )
             num_kv_update_cpu = numpy.array([total_pages], dtype=numpy.int32)
 
-        # ========== STEP 3: Single batch device transfer (consolidate all arrays) ==========
         # Transfer all CPU-computed arrays to device in ONE operation to minimize overhead
         # Slice logits_indices to padded_num_reqs for efficient sampling
         # Also include token_ids, num_computed_tokens, scheduled_full, active_mask_full
@@ -996,7 +1007,20 @@ class ExecutionManager:
             active_mask_full_dev,
         ) = jax.device_put(host_payload, self._empty_sharding)
 
-        # ========== STEP 4: Build BatchMetadata from transferred arrays ==========
+        # Transfer vision data to device if present
+        pixel_values_dev = None
+        image_grid_thw_dev = None
+        pixel_values_videos_dev = None
+        video_grid_thw_dev = None
+        if pixel_values is not None:
+            pixel_values_dev = jax.device_put(pixel_values, self._empty_sharding)
+        if image_grid_thw is not None:
+            image_grid_thw_dev = jax.device_put(image_grid_thw, self._empty_sharding)
+        if pixel_values_videos is not None:
+            pixel_values_videos_dev = jax.device_put(pixel_values_videos, self._empty_sharding)
+        if video_grid_thw is not None:
+            video_grid_thw_dev = jax.device_put(video_grid_thw, self._empty_sharding)
+
         metadata = BatchMetadata(
             scheduled=scheduled_dev,
             query_start_loc=qsl,
@@ -1015,6 +1039,11 @@ class ExecutionManager:
             request_distribution=req_dist_dev if self._use_request_distribution else None,
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
+            # Vision-language model data
+            pixel_values=pixel_values_dev,
+            image_grid_thw=image_grid_thw_dev,
+            pixel_values_videos=pixel_values_videos_dev,
+            video_grid_thw=video_grid_thw_dev,
         )
 
         return (
@@ -1145,7 +1174,9 @@ class ExecutionManager:
             "padded_num_reqs": padded_num_reqs,
         }
 
-    def get_async_prep_result(self) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array] | None:
+    def get_async_prep_result(
+        self,
+    ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array] | None:
         """Get the result of a previously started async prep.
 
         Returns None if no async prep is pending. Otherwise waits for the
@@ -1238,6 +1269,11 @@ class ExecutionManager:
             # v2-specific shardings (None if not used)
             slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
             num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
+            # Vision-language model shardings (None when not used)
+            pixel_values=None,
+            image_grid_thw=None,
+            pixel_values_videos=None,
+            video_grid_thw=None,
         )
 
         inputs_shardings = StepFunctionInputs(
@@ -1304,6 +1340,11 @@ class ExecutionManager:
                     past_key_values=kv_pages,
                     cache_metadata=cache_metadata,
                     apply_lm_head=False,
+                    # Vision-language model data - model handles None gracefully
+                    pixel_values=metadata.pixel_values,
+                    image_grid_thw=metadata.image_grid_thw,
+                    pixel_values_videos=metadata.pixel_values_videos,
+                    video_grid_thw=metadata.video_grid_thw,
                 )
                 hs = output.last_hidden_state.squeeze(0)
                 logits = model.apply_lm_head(hs[metadata.logits_indices])

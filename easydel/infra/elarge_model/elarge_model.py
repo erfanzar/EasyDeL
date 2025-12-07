@@ -187,7 +187,9 @@ class eLargeModel:
         Returns:
             eLargeModel instance with configuration
         """
-        from .utils import infer_task_from_hf_config, normalize_task
+        from easydel.modules.auto.auto_configuration import infer_task_from_hf_config
+
+        from .utils import normalize_task
 
         # Auto-detect task if None or AUTO_BIND
         if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":

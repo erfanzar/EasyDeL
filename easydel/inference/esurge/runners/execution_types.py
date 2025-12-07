@@ -60,6 +60,12 @@ class BatchMetadata:
     This metadata supports both v2 and v3 attention kernels:
     - v2: Uses slot_mapping and num_kv_update_slices for KV cache updates
     - v3: Uses request_distribution for optimized ragged attention
+
+    Vision-language model support:
+    - pixel_values: Image pixel values for VLMs [batch, seq, channels]
+    - image_grid_thw: Grid shape (T, H, W) for each image
+    - pixel_values_videos: Video pixel values for VLMs
+    - video_grid_thw: Grid shape (T, H, W) for each video
     """
 
     scheduled: jax.Array
@@ -81,6 +87,12 @@ class BatchMetadata:
     # v2-specific fields (optional, only populated when version="v2")
     slot_mapping: jax.Array | None = None
     num_kv_update_slices: jax.Array | None = None
+
+    # Vision-language model data (None for text-only requests)
+    pixel_values: jax.Array | None = None
+    image_grid_thw: jax.Array | None = None
+    pixel_values_videos: jax.Array | None = None
+    video_grid_thw: jax.Array | None = None
 
 
 @auto_pytree(frozen=True)

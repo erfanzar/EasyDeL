@@ -1329,3 +1329,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
         Returns the embedding layer of the module.
         """
         return self.vision_model.embeddings
+
+    def get_task_head(self):
+        """Returns the image classification head."""
+        return self.classifier

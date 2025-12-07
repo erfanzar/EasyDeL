@@ -58,6 +58,7 @@ Note:
 """
 
 from ._specs import ChunkedLocalAttentionSpec, FullAttentionSpec, KVCacheSpec, MambaSpec, SlidingWindowSpec
+from .hybrid import HybridCache, HybridCacheMetaData, HybridCacheView, HybridMetadata
 from .lightning import LightningCache, LightningCacheMetaData, LightningCacheView, LightningMetadata
 from .mamba import MambaCache, MambaCacheMetaData, MambaCacheView, MambaMetadata
 from .mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView, Mamba2Metadata
@@ -67,6 +68,10 @@ from .transformer import TransformerCache, TransformerCacheMetaData, Transformer
 __all__ = (
     "ChunkedLocalAttentionSpec",
     "FullAttentionSpec",
+    "HybridCache",
+    "HybridCacheMetaData",
+    "HybridCacheView",
+    "HybridMetadata",
     "KVCacheSpec",
     "LightningCache",
     "LightningCacheMetaData",

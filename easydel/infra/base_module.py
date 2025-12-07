@@ -1785,13 +1785,19 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
 
-    def update_module(self, **kwargs: Unpack[EasyDeLBaseConfigDict]):
+    def update_module(
+        self,
+        recursive_update: bool = False,
+        **kwargs: Unpack[EasyDeLBaseConfigDict],
+    ):
         """Updates the module configuration and reinitializes the structure.
 
         Creates a new lazy module with updated configuration while preserving
         the current parameter state.
 
         Args:
+            recursive_update: If True, recursively apply the same updates to any
+                nested config objects that are subclasses of EasyDeLBaseConfig.
             **kwargs: Configuration parameters to update.
 
         Returns:
@@ -1800,6 +1806,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         config = self.config
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if recursive_update:
+            for attr_name in dir(config):
+                if attr_name.startswith("_"):
+                    continue
+                attr_value = getattr(config, attr_name, None)
+                if isinstance(attr_value, EasyDeLBaseConfig):
+                    for k, v in kwargs.items():
+                        if hasattr(attr_value, k):
+                            setattr(attr_value, k, v)
         module = self.lazy_init(
             config=config,
             dtype=self.dtype,
@@ -1810,7 +1825,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
         return self
 
-    def new_graphdef(self, **kwargs: Unpack[EasyDeLBaseConfigDict]):
+    def new_graphdef(
+        self,
+        recursive_update: bool = False,
+        **kwargs: Unpack[EasyDeLBaseConfigDict],
+    ):
         """Create a new module with updated configuration.
 
         Creates a new lazy module with updated configuration while preserving
@@ -1818,6 +1837,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         without reinitializing weights.
 
         Args:
+            recursive_update: If True, recursively apply the same updates to any
+                nested config objects that are subclasses of EasyDeLBaseConfig.
             **kwargs: Configuration parameters to update. These will be applied
                 to a copy of the current configuration.
 
@@ -1828,6 +1849,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         config = deepcopy(self.config)
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if recursive_update:
+            for attr_name in dir(config):
+                if attr_name.startswith("_"):
+                    continue
+                attr_value = getattr(config, attr_name, None)
+                if isinstance(attr_value, EasyDeLBaseConfig):
+                    for k, v in kwargs.items():
+                        if hasattr(attr_value, k):
+                            setattr(attr_value, k, v)
         module = self.lazy_init(
             config=config,
             dtype=self.dtype,

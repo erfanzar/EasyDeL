@@ -109,6 +109,7 @@ class TaskType(str, Enum):
     SEQUENCE_CLASSIFICATION = "sequence-classification"
     AUDIO_CLASSIFICATION = "audio-classification"
     IMAGE_CLASSIFICATION = "image-classification"
+    ANY_TO_ANY = "any-to-any"
     AUTO_BIND = "auto-bind"
 
 

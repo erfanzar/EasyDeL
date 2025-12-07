@@ -203,9 +203,11 @@ _import_structure = {
         "ArcticModel",
     ],
     "modules.auto": [
+        "AutoEasyDeLAnyToAnyModel",
         "AutoEasyDeLConfig",
         "AutoEasyDeLModel",
         "AutoEasyDeLModelForCausalLM",
+        "AutoEasyDeLModelForDiffusionLM",
         "AutoEasyDeLModelForImageTextToText",
         "AutoEasyDeLModelForSeq2SeqLM",
         "AutoEasyDeLModelForSequenceClassification",
@@ -214,7 +216,9 @@ _import_structure = {
         "AutoEasyDeLVisionModel",
         "AutoShardAndGatherFunctions",
         "AutoState",
+        "AutoStateAnyToAnyModel",
         "AutoStateForCausalLM",
+        "AutoStateForDiffusionLM",
         "AutoStateForImageSequenceClassification",
         "AutoStateForImageTextToText",
         "AutoStateForSeq2SeqLM",
@@ -361,6 +365,11 @@ _import_structure = {
         "InternLM2ForSequenceClassification",
         "InternLM2Model",
     ],
+    "modules.kimi_linear": [
+        "KimiLinearConfig",
+        "KimiLinearForCausalLM",
+        "KimiLinearModel",
+    ],
     "modules.llama": [
         "LlamaConfig",
         "LlamaForCausalLM",
@@ -490,6 +499,34 @@ _import_structure = {
         "Qwen3MoeForCausalLM",
         "Qwen3MoeForSequenceClassification",
         "Qwen3MoeModel",
+    ],
+    "modules.qwen3_next": [
+        "Qwen3NextConfig",
+        "Qwen3NextForCausalLM",
+        "Qwen3NextModel",
+    ],
+    "modules.qwen3_omni_moe": [
+        "Qwen3OmniMoeAudioConfig",
+        "Qwen3OmniMoeAudioEncoder",
+        "Qwen3OmniMoeAudioEncoderConfig",
+        "Qwen3OmniMoeCode2Wav",
+        "Qwen3OmniMoeCode2WavConfig",
+        "Qwen3OmniMoeConfig",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3OmniMoeModel",
+        "Qwen3OmniMoeTalkerCodePredictorConfig",
+        "Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration",
+        "Qwen3OmniMoeTalkerCodePredictorModel",
+        "Qwen3OmniMoeTalkerConfig",
+        "Qwen3OmniMoeTalkerForConditionalGeneration",
+        "Qwen3OmniMoeTalkerTextConfig",
+        "Qwen3OmniMoeTextConfig",
+        "Qwen3OmniMoeThinkerConfig",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerModel",
+        "Qwen3OmniMoeVisionConfig",
+        "Qwen3OmniMoeVisionEncoder",
+        "Qwen3OmniMoeVisionEncoderConfig",
     ],
     "modules.qwen3_vl": [
         "Qwen3VLConfig",
@@ -664,9 +701,11 @@ if _tp.TYPE_CHECKING:
     from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
+        AutoEasyDeLAnyToAnyModel,
         AutoEasyDeLConfig,
         AutoEasyDeLModel,
         AutoEasyDeLModelForCausalLM,
+        AutoEasyDeLModelForDiffusionLM,
         AutoEasyDeLModelForImageTextToText,
         AutoEasyDeLModelForSeq2SeqLM,
         AutoEasyDeLModelForSequenceClassification,
@@ -675,7 +714,9 @@ if _tp.TYPE_CHECKING:
         AutoEasyDeLVisionModel,
         AutoShardAndGatherFunctions,
         AutoState,
+        AutoStateAnyToAnyModel,
         AutoStateForCausalLM,
+        AutoStateForDiffusionLM,
         AutoStateForImageSequenceClassification,
         AutoStateForImageTextToText,
         AutoStateForSeq2SeqLM,
@@ -736,6 +777,7 @@ if _tp.TYPE_CHECKING:
         InternLM2ForSequenceClassification,
         InternLM2Model,
     )
+    from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
     from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
     from .modules.llama4 import (
         Llama4Config,
@@ -768,6 +810,34 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
+    from .modules.qwen3_next import (
+        Qwen3NextConfig,
+        Qwen3NextForCausalLM,
+        Qwen3NextModel,
+    )
+    from .modules.qwen3_omni_moe import (
+        Qwen3OmniMoeAudioConfig,
+        Qwen3OmniMoeAudioEncoder,
+        Qwen3OmniMoeAudioEncoderConfig,
+        Qwen3OmniMoeCode2Wav,
+        Qwen3OmniMoeCode2WavConfig,
+        Qwen3OmniMoeConfig,
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeModel,
+        Qwen3OmniMoeTalkerCodePredictorConfig,
+        Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration,
+        Qwen3OmniMoeTalkerCodePredictorModel,
+        Qwen3OmniMoeTalkerConfig,
+        Qwen3OmniMoeTalkerForConditionalGeneration,
+        Qwen3OmniMoeTalkerTextConfig,
+        Qwen3OmniMoeTextConfig,
+        Qwen3OmniMoeThinkerConfig,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerModel,
+        Qwen3OmniMoeVisionConfig,
+        Qwen3OmniMoeVisionEncoder,
+        Qwen3OmniMoeVisionEncoderConfig,
+    )
     from .modules.qwen3_vl import (
         Qwen3VisionTransformerPretrainedModel,
         Qwen3VLConfig,

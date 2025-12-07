@@ -274,7 +274,7 @@ class Llama4Config(EasyDeLBaseConfig):
             self.vision_config = Llama4VisionConfig()
             logger.info("vision_config is None, using default llama4 vision config")
         elif isinstance(vision_config, dict):
-            self.vision_config = Llama4VisionConfig(**vision_config)
+            self.vision_config = Llama4VisionConfig(**self._fix_parent_kws(vision_config, kwargs))
         elif isinstance(vision_config, Llama4VisionConfig):
             self.vision_config = vision_config
 
@@ -286,7 +286,7 @@ class Llama4Config(EasyDeLBaseConfig):
             self.text_config = Llama4TextConfig()
             logger.info("text_config is None, using default llama4 text config")
         elif isinstance(text_config, dict):
-            self.text_config = Llama4TextConfig(**text_config)
+            self.text_config = Llama4TextConfig(**self._fix_parent_kws(text_config, kwargs))
         elif isinstance(text_config, Llama4TextConfig):
             self.text_config = text_config
 

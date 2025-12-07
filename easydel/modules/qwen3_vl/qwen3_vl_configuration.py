@@ -89,7 +89,6 @@ class Qwen3VLVisionConfig(EasyDeLBaseConfig):
         self.tokens_per_second = tokens_per_second
         self.initializer_range = initializer_range
 
-        # Computed attributes for compatibility
         self.embed_dim = hidden_size
 
 
@@ -174,13 +173,6 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         self.sliding_window = sliding_window
         self.max_window_layers = max_window_layers
 
-        # Handle rope_scaling type conversion for HF compatibility
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            rtype = self.rope_scaling["type"]
-            if rtype == "mrope" or ("mrope_section" in self.rope_scaling and rtype == "default"):
-                self.rope_scaling["type"] = "mrope"
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Get attention mask details for sliding window attention."""
         mapping = {}
@@ -230,16 +222,15 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         **kwargs,
     ):
         if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+            self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
 
         if isinstance(text_config, dict):
-            self.text_config = self.sub_configs["text_config"](**text_config)
+            self.text_config = self.sub_configs["text_config"](**self._fix_parent_kws(text_config, kwargs))
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
 
-        # Token IDs
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
@@ -257,47 +248,36 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         """
         return self.text_config
 
-    def get_partition_rules(self, fully_sharded_data_parallel: bool = False):
+    def get_partition_rules(self, *args, **kwargs):
         """Get partition rules for model parallelism."""
         pmag = self.partition_manager
         return (
-            # Text model embeddings
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            # Text attention projections
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            # Text MLP
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            # Text norms
             (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            # LM head
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            # Vision patch embed
             (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            # Vision attention
-            (r"visual/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/.*/attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"visual/.*/attn/proj/bias", pmag.resolve(Replicated)),
-            # Vision MLP
-            (r"visual/.*/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/.*/mlp/fc1/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/mlp/fc2/kernel", pmag.resolve(RowWise)),
-            (r"visual/.*/mlp/fc2/bias", pmag.resolve(Replicated)),
-            # Vision norms
-            (r"visual/.*/norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"visual/.*/norm(1|2)/bias", pmag.resolve(Replicated)),
-            # Vision merger
-            (r"visual/merger/ln_q/scale", pmag.resolve(Replicated)),
-            (r"visual/merger/ln_q/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/0/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/merger/mlp/0/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/2/kernel", pmag.resolve(RowWise)),
-            (r"visual/merger/mlp/2/bias", pmag.resolve(Replicated)),
-            # Catch-all
+            (r"attn/qkv/kernel", pmag.resolve(ColumnWise)),
+            (r"attn/qkv/bias", pmag.resolve(Replicated)),
+            (r"attn/proj/kernel", pmag.resolve(RowWise)),
+            (r"attn/proj/bias", pmag.resolve(Replicated)),
+            (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/fc1/bias", pmag.resolve(Replicated)),
+            (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
+            (r"mlp/fc2/bias", pmag.resolve(Replicated)),
+            (r"norm(1|2)/scale", pmag.resolve(Replicated)),
+            (r"norm(1|2)/bias", pmag.resolve(Replicated)),
+            (r"ln_q/scale", pmag.resolve(Replicated)),
+            (r"ln_q/bias", pmag.resolve(Replicated)),
+            (r"mlp/0/kernel", pmag.resolve(ColumnWise)),
+            (r"mlp/0/bias", pmag.resolve(Replicated)),
+            (r"mlp/2/kernel", pmag.resolve(RowWise)),
+            (r"mlp/2/bias", pmag.resolve(Replicated)),
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )

@@ -838,12 +838,8 @@ class EasyBridgeMixin(PushToHubMixin):
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
         trust_remote_code = kwargs.get("trust_remote_code", False)
-        config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
-        )
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
         model_type: str = config.model_type
-
         config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
         logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
@@ -981,6 +977,8 @@ class EasyBridgeMixin(PushToHubMixin):
         elif cls._model_task == TaskType.BASE_VISION:
             # hf dont see anything diff between base and vision modules
             from transformers import AutoModel as module
+        elif cls._model_task == TaskType.ANY_TO_ANY:
+            from transformers import AutoModelForTextToWaveform as module
         else:
             raise ValueError("couldn't find requested hf autoloader, you can set `hf_torch_auto_loader` to your class")
         return module

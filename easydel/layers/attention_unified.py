@@ -433,8 +433,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-    # ========== Position Encoding Methods ==========
-
     def _create_rotary(self, config: Cfg, dtype: DTypeLike):
         """Create rotary position embedding layer.
 
@@ -501,8 +499,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         )
         return alibi_bias
 
-    # ========== Attention Performer ==========
-
     def _create_attention_performer(self, config: Cfg, rngs: nn.Rngs) -> FlexibleAttentionModule:
         """Create attention performer module.
 
@@ -517,8 +513,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=getattr(config, "attention_dropout", 0.0),
         )
-
-    # ========== Q/K/V Normalization Layers ==========
 
     def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
         """Create query normalization layer.
@@ -584,7 +578,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             rngs=rngs,
         )
 
-    # ========== Projection Accessor Methods ==========
     @property
     def query_projection(self) -> ColumnParallelLinear:
         """Get query projection (for fused QKV support)."""
@@ -630,7 +623,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         """Get output normalization layer."""
         return getattr(self, self.norms_mapping["output_normalization"])
 
-    # ========== MLA Projection Accessor Properties ==========
     @property
     def mla_q_proj(self) -> ColumnParallelLinear:
         """Get MLA query projection (non-LoRA)."""

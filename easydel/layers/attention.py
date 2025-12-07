@@ -269,6 +269,7 @@ class FlexibleAttentionModule(nn.Module):
         dropout_prob: float = 0.0,
         *,
         rngs: nn.Rngs | None = None,
+        attn_mechanism: AttentionMechanisms | None = None,
     ):
         """
         Initializes the AttentionModule.
@@ -280,6 +281,10 @@ class FlexibleAttentionModule(nn.Module):
             dropout_prob (float, optional): The dropout probability for attention weights.
                                              Defaults to 0.0.
         """
+
+        if attn_mechanism is None:
+            attn_mechanism = base_config.attn_mechanism
+
         rngs_computed: nn.Rngs
         if rngs is None:
             rngs_computed = nn.Rngs(42)
@@ -294,13 +299,13 @@ class FlexibleAttentionModule(nn.Module):
         if attn_softmax_dtype_is_string:
             base_config.attn_softmax_dtype = _get_jax_dtype_from_string(base_config.attn_softmax_dtype)
 
-        is_auto_mechanism: bool = base_config.attn_mechanism == AttentionMechanisms.AUTO
+        is_auto_mechanism: bool = attn_mechanism == AttentionMechanisms.AUTO
         if is_auto_mechanism:
             impl_name: AttentionMechanisms
             runtime_dtype: jnp.dtype
             impl_name, runtime_dtype = get_optimal_config()
             logger.debug(f"Automatically select OperationImpl {impl_name} | {runtime_dtype}")
-            base_config.attn_mechanism = impl_name
+            attn_mechanism = impl_name
             base_config.attn_dtype = runtime_dtype
 
         metadata: OperationMetadata = OperationMetadata.from_config(config=base_config)
@@ -309,7 +314,7 @@ class FlexibleAttentionModule(nn.Module):
         self.rngs: nn.Rngs = rngs_computed
         self.softmax_scale: float = softmax_scale
         self.dropout_prob: float = dropout_prob
-        impl_name_final: str = base_config.attn_mechanism
+        impl_name_final: str = attn_mechanism
         self.impl: tp.Any = OperationRegistry.create(impl_name=impl_name_final, metadata=metadata)
         self.deterministic: bool = True
         self.impl_decode: tp.Any | None = None

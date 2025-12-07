@@ -15,6 +15,8 @@
 from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
+from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
+from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
@@ -24,9 +26,14 @@ __all__ = (
     "AutoRegressiveDecodeAttn",
     "BlockSparseAttn",
     "FlashAttn",
+    "GatedDeltaRuleOp",
+    "GatedDeltaRuleOutput",
+    "KDAOutput",
+    "KernelDeltaAttnOp",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
     "RingAttn",
     "ScaledDotProductAttn",
     "VanillaAttn",
+    "fused_kda_gate",
 )

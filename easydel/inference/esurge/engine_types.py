@@ -31,6 +31,7 @@ import time
 from typing import Any
 
 import msgspec
+import numpy as np
 
 from ..sampling_params import SamplingParams
 from .outputs import LogprobsLists, LogprobsTensors
@@ -75,6 +76,10 @@ class EngineCoreRequest(msgspec.Struct, array_like=True, omit_defaults=True, gc=
         client_index: Index of the client making the request.
         current_wave: Current processing wave number.
         priority: Request priority for scheduling.
+        pixel_values: Image pixel values for vision-language models.
+        image_grid_thw: Grid shape (T, H, W) for each image.
+        pixel_values_videos: Video pixel values for vision-language models.
+        video_grid_thw: Grid shape (T, H, W) for each video.
     """
 
     request_id: str
@@ -86,6 +91,11 @@ class EngineCoreRequest(msgspec.Struct, array_like=True, omit_defaults=True, gc=
     client_index: int = 0
     current_wave: int = 0
     priority: int = 0
+    # Vision-language model support
+    pixel_values: np.ndarray | None = None
+    image_grid_thw: np.ndarray | None = None
+    pixel_values_videos: np.ndarray | None = None
+    video_grid_thw: np.ndarray | None = None
 
 
 class EngineCoreEventType(enum.IntEnum):

@@ -43,7 +43,7 @@ TPU/GPU clusters.
 
 - **🔮 Modern Architecture**: Built on Flax NNX (not legacy Linen) for better modularity and performance
 - **50+ Model Architectures**: Broad JAX model collection including LLaMA, Qwen, Mistral, DeepSeek, Gemma, and more
-- **14 Specialized Trainers**: From supervised fine-tuning to RLHF, preference optimization, and knowledge distillation
+- **16 Specialized Trainers**: From supervised fine-tuning to RLHF, preference optimization, and knowledge distillation
 - **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, and OpenAI-compatible API
 - **Full Multimodal Support**: Vision-language models (LLaVA, Qwen2-VL, Llama4-Vision), speech recognition (Whisper), and diffusion models
 - **🚀 TPU & GPU Optimized**: Triton (GPU) and Pallas (TPU) kernel options where available
@@ -80,7 +80,7 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 
 ### Training & Fine-Tuning
 
-#### 14 Specialized Trainers (unified API)
+#### 16 Specialized Trainers (unified API)
 
 ##### Supervised Learning
 
@@ -99,6 +99,8 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 ##### Reinforcement Learning
 
 - **GRPOTrainer** - Group Relative Policy Optimization with custom reward functions
+- **GSPOTrainer** - Group Stable Policy Optimization for stable RL training
+- **GFPOTrainer** - Group Fast Policy Optimization for efficient policy updates
 - **NashMDTrainer** - Nash-MD for multi-agent equilibrium
 
 ##### Knowledge Distillation
@@ -1264,7 +1266,6 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 
 > [!NOTE]
 > Use `from_torch=None` to automatically detect checkpoints type!.
-
 > [!TIP]
 > Use `from_torch=True` to automatically convert PyTorch checkpoints to EasyDeL. This enables using any HuggingFace model even if there's no native EasyDeL checkpoint.
 

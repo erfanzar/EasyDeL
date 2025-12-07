@@ -540,6 +540,14 @@ class RwkvModel(EasyDeLBaseModule):
             attentions=all_self_attentions,
         )
 
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.embeddings
+
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self
+
 
 @register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
 class RwkvForCausalLM(EasyDeLBaseModule):
@@ -606,3 +614,15 @@ class RwkvForCausalLM(EasyDeLBaseModule):
             hidden_states=rwkv_outputs.hidden_states,
             attentions=rwkv_outputs.attentions,
         )
+
+    def get_lm_head(self):
+        """Returns the language modeling head."""
+        return self.head
+
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.rwkv.get_embedding()
+
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self.rwkv
