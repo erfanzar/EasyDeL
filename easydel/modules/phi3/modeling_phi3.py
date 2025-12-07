@@ -175,6 +175,7 @@ class Phi3Attention(UnifiedAttention):
     def __init__(
         self,
         config: Phi3Config,
+        layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -189,6 +190,7 @@ class Phi3Attention(UnifiedAttention):
             param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
             rngs (nn.Rngs): Random number generators.
+            layer_idx (int): Layer index.
 
         Raises:
             ValueError: If `hidden_size` is not divisible by `num_heads`.
@@ -425,6 +427,7 @@ class Phi3DecoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(
             dim=config.hidden_size,
