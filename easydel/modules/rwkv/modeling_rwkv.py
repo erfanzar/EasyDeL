@@ -348,8 +348,7 @@ class SingleStandRwkvBlock(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
-        *,
-        rngs: nn.Rngs,
+        rngs: nn.Rngs = None,
     ) -> None:
         self.config = config
         self.layer_id = layer_id
@@ -360,9 +359,11 @@ class SingleStandRwkvBlock(nn.Module):
 
         if layer_id == 0:
             self.pre_ln = nn.LayerNorm(
+                config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
+                rngs=rngs,
             )
 
         self.ln1 = nn.LayerNorm(
@@ -386,6 +387,7 @@ class SingleStandRwkvBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            rngs=rngs,
         )
         self.feed_forward = RwkvFeedForward(
             config=config,
@@ -393,6 +395,7 @@ class SingleStandRwkvBlock(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            rngs=rngs,
         )
 
     def __call__(self, hidden, state=None, output_attentions: bool = False):
@@ -421,7 +424,9 @@ class SingleStandRwkvBlock(nn.Module):
         return outputs
 
 
-RwkvBlock = nn.vmap(SingleStandRwkvBlock, in_axes=0, out_axes=0)
+# Use SingleStandRwkvBlock directly since nn.vmap on class constructors has issues
+# with keyword argument resolution in recent Flax versions
+RwkvBlock = SingleStandRwkvBlock
 
 
 @register_module(TaskType.BASE_MODULE, config=RwkvConfig, model_type="rwkv")

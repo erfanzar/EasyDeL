@@ -1711,7 +1711,14 @@ class ArrayParam(nn.Param):
         if init_kwargs is None:
             init_kwargs = {}
         init_kwargs = hashable_dict(init_kwargs)
-        init_fn = getattr(jax.nn.initializers, init_method, jax.nn.initializers.normal)(**init_kwargs)
+        # Some JAX initializers (zeros, ones) are direct functions that take (key, shape, dtype),
+        # while others (normal, uniform, etc.) are factory functions that return an initializer.
+        # We need to handle both cases.
+        direct_initializers = {"zeros", "ones"}
+        if init_method in direct_initializers:
+            init_fn = getattr(jax.nn.initializers, init_method)
+        else:
+            init_fn = getattr(jax.nn.initializers, init_method, jax.nn.initializers.normal)(**init_kwargs)
         if value is None:
             value = init_fn(key, shape, dtype)
         return cls(
@@ -1738,7 +1745,13 @@ class ArrayParam(nn.Param):
         init_kwargs = self.init_kwargs
         if init_kwargs is None:
             init_kwargs = {}
-        init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**init_kwargs)
+        # Some JAX initializers (zeros, ones) are direct functions that take (key, shape, dtype),
+        # while others (normal, uniform, etc.) are factory functions that return an initializer.
+        direct_initializers = {"zeros", "ones"}
+        if self.init_method in direct_initializers:
+            init_fn = getattr(jax.nn.initializers, self.init_method)
+        else:
+            init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**init_kwargs)
         val = init_fn(key, self.shape, self.dtype)
 
         if shard_fn is not None:
