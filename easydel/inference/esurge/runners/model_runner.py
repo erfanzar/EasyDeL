@@ -593,6 +593,12 @@ class eSurgeRunner:
                 page_ids=new_req_data.page_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
+                # Vision-language model data
+                pixel_values=new_req_data.pixel_values,
+                image_grid_thw=new_req_data.image_grid_thw,
+                pixel_values_videos=new_req_data.pixel_values_videos,
+                video_grid_thw=new_req_data.video_grid_thw,
+                mm_features=new_req_data.mm_features,
             )
             req_ids_to_add.append(req_id)
 
@@ -906,6 +912,42 @@ class eSurgeRunner:
                     self._empty_sharding,
                 )
 
+            image_pixel_values_list: list[np.ndarray] = []
+            image_grid_thw_list: list[np.ndarray] = []
+            video_pixel_values_list: list[np.ndarray] = []
+            video_grid_thw_list: list[np.ndarray] = []
+            vision_request_states: list[CachedRequestState] = []
+
+            for _i, rid in enumerate(req_ids_window):
+                if rid is not None:
+                    req_state = self.requests.get(rid)
+                    if req_state is not None and req_state.has_vision and not req_state.vision_processed:
+                        if req_state.pixel_values is not None:
+                            image_pixel_values_list.append(req_state.pixel_values)
+                            if req_state.image_grid_thw is not None:
+                                image_grid_thw_list.append(req_state.image_grid_thw)
+                        if req_state.pixel_values_videos is not None:
+                            video_pixel_values_list.append(req_state.pixel_values_videos)
+                            if req_state.video_grid_thw is not None:
+                                video_grid_thw_list.append(req_state.video_grid_thw)
+                        vision_request_states.append(req_state)
+
+            # Concatenate vision data from all requests
+            pixel_values = None
+            image_grid_thw = None
+            pixel_values_videos = None
+            video_grid_thw = None
+
+            if image_pixel_values_list:
+                pixel_values = np.concatenate(image_pixel_values_list, axis=0)
+                if image_grid_thw_list:
+                    image_grid_thw = np.concatenate(image_grid_thw_list, axis=0)
+
+            if video_pixel_values_list:
+                pixel_values_videos = np.concatenate(video_pixel_values_list, axis=0)
+                if video_grid_thw_list:
+                    video_grid_thw = np.concatenate(video_grid_thw_list, axis=0)
+
             # Get page table as CPU array (already on CPU, no transfer needed)
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
             step_start = time.time()
@@ -929,7 +971,6 @@ class eSurgeRunner:
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
                 padded_num_reqs=padded_num_reqs,
-                # Pass NumPy arrays for CPU-first batch metadata preparation
                 token_ids_cpu=self.sequence_buffer.token_ids,
                 num_computed_tokens_cpu=self.sequence_buffer.num_computed_tokens,
                 temperature_cpu=self.sequence_buffer.temperature,
@@ -937,7 +978,15 @@ class eSurgeRunner:
                 top_k_cpu=self.sequence_buffer.top_k,
                 min_p_cpu=self.sequence_buffer.min_p,
                 page_table_cpu=page_table_cpu,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
             )
+
+            # Clear vision data after prefill to free memory
+            for req_state in vision_request_states:
+                req_state.clear_vision_data()
 
             # Start async copy to host (non-blocking) - overlaps with post-processing
             token_ids_async = jax.copy_to_host_async(minimal_device_state.token_ids)

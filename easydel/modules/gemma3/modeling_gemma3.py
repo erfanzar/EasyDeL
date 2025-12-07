@@ -906,6 +906,10 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
         """
         return self.model.get_embedding()
 
+    def get_task_head(self):
+        """Returns the sequence classification head."""
+        return self.score
+
 
 class Gemma3MultiModalProjector(nn.Module):
     """Multi-modal projector for Gemma3 vision-language models.

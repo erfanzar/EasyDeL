@@ -1331,6 +1331,7 @@ class TaskType(str, Enum):
     SEQUENCE_CLASSIFICATION = "sequence-classification"
     AUDIO_CLASSIFICATION = "audio-classification"
     IMAGE_CLASSIFICATION = "image-classification"
+    ANY_TO_ANY = "any-to-any"
     AUTO_BIND = "auto-bind"
 
 
@@ -1734,7 +1735,10 @@ class ArrayParam(nn.Param):
             key: PRNG key for random initialization.
             shard_fn: Optional function to apply sharding to the reinitialized value.
         """
-        init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**self.init_kwargs)
+        init_kwargs = self.init_kwargs
+        if init_kwargs is None:
+            init_kwargs = {}
+        init_fn = getattr(jax.nn.initializers, self.init_method, jax.nn.initializers.normal)(**init_kwargs)
         val = init_fn(key, self.shape, self.dtype)
 
         if shard_fn is not None:

@@ -89,6 +89,7 @@ from easydel.workers.esurge.pipeline import DetokenizerResult, WorkerManager
 
 from .engine_types import EngineCoreOutputs
 from .metrics import get_metrics_collector, initialize_metrics, log_metrics_summary
+from .multimodal import MultiModalManager
 from .request import EngineRequest, EngineRequestStatus
 from .runners import eSurgeRunner
 from .scheduler import Scheduler, SchedulerOutput
@@ -281,6 +282,10 @@ class eSurge:
         | None = None,
         extra_eos_token_ids: list[int] | None = None,
         silent_mode: bool = False,
+        # Vision-language model support
+        processor: Any | None = None,
+        resolution_buckets: list[tuple[int, int]] | None = None,
+        vision_cache_capacity_mb: int = 1024,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -379,6 +384,17 @@ class eSurge:
             tokenizer_obj = tokenizer
             tokenizer_source = getattr(tokenizer_obj, "name_or_path", None)
         self.tokenizer = tokenizer_obj
+
+        # Vision-language model support
+        self._processor = processor
+        self._multimodal_manager: MultiModalManager | None = None
+        if processor is not None:
+            self._multimodal_manager = MultiModalManager(
+                processor=processor,
+                resolution_buckets=resolution_buckets,
+                cache_capacity_mb=vision_cache_capacity_mb,
+                enable_cache=True,
+            )
 
         self._monitoring_server = None
         self._monitoring_urls: dict[str, str] | None = None
@@ -1138,7 +1154,7 @@ class eSurge:
 
     def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict],
         tools: list[dict] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
@@ -1149,16 +1165,26 @@ class eSurge:
 
         Provides a convenient chat-based interface for conversational AI applications.
         Automatically formats messages using the model's chat template and handles
-        both streaming and non-streaming responses.
+        both streaming and non-streaming responses. Supports multimodal content
+        (images and videos) for vision-language models.
 
         Args:
             messages: List of message dictionaries representing the conversation history.
-                Each message must have 'role' and 'content' keys. Supported roles are
-                typically 'system', 'user', and 'assistant', but may vary by model.
-                Example: [{"role": "user", "content": "Hello!"}]
+                Each message must have 'role' and 'content' keys. Content can be:
+                - A string for text-only messages
+                - A list of content items for multimodal messages (OpenAI format)
+
+                Text-only example:
+                    [{"role": "user", "content": "Hello!"}]
+
+                Multimodal example:
+                    [{"role": "user", "content": [
+                        {"type": "image", "image": pil_image},
+                        {"type": "text", "text": "Describe this image"}
+                    ]}]
+
             tools: Optional list of tool/function definitions for function calling.
-                Format should match the model's expected tool schema. Tools allow the
-                model to request function calls as part of its response.
+                Format should match the model's expected tool schema.
             sampling_params: Generation parameters controlling temperature, top_p,
                 max_tokens, etc. Defaults to SamplingParams(max_tokens=128) if None.
             request_id: Optional unique identifier for tracking this request.
@@ -1176,61 +1202,223 @@ class eSurge:
               with delta_text containing newly generated text chunks.
 
         Raises:
-            ValueError: If messages format is invalid or empty.
+            ValueError: If messages format is invalid or empty, or if multimodal
+                content is provided but no processor is configured.
             RuntimeError: If scheduler is not running or tokenizer lacks chat template.
 
         Example:
-            >>> # Non-streaming chat
+            >>> # Text-only chat
             >>> messages = [
             ...     {"role": "system", "content": "You are a helpful assistant."},
             ...     {"role": "user", "content": "Explain quantum computing"}
             ... ]
-            >>> response = engine.chat(messages, sampling_params=SamplingParams(max_tokens=200))
+            >>> response = engine.chat(messages)
             >>> print(response.get_text())
             >>>
-            >>> # Streaming chat with function calling
-            >>> tools = [{
-            ...     "type": "function",
-            ...     "function": {
-            ...         "name": "get_weather",
-            ...         "description": "Get weather for a location",
-            ...         "parameters": {...}
-            ...     }
-            ... }]
-            >>> for chunk in engine.chat(messages, tools=tools, stream=True):
-            ...     print(chunk.delta_text, end="", flush=True)
+            >>> # Multimodal chat with images (requires processor)
+            >>> from PIL import Image
+            >>> image = Image.open("photo.jpg")
+            >>> messages = [
+            ...     {"role": "user", "content": [
+            ...         {"type": "image", "image": image},
+            ...         {"type": "text", "text": "What's in this image?"}
+            ...     ]}
+            ... ]
+            >>> response = engine.chat(messages)
+            >>> print(response.get_text())
             >>>
-            >>> # Custom chat template
-            >>> custom_template = "{% for message in messages %}...{% endfor %}"
-            >>> response = engine.chat(messages, chat_template=custom_template)
+            >>> # Streaming multimodal chat
+            >>> for chunk in engine.chat(messages, stream=True):
+            ...     print(chunk.delta_text, end="", flush=True)
 
         Note:
-            This method provides compatibility with OpenAI's chat completions API
-            and vLLM's chat interface, making it easy to migrate existing applications.
-            The exact behavior of tool calling and special tokens depends on the
-            specific model being used.
+            For multimodal support, you must configure the engine with a processor
+            during initialization: eSurge(..., processor=AutoProcessor.from_pretrained(...))
         """
+        has_multimodal = self._messages_have_multimodal_content(messages)
+
+        if has_multimodal:
+            return self._chat_multimodal(
+                messages=messages,
+                tools=tools,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                stream=stream,
+                chat_template=chat_template,
+            )
+        else:
+            prompt = self._format_chat_prompt(
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                chat_template=chat_template,
+            )
+            if stream:
+                return self.stream(prompt, sampling_params=sampling_params, request_id=request_id)
+            else:
+                outs = self.generate(
+                    prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    use_tqdm=False,
+                )
+                return outs[0]
+
+    def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
+        """Check if messages contain multimodal content (images/videos)."""
+        for message in messages:
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+                        if item_type in ("image", "video", "image_url"):
+                            return True
+        return False
+
+    def _chat_multimodal(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        stream: bool = False,
+        chat_template: str | None = None,
+    ):
+        """Handle multimodal chat with images/videos."""
+        if self._multimodal_manager is None:
+            raise ValueError(
+                "Multimodal content detected but no processor configured. "
+                "Initialize eSurge with: processor=AutoProcessor.from_pretrained(...)"
+            )
+
+        if request_id is None:
+            request_id = self._generate_request_id()
+
+        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
+
+        images, videos = self._multimodal_manager.extract_media_from_messages(messages)
+
+        pixel_values, image_grid_thw = self._multimodal_manager.process_images(images)
+        pixel_values_videos, video_grid_thw = self._multimodal_manager.process_videos(videos)
+
+        # Create mm_features for caching and batching support
+        mm_features = []
+        if images:
+            mm_features.extend(self._multimodal_manager.process_images_to_features(images))
+        if videos:
+            mm_features.extend(self._multimodal_manager.process_videos_to_features(videos))
+
+        prompt_token_ids = self._multimodal_manager.tokenize_multimodal(messages=messages, images=images, videos=videos)
+
         prompt = self._format_chat_prompt(
             messages,
             tools=tools,
             add_generation_prompt=True,
             chat_template=chat_template,
         )
+
+        effective_params = self._prepare_sampling_params_for_request(
+            base_sampling_params,
+            request_id=request_id,
+            prompt=prompt,
+        )
+
+        # Add request with vision data
+        self._add_request(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params=effective_params,
+            prompt_token_ids=prompt_token_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            mm_features=mm_features,
+        )
+
+        if not self._scheduler_running:
+            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+
         if stream:
-            return self.stream(
-                prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-            )
+            return self._stream_multimodal_request(request_id)
         else:
-            outs = self.generate(
-                prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                use_tqdm=False,
-            )
-            # generate() returns a list; chat is single prompt, so return the first
-            return outs[0]
+            return self._wait_for_request(request_id)
+
+    def _stream_multimodal_request(self, request_id: str) -> Iterator[RequestOutput]:
+        """Stream output for a multimodal request."""
+        with self._request_lock:
+            req_event = self._request_events.get(request_id)
+        if req_event is None:
+            raise RuntimeError("Request event missing")
+
+        last_update_seq = -1
+
+        while True:
+            req_event.wait(timeout=1.0)
+            req_event.clear()
+
+            snapshot = None
+            with self._output_lock:
+                ro = self._request_outputs.get(request_id)
+                if ro is None:
+                    break
+
+                if ro.update_seq != last_update_seq:
+                    outputs_copy = []
+                    for comp in ro.outputs:
+                        outputs_copy.append(
+                            CompletionOutput(
+                                index=comp.index,
+                                text=comp.text,
+                                token_ids=list(comp.token_ids),
+                                cumulative_logprob=comp.cumulative_logprob,
+                                logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                finish_reason=comp.finish_reason,
+                            )
+                        )
+
+                    snapshot = RequestOutput(
+                        request_id=ro.request_id,
+                        prompt=ro.prompt,
+                        prompt_token_ids=list(ro.prompt_token_ids),
+                        outputs=outputs_copy,
+                        finished=ro.finished,
+                        metrics=dict(ro.metrics) if ro.metrics is not None else None,
+                        accumulated_text=ro.accumulated_text,
+                        delta_text=ro.delta_text,
+                        tokens_per_second=ro.tokens_per_second,
+                        num_generated_tokens=ro.num_generated_tokens,
+                        time_spent_generating=ro.time_spent_generating,
+                        first_token_time=ro.first_token_time,
+                        processing_time=ro.processing_time,
+                        update_seq=ro.update_seq,
+                    )
+                    last_update_seq = ro.update_seq
+
+            if snapshot is not None:
+                yield snapshot
+                if snapshot.finished:
+                    break
+
+        with self._request_lock:
+            self._request_events.pop(request_id, None)
+
+    def _wait_for_request(self, request_id: str) -> RequestOutput:
+        """Wait for a request to complete and return the output."""
+        with self._request_lock:
+            req_event = self._request_events.get(request_id)
+        if req_event is None:
+            raise RuntimeError("Request event missing")
+
+        while True:
+            self._output_event.wait(timeout=0.1)
+            self._output_event.clear()
+            with self._output_lock:
+                if request_id in self._request_outputs:
+                    output = self._request_outputs[request_id]
+                    if output.finished:
+                        return output
 
     def update_model_weights(
         self,
@@ -1310,6 +1498,12 @@ class eSurge:
         prompt: str,
         sampling_params: SamplingParams,
         prompt_token_ids: list[int] | None = None,
+        # Vision-language model data (optional)
+        pixel_values: Any | None = None,
+        image_grid_thw: Any | None = None,
+        pixel_values_videos: Any | None = None,
+        video_grid_thw: Any | None = None,
+        mm_features: list | None = None,
     ) -> None:
         """Add a new request to the scheduler queue with intelligent context management.
 
@@ -1583,6 +1777,12 @@ class eSurge:
                     eos_token_id=primary_eos_token_id,
                     parent_request_id=parent_id,
                     sample_index=sample_idx,
+                    # Vision-language model data (only for first sample to save memory)
+                    pixel_values=pixel_values if sample_idx == 0 else None,
+                    image_grid_thw=image_grid_thw if sample_idx == 0 else None,
+                    pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
+                    video_grid_thw=video_grid_thw if sample_idx == 0 else None,
+                    mm_features=mm_features if sample_idx == 0 else None,
                 )
             )
 

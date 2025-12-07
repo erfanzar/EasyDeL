@@ -100,7 +100,6 @@ class Qwen3VLMoeVisionConfig(EasyDeLBaseConfig):
         self.tokens_per_second = tokens_per_second
         self.initializer_range = initializer_range
 
-        # Computed attributes for compatibility
         self.embed_dim = hidden_size
 
 
@@ -168,7 +167,6 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         use_sliding_window: bool = False,
         sliding_window: int = 4096,
         max_window_layers: int = 80,
-        # MoE-specific parameters
         decoder_sparse_step: int = 1,
         moe_intermediate_size: int = 1408,
         num_experts_per_tok: int = 4,
@@ -202,7 +200,6 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
 
-        # MoE configuration
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -219,14 +216,6 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-
-        # Handle rope_scaling type conversion for HF compatibility
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            rtype = self.rope_scaling["type"]
-            # Treat legacy/default+section or explicit mrope as mrope
-            if rtype == "mrope" or ("mrope_section" in self.rope_scaling and rtype == "default"):
-                self.rope_scaling["type"] = "mrope"
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Get attention mask details for sliding window attention."""
@@ -277,15 +266,14 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         **kwargs,
     ):
         if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
+            self.vision_config = self.sub_configs["vision_config"](**self._fix_parent_kws(vision_config, kwargs))
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
 
         if isinstance(text_config, dict):
-            self.text_config = self.sub_configs["text_config"](**text_config)
+            self.text_config = self.sub_configs["text_config"](**self._fix_parent_kws(text_config, kwargs))
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
-        # Token IDs
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
@@ -303,25 +291,20 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         """
         return self.text_config
 
-    def get_partition_rules(self, fully_sharded_data_parallel: bool = False):
+    def get_partition_rules(self, *args, **kwargs):
         """Get partition rules for model parallelism combining vision and MoE sharding."""
         pmag = self.partition_manager
         return (
-            # Text model embeddings
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            # Text attention projections
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            # Text dense MLP (non-MoE layers)
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            # MoE router
             (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            # MoE experts
             (
                 r"mlp/experts/(gate_proj|up_proj)/kernel",
                 get_moe_partition_spec(
@@ -347,33 +330,25 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
                 ),
             ),
             (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            # Text norms
             (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            # LM head
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            # Vision patch embed
             (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            # Vision attention
             (r"visual/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
             (r"visual/.*/attn/qkv/bias", pmag.resolve(Replicated)),
             (r"visual/.*/attn/proj/kernel", pmag.resolve(RowWise)),
             (r"visual/.*/attn/proj/bias", pmag.resolve(Replicated)),
-            # Vision MLP
             (r"visual/.*/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
             (r"visual/.*/mlp/fc1/bias", pmag.resolve(Replicated)),
             (r"visual/.*/mlp/fc2/kernel", pmag.resolve(RowWise)),
             (r"visual/.*/mlp/fc2/bias", pmag.resolve(Replicated)),
-            # Vision norms
             (r"visual/.*/norm(1|2)/scale", pmag.resolve(Replicated)),
             (r"visual/.*/norm(1|2)/bias", pmag.resolve(Replicated)),
-            # Vision merger
             (r"visual/merger/ln_q/scale", pmag.resolve(Replicated)),
             (r"visual/merger/ln_q/bias", pmag.resolve(Replicated)),
             (r"visual/merger/mlp/0/kernel", pmag.resolve(ColumnWise)),
             (r"visual/merger/mlp/0/bias", pmag.resolve(Replicated)),
             (r"visual/merger/mlp/2/kernel", pmag.resolve(RowWise)),
             (r"visual/merger/mlp/2/bias", pmag.resolve(Replicated)),
-            # Catch-all
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )

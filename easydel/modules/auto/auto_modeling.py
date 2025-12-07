@@ -786,3 +786,13 @@ class AutoStateVisionModel(BaseAutoEasyState):
     """Loads saved states for vision-only EasyDeL modules."""
 
     _base = AutoEasyDeLVisionModel
+
+
+class AutoEasyDeLAnyToAnyModel(BaseAutoEasyModel):
+    """Auto loader for generic models that map arbitrary input modalities to any output type."""
+    model_task: TaskType = TaskType.ANY_TO_ANY
+
+
+class AutoStateAnyToAnyModel(BaseAutoEasyModel):
+    """Loads or builds states for the generic any-to-any EasyDeL modules."""
+    _base = AutoEasyDeLAnyToAnyModel

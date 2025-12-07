@@ -1070,6 +1070,10 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
         """
         return self.roberta.get_embedding()
 
+    def get_task_head(self):
+        """Returns the sequence classification head."""
+        return self.classifier
+
 
 class RobertaForMultipleChoice(EasyDeLBaseModule):
     """RoBERTa encoder adapted for multiple-choice tasks with per-option scoring."""
@@ -1287,6 +1291,10 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
         """
         return self.roberta.get_embedding()
 
+    def get_task_head(self):
+        """Returns the token classification head."""
+        return self.classifier
+
 
 class RobertaForQuestionAnswering(EasyDeLBaseModule):
     """RoBERTa encoder with start/end span heads for extractive QA."""
@@ -1391,6 +1399,10 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
         Returns the embedding layer of the module.
         """
         return self.roberta.get_embedding()
+
+    def get_task_head(self):
+        """Returns the question answering head."""
+        return self.qa_outputs
 
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")

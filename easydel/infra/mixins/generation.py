@@ -192,24 +192,25 @@ class EasyGenerationMixin:
             RaggedPagesCacheMetaData: An initialized metadata object containing the
                 static configuration for the paged cache.
         """
-        num_hidden_layers = _safepick(self.config, "num_hidden_layers")
+        text_config = self.config.get_text_config()
+        num_hidden_layers = _safepick(text_config, "num_hidden_layers")
 
-        num_key_value_heads = _safepick(self.config, "num_key_value_heads")
-        num_attention_heads = _safepick(self.config, "num_attention_heads")
+        num_key_value_heads = _safepick(text_config, "num_key_value_heads")
+        num_attention_heads = _safepick(text_config, "num_attention_heads")
 
-        hidden_size = _safepick(self.config, "hidden_size")
+        hidden_size = _safepick(text_config, "hidden_size")
 
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
-        head_dim = _safepick(self.config, "head_dim")
+        head_dim = _safepick(text_config, "head_dim")
 
         if head_dim is None:
             head_dim = hidden_size // num_attention_heads
 
         from easydel.layers.attention import AttentionMechanisms
 
-        match self.config.attn_mechanism:
+        match text_config.attn_mechanism:
             case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
                 version = "v3"
             case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
@@ -220,8 +221,8 @@ class EasyGenerationMixin:
 
         return RaggedPagesCacheMetaData.create(
             mesh=self.mesh,
-            partition_manager=self.config.partition_manager,
-            kvdtype=self.config.kvdtype,
+            partition_manager=text_config.partition_manager,
+            kvdtype=text_config.kvdtype,
             max_model_length=max_model_length,
             num_hidden_layers=num_hidden_layers,
             num_kv_heads=num_key_value_heads,
@@ -255,6 +256,7 @@ class EasyGenerationMixin:
         Returns:
             TransformerCacheMetaData: An initialized metadata object for a standard KV cache.
         """
+        text_config = self.config.get_text_config()
         if pad_token_id is None:
             if hasattr(self, "generation_config"):
                 pad_token_id = self.generation_config.pad_token_id
@@ -262,17 +264,17 @@ class EasyGenerationMixin:
                 pad_token_id = self.config.pad_token_id
             else:
                 pad_token_id = 0
-        head_dim = getattr(self.config, "head_dim", None)
+        head_dim = getattr(text_config, "head_dim", None)
         if head_dim is None:
-            head_dim = self.config.hidden_size // self.config.num_attention_heads
-        num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
+            head_dim = text_config.hidden_size // text_config.num_attention_heads
+        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
         if num_key_value_heads is None:
-            num_key_value_heads = self.config.num_attention_heads
+            num_key_value_heads = text_config.num_attention_heads
 
         from easydel.layers.caching import TransformerCacheMetaData
 
         return TransformerCacheMetaData.create(
-            num_hidden_layers=self.config.num_hidden_layers,
+            num_hidden_layers=text_config.num_hidden_layers,
             pad_token_id=pad_token_id,
             batch_size=batch_size,
             sequence_length=max_length,
@@ -315,6 +317,7 @@ class EasyGenerationMixin:
             AssertionError: If `metadata` is None and any of the required arguments
                 (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
         """
+        text_config = self.config.get_text_config()
         if metadata is None:
             assert page_size is not None, "if your not passing metadata you should pass `page_size`"
             assert hbm_utilization is not None, "if your not passing metadata you should pass `hbm_utilization`"
@@ -326,11 +329,11 @@ class EasyGenerationMixin:
                 max_model_length=max_model_length,
             )
         return RaggedPagesCache.init_cache(
-            mesh=self.config.mesh,
+            mesh=text_config.mesh,
             metadata=metadata,
-            partition_manager=self.config.partition_manager,
+            partition_manager=text_config.partition_manager,
             quantizer=self._quant_class(
-                quantization_config=self.config.kv_cache_quantization_config,
+                quantization_config=text_config.kv_cache_quantization_config,
             ),
         )
 
@@ -365,20 +368,22 @@ class EasyGenerationMixin:
 
         from easydel.layers.caching import TransformerCache
 
+        text_config = self.config.get_text_config()
+
         return TransformerCache.init_cache(
-            dtype=self.config.kvdtype,
-            partition_manager=self.config.partition_manager,
+            dtype=text_config.kvdtype,
+            partition_manager=text_config.partition_manager,
             metadata=self.create_cache_metadata(
                 batch_size=batch_size,
                 max_length=max_length,
                 pad_token_id=pad_token_id,
             ),
             quantizer=self._quant_class(
-                quantization_config=self.config.kv_cache_quantization_config,
+                quantization_config=text_config.kv_cache_quantization_config,
             ),
-            mesh=self.config.mesh,
+            mesh=text_config.mesh,
             starts=starts,
-            mask_type_details=self.config.get_mask_details(),
+            mask_type_details=text_config.get_mask_details(),
         )
 
     @cached_property
@@ -1712,7 +1717,7 @@ class EasyGenerationMixin:
         """
         gdef = self.graphdef
         if self.config.attn_mechanism not in ["ragged_page_attention_v2", "ragged_page_attention_v3"]:
-            gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+            gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
         return gdef
 
     @property

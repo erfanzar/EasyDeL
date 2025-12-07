@@ -34,6 +34,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
 from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
 from easydel.modules.auto import (
+    AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,
     AutoEasyDeLModelForDiffusionLM,
@@ -142,6 +143,8 @@ def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
         return AutoEasyDeLModelForZeroShotImageClassification.from_pretrained(**kw)
     if task == TaskType.DIFFUSION_LM:
         return AutoEasyDeLModelForDiffusionLM.from_pretrained(**kw)
+    if task == TaskType.ANY_TO_ANY:
+        return AutoEasyDeLAnyToAnyModel.from_pretrained(**kw)
     return AutoEasyDeLModel.from_pretrained(**kw)
 
 
@@ -277,8 +280,13 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
 
     cfg = normalize(cfg_like)
     task = resolve_task(cfg)
-    if task not in [TaskType.CAUSAL_LM, TaskType.IMAGE_TEXT_TO_TEXT, getattr(TaskType, "VISION_LM", None)]:
-        raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, VISION_LM]; got {task}")
+    if task not in [
+        TaskType.CAUSAL_LM,
+        TaskType.IMAGE_TEXT_TO_TEXT,
+        TaskType.ANY_TO_ANY,
+        getattr(TaskType, "VISION_LM", None),
+    ]:
+        raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY, VISION_LM]; got {task}")
     tok_path = cfg["model"].get("tokenizer", cfg["model"]["name_or_path"])
     if model is None:
         model = build_model(cfg)

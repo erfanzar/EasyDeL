@@ -809,17 +809,17 @@ class OPTModel(EasyDeLBaseModule):
             past_key_values=decoder_outputs.past_key_values,
         )
 
-    def set_input_embeddings(self, value):
+    def set_embeddings(self, value):
         """Sets the input embeddings for the model."""
         self.decoder.embed_tokens = value
 
-    def get_input_embeddings(self):
+    def get_embedding(self):
         """Gets the input embeddings from the model."""
         return self.decoder.embed_tokens
 
-    def get_embedding(self):
-        """Returns the embedding layer of the module."""
-        return self.decoder.embed_tokens
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self.decoder
 
 
 @register_module(TaskType.CAUSAL_LM, config=OPTConfig, model_type="opt")

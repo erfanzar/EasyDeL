@@ -51,7 +51,7 @@ from easydel.layers.caching import (
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm
 
-from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLVisionConfig
+from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
 # TODO: Convert this to a jitable jax fn and use that inside model instead of precall
@@ -207,14 +207,14 @@ def get_rope_index(
             mrope_position_deltas.append(int(llm_positions.max() + 1 - len(input_tokens)))
     else:
         if attention_mask is not None:
-            position_ids = np.cumsum(attention_mask, axis=-1) - 1
-            position_ids = np.where(attention_mask == 0, 1, position_ids)
-            position_ids = np.expand_dims(position_ids, axis=0).repeat(3, axis=0)
-            max_position_ids = np.max(position_ids, axis=(0, 2), keepdims=True)
+            position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
+            position_ids = jnp.where(attention_mask == 0, 1, position_ids)
+            position_ids = jnp.expand_dims(position_ids, axis=0).repeat(3, axis=0)
+            max_position_ids = jnp.max(position_ids, axis=(0, 2), keepdims=True)
             mrope_position_deltas = (max_position_ids + 1 - attention_mask.shape[-1]).reshape(-1)
         else:
-            position_ids = np.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
-            mrope_position_deltas = np.zeros((batch_size,), dtype=input_ids.dtype)
+            position_ids = jnp.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
+            mrope_position_deltas = jnp.zeros((batch_size,), dtype=input_ids.dtype)
 
     return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)
 
@@ -233,37 +233,21 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     rope_deltas: chex.Array | None = None
 
 
-def create_attention_mask(cu_seqlens, seq_length, dtype):
+def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+    """Create block-diagonal attention mask from cumulative sequence lengths.
+
+    Vectorized implementation that works correctly with JAX tracing.
     """
-    Creates an attention mask matrix.
+    positions = jnp.arange(seq_length)
+    starts = cu_seqlens[:-1]
+    ends = cu_seqlens[1:]
+    in_segment = (positions[:, None] >= starts[None, :]) & (positions[:, None] < ends[None, :])
 
-    Args:
-        cu_seqlens: Cumulative sequence lengths.
-        seq_length: Length of each sequence.
-        dtype: Data type of the mask.
+    segment_ids = jnp.argmax(in_segment.astype(jnp.int32), axis=-1)
+    same_segment = segment_ids[:, None] == segment_ids[None, :]
+    attention_mask = jnp.where(same_segment, 0.0, jnp.finfo(dtype).min).astype(dtype)
 
-    Returns:
-        Attention mask matrix.
-    """
-    attention_mask = jnp.full(
-        (1, seq_length, seq_length),
-        jnp.finfo(dtype).min,
-        dtype=dtype,
-    )
-
-    mask_updates = jnp.zeros((1, seq_length, seq_length), dtype=dtype)
-
-    for i in range(1, len(cu_seqlens)):
-        start_idx = cu_seqlens[i - 1]
-        end_idx = cu_seqlens[i]
-        mask_updates = mask_updates.at[
-            ...,
-            start_idx:end_idx,
-            start_idx:end_idx,
-        ].set(0)
-
-    attention_mask = jax.lax.dynamic_update_slice(attention_mask, mask_updates, (0, 0, 0))
-    return attention_mask
+    return attention_mask[None, :, :]
 
 
 def _merge_multimodal_embeddings(
@@ -271,13 +255,31 @@ def _merge_multimodal_embeddings(
     is_multimodal: jax.Array,
     multimodal_embeddings: jax.Array,
 ) -> jax.Array:
-    """Merge multimodal embeddings into text embeddings at placeholder positions."""
+    """Merge multimodal embeddings into text embeddings at placeholder positions.
+
+    Args:
+        inputs_embeds: Text embeddings with shape (batch, seq_len, hidden)
+        is_multimodal: Boolean mask with shape (batch, seq_len)
+        multimodal_embeddings: Flattened vision embeddings with shape (total_tokens, hidden)
+
+    Returns:
+        Merged embeddings with shape (batch, seq_len, hidden)
+    """
+    batch_size, seq_len, hidden = inputs_embeds.shape
+
+    flat_embeds = inputs_embeds.reshape(-1, hidden)
+    flat_mask = is_multimodal.reshape(-1)
+
     dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
     flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-    gather_indices = jnp.cumsum(is_multimodal)
+
+    gather_indices = jnp.cumsum(flat_mask)
     update_values = flattened_padded[gather_indices]
-    condition = jnp.expand_dims(is_multimodal, axis=-1)
-    return jnp.where(condition, update_values, inputs_embeds)
+
+    condition = jnp.expand_dims(flat_mask, axis=-1)
+    merged = jnp.where(condition, update_values, flat_embeds)
+
+    return merged.reshape(batch_size, seq_len, hidden)
 
 
 def merge_multimodal_embeddings(
@@ -309,17 +311,37 @@ def rotate_half(x):
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
-def apply_rotary_pos_emb_vision(array: chex.Array, freqs: chex.Array) -> chex.Array:
-    """Apply rotary positional embedding to vision features."""
-    orig_dtype = array.dtype
-    array = array.astype("f4")
-    cos = jnp.cos(freqs)
-    sin = jnp.sin(freqs)
-    cos = jnp.expand_dims(jnp.repeat(jnp.expand_dims(cos, 1), 2, -1), 0).astype("f4")
-    sin = jnp.expand_dims(jnp.repeat(jnp.expand_dims(sin, 1), 2, -1), 0).astype("f4")
-    output = (array * cos) + (rotate_half(array) * sin)
-    output = output.astype(orig_dtype)
-    return output.squeeze(0)
+def apply_rotary_pos_emb_vision(
+    q: chex.Array,
+    k: chex.Array,
+    cos: chex.Array,
+    sin: chex.Array,
+) -> tuple[chex.Array, chex.Array]:
+    """Apply rotary positional embedding to vision features.
+
+    Matches HuggingFace's implementation exactly.
+
+    Args:
+        q: Query tensor of shape (seq_len, num_heads, head_dim)
+        k: Key tensor of shape (seq_len, num_heads, head_dim)
+        cos: Cosine embeddings of shape (seq_len, head_dim)
+        sin: Sine embeddings of shape (seq_len, head_dim)
+
+    Returns:
+        Tuple of (q_embed, k_embed) with same shapes as inputs.
+    """
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q = q.astype("f4")
+    k = k.astype("f4")
+    # unsqueeze(-2) adds a dimension at axis -2 (before last)
+    cos = jnp.expand_dims(cos, axis=-2).astype("f4")  # (seq_len, 1, head_dim)
+    sin = jnp.expand_dims(sin, axis=-2).astype("f4")  # (seq_len, 1, head_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.astype(orig_q_dtype)
+    k_embed = k_embed.astype(orig_k_dtype)
+    return q_embed, k_embed
 
 
 class Qwen2VLPatchEmbed(nn.Module):
@@ -400,6 +422,7 @@ class Qwen2VLPatchMerger(nn.Module):
             ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
+                use_bias=True,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -409,6 +432,7 @@ class Qwen2VLPatchMerger(nn.Module):
             RowParallelLinear(
                 self.hidden_size,
                 dim,
+                use_bias=True,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
@@ -418,7 +442,7 @@ class Qwen2VLPatchMerger(nn.Module):
 
     def __call__(self, x: chex.Array) -> chex.Array:
         x = self.ln_q(x).reshape(-1, self.hidden_size)
-        for mlp in self.mlp:  # make easy attach work with no effort
+        for mlp in self.mlp:
             x = mlp(x)
         return x
 
@@ -441,6 +465,7 @@ class Qwen2VLVisionMLP(nn.Module):
         self.fc1 = ColumnParallelLinear(
             dim,
             hidden_dim,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -450,6 +475,7 @@ class Qwen2VLVisionMLP(nn.Module):
         self.fc2 = RowParallelLinear(
             hidden_dim,
             dim,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -479,15 +505,13 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        # Create a proxy config to adapt VisionConfig to UnifiedAttention requirements
         class ConfigAdapter:
             def __init__(self, config, dim, num_heads):
                 self.hidden_size = dim
                 self.num_attention_heads = num_heads
                 self.num_key_value_heads = num_heads
                 self.head_dim = dim // num_heads
-                self.attention_bias = True  # Vision model usually has bias
-                # Copy other attributes from config
+                self.attention_bias = True
                 for k, v in config.__dict__.items():
                     if not hasattr(self, k):
                         setattr(self, k, v)
@@ -530,6 +554,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self.proj = RowParallelLinear(
             self.embed_dim,
             self.embed_dim,
+            use_bias=True,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -542,13 +567,14 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            attn_mechanism="vanilla",
         )
 
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         cu_seqlens: chex.Array,
-        rotary_pos_emb: chex.Array = None,
+        position_embeddings: tuple[chex.Array, chex.Array] = None,
     ) -> chex.Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
@@ -560,23 +586,27 @@ class Qwen2VLVisionAttention(UnifiedAttention):
                 0,
             ),
         )
-        q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-        k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-        row_ids = jnp.arange(seq_length)[None, None, :]
-        col_ids = jnp.arange(seq_length)[None, :, None]
-        starts = cu_seqlens[:-1][:, None, None]
-        ends = cu_seqlens[1:][:, None, None]
-        is_valid = (row_ids >= starts) & (row_ids < ends) & (col_ids >= starts) & (col_ids < ends)
-        combined_mask = jnp.any(is_valid, axis=0)
-        attention_mask = jnp.where(combined_mask, 0.0, jnp.finfo(q.dtype).min)
-        q = q.swapaxes(0, 1)
-        k = k.swapaxes(0, 1)
-        v = v.swapaxes(0, 1)
-        attn_weights = jnp.matmul(q, k.swapaxes(1, 2)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights + attention_mask
-        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
-        attn_output = jnp.matmul(attn_weights, v)
-        attn_output = attn_output.swapaxes(0, 1).reshape(seq_length, -1)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        # Match HF: process each segment defined by cu_seqlens separately
+        q = q.swapaxes(0, 1)[None, ...]  # (1, num_heads, seq, head_dim)
+        k = k.swapaxes(0, 1)[None, ...]
+        v = v.swapaxes(0, 1)[None, ...]
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if lengths.ndim == 0:
+            lengths = lengths[None]
+        splits = [jnp.split(tensor, jnp.cumsum(lengths)[:-1], axis=2) for tensor in (q, k, v)]
+
+        attn_outputs = []
+        for q_chunk, k_chunk, v_chunk in zip(*splits):
+            attn_weights = jnp.matmul(q_chunk, k_chunk.swapaxes(-1, -2)) / math.sqrt(self.head_dim)
+            attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q_chunk.dtype)
+            attn_output = jnp.matmul(attn_weights, v_chunk)
+            attn_output = attn_output.swapaxes(1, 2)  # (1, seq_chunk, num_heads, head_dim)
+            attn_outputs.append(attn_output)
+
+        attn_output = jnp.concatenate(attn_outputs, axis=1)
+        attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -630,11 +660,11 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> chex.Array:
+    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> chex.Array:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -645,7 +675,7 @@ class Qwen2VLMLP(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2VLConfig,
+        config: Qwen2VLTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -717,7 +747,7 @@ class Qwen2VLAttention(UnifiedAttention):
 
     def __init__(
         self,
-        config: Qwen2VLConfig,
+        config: Qwen2VLTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -741,15 +771,13 @@ class Qwen2VLAttention(UnifiedAttention):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
+        position_ids: Int[Array, "batch seq_len"] | Int[Array, "3 batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
-        if position_ids is not None and position_ids.ndim == 3:
-            position_ids = position_ids[0]
         return super().__call__(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -767,7 +795,7 @@ class Qwen2VLDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2VLConfig,
+        config: Qwen2VLTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
@@ -868,7 +896,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         )
 
 
-@register_module(TaskType.BASE_VISION, config=Qwen2VLConfig, model_type="qwen2_vl")
+@register_module(TaskType.BASE_VISION, config=Qwen2VLVisionConfig, model_type="qwen2_vl")
 class Qwen2VLVisionTransformer(EasyDeLBaseModule):
     """Vision transformer encoder used to extract image features for Qwen2-VL."""
 
@@ -883,6 +911,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        assert isinstance(config, Qwen2VLVisionConfig), (
+            "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
+        )
         super().__init__(
             config=config,
             dtype=dtype,
@@ -935,12 +966,13 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         pos_ids = []
 
         for t, h, w in grid_thw:
-            # Create height position ids
+            # Convert to Python ints for reshape operations
+            t, h, w = int(t), int(h), int(w)
+
             hpos_ids = jnp.arange(h)
             hpos_ids = jnp.expand_dims(hpos_ids, 1)
             hpos_ids = jnp.broadcast_to(hpos_ids, (h, w))
 
-            # Reshape and permute height positions
             hpos_ids = hpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
@@ -950,12 +982,10 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             hpos_ids = jnp.transpose(hpos_ids, (0, 2, 1, 3))
             hpos_ids = hpos_ids.flatten()
 
-            # Create width position ids
             wpos_ids = jnp.arange(w)
             wpos_ids = jnp.expand_dims(wpos_ids, 0)
             wpos_ids = jnp.broadcast_to(wpos_ids, (h, w))
 
-            # Reshape and permute width positions
             wpos_ids = wpos_ids.reshape(
                 h // self.spatial_merge_size,
                 self.spatial_merge_size,
@@ -965,9 +995,8 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             wpos_ids = jnp.transpose(wpos_ids, (0, 2, 1, 3))
             wpos_ids = wpos_ids.flatten()
 
-            # Stack and repeat
             stacked = jnp.stack([hpos_ids, wpos_ids], axis=-1)
-            repeated = jnp.repeat(stacked, t, axis=1)
+            repeated = jnp.tile(stacked, (t, 1))
             pos_ids.append(repeated)
 
         pos_ids = jnp.concatenate(pos_ids, axis=0)
@@ -975,7 +1004,6 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             jnp.arange(0, max_grid_size, dtype="f4"),
             1.0 / (10000 ** (jnp.arange(0, self._head_dim_ro, 2, dtype="f4") / self._head_dim_ro)),
         )
-        # Index into embeddings and flatten
         rotary_pos_emb = jnp.take(rotary_pos_emb_full, pos_ids, axis=0)
         rotary_pos_emb = rotary_pos_emb.reshape(pos_ids.shape[0], -1)
 
@@ -990,6 +1018,10 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
+        # Match HuggingFace: concatenate and compute cos/sin
+        emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
+        position_embeddings = (jnp.cos(emb), jnp.sin(emb))
+
         grid_lens = grid_thw[:, 1] * grid_thw[:, 2]
         repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
         cu_seqlens = jnp.cumsum(repeated, dtype="i4")
@@ -998,7 +1030,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
             hidden_states = block(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
             )
 
         return self.merger(hidden_states)
@@ -1031,19 +1063,20 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         return self.patch_embed
 
 
-@register_module(TaskType.BASE_MODULE, config=Qwen2VLConfig, model_type="qwen2_vl")
+@register_module(TaskType.BASE_MODULE, config=Qwen2VLTextConfig, model_type="qwen2_vl")
 class Qwen2VLTextModel(EasyDeLBaseModule):
     """Language decoder stack for Qwen2-VL that consumes projected vision tokens."""
 
     def __init__(
         self,
-        config: Qwen2VLConfig,
+        config: Qwen2VLTextConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
     ):
+        assert isinstance(config, Qwen2VLTextConfig), "Qwen2VLTextModel requires a Qwen2VLTextConfig instance"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1121,7 +1154,11 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if position_ids is None:
-            position_ids = mask_info.q_position_ids
+            batch_size = inputs_embeds.shape[0]
+            pos_2d = mask_info.q_position_ids
+            position_ids = jnp.broadcast_to(
+                pos_2d[None, :, :], (3, batch_size, sequence_length)
+            )
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -1197,13 +1234,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         """
         return self.embed_tokens
 
-    def get_input_embeddings(self):
-        """
-        Returns the input embedding layer of the module.
-        """
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
+    def set_embeddings(self, value):
         """
         Sets the input embedding layer of the module.
         """
@@ -1240,7 +1271,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.language_model = Qwen2VLTextModel(
-            config,
+            config.text_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -1248,15 +1279,13 @@ class Qwen2VLModel(EasyDeLBaseModule):
         )
         self.rope_deltas = None
 
-    def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.language_model.set_input_embeddings(value)
+    def set_embeddings(self, value):
+        self.language_model.set_embeddings(value)
 
     def get_video_features(self, pixel_values_videos: chex.Array, video_grid_thw: chex.Array | None = None):
         pixel_values_videos = pixel_values_videos.astype(self.visual.dtype)
-        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        max_grid_size = int(video_grid_thw[:, 1:].max()) if video_grid_thw is not None else 1
+        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw, max_grid_size=max_grid_size)
         if video_grid_thw is not None:
             split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
             indices = np.cumsum(split_sizes)[:-1]
@@ -1265,7 +1294,8 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
     def get_image_features(self, pixel_values: chex.Array, image_grid_thw: chex.Array | None = None):
         pixel_values = pixel_values.astype(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        max_grid_size = int(image_grid_thw[:, 1:].max()) if image_grid_thw is not None else 1
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, max_grid_size=max_grid_size)
         if image_grid_thw is not None:
             split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
             indices = np.cumsum(split_sizes)[:-1]
@@ -1319,7 +1349,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            inputs_embeds = self.get_embedding()(input_ids)
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
@@ -1343,6 +1373,21 @@ class Qwen2VLModel(EasyDeLBaseModule):
                 placeholder_token_id=self.config.video_token_id,
             )
 
+        if rope_deltas is not None:
+            self.rope_deltas = rope_deltas
+
+        if position_ids is None:
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+            )
+            self.rope_deltas = rope_deltas
+        elif position_ids.ndim == 2:
+            batch_size, seq_length = position_ids.shape
+            position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, seq_length))
+
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
@@ -1362,6 +1407,14 @@ class Qwen2VLModel(EasyDeLBaseModule):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.language_model.get_embedding()
+
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self.language_model
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen2VLConfig, model_type="qwen2_vl")
@@ -1384,17 +1437,15 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         _uses_mrope: True (uses multi-dimensional RoPE)
     """
 
-    # Class attributes for registration and capabilities
     _task_type = TaskType.IMAGE_TEXT_TO_TEXT
     _model_type = "qwen2_vl"
     _config_class = Qwen2VLConfig
-    _auto_register = False  # Already registered via decorator
+    _auto_register = False
     _supports_video = True
     _uses_mrope = True
 
-    # Component name mapping (Qwen uses "visual" not "vision_tower")
     _vision_tower_name = "visual"
-    _projector_name = "merger"  # Qwen2VL uses merger in visual
+    _projector_name = "merger"
     _language_model_name = "language_model"
 
     loss_type = "ForCausalLM"
@@ -1417,14 +1468,11 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            # VLM-specific configuration
             vision_feature_layer=-1,
             vision_feature_select_strategy="default",
             image_token_index=config.image_token_id,
             video_token_index=config.video_token_id,
-            # mRoPE config
             spatial_merge_size=config.vision_config.spatial_merge_size,
-            # LM head configuration
             tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
             lm_head_bias=False,
         )
@@ -1435,11 +1483,11 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """Property to access the vision transformer for backward compatibility."""
         return self.base_model.visual
 
-    def get_input_embeddings(self):
-        return self.base_model.get_input_embeddings()
+    def get_embedding(self):
+        return self.base_model.get_embedding()
 
-    def set_input_embeddings(self, value):
-        self.base_model.set_input_embeddings(value)
+    def set_embeddings(self, value):
+        self.base_model.set_embeddings(value)
 
     def get_video_features(
         self,
@@ -1560,6 +1608,9 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
             lm_logits = self.apply_logit_cap(lm_logits)
 
+        if rope_deltas is None:
+            rope_deltas = getattr(self.base_model, "rope_deltas", None)
+
         return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
@@ -1584,6 +1635,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        rope_deltas=None,
         **kwargs,
     ):
         batch_size, _seq_length = input_ids.shape
@@ -1599,23 +1651,56 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
                 pad_token_id,
             )
 
+        # Note: Don't include input_ids in model_inputs - it will be passed as a positional arg
         if inputs_embeds is not None:
-            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
+            model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+            model_inputs = {}
+
+        if attention_mask is None:
+            attn_2d = jnp.ones((batch_size, _seq_length), dtype="b1")
+        else:
+            attn_2d = attention_mask
+
+        extended_attention_mask = jnp.ones((batch_size, max_length), dtype=attn_2d.dtype)
+        extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attn_2d, (0, 0))
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids if inputs_embeds is None else None,
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=extended_attention_mask,
         )
-        attn = mask_info.attention_mask if mask_info is not None else None
-        if attn is None:
-            attn = jnp.ones((batch_size, _seq_length), dtype="b1")
 
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype=attn.dtype)
-        extended_attention_mask = jax.lax.dynamic_update_slice(extended_attention_mask, attn, (0, 0))
+        # Note: get_rope_index uses numpy and is NOT JIT-compatible (uses data-dependent control flow)
+        if position_ids is not None and position_ids.ndim == 2:
+            position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, _seq_length))
+            if rope_deltas is None:
+                max_pos = jnp.max(position_ids)
+                rope_deltas = jnp.full((batch_size, 1), max_pos + 1 - _seq_length, dtype=jnp.int32)
+        elif position_ids is None:
+            if image_grid_thw is not None or video_grid_thw is not None:
+                position_ids, rope_deltas = self.base_model.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attn_2d,
+                )
+            elif attn_2d is not None:
+                attn_mask_int = attn_2d.astype(jnp.int32)
+                position_ids = jnp.cumsum(attn_mask_int, axis=-1) - 1
+                position_ids = jnp.where(attn_mask_int == 0, 1, position_ids)
+                position_ids = jnp.expand_dims(position_ids, axis=0)
+                position_ids = jnp.broadcast_to(position_ids, (3, batch_size, _seq_length))
+                max_pos = jnp.max(position_ids)
+                rope_deltas = jnp.full((batch_size, 1), max_pos + 1 - _seq_length, dtype=jnp.int32)
+            else:
+                position_ids = jnp.broadcast_to(
+                    jnp.arange(_seq_length, dtype=jnp.int32)[None, None, :],
+                    (3, batch_size, _seq_length),
+                )
+                rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+
         model_inputs.update(
             {
                 "position_ids": position_ids,
@@ -1626,6 +1711,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
                 "pixel_values_videos": pixel_values_videos,
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
+                "rope_deltas": rope_deltas,
             }
         )
         return model_inputs
@@ -1643,10 +1729,20 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, :, -1:] + 1
-        model_kwargs.pop("pixel_values", None)  # only effect first iter
-        model_kwargs.pop("pixel_values_videos", None)  # only effect first iter
-        model_kwargs.pop("token_type_ids", None)  # only effect first iter
+
+        if hasattr(model_outputs, "rope_deltas") and model_outputs.rope_deltas is not None:
+            model_kwargs["rope_deltas"] = model_outputs.rope_deltas
+
+        if model_kwargs.get("position_ids") is not None:
+            position_ids = model_kwargs["position_ids"]
+            if position_ids.ndim == 3:
+                model_kwargs["position_ids"] = position_ids[:, :, -1:] + 1
+            else:
+                model_kwargs["position_ids"] = position_ids[:, -1:] + 1
+
+        model_kwargs.pop("pixel_values", None)
+        model_kwargs.pop("pixel_values_videos", None)
+        model_kwargs.pop("token_type_ids", None)
         return model_kwargs
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
@@ -1679,31 +1775,54 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         )
         attention_mask = mask_info.attention_mask
 
+        input_ids = others.get("input_ids", None)
         rope_deltas = others.get("rope_deltas", None)
         position_ids = others.get("position_ids", None)
-        tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 1.0)
 
         if (
+            position_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            position_ids, rope_deltas = self.base_model.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+            )
+        elif position_ids is not None and position_ids.ndim == 2:
+            batch_size, sequence_length = position_ids.shape
+            position_ids = jnp.expand_dims(position_ids, axis=0)
+            position_ids = jnp.broadcast_to(position_ids, (3, batch_size, sequence_length))
+            if rope_deltas is None:
+                max_pos = jnp.max(position_ids)
+                rope_deltas = jnp.full((batch_size, 1), max_pos + 1 - sequence_length, dtype=jnp.int32)
+
+        # Note: get_rope_index uses numpy and is NOT JIT-compatible (uses data-dependent control flow)
+        elif (
             position_ids is None
             and others.get("input_ids", None) is not None
             and (attention_mask is None or attention_mask.ndim == 2)
         ):
-            if others.get("past_key_values", None) is not None or others.get("rope_deltas", None) is None:
-                position_ids, rope_deltas = get_rope_index(
-                    input_ids=others.get("input_ids"),
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    attention_mask=np.array(attention_mask) if attention_mask is not None else None,
-                    spatial_merge_size=self.visual.spatial_merge_size,
-                    image_token_id=self.config.image_token_id,
-                    video_token_id=self.config.video_token_id,
-                    vision_start_token_id=self.config.vision_start_token_id,
-                    tokens_per_second=tokens_per_second,
-                )
+            input_ids = others.get("input_ids")
+            batch_size, sequence_length = input_ids.shape
+
+            if attention_mask is not None and attention_mask.ndim == 2:
+                attn_mask_int = attention_mask.astype(jnp.int32)
+                position_ids = jnp.cumsum(attn_mask_int, axis=-1) - 1
+                position_ids = jnp.where(attn_mask_int == 0, 1, position_ids)
+                position_ids = jnp.expand_dims(position_ids, axis=0)
+                position_ids = jnp.broadcast_to(position_ids, (3, batch_size, sequence_length))
+                if rope_deltas is None:
+                    max_pos = jnp.max(position_ids)
+                    rope_deltas = jnp.full((batch_size, 1), max_pos + 1 - sequence_length, dtype=jnp.int32)
             else:
-                batch_size, sequence_length = others.get("input_ids").shape
-                position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
-                position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
+                position_ids = jnp.broadcast_to(
+                    jnp.arange(sequence_length, dtype=jnp.int32)[None, None, :],
+                    (3, batch_size, sequence_length),
+                )
+                if rope_deltas is None:
+                    rope_deltas = jnp.zeros((batch_size, 1), dtype=jnp.int32)
         if drop_ids:
             others.pop("input_ids", None)
         others.update(

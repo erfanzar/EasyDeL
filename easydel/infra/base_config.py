@@ -52,7 +52,6 @@ import warnings
 from typing import Any, NotRequired
 
 import chex
-import huggingface_hub
 import jax
 import jax.extend
 import jax.tree_util
@@ -94,6 +93,8 @@ if tp.TYPE_CHECKING:
     from easydel.layers.rotary_embedding import RopeConfig
 
     from .utils import AttnMaskDetail, ModuleCaches
+
+
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
@@ -1069,21 +1070,132 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 for key_, value_ in kwargs.items():
                     setattr(getattr(self, name), key_, value_)
 
+    # Attributes to hide from __repr__ and __str__ output
+    _hidden_repr_attrs: tp.ClassVar[set[str]] = {
+        # EasyDeL-specific attributes
+        "sharding_axis_dims",
+        "sharding_dcn_axis_dims",
+        "sharding_axis_names",
+        "attn_mechanism",
+        "decode_attn_mechanism",
+        "blocksize_k",
+        "blocksize_q",
+        "blocksize_b",
+        "moe_tiling_size_batch",
+        "moe_tiling_size_seqlen",
+        "moe_tiling_size_dim",
+        "partition_axis",
+        "use_sharded_kv_caching",
+        "use_sharding_constraint",
+        "backend",
+        "platform",
+        "easy_method",
+        "bits",
+        "scan_ring_attention",
+        "scan_attention_layers",
+        "use_scan_mlp",
+        "scan_mlp_chunk_size",
+        "sequence_axis_name",
+        "gradient_checkpointing",
+        "gradient_checkpointing_targets",
+        "precompute_masks",
+        "kv_cache_quantization_config",
+        "quantization_config",
+        "kv_cache_sharding_sequence_axis_name",
+        "flash_attention_backward_pass_impl",
+        "attn_dtype",
+        "kvdtype",
+        "attn_softmax_dtype",
+        "fcm_max_ratio",
+        "fcm_min_ratio",
+        "hardware_abstraction",
+        "pallas_m_block_size",
+        "pallas_k_block_size",
+        "pallas_n_block_size",
+        "moe_method",
+        "moe_force_xla_gmm",
+        "use_expert_tensor_mode",
+        "use_ring_of_experts",
+        "fsdp_is_ep_bound",
+        "sp_is_ep_bound",
+        "operation_configs",
+        # HuggingFace PretrainedConfig default attributes
+        "pretraining_tp",
+        "return_dict",
+        "output_hidden_states",
+        "torchscript",
+        "dtype",
+        "task_specific_params",
+        "problem_type",
+        "tokenizer_class",
+        "prefix",
+        "bos_token_id",
+        "pad_token_id",
+        "eos_token_id",
+        "sep_token_id",
+        "decoder_start_token_id",
+        "max_length",
+        "min_length",
+        "do_sample",
+        "early_stopping",
+        "num_beams",
+        "temperature",
+        "top_k",
+        "top_p",
+        "typical_p",
+        "repetition_penalty",
+        "length_penalty",
+        "no_repeat_ngram_size",
+        "encoder_no_repeat_ngram_size",
+        "bad_words_ids",
+        "num_return_sequences",
+        "output_scores",
+        "return_dict_in_generate",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "remove_invalid_values",
+        "exponential_decay_length_penalty",
+        "suppress_tokens",
+        "begin_suppress_tokens",
+        "num_beam_groups",
+        "diversity_penalty",
+        "transformers_version",
+        "add_cross_attention",
+        "tie_encoder_decoder",
+        "architectures",
+        "finetuning_task",
+        "id2label",
+        "label2id",
+        "chunk_size_feed_forward",
+        "is_encoder_decoder",
+        "is_decoder",
+        "cross_attention_hidden_size",
+        "tie_word_embeddings",
+        "output_attentions",
+        "pruned_heads",
+        "tf_legacy_loss",
+        "use_bfloat16",
+    }
+
     def __repr__(self):
         """Return a multi-line summary of public config fields.
 
         The output lists non-private attributes on separate lines and truncates
-        long values to keep the representation readable.
+        long values to keep the representation readable. EasyDeL-specific internal
+        attributes are hidden unless `_show_private_attrs` is True.
         """
 
         string = f"{self.__class__.__name__}(\n"
         for k, v in self.__dict__.items():
-            if not k.startswith("_"):
-                try:
-                    repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-                    string += repr_src if len(repr_src) < 500 else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-                except TypeError:
-                    pass
+            if k.startswith("_"):
+                continue
+            if not self._show_private_attrs and k in self._hidden_repr_attrs:
+                continue
+            try:
+                repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+                string += repr_src if len(repr_src) < 1500 else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+            except TypeError:
+                pass
         return string + ")"
 
     def to_diff_dict(self) -> dict[str, Any]:
@@ -1178,7 +1290,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         token: str | bool | None = None,
         revision: str = "main",
         **kwargs,
-    ) -> PretrainedConfig:
+    ):
         r"""
         Instantiate a [`PretrainedConfig`] (or a derived class) from a pretrained model configuration.
 
@@ -1200,12 +1312,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             resume_download:
                 Deprecated and ignored. All downloads are now resumed by default when possible.
                 Will be removed in v5 of Transformers.
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
             token (`str` or `bool`, *optional*):
                 The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
-                the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
+                the token generated when running `hf auth login` (stored in `~/.huggingface`).
             revision (`str`, *optional*, defaults to `"main"`):
                 The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
                 git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
@@ -1213,20 +1325,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
                 <Tip>
 
-                To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>".
+                To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>"`.
 
                 </Tip>
 
             return_unused_kwargs (`bool`, *optional*, defaults to `False`):
                 If `False`, then this function returns just the final configuration object.
 
-                If `True`, then this functions returns a `tp.Tuple(config, unused_kwargs)` where *unused_kwargs* is a
+                If `True`, then this functions returns a `Tuple(config, unused_kwargs)` where *unused_kwargs* is a
                 dictionary consisting of the key/value pairs whose keys are not configuration attributes: i.e., the
                 part of `kwargs` which has not been used to update `config` and is otherwise ignored.
             subfolder (`str`, *optional*, defaults to `""`):
                 In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
                 specify the folder name here.
-            kwargs (`Dict[str, tp.Any]`, *optional*):
+            kwargs (`dict[str, Any]`, *optional*):
                 The values in kwargs of any keys which are configuration attributes will be used to override the loaded
                 values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
                 by the `return_unused_kwargs` keyword parameter.
@@ -1236,40 +1348,39 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         Examples:
 
-
-        >>> # We can't instantiate directly the base class *PretrainedConfig* so let's show the examples on a
-        >>> # derived class: BertConfig
-        >>> config = BertConfig.from_pretrained(
-        ...   "google-bert/bert-base-uncased"
-        >>> )  # Download configuration from huggingface.co and cache.
-        >>> config = BertConfig.from_pretrained(
-        ...   "./test/saved_model/"
-        >>> )  # E.g. config (or model) was saved using *save_pretrained('./test/saved_model/')*
-        >>> config = BertConfig.from_pretrained("./test/saved_model/my_configuration.json")
-        >>> config = BertConfig.from_pretrained(
-        ...  "google-bert/bert-base-uncased", output_attentions=True, foo=False
-        >>> )
-        >>> assert config.output_attentions == True
-        >>> config, unused_kwargs = BertConfig.from_pretrained(
-        ...  "google-bert/bert-base-uncased",
-        ...  output_attentions=True,
-        ...  foo=False,
-        ...  return_unused_kwargs=True,
-        >>> )
-        >>> assert config.output_attentions == True
-        >>> assert unused_kwargs == {"foo": False}
-
+        ```python
+        # We can't instantiate directly the base class *PretrainedConfig* so let's show the examples on a
+        # derived class: BertConfig
+        config = BertConfig.from_pretrained(
+            "google-bert/bert-base-uncased"
+        )  # Download configuration from huggingface.co and cache.
+        config = BertConfig.from_pretrained(
+            "./test/saved_model/"
+        )  # E.g. config (or model) was saved using *save_pretrained('./test/saved_model/')*
+        config = BertConfig.from_pretrained("./test/saved_model/my_configuration.json")
+        config = BertConfig.from_pretrained("google-bert/bert-base-uncased", output_attentions=True, foo=False)
+        assert config.output_attentions == True
+        config, unused_kwargs = BertConfig.from_pretrained(
+            "google-bert/bert-base-uncased", output_attentions=True, foo=False, return_unused_kwargs=True
+        )
+        assert config.output_attentions == True
+        assert unused_kwargs == {"foo": False}
         ```"""
         kwargs["cache_dir"] = cache_dir
         kwargs["force_download"] = force_download
         kwargs["local_files_only"] = local_files_only
         kwargs["revision"] = revision
-        if hasattr(cls, "_set_token_in_kwargs"):
-            cls._set_token_in_kwargs(kwargs, token)
-        else:
-            if "token" not in kwargs:
-                kwargs["token"] = huggingface_hub.get_token()
+
+        cls._set_token_in_kwargs(kwargs, token)
+
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+        if cls.base_config_key and cls.base_config_key in config_dict:
+            config_dict = config_dict[cls.base_config_key]
+
+        if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
+            for v in config_dict.values():
+                if isinstance(v, dict) and v.get("model_type") == cls.model_type:
+                    config_dict = v
 
         return cls.from_dict(config_dict, **kwargs)
 
@@ -1498,6 +1609,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         from easydel.layers.rotary_embedding import get_rope
 
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
         rotary_dim = rotary_dim or head_size
         rope_config = self._get_rope_config()
         return get_rope(
@@ -1508,6 +1620,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             dtype=dtype,
             is_neox_style=is_neox_style,
             rope_scaling=rope_config.to_dict(),
+            partial_rotary_factor=partial_rotary_factor,
         )
 
     def get_basic_inv_frequencies(
@@ -1532,6 +1645,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         from .utils import ModuleCaches
 
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", partial_rotary_factor)
         head_size = head_size or self.head_dim
         rotary_dim = rotary_dim or head_size
         rope_config = self._get_rope_config()
@@ -1567,6 +1681,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         from .utils import ModuleCaches
 
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
         head_size = head_size or self.head_dim
         rotary_dim = rotary_dim or head_size
         rope_config = self._get_rope_config()
@@ -1577,6 +1692,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             max_position=self.granted_freq_max_position_embedding,
             base=base or self.rope_theta,
             rope_scaling=rope_config.to_dict(),
+            partial_rotary_factor=partial_rotary_factor,
         ).astype(jnp.bfloat16)
 
         return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
@@ -1689,6 +1805,33 @@ class EasyDeLBaseConfig(PretrainedConfig):
         else:
             fcm_mask = None
         return fcm_mask
+
+    @staticmethod
+    def _fix_parent_kws(kw1, kw2):
+        result = copy.deepcopy(kw1)
+        tkey = result.keys()
+        for k, v in kw2.items():
+            if k not in tkey:
+                result[k] = v
+        return result
+
+    @staticmethod
+    def _prefix_partition_rules(rules: tuple, prefix: str) -> tuple:
+        """Add a prefix to all regex patterns in partition rules.
+
+        Args:
+            rules: Tuple of (regex_pattern, partition_spec) pairs.
+            prefix: Prefix to add (e.g., "thinker/").
+
+        Returns:
+            New tuple with prefixed patterns.
+        """
+        prefixed = []
+        for pattern, spec in rules:
+            if pattern in (".*", r".*"):
+                continue
+            prefixed.append((f"{prefix}/{pattern}", spec))
+        return tuple(prefixed)
 
     @property
     def partition_manager(self) -> PartitionManager:

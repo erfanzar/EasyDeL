@@ -550,6 +550,14 @@ class Exaone4Model(EasyDeLBaseModule):
             past_key_values=past_key_values,
         )
 
+    def get_embedding(self):
+        """Returns the embedding layer of the module."""
+        return self.embed_tokens
+
+    def get_decoder(self):
+        """Returns the decoder part of the model."""
+        return self
+
 
 @register_module(TaskType.CAUSAL_LM, config=Exaone4Config, model_type="exaone4")
 class Exaone4ForCausalLM(BaseCausalLMModule[Exaone4Model, Exaone4Config]):

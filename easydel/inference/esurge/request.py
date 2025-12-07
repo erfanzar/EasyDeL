@@ -33,11 +33,16 @@ Example:
 
 import enum
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from ..sampling_params import SamplingParams
 from .engine_types import EngineCoreEvent, EngineCoreEventType, EngineCoreRequest, FinishReason
 from .utils import ConstantList
+
+if TYPE_CHECKING:
+    from .multimodal import MultiModalFeature
 
 
 class EngineRequest:
@@ -59,6 +64,11 @@ class EngineRequest:
         status: Current request status.
         events: List of events during processing.
         stop_reason: Reason for stopping generation.
+        pixel_values: Image pixel values for vision-language models.
+        image_grid_thw: Grid shape (T, H, W) for each image.
+        pixel_values_videos: Video pixel values for vision-language models.
+        video_grid_thw: Grid shape (T, H, W) for each video.
+        mm_features: List of multimodal features with metadata for caching.
 
     Example:
         >>> request = EngineRequest(
@@ -80,6 +90,12 @@ class EngineRequest:
         priority: int = 0,
         parent_request_id: str | None = None,
         sample_index: int = 0,
+        # Vision-language model support
+        pixel_values: np.ndarray | None = None,
+        image_grid_thw: np.ndarray | None = None,
+        pixel_values_videos: np.ndarray | None = None,
+        video_grid_thw: np.ndarray | None = None,
+        mm_features: list["MultiModalFeature"] | None = None,
     ) -> None:
         """Initialize EngineRequest.
 
@@ -93,6 +109,11 @@ class EngineRequest:
             priority: Request priority.
             parent_request_id: Parent request ID for n>1 sampling.
             sample_index: Sample index (0 to n-1) for n>1 sampling.
+            pixel_values: Image pixel values for VLMs.
+            image_grid_thw: Grid shape (T, H, W) for each image.
+            pixel_values_videos: Video pixel values for VLMs.
+            video_grid_thw: Grid shape (T, H, W) for each video.
+            mm_features: List of multimodal features with metadata.
         """
         self.request_id = request_id
         self.client_index = client_index
@@ -130,6 +151,42 @@ class EngineRequest:
 
         self.num_nans_in_logits = 0
 
+        # Vision-language model data
+        self.pixel_values = pixel_values
+        self.image_grid_thw = image_grid_thw
+        self.pixel_values_videos = pixel_values_videos
+        self.video_grid_thw = video_grid_thw
+        self.mm_features: list["MultiModalFeature"] = mm_features or []
+        self._vision_processed = False
+
+    @property
+    def has_vision(self) -> bool:
+        """Check if request has vision data (images or videos)."""
+        return (
+            self.pixel_values is not None
+            or self.pixel_values_videos is not None
+            or len(self.mm_features) > 0
+        )
+
+    def clear_vision_data(self) -> None:
+        """Clear raw vision data after prefill to free memory.
+
+        Note: mm_features with cached_embeddings are preserved for multi-turn.
+        """
+        self.pixel_values = None
+        self.image_grid_thw = None
+        self.pixel_values_videos = None
+        self.video_grid_thw = None
+        # Clear pixel values from features but preserve cached embeddings
+        for feat in self.mm_features:
+            feat.clear_pixel_values()
+        self._vision_processed = True
+
+    @property
+    def vision_processed(self) -> bool:
+        """Check if vision data has been processed (prefill complete)."""
+        return self._vision_processed
+
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "EngineRequest":
         return cls(
@@ -140,6 +197,12 @@ class EngineRequest:
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             priority=request.priority,
+            # Vision-language model data
+            pixel_values=request.pixel_values,
+            image_grid_thw=request.image_grid_thw,
+            pixel_values_videos=request.pixel_values_videos,
+            video_grid_thw=request.video_grid_thw,
+            mm_features=getattr(request, "mm_features", None),
         )
 
     def append_output_token_ids(

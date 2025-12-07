@@ -101,6 +101,7 @@ from .monitoring import (
     start_monitoring_server,
     stop_monitoring,
 )
+from .multimodal import MultiModalManager, VisionEncoderCache
 from .request import EngineRequest, EngineRequestStatus
 from .runners import SequenceBuffer, eSurgeRunner
 from .scheduler import (
@@ -141,6 +142,7 @@ __all__ = (
     "MambaSpec",
     "MetricsCollector",
     "ModelRunnerMetrics",
+    "MultiModalManager",
     "NewRequestData",
     "PagePool",
     "PriorityRequestQueue",
@@ -160,6 +162,7 @@ __all__ = (
     "SlidingWindowSpec",
     "SystemMetrics",
     "UnitaryCacheCoordinator",
+    "VisionEncoderCache",
     "create_kv_cache_specs_from_config",
     "eSurge",
     "eSurgeApiServer",

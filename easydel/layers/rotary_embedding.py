@@ -875,6 +875,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         dtype: jnp.dtype,
         mrope_section: tuple[int, int, int] | None = None,
         attention_scaling: float = 1.0,
+        mrope_interleaved: bool = True,
     ):
         super().__init__(
             head_size=head_size,
@@ -886,6 +887,35 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         )
         self.mrope_section = mrope_section if mrope_section is not None else (24, 20, 20)
         self.attention_scaling = attention_scaling
+        self.mrope_interleaved = mrope_interleaved
+
+    def _apply_chunked_mrope(self, emb: jax.Array) -> jax.Array:
+        """Apply Qwen2-VL style chunked mRoPE.
+
+        Matches HuggingFace's apply_multimodal_rotary_pos_emb (Qwen2-VL):
+        - Takes the DOUBLED embedding (freqs concatenated with itself)
+        - Uses mrope_section * 2 to split the full rotary_dim
+        - For chunk i, selects from dimension (i % 3): T=0, H=1, W=2
+        - Concatenates chunks back together
+
+        Result pattern: [T:0-31, H:32-79, W:80-127] (contiguous chunks)
+
+        Args:
+            emb: Doubled frequencies with shape (3, batch, seq, rotary_dim)
+
+        Returns:
+            Combined frequencies with shape (batch, seq, rotary_dim)
+        """
+        t_size, h_size, _w_size = self.mrope_section
+        t_size_doubled = t_size * 2
+        h_size_doubled = h_size * 2
+
+        # Extract chunks and select from appropriate dimension (T=0, H=1, W=2)
+        t_chunk = emb[0, ..., :t_size_doubled]
+        h_chunk = emb[1, ..., t_size_doubled : t_size_doubled + h_size_doubled]
+        w_chunk = emb[2, ..., t_size_doubled + h_size_doubled :]
+
+        return jnp.concatenate([t_chunk, h_chunk, w_chunk], axis=-1)
 
     def _apply_interleaved_mrope(self, freqs: jax.Array) -> jax.Array:
         """Interleave THW frequencies from chunked layout."""
@@ -905,7 +935,11 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         offsets: jax.Array | None = None,
         frequencies: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Apply interleaved THW MRoPE to query/key.
+        """Apply multimodal rotary position embedding (mRoPE) to query/key.
+
+        Supports two mRoPE patterns:
+        - Chunked (Qwen2-VL): mrope_interleaved=False - contiguous T/H/W chunks
+        - Interleaved (Qwen3-VL): mrope_interleaved=True - interleaved T/H/W pattern
 
         Args:
             positions: Position IDs with shape (batch, seq) or (3, batch, seq).
@@ -942,19 +976,35 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
                 axis=0,
             )  # (3, b, seq, rotary_dim)
             cos_half, sin_half = jnp.split(freqs_full, 2, axis=-1)  # each (3, b, seq, dim/2)
-            cos_half = self._apply_interleaved_mrope(cos_half)
-            sin_half = self._apply_interleaved_mrope(sin_half)
-            cos = jnp.concatenate([cos_half, cos_half], axis=-1)
-            sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+
+            if self.mrope_interleaved:
+                # Qwen3-VL style: apply interleaving on half-dim freqs, then double
+                cos_interleaved = self._apply_interleaved_mrope(cos_half)  # (b, seq, dim/2)
+                sin_interleaved = self._apply_interleaved_mrope(sin_half)  # (b, seq, dim/2)
+                cos = jnp.concatenate([cos_interleaved, cos_interleaved], axis=-1)  # (b, seq, dim)
+                sin = jnp.concatenate([sin_interleaved, sin_interleaved], axis=-1)  # (b, seq, dim)
+            else:
+                # Qwen2-VL style: double first, then apply chunked pattern
+                cos_doubled = jnp.concatenate([cos_half, cos_half], axis=-1)  # (3, b, seq, dim)
+                sin_doubled = jnp.concatenate([sin_half, sin_half], axis=-1)  # (3, b, seq, dim)
+                cos = self._apply_chunked_mrope(cos_doubled)  # (b, seq, dim)
+                sin = self._apply_chunked_mrope(sin_doubled)  # (b, seq, dim)
         else:
             inv_freq = compute_basic_inv_frequencies(self.base, self.rotary_dim)  # (rotary_dim//2,)
             inv_freq = inv_freq[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
             freqs = positions[..., jnp.newaxis].astype(jnp.float32) * inv_freq  # (3, b, seq, dim/2)
-            freqs = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
-            cos_half = jnp.cos(freqs)
-            sin_half = jnp.sin(freqs)
-            cos = jnp.concatenate([cos_half, cos_half], axis=-1)
-            sin = jnp.concatenate([sin_half, sin_half], axis=-1)
+
+            if self.mrope_interleaved:
+                # Qwen3-VL style: apply interleaving on half-dim freqs, then double
+                freqs_interleaved = self._apply_interleaved_mrope(freqs)  # (b, seq, dim/2)
+                emb = jnp.concatenate([freqs_interleaved, freqs_interleaved], axis=-1)  # (b, seq, dim)
+            else:
+                # Qwen2-VL style: double first, then apply chunked pattern
+                emb = jnp.concatenate([freqs, freqs], axis=-1)  # (3, b, seq, dim)
+                emb = self._apply_chunked_mrope(emb)  # (b, seq, dim)
+
+            cos = jnp.cos(emb)
+            sin = jnp.sin(emb)
 
         # Apply attention scaling (typically 1.0 for standard mRoPE, can be different for advanced types)
         cos = cos * self.attention_scaling
@@ -1512,7 +1562,9 @@ def get_rope(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
-        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+        # HuggingFace Qwen2-VL uses rope_type='default' with mrope_section for mRoPE
+        # We detect this and switch to mrope for proper multimodal rotary embedding
+        if "mrope_section" in rope_scaling.keys():
             scaling_type = "mrope"
 
         if scaling_type == "llama3":
@@ -1625,6 +1677,7 @@ def get_rope(
                 is_neox_style=is_neox_style,
                 dtype=dtype,
                 mrope_section=rope_scaling.get("mrope_section"),
+                mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -1687,7 +1740,9 @@ def get_frequencies(
         )
     else:
         scaling_type = rope_scaling["rope_type"]
-        if "mrope_interleaved" in rope_scaling.keys() and "mrope_section" in rope_scaling.keys():
+        # HuggingFace Qwen2-VL uses rope_type='default' with mrope_section for mRoPE
+        # We detect this and switch to mrope for proper multimodal rotary embedding
+        if "mrope_section" in rope_scaling.keys():
             scaling_type = "mrope"
 
         if scaling_type == "llama3":

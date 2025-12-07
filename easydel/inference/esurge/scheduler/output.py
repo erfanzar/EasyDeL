@@ -13,11 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ...sampling_params import SamplingParams
+    from ..multimodal import MultiModalFeature
     from ..request import EngineRequest
 
 
@@ -28,6 +29,12 @@ class NewRequestData:
     sampling_params: SamplingParams | None
     page_ids: tuple[list[int], ...]
     num_computed_tokens: int
+    # Vision-language model support
+    pixel_values: Any | None = None
+    image_grid_thw: Any | None = None
+    pixel_values_videos: Any | None = None
+    video_grid_thw: Any | None = None
+    mm_features: list["MultiModalFeature"] = field(default_factory=list)
 
     @classmethod
     def from_request(
@@ -41,6 +48,21 @@ class NewRequestData:
             sampling_params=request.sampling_params,
             page_ids=page_ids,
             num_computed_tokens=request.num_computed_tokens,
+            # Vision-language model data
+            pixel_values=request.pixel_values,
+            image_grid_thw=request.image_grid_thw,
+            pixel_values_videos=request.pixel_values_videos,
+            video_grid_thw=request.video_grid_thw,
+            mm_features=request.mm_features,
+        )
+
+    @property
+    def has_vision(self) -> bool:
+        """Check if request has vision data."""
+        return (
+            self.pixel_values is not None
+            or self.pixel_values_videos is not None
+            or len(self.mm_features) > 0
         )
 
     def __repr__(self):
@@ -50,7 +72,8 @@ class NewRequestData:
             f"prompt_token_ids={self.prompt_token_ids},"
             f"sampling_params={self.sampling_params},"
             f"page_ids={self.page_ids},"
-            f"num_computed_tokens={self.num_computed_tokens}"
+            f"num_computed_tokens={self.num_computed_tokens},"
+            f"has_vision={self.has_vision}"
             ")"
         )
 
@@ -62,6 +85,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"page_ids={self.page_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"has_vision={self.has_vision}"
             ")"
         )
 

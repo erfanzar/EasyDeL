@@ -14,6 +14,7 @@
 
 from .auto_configuration import AutoEasyDeLConfig, AutoShardAndGatherFunctions, get_modules_by_type
 from .auto_modeling import (
+    AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,
     AutoEasyDeLModelForDiffusionLM,
@@ -24,6 +25,7 @@ from .auto_modeling import (
     AutoEasyDeLModelForZeroShotImageClassification,
     AutoEasyDeLVisionModel,
     AutoState,
+    AutoStateAnyToAnyModel,
     AutoStateForCausalLM,
     AutoStateForDiffusionLM,
     AutoStateForImageSequenceClassification,
@@ -35,6 +37,7 @@ from .auto_modeling import (
 )
 
 __all__ = (
+    "AutoEasyDeLAnyToAnyModel",
     "AutoEasyDeLConfig",
     "AutoEasyDeLModel",
     "AutoEasyDeLModelForCausalLM",
@@ -47,6 +50,7 @@ __all__ = (
     "AutoEasyDeLVisionModel",
     "AutoShardAndGatherFunctions",
     "AutoState",
+    "AutoStateAnyToAnyModel",
     "AutoStateForCausalLM",
     "AutoStateForDiffusionLM",
     "AutoStateForImageSequenceClassification",

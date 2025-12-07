@@ -1263,6 +1263,10 @@ class CLIPForImageClassification(EasyDeLBaseModule):
         """
         return self.vision_model.embeddings
 
+    def get_task_head(self):
+        """Returns the image classification head."""
+        return self.classifier
+
 
 @register_module(config=CLIPConfig, model_type="clip", task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION)
 class CLIPModel(EasyDeLBaseModule):

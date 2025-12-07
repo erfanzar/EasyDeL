@@ -52,7 +52,7 @@ def resolve_task(cfg: ELMConfig) -> TaskType:
     if task is None or task == TaskType.AUTO_BIND:
         model_name = cfg["model"].get("name_or_path")
         if model_name:
-            from .utils import infer_task_from_hf_config
+            from easydel.modules.auto.auto_configuration import infer_task_from_hf_config
 
             inferred = infer_task_from_hf_config(model_name)
             if inferred is not None:
