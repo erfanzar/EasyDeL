@@ -1333,18 +1333,25 @@ class ExecutionManager:
                     # Pass version from metadata
                     version=self._metadata_version,
                 )
+                external_inputs = {}
 
+                # Vision-language model data - model handles None gracefully
+                if metadata.pixel_values is not None or metadata.pixel_values_videos is not None:
+                    external_inputs.update(
+                        dict(
+                            pixel_values=metadata.pixel_values,
+                            image_grid_thw=metadata.image_grid_thw,
+                            pixel_values_videos=metadata.pixel_values_videos,
+                            video_grid_thw=metadata.video_grid_thw,
+                        )
+                    )
                 output = model(
                     input_ids=jnp.expand_dims(input_ids_view, 0),
                     position_ids=jnp.expand_dims(position_ids_view, 0),
                     past_key_values=kv_pages,
                     cache_metadata=cache_metadata,
                     apply_lm_head=False,
-                    # Vision-language model data - model handles None gracefully
-                    pixel_values=metadata.pixel_values,
-                    image_grid_thw=metadata.image_grid_thw,
-                    pixel_values_videos=metadata.pixel_values_videos,
-                    video_grid_thw=metadata.video_grid_thw,
+                    **external_inputs,
                 )
                 hs = output.last_hidden_state.squeeze(0)
                 logits = model.apply_lm_head(hs[metadata.logits_indices])

@@ -278,11 +278,15 @@ class AutoEasyDeLConfig:
         cls_main = AutoConfig if from_torch else EasyDeLBaseConfig
         config = cls_main.from_pretrained(pretrained_model_name_or_path)
         model_type: str = config.model_type
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
-        ovo_model_type: str = config.model_type
 
-        if model_type != ovo_model_type:
-            model_type = ovo_model_type
+        try:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+            ovo_model_type: str = config.model_type
+
+            if model_type != ovo_model_type:
+                model_type = ovo_model_type
+        except Exception:
+            ...
 
         if model_task == TaskType.AUTO_BIND:
             model_task = infer_task_from_hf_config(pretrained_model_name_or_path)
