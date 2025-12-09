@@ -868,6 +868,14 @@ class MiniMaxText01Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        # Build attention type list from layer_types config
+        # 0 = full_attention, 1 = sliding_attention (or other)
+        self.attn_type_list = [
+            0 if lt == "full_attention" else 1 for lt in (config.layer_types or [])
+        ]
+        if not self.attn_type_list:
+            self.attn_type_list = [0] * config.num_hidden_layers
+
         self.layers: list[MiniMaxText01DecoderLayer] = []
 
         for i in range(config.num_hidden_layers):

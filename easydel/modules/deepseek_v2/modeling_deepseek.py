@@ -1024,3 +1024,103 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             attention_mask=attention_mask,
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+
+    def create_cache_metadata(
+        self,
+        batch_size: int,
+        max_length: int,
+        pad_token_id: int | None = None,
+    ):
+        """Create cache metadata for MLA attention.
+
+        MLA uses different dimensions for keys and values:
+        - Keys: num_attention_heads x q_head_dim (qk_nope_head_dim + qk_rope_head_dim)
+        - Values: num_attention_heads x v_head_dim
+
+        Args:
+            batch_size: Batch size for the cache
+            max_length: Maximum sequence length
+            pad_token_id: Padding token ID (optional)
+
+        Returns:
+            TransformerCacheMetaData configured for MLA
+        """
+        from easydel.layers.caching import TransformerCacheMetaData
+
+        config = self.config
+        if pad_token_id is None:
+            if hasattr(self, "generation_config") and self.generation_config is not None:
+                pad_token_id = self.generation_config.pad_token_id
+            elif hasattr(config, "pad_token_id"):
+                pad_token_id = config.pad_token_id
+            else:
+                pad_token_id = 0
+
+        # MLA dimensions
+        q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        v_head_dim = config.v_head_dim
+
+        return TransformerCacheMetaData.create(
+            num_hidden_layers=config.num_hidden_layers,
+            pad_token_id=pad_token_id,
+            batch_size=batch_size,
+            sequence_length=max_length,
+            num_heads=config.num_attention_heads,
+            key_heads=config.num_attention_heads,
+            value_heads=config.num_attention_heads,
+            key_dim=q_head_dim,
+            value_dim=v_head_dim,
+        )
+
+    def create_paged_metadata(
+        self,
+        hbm_utilization: float,
+        page_size: int,
+        max_model_length: int,
+    ):
+        """Create paged cache metadata for MLA attention.
+
+        MLA uses different dimensions for keys and values:
+        - Keys: num_attention_heads x q_head_dim (qk_nope_head_dim + qk_rope_head_dim)
+        - Values: num_attention_heads x v_head_dim
+
+        Args:
+            hbm_utilization: Target HBM utilization (0.0 to 1.0)
+            page_size: Number of tokens per page
+            max_model_length: Maximum model sequence length
+
+        Returns:
+            RaggedPagesCacheMetaData configured for MLA
+        """
+        from easydel.layers.caching import RaggedPagesCacheMetaData
+        from easydel.layers.attention import AttentionMechanisms
+
+        config = self.config
+        text_config = config.get_text_config()
+
+        # MLA dimensions
+        q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        v_head_dim = config.v_head_dim
+
+        match text_config.attn_mechanism:
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
+                version = "v3"
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
+                version = "v2"
+            case _:
+                version = "v3"
+
+        return RaggedPagesCacheMetaData.create(
+            mesh=self.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=text_config.kvdtype,
+            max_model_length=max_model_length,
+            num_hidden_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_attention_heads,
+            kv_head_dim_size=q_head_dim,
+            k_headdim=q_head_dim,
+            v_headdim=v_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            version=version,
+        )

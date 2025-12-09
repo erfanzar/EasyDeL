@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-import typing as tp
-
 import chex
 import jax
 import jax.numpy as jnp
@@ -305,65 +303,6 @@ class LlavaModel(EasyDeLBaseModule):
         pad_token_id=None,
     ):
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        """Helper function to get keyword arguments for model compilation, potentially including vision inputs.
-
-        Args:
-            batch_size (int): Batch size for text inputs.
-            input_tokens_length (int): Sequence length for text inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
-            rngs (jax.random.PRNGKey): Random number generator key.
-            vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
-            vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
-            vision_channels (int): Number of channels for vision inputs. Defaults to 3.
-            vision_height (Optional[int]): Height for vision inputs (defaults to config).
-            vision_width (Optional[int]): Width for vision inputs (defaults to config).
-            required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
-            **kwargs: Additional arguments passed to the language model's compile kwargs method.
-
-        Returns:
-            dict: Keyword arguments for model compilation.
-        """
-        basics = self.language_model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-
-        if vision_included:
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels or 3,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype="f4",
-            )
-            basics.update({"pixel_values": pixel_values})
-        return basics
 
     def prepare_inputs_for_generation(
         self,

@@ -258,22 +258,18 @@ class FalconBlock(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
-            self.ln_attn = nn.LayerNorm(
+        # Match HuggingFace: set default num_ln_in_parallel_attn for new_decoder_architecture
+        if config.num_ln_in_parallel_attn is None and config.new_decoder_architecture:
+            config.num_ln_in_parallel_attn = 2
+
+        if not config.parallel_attn:
+            self.post_attention_layernorm = nn.LayerNorm(
                 self.config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 rngs=rngs,
             )
-            self.ln_mlp = nn.LayerNorm(
-                self.config.hidden_size,
-                epsilon=config.layer_norm_epsilon,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                rngs=rngs,
-            )
-        else:
             self.input_layernorm = nn.LayerNorm(
                 self.config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
@@ -281,8 +277,24 @@ class FalconBlock(nn.Module):
                 param_dtype=self.param_dtype,
                 rngs=rngs,
             )
-            if not config.parallel_attn:
-                self.post_attention_layernorm = nn.LayerNorm(
+        else:
+            if config.num_ln_in_parallel_attn == 2:
+                self.ln_attn = nn.LayerNorm(
+                    self.config.hidden_size,
+                    epsilon=config.layer_norm_epsilon,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                    rngs=rngs,
+                )
+                self.ln_mlp = nn.LayerNorm(
+                    self.config.hidden_size,
+                    epsilon=config.layer_norm_epsilon,
+                    dtype=self.dtype,
+                    param_dtype=self.param_dtype,
+                    rngs=rngs,
+                )
+            else:
+                self.input_layernorm = nn.LayerNorm(
                     self.config.hidden_size,
                     epsilon=config.layer_norm_epsilon,
                     dtype=self.dtype,
@@ -348,7 +360,8 @@ class FalconBlock(nn.Module):
         """
         residual = hidden_states
 
-        if self.config.num_ln_in_parallel_attn == 2:
+        # Match HuggingFace logic for layer normalization
+        if self.config.new_decoder_architecture and self.config.num_ln_in_parallel_attn == 2:
             attention_layernorm_out = self.ln_attn(hidden_states)
             mlp_layernorm_out = self.ln_mlp(hidden_states)
         else:
@@ -366,12 +379,20 @@ class FalconBlock(nn.Module):
             alibi,
         )
 
-        if self.config.num_ln_in_parallel_attn == 1:
+        # Match HuggingFace logic for mlp_layernorm_out assignment
+        if not self.config.new_decoder_architecture:
             if self.config.parallel_attn:
                 mlp_layernorm_out = attention_layernorm_out
             else:
                 residual = dropout_add(self.dropout, attn_outputs.attention_output, residual)
                 mlp_layernorm_out = self.post_attention_layernorm(residual)
+
+        if (
+            self.config.new_decoder_architecture
+            and self.config.parallel_attn
+            and self.config.num_ln_in_parallel_attn == 1
+        ):
+            mlp_layernorm_out = attention_layernorm_out
 
         if self.config.use_scan_mlp:
             mlp_output = block_wise_ffn(

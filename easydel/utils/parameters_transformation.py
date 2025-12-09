@@ -290,10 +290,12 @@ class StateDictConverter:
                 for key in keys:
                     tensor = state_dict.get(key)
                     try:
-                        bytesi = {
-                            i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
-                            for i in range(jax.local_device_count())
-                        }
+                        # Note: memory_stats() returns None on CPU devices
+                        def get_memory_bytes(device_idx):
+                            stats = jax.local_devices()[device_idx].memory_stats()
+                            return stats["bytes_in_use"] if stats is not None else 0
+
+                        bytesi = {i: get_memory_bytes(i) for i in range(jax.local_device_count())}
                         results = StateDictConverter.process_tensor(key, tensor, config)
                         if results is not None:
                             for key_tuple, jax_array in results:
@@ -301,10 +303,7 @@ class StateDictConverter:
                                     jax_array = shard_fns[key_tuple](jax_array)
                                 if callback is not None:
                                     jax_array = callback(jax_array, key_tuple)
-                                bytesn = {
-                                    i: jax.local_devices()[i].memory_stats()["bytes_in_use"]
-                                    for i in range(jax.local_device_count())
-                                }
+                                bytesn = {i: get_memory_bytes(i) for i in range(jax.local_device_count())}
                                 change = {i: bytesn[i] - bytesi[i] for i in range(jax.local_device_count())}
                                 divider = 1024**3
                                 change_gb = {i: round(change[i] / divider, 4) for i in change}

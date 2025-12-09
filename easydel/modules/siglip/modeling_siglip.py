@@ -264,10 +264,10 @@ class SiglipAttention(AttentionModule):
 
         self.causal = False
         self.attention_performer = FlexibleAttentionModule(
-            rngs=rngs,
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            rngs=rngs,
         )
 
     def _split_heads(self, hidden_states):
@@ -279,7 +279,7 @@ class SiglipAttention(AttentionModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
         query = checkpoint_name(self.q_proj(hidden_states), "attn_query")
@@ -290,39 +290,12 @@ class SiglipAttention(AttentionModule):
         key = self._split_heads(key)
         value = self._split_heads(value)
 
-        causal_attention_mask = None
-        if self.causal:
-            raise NotImplementedError()
-        if attention_mask is not None and causal_attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-            attention_mask = nn.combine_masks(
-                mask_info,
-                causal_attention_mask,
-                dtype="i4",
-            )
-        elif causal_attention_mask is not None:
-            attention_mask = causal_attention_mask
-        elif attention_mask is not None:
-            if attention_mask.ndim == 2:
-                attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-        attention_bias = None
-        if attention_mask is not None:
-            attention_bias = jax.lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-            attention_mask = None
-
         attentions = self.attention_performer.forward(
             query_states=query,
             key_states=key,
             value_states=value,
             mode=common_types.MODE_TRAIN,
-            bias=None,
-            init_bias=lambda: attention_bias,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             causal=self.causal,
         )
 
@@ -431,14 +404,14 @@ class SiglipEncoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
         )
         hidden_states = attn_outputs.attention_output
@@ -486,7 +459,7 @@ class SiglipEncoder(nn.Module):
     def __call__(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -500,7 +473,7 @@ class SiglipEncoder(nn.Module):
 
             layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                mask_info=mask_info,
                 output_attentions=output_attentions,
             )
             hidden_states = layer_outputs.hidden_states
@@ -590,7 +563,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
+            mask_info=mask_info,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
@@ -665,7 +638,6 @@ class SiglipTextModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
@@ -673,7 +645,6 @@ class SiglipTextModel(EasyDeLBaseModule):
     ) -> tuple | BaseModelOutputWithPooling:
         return self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
@@ -951,7 +922,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 
 
 @register_module(TaskType.BASE_VISION, config=SiglipVisionConfig, model_type="siglip_vision_model")
-class SiglipVisionModel(nn.Module):
+class SiglipVisionModel(EasyDeLBaseModule):
     """Convenience wrapper around the SigLIP vision transformer backbone."""
 
     def __init__(
@@ -963,6 +934,13 @@ class SiglipVisionModel(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
         self.vision_model = SiglipVisionTransformer(
             config=config,
             dtype=dtype,
@@ -1092,9 +1070,11 @@ class SiglipModel(EasyDeLBaseModule):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        if mask_info is None and attention_mask is not None:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,
@@ -1151,10 +1131,11 @@ class SiglipModel(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
         )
+        if mask_info is None and attention_mask is not None:
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
 
         text_outputs = self.text_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
             output_attentions=output_attentions,

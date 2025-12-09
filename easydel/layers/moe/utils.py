@@ -345,6 +345,12 @@ class MoeFusedHooks:
         after_gate: Invoked after gate/router logits are computed. Can postprocess logits.
             Signature: (gate_logits: Array) -> Array
 
+        normalize_gate_logits: Invoked to compute gate weights from logits. If set, replaces
+            the default softmax normalization. Useful for models using sigmoid-based routing
+            (e.g., Llama4) instead of softmax.
+            Signature: (gate_logits: Array) -> Array
+            Default: softmax(gate_logits)
+
         before_topk: Invoked before top-k expert selection. Can modify logits before selection.
             Signature: (gate_logits: Array) -> Array
 
@@ -394,11 +400,14 @@ class MoeFusedHooks:
 
     before_gate: Callable | None = None
     after_gate: Callable | None = None
+    normalize_gate_logits: Callable | None = None  # If set, replaces default softmax normalization
     before_topk: Callable | None = None
     select_hook: Callable | None = None
     refine_inputs_hook: Callable | None = None
+    scale_replicated_inputs: Callable | None = None  # Scale inputs after replication for input-scaling MoE
     after_ep_receive: Callable | None = None
     refine_weights_hook: Callable | None = None
+    output_weights_hook: Callable | None = None  # Modify weights during output combination (unpermute)
     after_wiwu: Callable | None = None
     before_wo: Callable | None = None
     after_wo: Callable | None = None
@@ -418,11 +427,14 @@ class MoeFusedHooks:
             (
                 id(self.before_gate),
                 id(self.after_gate),
+                id(self.normalize_gate_logits),
                 id(self.before_topk),
                 id(self.select_hook),
                 id(self.refine_inputs_hook),
+                id(self.scale_replicated_inputs),
                 id(self.after_ep_receive),
                 id(self.refine_weights_hook),
+                id(self.output_weights_hook),
                 id(self.after_wiwu),
                 id(self.before_wo),
                 id(self.after_wo),
@@ -739,6 +751,7 @@ def permute(
     select_hook: typing.Callable[[jax.Array, jax.Array, int], tuple[jax.Array, jax.Array]] | None = None,
     refine_weights_hook: typing.Callable[[jax.Array], jax.Array] | None = None,
     refine_inputs_hook: typing.Callable[[jax.Array, jax.Array, tuple[int]], jax.Array] | None = None,
+    scale_replicated_inputs: typing.Callable[[jax.Array, jax.Array], jax.Array] | None = None,
 ):
     """Permute tokens by expert assignment for grouped matmul.
 
@@ -822,6 +835,13 @@ def permute(
 
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
     replicated_inputs_2d = jnp.repeat(inputs_2d, num_experts_per_tok, axis=0)
+
+    # Apply input scaling if hook is provided (for input-scaling MoE like Llama4)
+    # weights shape: (tokens, k), flatten to (tokens*k,) to match replicated_inputs_2d
+    if scale_replicated_inputs is not None:
+        flattened_weights = jnp.ravel(weights)  # (tokens*k,)
+        replicated_inputs_2d = scale_replicated_inputs(replicated_inputs_2d, flattened_weights)
+
     sorted_inputs = sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(dtype)
     group_size = jnp.bincount(flatten_selected_experts, length=num_experts)
 

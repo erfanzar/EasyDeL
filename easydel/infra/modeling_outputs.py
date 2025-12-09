@@ -644,8 +644,8 @@ class MaskedLMOutput(ModelOutput):
     loss: chex.Array | None = None
 
 
-CausalLMOutput = MaskedLMOutput
-# type:ignore
+@auto_pytree
+class CausalLMOutput(MaskedLMOutput): ...
 
 
 @auto_pytree

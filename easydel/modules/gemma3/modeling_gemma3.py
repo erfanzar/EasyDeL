@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import typing as tp
 from functools import cached_property, partial
 
 import chex
@@ -243,6 +242,41 @@ class Gemma3Attention(UnifiedAttention):
         """
 
         return self.q_norm(query_states), self.k_norm(key_states), value_states
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ):
+        """Override forward to check for causal_baked flag on mask_info."""
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        original_causal = self.causal
+        self.causal = causal_for_kernel
+        try:
+            result = super().forward(
+                hidden_states=hidden_states,
+                mask_info=mask_info,
+                position_ids=position_ids,
+                mode=mode,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                output_attentions=output_attentions,
+                frequencies=frequencies,
+                alibi=alibi,
+            )
+        finally:
+            self.causal = original_causal
+        return result
 
 
 class Gemma3MLP(nn.Module):
@@ -569,7 +603,14 @@ class Gemma3TextModel(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         if token_type_ids is not None:
+            # For VLM with token_type_ids, we need to allow bidirectional attention
+            # for image tokens while maintaining causal for text tokens.
+            # HF uses: (causal_mask) | (image_bidirectional_mask)
+            # To achieve this, we bake causal into the mask first, then OR with
+            # the image bidirectional mask via apply_token_type_ids.
+            mask_info = mask_info.apply_causal()
             mask_info = mask_info.apply_token_type_ids(token_type_ids)
+            object.__setattr__(mask_info, "_causal_baked", True)
         if position_ids is None:
             position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds
@@ -1074,7 +1115,7 @@ class Gemma3Model(EasyDeLBaseModule):
                     jnp.array(self.config.image_token_id, dtype="i4")
                 )
             else:
-                special_image_mask = jnp.expand_dims((input_ids == self.config.image_token_id) - 1)
+                special_image_mask = jnp.expand_dims(input_ids == self.config.image_token_id, axis=-1)
                 special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
             image_features = image_features.astype(inputs_embeds.dtype)
             inputs_embeds = jnp.place(inputs_embeds, special_image_mask, image_features, inplace=False)
@@ -1109,52 +1150,6 @@ class Gemma3Model(EasyDeLBaseModule):
         pad_token_id=None,
     ):
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        basics = super()._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-        token_type_ids = jnp.ones(
-            (batch_size, input_tokens_length),
-            dtype="i4",
-            device=input_sharding,
-        )
-        basics.update({"token_type_ids": token_type_ids})
-        if vision_included:
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels or 3,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype="f4",
-            )
-            basics.update({"pixel_values": pixel_values})
-        return basics
 
     def prepare_inputs_for_generation(
         self,
@@ -1329,6 +1324,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         # Forward through base model
         outputs = self.base_model(
             input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,

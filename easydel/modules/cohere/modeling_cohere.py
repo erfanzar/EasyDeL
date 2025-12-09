@@ -146,7 +146,6 @@ class CohereAttention(UnifiedAttention):
             causal=True,
         )
 
-        # Add Q/K normalization if configured
         if config.use_qk_norm:
             self.q_norm = RMSNorm(
                 dim=(self.head_dim, self.config.num_attention_heads),
@@ -594,7 +593,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:
+    ) -> CausalLMOutput:  # type:ignore
         """
         Forward pass through the Cohere model for Causal Language Modeling.
 

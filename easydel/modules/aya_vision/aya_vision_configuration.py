@@ -56,6 +56,7 @@ class AyaVisionConfig(EasyDeLBaseConfig):
     """
 
     model_type = "aya_vision"
+    attribute_map: typing.ClassVar = {"image_token_id": "image_token_index"}
     sub_configs: typing.ClassVar = {"text_config": AutoEasyDeLConfig, "vision_config": AutoEasyDeLConfig}
 
     def __init__(

@@ -281,12 +281,12 @@ class XerxesSparseMoeBlock(nn.Module):
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
                 block_wise_ffn(
-                    self.layers[index],
+                    self.experts[index],
                     hidden_states,
                     self.config.scan_mlp_chunk_size,
                 )
                 if self.config.use_scan_mlp
-                else self.layers[index](hidden_states)
+                else self.experts[index](hidden_states)
             )
             expert_layer_output_exp = (
                 jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]

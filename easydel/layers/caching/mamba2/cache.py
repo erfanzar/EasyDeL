@@ -100,7 +100,7 @@ class Mamba2CacheMetaData(BaseCacheMetadata):
     @classmethod
     def create(
         cls,
-        parition_axis: PartitionAxis,
+        partition_axis: PartitionAxis,
         num_hidden_layers: int,
         batch_size: int,
         intermediate_size: int,
@@ -150,7 +150,7 @@ class Mamba2CacheMetaData(BaseCacheMetadata):
 
         return cls(
             num_hidden_layers=num_hidden_layers,
-            parition_axis=parition_axis,
+            partition_axis=partition_axis,
             batch_size=batch_size,
             intermediate_size=intermediate_size,
             num_heads=num_heads,

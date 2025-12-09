@@ -28,6 +28,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     MoeCausalLMOutput,
@@ -430,7 +431,7 @@ class ArcticMoeBlock(BaseMoeModule):
 
         Returns:
                 tp.Tuple[chex.Array, chex.Array]: Tuple containing the output
-                    hidden state and router logits (or 0.0 if not MoE).
+                    hidden state and router_logits (or None if not MoE).
         """
         if self.is_moe_layer:
             out, router_logits = self.moe_call(
@@ -443,7 +444,7 @@ class ArcticMoeBlock(BaseMoeModule):
                 act_fn=self.experts.act_fn,
             )
             return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
-        return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)
+        return self.mlp(hidden_states), None
 
 
 class ArcticDecoderLayer(nn.Module):
@@ -543,6 +544,7 @@ class ArcticDecoderLayer(nn.Module):
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
         output_attentions: bool = False,
+        output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
         residual_input = hidden_states
@@ -572,17 +574,18 @@ class ArcticDecoderLayer(nn.Module):
             partition_manager=self.config.partition_manager,
         )
         residual_attn = hidden_states
+        router_logits = None
         if self.parallel_attn_mlp_res:
             hidden_states = self.residual_layernorm(hidden_states)
             hidden_states = self.residual_mlp(hidden_states)
             residual_residual = checkpoint_name(residual_attn + hidden_states, "residual")
             # parallel mlp moe part
             hidden_states = self.post_attention_layernorm(residual_input)
-            hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
+            hidden_states, router_logits = self.block_sparse_moe(hidden_states)
             hidden_states = checkpoint_name(residual_residual + hidden_states, "residual")
         else:
             hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
+            hidden_states, router_logits = self.block_sparse_moe(hidden_states)
             hidden_states = checkpoint_name(residual_attn + hidden_states, "residual")
 
         hidden_states = apply_logical_sharding(
@@ -595,9 +598,8 @@ class ArcticDecoderLayer(nn.Module):
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
-            router_logits=None,
+            router_logits=router_logits if output_router_logits else None,
             cache_view=attn_outputs.cache_view,
-            gate_loss=gate_loss,
         )
 
 
@@ -691,6 +693,7 @@ class ArcticModel(EasyDeLBaseModule):
                 segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
                 output_attentions (Optional[bool]): Whether to return attention weights.
                 output_hidden_states (Optional[bool]): Whether to return all hidden states.
+                output_router_logits (Optional[bool]): Whether to return router logits.
                 past_key_values (Optional[TransformerCache | RaggedPagesCache]):
                     Cached key/value states for faster decoding.
                 cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]):
@@ -704,10 +707,13 @@ class ArcticModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        all_router_losses = ()
+        all_router_logits = () if output_router_logits else None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -753,6 +759,7 @@ class ArcticModel(EasyDeLBaseModule):
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 frequencies=self.frequencies,
             )
             hidden_states = outputs.hidden_states
@@ -766,7 +773,8 @@ class ArcticModel(EasyDeLBaseModule):
             if output_attentions:
                 all_self_attns += (outputs.attention_weight,)
 
-            all_router_losses += (outputs.gate_loss,)
+            if output_router_logits:
+                all_router_logits += (outputs.router_logits,)
 
             past_key_values[idx] = outputs.cache_view
 
@@ -780,7 +788,7 @@ class ArcticModel(EasyDeLBaseModule):
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            all_router_losses=all_router_losses,
+            router_logits=all_router_logits,
             past_key_values=past_key_values,
         )
 
@@ -875,7 +883,24 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
+            aux_loss_fn=self._compute_aux_loss,
         )
+
+    def _compute_aux_loss(self, outputs, attention_mask):
+        """Compute auxiliary loss from router logits."""
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
+            return None
+        # Filter out None values (from non-MoE layers based on moe_layer_frequency)
+        valid_logits = tuple(l for l in outputs.router_logits if l is not None)  # noqa: E741
+        if not valid_logits:
+            return None
+        aux_loss = auxiliary_load_balancing_loss_func(
+            gate_logits=valid_logits,
+            num_experts=self.config.num_local_experts,
+            top_k=self.config.num_experts_per_tok,
+            attention_mask=attention_mask,
+        )
+        return aux_loss
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ArcticConfig, model_type="arctic")

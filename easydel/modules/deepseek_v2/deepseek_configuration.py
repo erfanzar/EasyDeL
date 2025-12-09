@@ -256,6 +256,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
+        self.head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.topk_method = topk_method
         self.n_group = n_group
         self.topk_group = topk_group

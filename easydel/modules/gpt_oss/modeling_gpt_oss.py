@@ -717,7 +717,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
 
         def _aux_loss_fn(outputs, attention_mask):
             """Custom auxiliary loss for GPT-OSS."""
-            if outputs.router_logits is None:
+            if outputs.router_logits is None or len(outputs.router_logits) == 0:
                 return None
             return auxiliary_load_balancing_loss_func(
                 gate_logits=outputs.router_logits,
