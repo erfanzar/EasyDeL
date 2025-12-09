@@ -994,6 +994,7 @@ class eSurgeRunner:
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
+
             # host copies once
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
@@ -1037,6 +1038,7 @@ class eSurgeRunner:
                 else:
                     sampled_token_ids_all.append([])
                     discard_sampled_tokens_req_indices.append(i)
+
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
 

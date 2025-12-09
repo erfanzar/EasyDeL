@@ -556,13 +556,9 @@ class ExecutionManager:
         )
 
         # Create minimal device state from already-transferred arrays (no separate device transfer needed)
-        device_state = MinimalDeviceState(
-            token_ids=token_ids_dev,
-            num_tokens=num_computed_tokens_dev,
-        )
+        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
 
         inputs = StepFunctionInputs(
-            device_state=device_state,
             kv_pages=self.kv_pages,
             scheduled_full=scheduled_full,
             req_num_tokens_full=req_num_tokens_full,
@@ -727,16 +723,14 @@ class ExecutionManager:
             self.kv_pages,
             self.rng_key,
             num_tokens,
-            num_reqs_max_model_len,
-            max_pages_per_req,
             max_num_reqs,
             padded_num_reqs,
             metadata,
         )
         # compargs already contains properly prepared metadata from get_compile_configurations
-        inputs = compargs[3]
+        inputs, device_state = compargs[3], compargs[4]
         self._compile_model_step(num_tokens, padded_num_reqs, compargs)
-        self._compile_sampler(num_tokens, padded_num_reqs, inputs, inputs.batch_metadata)
+        self._compile_sampler(num_tokens, padded_num_reqs, inputs, inputs.batch_metadata, device_state)
 
     def init_fns(self) -> None:
         """Initialize the fused step execution function.
@@ -1277,7 +1271,6 @@ class ExecutionManager:
         )
 
         inputs_shardings = StepFunctionInputs(
-            device_state=self._empty_sharding,
             kv_pages=es.extract_shardings(self.kv_pages, self.mesh),
             scheduled_full=self._empty_sharding,
             req_num_tokens_full=self._empty_sharding,
@@ -1440,7 +1433,7 @@ class ExecutionManager:
 
         if key not in self._model_lowerd_history:
             if self.use_aot_forward:
-                compiled = self._model_step_fn.lower(*compargs).compile()
+                compiled = self._model_step_fn.lower(*(compargs[0], compargs[1], compargs[2], compargs[3])).compile()
                 self._model_cache_put(key, compiled)
                 warm_args = (compargs[1], compargs[2], compargs[3])
                 self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"] = _tree_hash(warm_args)
@@ -1449,7 +1442,8 @@ class ExecutionManager:
                 def wrapped(graphstate, graphother, inputs):
                     return self._model_step_fn(self.graphdef, graphstate, graphother, inputs)
 
-                _ = wrapped(self.graphstate, self.graphother, compargs[3])
+                out = wrapped(self.graphstate, self.graphother, compargs[3])
+                self.kv_pages = out.kv_pages
                 self._model_cache_put(key, wrapped)
 
     def _compile_sampler(
@@ -1458,6 +1452,7 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
         metadata: BatchMetadata,
+        device_state: MinimalDeviceState,
     ):
         """Compile the sampler/update ejit."""
         mode = "aot" if self.use_aot_forward else "jit"
@@ -1467,17 +1462,15 @@ class ExecutionManager:
             return
 
         vocab_size = self.model.config.get_text_config().vocab_size
-        # Use padded_num_reqs for logits shape to match actual runtime dimensions
-        dummy_logits = jax.device_put(
-            jnp.zeros(
-                (padded_num_reqs, vocab_size),
-                dtype=self.model.dtype,
-            ),
-            self._empty_sharding,
+        dummy_logits = jnp.zeros(
+            (padded_num_reqs, vocab_size),
+            dtype=self.model.dtype,
+            out_sharding=self._empty_sharding,
         )
+
         sampler_args = (
             metadata,
-            inputs.device_state,
+            device_state,
             inputs.req_num_tokens_full,
             inputs.active_mask_full,
             dummy_logits,
@@ -1523,8 +1516,6 @@ class ExecutionManager:
         kv_pages: RaggedPagesCache,
         rng_key: jax.random.PRNGKey,
         num_tokens: int,
-        num_reqs_max_model_len: int,
-        max_pages_per_req: int,
         max_num_reqs: int,
         padded_num_reqs: int,
         metadata: RaggedPagesCacheView,
@@ -1602,13 +1593,9 @@ class ExecutionManager:
         )
 
         # device_state for compilation uses already-transferred arrays
-        device_state = MinimalDeviceState(
-            token_ids=token_ids_dev,
-            num_tokens=num_computed_tokens_dev,
-        )
+        device_state = MinimalDeviceState(token_ids=token_ids_dev, num_tokens=num_computed_tokens_dev)
 
         inputs = StepFunctionInputs(
-            device_state=device_state,
             kv_pages=kv_pages,
             scheduled_full=scheduled_full,
             req_num_tokens_full=jax.device_put(jnp.full((max_num_reqs,), 10, dtype=jnp.int32), self._empty_sharding),
@@ -1617,7 +1604,7 @@ class ExecutionManager:
             batch_metadata=dummy_metadata,
         )
 
-        return [self.graphdef, self.graphstate, self.graphother, inputs]
+        return [self.graphdef, self.graphstate, self.graphother, inputs, device_state]
 
     @property
     def maybe_implicit(self):
