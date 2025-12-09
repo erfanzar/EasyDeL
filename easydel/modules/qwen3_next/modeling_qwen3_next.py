@@ -1272,7 +1272,7 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
 
     def _compute_aux_loss(self, outputs, attention_mask):
         """Compute auxiliary loss from router logits."""
-        if outputs.router_logits is None:
+        if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
         aux_loss = auxiliary_load_balancing_loss_func(
             gate_logits=outputs.router_logits,

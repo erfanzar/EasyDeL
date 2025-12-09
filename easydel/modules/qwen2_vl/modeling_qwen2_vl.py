@@ -574,7 +574,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         cu_seqlens: chex.Array,
-        position_embeddings: tuple[chex.Array, chex.Array] = None,
+        position_embeddings: tuple[chex.Array, chex.Array] | None = None,
     ) -> chex.Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
@@ -598,7 +598,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         splits = [jnp.split(tensor, jnp.cumsum(lengths)[:-1], axis=2) for tensor in (q, k, v)]
 
         attn_outputs = []
-        for q_chunk, k_chunk, v_chunk in zip(*splits):
+        for q_chunk, k_chunk, v_chunk in zip(*splits, strict=False):
             attn_weights = jnp.matmul(q_chunk, k_chunk.swapaxes(-1, -2)) / math.sqrt(self.head_dim)
             attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q_chunk.dtype)
             attn_output = jnp.matmul(attn_weights, v_chunk)
@@ -1156,9 +1156,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         if position_ids is None:
             batch_size = inputs_embeds.shape[0]
             pos_2d = mask_info.q_position_ids
-            position_ids = jnp.broadcast_to(
-                pos_2d[None, :, :], (3, batch_size, sequence_length)
-            )
+            position_ids = jnp.broadcast_to(pos_2d[None, :, :], (3, batch_size, sequence_length))
 
         hidden_states = inputs_embeds
         if mode is None:
@@ -1779,11 +1777,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         rope_deltas = others.get("rope_deltas", None)
         position_ids = others.get("position_ids", None)
 
-        if (
-            position_ids is None
-            and input_ids is not None
-            and (image_grid_thw is not None or video_grid_thw is not None)
-        ):
+        if position_ids is None and input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
             position_ids, rope_deltas = self.base_model.get_rope_index(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -1838,51 +1832,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         return others
 
     def get_static_arguments(self):
-        return (
-            "image_grid_thw",
-            "video_grid_thw",
-        )
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        basics = super()._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-
-        if vision_included:
-            assert required_props is not None
-            assert "image_grid_thw" in required_props.keys()
-
-            pixel_values = jnp.ones((vision_height, vision_width), dtype="f4")
-            basics.update(
-                {
-                    "pixel_values": pixel_values,
-                    "image_grid_thw": jnp.array(required_props["image_grid_thw"]["value"]),
-                }
-            )
-        return basics
+        return ("image_grid_thw", "video_grid_thw")
 
     def _create_required_props_from_kwargs(
         self,

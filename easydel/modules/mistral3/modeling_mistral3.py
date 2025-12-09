@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import typing as tp
 
 import chex
 import jax
@@ -342,45 +341,7 @@ class Mistral3Model(EasyDeLBaseModule):
     ):
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        basics = self.language_model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-        if vision_included:
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels or 3,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype="f4",
-            )
-            basics.update({"pixel_values": pixel_values})
-        return basics
+
 
     def prepare_inputs_for_generation(
         self,

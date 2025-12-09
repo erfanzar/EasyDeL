@@ -603,54 +603,6 @@ class EasyGenerationMixin:
         """
         return None
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ) -> dict[str, tp.Any]:
-        """
-        Generates a dictionary of placeholder keyword arguments needed for model compilation.
-
-        Creates dummy tensors (like `input_ids`, `attention_mask`) with the specified shapes
-        and sharding, along with necessary RNGs, to allow JAX to trace and compile the
-        model's forward pass without needing real data. This is often used for AOT compilation
-        or initialization checks. Specific models might override this to add more required inputs.
-
-        Args:
-            batch_size (int): The batch size for the dummy inputs.
-            input_tokens_length (int): The sequence length for the dummy inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding for the dummy inputs.
-            rngs (jax.random.PRNGKey): RNG keys required by the model (e.g., for dropout).
-            vision_included (bool): Flag indicating if vision inputs are needed (for multimodal).
-            vision_batch_size (int): Batch size for dummy vision inputs.
-            vision_channels (int): Channels for dummy vision inputs.
-            vision_height (tp.Optional[int]): Height for dummy vision inputs.
-            vision_width (tp.Optional[int]): Width for dummy vision inputs.
-            required_props (tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]): Optional
-                additional properties extracted by `_create_required_props_from_kwargs`.
-            **kwargs: Additional keyword arguments.
-
-        Returns:
-            dict: A dictionary containing dummy keyword arguments suitable for model compilation.
-        """
-        deteshape = (batch_size, input_tokens_length)
-        # Return a dummy MaskInfo instead of attention_mask for compilation
-        seg = jnp.zeros((batch_size, input_tokens_length), dtype=jnp.int32)  # all valid
-        mi = MaskInfo.from_segments(seg).apply_causal()
-        return dict(
-            input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
-            mask_info=mi,
-            rng=rngs,
-        )
 
     def _validate_signature(
         self,

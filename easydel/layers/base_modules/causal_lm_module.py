@@ -325,13 +325,14 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
             logits = self.apply_logit_cap(logits)
 
-        # Compute auxiliary loss
         aux_loss = None
-        if aux_loss_fn is not None:
-            # Use custom aux_loss function provided by subclass
+        if aux_loss_fn is not None and mode not in [
+            common_types.MODE_DECODE,
+            common_types.MODE_PREFILL,
+            common_types.MODE_INSERT,
+        ]:
             aux_loss = aux_loss_fn(outputs, attention_mask)
         else:
-            # Try to compute from all_router_losses (Arctic pattern)
             aux_loss = self.compute_router_aux_loss(outputs)
 
         return MoeCausalLMOutput(

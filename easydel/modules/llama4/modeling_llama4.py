@@ -51,6 +51,13 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.moe import (
+    BaseMoeModule,
+    ColumnParallelMoELinear,
+    MoeLoadBalancingStrategy,
+    MoeRoutingStrategy,
+    RowParallelMoELinear,
+)
 from easydel.layers.norms import RMSNorm as Llama4TextRMSNorm
 from easydel.utils.compiling_utils import ejit
 
@@ -100,19 +107,6 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-def bmm(inputs, kernel, precision):
-    """Batch matrix multiplication helper that works for 2D or higher-rank inputs."""
-    subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
-
-    return jnp.einsum(
-        subscript,
-        inputs,
-        kernel,
-        precision=precision,
-        optimize=True,
-    )
-
-
 @ejit(static_argnums=(0, 1, 2, 3))
 def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
     """Compute rotary frequencies for the vision transformer grid."""
@@ -154,6 +148,23 @@ class Llama4TextExperts(nn.Module):
     enabling efficient scaling and specialization of model capacity.
     """
 
+    reform_param: tp.ClassVar = {
+        # HuggingFace has fused gate_up_proj, we split into separate gate_proj and up_proj
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[:, :, : x.shape[-1] // 2]},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[:, :, x.shape[-1] // 2 :]},
+            ],
+            "inverse_spliter": lambda g, u: jnp.concatenate([g, u], axis=-1),
+        },
+        "down_proj$": {
+            "splits": [
+                {"name": "down_proj.kernel", "spliter": lambda x: x},
+            ],
+            "inverse_spliter": lambda x: x,
+        },
+    }
+
     def __init__(
         self,
         config: Llama4Config,
@@ -172,29 +183,54 @@ class Llama4TextExperts(nn.Module):
         self.hidden_size = config.hidden_size
         self.expert_dim = self.intermediate_size
 
-        self.gate_up_proj = ArrayParam.bound(
-            shape=(self.num_experts, self.hidden_size, 2 * self.expert_dim),
-            dtype=self.param_dtype,
-            init_method="normal",
-            init_kwargs={"stddev": config.initializer_range},
-            key=rngs.params(),
+        self.gate_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            use_bias=False,
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
-        self.down_proj = ArrayParam.bound(
-            shape=(self.num_experts, self.expert_dim, self.hidden_size),
-            dtype=self.param_dtype,
-            init_method="normal",
-            init_kwargs={"stddev": config.initializer_range},
-            key=rngs.params(),
+        self.up_proj = ColumnParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            rngs=rngs,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            use_bias=False,
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
         )
+        self.down_proj = RowParallelMoELinear(
+            num_experts=config.num_local_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+            rngs=rngs,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(config.initializer_range),
+            partition_manager=config.partition_manager,
+            use_expert_tensor_mode=config.use_expert_tensor_mode,
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+        self.act_fn = ACT2FN[self.config.hidden_act]
 
-        self.activation_fn = ACT2FN[self.config.hidden_act]
-
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        hidden_states = hidden_states.reshape(self.num_experts, -1, self.hidden_size)
-        gate_up = bmm(hidden_states, self.gate_up_proj, self.precision)
-        gate, up = jnp.split(gate_up, 2, axis=-1)
-        next_states = bmm((up * self.activation_fn(gate)), self.down_proj, self.precision)
-        return next_states.reshape(-1, self.hidden_size)
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        group_sizes: chex.Array,
+        sorted_experts: chex.Array | None = None,
+    ) -> chex.Array:
+        """Forward pass through MoE experts."""
+        gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
+        up = self.up_proj(hidden_states, group_sizes, sorted_experts)
+        return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
 
 
 class Llama4TextL2Norm(nn.Module):
@@ -272,7 +308,7 @@ class Llama4TextMLP(nn.Module):
         return checkpoint_name(hidden_states, "mlp_output")
 
 
-class Llama4TextMoe(nn.Module):
+class Llama4TextMoe(BaseMoeModule):
     """Mixture of Experts layer for Llama4 text models.
 
     Routes inputs to specialized expert networks based on learned routing,
@@ -288,7 +324,17 @@ class Llama4TextMoe(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        self.config = config
+        super().__init__(
+            config=config,
+            n_routed_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            lbl_coef=None,
+            rzl_coef=None,
+            routing_strategy=MoeRoutingStrategy.TOP_K,
+            load_balancing_strategy=MoeLoadBalancingStrategy.STANDARD,
+        )
+
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
@@ -296,6 +342,7 @@ class Llama4TextMoe(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_local_experts
+
         self.experts = Llama4TextExperts(
             config=config,
             dtype=dtype,
@@ -322,36 +369,90 @@ class Llama4TextMoe(nn.Module):
             rngs=rngs,
         )
 
+        # Configure hooks for Llama4 sigmoid-based INPUT SCALING routing
+        # HF Llama4 uses INPUT scaling: expert(input * weight)
+        # EasyDeL sparse MoE uses OUTPUT scaling by default: weight * expert(input)
+        # To match HF, we use scale_replicated_inputs to scale inputs BEFORE expert processing,
+        # then set output weights to 1.0 to avoid double-scaling.
+
+        def _sigmoid_topk_weights(logits: jax.Array) -> jax.Array:
+            """Apply sigmoid to logits, zero out non-top-k."""
+            _, top_idx = jax.lax.top_k(logits, k=self.num_experts_per_tok)
+            sigmoid_weights = jax.nn.sigmoid(logits.astype(jnp.float32))
+            mask = jnp.zeros_like(logits, dtype=jnp.bool_)
+            row_idx = jnp.arange(logits.shape[0])[:, None]
+            mask = mask.at[row_idx, top_idx].set(True)
+            return jnp.where(mask, sigmoid_weights, 0.0).astype(logits.dtype)
+
+        def _scale_inputs(inputs: jax.Array, weights: jax.Array) -> jax.Array:
+            """Scale replicated inputs by their corresponding weights (input scaling).
+
+            Args:
+                inputs: Replicated token representations, shape (tokens*k, hidden)
+                weights: Flattened weights, shape (tokens*k,)
+
+            Returns:
+                Scaled inputs, shape (tokens*k, hidden)
+            """
+            return inputs * weights[:, None]
+
+        def _passthrough_weights(weights: jax.Array) -> jax.Array:
+            """Pass through weights unchanged (avoid default sum normalization).
+
+            Called by refine_weights_hook after top-k selection. For Llama4,
+            we use sigmoid weights directly without sum normalization.
+            """
+            return weights
+
+        def _unity_output_weights(weights: jax.Array) -> jax.Array:
+            """Replace output weights with 1.0 since scaling is done on inputs.
+
+            This is called during unpermute to avoid double-scaling.
+            The weights have shape (tokens, k) where k = num_experts_per_tok.
+            """
+            return jnp.ones_like(weights)
+
+        # Configure for Llama4's input scaling: expert(input * weight)
+        # - normalize_gate_logits: Apply sigmoid with top-k masking to get weights
+        # - refine_weights_hook: Pass through weights (avoid default sum normalization)
+        # - scale_replicated_inputs: Scale inputs by weights before expert processing
+        # - output_weights_hook: Set output combination weights to 1.0 to avoid double-scaling
+        self.moe_hooks = self.moe_hooks.replace(
+            normalize_gate_logits=_sigmoid_topk_weights,
+            refine_weights_hook=_passthrough_weights,
+            scale_replicated_inputs=_scale_inputs,
+            output_weights_hook=_unity_output_weights,
+        )
+
     def __call__(
-        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        training: bool = False,
+        layer_idx: int | None = None,
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        batch, seq_len, hidden_dim = hidden_states.shape
-        assert hidden_dim == self.hidden_dim, "Input hidden_dim mismatch"
+        del training
 
-        # Reshape to [batch*seq_len, hidden_dim]
-        flattened_hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        tokens_per_expert = flattened_hidden_states.shape[0]
+        # Shared expert output
+        shared_out = self.shared_expert(hidden_states)
 
-        router_logits = checkpoint_name(self.router(flattened_hidden_states), "moe_router_logits")
-        router_top_value, router_indices_topk = jax.lax.top_k(router_logits, self.top_k)
+        # MoE expert output
+        def ffn_activation(gate, up):
+            return self.experts.act_fn(gate) * up
 
-        scores_base = jnp.full_like(router_logits, -jnp.inf)
-        token_idx = jnp.arange(tokens_per_expert)[:, None]
-        expert_idx = router_indices_topk
-        scores_scattered = scores_base.at[token_idx, expert_idx].set(router_top_value)
+        expert_out, router_logits = self.moe_call(
+            hidden_state=hidden_states,
+            gate_layer=self.router,
+            expert_layer=self.experts,
+            wi_kernel=self.experts.gate_proj.kernel.value,
+            wu_kernel=self.experts.up_proj.kernel.value,
+            wd_kernel=self.experts.down_proj.kernel.value,
+            act_fn=self.experts.act_fn,
+            ffn_activation=ffn_activation,
+            layer_idx=layer_idx,
+        )
 
-        router_scores = jax.nn.sigmoid(scores_scattered.astype(jnp.float32)).astype(hidden_states.dtype)
-        out = self.shared_expert(flattened_hidden_states)
-        expert_outputs = jnp.zeros_like(out)
-        for expert_idx in range(self.num_experts):
-            expert_mask = router_scores[:, expert_idx : expert_idx + 1]
-            expert_inputs = flattened_hidden_states * expert_mask
-            expert_output = self.experts(expert_inputs)
-            expert_outputs = expert_outputs + expert_output
-        final_output = checkpoint_name(out + expert_outputs, "moe_expert_output")
-        final_output = final_output.reshape(batch, seq_len, hidden_dim)
-        router_scores_transposed = router_scores.T
-        return final_output, router_scores_transposed
+        final_output = checkpoint_name(shared_out + expert_out, "moe_expert_output")
+        return final_output, checkpoint_name(router_logits, "moe_router_logits")
 
 
 class Llama4TextAttention(UnifiedAttention):
@@ -431,34 +532,6 @@ class Llama4TextAttention(UnifiedAttention):
             attn_scales = attn_scales.reshape((*attn_scales.shape, 1, 1))
             query_states = (query_states * attn_scales).astype(query_states.dtype)
         return query_states, key_states, value_states
-
-    def forward(
-        self,
-        hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo | None,
-        position_ids: Int[Array, "batch seq_len"],
-        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        output_attentions: bool = False,
-        frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
-    ) -> AttentionLayerOutput:
-        self._cached_position_ids = position_ids if (self.attn_temperature_tuning and not self.use_rope) else None
-        try:
-            return super().forward(
-                hidden_states,
-                mask_info,
-                position_ids,
-                mode,
-                cache_view,
-                cache_metadata,
-                output_attentions,
-                frequencies,
-                alibi,
-            )
-        finally:
-            self._cached_position_ids = None
 
 
 class Llama4TextDecoderLayer(nn.Module):
@@ -1731,65 +1804,6 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         pad_token_id=None,
     ):
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding: jax.sharding.PartitionSpec,
-        rngs: jax.random.PRNGKey,
-        vision_included: bool = False,
-        vision_batch_size: int = 1,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        required_props: tp.Mapping[str, dict[str, tp.Any]] | None = None,
-        **kwargs,
-    ):
-        """Helper function to get keyword arguments for model compilation, potentially including vision inputs.
-
-        Args:
-            batch_size (int): Batch size for text inputs.
-            input_tokens_length (int): Sequence length for text inputs.
-            input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
-            rngs (jax.random.PRNGKey): Random number generator key.
-            vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
-            vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
-            vision_channels (int): Number of channels for vision inputs. Defaults to 3.
-            vision_height (Optional[int]): Height for vision inputs (defaults to config).
-            vision_width (Optional[int]): Width for vision inputs (defaults to config).
-            required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
-            **kwargs: Additional arguments passed to the language model's compile kwargs method.
-
-        Returns:
-            dict: Keyword arguments for model compilation.
-        """
-        basics = self.language_model._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            vision_included=vision_included,
-            vision_batch_size=vision_batch_size,
-            vision_channels=vision_channels,
-            vision_height=vision_height,
-            vision_width=vision_width,
-            required_props=required_props,
-            **kwargs,
-        )
-
-        if vision_included:
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels or 3,
-                    self.config.vision_config.image_size,
-                    self.config.vision_config.image_size,
-                ),
-                dtype="f4",
-            )
-            basics.update({"pixel_values": pixel_values})
-        return basics
 
     def prepare_inputs_for_generation(
         self,

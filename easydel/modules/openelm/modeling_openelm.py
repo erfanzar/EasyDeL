@@ -153,6 +153,8 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         else:
             self.q_norm = None
             self.k_norm = None
+        self.rotary = self._create_rotary(config, dtype)
+        self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _postprocess_qkv(
         self,

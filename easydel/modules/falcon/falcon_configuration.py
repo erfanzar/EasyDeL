@@ -194,6 +194,11 @@ class FalconConfig(EasyDeLBaseConfig):
     def rotary(self):
         return not self.alibi
 
+    @property
+    def num_key_value_heads(self):
+        """Alias for num_kv_heads to match UnifiedAttention expectations."""
+        return self.num_kv_heads
+
     def get_partition_rules(self, *args, **kwargs):
         """
         Get the partition rules for the model.

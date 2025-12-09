@@ -820,7 +820,8 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         )
 
         if pixel_values is not None and pixel_values.ndim == 4:
-            pixel_values = jnp.swapaxes(pixel_values, 1, 3)
+            # Convert from NCHW (PyTorch) to NHWC (JAX)
+            pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
@@ -868,6 +869,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
         return self.embeddings
 
 
+@register_module(config=CLIPTextConfig, model_type="clip_text_model", task_type=TaskType.BASE_MODULE)
 class CLIPTextModel(EasyDeLBaseModule):
     """
     Bare CLIP text model (transformer) outputting raw hidden-states without any specific head on top.
@@ -907,8 +909,9 @@ class CLIPTextModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        mask_info: MaskInfo,
-        position_ids: Int[Array, "batch seq_len"],
+        mask_info: MaskInfo | None = None,
+        attention_mask: Array | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -916,15 +919,23 @@ class CLIPTextModel(EasyDeLBaseModule):
 
         Args:
                 input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
+                attention_mask (chex.Array): Attention mask (1 for tokens to attend, 0 for masked).
+                position_ids (chex.Array): Position IDs. If None, will be generated automatically.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
-
 
         Returns:
                 Union[BaseModelOutputWithPooling, Tuple]: Model output.
         """
+        batch_size, seq_len = input_ids.shape
+
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32)[None, :], (batch_size, seq_len))
+
+        if mask_info is None:
+            if attention_mask is None:
+                attention_mask = jnp.ones((batch_size, seq_len), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
 
         return self.text_model(
             input_ids=input_ids,

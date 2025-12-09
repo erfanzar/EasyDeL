@@ -505,60 +505,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             aux_loss=aux_loss,
         )
 
-    def _get_compile_model_kwargs(
-        self,
-        batch_size: int,
-        input_tokens_length: int,
-        input_sharding,
-        rngs,
-        vision_included: bool = False,
-        vision_batch_size: int | None = None,
-        vision_channels: int = 3,
-        vision_height: int | None = None,
-        vision_width: int | None = None,
-        **kwargs,
-    ) -> dict:
-        """Get kwargs for model compilation with optional vision inputs.
-
-        Args:
-            batch_size: Batch size for compilation
-            input_tokens_length: Input sequence length
-            input_sharding: Input sharding specification
-            rngs: Random number generators
-            vision_included: Whether to include vision inputs
-            vision_batch_size: Batch size for vision inputs
-            vision_channels: Number of image channels
-            vision_height: Image height
-            vision_width: Image width
-            **kwargs: Additional kwargs
-
-        Returns:
-            Dictionary of kwargs for model compilation
-        """
-        basics = super()._get_compile_model_kwargs(
-            batch_size=batch_size,
-            input_tokens_length=input_tokens_length,
-            input_sharding=input_sharding,
-            rngs=rngs,
-            **kwargs,
-        )
-
-        if vision_included:
-            vision_config = getattr(self.config, "vision_config", self.config)
-            image_size = getattr(vision_config, "image_size", 224)
-
-            pixel_values = jnp.ones(
-                (
-                    vision_batch_size or 1,
-                    vision_channels,
-                    vision_height or image_size,
-                    vision_width or image_size,
-                ),
-                dtype="f4",
-            )
-            basics["pixel_values"] = pixel_values
-
-        return basics
 
     def prepare_inputs_for_generation(
         self,

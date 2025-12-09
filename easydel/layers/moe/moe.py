@@ -744,6 +744,8 @@ class BaseMoeModule(nn.Module, ABC):
         select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
         refine_weights_hook = self.moe_hooks.refine_weights_hook if self.moe_hooks else None
         refine_inputs_hook = self.moe_hooks.refine_inputs_hook if self.moe_hooks else None
+        scale_replicated_inputs = self.moe_hooks.scale_replicated_inputs if self.moe_hooks else None
+        output_weights_hook = self.moe_hooks.output_weights_hook if self.moe_hooks else None
 
         hooks = self.moe_hooks
         _BS, _SQLN, HD = hidden_state.shape
@@ -756,7 +758,10 @@ class BaseMoeModule(nn.Module, ABC):
         if hooks is not None and hooks.after_gate is not None:
             prein_gate_logits = hooks.after_gate(prein_gate_logits)
 
-        gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
+        if hooks is not None and hooks.normalize_gate_logits is not None:
+            gate_logits = hooks.normalize_gate_logits(prein_gate_logits)
+        else:
+            gate_logits = jax.nn.softmax(prein_gate_logits.astype("f4"), axis=-1).astype(prein_gate_logits.dtype)
         if hooks is not None and hooks.before_topk is not None:
             gate_logits = hooks.before_topk(gate_logits)
 
@@ -861,6 +866,7 @@ class BaseMoeModule(nn.Module, ABC):
                     select_hook=select_hook,
                     refine_weights_hook=refine_weights_hook,
                     refine_inputs_hook=refine_inputs_hook,
+                    scale_replicated_inputs=scale_replicated_inputs,
                 )
 
                 group_sizes = group_sizes[:experts_per_shard]  # only the local experts
@@ -880,6 +886,7 @@ class BaseMoeModule(nn.Module, ABC):
                     select_hook=select_hook,
                     refine_weights_hook=refine_weights_hook,
                     refine_inputs_hook=refine_inputs_hook,
+                    scale_replicated_inputs=scale_replicated_inputs,
                 )
 
                 if ep_size > 1:
@@ -945,6 +952,7 @@ class BaseMoeModule(nn.Module, ABC):
                     batch_size=batch_size,
                     sequence_length=sequence_length,
                     use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+                    weight_modif_fn=output_weights_hook,
                     num_experts_per_tok=self.num_experts_per_tok,
                     dtype=self.dtype,
                 )
@@ -984,6 +992,7 @@ class BaseMoeModule(nn.Module, ABC):
                     batch_size=batch_size,
                     sequence_length=sequence_length,
                     use_custom_sort_vjp=True,
+                    weight_modif_fn=output_weights_hook,
                     num_experts_per_tok=self.num_experts_per_tok,
                     dtype=self.dtype,
                 )

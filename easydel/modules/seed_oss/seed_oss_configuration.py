@@ -71,6 +71,10 @@ class SeedOssConfig(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        attention_bias: bool = True,
+        attention_out_bias: bool = False,
+        residual_dropout=0.1,
+        mlp_bias: bool = False,
         **kwargs,
     ):
         if num_key_value_heads is None:
@@ -106,6 +110,10 @@ class SeedOssConfig(EasyDeLBaseConfig):
         self.sliding_window = sliding_window
         self.max_window_layers = max_window_layers
         self.layer_types = layer_types
+        self.attention_bias = attention_bias
+        self.attention_out_bias = attention_out_bias
+        self.residual_dropout = residual_dropout
+        self.mlp_bias = mlp_bias
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention"
