@@ -353,13 +353,6 @@ class eSurge:
         self.silent_mode = silent_mode
         self._info = logger.info if not self.silent_mode else lambda *args, **kwargs: None
 
-        if page_size < DEFAULT_PAGE_SIZE_GPU_MIN and jax.default_backend() != "tpu":
-            logger.warn(
-                f"PageSize less than {DEFAULT_PAGE_SIZE_GPU_MIN} is inefficient for gpu/cpu "
-                f"so we will automatically use {DEFAULT_PAGE_SIZE_GPU_MIN} for you!"
-            )
-            page_size = DEFAULT_PAGE_SIZE_GPU_MIN
-
         if reserve_tokens is None:
             reserve_tokens = max_num_seqs
 

@@ -113,8 +113,6 @@ class StepFunctionInputs:
     via JAX pytree transformations.
 
     Attributes:
-        device_state: Minimal device state containing only token_ids and num_tokens
-            for sampler updates. All other metadata stays on CPU.
         kv_pages: Paged key-value cache storage for attention computation.
             Uses ragged paging for memory-efficient caching across variable-length
             sequences.
@@ -135,7 +133,6 @@ class StepFunctionInputs:
 
     Example:
         >>> inputs = StepFunctionInputs(
-        ...     device_state=MinimalDeviceState(...),
         ...     kv_pages=cache,
         ...     scheduled_full=jnp.array([4, 8, 2]),
         ...     req_num_tokens_full=jnp.array([512, 256, 128]),
@@ -145,13 +142,58 @@ class StepFunctionInputs:
         ... )
     """
 
-    device_state: MinimalDeviceState
     kv_pages: RaggedPagesCache
     scheduled_full: jax.Array  # [max_num_reqs] int32
     req_num_tokens_full: jax.Array  # [max_num_reqs] int32
     active_mask_full: jax.Array  # [max_num_reqs] bool
     rng_key: jax.Array
     batch_metadata: BatchMetadata
+
+    def print_status(self) -> None:
+        """Print the shapes of all fields in this StepFunctionInputs structure."""
+        lines = []
+
+        lines.append("StepFunctionInputs Status")
+        lines.append("\nMinimalDeviceState:")
+        lines.append(f"  token_ids:       {self.device_state.token_ids.shape}")
+        lines.append(f"  num_tokens:      {self.device_state.num_tokens.shape}")
+        lines.append("\nRaggedPagesCache:")
+        lines.append(f"  kv_pages:        {len(self.kv_pages.views)}x{self.kv_pages.views[-1].kv_pages.shape}")
+        lines.append("\nRequest Arrays:")
+        lines.append(f"  scheduled_full:      {self.scheduled_full.shape}")
+        lines.append(f"  req_num_tokens_full: {self.req_num_tokens_full.shape}")
+        lines.append(f"  active_mask_full:    {self.active_mask_full.shape}")
+        lines.append(f"  rng_key:             {self.rng_key.shape}")
+        lines.append("\nBatchMetadata:")
+        lines.append(f"  scheduled:            {self.batch_metadata.scheduled.shape}")
+        lines.append(f"  query_start_loc:      {self.batch_metadata.query_start_loc.shape}")
+        lines.append(f"  seq_lens:             {self.batch_metadata.seq_lens.shape}")
+        lines.append(f"  pages_tables:         {self.batch_metadata.pages_tables.shape}")
+        lines.append(f"  padded_num_reqs:      {self.batch_metadata.padded_num_reqs.shape}")
+        lines.append(f"  request_distribution: {self.batch_metadata.request_distribution.shape}")
+        lines.append(f"  logits_indices:       {self.batch_metadata.logits_indices.shape}")
+        lines.append(f"  input_ids_buf:        {self.batch_metadata.input_ids_buf.shape}")
+        lines.append(f"  position_ids_buf:     {self.batch_metadata.position_ids_buf.shape}")
+        lines.append(f"  num_requests:         {self.batch_metadata.num_requests.shape}")
+        lines.append(f"  temperature:          {self.batch_metadata.temperature.shape}")
+        lines.append(f"  top_p:                {self.batch_metadata.top_p.shape}")
+        lines.append(f"  top_k:                {self.batch_metadata.top_k.shape}")
+        lines.append(f"  min_p:                {self.batch_metadata.min_p.shape}")
+        lines.append(f"  positions:            {self.batch_metadata.positions.shape}")
+        if self.batch_metadata.slot_mapping is not None:
+            lines.append(f"  slot_mapping:         {self.batch_metadata.slot_mapping.shape}")
+        if self.batch_metadata.num_kv_update_slices is not None:
+            lines.append(f"  num_kv_update_slices: {self.batch_metadata.num_kv_update_slices.shape}")
+        if self.batch_metadata.pixel_values is not None:
+            lines.append("\nVision-Language Model Data:")
+            lines.append(f"  pixel_values:         {self.batch_metadata.pixel_values.shape}")
+        if self.batch_metadata.image_grid_thw is not None:
+            lines.append(f"  image_grid_thw:       {self.batch_metadata.image_grid_thw.shape}")
+        if self.batch_metadata.pixel_values_videos is not None:
+            lines.append(f"  pixel_values_videos:  {self.batch_metadata.pixel_values_videos.shape}")
+        if self.batch_metadata.video_grid_thw is not None:
+            lines.append(f"  video_grid_thw:       {self.batch_metadata.video_grid_thw.shape}")
+        print("\n".join(lines))
 
 
 @auto_pytree(frozen=True)
