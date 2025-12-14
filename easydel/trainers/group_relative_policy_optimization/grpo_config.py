@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -23,7 +21,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "grpo")
-@auto_pytree
+@dataclass
 class GRPOConfig(TrainingArguments):
     """Configuration class for Group Relative Policy Optimization training.
 

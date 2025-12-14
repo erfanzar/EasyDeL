@@ -102,6 +102,7 @@ class GPTJConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a GPTJConfig object.
@@ -148,6 +149,9 @@ class GPTJConfig(EasyDeLBaseConfig):
         self.eos_token_id = eos_token_id
         self.from_pt = False
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layer
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

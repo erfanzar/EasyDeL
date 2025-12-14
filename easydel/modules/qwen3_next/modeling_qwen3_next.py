@@ -50,14 +50,16 @@ from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    LinearCacheView,
+    LinearMetadata,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
-)
-from easydel.layers.caching.hybrid import (
-    HybridCache,
-    HybridCacheView,
-    HybridMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
@@ -73,11 +75,15 @@ from easydel.layers.operations.modules import GatedDeltaRuleOp, GatedDeltaRuleOu
 from .qwen3_next_configuration import Qwen3NextConfig
 
 
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+def apply_mask_to_padding_states(hidden_states: chex.Array, attention_mask: chex.Array | None) -> chex.Array:
+    if (
+        attention_mask is not None
+        and attention_mask.shape[0] == hidden_states.shape[0]
+        and attention_mask.shape[1] == hidden_states.shape[1]
+        and attention_mask.shape[1] > 1
+    ):
         dtype = hidden_states.dtype
-        hidden_states = (hidden_states * attention_mask[:, :, None]).astype(dtype)
-
+        return (hidden_states * attention_mask[:, :, None]).astype(dtype)
     return hidden_states
 
 
@@ -526,8 +532,8 @@ class Qwen3NextFullAttention(UnifiedAttention):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | HybridCacheView | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -555,10 +561,6 @@ class Qwen3NextFullAttention(UnifiedAttention):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
-
-        if self.num_key_value_groups != 1:
-            key_states = jnp.repeat(key_states, self.num_key_value_groups, axis=2)
-            value_states = jnp.repeat(value_states, self.num_key_value_groups, axis=2)
 
         (
             key_states,
@@ -738,19 +740,13 @@ class Qwen3NextLinearAttention(nn.Module):
 
         self.dt_bias = nn.Param(jnp.ones((self.num_v_heads,), dtype=param_dtype))
 
-        self._gdr_op = None
-
-    @property
-    def gdr_op(self) -> GatedDeltaRuleOp:
-        """Lazily create the GatedDeltaRule operation."""
-        if self._gdr_op is None:
-            metadata = OperationMetadata(
-                runtime_dtype=self.dtype,
-                runtime_softmax_dtype=jnp.float32,
-                base_config=self.config,
-            )
-            self._gdr_op = GatedDeltaRuleOp(metadata)
-        return self._gdr_op
+        # Initialize GatedDeltaRule operation eagerly for discovery
+        metadata = OperationMetadata(
+            runtime_dtype=self.dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=self.config,
+        )
+        self.gdr_op = GatedDeltaRuleOp(metadata)
 
     def fix_query_key_value_ordering(
         self,
@@ -804,15 +800,17 @@ class Qwen3NextLinearAttention(nn.Module):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
-        cache_view: HybridCacheView | None = None,
-        cache_metadata: HybridMetadata | None = None,
+        cache_view: LinearCacheView | None = None,
+        cache_metadata: LinearMetadata | None = None,
     ) -> DecoderLayerOutput:
         if mask_info is not None:
-            q_mask = jnp.any(mask_info.attention_mask, axis=1)
-            q_mask = jnp.any(q_mask, axis=-1)
+            q_mask = mask_info.q_attention_mask
+            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
+                q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
+        is_inference = seq_len == 1 and cache_view is not None
 
         projected_qkvz = self.in_proj_qkvz(hidden_states)
         projected_ba = self.in_proj_ba(hidden_states)
@@ -823,12 +821,57 @@ class Qwen3NextLinearAttention(nn.Module):
         key_flat = key.reshape(batch_size, seq_len, -1)
         value_flat = value.reshape(batch_size, seq_len, -1)
         conv_input = jnp.concatenate([query_flat, key_flat, value_flat], axis=-1)
+        # conv_input: [batch, seq_len, conv_dim]
 
         conv_state = None
-        if cache_view is not None and cache_view.conv_state is not None:
+        new_conv_state = None
+
+        if is_inference and cache_view.conv_state is not None:
+            # Inference mode: use cached conv_state for incremental convolution
+            # conv_state shape: [batch, conv_dim, d_conv]
             conv_state = cache_view.conv_state
 
-        conv_output = jax.nn.silu(self.conv1d(conv_input))
+            # Roll the conv_state to make room for new input and insert new hidden state
+            # conv_input has shape [batch, 1, conv_dim], squeeze seq dim
+            new_hidden = conv_input[:, 0, :]  # [batch, conv_dim]
+            conv_state = jnp.roll(conv_state, shift=-1, axis=-1)
+            conv_state = conv_state.at[:, :, -1].set(new_hidden)
+            new_conv_state = conv_state
+
+            # Manual depthwise convolution: sum(conv_state * kernel)
+            # kernel shape from nn.Conv: [kernel_size, in_features, out_features]
+            # For depthwise (feature_group_count=conv_dim): kernel is [kernel_size, 1, conv_dim]
+            kernel = self.conv1d.kernel.value  # [kernel_size, 1, conv_dim]
+            kernel = jnp.squeeze(kernel, axis=1)  # [kernel_size, conv_dim]
+            kernel = kernel.T  # [conv_dim, kernel_size]
+
+            # conv_state: [batch, conv_dim, d_conv], kernel: [conv_dim, kernel_size]
+            # Element-wise multiply and sum over the conv dimension
+            conv_output = jnp.sum(conv_state * kernel[None, :, :], axis=-1)  # [batch, conv_dim]
+            conv_output = jax.nn.silu(conv_output)
+            conv_output = conv_output[:, None, :]  # [batch, 1, conv_dim]
+        else:
+            # Training/prefill mode: use full convolution
+            # conv1d expects [batch, seq, features], outputs same shape with causal padding
+            conv_output = jax.nn.silu(self.conv1d(conv_input))
+
+            # Save conv_state for future inference: last d_conv-1 inputs + zero padding
+            if cache_view is not None:
+                d_conv = self.config.linear_conv_kernel_dim
+                # conv_input: [batch, seq_len, conv_dim] -> need [batch, conv_dim, d_conv]
+                conv_input_transposed = conv_input.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
+                if seq_len >= d_conv:
+                    # Take last d_conv elements
+                    new_conv_state = conv_input_transposed[:, :, -d_conv:]
+                else:
+                    # Pad with zeros on the left
+                    pad_width = d_conv - seq_len
+                    new_conv_state = jnp.pad(
+                        conv_input_transposed,
+                        ((0, 0), (0, 0), (pad_width, 0)),
+                        mode="constant",
+                        constant_values=0,
+                    )
 
         conv_query = conv_output[:, :, : self.key_dim]
         conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
@@ -859,7 +902,7 @@ class Qwen3NextLinearAttention(nn.Module):
             value=value,
             beta=beta,
             decay=decay,
-            conv_state=conv_state,
+            conv_state=None,  # conv_state is handled separately above
             recurrent_state=recurrent_state,
         )
 
@@ -876,9 +919,9 @@ class Qwen3NextLinearAttention(nn.Module):
 
         new_cache_view = cache_view
         if cache_view is not None:
-            new_cache_view = cache_view.update_recurrent_state(
-                new_conv_state=gdr_output.conv_state,
-                new_recurrent_state=gdr_output.recurrent_state,
+            new_cache_view = cache_view.replace(
+                conv_state=new_conv_state if new_conv_state is not None else cache_view.conv_state,
+                recurrent_state=gdr_output.recurrent_state,
             )
 
         return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
@@ -983,8 +1026,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | HybridCacheView | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | LinearCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -1108,8 +1151,8 @@ class Qwen3NextModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1250,8 +1293,8 @@ class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         return self.forward_moe(

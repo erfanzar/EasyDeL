@@ -4,7 +4,11 @@ easydel.inference.esurge.runners package
 .. toctree::
    :maxdepth: 2
 
-   inference/esurge/runners/execution_manager
-   inference/esurge/runners/model_runner
-   inference/esurge/runners/sequence_buffer
-   inference/esurge/runners/states
+   executors/index
+   async_types
+   execution_manager
+   execution_protocol
+   execution_types
+   model_runner
+   sequence_buffer
+   states

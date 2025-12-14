@@ -162,11 +162,7 @@ class EngineRequest:
     @property
     def has_vision(self) -> bool:
         """Check if request has vision data (images or videos)."""
-        return (
-            self.pixel_values is not None
-            or self.pixel_values_videos is not None
-            or len(self.mm_features) > 0
-        )
+        return self.pixel_values is not None or self.pixel_values_videos is not None or len(self.mm_features) > 0
 
     def clear_vision_data(self) -> None:
         """Clear raw vision data after prefill to free memory.

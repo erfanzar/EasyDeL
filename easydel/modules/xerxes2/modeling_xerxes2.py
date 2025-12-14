@@ -41,11 +41,13 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
-    TransformerCacheMetaData,
+    TransformerCacheConfig,
     TransformerCacheView,
     TransformerMetadata,
 )
@@ -558,7 +560,7 @@ class Xerxes2DecoderLayer(nn.Module):
         frequencies: tuple[chex.Array, chex.Array],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
     ):
@@ -681,8 +683,8 @@ class Xerxes2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -847,8 +849,8 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -905,55 +907,18 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
 
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
-        if pad_token_id is None:
-            if hasattr(self, "generation_config"):
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(self.config, "pad_token_id"):
-                pad_token_id = self.config.pad_token_id
-            else:
-                pad_token_id = 0
+    def create_transformer_cache_config(self, batch_size: int, max_length: int):
         head_dim = getattr(self.config, "head_dim", None)
         if head_dim is None:
             head_dim = self.config.hidden_size // self.config.num_attention_heads
         num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
         if num_key_value_heads is None:
             num_key_value_heads = self.config.num_attention_heads
-        return TransformerCacheMetaData.create(
+        return TransformerCacheConfig.create(
             num_hidden_layers=self.config.num_hidden_layers,
             batch_size=batch_size,
             sequence_length=max_length,
-            num_heads=1,
+            num_heads=self.config.num_attention_heads,
             key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
             value_dim=self.config.vhead_dim,
-        )
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return TransformerCache.init_cache(
-            dtype=self.config.kvdtype,
-            partition_manager=self.config.partition_manager,
-            metadata=self.create_cache_metadata(
-                batch_size=batch_size,
-                max_length=max_length,
-                pad_token_id=pad_token_id,
-            ),
-            quantizer=self._quant_class(
-                quantization_config=self.config.kv_cache_quantization_config,
-            ),
-            mesh=self.config.mesh,
-            starts=starts,
-            mask_type_details=self.config.get_mask_details(),
         )

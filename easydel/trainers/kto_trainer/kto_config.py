@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from eformer.pytree import auto_pytree
-
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
@@ -25,7 +23,6 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "kto")
-@auto_pytree
 @dataclass
 class KTOConfig(TrainingArguments):
     """Configuration for the :class:`~easydel.trainers.KTOTrainer`."""

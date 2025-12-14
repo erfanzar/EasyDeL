@@ -129,6 +129,7 @@ class Olmo2Config(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an Olmo2Config object.
@@ -193,6 +194,9 @@ class Olmo2Config(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
 
         self.rms_norm_eps = rms_norm_eps
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def _rope_scaling_validation(self):
         """

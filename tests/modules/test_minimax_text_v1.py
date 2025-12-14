@@ -48,6 +48,19 @@ class TestMiniMaxTextV1:
         )
         assert result.success, f"MiniMax Text V1 CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, minimax_text_v1_config, small_model_config, hf_minimax_class):
+        """Test MiniMax Text V1 text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="minimax_text_01",
+            hf_class=hf_minimax_class,
+            task=ed.TaskType.CAUSAL_LM,
+            config=minimax_text_v1_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"MiniMax Text V1 generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

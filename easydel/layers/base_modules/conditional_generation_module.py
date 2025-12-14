@@ -32,6 +32,8 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.modeling_outputs import Seq2SeqLMOutput
 from easydel.infra.utils import auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
     TransformerCache,
@@ -155,8 +157,8 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         pixel_values: Float[Array, "batch channels height width"] | None = None,
         # Common arguments
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,

@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -26,7 +24,7 @@ from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 
 
 @Registry.register("trainer-arguments", "xpo")
-@auto_pytree
+@dataclass
 class XPOConfig(GRPOConfig):
     """Configuration for the XPO (Exploratory Preference Optimization) trainer.
 

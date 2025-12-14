@@ -25,7 +25,7 @@ The caching system is built on a three-tier hierarchy:
 3. Cache classes that orchestrate multiple views across all layers
 
 Key Classes:
-    BaseCacheMetadata: Abstract base for cache configuration metadata
+    BaseCacheConfig: Abstract base for cache configuration metadata
     BaseRunTimeMetadata: Abstract base for runtime metadata during computation
     BaseCacheView: Abstract base for single-layer cache management
     BaseCache: Abstract base for multi-layer cache orchestration
@@ -39,7 +39,7 @@ Design Principles:
 Example:
     To implement a new caching strategy, extend the base classes:
 
-    >>> class MyCustomMetadata(BaseCacheMetadata):
+    >>> class MyCustomMetadata(BaseCacheConfig):
     ...     my_param: int
     ...
     ...     @classmethod
@@ -62,7 +62,7 @@ from eformer.pytree import auto_pytree
 
 
 @auto_pytree
-class BaseCacheMetadata(ABC):
+class BaseCacheConfig(ABC):
     """Abstract base class defining the interface for cache metadata.
 
     This class serves as the foundation for all cache metadata implementations.
@@ -93,7 +93,7 @@ class BaseCacheMetadata(ABC):
 
     @classmethod
     @abstractmethod
-    def create(cls, *args, **kwargs) -> BaseCacheMetadata:
+    def create(cls, *args, **kwargs) -> BaseCacheConfig:
         """Factory method to create and validate a metadata instance.
 
         This method serves as the primary constructor for metadata objects,
@@ -114,7 +114,7 @@ class BaseCacheMetadata(ABC):
                 Implementation-specific parameters.
 
         Returns:
-            BaseCacheMetadata: A validated instance of the concrete metadata
+            BaseCacheConfig: A validated instance of the concrete metadata
                 implementation. The returned object is immutable and ready
                 for use in cache initialization.
 
@@ -127,7 +127,7 @@ class BaseCacheMetadata(ABC):
             TypeError: If required parameters are missing or have incorrect types.
 
         Example:
-            >>> metadata = TransformerCacheMetaData.create(
+            >>> metadata = TransformerCacheConfig.create(
             ...     batch_size=4,
             ...     sequence_length=1024,
             ...     num_hidden_layers=12,
@@ -173,6 +173,267 @@ class BaseRunTimeMetadata:
     """
 
 
+@auto_pytree
+class OperationsMetadata(BaseRunTimeMetadata):
+    """Unified runtime metadata for all cache types using composition.
+
+    This class provides a single entry point for runtime metadata across all
+    cache types. Instead of requiring users to know which specific metadata
+    class to use, they can use OperationsMetadata which internally holds
+    the appropriate type-specific metadata.
+
+    The composition approach:
+    - Keeps existing metadata classes unchanged (backward compatible)
+    - Provides unified access to common fields
+    - Allows type-specific access when needed
+    - Works with the dynamic operation discovery system
+
+    Only one of the type-specific metadata fields should be populated at a time,
+    matching the cache type being used.
+
+    Attributes:
+        transformer: TransformerMetadata for standard KV-cache operations.
+        hybrid: HybridMetadata for hybrid attention models.
+        ragged: RaggedPagesMetadata for paged attention.
+        recurrent: RecurrentMetadata for recurrent/linear attention models.
+
+    Example:
+        >>> # Create for transformer cache
+        >>> metadata = OperationsMetadata.for_transformer(
+        ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
+        ... )
+        >>>
+        >>> # Create for hybrid cache
+        >>> metadata = OperationsMetadata.for_hybrid()
+        >>>
+        >>> # Access type-specific metadata
+        >>> if metadata.transformer is not None:
+        ...     print(metadata.transformer.starts)
+    """
+
+    transformer: tp.Any | None = None  # TransformerMetadata
+    hybrid: tp.Any | None = None  # HybridMetadata
+    ragged: tp.Any | None = None  # RaggedPagesMetadata
+    recurrent: tp.Any | None = None  # RecurrentMetadata
+
+    @classmethod
+    def for_transformer(
+        cls,
+        postpadded: bool = False,
+        starts: tp.Any | None = None,
+        indexs: tp.Any | None = None,
+    ) -> "OperationsMetadata":
+        """Create OperationsMetadata for transformer cache.
+
+        Args:
+            postpadded: Whether sequences are post-padded.
+            starts: Starting positions for sequences.
+            indexs: Current position indices.
+
+        Returns:
+            OperationsMetadata with transformer field populated.
+        """
+        from easydel.layers.caching.transformer import TransformerMetadata
+
+        return cls(transformer=TransformerMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
+
+    @classmethod
+    def for_hybrid(
+        cls,
+        postpadded: bool = False,
+        starts: tp.Any | None = None,
+        indexs: tp.Any | None = None,
+    ) -> "OperationsMetadata":
+        """Create OperationsMetadata for hybrid cache.
+
+        Since HybridCache contains multiple view types, the metadata includes
+        fields needed by TransformerCacheView layers (postpadded, starts, indexs).
+        Recurrent layers don't need additional metadata during inference.
+
+        Args:
+            postpadded: Whether sequences are post-padded.
+            starts: Starting positions for sequences.
+            indexs: Current position indices.
+
+        Returns:
+            OperationsMetadata with hybrid field populated.
+        """
+        from easydel.layers.caching.hybrid import HybridMetadata
+
+        return cls(hybrid=HybridMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
+
+    @classmethod
+    def for_ragged(
+        cls,
+        pages_tables: tp.Any,
+        context_lens: tp.Any,
+        query_start_loc: tp.Any,
+        num_seqs: tp.Any,
+        slot_mapping: tp.Any | None = None,
+        position_ids: tp.Any | None = None,
+        request_distribution: tp.Any | None = None,
+        num_kv_update_slices: tp.Any | None = None,
+        version: str = "v3",
+        page_size: int = 128,
+        prefill_chunk_size: int = 512,
+    ) -> "OperationsMetadata":
+        """Create OperationsMetadata for ragged pages cache.
+
+        Args:
+            pages_tables: Page tables mapping.
+            context_lens: Context lengths per sequence.
+            query_start_loc: Query start locations.
+            num_seqs: Number of sequences.
+            slot_mapping: Slot mapping for v2.
+            position_ids: Position IDs.
+            request_distribution: Request distribution for v3.
+            num_kv_update_slices: KV update slices for v2.
+            version: Version "v2" or "v3".
+            page_size: Page size.
+            prefill_chunk_size: Prefill chunk size.
+
+        Returns:
+            OperationsMetadata with ragged field populated.
+        """
+        from easydel.layers.caching.ragged_page import RaggedPagesMetadata
+
+        return cls(
+            ragged=RaggedPagesMetadata(
+                pages_tables=pages_tables,
+                context_lens=context_lens,
+                query_start_loc=query_start_loc,
+                num_seqs=num_seqs,
+                slot_mapping=slot_mapping,
+                position_ids=position_ids,
+                request_distribution=request_distribution,
+                num_kv_update_slices=num_kv_update_slices,
+                version=version,
+                page_size=page_size,
+                prefill_chunk_size=prefill_chunk_size,
+            )
+        )
+
+    @classmethod
+    def for_recurrent(cls) -> "OperationsMetadata":
+        """Create OperationsMetadata for recurrent cache.
+
+        Returns:
+            OperationsMetadata with recurrent field populated.
+        """
+        from easydel.layers.caching.recurrent import RecurrentMetadata
+
+        return cls(recurrent=RecurrentMetadata())
+
+    @property
+    def cache_type(self) -> str:
+        """Determine the cache type based on which field is populated.
+
+        Returns:
+            str: "transformer", "hybrid", "ragged", or "recurrent".
+        """
+        if self.transformer is not None:
+            return "transformer"
+        if self.hybrid is not None:
+            return "hybrid"
+        if self.ragged is not None:
+            return "ragged"
+        if self.recurrent is not None:
+            return "recurrent"
+        return "unknown"
+
+    def get_inner(self) -> BaseRunTimeMetadata | None:
+        """Get the inner type-specific metadata.
+
+        Returns:
+            The populated metadata instance, or None if none populated.
+        """
+        if self.transformer is not None:
+            return self.transformer
+        if self.hybrid is not None:
+            return self.hybrid
+        if self.ragged is not None:
+            return self.ragged
+        if self.recurrent is not None:
+            return self.recurrent
+        return None
+
+
+def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.Any:
+    """Unwrap OperationsMetadata or HybridMetadata to the inner type-specific metadata.
+
+    This helper function allows cache views and operations to accept:
+    - Specific metadata types (e.g., TransformerMetadata)
+    - OperationsMetadata (unified wrapper)
+    - HybridMetadata (when using HybridCache)
+
+    And automatically extract/convert to the appropriate type.
+
+    Special handling for HybridMetadata:
+    - When expected_type is "transformer", extracts TransformerMetadata from
+      HybridMetadata's embedded fields (postpadded, starts, indexs).
+    - This enables HybridCache to work seamlessly with TransformerCacheView layers.
+
+    Args:
+        metadata: Either a specific metadata type, OperationsMetadata, or HybridMetadata.
+        expected_type: Optional expected cache type ("transformer", "hybrid",
+            "ragged", "recurrent"). If provided, extracts/converts to that type.
+
+    Returns:
+        The unwrapped metadata. If metadata is already the expected type, returns
+        it unchanged. If metadata is OperationsMetadata or HybridMetadata, returns
+        the inner metadata converted to the expected type.
+
+    Example:
+        >>> # In TransformerCacheView.concatenate_to_cache:
+        >>> cache_metadata = unwrap_metadata(cache_metadata, "transformer")
+        >>> # cache_metadata is now TransformerMetadata (or None)
+    """
+    if metadata is None:
+        return None
+
+    # If it's OperationsMetadata, extract the inner metadata
+    if isinstance(metadata, OperationsMetadata):
+        if expected_type == "transformer":
+            # First check if we have direct transformer metadata
+            if metadata.transformer is not None:
+                return metadata.transformer
+            # If we have hybrid metadata, convert to transformer metadata
+            if metadata.hybrid is not None:
+                from easydel.layers.caching.transformer import TransformerMetadata
+
+                return TransformerMetadata(
+                    postpadded=getattr(metadata.hybrid, "postpadded", False),
+                    starts=getattr(metadata.hybrid, "starts", None),
+                    indexs=getattr(metadata.hybrid, "indexs", None),
+                )
+            return None
+        elif expected_type == "hybrid":
+            return metadata.hybrid
+        elif expected_type == "ragged":
+            return metadata.ragged
+        elif expected_type == "recurrent":
+            return metadata.recurrent
+        else:
+            # Return whatever is populated
+            return metadata.get_inner()
+
+    # Check if it's HybridMetadata and we need TransformerMetadata
+    # Import here to avoid circular import
+    from easydel.layers.caching.hybrid import HybridMetadata
+
+    if isinstance(metadata, HybridMetadata) and expected_type == "transformer":
+        from easydel.layers.caching.transformer import TransformerMetadata
+
+        return TransformerMetadata(
+            postpadded=getattr(metadata, "postpadded", False),
+            starts=getattr(metadata, "starts", None),
+            indexs=getattr(metadata, "indexs", None),
+        )
+
+    # Already a specific type, return as-is
+    return metadata
+
+
 class BaseCacheView(ABC):
     """Abstract base class for single-layer cache management.
 
@@ -201,7 +462,7 @@ class BaseCacheView(ABC):
     - Sharding aware: Integrate with JAX's sharding system
 
     Attributes:
-        metadata (BaseCacheMetadata): Configuration metadata for this cache.
+        metadata (BaseCacheConfig): Configuration metadata for this cache.
             Shared across all views in the same cache hierarchy.
         layer_index (int | None): The index of the layer this view represents.
             None for cache types that don't have layer structure.
@@ -211,12 +472,12 @@ class BaseCacheView(ABC):
         concrete implementations need to control their PyTree structure.
     """
 
-    metadata: BaseCacheMetadata
+    metadata: BaseCacheConfig
     layer_index: int | None
 
     @classmethod
     @abstractmethod
-    def init(cls, metadata: BaseCacheMetadata, *args, **kwargs) -> BaseCacheView:
+    def init(cls, metadata: BaseCacheConfig, *args, **kwargs) -> BaseCacheView:
         """Initialize a new cache view for a single layer.
 
         This factory method creates and initializes a cache view with the
@@ -231,7 +492,7 @@ class BaseCacheView(ABC):
         5. Sets initial indices and positions
 
         Args:
-            metadata (BaseCacheMetadata): Static configuration metadata that
+            metadata (BaseCacheConfig): Static configuration metadata that
                 defines cache dimensions, dtypes, and behavior.
             *args: Additional positional arguments. Common args include:
                 - mesh: JAX device mesh for sharding
@@ -254,10 +515,10 @@ class BaseCacheView(ABC):
 
         Example:
             >>> view = TransformerCacheView.init(
-            ...     metadata=metadata,
+            ...     config=metadata,
+            ...     layer_index=0,
             ...     mesh=mesh,
             ...     dtype=jnp.bfloat16,
-            ...     layer_index=0
             ... )
         """
         pass
@@ -363,7 +624,7 @@ class BaseCache(ABC):
     @abstractmethod
     def init_cache(
         cls,
-        metadata: BaseCacheMetadata,
+        metadata: BaseCacheConfig,
         *args,
         **kwargs,
     ) -> BaseCache:
@@ -381,7 +642,7 @@ class BaseCache(ABC):
         5. Returns ready-to-use cache
 
         Args:
-            metadata (BaseCacheMetadata): Configuration metadata defining
+            metadata (BaseCacheConfig): Configuration metadata defining
                 cache dimensions, number of layers, and behavior.
             *args: Additional positional arguments. Common args include:
                 - mesh: JAX device mesh for distributed execution

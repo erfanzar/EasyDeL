@@ -121,6 +121,7 @@ class GiddConfig(EasyDeLBaseConfig):
         attention_bias: bool = False,
         mlp_bias: bool = False,
         scan_layers: bool = False,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -147,6 +148,9 @@ class GiddConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.scan_layers = scan_layers
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

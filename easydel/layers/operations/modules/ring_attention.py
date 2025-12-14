@@ -67,8 +67,16 @@ from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float
 
+from easydel.layers.caching import TransformerCacheView
+
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 from .vanilla_attention import VanillaAttn
 
 
@@ -110,6 +118,23 @@ class RingAttn(OperationImpl):
             OperationMetadata: Configuration including dtype, mesh, etc.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for RingAttn.
+
+        Ring attention requires basic metadata and uses TransformerCacheView
+        for KV-cache management.
+        """
+        return OperationRequirements.create(
+            name="ring",
+            required_metadata=MetadataField.basic(),
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            cache_view_class=TransformerCacheView,
+        )
 
     @jax.named_scope("easydel-ringimpl")
     def forward_native(

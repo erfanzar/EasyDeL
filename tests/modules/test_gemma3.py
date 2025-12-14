@@ -6,9 +6,9 @@ import transformers
 import easydel as ed
 
 try:
-    from .test_utils import VisionLanguageTester
+    from .test_utils import CausalLMTester, VisionLanguageTester
 except ImportError:
-    from test_utils import VisionLanguageTester
+    from test_utils import CausalLMTester, VisionLanguageTester
 
 
 class TestGemma3:
@@ -84,6 +84,24 @@ class TestGemma3:
             vlm_config=vlm_config,
         )
         assert result.success, f"Gemma3 VLM failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, gemma3_config, small_model_config):
+        """Test Gemma3 text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+
+        gemma3_config.text_config.max_position_embeddings = 2048
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="gemma3",
+            hf_class=transformers.Gemma3ForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=gemma3_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Gemma3 generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

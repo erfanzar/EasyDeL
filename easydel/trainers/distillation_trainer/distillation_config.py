@@ -14,9 +14,7 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -25,7 +23,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "distillation")
-@auto_pytree
+@dataclass
 class DistillationConfig(TrainingArguments):
     """Configuration class for knowledge distillation training.
 

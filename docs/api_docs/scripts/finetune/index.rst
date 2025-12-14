@@ -4,9 +4,9 @@ easydel.scripts.finetune package
 .. toctree::
    :maxdepth: 2
 
-   scripts/finetune/dpo
-   scripts/finetune/gsm8k_grpo
-   scripts/finetune/numinamath_grpo
-   scripts/finetune/orpo
-   scripts/finetune/reward
-   scripts/finetune/sft
+   dpo
+   gsm8k_grpo
+   numinamath_grpo
+   orpo
+   reward
+   sft

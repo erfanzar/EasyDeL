@@ -45,7 +45,13 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput
 from easydel.infra.utils import get_dot_general_by_bits
 
 from .attention import AttentionModule, FlexibleAttentionModule
-from .caching import RaggedPagesCacheView, RaggedPagesMetadata, TransformerCacheView, TransformerMetadata
+from .caching import (
+    OperationsMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from .linear import ColumnParallelLinear, RowParallelLinear
 from .norms import RMSNorm
 
@@ -745,7 +751,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -827,6 +833,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
         (
             key_states,
             value_states,
@@ -858,7 +868,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
+            causal=causal_for_kernel,
             sliding_window=self.sliding_window,
             softmax_aux=softmax_aux,
         )
@@ -888,7 +898,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -969,6 +979,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         value_states = value_states.transpose(0, 2, 1, 3)
 
         # Concatenate with KV cache
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
         (
             key_states,
             value_states,
@@ -998,7 +1013,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
+            causal=causal_for_kernel,
             sliding_window=self.sliding_window,
             softmax_aux=softmax_aux,
         )
@@ -1020,7 +1035,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
@@ -1046,8 +1061,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         # 4. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # 5. NO RoPE - ALiBi handles positions via bias
-
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
         # 6. KV cache concatenation
         (
             key_states,
@@ -1085,7 +1101,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
+            causal=causal_for_kernel,
             sliding_window=self.sliding_window,
             softmax_aux=softmax_aux,
         )
@@ -1111,7 +1127,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -1170,3 +1186,42 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 frequencies,
                 alibi,
             )
+
+    # Operation access properties for dynamic discovery
+    @property
+    def operation_executor(self):
+        """Get the OperationExecutor from attention_performer.
+
+        Returns:
+            OperationExecutor if attention_performer exists, None otherwise.
+        """
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_executor
+        return None
+
+    @property
+    def operation(self):
+        """Get the primary operation from attention_performer."""
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation
+        return None
+
+    @property
+    def operation_requirements(self):
+        """Get requirements from the attention performer.
+
+        Returns:
+            OperationRequirements if attention_performer exists, default otherwise.
+        """
+        from easydel.layers.operations.requirements import OperationRequirements
+
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_requirements
+        return OperationRequirements.default()
+
+    @property
+    def requires_cache(self) -> bool:
+        """Whether this attention layer requires cache."""
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.requires_cache
+        return True

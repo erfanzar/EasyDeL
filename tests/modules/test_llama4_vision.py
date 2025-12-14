@@ -6,9 +6,9 @@ import transformers
 import easydel as ed
 
 try:
-    from .test_utils import VisionLanguageTester
+    from .test_utils import CausalLMTester, VisionLanguageTester
 except ImportError:
-    from test_utils import VisionLanguageTester
+    from test_utils import CausalLMTester, VisionLanguageTester
 
 
 class TestLlama4Vision:
@@ -118,6 +118,19 @@ class TestLlama4Vision:
             vlm_config=vlm_config,
         )
         assert result.success, f"Llama4 VLM failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, llama4_vision_config, small_model_config):
+        """Test Llama4 text-only generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="llama4",
+            hf_class=transformers.Llama4ForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=llama4_vision_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Llama4 generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

@@ -48,7 +48,13 @@ from jaxtyping import Array, Float, Int
 
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput
 
-from .caching import RaggedPagesCacheView, RaggedPagesMetadata, TransformerCacheView, TransformerMetadata
+from .caching import (
+    OperationsMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 
 
 class BaseDecoderLayer:
@@ -73,7 +79,7 @@ class BaseDecoderLayer:
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         checkpoint_names: tuple[str, str] = ("norm", "residual"),
@@ -202,7 +208,7 @@ class BaseDecoderLayer:
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         partition_manager,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         use_scan_mlp: bool = False,

@@ -14,9 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -25,7 +23,7 @@ from ..supervised_fine_tuning_trainer import SFTConfig
 
 
 @Registry.register("trainer-arguments", "gkd")
-@auto_pytree
+@dataclass
 class GKDConfig(SFTConfig):
     """Configuration for the :class:`~easydel.trainers.GKDTrainer`.
 

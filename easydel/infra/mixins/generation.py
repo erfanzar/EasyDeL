@@ -56,6 +56,7 @@ from functools import cached_property, partial
 import chex
 import jax
 import numpy as np
+from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -76,7 +77,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheMetaData
+from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -85,7 +86,7 @@ if tp.TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from easydel.inference.sampling_params import SamplingParams
-    from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
+    from easydel.layers.caching import OperationsMetadata
 
 logger = get_logger(__name__)
 
@@ -174,117 +175,9 @@ class EasyGenerationMixin:
     _model_task: str | None = None
     _model_type: str | None = None
 
-    def create_paged_metadata(
-        self,
-        hbm_utilization: float,
-        page_size: int,
-        max_model_length: int,
-    ) -> RaggedPagesCacheMetaData:
-        """
-        Creates the static configuration metadata required for initializing a Paged KV Cache.
-
-        This method gathers necessary parameters from the model's configuration
-        (like number of layers, heads, dimensions) and combines them with the provided
-        arguments to instantiate and return a `RaggedPagesCacheMetaData` object.
-        This metadata object defines the structure and allocation parameters for the paged cache.
-
-        Returns:
-            RaggedPagesCacheMetaData: An initialized metadata object containing the
-                static configuration for the paged cache.
-        """
-        text_config = self.config.get_text_config()
-        num_hidden_layers = _safepick(text_config, "num_hidden_layers")
-
-        num_key_value_heads = _safepick(text_config, "num_key_value_heads")
-        num_attention_heads = _safepick(text_config, "num_attention_heads")
-
-        hidden_size = _safepick(text_config, "hidden_size")
-
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        head_dim = _safepick(text_config, "head_dim")
-
-        if head_dim is None:
-            head_dim = hidden_size // num_attention_heads
-
-        from easydel.layers.attention import AttentionMechanisms
-
-        match text_config.attn_mechanism:
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
-                version = "v3"
-            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
-                version = "v2"
-            case _:
-                version = "v3"
-                logger.warn("couldn't retrive version from attention mechanism we will set v3 for default")
-
-        return RaggedPagesCacheMetaData.create(
-            mesh=self.mesh,
-            partition_manager=text_config.partition_manager,
-            kvdtype=text_config.kvdtype,
-            max_model_length=max_model_length,
-            num_hidden_layers=num_hidden_layers,
-            num_kv_heads=num_key_value_heads,
-            kv_head_dim_size=head_dim,
-            k_headdim=None,
-            v_headdim=None,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            version=version,
-        )
-
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ) -> TransformerCacheMetaData:
-        """
-        Creates the metadata required for initializing a standard (non-paged) KV Cache.
-
-        This method gathers parameters like layer count, head dimensions, and determines
-        the appropriate padding token ID to instantiate and return a
-        `TransformerCacheMetaData` object suitable for a standard sequential KV cache.
-
-        Args:
-            batch_size (int): The batch size for which the cache is being configured.
-            max_length (int): The maximum sequence length the cache needs to support.
-            pad_token_id (int | None): The ID of the padding token. If None, it attempts
-                to find it from `self.generation_config` or `self.config`, defaulting to 0.
-
-        Returns:
-            TransformerCacheMetaData: An initialized metadata object for a standard KV cache.
-        """
-        text_config = self.config.get_text_config()
-        if pad_token_id is None:
-            if hasattr(self, "generation_config"):
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(self.config, "pad_token_id"):
-                pad_token_id = self.config.pad_token_id
-            else:
-                pad_token_id = 0
-        head_dim = getattr(text_config, "head_dim", None)
-        if head_dim is None:
-            head_dim = text_config.hidden_size // text_config.num_attention_heads
-        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
-        if num_key_value_heads is None:
-            num_key_value_heads = text_config.num_attention_heads
-
-        from easydel.layers.caching import TransformerCacheMetaData
-
-        return TransformerCacheMetaData.create(
-            num_hidden_layers=text_config.num_hidden_layers,
-            pad_token_id=pad_token_id,
-            batch_size=batch_size,
-            sequence_length=max_length,
-            num_heads=num_key_value_heads,
-            head_dim=head_dim,
-        )
-
     def init_ragged_pages(
         self,
-        metadata: RaggedPagesCacheMetaData | None = None,
+        config: RaggedPagesCacheConfig | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
@@ -293,44 +186,44 @@ class EasyGenerationMixin:
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
         This method orchestrates the creation of the `RaggedPagesCache`. It either uses
-        a pre-existing `RaggedPagesCacheMetaData` object passed via the `metadata`
-        argument, or if `metadata` is None, it first creates the metadata by calling
-        `self.create_paged_metadata` using the other provided arguments (page_size,
+        a pre-existing `RaggedPagesCacheConfig` object passed via the `config`
+        argument, or if `config` is None, it first creates the config by calling
+        `self.create_ragged_page_cache_config` using the other provided arguments (page_size,
         batch_size, etc.).
 
         Finally, it calls `RaggedPagesCache.init_cache` to allocate the necessary
         paged tensors (`key_pages`, `value_pages` for each layer) based on the
-        metadata, model's mesh, dtype, partition manager, and quantization settings.
+        config, model's mesh, dtype, partition manager, and quantization settings.
 
         Args:
-            metadata (tp.Optional[RaggedPagesCacheMetaData]): An optional pre-configured
-                metadata object. If provided, other arguments like page_size, batch_size etc.,
-                are ignored for metadata creation.
-            page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
-            hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
+            config (tp.Optional[RaggedPagesCacheConfig]): An optional pre-configured
+                config object. If provided, other arguments like page_size, batch_size etc.,
+                are ignored for config creation.
+            page_size (tp.Optional[int]): Number of tokens per page. Required if `config` is None.
+            hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `config` is None.
 
         Returns:
             RaggedPagesCache: An initialized RaggedPagesCache object containing the allocated
                 cache tensors (views) for all layers.
 
         Raises:
-            AssertionError: If `metadata` is None and any of the required arguments
+            AssertionError: If `config` is None and any of the required arguments
                 (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
         """
         text_config = self.config.get_text_config()
-        if metadata is None:
-            assert page_size is not None, "if your not passing metadata you should pass `page_size`"
-            assert hbm_utilization is not None, "if your not passing metadata you should pass `hbm_utilization`"
-            assert max_model_length is not None, "if your not passing metadata you should pass `max_model_length`"
+        if config is None:
+            assert page_size is not None, "if your not passing config you should pass `page_size`"
+            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
+            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
 
-            metadata = self.create_paged_metadata(
+            config = self.create_ragged_page_cache_config(
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
                 max_model_length=max_model_length,
             )
         return RaggedPagesCache.init_cache(
             mesh=text_config.mesh,
-            metadata=metadata,
+            config=config,
             partition_manager=text_config.partition_manager,
             quantizer=self._quant_class(
                 quantization_config=text_config.kv_cache_quantization_config,
@@ -344,14 +237,14 @@ class EasyGenerationMixin:
         starts: int | None = None,
         shardings: dict | None = None,
         pad_token_id: int | None = None,
-    ) -> TransformerCache:
+    ):
         """
-        Initializes and returns a standard (non-paged) Key-Value cache.
+        Initializes and returns the appropriate cache type for this model.
 
-        This method first creates the necessary metadata using `create_cache_metadata`
-        and then calls `TransformerCache.init_cache` to allocate and initialize
-        the cache tensors based on the model's configuration, dtype, sharding,
-        quantization settings, and provided batch size and maximum length.
+        This method automatically detects the cache type needed based on the model's
+        operations and creates the appropriate cache:
+        - For pure transformer models: Returns TransformerCache
+        - For hybrid/recurrent models: Returns HybridCache via init_operations_cache
 
         Args:
             batch_size (int): The batch size for the cache.
@@ -359,31 +252,704 @@ class EasyGenerationMixin:
             starts (int | None): Optional starting positions for the cache sequences.
                 If provided, influences the initial state. Defaults to None (usually 0).
             shardings (dict | None): Optional dictionary specifying sharding configurations.
-                (Note: This argument appears unused in the current implementation shown).
             pad_token_id (int | None): The ID of the padding token. If None, it's inferred.
 
         Returns:
-            TransformerCache: An initialized standard TransformerCache object.
+            TransformerCache or HybridCache depending on the model type.
         """
-
         from easydel.layers.caching import TransformerCache
 
         text_config = self.config.get_text_config()
+        cache_type = self.get_inference_cache_type()
 
-        return TransformerCache.init_cache(
-            dtype=text_config.kvdtype,
-            partition_manager=text_config.partition_manager,
-            metadata=self.create_cache_metadata(
+        if cache_type == "transformer":
+            return TransformerCache.init_cache(
+                mesh=text_config.mesh,
+                config=self.create_transformer_cache_config(
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    pad_token_id=pad_token_id,
+                ),
+                partition_manager=text_config.partition_manager,
+                dtype=text_config.kvdtype,
+                starts=starts,
+                quantizer=self._quant_class(
+                    quantization_config=text_config.kv_cache_quantization_config,
+                ),
+                mask_type_details=text_config.get_mask_details(),
+            )
+        else:
+            # For hybrid/recurrent models, use init_operations_cache
+            return self.init_operations_cache(
                 batch_size=batch_size,
                 max_length=max_length,
-                pad_token_id=pad_token_id,
-            ),
-            quantizer=self._quant_class(
-                quantization_config=text_config.kv_cache_quantization_config,
-            ),
+                starts=starts,
+                dtype=text_config.kvdtype,
+                quantizer=self._quant_class(
+                    quantization_config=text_config.kv_cache_quantization_config,
+                ),
+                masking_details=text_config.get_mask_details() if cache_type != "ragged" else None,
+            )
+
+    def get_inference_cache_type(self) -> str:
+        """Determine the appropriate cache type for inference based on model operations.
+
+        This method uses dynamic discovery to inspect the actual operations and
+        determine the best cache type:
+        - "hybrid": For models with recurrent layers (e.g., Qwen3Next with attention + linear)
+        - "transformer": For pure attention models using TransformerCache
+        - "ragged": For models that only support RaggedPagesCache
+
+        The returned cache type is used by execution managers to initialize the
+        appropriate cache and metadata structures.
+
+        Returns:
+            str: "hybrid", "transformer", or "ragged" based on model operations.
+
+        Example:
+            >>> cache_type = model.get_inference_cache_type()
+            >>> if cache_type == "ragged":
+            ...     cache = model.init_ragged_pages(...)
+            ... else:
+            ...     cache = model.init_operations_cache(...)
+        """
+        cache_info = self.get_operations_cache_info()
+        return cache_info.get_recommended_cache_type()
+
+    def create_transformer_cache_config(
+        self,
+        batch_size: int,
+        max_length: int,
+        pad_token_id: int | None = None,
+    ):
+        """Create TransformerCacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            pad_token_id: Optional pad token id override.
+
+        Returns:
+            TransformerCacheConfig configured for the model.
+        """
+        from easydel.layers.caching import TransformerCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if pad_token_id is None:
+            pad_token_id = getattr(text_config, "pad_token_id", 0)
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_attention_heads", None)
+
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        if num_kv_heads is None:
+            raise ValueError(
+                "Could not infer number of KV heads for TransformerCacheConfig; "
+                "expected `num_key_value_heads` or `num_attention_heads` on config."
+            )
+        if head_dim is None:
+            raise ValueError(
+                "Could not infer head_dim for TransformerCacheConfig; "
+                "expected `head_dim` or (`hidden_size` and `num_attention_heads`) on config."
+            )
+
+        # MLA-style attention (e.g., Kimi Linear / DeepSeek): KV head dims may differ
+        # from `head_dim` and K/V dims may differ from each other.
+        qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+        v_head_dim = getattr(text_config, "v_head_dim", None)
+        if qk_nope_head_dim is not None and qk_rope_head_dim is not None and v_head_dim is not None:
+            key_dim = int(qk_nope_head_dim + qk_rope_head_dim)
+            value_dim = int(v_head_dim)
+            if key_dim != head_dim or value_dim != head_dim:
+                # MLA forward path constructs KV with `num_attention_heads` heads (not GQA/MQA),
+                # so the cache must match that head count.
+                mla_heads = int(getattr(text_config, "num_attention_heads", num_kv_heads) or num_kv_heads)
+                return TransformerCacheConfig.create(
+                    batch_size=batch_size,
+                    sequence_length=max_length,
+                    num_hidden_layers=num_hidden_layers,
+                    pad_token_id=pad_token_id,
+                    num_heads=mla_heads,
+                    head_dim=None,
+                    key_dim=key_dim,
+                    value_dim=value_dim,
+                )
+
+        return TransformerCacheConfig.create(
+            batch_size=batch_size,
+            sequence_length=max_length,
+            num_hidden_layers=num_hidden_layers,
+            pad_token_id=pad_token_id,
+            num_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+
+    def create_recurrent_cache_config(self, batch_size: int):
+        """Create RecurrentCacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length (unused for recurrent).
+
+        Returns:
+            RecurrentCacheConfig configured for the model.
+        """
+        from easydel.layers.caching import RecurrentCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        # 1) Qwen3-Next / GatedDeltaRule-style linear attention
+        has_linear_attn_fields = any(
+            hasattr(text_config, name)
+            for name in (
+                "linear_num_value_heads",
+                "linear_num_key_heads",
+                "linear_key_head_dim",
+                "linear_value_head_dim",
+                "linear_conv_kernel_dim",
+            )
+        )
+        if has_linear_attn_fields:
+            conv_dim = getattr(text_config, "linear_d_inner", None)
+            if conv_dim is None:
+                num_k_heads = getattr(text_config, "linear_num_key_heads", None)
+                head_k_dim = getattr(text_config, "linear_key_head_dim", None)
+                num_v_heads = getattr(text_config, "linear_num_value_heads", None)
+                head_v_dim = getattr(text_config, "linear_value_head_dim", None)
+                if num_k_heads and head_k_dim and num_v_heads and head_v_dim:
+                    key_dim = num_k_heads * head_k_dim
+                    value_dim = num_v_heads * head_v_dim
+                    conv_dim = key_dim * 2 + value_dim
+                elif num_k_heads and head_k_dim:
+                    conv_dim = num_k_heads * head_k_dim
+                else:
+                    conv_dim = getattr(text_config, "intermediate_size", 2048)
+
+            conv_kernel_size = getattr(text_config, "linear_conv_kernel_dim", None)
+            if conv_kernel_size is None:
+                conv_kernel_size = getattr(text_config, "d_conv", 4)
+
+            num_heads = getattr(text_config, "linear_num_value_heads", None) or getattr(
+                text_config, "linear_num_key_heads", None
+            )
+            head_dim = getattr(text_config, "linear_key_head_dim", None)
+            d_state = getattr(text_config, "linear_d_state", None)
+            if d_state is None:
+                d_state = getattr(text_config, "linear_value_head_dim", None) or 64
+
+            recurrent_shape: tuple[int, ...]
+            if num_heads is not None and head_dim is not None:
+                # GDR/KDA-style recurrent state: [batch, num_heads, head_dim(key), d_state(value)]
+                recurrent_shape = (int(num_heads), int(head_dim), int(d_state))
+            else:
+                # Fallback: Mamba-style recurrent state
+                recurrent_shape = (int(conv_dim), int(d_state))
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=int(conv_dim),
+                conv_kernel_size=int(conv_kernel_size),
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 2) FalconH1-style (mamba_* prefixed attributes)
+        is_falcon_h1 = all(
+            hasattr(text_config, name)
+            for name in (
+                "mamba_n_heads",
+                "mamba_d_head",
+                "mamba_n_groups",
+                "mamba_d_state",
+                "mamba_d_conv",
+            )
+        )
+        if is_falcon_h1:
+            # FalconH1 uses mamba_intermediate_size property or mamba_d_ssm
+            intermediate_size = getattr(text_config, "mamba_intermediate_size", None)
+            if intermediate_size is None:
+                mamba_d_ssm = getattr(text_config, "mamba_d_ssm", None)
+                if mamba_d_ssm is not None:
+                    intermediate_size = mamba_d_ssm
+                else:
+                    hidden_size = getattr(text_config, "hidden_size", None)
+                    mamba_expand = getattr(text_config, "mamba_expand", 2)
+                    if hidden_size is None:
+                        raise ValueError("Could not infer intermediate_size for FalconH1 recurrent cache config.")
+                    intermediate_size = int(mamba_expand * hidden_size)
+
+            state_size = int(text_config.mamba_d_state)
+            n_groups = int(text_config.mamba_n_groups)
+            conv_dim = int(intermediate_size + 2 * n_groups * state_size)
+            conv_kernel_size = int(text_config.mamba_d_conv)
+            recurrent_shape = (int(text_config.mamba_n_heads), int(text_config.mamba_d_head), state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=conv_dim,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 3) Mamba2-style state space models (standard naming)
+        is_mamba2 = all(
+            hasattr(text_config, name)
+            for name in (
+                "num_heads",
+                "head_dim",
+                "n_groups",
+                "state_size",
+                "conv_kernel",
+            )
+        )
+        if is_mamba2:
+            intermediate_size = getattr(text_config, "intermediate_size", None)
+            if intermediate_size is None:
+                hidden_size = getattr(text_config, "hidden_size", None)
+                expand = getattr(text_config, "expand", 2)
+                if hidden_size is None:
+                    raise ValueError("Could not infer intermediate_size for Mamba2 recurrent cache config.")
+                intermediate_size = int(expand * hidden_size)
+
+            state_size = int(text_config.state_size)
+            n_groups = int(text_config.n_groups)
+            conv_dim = int(intermediate_size + 2 * n_groups * state_size)
+            conv_kernel_size = int(text_config.conv_kernel)
+            recurrent_shape = (int(text_config.num_heads), int(text_config.head_dim), state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=conv_dim,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 4) Mamba-style state space models
+        is_mamba = all(hasattr(text_config, name) for name in ("state_size", "conv_kernel", "intermediate_size"))
+        if is_mamba:
+            intermediate_size = int(text_config.intermediate_size)
+            state_size = int(text_config.state_size)
+            conv_kernel_size = int(text_config.conv_kernel)
+            recurrent_shape = (intermediate_size, state_size)
+
+            return RecurrentCacheConfig.create(
+                num_hidden_layers=num_hidden_layers,
+                partition_axis=partition_axis,
+                batch_size=batch_size,
+                conv_dim=intermediate_size,
+                conv_kernel_size=conv_kernel_size,
+                recurrent_state_shape=recurrent_shape,
+            )
+
+        # 5) Generic fallback
+        conv_dim = getattr(text_config, "intermediate_size", 2048)
+        conv_kernel_size = getattr(text_config, "d_conv", 4)
+        d_state = getattr(text_config, "state_size", 64)
+        return RecurrentCacheConfig.create(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            conv_dim=int(conv_dim),
+            conv_kernel_size=int(conv_kernel_size),
+            recurrent_state_shape=(int(conv_dim), int(d_state)),
+        )
+
+    def create_kda_cache_config(self, batch_size: int):
+        """Create KDACacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length (unused for KDA).
+
+        Returns:
+            KDACacheConfig configured for the model.
+        """
+        from easydel.layers.caching import KDACacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        linear_config = getattr(text_config, "linear_attn_config", None) or {}
+
+        num_heads = int(linear_config.get("num_heads", getattr(text_config, "num_attention_heads", 0) or 0))
+        head_k_dim = int(linear_config.get("head_k_dim", 128))
+        head_v_dim = int(linear_config.get("head_v_dim", 128))
+        d_conv = int(linear_config.get("d_conv", getattr(text_config, "d_conv", 4)))
+
+        if num_heads <= 0:
+            raise ValueError(
+                "Could not infer `num_heads` for KDACacheConfig; "
+                "expected `linear_attn_config['num_heads']` or `num_attention_heads`."
+            )
+
+        key_dim = num_heads * head_k_dim
+        value_dim = num_heads * head_v_dim
+        recurrent_shape = (num_heads, head_k_dim, head_v_dim)
+
+        return KDACacheConfig.create(
+            num_hidden_layers=num_hidden_layers,
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            d_conv=d_conv,
+            recurrent_state_shape=recurrent_shape,
+        )
+
+    def create_lightning_cache_config(self, batch_size: int):
+        """Create LightningCacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length (unused for lightning cache).
+
+        Returns:
+            LightningCacheConfig configured for the model.
+        """
+
+        from easydel.layers.caching import LightningCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        partition_axis = getattr(text_config, "partition_axis", None)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+
+        # Get heads/dims from config
+        num_heads = getattr(text_config, "num_attention_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        # Key/value heads for MQA/GQA
+        key_heads = getattr(text_config, "num_key_value_heads", num_heads)
+        value_heads = getattr(text_config, "num_key_value_heads", num_heads)
+
+        # Key/value dims (can be different from head_dim in some architectures)
+        key_dim = getattr(text_config, "key_dim", head_dim)
+        value_dim = getattr(text_config, "value_dim", head_dim)
+
+        return LightningCacheConfig.create(
+            partition_axis=partition_axis,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+        )
+
+    def create_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create RaggedPagesCacheConfig from model configuration.
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            page_size: Number of tokens per page.
+            hbm_utilization: Target HBM memory utilization fraction.
+            dtype: Data type for cache tensors.
+
+        Returns:
+            RaggedPagesCacheConfig configured for the model.
+        """
+        from easydel.layers.caching import RaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        return RaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            max_model_length=max_length,
+            kv_head_dim_size=head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+        )
+
+    def init_operations_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        *,
+        # RaggedPagesCache args (for ragged page attention)
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        quantizer=None,
+        masking_details=None,
+        starts: jnp.array | None = None,
+    ):
+        """Initialize cache using HybridCache as the universal per-layer container.
+
+        This method uses HybridCache to hold per-layer cache views, where each
+        layer gets the appropriate view type based on its operation:
+        - Attention operations -> TransformerCacheView
+        - GatedDeltaRule operations -> RecurrentCacheView
+        - KDA operations -> KDACacheView
+        - RaggedPageAttention operations -> RaggedPagesCacheView
+        - Lightning attention operations -> LightningCacheView
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            page_size: Page size for RaggedPagesCache (default 128).
+            hbm_utilization: HBM utilization for RaggedPagesCache (default 0.9).
+            dtype: Data type for cache tensors. Defaults to model's kvdtype.
+            quantizer: Optional quantizer for KV cache.
+            masking_details: Optional masking details for attention.
+
+        Returns:
+            HybridCache with per-layer views appropriate for each operation.
+
+        Example:
+            >>> # Standard usage - automatically creates appropriate views per layer
+            >>> cache = model.init_operations_cache(batch_size=1, max_length=2048)
+            >>> # cache.views[0] might be RecurrentCacheView (for linear attention layer)
+            >>> # cache.views[3] might be TransformerCacheView (for full attention layer)
+        """
+        from easydel.layers.caching import (
+            HybridCache,
+            KDACacheView,
+            LightningCacheView,
+            ParallelHybridCacheView,
+            RaggedPagesCacheView,
+            RecurrentCacheView,
+            TransformerCacheView,
+        )
+
+        text_config = self.config.get_text_config()
+        cache_view_mapping = self.get_operations_cache_view()
+
+        # Resolve dtype
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        # Check if any layer needs RaggedPagesCacheView and create shared config
+        shared_ragged_config = None
+        needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
+
+        if needs_ragged:
+            shared_ragged_config = self.create_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        with self.mesh:
+            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+            if num_hidden_layers is None:
+                num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
+
+            views = [None] * num_hidden_layers
+
+            for idx in range(num_hidden_layers):
+                view_class = cache_view_mapping.get(idx)
+                if view_class is None:
+                    raise ValueError(
+                        f"Missing cache view class for layer {idx}. "
+                        "Operation discovery did not return a cache view for every layer."
+                    )
+
+                if view_class is ParallelHybridCacheView:
+                    # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
+                    t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    transformer_view = TransformerCacheView.init(
+                        config=t_config,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        dtype=dtype,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                        masking_details=masking_details,
+                        starts=starts,
+                    )
+
+                    r_config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    recurrent_view = RecurrentCacheView.init(
+                        config=r_config,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+
+                    view = ParallelHybridCacheView(
+                        transformer=transformer_view,
+                        recurrent=recurrent_view,
+                        layer_index=idx,
+                    )
+                elif view_class is TransformerCacheView:
+                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    view = view_class.init(
+                        config=config,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        dtype=dtype,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                        masking_details=masking_details,
+                        starts=starts,
+                    )
+                elif view_class is RecurrentCacheView:
+                    config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    view = view_class.init(
+                        config=config,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                elif view_class is KDACacheView:
+                    config = self.create_kda_cache_config(batch_size=batch_size)
+                    view = view_class.init(
+                        config=config,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                elif view_class is RaggedPagesCacheView:
+                    view = view_class.init(
+                        config=shared_ragged_config,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                    )
+                elif view_class is LightningCacheView:
+                    config = self.create_lightning_cache_config(batch_size=batch_size)
+                    view = view_class.init(
+                        config=config,
+                        layer_index=idx,
+                        dtype=dtype,
+                    )
+                else:
+                    raise ValueError(f"Unknown cache view class: {view_class}")
+
+                views[idx] = view
+
+            return HybridCache(views=views)
+
+    def create_operations_metadata(
+        self,
+        *,
+        postpadded: bool = False,
+        starts: jnp.ndarray | None = None,
+        indexs: jnp.ndarray | None = None,
+        pages_tables: jnp.ndarray | None = None,
+        context_lens: jnp.ndarray | None = None,
+        query_start_loc: jnp.ndarray | None = None,
+        num_seqs: jnp.ndarray | None = None,
+        slot_mapping: jnp.ndarray | None = None,
+        position_ids: jnp.ndarray | None = None,
+        page_size: int = 128,
+    ) -> "OperationsMetadata":
+        """Create OperationsMetadata for use with cache operations.
+
+        This method creates OperationsMetadata that works with either:
+        - HybridCache: Uses HybridMetadata with embedded transformer fields
+        - RaggedPagesCache: Uses RaggedPagesMetadata (when ragged params provided)
+
+        For HybridCache (the default), the metadata includes fields needed by
+        TransformerCacheView layers (postpadded, starts, indexs). Recurrent
+        layers use their own internal state management.
+
+        Args:
+            postpadded: Whether sequences are post-padded (for transformer views).
+            starts: Starting positions for sequences (for transformer views).
+            indexs: Current position indices (for transformer views).
+            pages_tables: Page tables mapping (for ragged pages).
+            context_lens: Context lengths per sequence (for ragged pages).
+            query_start_loc: Query start locations (for ragged pages).
+            num_seqs: Number of sequences (for ragged pages).
+            slot_mapping: Slot mapping (for ragged pages).
+            position_ids: Position IDs (for ragged pages).
+            page_size: Page size (for ragged pages).
+
+        Returns:
+            OperationsMetadata configured for the cache type.
+
+        Example:
+            >>> # For HybridCache (default)
+            >>> metadata = model.create_operations_metadata(
+            ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
+            ... )
+            >>>
+            >>> # For RaggedPagesCache
+            >>> metadata = model.create_operations_metadata(
+            ...     pages_tables=..., context_lens=...
+            ... )
+        """
+        from easydel.layers.caching import OperationsMetadata
+
+        # Check if ragged pages metadata is requested
+        if pages_tables is not None and context_lens is not None:
+            return OperationsMetadata.for_ragged(
+                pages_tables=pages_tables,
+                context_lens=context_lens,
+                query_start_loc=query_start_loc,
+                num_seqs=num_seqs,
+                slot_mapping=slot_mapping,
+                position_ids=position_ids,
+                page_size=page_size,
+            )
+
+        # Default to hybrid metadata (works with HybridCache)
+        return OperationsMetadata.for_hybrid(
+            postpadded=postpadded,
             starts=starts,
-            mask_type_details=text_config.get_mask_details(),
+            indexs=indexs,
         )
 
     @cached_property
@@ -497,11 +1063,10 @@ class EasyGenerationMixin:
             else:
                 starts = self.compute_prefill_length(input_ids, pad_token_id)
 
-        past_key_values = self.init_cache(
+        past_key_values = self.init_operations_cache(
             batch_size=batch_size,
             max_length=max_length,
             starts=starts,
-            pad_token_id=pad_token_id,
         )
 
         if mask_info is None:
@@ -602,7 +1167,6 @@ class EasyGenerationMixin:
                 Defaults to returning None.
         """
         return None
-
 
     def _validate_signature(
         self,
@@ -1257,9 +1821,14 @@ class EasyGenerationMixin:
 
         def greedy_search_body_fn(state):
             """state update fn."""
-            call_kwargs = {
-                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
-            }
+            call_kwargs = dict(state.model_kwargs)
+            running_len = state.running_token.shape[1]
+            for mask_key in ("attention_mask", "decoder_attention_mask"):
+                mask = call_kwargs.get(mask_key, None)
+                if mask is None:
+                    continue
+                if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
+                    call_kwargs.pop(mask_key, None)
             model_outputs = model(state.running_token, **call_kwargs)
             logits = model_outputs.logits[:, -1]
 
@@ -1355,9 +1924,14 @@ class EasyGenerationMixin:
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
 
-            call_kwargs = {
-                k: v for k, v in state.model_kwargs.items() if k not in ("attention_mask", "decoder_attention_mask")
-            }
+            call_kwargs = dict(state.model_kwargs)
+            running_len = state.running_token.shape[1]
+            for mask_key in ("attention_mask", "decoder_attention_mask"):
+                mask = call_kwargs.get(mask_key, None)
+                if mask is None:
+                    continue
+                if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
+                    call_kwargs.pop(mask_key, None)
             model_outputs = model(state.running_token, **call_kwargs)
 
             logits = model_outputs.logits[:, -1]

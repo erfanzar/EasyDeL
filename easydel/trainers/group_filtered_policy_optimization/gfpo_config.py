@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -23,7 +21,7 @@ from ..group_relative_policy_optimization import GRPOConfig
 
 
 @Registry.register("trainer-arguments", "gfpo")
-@auto_pytree
+@dataclass
 class GFPOConfig(GRPOConfig):
     """Configuration class for Group Filtered Policy Optimization training.
 

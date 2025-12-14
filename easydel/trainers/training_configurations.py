@@ -22,7 +22,7 @@ import traceback
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import field
+from dataclasses import dataclass, field, fields
 
 import jax
 import jax.experimental
@@ -32,7 +32,6 @@ import numpy as np
 from eformer.loggings import get_logger
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
-from eformer.pytree import auto_pytree
 from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
 from optax import GradientTransformation
@@ -82,7 +81,7 @@ AVAILABLE_BACKENDS: list[str] = ["cpu", "gpu", "tpu", None]
 
 
 @Registry.register("trainer-arguments", "base")
-@auto_pytree
+@dataclass
 class TrainingArguments:
     """
     Comprehensive configuration class for training and evaluation.
@@ -1216,6 +1215,66 @@ class TrainingArguments:
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
         return json.loads(ePath(json_file).read_text())
+
+    def to_dict(self) -> dict[str, tp.Any]:
+        """Serializes this instance to a dictionary.
+
+        Returns:
+            dict[str, tp.Any]: A dictionary containing all serializable fields.
+        """
+        result = {}
+        for field_obj in fields(self):
+            value = getattr(self, field_obj.name)
+            if value is Ellipsis:
+                continue
+            if field_obj.name.startswith("_"):
+                continue
+            if isinstance(value, tuple):
+                result[field_obj.name] = list(value)
+            elif value is None:
+                result[field_obj.name] = None
+            elif hasattr(value, "to_dict") and callable(value.to_dict):
+                result[field_obj.name] = value.to_dict()
+            else:
+                try:
+                    json.dumps(value)
+                    result[field_obj.name] = value
+                except (TypeError, OverflowError):
+                    result[field_obj.name] = str(value)
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, tp.Any]):
+        """Deserializes a dictionary into a TrainingArguments instance.
+
+        Args:
+            data: Dictionary containing field names and values.
+
+        Returns:
+            TrainingArguments: A new instance created from the dictionary.
+        """
+        processed_data = {}
+        type_hints = tp.get_type_hints(cls)
+
+        for field_obj in fields(cls):
+            field_name = field_obj.name
+            if field_name not in data:
+                continue
+
+            value = data[field_name]
+            field_type = type_hints.get(field_name)
+
+            if (
+                value is not None
+                and isinstance(value, list)
+                and field_type is not None
+                and tp.get_origin(field_type) is tuple
+            ):
+                processed_data[field_name] = tuple(value)
+            else:
+                processed_data[field_name] = value
+
+        return cls(**processed_data)
 
     def to_json_string(self) -> str:
         """

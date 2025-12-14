@@ -63,10 +63,17 @@ from ejkernel.modules import ragged_decode_attention
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
+from easydel.layers.caching import TransformerCacheView
 from easydel.layers.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 from .vanilla_attention import VanillaAttn
 
 
@@ -103,6 +110,24 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             The `OperationMetadata` provided during initialization.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for AutoRegressiveDecodeAttn.
+
+        Decode attention operates specifically in decode mode and requires
+        basic metadata plus context lens. It works with transformer or hybrid cache.
+        Uses TransformerCacheView for KV-cache management.
+        """
+        return OperationRequirements.create(
+            name="autoregressive_decode",
+            required_metadata=MetadataField.basic() | MetadataField.CONTEXT_LENS,
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            cache_view_class=TransformerCacheView,
+        )
 
     @jax.named_scope("easydel-autoregressive_decodeattn")
     def forward_native(

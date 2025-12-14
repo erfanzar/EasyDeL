@@ -93,6 +93,7 @@ class RobertaConfig(EasyDeLBaseConfig):
         use_cache=True,
         classifier_dropout=None,
         gradient_checkpointing="nothing_saveable",
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -111,6 +112,9 @@ class RobertaConfig(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

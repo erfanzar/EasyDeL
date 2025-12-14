@@ -50,6 +50,11 @@ from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
@@ -190,6 +195,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Audio encoder doesn't need KV cache
         )
 
     def __call__(
@@ -707,6 +713,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
@@ -1251,8 +1258,8 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: chex.Array | None = None,
@@ -1660,8 +1667,8 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: chex.Array | None = None,
@@ -1839,8 +1846,8 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
         mask_info: MaskInfo,
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: chex.Array | None = None,
     ) -> DecoderLayerOutput:
@@ -1931,8 +1938,8 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> BaseModelOutput:
@@ -2050,8 +2057,8 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(EasyDeLBaseModule)
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> MoeCausalLMOutput:
@@ -2146,8 +2153,8 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         output_router_logits: bool = False,
@@ -2306,8 +2313,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         output_router_logits: bool = False,
@@ -2484,6 +2491,7 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Code2Wav encoder doesn't need KV cache
         )
 
     def __call__(
@@ -2828,8 +2836,8 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
         """Forward pass through text decoder only."""
         config = self.config
@@ -2990,8 +2998,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
         text_config = self.config.text_config
         output_router_logits = (
@@ -3219,8 +3227,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         text_config = self.config.text_config
@@ -3453,8 +3461,8 @@ class Qwen3OmniMoeForConditionalGeneration(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass through the Thinker component.

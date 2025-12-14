@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -26,7 +24,7 @@ from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 
 
 @Registry.register("trainer-arguments", "nash-md")
-@auto_pytree
+@dataclass
 class NashMDConfig(GRPOConfig):
     """Configuration for the :class:`~easydel.trainers.NashMDTrainer`.
 

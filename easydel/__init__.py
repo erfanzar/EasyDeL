@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 
 import os as _os
 import sys as _sys
@@ -288,6 +288,16 @@ _import_structure = {
         "FalconConfig",
         "FalconForCausalLM",
         "FalconModel",
+    ],
+    "modules.falcon_h1": [
+        "FalconH1Config",
+        "FalconH1ForCausalLM",
+        "FalconH1Model",
+    ],
+    "modules.falcon_mamba": [
+        "FalconMambaConfig",
+        "FalconMambaForCausalLM",
+        "FalconMambaModel",
     ],
     "modules.gemma": [
         "GemmaConfig",
@@ -751,6 +761,8 @@ if _tp.TYPE_CHECKING:
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
     from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
+    from .modules.falcon_h1 import FalconH1Config, FalconH1ForCausalLM, FalconH1Model
+    from .modules.falcon_mamba import FalconMambaConfig, FalconMambaForCausalLM, FalconMambaModel
     from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
     from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
     from .modules.gemma3 import (

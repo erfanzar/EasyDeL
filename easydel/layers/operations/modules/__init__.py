@@ -20,6 +20,8 @@ from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
+from .ssm1 import SSM1Op, SSM1Output
+from .ssm2 import SSM2Op, SSM2Output
 from .vanilla_attention import VanillaAttn
 
 __all__ = (
@@ -33,6 +35,10 @@ __all__ = (
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
     "RingAttn",
+    "SSM1Op",
+    "SSM1Output",
+    "SSM2Op",
+    "SSM2Output",
     "ScaledDotProductAttn",
     "VanillaAttn",
     "fused_kda_gate",

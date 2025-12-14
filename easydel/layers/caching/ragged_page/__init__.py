@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cache import RaggedPagesCache, RaggedPagesCacheMetaData, RaggedPagesCacheView, RaggedPagesMetadata
+from .cache import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
 
 __all__ = ("RaggedPagesCache", "RaggedPagesCacheView", "RaggedPagesCacheView", "RaggedPagesMetadata")

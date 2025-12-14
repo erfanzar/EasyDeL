@@ -40,6 +40,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
@@ -150,6 +153,7 @@ class RobertaSelfAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            requires_cache=False,  # RoBERTa is encoder-only, doesn't need KV cache
         )
         self.query = ColumnParallelLinear(
             self.config.hidden_size,
@@ -201,7 +205,7 @@ class RobertaSelfAttention(AttentionModule):
         layer_head_mask: Bool[Array, "num_heads"] | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
     ):
@@ -358,7 +362,7 @@ class RobertaAttention(nn.Module):
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states=None,
         output_attentions: bool = False,
     ):
@@ -514,7 +518,7 @@ class RobertaLayer(nn.Module):
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
@@ -599,8 +603,8 @@ class RobertaEncoder(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -870,7 +874,7 @@ class RobertaModel(EasyDeLBaseModule):
         head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1458,7 +1462,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
         head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):

@@ -188,8 +188,15 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
 
     @property
     def linear_d_inner(self) -> int:
-        """Return the inner dimension for linear attention."""
-        return self.linear_num_key_heads * self.linear_key_head_dim
+        """Return the inner dimension for linear attention convolution state.
+
+        This is the conv_dim used in Qwen3NextLinearAttention:
+        conv_dim = key_dim * 2 + value_dim
+        where key_dim = num_k_heads * head_k_dim and value_dim = num_v_heads * head_v_dim
+        """
+        key_dim = self.linear_num_key_heads * self.linear_key_head_dim
+        value_dim = self.linear_num_value_heads * self.linear_value_head_dim
+        return key_dim * 2 + value_dim
 
     @property
     def linear_d_state(self) -> int:

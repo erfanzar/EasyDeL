@@ -100,6 +100,22 @@ class TestQwen3VL:
         )
         assert result.success, f"Qwen3-VL text-only failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, qwen3_vl_config, small_model_config):
+        """Test Qwen3-VL text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="qwen3_vl",
+            hf_class=transformers.Qwen3VLForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=qwen3_vl_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Qwen3-VL generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

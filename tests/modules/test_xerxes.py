@@ -38,6 +38,19 @@ class TestXerxes:
         )
         assert result.success, f"Xerxes CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, xerxes_config, small_model_config):
+        """Test Xerxes text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="xerxes",
+            hf_class=None,
+            task=ed.TaskType.CAUSAL_LM,
+            config=xerxes_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Xerxes generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

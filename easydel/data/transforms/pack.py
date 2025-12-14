@@ -486,7 +486,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
                 source_id = example.get("__source__")
 
-                if isinstance(packer, (PoolPacker, FirstFitPacker)):
+                if isinstance(packer, (PoolPacker, FirstFitPacker)):  # noqa:UP038
                     results = packer.add(list(tokens), source_id)
                     for packed in results:
                         out = emit(packed)
@@ -500,7 +500,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
                             yield out
 
         # Flush packer
-        if isinstance(packer, (PoolPacker, FirstFitPacker)):
+        if isinstance(packer, (PoolPacker, FirstFitPacker)):  # noqa:UP038
             for packed in packer.flush_all():
                 out = emit(packed)
                 if out is not None:
@@ -534,8 +534,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
     def __repr__(self) -> str:
         return (
-            f"PackedShardedSource(seq_length={self._seq_length}, "
-            f"strategy={self._strategy!r}, source={self._source!r})"
+            f"PackedShardedSource(seq_length={self._seq_length}, strategy={self._strategy!r}, source={self._source!r})"
         )
 
 

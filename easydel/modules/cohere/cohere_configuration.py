@@ -104,6 +104,7 @@ class CohereConfig(EasyDeLBaseConfig):
         use_qk_norm: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes the CohereConfig instance.
@@ -156,6 +157,9 @@ class CohereConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.head_dim = hidden_size // num_attention_heads
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
