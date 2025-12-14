@@ -4,14 +4,14 @@ easydel.inference package
 .. toctree::
    :maxdepth: 2
 
-   inference/esurge/index
-   inference/evaluations/index
-   inference/tools/index
-   inference/vwhisper/index
-   inference/decoders
-   inference/inference_engine_interface
-   inference/logits_process
-   inference/oai_proxies
-   inference/openai_api_modules
-   inference/sampling_funcs
-   inference/sampling_params
+   esurge/index
+   evaluations/index
+   tools/index
+   vwhisper/index
+   decoders
+   inference_engine_interface
+   logits_process
+   oai_proxies
+   openai_api_modules
+   sampling_funcs
+   sampling_params

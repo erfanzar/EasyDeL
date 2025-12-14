@@ -95,7 +95,7 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
 from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
-from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin
+from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -113,7 +113,8 @@ BaseConf = EasyDeLBaseConfig
 
 @dataclass
 class ParameterTransformRule:
-    """Rule for transforming MoE parameter names and tensors.
+    """
+    Rule for transforming MoE parameter names and tensors.
 
     This dataclass defines transformation rules that can be applied to parameter
     names and their associated tensor values during model conversion or loading.
@@ -148,7 +149,7 @@ class ParameterTransformRule:
     consolidate_experts: bool = False
 
 
-class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseModuleProtocol):
+class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin, BaseModuleProtocol):
     """
     Base class for EasyDeL modules, providing common functionalities for model initialization,
     parameter handling, and integration with the EasyDeL ecosystem.
@@ -1298,10 +1299,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, BaseMod
         from easydel.layers.quantization import Array8B, ArrayNF4, Linear8bit, LinearNF4
 
         for _, tensor in nn.iter_graph(self):
-            if isinstance(tensor, (Linear8bit, LinearNF4)):
+            if isinstance(tensor, (Linear8bit, LinearNF4)):  # noqa:UP038
                 return True
 
-            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):
+            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):  # noqa:UP038
                 return True
         return False
 

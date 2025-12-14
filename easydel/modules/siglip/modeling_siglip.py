@@ -268,6 +268,7 @@ class SiglipAttention(AttentionModule):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
             rngs=rngs,
+            requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
 
     def _split_heads(self, hidden_states):

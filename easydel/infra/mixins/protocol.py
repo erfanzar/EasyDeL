@@ -107,7 +107,14 @@ if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
     from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
+    from easydel.layers.caching import (
+        HybridCache,
+        OperationsMetadata,
+        RaggedPagesCache,
+        RaggedPagesMetadata,
+        TransformerCache,
+        TransformerMetadata,
+    )
 
 
 def return_type_adjuster(
@@ -282,8 +289,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -350,8 +357,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeModelOutput:
         """
@@ -388,8 +395,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """
@@ -504,8 +511,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         mask_info: MaskInfo | None = None,
         position_ids: chex.Array | None = None,
         segment_ids: chex.Array | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         loss_config: LossConfig | None = None,
@@ -578,8 +585,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeModelOutput, LossMetrics]:
@@ -617,8 +624,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeCausalLMOutput, LossMetrics]:
@@ -1024,40 +1031,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
-        """Creates the metadata required for initializing a standard (non-paged) KV Cache.
-
-        Args:
-            batch_size: The batch size for which the cache is being configured.
-            max_length: The maximum sequence length the cache needs to support.
-            pad_token_id: The ID of the padding token. If None, it's inferred.
+    def get_inference_cache_type(self) -> str:
+        """Determine the appropriate cache type for inference.
 
         Returns:
-            An initialized metadata object for a standard KV cache.
-        """
-        ...
-
-    @abstractmethod
-    def create_paged_metadata(
-        self,
-        hbm_utilization: float,
-        page_size: int,
-        max_model_length: int,
-    ):
-        """Creates the static configuration metadata required for initializing a Paged KV Cache.
-
-        Args:
-            hbm_utilization: Target HBM memory utilization fraction.
-            page_size: Number of tokens per page in the paged cache.
-            max_model_length: Maximum sequence length the model will handle.
-
-        Returns:
-            An initialized metadata object containing the static configuration for the paged cache.
+            str: Either "hybrid" (for models with layer_types) or "ragged" (for pure attention).
         """
         ...
 

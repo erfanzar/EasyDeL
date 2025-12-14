@@ -45,6 +45,8 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -298,7 +300,7 @@ class GiddAttention(AttentionModule):
         mask_info: MaskInfo,
         noise_mask: chex.Array,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
         """
         Prepare and concatenate key, value, and attention mask for attention computation.
@@ -382,7 +384,7 @@ class GiddAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> tuple[chex.Array, chex.Array]:
@@ -644,7 +646,7 @@ class GiddLayer(nn.Module):
         noise_mask: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
@@ -803,8 +805,8 @@ class GiddModel(EasyDeLBaseModule):
         log_snr: chex.Array | None = None,
         noise_mask: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -1052,8 +1054,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         log_snr: chex.Array | None = None,
         noise_mask: chex.Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,

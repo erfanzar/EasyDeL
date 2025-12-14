@@ -41,6 +41,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -202,7 +204,7 @@ class DbrxAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -339,7 +341,7 @@ class DbrxNormAttentionNorm(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
@@ -692,7 +694,7 @@ class DbrxBlock(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES | None,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -821,8 +823,8 @@ class DbrxModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
         """
         Forward pass of the model.
@@ -992,8 +994,8 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass of the DbrxForCausalLM model."""
@@ -1067,8 +1069,8 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits

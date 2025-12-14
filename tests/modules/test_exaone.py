@@ -44,6 +44,19 @@ class TestEXAONE:
         )
         assert result.success, f"EXAONE CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, exaone_config, hf_exaone_class, small_model_config):
+        """Test EXAONE text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="exaone",
+            hf_class=hf_exaone_class,
+            task=ed.TaskType.CAUSAL_LM,
+            config=exaone_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"EXAONE generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

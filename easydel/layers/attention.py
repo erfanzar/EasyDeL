@@ -66,7 +66,13 @@ from jaxtyping import Bool, Complex, Float, Int
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
-from .caching import RaggedPagesCacheView, RaggedPagesMetadata, TransformerCacheView, TransformerMetadata
+from .caching import (
+    OperationsMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from .operations import AttentionOutput, OperationMetadata, OperationRegistry
 from .quantization.quantizers import EasyQuantizer
 
@@ -270,6 +276,7 @@ class FlexibleAttentionModule(nn.Module):
         *,
         rngs: nn.Rngs | None = None,
         attn_mechanism: AttentionMechanisms | None = None,
+        requires_cache: bool | None = None,
     ):
         """
         Initializes the AttentionModule.
@@ -280,6 +287,10 @@ class FlexibleAttentionModule(nn.Module):
             softmax_scale (float): The scaling factor to apply before the softmax function.
             dropout_prob (float, optional): The dropout probability for attention weights.
                                              Defaults to 0.0.
+            requires_cache (bool | None, optional): Override for cache requirements.
+                - None: Use the operation's class-level default (default).
+                - False: Disable cache (useful for encoder-only models like vision encoders).
+                - True: Force cache requirement.
         """
 
         if attn_mechanism is None:
@@ -314,14 +325,23 @@ class FlexibleAttentionModule(nn.Module):
         self.rngs: nn.Rngs = rngs_computed
         self.softmax_scale: float = softmax_scale
         self.dropout_prob: float = dropout_prob
+        self._requires_cache: bool | None = requires_cache
         impl_name_final: str = attn_mechanism
-        self.impl: tp.Any = OperationRegistry.create(impl_name=impl_name_final, metadata=metadata)
+        self.impl: tp.Any = OperationRegistry.create(
+            impl_name=impl_name_final,
+            metadata=metadata,
+            requires_cache=requires_cache,
+        )
         self.deterministic: bool = True
         self.impl_decode: tp.Any | None = None
         has_decode_mechanism: bool = base_config.decode_attn_mechanism is not None
         if has_decode_mechanism:
             decode_impl_name: str = base_config.decode_attn_mechanism
-            self.impl_decode = OperationRegistry.create(impl_name=decode_impl_name, metadata=metadata)
+            self.impl_decode = OperationRegistry.create(
+                impl_name=decode_impl_name,
+                metadata=metadata,
+                requires_cache=requires_cache,
+            )
 
     @jax.named_scope("easydel-flexible-attention")
     def forward(
@@ -333,7 +353,7 @@ class FlexibleAttentionModule(nn.Module):
         mask_info: MaskInfo | None = None,
         bias: Float[JArray, "batch heads seq_q seq_k"] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         init_bias: tp.Callable[[], Float[JArray, "batch heads seq_q seq_k"]] | None = None,
         causal: bool = True,
@@ -494,6 +514,51 @@ class FlexibleAttentionModule(nn.Module):
 
     __call__ = forward
 
+    # Operation access properties for dynamic discovery
+    @property
+    def operation_executor(self):
+        """Get an OperationExecutor for mode-bound operation access.
+
+        Returns:
+            OperationExecutor wrapping prefill and decode operations.
+        """
+        from easydel.layers.operations.executor import OperationExecutor
+
+        return OperationExecutor(
+            prefill_impl=self.impl,
+            decode_impl=self.impl_decode,
+            mixin_impl=None,
+        )
+
+    @property
+    def operation(self):
+        """Get the primary (prefill) operation instance."""
+        return self.impl
+
+    @property
+    def decode_operation(self):
+        """Get the decode operation instance (if different from prefill)."""
+        return self.impl_decode
+
+    @property
+    def operation_requirements(self):
+        """Get combined requirements from both prefill and decode operations.
+
+        Returns:
+            OperationRequirements with combined metadata/cache requirements.
+        """
+        return self.operation_executor.get_combined_requirements()
+
+    @property
+    def requires_cache(self) -> bool:
+        """Whether this attention module requires cache."""
+        return self.operation_executor.requires_cache
+
+    @property
+    def has_separate_decode(self) -> bool:
+        """Whether decode uses a different operation than prefill."""
+        return self.operation_executor.has_separate_decode
+
 
 Cfg = tp.TypeVar("Cfg", bound=EasyDeLBaseConfig)
 """Type variable for configuration objects."""
@@ -618,9 +683,10 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                        adjusted by the cache index if provided. Shape usually [batch, q_len].
         """
         end_index: int | Int[JArray, "batch 1"] = 0
-        is_cache_view: bool = isinstance(cache_view, TransformerCacheView)
         is_decode: bool = mode == common_types.MODE_DECODE
-        should_use_cache_index: bool = is_cache_view and is_decode
+        # Support transformer-like composite cache views (e.g., ParallelHybridCacheView)
+        has_indexs: bool = cache_view is not None and hasattr(cache_view, "indexs")
+        should_use_cache_index: bool = has_indexs and is_decode
         if should_use_cache_index:
             cache_indexs = cache_view.indexs
             end_index = jnp.reshape(cache_indexs, (-1, 1))
@@ -838,7 +904,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES | common_types.EMPTY_VAL = common_types.NOT_GIVEN,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         sliding_window: int | None = None,
     ) -> tuple[
         Array,
@@ -952,8 +1018,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         should_apply_sliding: bool = sliding_window_provided or has_cache_sliding
 
         if should_apply_sliding:
-            is_transformer_cache: bool = isinstance(cache_view, TransformerCacheView)
-            masking_details_final: AttnMaskDetail | None = cache_view.masking_details if is_transformer_cache else None
+            # Support transformer-like composite cache views (e.g., ParallelHybridCacheView)
+            masking_details_final: AttnMaskDetail | None = getattr(cache_view, "masking_details", None)
             has_masking_details: bool = masking_details_final is not None
             is_sliding_type: bool = has_masking_details and masking_details_final.mask_type == AttnMaskType.SLIDING
             sliding_window_computed: int | tuple[int, int]

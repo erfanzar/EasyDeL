@@ -50,6 +50,8 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -168,7 +170,7 @@ class OPTAttention(AttentionModule):
         mask_info: MaskInfo | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states: chex.Array | None = None,
         output_attentions: bool = False,
     ) -> AttentionLayerOutput:
@@ -333,7 +335,7 @@ class OPTDecoderLayer(nn.Module):
         mask_info: MaskInfo | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
     ) -> DecoderLayerOutput:
         """Forward pass of the OPTDecoderLayer.
@@ -615,8 +617,8 @@ class OPTDecoder(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -765,8 +767,8 @@ class OPTModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,

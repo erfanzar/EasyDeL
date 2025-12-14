@@ -42,6 +42,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -526,6 +528,7 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
             attn_mechanism="vanilla",
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
@@ -1217,7 +1220,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: chex.Array | None = None,
@@ -1278,9 +1281,9 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        assert isinstance(config, Qwen3VLMoeTextConfig), (
-            f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
-        )
+        assert isinstance(
+            config, Qwen3VLMoeTextConfig
+        ), f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1342,8 +1345,8 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -1704,8 +1707,8 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -1941,8 +1944,8 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,

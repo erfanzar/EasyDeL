@@ -27,6 +27,12 @@ from eformer.loggings import get_logger
 from easydel.utils.helpers import check_bool_flag
 
 from ._operation_meta import OperationMetadata
+from .requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 
 logger = get_logger("EasyDeL-BaseOperation")
 
@@ -72,6 +78,52 @@ class BaseOperation(ABC):
         Returns:
             The `OperationMetadata` instance passed during initialization.
         """
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """
+        Returns the operation requirements for metadata and cache types.
+
+        Operations override this method to declare:
+        - Required metadata fields (sequence lengths, page tables, etc.)
+        - Supported cache types (transformer, ragged pages, hybrid, etc.)
+
+        The inference engine uses these requirements to:
+        - Build only necessary metadata (avoiding unnecessary computation)
+        - Validate cache compatibility at initialization
+        - Provide clear error messages when requirements aren't met
+
+        Args:
+            mode: The execution mode (prefill, decode, or mixed). Some operations
+                  may have different requirements based on the mode.
+
+        Returns:
+            OperationRequirements declaring metadata and cache needs.
+
+        Example:
+            >>> from easydel.layers.operations.requirements import (
+            ...     RequirementsBuilder, MetadataField, CacheType
+            ... )
+            >>> @classmethod
+            ... def get_requirements(cls, mode=ExecutionMode.MIXED):
+            ...     return (RequirementsBuilder(cls.get_impl_name())
+            ...         .require_metadata(MetadataField.PAGES_TABLES)
+            ...         .support_cache(CacheType.RAGGED_PAGES)
+            ...         .build())
+        """
+        # Default implementation: basic metadata, any cache type
+        # Subclasses should override with specific requirements
+        name = cls.get_impl_name()
+        if isinstance(name, tuple):
+            name = name[0]
+        return OperationRequirements.create(
+            name=name,
+            required_metadata=MetadataField.basic(),
+            supported_cache=CacheType.any(),
+        )
 
     def current_backend(self) -> tp.Literal["tpu", "gpu", "cpu"]:
         """
@@ -319,7 +371,12 @@ class OperationRegistry:
         return impl_class
 
     @classmethod
-    def create(cls, impl_name: str, metadata: OperationMetadata) -> BaseOperation:
+    def create(
+        cls,
+        impl_name: str,
+        metadata: OperationMetadata,
+        requires_cache: bool | None = None,
+    ) -> BaseOperation:
         """
         Creates an instance of an attention implementation by name.
 
@@ -329,6 +386,11 @@ class OperationRegistry:
         Args:
             impl_name: The name of the implementation to instantiate.
             metadata: The `OperationMetadata` to pass to the implementation's constructor.
+            requires_cache: Optional override for cache requirements. If provided,
+                overrides the metadata's requires_cache setting for this instance.
+                - None: Use metadata's requires_cache (or class default if metadata is None)
+                - False: Disable cache (e.g., for vision encoders)
+                - True: Force cache requirement
 
         Returns:
             An initialized instance of the requested `OperationImpl` subclass.
@@ -336,6 +398,10 @@ class OperationRegistry:
         Raises:
             ValueError: If no implementation is registered with `impl_name`.
         """
+        # Apply requires_cache override to metadata if provided
+        if requires_cache is not None:
+            metadata.requires_cache = requires_cache
+
         impl_cls: type[BaseOperation] = cls.get(impl_name)
         instance: BaseOperation = impl_cls(metadata)
         return instance

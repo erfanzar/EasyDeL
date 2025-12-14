@@ -189,10 +189,10 @@ class eSurgeRunner:
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
         self.model = model.esurge_compatible_model
-        self.metadata = model.create_paged_metadata(
+        self.metadata = model.create_ragged_page_cache_config(
             hbm_utilization=hbm_utilization,
             page_size=page_size,
-            max_model_length=max_model_len,
+            max_length=max_model_len,
         )
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
@@ -857,7 +857,6 @@ class eSurgeRunner:
 
         start_index = 0
         total_step_time = 0.0
-        total_sync_time = 0.0
         total_post_proc_time = 0.0
 
         req_ids_all: list[str] = []
@@ -952,7 +951,6 @@ class eSurgeRunner:
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
             step_start = time.time()
             (
-                minimal_device_state,
                 out_tokens_win,
                 valid_mask_win,
                 self.input_ids_buf,
@@ -988,10 +986,6 @@ class eSurgeRunner:
             for req_state in vision_request_states:
                 req_state.clear_vision_data()
 
-            # Start async copy to host (non-blocking) - overlaps with post-processing
-            token_ids_async = jax.copy_to_host_async(minimal_device_state.token_ids)
-            num_tokens_async = jax.copy_to_host_async(minimal_device_state.num_tokens)
-
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
 
@@ -1018,6 +1012,10 @@ class eSurgeRunner:
                         req_state = self.requests[rid]
                         seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0)
 
+                        req_idx = self.sequence_buffer.req_id_to_index.get(rid)
+                        if req_idx is not None and 0 <= seq_len < self.max_model_len:
+                            self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+
                         # Check if async scheduling is enabled
                         if scheduler_output.async_scheduling:
                             # Async mode: don't append yet, will be done in next iteration
@@ -1041,19 +1039,6 @@ class eSurgeRunner:
 
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
-
-            # Complete async sync-back (should be done by now, overlapped with post-processing)
-            sq_utime = time.time()
-            token_ids_updated = np.asarray(token_ids_async)
-            num_tokens_updated = np.asarray(num_tokens_async)
-            if not token_ids_updated.flags.writeable:
-                token_ids_updated = token_ids_updated.copy()
-            if not num_tokens_updated.flags.writeable:
-                num_tokens_updated = num_tokens_updated.copy()
-            self.sequence_buffer.token_ids = token_ids_updated
-            self.sequence_buffer.num_computed_tokens = num_tokens_updated
-            sq_utime_took = time.time() - sq_utime
-            total_sync_time += sq_utime_took
 
             start_index = end_index
 

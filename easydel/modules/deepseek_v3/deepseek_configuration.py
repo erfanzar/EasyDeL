@@ -190,6 +190,7 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new DeepseekV3Config instance.
@@ -280,6 +281,9 @@ class DeepseekV3Config(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -271,10 +271,11 @@ class CausalLMTester(BaseTester):
     def test_generation(
         self,
         module_name: str,
-        hf_class: type,
+        hf_class: type | None,
         config: Any,
         small_model_config: dict,
         max_new_tokens: int = 16,
+        task: ed.TaskType = ed.TaskType.CAUSAL_LM,
     ) -> TestResult:
         """Test that generation runs without errors.
 
@@ -284,6 +285,7 @@ class CausalLMTester(BaseTester):
             config: Model configuration
             small_model_config: Base config dictionary
             max_new_tokens: Number of tokens to generate
+            task: Task type used to look up the EasyDeL module.
 
         Returns:
             TestResult indicating if generation succeeded
@@ -293,13 +295,13 @@ class CausalLMTester(BaseTester):
         try:
             # Setup config
             config = setup_config(config, small_model_config)
-
+            config.sharding_axis_dims = (1, 1, -1, 1, 1)
             # Handle EasyDeL-only models (no HF model needed for generation test)
             if hf_class is None:
                 with config.mesh:
                     ed_model = create_ed_model_only(
                         module_name=module_name,
-                        task=ed.TaskType.CAUSAL_LM,
+                        task=task,
                         config=config,
                         small_model_config=small_model_config,
                     )
@@ -352,7 +354,7 @@ class CausalLMTester(BaseTester):
             with config.mesh:
                 ed_model = create_ed_model(
                     module_name=module_name,
-                    task=ed.TaskType.CAUSAL_LM,
+                    task=task,
                     config=config,
                     small_model_config=small_model_config,
                     hf_model=hf_model,
@@ -814,6 +816,7 @@ class Seq2SeqTester(BaseTester):
         config: Any,
         small_model_config: dict,
         max_new_tokens: int = 16,
+        task: ed.TaskType = ed.TaskType.SEQUENCE_TO_SEQUENCE,
     ) -> TestResult:
         """Test encoder-decoder generation.
 
@@ -823,6 +826,7 @@ class Seq2SeqTester(BaseTester):
             config: Model configuration
             small_model_config: Base config dictionary
             max_new_tokens: Number of tokens to generate
+            task: Task type used to look up the EasyDeL module.
 
         Returns:
             TestResult indicating if generation succeeded
@@ -837,7 +841,7 @@ class Seq2SeqTester(BaseTester):
             with config.mesh:
                 ed_model = create_ed_model(
                     module_name=module_name,
-                    task=ed.TaskType.SEQUENCE_TO_SEQUENCE,
+                    task=task,
                     config=config,
                     small_model_config=small_model_config,
                     hf_model=hf_model,

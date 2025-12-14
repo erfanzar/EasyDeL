@@ -127,6 +127,7 @@ class Xerxes2Config(EasyDeLBaseConfig):
         mlp_only_layers: list[int] | None = None,
         hidden_act: str | None = None,
         rope_scaling: dict | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.bits = bits
@@ -156,6 +157,9 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
         self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

@@ -354,6 +354,7 @@ class PixtralAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(

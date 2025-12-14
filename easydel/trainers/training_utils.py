@@ -50,10 +50,20 @@ def make_assertions_and_get_sizes(
             ValueError: If the batch size is not divisible by the gradient accumulation steps.
     """
 
-    batch_size = batch[next(iter(batch.keys()))].shape[0]
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("`gradient_accumulation_steps` must be greater than 0.")
+
+    batch_size = None
+    for leaf in tu.tree_leaves(batch):
+        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
+            batch_size = leaf.shape[0]
+            break
+    if batch_size is None:
+        raise ValueError(
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+        )
+
     minibatch_size = batch_size // gradient_accumulation_steps
-    if not gradient_accumulation_steps > 0:
-        ValueError("`gradient_accumulation_steps` must be greater than 0.")
     if minibatch_size * gradient_accumulation_steps != batch_size:
         raise ValueError("Batch size must be divisible by gradient accumulation steps.")
     if batch_partition_spec is None:
@@ -148,7 +158,23 @@ def minibatch_call(
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
     Uses eval_shape to initialize accumulator structures efficiently.
     """
-    num_accum_steps = len(next(iter(batch.values()))) // minibatch_size
+    batch_size = None
+    for leaf in tu.tree_leaves(batch):
+        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
+            batch_size = leaf.shape[0]
+            break
+    if batch_size is None:
+        raise ValueError(
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+        )
+    if minibatch_size <= 0:
+        raise ValueError(f"`minibatch_size` must be > 0, got {minibatch_size}.")
+
+    num_accum_steps = batch_size // minibatch_size
+    if num_accum_steps * minibatch_size != batch_size:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by minibatch_size ({minibatch_size}) for gradient accumulation."
+        )
     if num_accum_steps > 1:
 
         def reshape_to_minibatches(arr):

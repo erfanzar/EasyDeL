@@ -49,7 +49,7 @@ class TestAyaVision:
         num_patches = (image_size // patch_size) ** 2
         # AyaVision uses pixel_shuffle with downsample_factor=2, which reduces tokens by 4x
         downsample_factor = 2
-        num_image_tokens = num_patches // (downsample_factor ** 2)
+        num_image_tokens = num_patches // (downsample_factor**2)
 
         return {
             "image_token_id": aya_vision_config.image_token_index,
@@ -94,6 +94,23 @@ class TestAyaVision:
             small_model_config=local_cfg,
         )
         assert result.success, f"Aya Vision text-only failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, aya_vision_config, small_model_config):
+        """Test Aya Vision text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+        local_cfg["vocab_size"] = aya_vision_config.text_config.vocab_size
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="aya_vision",
+            hf_class=transformers.AyaVisionForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=aya_vision_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Aya Vision generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

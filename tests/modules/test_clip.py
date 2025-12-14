@@ -1,20 +1,19 @@
 """Tests for CLIP model."""
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-import transformers
-
-import jax.numpy as jnp
 import torch
+import transformers
 
 import easydel as ed
 
 try:
     from .test_utils import compare_hidden_states, setup_config
-    from .test_utils.model_factory import create_ed_model, create_hf_model, cleanup_models
+    from .test_utils.model_factory import cleanup_models, create_ed_model, create_hf_model
 except ImportError:
     from test_utils import compare_hidden_states, setup_config
-    from test_utils.model_factory import create_ed_model, create_hf_model, cleanup_models
+    from test_utils.model_factory import cleanup_models, create_ed_model, create_hf_model
 
 
 class TestCLIP:
@@ -71,8 +70,8 @@ class TestCLIP:
             # Generate pixel_values input (not input_ids)
             batch_size = small_model_config["batch_size"]
             image_size = config.image_size
-            np.random.seed(42)
-            pixel_values_np = np.random.randn(batch_size, 3, image_size, image_size).astype(np.float32)
+            rng = np.random.default_rng(42)
+            pixel_values_np = rng.standard_normal((batch_size, 3, image_size, image_size), dtype=np.float32)
 
             # Run HF forward
             hf_output = hf_model(
@@ -118,8 +117,8 @@ class TestCLIP:
             # Generate text inputs
             batch_size = small_model_config["batch_size"]
             seq_len = min(small_model_config["sequence_length"], config.max_position_embeddings)
-            np.random.seed(42)
-            input_ids_np = np.random.randint(0, config.vocab_size, (batch_size, seq_len))
+            rng = np.random.default_rng(42)
+            input_ids_np = rng.integers(0, config.vocab_size, size=(batch_size, seq_len), dtype=np.int64)
             attention_mask_np = np.ones((batch_size, seq_len), dtype=np.int64)
 
             # Run HF forward

@@ -42,6 +42,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -650,7 +652,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: tuple[chex.Array, chex.Array] | None = None,
     ) -> DecoderLayerOutput:
@@ -788,8 +790,8 @@ class DeepseekV2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -968,8 +970,8 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1025,12 +1027,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int):
         """Create cache metadata for MLA attention.
 
         MLA uses different dimensions for keys and values:
@@ -1043,26 +1040,18 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             pad_token_id: Padding token ID (optional)
 
         Returns:
-            TransformerCacheMetaData configured for MLA
+            TransformerCacheConfig configured for MLA
         """
-        from easydel.layers.caching import TransformerCacheMetaData
+        from easydel.layers.caching import TransformerCacheConfig
 
         config = self.config
-        if pad_token_id is None:
-            if hasattr(self, "generation_config") and self.generation_config is not None:
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(config, "pad_token_id"):
-                pad_token_id = config.pad_token_id
-            else:
-                pad_token_id = 0
 
         # MLA dimensions
         q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         v_head_dim = config.v_head_dim
 
-        return TransformerCacheMetaData.create(
+        return TransformerCacheConfig.create(
             num_hidden_layers=config.num_hidden_layers,
-            pad_token_id=pad_token_id,
             batch_size=batch_size,
             sequence_length=max_length,
             num_heads=config.num_attention_heads,
@@ -1072,11 +1061,13 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             value_dim=v_head_dim,
         )
 
-    def create_paged_metadata(
+    def create_ragged_page_cache_config(
         self,
-        hbm_utilization: float,
-        page_size: int,
-        max_model_length: int,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
     ):
         """Create paged cache metadata for MLA attention.
 
@@ -1090,10 +1081,10 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             max_model_length: Maximum model sequence length
 
         Returns:
-            RaggedPagesCacheMetaData configured for MLA
+            RaggedPagesCacheConfig configured for MLA
         """
-        from easydel.layers.caching import RaggedPagesCacheMetaData
         from easydel.layers.attention import AttentionMechanisms
+        from easydel.layers.caching import RaggedPagesCacheConfig
 
         config = self.config
         text_config = config.get_text_config()
@@ -1110,11 +1101,11 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
             case _:
                 version = "v3"
 
-        return RaggedPagesCacheMetaData.create(
+        return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
             partition_manager=text_config.partition_manager,
             kvdtype=text_config.kvdtype,
-            max_model_length=max_model_length,
+            max_model_length=max_length,
             num_hidden_layers=config.num_hidden_layers,
             num_kv_heads=config.num_attention_heads,
             kv_head_dim_size=q_head_dim,

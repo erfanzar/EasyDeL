@@ -51,8 +51,17 @@ from eformer.pytree import auto_pytree
 from jax import lax
 from jaxtyping import Array, Float
 
+from easydel.layers.caching import KDACacheView
+
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+    RequirementsBuilder,
+)
 
 _MATMUL_PRECISION = lax.Precision.HIGHEST
 
@@ -466,6 +475,32 @@ class KernelDeltaAttnOp(OperationImpl):
             The OperationMetadata provided during initialization.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for KernelDeltaAttnOp (KDA).
+
+        KDA is a recurrent/linear attention mechanism similar to GDR that requires:
+        - Basic metadata plus state management fields
+        - Recurrent or Hybrid cache types for state persistence
+        - Uses KDACacheView for state management
+        """
+        return (
+            RequirementsBuilder("kernel_delta_attention")
+            .require_metadata(
+                MetadataField.SEQ_LENS
+                | MetadataField.POSITIONS
+                | MetadataField.HAS_INITIAL_STATE
+                | MetadataField.STATE_INDICES
+            )
+            .optional_metadata(MetadataField.LOGITS_INDICES)
+            .support_cache(CacheType.RECURRENT | CacheType.HYBRID)
+            .use_cache_view(KDACacheView)
+            .build()
+        )
 
     @jax.named_scope("easydel-kda-native")
     def forward_native(

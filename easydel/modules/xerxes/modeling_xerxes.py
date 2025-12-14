@@ -33,6 +33,7 @@ from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_b
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.caching import (
+    HybridCache,
     RaggedPagesCache,
     RaggedPagesCacheView,
     TransformerCache,
@@ -508,7 +509,7 @@ class XerxesModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -694,7 +695,7 @@ class XerxesForCausalLM(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesCacheView | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,

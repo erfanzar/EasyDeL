@@ -110,6 +110,7 @@ class GlmConfig(EasyDeLBaseConfig):
         eos_token_id=None,
         bos_token_id=None,
         attention_bias=True,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         if eos_token_id is None:
@@ -130,6 +131,9 @@ class GlmConfig(EasyDeLBaseConfig):
         self.rope_theta = rope_theta
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(
             pad_token_id=pad_token_id,

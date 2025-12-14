@@ -35,6 +35,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -518,6 +520,7 @@ class Qwen3VLVisionAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
             attn_mechanism="vanilla",
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
@@ -1027,7 +1030,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         position_ids: chex.Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: chex.Array | None = None,
     ) -> DecoderLayerOutput:
@@ -1141,8 +1144,8 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
@@ -1487,8 +1490,8 @@ class Qwen3VLModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         pixel_values: chex.Array | None = None,
@@ -1724,8 +1727,8 @@ class Qwen3VLForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLModel, Qwe
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,

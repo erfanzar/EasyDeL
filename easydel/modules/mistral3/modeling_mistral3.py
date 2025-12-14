@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-
 import chex
 import jax
 import jax.numpy as jnp
@@ -31,7 +30,14 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, ModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerMetadata,
+)
 from easydel.layers.linear import RowParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
@@ -274,8 +280,8 @@ class Mistral3Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -340,8 +346,6 @@ class Mistral3Model(EasyDeLBaseModule):
         pad_token_id: int | None = None,
     ):
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
-
-
 
     def prepare_inputs_for_generation(
         self,
@@ -487,8 +491,8 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,

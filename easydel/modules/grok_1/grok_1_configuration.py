@@ -107,6 +107,7 @@ class Grok1Config(EasyDeLBaseConfig):
         rope_theta: float = 10000,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a Grok1Config object.
@@ -163,6 +164,9 @@ class Grok1Config(EasyDeLBaseConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

@@ -62,8 +62,16 @@ from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float, PRNGKeyArray
 
+from easydel.layers.caching import TransformerCacheView
+
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 
 
 @OperationRegistry.register
@@ -98,6 +106,23 @@ class VanillaAttn(OperationImpl):
             The `OperationMetadata` provided during initialization.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for VanillaAttn.
+
+        Vanilla attention requires basic metadata and uses TransformerCacheView
+        for KV-cache management.
+        """
+        return OperationRequirements.create(
+            name="vanilla",
+            required_metadata=MetadataField.basic(),
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            cache_view_class=TransformerCacheView,
+        )
 
     @jax.named_scope("easydel-vanillaimpl-native-xla")
     def forward_native(

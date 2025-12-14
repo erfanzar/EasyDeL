@@ -587,18 +587,22 @@ class BCOPreprocessTransform(ExpandTransform):
 
         # Step 5: Yield TWO tokenized examples (unpair operation)
         # Chosen example (label=True)
-        yield self._tokenize_unpaired({
-            "prompt": prompt,
-            "completion": chosen,
-            "label": True,
-        })
+        yield self._tokenize_unpaired(
+            {
+                "prompt": prompt,
+                "completion": chosen,
+                "label": True,
+            }
+        )
 
         # Rejected example (label=False)
-        yield self._tokenize_unpaired({
-            "prompt": prompt,
-            "completion": rejected,
-            "label": False,
-        })
+        yield self._tokenize_unpaired(
+            {
+                "prompt": prompt,
+                "completion": rejected,
+                "label": False,
+            }
+        )
 
     def _tokenize_unpaired(self, example: dict) -> dict:
         """Tokenize a single unpaired example.
@@ -644,11 +648,11 @@ class BCOPreprocessTransform(ExpandTransform):
 
         # Truncate prompt (from left, keep most recent context)
         if self._max_prompt_length is not None:
-            prompt_ids = prompt_ids[-self._max_prompt_length:]
+            prompt_ids = prompt_ids[-self._max_prompt_length :]
 
         # Truncate completion (from right)
         if self._max_completion_length is not None:
-            completion_ids = completion_ids[:self._max_completion_length]
+            completion_ids = completion_ids[: self._max_completion_length]
 
         # Build full sequence: prompt + completion
         full_ids = prompt_ids + completion_ids

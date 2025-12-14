@@ -84,6 +84,9 @@ class BatchMetadata:
     min_p: jax.Array
     positions: jax.Array
 
+    # Total number of tokens in the batch (used by hybrid mode)
+    num_tokens: jax.Array | None = None
+
     # v2-specific fields (optional, only populated when version="v2")
     slot_mapping: jax.Array | None = None
     num_kv_update_slices: jax.Array | None = None

@@ -32,7 +32,7 @@ from jaxtyping import Array, Float, Int
 
 from easydel.utils.helpers import check_bool_flag
 
-from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView
+from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
@@ -119,13 +119,13 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
 
 
 @auto_pytree
-class RaggedPagesCacheMetaData(BaseCacheMetadata):
+class RaggedPagesCacheConfig(BaseCacheConfig):
     """
     Metadata holding configuration parameters for the Paged Attention KV cache.
 
     This class stores static configuration details required to initialize and manage
     a paged KV cache, such as dimensions, page sizes, and resource utilization hints.
-    It inherits from `BaseCacheMetadata`.
+    It inherits from `BaseCacheConfig`.
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -169,7 +169,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
         hbm_utilization: float = 0.9,
         page_size: int = 128,
         version: tp.Literal["v3", "v2"] = "v3",
-    ) -> RaggedPagesCacheMetaData:
+    ) -> RaggedPagesCacheConfig:
         if k_headdim is None:
             assert kv_head_dim_size is not None, "Either `k_headdim` or `kv_head_dim_size` must be provided"
             k_headdim = kv_head_dim_size
@@ -187,7 +187,7 @@ class RaggedPagesCacheMetaData(BaseCacheMetadata):
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
         logger.info(
-            f"Creating PagesCacheMetadata with {num_pages=} {page_bytes=} "
+            f"Creating PagesCacheConfig with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
         )
         assert version in ["v3", "v2"], f"got unknown version {version} it should be v3/v2."
@@ -302,7 +302,7 @@ class RaggedPagesCacheView(BaseCacheView):
     into the correct pages based on runtime metadata. It inherits from `BaseCacheView`.
 
     Attributes:
-        metadata (RaggedPagesCacheMetaData): The static configuration metadata for the
+        metadata (RaggedPagesCacheConfig): The static configuration metadata for the
             entire paged cache.
         layer_index (int): The index of the transformer layer this view corresponds to.
         kv_pages (tp.Union[cx.Array, ImplicitArray]): The tensor holding all key value pages for this layer.
@@ -310,7 +310,7 @@ class RaggedPagesCacheView(BaseCacheView):
             Can be a JAX array or an ImplicitArray if quantization is used.
     """
 
-    metadata: RaggedPagesCacheMetaData
+    metadata: RaggedPagesCacheConfig
     layer_index: int = field(pytree_node=False)
 
     kv_pages: (
@@ -326,47 +326,56 @@ class RaggedPagesCacheView(BaseCacheView):
     @classmethod
     def init(
         cls,
-        mesh: Mesh,
-        metadata: RaggedPagesCacheMetaData,
-        layer_index: int,
-        partition_manager: es.PartitionManager,
-        quantizer: EasyQuantizer | None = None,
-    ) -> RaggedPagesCacheView:
-        """
-        Initializes the RaggedPagesCacheView for a specific layer.
+        config: RaggedPagesCacheConfig,
+        layer_index: int | None = None,
+        *,
+        mesh: "Mesh | None" = None,
+        partition_manager: "es.PartitionManager | None" = None,
+        quantizer: "EasyQuantizer | None" = None,
+    ) -> "RaggedPagesCacheView":
+        """Initialize a RaggedPagesCacheView from a cache config.
 
-        Allocates the `kv_pages` tensors with the appropriate
-        shape, dtype, and sharding based on the provided metadata and partition manager.
-        Optionally applies quantization if a quantizer is provided.
+        Creates cache tensors for ragged page attention with shared
+        page pool across layers.
 
         Args:
-            mesh (Mesh): The JAX device mesh.
-            dtype (jnp.dtype): The data type for the cache pages (e.g., jnp.bfloat16).
-            metadata (RaggedPagesCacheMetaData): Static configuration for the cache.
-            layer_index (int): The index of the layer this view is for.
-            partition_manager (es.PartitionManager): Manages tensor sharding across the mesh.
-            quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply to the pages.
+            config: RaggedPagesCacheConfig with cache dimensions.
+            layer_index: Index of this layer in the model.
+            mesh: JAX device mesh for sharding.
+            partition_manager: Partition manager for sharding.
+            quantizer: Quantization configuration.
 
         Returns:
-            RaggedPagesCacheView: An initialized cache view for the specified layer.
+            RaggedPagesCacheView: Initialized cache view.
         """
-        from easydel.layers.quantization.quantizers import EasyQuantizer
+        from easydel.layers.quantization.quantizers import EasyQuantizer as EQ
 
-        quantizer = quantizer or EasyQuantizer(quantization_config=None)
-        kv_pages_shape, axes = metadata.get_shape_and_axes()
+        if quantizer is None:
+            quantizer = EQ(quantization_config=None)
+
+        # Allocate KV pages
+        kv_pages_shape, axes = config.get_shape_and_axes()
         kv_pages_sharding = partition_manager.resolve(axes=axes, mode=common_types.MODE_PREFILL, shape=kv_pages_shape)
         kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
         with jax.named_scope("easydel-paged-attention-cache-init"):
-            kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=metadata.kvdtype, device=kv_pages_sharding))
+            kv_pages = quantizer(jnp.zeros(shape=kv_pages_shape, dtype=config.kvdtype, device=kv_pages_sharding))
 
-        return cls(metadata=metadata, layer_index=layer_index, kv_pages=kv_pages, partition_manager=partition_manager)
+        return cls(
+            metadata=config,
+            layer_index=layer_index or 0,
+            kv_pages=kv_pages,
+            partition_manager=partition_manager,
+        )
 
     def concatenate_to_cache(
         self,
         key: Float[Array, "batch seq_len num_key_heads head_dim"],
         value: Float[Array, "batch seq_len num_value_heads head_dim"],
-        cache_metadata: RaggedPagesMetadata,
+        cache_metadata: RaggedPagesMetadata | OperationsMetadata,
     ) -> RaggedPagesCacheView:
+        # Unwrap OperationsMetadata to RaggedPagesMetadata if needed
+        cache_metadata = unwrap_metadata(cache_metadata, "ragged")
+
         if self.metadata.is_v2:
             num_kv_heads = key.shape[2]
             head_size = key.shape[3]
@@ -466,7 +475,7 @@ class RaggedPagesCache(BaseCache):
     views: list[RaggedPagesCacheView]
 
     @property
-    def metadata(self) -> RaggedPagesCacheMetaData | None:
+    def metadata(self) -> RaggedPagesCacheConfig | None:
         if self.views[-1] is None:
             return None
         return self.views[-1].metadata
@@ -475,7 +484,7 @@ class RaggedPagesCache(BaseCache):
     def init_cache(
         cls,
         mesh: Mesh,
-        metadata: RaggedPagesCacheMetaData,
+        config: RaggedPagesCacheConfig,
         partition_manager: es.PartitionManager,
         quantizer: EasyQuantizer | None = None,
     ) -> RaggedPagesCache:
@@ -483,12 +492,11 @@ class RaggedPagesCache(BaseCache):
         Initializes the entire RaggedPagesCache for all layers.
 
         Creates a list of `RaggedPagesCacheView` instances, one for each layer
-        specified in the `metadata`, by calling `RaggedPagesCacheView.init` for each layer.
+        specified in the `config`, by calling `RaggedPagesCacheView.init` for each layer.
 
         Args:
             mesh (Mesh): The JAX device mesh.
-            dtype (jnp.dtype): The data type for the cache pages.
-            metadata (RaggedPagesCacheMetaData): Static configuration for the cache.
+            config (RaggedPagesCacheConfig): Static configuration for the cache.
             partition_manager (es.PartitionManager): Manages tensor sharding.
             quantizer (tp.Optional["EasyQuantizer"]): Optional quantizer to apply.
 
@@ -497,13 +505,13 @@ class RaggedPagesCache(BaseCache):
         """
         views = [
             RaggedPagesCacheView.init(
-                mesh=mesh,
-                metadata=metadata,
-                quantizer=quantizer,
+                config=config,
                 layer_index=i,
+                mesh=mesh,
                 partition_manager=partition_manager,
+                quantizer=quantizer,
             )
-            for i in range(metadata.num_hidden_layers)
+            for i in range(config.num_hidden_layers)
         ]
         return cls(views=views)
 
@@ -519,6 +527,110 @@ class RaggedPagesCache(BaseCache):
         except AttributeError:
             kv_shape = "Uninitialized"
         return f"{self.__class__.__name__}(\n  kv_pages={kv_shape},\n  num_layers={len(self.views)},\n)"
+
+    def to_pure(self) -> tuple[list[dict[str, tp.Any]], RaggedPagesCacheConfig | None]:
+        """Convert cache to pure Python data for serialization.
+
+        Returns:
+            Tuple of (cache_data, metadata) where cache_data is a list of dicts
+            containing serialized view data and metadata is the shared RaggedPagesCacheConfig.
+        """
+        cache_data: list[dict[str, tp.Any]] = []
+        metadata: RaggedPagesCacheConfig | None = None
+
+        for view in self.views:
+            if view is None:
+                cache_data.append({"is_none": True})
+            else:
+                if metadata is None:
+                    metadata = view.metadata
+                cache_data.append(
+                    {
+                        "is_none": False,
+                        "kv_pages": view.kv_pages,
+                        "layer_index": view.layer_index,
+                    }
+                )
+
+        return cache_data, metadata
+
+    @classmethod
+    def from_pure(
+        cls,
+        cache_data: list[dict[str, tp.Any]],
+        metadata: RaggedPagesCacheConfig | None = None,
+        partition_manager: PartitionManager | None = None,
+    ) -> "RaggedPagesCache":
+        """Reconstruct cache from pure Python data.
+
+        Args:
+            cache_data: List of dicts containing serialized view data.
+            metadata: Shared RaggedPagesCacheConfig for reconstruction.
+            partition_manager: Optional partition manager for sharding.
+
+        Returns:
+            Reconstructed RaggedPagesCache instance.
+        """
+        views: list[RaggedPagesCacheView] = []
+        pm = partition_manager or PartitionManager(PartitionAxis())
+
+        for layer_data in cache_data:
+            if layer_data.get("is_none", False):
+                # RaggedPagesCache doesn't typically use None views
+                continue
+            else:
+                view = RaggedPagesCacheView(
+                    kv_pages=layer_data["kv_pages"],
+                    metadata=metadata,
+                    layer_index=layer_data.get("layer_index", 0),
+                    partition_manager=pm,
+                )
+                views.append(view)
+
+        return cls(views=views)
+
+    def insert(
+        self,
+        other: "RaggedPagesCache",
+        slot: int,
+    ) -> "RaggedPagesCache":
+        """Insert another cache's pages at a specific slot offset.
+
+        Note: For RaggedPagesCache, this operation is more nuanced due to
+        the paged structure. This implementation copies pages from the
+        other cache into this cache at specified page offsets.
+
+        Args:
+            other: Source RaggedPagesCache to copy from.
+            slot: Page offset to insert at.
+
+        Returns:
+            New RaggedPagesCache with the inserted pages.
+        """
+        new_views: list[RaggedPagesCacheView] = []
+
+        for self_view, other_view in zip(self.views, other.views, strict=False):
+            if self_view is None or other_view is None:
+                new_views.append(self_view)
+            else:
+                # For paged attention, we insert at the page level
+                # This assumes slot is a page index
+                other_view.kv_pages.shape[0]
+                new_kv_pages = jax.lax.dynamic_update_slice(
+                    self_view.kv_pages,
+                    other_view.kv_pages,
+                    (slot, 0, 0, 0, 0) if self_view.kv_pages.ndim == 5 else (slot, 0, 0, 0),
+                )
+
+                new_view = RaggedPagesCacheView(
+                    kv_pages=new_kv_pages,
+                    metadata=self_view.metadata,
+                    layer_index=self_view.layer_index,
+                    partition_manager=self_view.partition_manager,
+                )
+                new_views.append(new_view)
+
+        return RaggedPagesCache(views=new_views)
 
     __str__ = __repr__
 

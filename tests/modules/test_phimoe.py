@@ -57,6 +57,19 @@ class TestPhiMoE:
         )
         assert result.success, f"PhiMoE CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, phimoe_config, small_model_config):
+        """Test PhiMoE text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="phimoe",
+            hf_class=transformers.PhimoeForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=phimoe_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"PhiMoE generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

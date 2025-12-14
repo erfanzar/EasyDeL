@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.1.5.dev22"
+version = "0.2.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"

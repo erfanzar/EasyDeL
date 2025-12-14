@@ -675,8 +675,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
             ),
             backend=((self.backend if self.backend is not None else "") if hasattr(self, "backend") else ""),
         )
-
-        return mesh
+        self.set_model_mesh(mesh)
+        return self._hidden_mesh
 
     @property
     def expert_mesh(self) -> jax.sharding.Mesh:
@@ -757,6 +757,25 @@ class EasyDeLBaseConfig(PretrainedConfig):
             mesh: JAX device mesh to use for this model.
         """
         self._hidden_mesh = mesh
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for attr_name in sub_configs.keys():
+            sub_cfg = getattr(self, attr_name, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if hasattr(sub_cfg, "set_model_mesh"):
+                    sub_cfg.set_model_mesh(mesh)
+                else:
+                    sub_cfg._hidden_mesh = mesh
+            except Exception:
+                try:
+                    sub_cfg._hidden_mesh = mesh
+                except Exception:
+                    pass
 
     def jax_mesh(self):
         """Deprecated method for getting the JAX mesh.

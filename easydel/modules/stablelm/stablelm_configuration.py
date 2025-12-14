@@ -106,6 +106,7 @@ class StableLmConfig(EasyDeLBaseConfig):
         eos_token_id=0,
         bits: int | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs,
     ) -> None:
         """Initializes the StableLmConfig object.
@@ -162,6 +163,9 @@ class StableLmConfig(EasyDeLBaseConfig):
         self.partial_rotary_factor = partial_rotary_factor
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

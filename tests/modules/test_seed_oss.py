@@ -39,6 +39,19 @@ class TestSeedOSS:
         )
         assert result.success, f"Seed OSS CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, seed_oss_config, small_model_config):
+        """Test Seed OSS text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="seed_oss",
+            hf_class=transformers.SeedOssForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=seed_oss_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Seed OSS generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

@@ -106,6 +106,7 @@ class GemmaConfig(EasyDeLBaseConfig):
         bits: int | None = None,
         scan_layers: bool = False,
         hidden_activation="gelu_pytorch_tanh",
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new GemmaConfig instance.
@@ -156,6 +157,9 @@ class GemmaConfig(EasyDeLBaseConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.hidden_activation = hidden_activation
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

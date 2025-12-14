@@ -41,6 +41,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -568,6 +570,7 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
             attn_mechanism="vanilla",
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
@@ -774,7 +777,7 @@ class Qwen2VLAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"] | Int[Array, "3 batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
@@ -856,7 +859,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -911,9 +914,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        assert isinstance(config, Qwen2VLVisionConfig), (
-            "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
-        )
+        assert isinstance(
+            config, Qwen2VLVisionConfig
+        ), "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1127,8 +1130,8 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1323,7 +1326,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
@@ -1337,7 +1340,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
         cache_position: chex.Array | None = None,
         mask_info: MaskInfo | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1351,7 +1354,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            if isinstance(image_embeds, (list, tuple)):
+            if isinstance(image_embeds, (list, tuple)):  # noqa:UP038
                 image_embeds = jnp.concatenate(image_embeds, axis=0)
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids=input_ids,
@@ -1362,7 +1365,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            if isinstance(video_embeds, (list, tuple)):
+            if isinstance(video_embeds, (list, tuple)):  # noqa:UP038
                 video_embeds = jnp.concatenate(video_embeds, axis=0)
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids=input_ids,
@@ -1530,8 +1533,8 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,

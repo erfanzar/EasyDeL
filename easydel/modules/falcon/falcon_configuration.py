@@ -117,6 +117,7 @@ class FalconConfig(EasyDeLBaseConfig):
         activation="gelu",
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new FalconConfig instance.
@@ -188,6 +189,9 @@ class FalconConfig(EasyDeLBaseConfig):
         if ff_factor is None:
             ff_factor = ffn_hidden_size // hidden_size
         self.ff_factor = ff_factor
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, bits=bits, **kwargs)
 
     @property
