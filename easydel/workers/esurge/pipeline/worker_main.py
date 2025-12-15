@@ -104,6 +104,8 @@ def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict
         tokenizer_path: Path or identifier for the tokenizer.
         tokenizer_kwargs: Additional kwargs for loading the tokenizer.
     """
+    if "trust_remote_code" not in tokenizer_kwargs.keys():
+        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
@@ -148,6 +150,8 @@ def _detokenizer_worker(
     tokenizer_kwargs: Additional kwargs for loading the tokenizer.
     max_states: Maximum number of decoding states to maintain.
     """
+    if "trust_remote_code" not in tokenizer_kwargs.keys():
+        tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
     decoder = SimpleDecoder(tokenizer)
     eos_token_id = tokenizer.eos_token_id

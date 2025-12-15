@@ -146,6 +146,7 @@ class LoaderCfg(TypedDict, total=False):
     precision: NotRequired[PrecisionLike]
     verbose: NotRequired[bool]
     from_torch: NotRequired[bool | None]
+    trust_remote_code: NotRequired[bool]
 
 
 class ShardingCfg(TypedDict, total=False):
