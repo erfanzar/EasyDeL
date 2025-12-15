@@ -1261,29 +1261,55 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return serializable_config_dict
 
     def to_dict(self) -> dict[str, tp.Any]:
-        """Serialize config to a dictionary while temporarily hiding forbidden types."""
+        """Serialize config to a dictionary while temporarily hiding forbidden types.
+
+        Notes:
+            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for runtime use.
+            That object contains non-picklable JAX devices, so we must exclude it from any deep
+            copies performed during serialization.
+        """
         sd = self.__dict__
-        forbidden_types = ["_ScalarMeta"]
-        extracted_values = {k: sd.pop(k) for k in list(sd.keys()) if sd.get(k).__class__.__name__ in forbidden_types}
+        forbidden_types = {"_ScalarMeta"}
+        extracted_values: dict[str, tp.Any] = {}
 
-        result = copy.deepcopy(self.__dict__)
-        if hasattr(self.__class__, "model_type"):
-            result["model_type"] = self.__class__.model_type
+        for key in list(sd.keys()):
+            value = sd.get(key)
+            if key == "_hidden_mesh" or value.__class__.__name__ in forbidden_types:
+                extracted_values[key] = sd.pop(key)
 
-        result["transformers_version"] = transformers.__version__
+        try:
+            result = copy.deepcopy(self.__dict__)
+            if hasattr(self.__class__, "model_type"):
+                result["model_type"] = self.__class__.model_type
 
-        for key, value in result.items():
-            if isinstance(value, PretrainedConfig):
-                value = value.to_dict()
-                del value["transformers_version"]
+            result["transformers_version"] = transformers.__version__
 
-            result[key] = value
+            for key, value in result.items():
+                if isinstance(value, PretrainedConfig):
+                    value = value.to_dict()
+                    del value["transformers_version"]
 
-        self._remove_keys_not_serialized(result)
-        self.dict_dtype_to_str(result)
+                result[key] = value
 
-        for k, v in extracted_values.items():
-            sd[k] = v
+            self._remove_keys_not_serialized(result)
+            self.dict_dtype_to_str(result)
+            return result
+        finally:
+            for key, value in extracted_values.items():
+                sd[key] = value
+
+    def __deepcopy__(self, memo):
+        """Deep copy the config while keeping the cached runtime mesh by reference."""
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+
+        for key, value in self.__dict__.items():
+            if key == "_hidden_mesh":
+                setattr(result, key, value)
+            else:
+                setattr(result, key, copy.deepcopy(value, memo))
+
         return result
 
     def attach_custom_arguments(self, **kwargs):

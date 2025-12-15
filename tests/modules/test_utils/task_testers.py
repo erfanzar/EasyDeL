@@ -638,6 +638,7 @@ class VisionLanguageTester(BaseTester):
                     pixel_values_shape=vlm_config["pixel_values_shape"],
                     num_images=vlm_config.get("num_images", 1),
                     token_type_ids=vlm_config.get("use_token_type_ids", False),
+                    image_grid_hws=vlm_config.get("image_grid_hws"),
                 )
 
             # Handle EasyDeL-only VLM models (no HF comparison)

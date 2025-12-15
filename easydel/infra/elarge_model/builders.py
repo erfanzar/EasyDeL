@@ -105,6 +105,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         quantize_tensors=bool(quant.get("quantize_tensors", False)),
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
+        trust_remote_code=loader.get("trust_remote_code", False),
         **(model.get("extra_kwargs") or {}),
     )
 
@@ -292,7 +293,10 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         model = build_model(cfg)
     return eSurge(
         model=model,
-        tokenizer=AutoTokenizer.from_pretrained(tok_path),
+        tokenizer=AutoTokenizer.from_pretrained(
+            tok_path,
+            trust_remote_code=cfg["loader"].get("trust_remote_code", False),
+        ),
         **to_esurge_kwargs(cfg),
     )
 

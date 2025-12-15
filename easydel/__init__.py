@@ -380,6 +380,11 @@ _import_structure = {
         "KimiLinearForCausalLM",
         "KimiLinearModel",
     ],
+    "modules.kimi_vl": [
+        "KimiVLConfig",
+        "KimiVLForConditionalGeneration",
+        "MoonViTConfig",
+    ],
     "modules.llama": [
         "LlamaConfig",
         "LlamaForCausalLM",
@@ -790,6 +795,7 @@ if _tp.TYPE_CHECKING:
         InternLM2Model,
     )
     from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
+    from .modules.kimi_vl import KimiVLConfig, KimiVLForConditionalGeneration, MoonViTConfig
     from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
     from .modules.llama4 import (
         Llama4Config,

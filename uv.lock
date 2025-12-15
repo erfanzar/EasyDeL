@@ -582,7 +582,7 @@ wheels = [
 
 [[package]]
 name = "easydel"
-version = "0.1.5.dev22"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
