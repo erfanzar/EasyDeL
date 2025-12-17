@@ -43,6 +43,9 @@ eggs/
 mojo_module/
 test.mojo
 run.mojo
+/cuda_stuff
+/aten_lib
+.serena
 llama.bin
 llama-tokenizer.bin
 lib64/
