@@ -159,7 +159,7 @@ def _sanitize_sharding_axes_for_shape(
     mesh: Mesh,
     partition_manager: PartitionManager,
     axes: list[object | None],
-    mode: common_types.RUNTIME_MODE_TYPES,
+    mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
     shape: tuple[int, ...],
 ) -> tuple[object | None, ...]:
     """Disable incompatible sharding axes for a given shape.
