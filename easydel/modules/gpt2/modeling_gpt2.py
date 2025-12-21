@@ -108,10 +108,10 @@ class Conv1D(nn.Module):
         """Forward pass of the Conv1D layer.
 
         Args:
-            inputs (chex.Array): Input tensor.
+            inputs (Array): Input tensor.
 
         Returns:
-            chex.Array: Output tensor after applying the 1D convolution.
+            Array: Output tensor after applying the 1D convolution.
         """
         inputs = jnp.asarray(inputs, self.dtype)
         bias = self.bias.value
@@ -245,10 +245,10 @@ class GPT2Attention(UnifiedAttention):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
@@ -267,11 +267,11 @@ class GPT2Attention(UnifiedAttention):
         """Forward pass of the GPT2Attention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            key_value_states (chex.Array, optional): Key/value states for cross-attention.
+            hidden_states (Array): Input hidden states.
+            key_value_states (Array, optional): Key/value states for cross-attention.
                 Defaults to None (self-attention).
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            attention_mask (Array): Mask to apply on the attention scores.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
                 Defaults to None.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
@@ -280,7 +280,7 @@ class GPT2Attention(UnifiedAttention):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output and optionally
+            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the attention output and optionally
                 the attention weights.
         """
         is_cross_attention = key_value_states is not None
@@ -397,10 +397,10 @@ class GPT2MLP(nn.Module):
         """Forward pass of the GPT2MLP module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
+            hidden_states (Array): Input hidden states.
 
         Returns:
-            chex.Array: Output hidden states after processing through the MLP.
+            Array: Output hidden states after processing through the MLP.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -526,12 +526,12 @@ class GPT2Block(nn.Module):
         """Forward pass of the GPT2Block module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array, optional): Mask to apply on the self-attention scores. Defaults to None.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
-            encoder_hidden_states (chex.Array, optional): Hidden states from the encoder for cross-attention.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array, optional): Mask to apply on the self-attention scores. Defaults to None.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
+            encoder_hidden_states (Array, optional): Hidden states from the encoder for cross-attention.
                 Defaults to None.
-            encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states in cross-attention.
+            encoder_attention_mask (Array, optional): Mask for the encoder hidden states in cross-attention.
                 Defaults to None.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
@@ -540,7 +540,7 @@ class GPT2Block(nn.Module):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
         Returns:
-            tp.Tuple[chex.Array, ...]: A tuple containing the output hidden states and
+            tp.Tuple[Array, ...]: A tuple containing the output hidden states and
                 optionally attention weights (self and cross).
         """
         residual = hidden_states
@@ -709,14 +709,14 @@ class GPT2Model(EasyDeLBaseModule):
         """Forward pass through the GPT2Model.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
                 Only one of input_ids or inputs_embeds should be provided.
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token. Defaults to None.
-            encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention.
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Array, optional): Indices of positions of each input sequence token. Defaults to None.
+            encoder_hidden_states (Array, optional): Hidden states from an encoder model for cross-attention.
                 Defaults to None.
-            encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
+            encoder_attention_mask (Array, optional): Mask for the encoder hidden states. Defaults to None.
             past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
                 precomputed key/value states. Defaults to None.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.

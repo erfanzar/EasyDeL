@@ -837,6 +837,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
         (
             key_states,
             value_states,
@@ -851,7 +855,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=self.sliding_window,
+            sliding_window=sliding_window_for_kernel,
         )
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
@@ -869,7 +873,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=causal_for_kernel,
-            sliding_window=self.sliding_window,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 
@@ -984,6 +988,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
         (
             key_states,
             value_states,
@@ -1014,7 +1022,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=causal_for_kernel,
-            sliding_window=self.sliding_window,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 
@@ -1064,6 +1072,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
         # 6. KV cache concatenation
         (
             key_states,
@@ -1102,7 +1114,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             init_bias=init_attention_bias,
             mask_info=mask_info,
             causal=causal_for_kernel,
-            sliding_window=self.sliding_window,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 

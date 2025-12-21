@@ -272,10 +272,10 @@ class GPTJMLP(nn.Module):
         """Forward pass of the GPTJMLP module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
+            hidden_states (Array): Input hidden states.
 
         Returns:
-            chex.Array: Output hidden states after processing through the MLP.
+            Array: Output hidden states after processing through the MLP.
         """
         gate = checkpoint_name(self.act(self.fc_in(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.dropout(self.fc_out(gate)), "mlp_output")
@@ -364,20 +364,20 @@ class GPTJBlock(nn.Module):
         """Forward pass of the GPTJBlock module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache view for
                 key_states/value_states states.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for
                 cache handling.
             output_attentions (bool, optional): Whether to return attention weights.
-            frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
+            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the output hidden states and
+            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the output hidden states and
                 optionally the attention weights.
         """
         residual = hidden_states
@@ -508,15 +508,15 @@ class GPTJModel(EasyDeLBaseModule):
         """Forward pass through the GPTJModel.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
             past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
                 key_states/value_states states.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            segment_ids (Array, optional): Segment token indices for segment embeddings.
+            extra_embedding (Array, optional): Additional embedding to add to input embeddings.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
 

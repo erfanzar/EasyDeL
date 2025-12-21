@@ -412,6 +412,13 @@ class BatchMetadataPreparer:
         min_p_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        # VLM prefill helpers (optional)
+        mrope_position_ids_cpu: np.ndarray | None = None,
+        prefill_embeds_cpu: np.ndarray | None = None,
+        prefill_embeds_mask_cpu: np.ndarray | None = None,
+        # DeepStack-style visual injection (optional)
+        visual_pos_masks_cpu: np.ndarray | None = None,
+        deepstack_visual_embeds_cpu: list[np.ndarray] | None = None,
         # Vision-language model data (optional)
         pixel_values: np.ndarray | None = None,
         image_grid_thw: np.ndarray | None = None,
@@ -455,6 +462,25 @@ class BatchMetadataPreparer:
             active_mask_full_dev,
         ) = jax.device_put(host_payload, self._empty_sharding)
 
+        mrope_position_ids_dev = None
+        prefill_embeds_dev = None
+        prefill_embeds_mask_dev = None
+        if mrope_position_ids_cpu is not None:
+            mrope_position_ids_dev = jax.device_put(mrope_position_ids_cpu, self._empty_sharding)
+        if prefill_embeds_cpu is not None:
+            prefill_embeds_dev = jax.device_put(prefill_embeds_cpu, self._empty_sharding)
+        if prefill_embeds_mask_cpu is not None:
+            prefill_embeds_mask_dev = jax.device_put(prefill_embeds_mask_cpu, self._empty_sharding)
+
+        visual_pos_masks_dev = None
+        deepstack_visual_embeds_dev = None
+        if visual_pos_masks_cpu is not None:
+            visual_pos_masks_dev = jax.device_put(visual_pos_masks_cpu, self._empty_sharding)
+        if deepstack_visual_embeds_cpu is not None:
+            deepstack_visual_embeds_dev = tuple(
+                jax.device_put(arr, self._empty_sharding) for arr in deepstack_visual_embeds_cpu
+            )
+
         pixel_values_dev = None
         image_grid_thw_dev = None
         pixel_values_videos_dev = None
@@ -490,6 +516,11 @@ class BatchMetadataPreparer:
             image_grid_thw=image_grid_thw_dev,
             pixel_values_videos=pixel_values_videos_dev,
             video_grid_thw=video_grid_thw_dev,
+            mrope_position_ids=mrope_position_ids_dev,
+            prefill_embeds=prefill_embeds_dev,
+            prefill_embeds_mask=prefill_embeds_mask_dev,
+            visual_pos_masks=visual_pos_masks_dev,
+            deepstack_visual_embeds=deepstack_visual_embeds_dev,
         )
 
         return (

@@ -209,7 +209,7 @@ class MyCustomTrainer(BaseTrainerProtocol):
 1.  **State Management**: Ensure `EasyDeLState` is consistently updated and managed, especially `state.step`.
 2.  **Immutability**: Respect JAX's functional nature. Training/evaluation step functions should be pure and return new states/metrics rather than modifying inputs in place.
 3.  **Error Handling**: Implement robust handling for potential issues like OOM errors, data loading failures, or numerical instability (e.g., NaN losses). Consider adding try-except blocks around critical sections like the training step.
-4.  **Logging**: Provide clear and configurable logging (e.g., using `logging` module or TensorBoard) for loss, metrics, learning rate, and system stats (memory usage). Leverage `arguments.logging_steps`.
-5.  **Checkpointing**: Implement reliable checkpointing triggered by `arguments.save_strategy` and `arguments.save_steps`/`epochs`. Ensure checkpoints include everything needed to resume. Handle `arguments.save_total_limit`.
+4.  **Logging**: Provide clear and configurable logging (e.g., using `logging` module or TensorBoard) for loss, metrics, learning rate, and system stats (memory usage). Leverage `arguments.log_steps`.
+5.  **Checkpointing**: Implement reliable checkpointing triggered by `arguments.save_steps` and `arguments.save_interval_minutes`. Ensure checkpoints include everything needed to resume. Handle `arguments.save_total_limit`.
 6.  **Distributed Training**: Design step functions (`train_step_fn`, `eval_step_fn`) and checkpointing logic with JAX parallelism (`pmap`, `shmap`) in mind. Ensure gradients are correctly aggregated and parameters are synchronized/saved across devices.
 7.  **Resource Management**: Ensure proper cleanup of resources, especially when dealing with external libraries or large datasets.

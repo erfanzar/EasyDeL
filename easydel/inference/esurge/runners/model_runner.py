@@ -73,6 +73,7 @@ from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..page_table import PAGE_TABLE_PADDING_VAL
 from ..scheduler import SchedulerOutput
+from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults
 from .execution_manager import ExecutionManager
 from .sequence_buffer import (
@@ -527,6 +528,78 @@ class eSurgeRunner:
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
         self.executor_manager.kv_pages = self.model.init_ragged_pages(self.metadata)
 
+    def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
+        """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.
+
+        Some VLM base models compute mRoPE indices via NumPy/data-dependent control-flow
+        which is not compatible with JIT/AOT inside the compiled eSurge step. We run
+        those parts eagerly here and store host-side arrays for later reuse.
+        """
+        if req_state.vision_processed:
+            return
+
+        uses_mrope = model_uses_mrope(self.model)
+
+        # If raw vision inputs are missing but the request is marked as "has_vision"
+        # (e.g. only cached mm_features remain), skip precompute and treat it as processed.
+        if req_state.pixel_values is None and req_state.pixel_values_videos is None:
+            req_state._vision_processed = True
+            return
+
+        if req_state.prefill_inputs_embeds is not None and (
+            not uses_mrope or req_state.prefill_position_ids is not None
+        ):
+            req_state.clear_vision_data()
+            return
+
+        prompt_ids = np.asarray(req_state.prompt_token_ids, dtype=np.int32)[None, :]
+        input_ids = jnp.asarray(prompt_ids, dtype=jnp.int32)
+        attention_mask = jnp.ones(input_ids.shape, dtype=jnp.int32)
+
+        try:
+            embed_kwargs: dict[str, typing.Any] = {"attention_mask": attention_mask}
+            if req_state.pixel_values is not None:
+                embed_kwargs["pixel_values"] = req_state.pixel_values
+                if req_state.image_grid_thw is not None:
+                    embed_kwargs["image_grid_thw"] = req_state.image_grid_thw
+            if req_state.pixel_values_videos is not None:
+                embed_kwargs["pixel_values_videos"] = req_state.pixel_values_videos
+                if req_state.video_grid_thw is not None:
+                    embed_kwargs["video_grid_thw"] = req_state.video_grid_thw
+
+            inputs_embeds, info = self.model.compute_embedding_with_info(input_ids, **embed_kwargs)
+        except Exception as exc:
+            logger.warning(f"VLM precompute failed for req_id={req_state.req_id}: {exc}")
+            return
+
+        # Store host-side views (keeps compiled step free of vision preprocessing).
+        embeds_host = np.asarray(jax.device_get(inputs_embeds))
+        req_state.prefill_inputs_embeds = embeds_host[0]
+
+        if getattr(info, "position_ids", None) is not None:
+            pos_host = np.asarray(jax.device_get(info.position_ids))
+            if pos_host.ndim == 3:
+                pos_host = pos_host[:, 0, :]
+            req_state.prefill_position_ids = pos_host.astype(np.int32, copy=False)
+
+        if getattr(info, "rope_deltas", None) is not None:
+            req_state.prefill_rope_deltas = np.asarray(jax.device_get(info.rope_deltas)).astype(np.int32, copy=False)
+
+        if getattr(info, "visual_pos_masks", None) is not None:
+            mask_host = np.asarray(jax.device_get(info.visual_pos_masks))
+            if mask_host.ndim == 2:
+                mask_host = mask_host[0]
+            req_state.prefill_visual_pos_masks = mask_host.astype(bool, copy=False)
+
+        if getattr(info, "deepstack_visual_embeds", None) is not None:
+            ds_list = []
+            for arr in info.deepstack_visual_embeds:
+                ds_list.append(np.asarray(jax.device_get(arr)))
+            req_state.prefill_deepstack_visual_embeds = ds_list
+
+        # Raw vision tensors are no longer needed once embeddings are cached.
+        req_state.clear_vision_data()
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> bool:
         """Update internal states based on scheduler output.
 
@@ -660,6 +733,17 @@ class eSurgeRunner:
         # 7) Condense to remove holes
         if removed_req_indices:
             self.sequence_buffer.condense(removed_req_indices)
+
+        # Drop cached VLM prompt helpers once prefill is complete to free host RAM.
+        for req_state in self.requests.values():
+            if (
+                req_state.prefill_inputs_embeds is not None
+                and req_state.num_computed_tokens >= req_state.num_prompt_tokens
+            ):
+                req_state.prefill_inputs_embeds = None
+                req_state.prefill_position_ids = None
+                req_state.prefill_visual_pos_masks = None
+                req_state.prefill_deepstack_visual_embeds = None
 
         has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
@@ -863,6 +947,15 @@ class eSurgeRunner:
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
 
+        cfg = getattr(self.model, "config", None)
+        task_type = getattr(self.model, "_task_type", None)
+        is_vlm_model = task_type == "image-text-to-text" or (
+            cfg is not None
+            and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
+            and callable(getattr(self.model, "get_image_features", None))
+        )
+        uses_mrope_model = model_uses_mrope(self.model)
+
         while start_index < self.sequence_buffer.num_reqs:
             num_reqs_total = self.sequence_buffer.num_reqs
             scheduled_list: list[int] = []
@@ -911,41 +1004,120 @@ class eSurgeRunner:
                     self._empty_sharding,
                 )
 
-            image_pixel_values_list: list[np.ndarray] = []
-            image_grid_thw_list: list[np.ndarray] = []
-            video_pixel_values_list: list[np.ndarray] = []
-            video_grid_thw_list: list[np.ndarray] = []
-            vision_request_states: list[CachedRequestState] = []
-
-            for _i, rid in enumerate(req_ids_window):
-                if rid is not None:
+            mrope_position_ids_cpu = None
+            prefill_embeds_cpu = None
+            prefill_embeds_mask_cpu = None
+            visual_pos_masks_cpu = None
+            deepstack_visual_embeds_cpu = None
+            if is_vlm_model:
+                # Precompute per-request VLM prompt embeddings outside the compiled step.
+                for rid in req_ids_window:
+                    if rid is None:
+                        continue
                     req_state = self.requests.get(rid)
-                    if req_state is not None and req_state.has_vision and not req_state.vision_processed:
-                        if req_state.pixel_values is not None:
-                            image_pixel_values_list.append(req_state.pixel_values)
-                            if req_state.image_grid_thw is not None:
-                                image_grid_thw_list.append(req_state.image_grid_thw)
-                        if req_state.pixel_values_videos is not None:
-                            video_pixel_values_list.append(req_state.pixel_values_videos)
-                            if req_state.video_grid_thw is not None:
-                                video_grid_thw_list.append(req_state.video_grid_thw)
-                        vision_request_states.append(req_state)
+                    if req_state is None:
+                        continue
+                    if req_state.has_vision and not req_state.vision_processed:
+                        self._precompute_vlm_prefill(req_state)
 
-            # Concatenate vision data from all requests
-            pixel_values = None
-            image_grid_thw = None
-            pixel_values_videos = None
-            video_grid_thw = None
+                hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
+                prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=np.float16)
+                prefill_embeds_mask_cpu = np.zeros((num_tokens_static,), dtype=bool)
 
-            if image_pixel_values_list:
-                pixel_values = np.concatenate(image_pixel_values_list, axis=0)
-                if image_grid_thw_list:
-                    image_grid_thw = np.concatenate(image_grid_thw_list, axis=0)
+                if uses_mrope_model:
+                    mrope_position_ids_cpu = np.zeros((3, num_tokens_static), dtype=np.int32)
 
-            if video_pixel_values_list:
-                pixel_values_videos = np.concatenate(video_pixel_values_list, axis=0)
-                if video_grid_thw_list:
-                    video_grid_thw = np.concatenate(video_grid_thw_list, axis=0)
+                    deepstack_indexes = getattr(
+                        getattr(self.model.config, "vision_config", None),
+                        "deepstack_visual_indexes",
+                        None,
+                    )
+                    deepstack_layers = len(deepstack_indexes) if deepstack_indexes else 0
+                    if deepstack_layers:
+                        visual_pos_masks_cpu = np.zeros((num_tokens_static,), dtype=bool)
+                        deepstack_visual_embeds_cpu = [
+                            np.zeros((num_tokens_static, hidden_size), dtype=np.float16) for _ in range(deepstack_layers)
+                        ]
+                    visual_off = 0
+
+                off = 0
+                for req_idx, rid in enumerate(req_ids_window):
+                    if rid is None:
+                        continue
+                    n = int(scheduled_list[req_idx])
+                    if n <= 0:
+                        continue
+
+                    req_state = self.requests.get(rid)
+                    start_tok = int(self.sequence_buffer.num_computed_tokens[req_idx])
+                    end_tok = start_tok + n
+
+                    if uses_mrope_model and mrope_position_ids_cpu is not None:
+                        # mRoPE position ids: use precomputed prompt indices when available, otherwise
+                        # fall back to a constant delta-adjusted 1D position broadcast.
+                        if (
+                            req_state is not None
+                            and req_state.prefill_position_ids is not None
+                            and start_tok < req_state.num_prompt_tokens
+                        ):
+                            prompt_end = min(end_tok, req_state.num_prompt_tokens)
+                            prompt_n = int(prompt_end - start_tok)
+                            if prompt_n > 0:
+                                mrope_position_ids_cpu[:, off : off + prompt_n] = req_state.prefill_position_ids[
+                                    :, start_tok:prompt_end
+                                ]
+
+                            if prompt_n < n:
+                                delta = 0
+                                if req_state.prefill_rope_deltas is not None:
+                                    delta = int(np.asarray(req_state.prefill_rope_deltas).reshape(-1)[0])
+                                idxs = np.arange(start_tok + prompt_n, end_tok, dtype=np.int32) + np.int32(delta)
+                                mrope_position_ids_cpu[:, off + prompt_n : off + n] = np.broadcast_to(
+                                    idxs[None, :], (3, idxs.shape[0])
+                                )
+                        else:
+                            delta = 0
+                            if req_state is not None and req_state.prefill_rope_deltas is not None:
+                                delta = int(np.asarray(req_state.prefill_rope_deltas).reshape(-1)[0])
+                            idxs = np.arange(start_tok, end_tok, dtype=np.int32) + np.int32(delta)
+                            mrope_position_ids_cpu[:, off : off + n] = np.broadcast_to(idxs[None, :], (3, n))
+
+                    # Embedding overrides: use precomputed prompt embeddings when available.
+                    if (
+                        req_state is not None
+                        and req_state.prefill_inputs_embeds is not None
+                        and start_tok < req_state.num_prompt_tokens
+                    ):
+                        prompt_end = min(end_tok, req_state.num_prompt_tokens)
+                        prompt_n = int(prompt_end - start_tok)
+                        if prompt_n > 0:
+                            prefill_embeds_cpu[off : off + prompt_n] = req_state.prefill_inputs_embeds[
+                                start_tok:prompt_end
+                            ]
+                            prefill_embeds_mask_cpu[off : off + prompt_n] = True
+
+                            if visual_pos_masks_cpu is not None and req_state.prefill_visual_pos_masks is not None:
+                                mask_slice = req_state.prefill_visual_pos_masks[start_tok:prompt_end]
+                                visual_pos_masks_cpu[off : off + prompt_n] = mask_slice
+
+                                num_before = int(req_state.prefill_visual_pos_masks[:start_tok].sum())
+                                num_in = int(mask_slice.sum())
+                                if (
+                                    uses_mrope_model
+                                    and num_in
+                                    and deepstack_visual_embeds_cpu is not None
+                                    and req_state.prefill_deepstack_visual_embeds is not None
+                                ):
+                                    ds_list = req_state.prefill_deepstack_visual_embeds
+                                    for layer_idx, buf in enumerate(deepstack_visual_embeds_cpu):
+                                        if layer_idx >= len(ds_list):
+                                            break
+                                        buf[visual_off : visual_off + num_in] = ds_list[layer_idx][
+                                            num_before : num_before + num_in
+                                        ]
+                                    visual_off += num_in
+
+                    off += n
 
             # Get page table as CPU array (already on CPU, no transfer needed)
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
@@ -976,15 +1148,12 @@ class eSurgeRunner:
                 top_k_cpu=self.sequence_buffer.top_k,
                 min_p_cpu=self.sequence_buffer.min_p,
                 page_table_cpu=page_table_cpu,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
+                mrope_position_ids_cpu=mrope_position_ids_cpu,
+                prefill_embeds_cpu=prefill_embeds_cpu,
+                prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+                visual_pos_masks_cpu=visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
             )
-
-            # Clear vision data after prefill to free memory
-            for req_state in vision_request_states:
-                req_state.clear_vision_data()
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start

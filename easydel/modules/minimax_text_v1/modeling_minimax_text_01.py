@@ -18,7 +18,6 @@ import math
 import warnings
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -35,6 +34,7 @@ from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -242,7 +242,7 @@ class MiniMaxText01LightningAttention(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        slope_rate: chex.Array | None = None,
+        slope_rate: Array | None = None,
     ):
         # TODO: fix these static issues here
         batch_size, sequence_length, _ = hidden_states.shape
@@ -356,7 +356,7 @@ class MiniMaxText01Attention(AttentionModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[Array, Array]:
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
             checkpoint_name(self.q_proj(hidden_states), name="attn_query"),
@@ -588,7 +588,7 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
         self.jitter_noise = config.router_jitter_noise
         self.deterministic = False
 
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1024,8 +1024,12 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MiniMaxText01Config, model_type="MiniMaxText01")
-class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
+class MiniMaxText01ForCausalLM(BaseCausalLMModule[MiniMaxText01Model, MiniMaxText01Config]):
     """MiniMax Text model with language modeling head for causal generation."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "MiniMaxText01"
+    _config_class = MiniMaxText01Config
 
     def __init__(
         self,
@@ -1038,35 +1042,13 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=MiniMaxText01Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = MiniMaxText01Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            use_bias=False,
-            kernel_init=nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
 
     def __call__(
@@ -1086,40 +1068,32 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
     ) -> MoeCausalLMOutput | tuple:
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            mask_info=mask_info,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            output_router_logits=output_router_logits,
-            mode=mode,
-            past_key_values=past_key_values,
-            cache_metadata=cache_metadata,
-        )
-        logits = None
-        if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
-        aux_loss = None
-        if output_router_logits and outputs.router_logits is not None:
+
+        def _aux_loss_fn(outputs, attention_mask):
+            if not output_router_logits or outputs.router_logits is None:
+                return None
             aux_loss = auxiliary_load_balancing_loss_func(
                 gate_logits=outputs.router_logits,
                 num_experts=self.config.num_local_experts,
                 top_k=self.config.num_experts_per_tok,
                 attention_mask=attention_mask,
             )
-            aux_loss += aux_loss * self.config.router_aux_loss_coef
+            return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-        return MoeCausalLMOutput(
-            aux_loss=aux_loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            last_hidden_state=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
-            past_key_values=outputs.past_key_values,
+        return self.forward_moe(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            mask_info=mask_info,
+            position_ids=position_ids,
+            mode=mode,
+            past_key_values=past_key_values,
+            cache_metadata=cache_metadata,
+            apply_lm_head=apply_lm_head,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            aux_loss_fn=_aux_loss_fn,
         )
 
     def get_encoder(self):

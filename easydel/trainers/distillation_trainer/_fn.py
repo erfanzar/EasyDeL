@@ -29,7 +29,6 @@ All functions are designed for JAX/Flax models and support distributed training.
 
 import typing as tp
 
-import chex
 import flax
 import flax.nnx
 import jax
@@ -38,6 +37,7 @@ from eformer.escale import with_sharding_constraint
 from jax import Array as JaxArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+from jaxtyping import Array
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
@@ -46,14 +46,14 @@ from ..training_utils import make_assertions_and_get_sizes, minibatch_call, upda
 
 
 def distillation_loss(
-    student_logits: chex.Array,
-    teacher_logits: chex.Array,
-    attention_mask: chex.Array | None = None,
-    labels: chex.Array | None = None,
+    student_logits: Array,
+    teacher_logits: Array,
+    attention_mask: Array | None = None,
+    labels: Array | None = None,
     use_hard_labels: bool = False,
     temperature: float = 4.0,
     alpha: float = 0.9,
-) -> tuple[chex.Array, dict[str, chex.Array]]:
+) -> tuple[Array, dict[str, Array]]:
     """Compute knowledge distillation loss between student and teacher models.
 
     This function implements the distillation loss as described in Hinton et al.'s
@@ -62,13 +62,13 @@ def distillation_loss(
     supervised learning loss on hard labels.
 
     Args:
-        student_logits (chex.Array): Raw logits from the student model.
+        student_logits (Array): Raw logits from the student model.
             Shape: [batch_size, sequence_length, vocab_size]
-        teacher_logits (chex.Array): Raw logits from the teacher model.
+        teacher_logits (Array): Raw logits from the teacher model.
             Shape: [batch_size, sequence_length, vocab_size]
-        attention_mask (chex.Array | None): Mask indicating valid tokens.
+        attention_mask (Array | None): Mask indicating valid tokens.
             1 for valid tokens, 0 for padding. Shape: [batch_size, sequence_length]
-        labels (chex.Array | None): Ground truth labels for supervised loss.
+        labels (Array | None): Ground truth labels for supervised loss.
             Shape: [batch_size, sequence_length]
         use_hard_labels (bool): Whether to include supervised loss with hard labels.
             If True, combines distillation loss with cross-entropy loss.
@@ -78,7 +78,7 @@ def distillation_loss(
             1.0 means pure distillation, 0.0 means pure supervised. Default: 0.9
 
     Returns:
-        tuple[chex.Array, dict[str, chex.Array]]: Scalar loss value combining distillation
+        tuple[Array, dict[str, Array]]: Scalar loss value combining distillation
         and optional supervised loss together with the individual components.
 
     Note:

@@ -32,7 +32,7 @@ class TestLLaVA:
             num_attention_heads=small_model_config["num_attention_heads"],
             num_key_value_heads=small_model_config["num_key_value_heads"],
             intermediate_size=small_model_config["intermediate_size"],
-            max_position_embeddings=small_model_config["max_position_embeddings"],
+            max_position_embeddings=max(small_model_config["max_position_embeddings"], 2048),
         )
         # Use a valid image token ID within vocab range
         image_token_id = small_model_config["vocab_size"] - 1
@@ -49,7 +49,8 @@ class TestLLaVA:
         num_images = 1
         image_size = llava_config.vision_config.image_size
         patch_size = llava_config.vision_config.patch_size
-        num_patches = (image_size // patch_size) ** 2 + 1  # +1 for CLS
+        # Llava's default vision feature selection drops the CLS token.
+        num_patches = (image_size // patch_size) ** 2
 
         return {
             "image_token_id": llava_config.image_token_id,

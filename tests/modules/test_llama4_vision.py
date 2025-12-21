@@ -51,6 +51,7 @@ class TestLlama4Vision:
             router_aux_loss_coef=0.0,
             router_jitter_noise=0.0,
         )
+        text_config.moe_force_xla_gmm = True
 
         vision_config = ed.Llama4VisionConfig(
             hidden_size=512,
@@ -77,6 +78,7 @@ class TestLlama4Vision:
 
         header_config.text_config = text_config
         header_config.vision_config = vision_config
+        header_config.moe_force_xla_gmm = True
         return header_config
 
     @pytest.fixture

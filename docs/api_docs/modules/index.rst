@@ -24,7 +24,10 @@ easydel.modules package
    gidd/index
    glm/index
    glm4/index
+   glm46v/index
    glm4_moe/index
+   glm4v/index
+   glm4v_moe/index
    gpt2/index
    gpt_j/index
    gpt_neox/index
@@ -32,6 +35,7 @@ easydel.modules package
    grok_1/index
    internlm2/index
    kimi_linear/index
+   kimi_vl/index
    llama/index
    llama4/index
    llava/index

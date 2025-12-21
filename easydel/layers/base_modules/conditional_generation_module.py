@@ -83,8 +83,11 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         # LM head configuration
+        lm_head_name: str = "lm_head",
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
+        lm_head_class: nn.Module = ColumnParallelLinear,
+        create_lm_head: bool = True,
     ):
         """Initialize the Conditional Generation module.
 
@@ -117,31 +120,34 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
             head_kernel_init=lm_head_kernel_init,
         )
 
-        # Create LM head
-        lm_head_block = ColumnParallelLinear
-        if self._gradient_checkpointing_feature.should_checkpoint():
-            lm_head_block = auto_remat(
-                lm_head_block,
-                **self._gradient_checkpointing_feature.get_config(),
+        self._lm_head_name = lm_head_name
+
+        if create_lm_head:
+            head_block = lm_head_class
+            if self._gradient_checkpointing_feature.should_checkpoint():
+                head_block = auto_remat(
+                    head_block,
+                    **self._gradient_checkpointing_feature.get_config(),
+                )
+
+            lm_head = head_block(
+                config.get_text_config().hidden_size,
+                config.get_text_config().vocab_size,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                use_bias=self._head_bias,
+                kernel_init=self._head_kernel_init,
+                precision=precision,
+                rngs=rngs,
+                **get_dot_general_by_bits(
+                    getattr(config, "bits", None),
+                    getattr(config, "easy_method", ""),
+                ),
             )
+            setattr(self, lm_head_name, lm_head)
 
-        self.lm_head = lm_head_block(
-            config.get_text_config().hidden_size,
-            config.get_text_config().vocab_size,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=self._head_bias,
-            kernel_init=self._head_kernel_init,
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(
-                getattr(config, "bits", None),
-                getattr(config, "easy_method", ""),
-            ),
-        )
-
-        if tie_word_embeddings:
-            self._tie_embeddings_feature.setup(self.get_embedding(), self.lm_head)
+            if tie_word_embeddings:
+                self._tie_embeddings_feature.setup(self.get_embedding(), lm_head)
 
     def __call__(
         self,
@@ -231,12 +237,27 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head."""
-        return self.lm_head(hidden_states)
+        """Apply the language modeling head (optionally tied to input embeddings)."""
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+        lm_head = self.get_task_head()
+        return lm_head(hidden_states, w=w)
 
     def get_task_head(self):
         """Returns the LM head."""
-        return self.lm_head
+        if hasattr(self, self._lm_head_name):
+            return getattr(self, self._lm_head_name)
+        if hasattr(self.base_model, "get_lm_head"):
+            return self.base_model.get_lm_head()
+
+        raise AttributeError(f"{self.__class__.__name__} has no LM head named '{self._lm_head_name}'.")
 
     def get_lm_head(self):
         """Alias for get_task_head."""

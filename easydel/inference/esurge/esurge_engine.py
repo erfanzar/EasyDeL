@@ -292,7 +292,7 @@ class eSurge:
 
         Args:
             model: Model path (HuggingFace hub) or preloaded EasyDeL model instance.
-            tokenizer: Tokenizer path or instance. If None, loads from model path.
+            tokenizer: Deprecated alias for `processor`. Tokenizer path or instance.
             dtype: JAX dtype for model computations (default: bfloat16).
             max_model_len: Maximum sequence length the model can handle.
             min_input_pad: Minimum padding for input sequences.
@@ -341,6 +341,9 @@ class eSurge:
                 These will be treated as end-of-sequence tokens for all requests unless
                 overridden in SamplingParams.
             silent_mode: If True, suppress informational eSurge engine logs.
+            processor: Unified text/multimodal processor. Can be a tokenizer or an
+                HF processor (with an embedded tokenizer). If None, falls back to
+                `tokenizer` and then to loading from `model` when `model` is a string.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -364,26 +367,65 @@ class eSurge:
         self.page_size = page_size
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
-        if tokenizer is None:
+        # `processor` is the unified interface for text + multimodal workflows.
+        # Backward-compat: if `processor` isn't provided, fall back to `tokenizer`.
+        if tokenizer is not None and processor is not None and tokenizer is not processor:
+            logger.warning("Both `tokenizer` and `processor` were provided; `processor` will be used for multimodal.")
+
+        processor_obj: Any | None = processor if processor is not None else tokenizer
+        processor_source: str | None = None
+
+        if processor_obj is None:
             if isinstance(model, str):
-                tokenizer_source = model
-                tokenizer_obj = AutoTokenizer.from_pretrained(model)
+                processor_source = model
+                processor_obj = AutoTokenizer.from_pretrained(model)
             else:
-                raise ValueError("Tokenizer must be provided when using preloaded model")
-        elif isinstance(tokenizer, str):
-            tokenizer_source = tokenizer
-            tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
+                raise ValueError("Processor must be provided when using a preloaded model.")
+        elif isinstance(processor_obj, str):
+            processor_source = processor_obj
+            processor_obj = AutoTokenizer.from_pretrained(processor_obj)
         else:
-            tokenizer_obj = tokenizer
-            tokenizer_source = getattr(tokenizer_obj, "name_or_path", None)
+            processor_source = getattr(processor_obj, "name_or_path", None)
+
+        tokenizer_obj: PreTrainedTokenizerBase | None = None
+        if isinstance(processor_obj, PreTrainedTokenizerBase):
+            tokenizer_obj = processor_obj
+        else:
+            maybe_tok = getattr(processor_obj, "tokenizer", None)
+            if isinstance(maybe_tok, PreTrainedTokenizerBase):
+                tokenizer_obj = maybe_tok
+
+        if tokenizer_obj is None:
+            if isinstance(tokenizer, PreTrainedTokenizerBase):
+                tokenizer_obj = tokenizer
+            elif isinstance(tokenizer, str):
+                processor_source = processor_source or tokenizer
+                tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
+            else:
+                source = processor_source or (model if isinstance(model, str) else None)
+                if source is None:
+                    raise ValueError(
+                        "Tokenizer must be provided (or inferable from processor) when using a preloaded model."
+                    )
+                tokenizer_obj = AutoTokenizer.from_pretrained(source)
+
+        tokenizer_source = (
+            getattr(tokenizer_obj, "name_or_path", None)
+            or processor_source
+            or (model if isinstance(model, str) else None)
+        )
+        if tokenizer_source is None:
+            raise ValueError("Could not infer a tokenizer source for tokenizer/detokenizer workers.")
+
+        self.processor = processor_obj
         self.tokenizer = tokenizer_obj
 
         # Vision-language model support
-        self._processor = processor
         self._multimodal_manager: MultiModalManager | None = None
-        if processor is not None:
+        if self.processor is not None:
             self._multimodal_manager = MultiModalManager(
-                processor=processor,
+                processor=self.processor,
+                model=None if isinstance(model, str) else model,
                 resolution_buckets=resolution_buckets,
                 cache_capacity_mb=vision_cache_capacity_mb,
                 enable_cache=True,
@@ -438,6 +480,9 @@ class eSurge:
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
+
+        if self._multimodal_manager is not None and self._multimodal_manager.model is None:
+            self._multimodal_manager.model = model
 
         # Profiling state
         self._profiling_active = False
@@ -567,9 +612,11 @@ class eSurge:
                 if not self._overlap_execution:
                     while self._scheduler_running:
                         try:
-                            scheduler_output = self.scheduler.schedule()
+                            with self._scheduler_lock:
+                                scheduler_output = self.scheduler.schedule()
                             model_output = self.runner.execute_model(scheduler_output)
-                            engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+                            with self._scheduler_lock:
+                                engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                             if engine_outputs:
                                 self._process_engine_outputs(engine_outputs)
                             # Reset error counter on success
@@ -605,7 +652,8 @@ class eSurge:
                             self._drain_runner_future(*pending_future)
                             pending_future = None
 
-                        scheduler_output = self.scheduler.schedule()
+                        with self._scheduler_lock:
+                            scheduler_output = self.scheduler.schedule()
                         future = self.runner.execute_model_async(scheduler_output)
                         pending_future = (future, scheduler_output)
                         # Reset error counter on success
@@ -1015,6 +1063,16 @@ class eSurge:
 
         if pbar:
             pbar.close()
+
+        # Cleanup per-request events (outputs are preserved for post-hoc access)
+        with self._request_lock:
+            for output in outputs:
+                rid = output.request_id
+                self._request_events.pop(rid, None)
+                n_samples = len(output.outputs)
+                if n_samples > 1:
+                    for sample_idx in range(n_samples):
+                        self._request_events.pop(f"{rid}-{sample_idx}", None)
         return outputs
 
     def stream(
@@ -1093,57 +1151,65 @@ class eSurge:
 
         last_update_seq = -1
 
-        while True:
-            req_event.wait(timeout=1.0)
-            req_event.clear()
+        try:
+            while True:
+                req_event.wait(timeout=1.0)
+                req_event.clear()
 
-            snapshot = None
+                snapshot = None
+                with self._output_lock:
+                    ro = self._request_outputs.get(request_id)
+                    if ro is None:
+                        break
+
+                    if ro.update_seq != last_update_seq:
+                        # Snapshot without holding the lock during yield
+                        outputs_copy = []
+                        for comp in ro.outputs:
+                            outputs_copy.append(
+                                CompletionOutput(
+                                    index=comp.index,
+                                    text=comp.text,
+                                    token_ids=list(comp.token_ids),
+                                    cumulative_logprob=comp.cumulative_logprob,
+                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                    finish_reason=comp.finish_reason,
+                                )
+                            )
+
+                        snapshot = RequestOutput(
+                            request_id=ro.request_id,
+                            prompt=ro.prompt,
+                            prompt_token_ids=list(ro.prompt_token_ids),
+                            outputs=outputs_copy,
+                            finished=ro.finished,
+                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
+                            accumulated_text=ro.accumulated_text,
+                            delta_text=ro.delta_text,
+                            tokens_per_second=ro.tokens_per_second,
+                            num_generated_tokens=ro.num_generated_tokens,
+                            time_spent_generating=ro.time_spent_generating,
+                            first_token_time=ro.first_token_time,
+                            processing_time=ro.processing_time,
+                            update_seq=ro.update_seq,
+                        )
+                        last_update_seq = ro.update_seq
+
+                if snapshot is not None:
+                    yield snapshot
+                    if snapshot.finished:
+                        break
+        finally:
             with self._output_lock:
                 ro = self._request_outputs.get(request_id)
-                if ro is None:
-                    break
-
-                if ro.update_seq != last_update_seq:
-                    # Snapshot without holding the lock during yield
-                    outputs_copy = []
-                    for comp in ro.outputs:
-                        outputs_copy.append(
-                            CompletionOutput(
-                                index=comp.index,
-                                text=comp.text,
-                                token_ids=list(comp.token_ids),
-                                cumulative_logprob=comp.cumulative_logprob,
-                                logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
-                                finish_reason=comp.finish_reason,
-                            )
-                        )
-
-                    snapshot = RequestOutput(
-                        request_id=ro.request_id,
-                        prompt=ro.prompt,
-                        prompt_token_ids=list(ro.prompt_token_ids),
-                        outputs=outputs_copy,
-                        finished=ro.finished,
-                        metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                        accumulated_text=ro.accumulated_text,
-                        delta_text=ro.delta_text,
-                        tokens_per_second=ro.tokens_per_second,
-                        num_generated_tokens=ro.num_generated_tokens,
-                        time_spent_generating=ro.time_spent_generating,
-                        first_token_time=ro.first_token_time,
-                        processing_time=ro.processing_time,
-                        update_seq=ro.update_seq,
-                    )
-                    last_update_seq = ro.update_seq
-
-            if snapshot is not None:
-                yield snapshot
-                if snapshot.finished:
-                    break
-
-        # Cleanup per-request event (output is preserved for generate or post-hoc access)
-        with self._request_lock:
-            self._request_events.pop(request_id, None)
+                n_samples = len(ro.outputs) if ro is not None else 0
+                finished = ro.finished if ro is not None else True
+            if finished:
+                with self._request_lock:
+                    self._request_events.pop(request_id, None)
+                    if n_samples > 1:
+                        for sample_idx in range(n_samples):
+                            self._request_events.pop(f"{request_id}-{sample_idx}", None)
 
     def chat(
         self,
@@ -1229,7 +1295,6 @@ class eSurge:
             during initialization: eSurge(..., processor=AutoProcessor.from_pretrained(...))
         """
         has_multimodal = self._messages_have_multimodal_content(messages)
-
         if has_multimodal:
             return self._chat_multimodal(
                 messages=messages,
@@ -1265,7 +1330,9 @@ class eSurge:
                 for item in content:
                     if isinstance(item, dict):
                         item_type = item.get("type", "")
-                        if item_type in ("image", "video", "image_url"):
+                        if item_type in ("image", "image_url", "input_image", "video", "video_url", "input_video"):
+                            return True
+                        if any(k in item for k in ("image", "image_url", "video", "video_url")):
                             return True
         return False
 
@@ -1282,7 +1349,7 @@ class eSurge:
         if self._multimodal_manager is None:
             raise ValueError(
                 "Multimodal content detected but no processor configured. "
-                "Initialize eSurge with: processor=AutoProcessor.from_pretrained(...)"
+                "Initialize eSurge with: processor=<tokenizer-or-processor> (e.g. AutoProcessor/AutoTokenizer)."
             )
 
         if request_id is None:
@@ -1302,7 +1369,13 @@ class eSurge:
         if videos:
             mm_features.extend(self._multimodal_manager.process_videos_to_features(videos))
 
-        prompt_token_ids = self._multimodal_manager.tokenize_multimodal(messages=messages, images=images, videos=videos)
+        prompt_token_ids = self._multimodal_manager.tokenize_multimodal(
+            messages=messages,
+            images=images,
+            videos=videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
 
         prompt = self._format_chat_prompt(
             messages,
@@ -1347,55 +1420,64 @@ class eSurge:
 
         last_update_seq = -1
 
-        while True:
-            req_event.wait(timeout=1.0)
-            req_event.clear()
+        try:
+            while True:
+                req_event.wait(timeout=1.0)
+                req_event.clear()
 
-            snapshot = None
+                snapshot = None
+                with self._output_lock:
+                    ro = self._request_outputs.get(request_id)
+                    if ro is None:
+                        break
+
+                    if ro.update_seq != last_update_seq:
+                        outputs_copy = []
+                        for comp in ro.outputs:
+                            outputs_copy.append(
+                                CompletionOutput(
+                                    index=comp.index,
+                                    text=comp.text,
+                                    token_ids=list(comp.token_ids),
+                                    cumulative_logprob=comp.cumulative_logprob,
+                                    logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
+                                    finish_reason=comp.finish_reason,
+                                )
+                            )
+
+                        snapshot = RequestOutput(
+                            request_id=ro.request_id,
+                            prompt=ro.prompt,
+                            prompt_token_ids=list(ro.prompt_token_ids),
+                            outputs=outputs_copy,
+                            finished=ro.finished,
+                            metrics=dict(ro.metrics) if ro.metrics is not None else None,
+                            accumulated_text=ro.accumulated_text,
+                            delta_text=ro.delta_text,
+                            tokens_per_second=ro.tokens_per_second,
+                            num_generated_tokens=ro.num_generated_tokens,
+                            time_spent_generating=ro.time_spent_generating,
+                            first_token_time=ro.first_token_time,
+                            processing_time=ro.processing_time,
+                            update_seq=ro.update_seq,
+                        )
+                        last_update_seq = ro.update_seq
+
+                if snapshot is not None:
+                    yield snapshot
+                    if snapshot.finished:
+                        break
+        finally:
             with self._output_lock:
                 ro = self._request_outputs.get(request_id)
-                if ro is None:
-                    break
-
-                if ro.update_seq != last_update_seq:
-                    outputs_copy = []
-                    for comp in ro.outputs:
-                        outputs_copy.append(
-                            CompletionOutput(
-                                index=comp.index,
-                                text=comp.text,
-                                token_ids=list(comp.token_ids),
-                                cumulative_logprob=comp.cumulative_logprob,
-                                logprobs=[dict(lp) for lp in comp.logprobs] if comp.logprobs else None,
-                                finish_reason=comp.finish_reason,
-                            )
-                        )
-
-                    snapshot = RequestOutput(
-                        request_id=ro.request_id,
-                        prompt=ro.prompt,
-                        prompt_token_ids=list(ro.prompt_token_ids),
-                        outputs=outputs_copy,
-                        finished=ro.finished,
-                        metrics=dict(ro.metrics) if ro.metrics is not None else None,
-                        accumulated_text=ro.accumulated_text,
-                        delta_text=ro.delta_text,
-                        tokens_per_second=ro.tokens_per_second,
-                        num_generated_tokens=ro.num_generated_tokens,
-                        time_spent_generating=ro.time_spent_generating,
-                        first_token_time=ro.first_token_time,
-                        processing_time=ro.processing_time,
-                        update_seq=ro.update_seq,
-                    )
-                    last_update_seq = ro.update_seq
-
-            if snapshot is not None:
-                yield snapshot
-                if snapshot.finished:
-                    break
-
-        with self._request_lock:
-            self._request_events.pop(request_id, None)
+                n_samples = len(ro.outputs) if ro is not None else 0
+                finished = ro.finished if ro is not None else True
+            if finished:
+                with self._request_lock:
+                    self._request_events.pop(request_id, None)
+                    if n_samples > 1:
+                        for sample_idx in range(n_samples):
+                            self._request_events.pop(f"{request_id}-{sample_idx}", None)
 
     def _wait_for_request(self, request_id: str) -> RequestOutput:
         """Wait for a request to complete and return the output."""
@@ -1404,14 +1486,25 @@ class eSurge:
         if req_event is None:
             raise RuntimeError("Request event missing")
 
+        output: RequestOutput | None = None
         while True:
-            self._output_event.wait(timeout=0.1)
-            self._output_event.clear()
+            req_event.wait(timeout=1.0)
+            req_event.clear()
             with self._output_lock:
-                if request_id in self._request_outputs:
-                    output = self._request_outputs[request_id]
-                    if output.finished:
-                        return output
+                output = self._request_outputs.get(request_id)
+                if output is not None and output.finished:
+                    break
+
+        # Request is finished; cleanup per-request events (output is preserved)
+        n_samples = len(output.outputs) if output is not None else 0
+        with self._request_lock:
+            self._request_events.pop(request_id, None)
+            if n_samples > 1:
+                for sample_idx in range(n_samples):
+                    self._request_events.pop(f"{request_id}-{sample_idx}", None)
+
+        assert output is not None
+        return output
 
     def update_model_weights(
         self,
@@ -1730,6 +1823,24 @@ class eSurge:
                     sampling_params._all_stop_token_ids.add(eos_id)
 
         # Create n EngineRequest objects for parallel sampling
+        mm_features_cache_key_only = None
+        if mm_features and n_samples > 1:
+            mm_features_cache_key_only = []
+            for feat in mm_features:
+                try:
+                    mm_features_cache_key_only.append(
+                        type(feat)(
+                            mm_hash=getattr(feat, "mm_hash", ""),
+                            modality=getattr(feat, "modality", "image"),
+                            pixel_values=None,
+                            grid_thw=None,
+                        )
+                    )
+                except Exception:
+                    # Worst-case fallback: keep the original feature object.
+                    # This preserves correctness at the cost of extra memory.
+                    mm_features_cache_key_only.append(feat)
+
         for sample_idx in range(n_samples):
             if n_samples == 1:
                 # For n=1, use the original request_id
@@ -1762,22 +1873,25 @@ class eSurge:
                         "parent_request_id": request_id,
                     }
 
-            self.scheduler.add_request(
-                EngineRequest(
-                    request_id=child_request_id,
-                    prompt_token_ids=token_ids,
-                    sampling_params=sampling_params,
-                    eos_token_id=primary_eos_token_id,
-                    parent_request_id=parent_id,
-                    sample_index=sample_idx,
-                    # Vision-language model data (only for first sample to save memory)
-                    pixel_values=pixel_values if sample_idx == 0 else None,
-                    image_grid_thw=image_grid_thw if sample_idx == 0 else None,
-                    pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
-                    video_grid_thw=video_grid_thw if sample_idx == 0 else None,
-                    mm_features=mm_features if sample_idx == 0 else None,
+            with self._scheduler_lock:
+                self.scheduler.add_request(
+                    EngineRequest(
+                        request_id=child_request_id,
+                        prompt_token_ids=token_ids,
+                        sampling_params=sampling_params,
+                        eos_token_id=primary_eos_token_id,
+                        parent_request_id=parent_id,
+                        sample_index=sample_idx,
+                        # Vision-language model data (only for first sample to save memory)
+                        pixel_values=pixel_values if sample_idx == 0 else None,
+                        image_grid_thw=image_grid_thw if sample_idx == 0 else None,
+                        pixel_values_videos=pixel_values_videos if sample_idx == 0 else None,
+                        video_grid_thw=video_grid_thw if sample_idx == 0 else None,
+                        # Keep multimodal cache keys for all samples so n>1 can share
+                        # KV-prefix pages via prefix caching without duplicating pixel buffers.
+                        mm_features=mm_features if sample_idx == 0 else mm_features_cache_key_only,
+                    )
                 )
-            )
 
         self._info(
             f"Queued request {request_id}: prompt_len={prompt_len}, "
@@ -1808,39 +1922,75 @@ class eSurge:
         Args:
             request_id: ID of the request to abort.
         """
+        detokenizer_reset_ids: set[str] = set()
+        parent_request_id = request_id
+        sample_index = 0
+        metrics_collector = get_metrics_collector()
+
         # Acquire all locks atomically to prevent race conditions
         with self._scheduler_lock, self._request_lock, self._output_lock:
-            # Mark request as aborted in scheduler
+            rd = self._active_requests.get(request_id)
+            if rd is not None:
+                parent_request_id = rd.get("parent_request_id", request_id)
+                sample_index = int(rd.get("sample_index", 0) or 0)
+
+            # Resolve scheduler-side IDs to abort (n=1: request_id; n>1: children of parent)
+            abort_ids: set[str] = set()
             if request_id in self.scheduler.requests:
-                self.scheduler.requests[request_id].status = EngineRequestStatus.FINISHED_ABORTED
+                abort_ids.add(request_id)
+                parent_request_id = self.scheduler.requests[request_id].parent_request_id or parent_request_id
+            abort_ids.update(
+                rid
+                for rid, req in self.scheduler.requests.items()
+                if getattr(req, "parent_request_id", None) == request_id
+            )
 
-            # Clean up active request tracking
-            self._active_requests.pop(request_id, None)
+            if abort_ids:
+                self.scheduler.finish_requests(abort_ids, EngineRequestStatus.FINISHED_ABORTED)
+                detokenizer_reset_ids |= abort_ids
 
-            # Update output state with bounds checking
-            if request_id in self._request_outputs:
-                ro = self._request_outputs[request_id]
-                ro.finished = True
-                # Mark all completion outputs as aborted (handles n>1 case)
-                for output in ro.outputs:
-                    output.finish_reason = "aborted"
+            # Clean up active request tracking (outputs are preserved)
+            for rid in abort_ids:
+                self._active_requests.pop(rid, None)
+            self._active_requests.pop(parent_request_id, None)
+
+            # Update output state
+            ro = self._request_outputs.get(parent_request_id)
+            if ro is not None:
+                if request_id == parent_request_id:
+                    ro.finished = True
+                    for output in ro.outputs:
+                        output.finish_reason = "abort"
+                    if metrics_collector:
+                        metrics_collector.complete_request(parent_request_id, finish_reason="abort")
+                else:
+                    if 0 <= sample_index < len(ro.outputs):
+                        ro.outputs[sample_index].finish_reason = "abort"
+                    ro.finished = all(output.finish_reason is not None for output in ro.outputs)
+                    if ro.finished and metrics_collector:
+                        metrics_collector.complete_request(parent_request_id, finish_reason="abort")
                 ro.update_seq += 1
 
-            # Get event while still holding lock
-            ev = self._request_events.get(request_id)
+            # Get event while still holding lock (streaming uses parent event)
+            ev = self._request_events.get(parent_request_id)
+
+            if not detokenizer_reset_ids:
+                detokenizer_reset_ids.add(request_id)
 
         # Reset detokenizer state (outside locks to avoid blocking)
-        try:
-            self._detokenizer_client.reset(request_id)
-            # Remove from failed set if it was there
-            self._failed_detokenizer_resets.discard(request_id)
-        except Exception:
-            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
-            # Track failed reset
-            self._failed_detokenizer_resets.add(request_id)
-            # Trigger cleanup if threshold reached
-            if len(self._failed_detokenizer_resets) >= self._detokenizer_cleanup_threshold:
-                self._cleanup_detokenizer_state()
+        for rid in detokenizer_reset_ids:
+            try:
+                self._detokenizer_client.reset(rid)
+                # Remove from failed set if it was there
+                self._failed_detokenizer_resets.discard(rid)
+            except Exception:
+                logger.debug("Failed to reset detokenizer state for %s", rid, exc_info=True)
+                # Track failed reset
+                self._failed_detokenizer_resets.add(rid)
+
+        # Trigger cleanup if threshold reached
+        if len(self._failed_detokenizer_resets) >= self._detokenizer_cleanup_threshold:
+            self._cleanup_detokenizer_state()
 
         # Notify waiters
         if ev:
@@ -1970,7 +2120,8 @@ class eSurge:
 
     def _drain_runner_future(self, future, scheduler_output: SchedulerOutput) -> None:
         model_output = self.runner.wait_for_execution(future)
-        engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+        with self._scheduler_lock:
+            engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
         if engine_outputs:
             self._process_engine_outputs(engine_outputs)
         self._handle_profiling_step()
@@ -2036,11 +2187,11 @@ class eSurge:
 
                         if rd["first_token_time"] is None and num_generated > 0:
                             rd["first_token_time"] = now - rd["start_time"]
-                            if metrics_collector:
-                                metrics_collector.record_first_token(request_id)
+                            if metrics_collector and ro.first_token_time is None:
+                                metrics_collector.record_first_token(parent_request_id)
 
                         if metrics_collector:
-                            metrics_collector.add_generated_tokens(request_id, len(new_tokens))
+                            metrics_collector.add_generated_tokens(parent_request_id, len(new_tokens))
 
                         last_idx = rd["last_decoded_index"]
                         should_decode = (
@@ -2152,15 +2303,25 @@ class eSurge:
                             "tokens_per_second": ro.tokens_per_second,
                         }
 
-                        if metrics_collector:
+                        if metrics_collector and ro.finished:
+                            finish_reason = comp.finish_reason
+                            if any(out.finish_reason == "abort" for out in ro.outputs):
+                                finish_reason = "abort"
+                            elif any(out.finish_reason == "length" for out in ro.outputs):
+                                finish_reason = "length"
+                            elif any(out.finish_reason == "stop" for out in ro.outputs):
+                                finish_reason = "stop"
                             metrics_collector.complete_request(
-                                request_id,
-                                finish_reason=comp.finish_reason,
+                                parent_request_id,
+                                finish_reason=finish_reason,
                             )
                         try:
                             self._detokenizer_client.reset(request_id)
                         except Exception:
                             logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
+                        self._active_requests.pop(request_id, None)
+                        if ro.finished and parent_request_id != request_id:
+                            self._active_requests.pop(parent_request_id, None)
                     ro.update_seq += 1
                     if text_changed or engine_output.finished:
                         # Signal the parent request event

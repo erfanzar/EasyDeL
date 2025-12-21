@@ -74,7 +74,6 @@ from functools import cached_property, partial
 from re import Pattern
 from typing import Self, Unpack
 
-import chex
 import flax
 import flax.nnx
 import flax.struct
@@ -87,6 +86,7 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jaxtyping import Array, Float, Int
 
 from easydel.infra.utils import ArrayParam
 from easydel.utils import traversals
@@ -96,6 +96,7 @@ from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
 from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
+from .modeling_outputs import EmbeddingInfo
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -1106,6 +1107,29 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         raise NotImplementedError()
 
+    def compute_embedding(self: Self, input_ids: Int[Array, "..."], *args, **kwargs) -> Float[Array, "..."]:
+        """Compute input embeddings from token IDs.
+
+        By default, this calls the embedding layer returned by `get_embedding()`.
+        Vision-language models can override this hook to incorporate multimodal
+        embeddings or other model-specific preprocessing.
+        """
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+        return self.get_embedding()(jnp.asarray(input_ids, dtype="i4"))
+
+    def compute_embedding_with_info(
+        self: Self, input_ids: Int[Array, "..."], *args, **kwargs
+    ) -> tuple[Float[Array, "..."], EmbeddingInfo | None]:
+        """Compute input embeddings and optional auxiliary info.
+
+        The default implementation returns `(compute_embedding(...), None)`.
+        Multimodal models can override this to return extra tensors needed to
+        reproduce the full forward pass when providing `inputs_embeds` directly
+        (e.g. DeepStack visual features, mRoPE indices).
+        """
+        return self.compute_embedding(input_ids, *args, **kwargs), None
+
     @classmethod
     def sequential_init(cls: type[Self], **kwargs) -> Self:
         """Initialize model parameters sequentially with proper sharding.
@@ -1299,10 +1323,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         from easydel.layers.quantization import Array8B, ArrayNF4, Linear8bit, LinearNF4
 
         for _, tensor in nn.iter_graph(self):
-            if isinstance(tensor, (Linear8bit, LinearNF4)):  # noqa:UP038
+            if isinstance(tensor, (Linear8bit, LinearNF4)):
                 return True
 
-            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):  # noqa:UP038
+            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):
                 return True
         return False
 
@@ -1704,7 +1728,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
     def compute_loss(
         self,
         *,
-        labels: chex.Array | None = None,
+        labels: Array | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
         **batch,
@@ -1718,7 +1742,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         and default loss configurations.
 
         Args:
-            labels (tp.Optional[chex.Array], optional): The target labels. If None and the task is Causal LM,
+            labels (tp.Optional[Array], optional): The target labels. If None and the task is Causal LM,
                 `input_ids` from the batch might be used. Defaults to None.
             loss_config (tp.Optional[LossConfig], optional): Specific configuration for the loss calculation.
                 If None, defaults might be inferred (e.g., for sequence classification). Defaults to None.
@@ -1764,7 +1788,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         outputs = outputs.replace(loss=loss_output.loss)
         return outputs, loss_output
 
-    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+    def apply_lm_head(self, hidden_states: Array) -> Array:
         """
         Apply the language model head to transform hidden states into logits.
 

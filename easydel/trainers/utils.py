@@ -32,7 +32,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import current_thread
 
-import chex
 import jax
 import numpy as np
 from datasets import Dataset, IterableDataset
@@ -41,6 +40,7 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from grain import python as pygrain
 from jax import numpy as jnp
+from jaxtyping import Array
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
@@ -1755,11 +1755,11 @@ def np_pad(
 
 
 def pad_to_length(
-    tensor: chex.Array,
+    tensor: Array,
     length: int,
     pad_value: int | float,
     axis: int = -1,
-) -> chex.Array:
+) -> Array:
     """Pad or truncate a tensor to a specific length along an axis.
 
     Args:
@@ -1769,7 +1769,7 @@ def pad_to_length(
         axis: Axis along which to pad/truncate (default -1).
 
     Returns:
-        chex.Array: Tensor padded or truncated to the specified length.
+        Array: Tensor padded or truncated to the specified length.
 
     Note:
         If tensor is already longer than length, it will be truncated.

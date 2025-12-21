@@ -320,14 +320,14 @@ class Olmo3DecoderLayer(nn.Module):
         """Forward pass of the Olmo3DecoderLayer module.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
                 mask_info (MaskInfo): Mask information for attention.
-                position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+                position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
                 mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (train/eval/infer).
                 cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
                 cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
                 output_attentions (bool): Whether to return attention weights. Default is False.
-                frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+                frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
                 DecoderLayerOutput: Output containing hidden states and optional attention weights.
@@ -464,13 +464,13 @@ class Olmo3Model(EasyDeLBaseModule):
         """Forward pass of the Olmo3Model.
 
         Args:
-                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[Array]): Input embeddings.
                         Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                         Shape: (batch_size, sequence_length).
                 mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                position_ids (tp.Optional[Array]): Position indices for the tokens.
                         Shape: (batch_size, sequence_length).
                 mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
                 past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
@@ -632,13 +632,13 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
         """Forward pass of the Olmo3ForCausalLM model.
 
         Args:
-                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[Array]): Input embeddings.
                         Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                         Shape: (batch_size, sequence_length).
                 mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                position_ids (tp.Optional[Array]): Position indices for the tokens.
                         Shape: (batch_size, sequence_length).
                 mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
                 past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
@@ -761,13 +761,13 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
         """Forward pass of the Olmo3ForSequenceClassification model.
 
         Args:
-                input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+                inputs_embeds (tp.Optional[Array]): Input embeddings.
                         Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                         Shape: (batch_size, sequence_length).
                 mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+                position_ids (tp.Optional[Array]): Position indices for the tokens.
                         Shape: (batch_size, sequence_length).
                 mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
                 past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):

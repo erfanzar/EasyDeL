@@ -14,7 +14,6 @@
 
 import functools
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -357,10 +356,10 @@ class MistralModel(EasyDeLBaseModule):
         """Forward pass through the Mistral model.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
             past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
@@ -519,10 +518,10 @@ class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
         """Forward pass through the Mistral model for causal language modeling.
 
         Args:
-                input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-                inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-                position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+                input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+                inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+                attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+                position_ids (Array, optional): Indices of positions of each input sequence token.
                 past_key_values (TransformerCache | RaggedPagesCache, optional):
                     Cache containing precomputed key/value states.
                 cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
@@ -623,11 +622,11 @@ class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralM
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -640,10 +639,10 @@ class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralM
         a classification head to the output.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
             past_key_values (TransformerCache | RaggedPagesCache, optional):
                 Cache containing precomputed key/value states.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.

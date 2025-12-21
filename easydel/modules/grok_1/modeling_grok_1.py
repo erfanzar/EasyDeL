@@ -15,7 +15,6 @@
 
 from functools import cached_property
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -144,10 +143,10 @@ class Grok1Attention(AttentionModule):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.hidden_size))
 
@@ -165,21 +164,21 @@ class Grok1Attention(AttentionModule):
         """Forward pass of the Grok1Attention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
             output_attentions (bool, optional): Whether to return attention weights.
-            fcm_mask (tp.Optional[chex.Array], optional): Forward causal mask.
-            frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
+            fcm_mask (tp.Optional[Array], optional): Forward causal mask.
+            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention
+            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the attention
                 output and optionally the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
@@ -308,10 +307,10 @@ class Grok1BLockSparseMLP(nn.Module):
         """Forward pass of the Grok1BLockSparseMLP module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
+            hidden_states (Array): Input hidden states.
 
         Returns:
-            chex.Array: Output hidden states after processing through the block sparse MLP.
+            Array: Output hidden states after processing through the block sparse MLP.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -380,14 +379,14 @@ class Grok1SparseMoeBlock(nn.Module):
             for i in range(self.config.num_experts)
         ]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Grok1SparseMoeBlock.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
+            hidden_states (Array): Input hidden states.
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the output hidden states
+            tp.Tuple[Array, Array]: A tuple containing the output hidden states
                 and the router logits.
         """
         hidden_states = apply_logical_sharding(
@@ -527,22 +526,22 @@ class Grok1DecoderLayer(nn.Module):
         """Forward pass of the Grok1DecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
                 Metadata for cache handling.
-            segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
             output_router_logits (bool, optional): Whether to return router logits from the MoE layer. Defaults to False.
-            fcm_mask (tp.Optional[chex.Array], optional): Forward causal mask. Defaults to None.
-            frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
+            fcm_mask (tp.Optional[Array], optional): Forward causal mask. Defaults to None.
+            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array], tp.Optional[chex.Array]]: A tuple containing the
+            tp.Tuple[Array, tp.Optional[Array], tp.Optional[Array]]: A tuple containing the
                 output hidden states, optionally the attention weights, and optionally the router logits.
         """
         residual = hidden_states
@@ -667,11 +666,11 @@ class Grok1Model(EasyDeLBaseModule):
         """Forward pass through the Grok1Model.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
+            segment_ids (Array, optional): Segment token indices for segment embeddings.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
             output_router_logits (bool, optional): Whether to return router logits from MoE layers.
@@ -738,7 +737,7 @@ class Grok1Model(EasyDeLBaseModule):
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 mode=mode,
-                cache_view=past_key_values.view[idx],
+                cache_view=past_key_values[idx],
                 cache_metadata=cache_metadata,
                 frequencies=self.frequencies,
             )
@@ -854,10 +853,10 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         """Forward pass through the Grok1ForCausalLM model.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
             output_attentions (bool, optional): Whether to return attention weights.
             output_hidden_states (bool, optional): Whether to return hidden states of all layers.
             output_router_logits (bool, optional): Whether to return router logits from MoE layers.
@@ -898,7 +897,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply LM head with Grok-1's output multiplier scale."""
         lm_logits = super().apply_lm_head(hidden_states)
         lm_logits = lm_logits * self.output_multiplier_scale

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -60,40 +59,40 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
     Base class for Mistral3 causal language model (or autoregressive) outputs.
 
     Args:
-        loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
             Language modeling loss (for next-token prediction).
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is
+        past_key_values (`tuple(tuple(Array))`, *optional*, returned when `use_cache=True` is
             passed or when `config.use_cache=True`):
-            Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
             `config.output_hidden_states=True`):
-            Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed
+        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed
             or when `config.output_attentions=True`):
-            Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        image_hidden_states (`chex.Array`, *optional*):
-            A `chex.Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
+        image_hidden_states (`Array`, *optional*):
+            A `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
+    loss: Array | None = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
@@ -262,20 +261,53 @@ class Mistral3Model(EasyDeLBaseModule):
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.vision_feature_layer = config.vision_feature_layer
 
-    def get_image_features(self, pixel_values: chex.Array, image_sizes: chex.Array) -> chex.Array:
+    def get_image_features(self, pixel_values: Array, image_sizes: Array) -> Array:
         image_features = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
         image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
-        downsample_ratio = self.vision_tower.patch_size * self.config.spatial_merge_size
-        split_sizes = [(height // downsample_ratio) * (width // downsample_ratio) for height, width in image_sizes]
-        image_features = jnp.split(image_features.squeeze(0), split_sizes)
-        return image_features
+        return image_features.squeeze(0)
+
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        image_features: Array | None = None,
+        pixel_values: Array | None = None,
+        image_sizes: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        image_token_id = self.config.image_token_index
+        if image_token_id >= self.vocab_size:
+            llm_input_ids = jnp.where(input_ids == image_token_id, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+
+        if image_features is None and pixel_values is not None:
+            if image_sizes is None:
+                raise ValueError("`image_sizes` must be provided when `pixel_values` is not None.")
+            image_features = self.get_image_features(pixel_values, image_sizes)
+
+        if image_features is not None:
+            multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
+            inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                placeholder_token_id=image_token_id,
+            )
+
+        return inputs_embeds
 
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
-        image_sizes: chex.Array = None,
+        pixel_values: Array = None,
+        image_sizes: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -294,27 +326,17 @@ class Mistral3Model(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_index >= self.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_index
-            llm_input_ids = input_ids
-            llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
-        else:
-            llm_input_ids = input_ids
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
 
-        if inputs_embeds is None:
-            inputs_embeds = self.language_model.embed_tokens(llm_input_ids)
-
+        image_features = None
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, image_sizes)
 
-            special_image_mask = jnp.expand_dims((input_ids == self.config.image_token_index), -1)
-            special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
-            image_features = image_features.astype(inputs_embeds.dtype)
-            inputs_embeds = jnp.place(
-                inputs_embeds,
-                special_image_mask,
-                image_features,
-                inplace=False,
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -353,7 +375,7 @@ class Mistral3Model(EasyDeLBaseModule):
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
@@ -464,7 +486,7 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
     def get_image_features(
         self,
         pixel_values: Float[Array, "batch channels height width"],
-        image_sizes: chex.Array | None = None,
+        image_sizes: Array | None = None,
         **kwargs,
     ) -> Float[Array, "batch num_patches hidden"]:
         """Extract and project image features from pixel values.
@@ -482,11 +504,14 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         """
         return self.base_model.get_image_features(pixel_values=pixel_values, image_sizes=image_sizes)
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
-        image_sizes: chex.Array = None,
+        pixel_values: Array = None,
+        image_sizes: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

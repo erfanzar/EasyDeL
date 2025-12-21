@@ -42,6 +42,32 @@ def make_text_inputs(
     }
 
 
+def make_vision_inputs(
+    batch_size: int,
+    image_size: int = 224,
+    num_channels: int = 3,
+    seed: int = 42,
+) -> dict:
+    """Generate vision inputs for both PyTorch and JAX.
+
+    Args:
+        batch_size: Batch size
+        image_size: Image dimension (height = width)
+        num_channels: Number of image channels
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary with 'torch' and 'jax' keys containing pixel_values tensors
+    """
+    rng = np.random.default_rng(seed)
+    np_pixel_values = rng.standard_normal((batch_size, num_channels, image_size, image_size)).astype(np.float32)
+
+    return {
+        "torch": {"pixel_values": torch.from_numpy(np_pixel_values).to(torch.float32)},
+        "jax": {"pixel_values": jnp.asarray(np_pixel_values, dtype="f4")},
+    }
+
+
 def make_input_ids(
     vocab_size: int,
     input_shape: tuple[int, int],
@@ -75,6 +101,8 @@ def make_vlm_inputs(
     num_images: int = 1,
     token_type_ids: bool = False,
     image_grid_hws: np.ndarray | None = None,
+    image_grid_thw: np.ndarray | None = None,
+    video_grid_thw: np.ndarray | None = None,
     seed: int = 42,
 ) -> dict:
     """Generate Vision-Language Model inputs with image token placeholders.
@@ -88,6 +116,12 @@ def make_vlm_inputs(
         pixel_values_shape: Shape of pixel_values tensor (batch, channels, height, width)
         num_images: Number of images to include
         token_type_ids: Whether to generate token_type_ids (for Gemma3)
+        image_grid_hws: Optional per-image (height, width) grid for models that
+            accept `image_grid_hws` (e.g. Gemma3).
+        image_grid_thw: Optional per-image (temporal, height, width) grid for
+            models that accept `image_grid_thw` (e.g. GLM/Qwen style patch grids).
+        video_grid_thw: Optional per-video (temporal, height, width) grid for
+            models that accept `video_grid_thw`.
         seed: Random seed
 
     Returns:
@@ -146,6 +180,16 @@ def make_vlm_inputs(
         image_grid_hws = np.asarray(image_grid_hws, dtype=np.int64)
         result["torch"]["image_grid_hws"] = torch.from_numpy(image_grid_hws).to(torch.long)
         result["jax"]["image_grid_hws"] = jnp.asarray(image_grid_hws, dtype="i4")
+
+    if image_grid_thw is not None:
+        image_grid_thw = np.asarray(image_grid_thw, dtype=np.int64)
+        result["torch"]["image_grid_thw"] = torch.from_numpy(image_grid_thw).to(torch.long)
+        result["jax"]["image_grid_thw"] = jnp.asarray(image_grid_thw, dtype="i4")
+
+    if video_grid_thw is not None:
+        video_grid_thw = np.asarray(video_grid_thw, dtype=np.int64)
+        result["torch"]["video_grid_thw"] = torch.from_numpy(video_grid_thw).to(torch.long)
+        result["jax"]["video_grid_thw"] = jnp.asarray(video_grid_thw, dtype="i4")
 
     return result
 

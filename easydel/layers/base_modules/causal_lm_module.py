@@ -348,18 +348,18 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        This method is separated to allow easy customization in subclasses.
-
-        Args:
-            hidden_states: Hidden states from the model
-
-        Returns:
-            Logits over vocabulary
-        """
+        """Apply the language modeling head (optionally tied to input embeddings)."""
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
         lm_head = getattr(self, self._lm_head_name)
-        return lm_head(hidden_states)
+        return lm_head(hidden_states, w=w)
 
     def get_task_head(self):
         """Returns the language modeling head.

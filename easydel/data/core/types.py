@@ -103,22 +103,27 @@ class BaseDatasetInform:
         format_fields: Optional mapping for renaming fields.
     """
 
-    type: DatasetType | str | None = None
-    data_files: os.PathLike | str | None = None
+    type: DatasetType | str | None = None  # noqa: A003
+    data_files: os.PathLike | str | list[os.PathLike | str] | None = None
     num_rows: int | None = None
     dataset_split_name: str | None = None
     split: str = "train"
-    format_callback: tp.Callable[[dict], dict] | None = None
+    format_callback: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
     format_fields: dict[str, str] | None = None
 
     def __post_init__(self):
         if self.type is None:
             # Convert PathLike to string for type inference
-            if self.data_files is not None:
-                path_str = str(self.data_files)
-                inferred_type = DatasetType.infer_from_path(path_str)
-            else:
-                inferred_type = None
+            inferred_type = None
+            if self.data_files:
+                first_file: os.PathLike | str | None
+                if isinstance(self.data_files, list):
+                    first_file = self.data_files[0] if self.data_files else None
+                else:
+                    first_file = self.data_files
+
+                if first_file is not None:
+                    inferred_type = DatasetType.infer_from_path(os.fspath(first_file))
             if inferred_type:
                 self.type = inferred_type
             assert self.type is not None, (
@@ -131,7 +136,7 @@ class BaseDatasetInform:
             except ValueError:
                 pass
 
-        if self.dataset_split_name and str(self.type) not in {"huggingface", "hf"}:
+        if self.dataset_split_name and str(self.get_str_type()) not in {"huggingface", "hf"}:
             import warnings
 
             warnings.warn(
@@ -166,7 +171,7 @@ class TextDatasetInform(BaseDatasetInform):
 
     content_field: str = "content"
     additional_fields: list[str] | None = None
-    preprocessing_fn: tp.Callable | None = None
+    preprocessing_fn: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
 
 
 @auto_pytree
@@ -185,7 +190,7 @@ class VisualDatasetInform(BaseDatasetInform):
     pixel_field: str = "images"
     content_field: str | None = None
     image_size: tuple[int, int] | None = None
-    preprocessing_fn: tp.Callable | None = None
+    preprocessing_fn: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
 
 
 @auto_pytree
@@ -263,10 +268,10 @@ class DatasetMixture:
     pack_eos_token_id: int = 0
     pack_shuffle: bool = True
     pack_shuffle_buffer_factor: int = 16
-    dask_storage_options: dict | None = None
+    dask_storage_options: dict[str, tp.Any] | None = None
 
     pack_on_the_fly: bool = False
-    tokenize_callback: tp.Callable[[dict], list[int]] | None = None
+    tokenize_callback: tp.Callable[[dict[str, tp.Any]], list[int]] | None = None
 
     # Prefetch configuration
     prefetch_workers: int = 2

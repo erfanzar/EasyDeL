@@ -30,6 +30,7 @@ Each source supports:
 
 from __future__ import annotations
 
+import os
 import typing as tp
 from dataclasses import dataclass
 
@@ -85,7 +86,7 @@ def _detect_format(files: list[str]) -> str:
     return "arrow"  # Default
 
 
-def expand_data_files(data_files: str | list[str]) -> list[str]:
+def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -> list[str]:
     """Expand glob patterns and validate file existence.
 
     Args:
@@ -113,12 +114,12 @@ def expand_data_files(data_files: str | list[str]) -> list[str]:
                 return m
         return []
 
-    if isinstance(data_files, str):
-        files = expand_one(data_files)
+    if isinstance(data_files, (str, os.PathLike)):
+        files = expand_one(os.fspath(data_files))
     else:
         files = []
         for p in data_files:
-            files.extend(expand_one(str(p)))
+            files.extend(expand_one(os.fspath(p)))
 
     if not files:
         raise FileNotFoundError(f"No files matched: {data_files}")
@@ -146,7 +147,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         columns: list[str] | None = None,
     ):
@@ -264,7 +265,7 @@ class JsonShardedSource(ShardedDataSource[dict]):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         jsonl: bool = True,
     ):
@@ -352,7 +353,7 @@ class ArrowShardedSource(ShardedDataSource[dict]):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
     ):
         """Initialize ArrowShardedSource.
@@ -410,7 +411,7 @@ class CsvShardedSource(ShardedDataSource[dict]):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         delimiter: str = ",",
     ):
@@ -468,7 +469,7 @@ class TextShardedSource(ShardedDataSource[dict]):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str | os.PathLike | list[str | os.PathLike],
         storage_options: dict | None = None,
         text_field: str = "text",
     ):
@@ -713,7 +714,7 @@ def create_source(config: "DatasetConfig") -> ShardedDataSource:
         return ArrowShardedSource(files, storage_options)
 
 
-def _detect_builder_and_files(data_files: str | list[str]) -> tuple[str, list[str]]:
+def _detect_builder_and_files(data_files: str | os.PathLike | list[str | os.PathLike]) -> tuple[str, list[str]]:
     """Legacy function for backward compatibility.
 
     Auto-detect dataset builder type and expand file patterns.

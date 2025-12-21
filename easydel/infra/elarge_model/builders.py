@@ -27,6 +27,9 @@ from collections.abc import Mapping
 from typing import Any
 
 if tp.TYPE_CHECKING:
+    from datasets import Dataset, IterableDataset
+    from transformers import PreTrainedTokenizerBase
+
     from easydel.data.core.protocols import ShardedDataSource
 
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
@@ -275,7 +278,7 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         >>> engine = build_esurge(cfg)
         >>>
     """
-    from transformers import AutoTokenizer
+    from transformers import AutoProcessor, AutoTokenizer
 
     from easydel.inference import eSurge
 
@@ -288,15 +291,33 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         getattr(TaskType, "VISION_LM", None),
     ]:
         raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY, VISION_LM]; got {task}")
-    tok_path = cfg["model"].get("tokenizer", cfg["model"]["name_or_path"])
+    trust_remote_code = bool(cfg["loader"].get("trust_remote_code", False))
+    proc_path = (
+        cfg["model"].get("processor")
+        or cfg["model"].get("tokenizer")
+        or cfg["model"].get("name_or_path")
+        or cfg["model"]["name_or_path"]
+    )
     if model is None:
         model = build_model(cfg)
+    processor = None
+
+    is_vlm_task = task in [TaskType.IMAGE_TEXT_TO_TEXT, TaskType.ANY_TO_ANY, getattr(TaskType, "VISION_LM", None)]
+
+    # For VLM tasks, try to load a ProcessorMixin; if it doesn't exist in the
+    # installed Transformers version, fall back to the tokenizer as the
+    # "processor" (eSurge has a tokenizer-only multimodal fallback for patchified VLMs).
+    if is_vlm_task:
+        try:
+            processor = AutoProcessor.from_pretrained(proc_path, trust_remote_code=trust_remote_code)
+        except Exception:
+            processor = None
+
+    if processor is None:
+        processor = AutoTokenizer.from_pretrained(proc_path, trust_remote_code=trust_remote_code)
     return eSurge(
         model=model,
-        tokenizer=AutoTokenizer.from_pretrained(
-            tok_path,
-            trust_remote_code=cfg["loader"].get("trust_remote_code", False),
-        ),
+        processor=processor,
         **to_esurge_kwargs(cfg),
     )
 
@@ -339,10 +360,37 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
 
     informs = []
     for inform_cfg in mixture_cfg.get("informs", []):
+        data_files = inform_cfg.get("data_files")
+        source_type = inform_cfg.get("type")
+
+        if data_files is None:
+            if isinstance(source_type, str):
+                candidate = source_type.strip()
+                known_types = {
+                    "json",
+                    "jsonl",
+                    "parquet",
+                    "csv",
+                    "arrow",
+                    "tsv",
+                    "txt",
+                    "text",
+                    "huggingface",
+                    "hf",
+                }
+                if candidate and candidate.lower() not in known_types:
+                    # Backward-compatible shorthand: allow HF dataset id in `type` without `data_files`.
+                    data_files = candidate
+                    source_type = "hf"
+                else:
+                    raise ValueError("mixture.informs[].data_files is required")
+            else:
+                raise ValueError("mixture.informs[].data_files is required")
+
         if "pixel_field" in inform_cfg:
             inform = VisualDatasetInform(
-                type=inform_cfg.get("type"),
-                data_files=inform_cfg["data_files"],
+                type=source_type,
+                data_files=data_files,
                 dataset_split_name=inform_cfg.get("dataset_split_name", None),
                 split=inform_cfg.get("split", "train"),
                 pixel_field=inform_cfg.get("pixel_field", "images"),
@@ -351,11 +399,12 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 num_rows=inform_cfg.get("num_rows"),
                 format_callback=inform_cfg.get("format_callback"),
                 format_fields=inform_cfg.get("format_fields"),
+                preprocessing_fn=inform_cfg.get("preprocessing_fn"),
             )
         else:
             inform = TextDatasetInform(
-                type=inform_cfg.get("type"),
-                data_files=inform_cfg["data_files"],
+                type=source_type,
+                data_files=data_files,
                 dataset_split_name=inform_cfg.get("dataset_split_name", None),
                 split=inform_cfg.get("split", "train"),
                 content_field=inform_cfg.get("content_field", "content"),
@@ -363,6 +412,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 num_rows=inform_cfg.get("num_rows"),
                 format_callback=inform_cfg.get("format_callback"),
                 format_fields=inform_cfg.get("format_fields"),
+                preprocessing_fn=inform_cfg.get("preprocessing_fn"),
             )
         informs.append(inform)
 
@@ -375,6 +425,12 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
         batch_size=mixture_cfg.get("batch_size", 1),
         shuffle_buffer_size=mixture_cfg.get("shuffle_buffer_size"),
         seed=mixture_cfg.get("seed", 42),
+        prefetch_workers=mixture_cfg.get("prefetch_workers", 2),
+        prefetch_buffer_size=mixture_cfg.get("prefetch_buffer_size", 4),
+        cloud_max_retries=mixture_cfg.get("cloud_max_retries", 3),
+        cloud_retry_delay=mixture_cfg.get("cloud_retry_delay", 0.1),
+        cache_remote_files=mixture_cfg.get("cache_remote_files", True),
+        cache_expiry_seconds=mixture_cfg.get("cache_expiry_seconds", 86400),
     )
 
     if "pack_tokens" in mixture_cfg:
@@ -409,7 +465,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
     return kwargs
 
 
-def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
+def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]) -> Dataset | IterableDataset | None:
     """Build a dataset from ELM configuration with data mixture.
 
     Creates a unified dataset from the mixture configuration using the
@@ -449,8 +505,8 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]):
 
 
 def tokenize_dataset(
-    dataset,
-    tokenizer,
+    dataset: Dataset | IterableDataset,
+    tokenizer: PreTrainedTokenizerBase,
     text_field: str = "text",
     output_field: str = "tokens",
     max_length: int = 2048,
@@ -463,7 +519,7 @@ def tokenize_dataset(
     batch_size: int = 1000,
     remove_columns: list[str] | None = None,
     keep_in_memory: bool = False,
-):
+) -> Dataset | IterableDataset:
     """Tokenize a dataset using the provided tokenizer.
 
     Args:
@@ -539,9 +595,9 @@ def tokenize_dataset(
 
 
 def save_dataset(
-    dataset,
+    dataset: Dataset | IterableDataset,
     output_path: str,
-    format: str = "parquet",  # noqa:A002
+    format: str = "parquet",  # noqa: A002
     num_shards: int | None = None,
     compression: str | None = "snappy",
     max_shard_size: str | int = "500MB",
@@ -550,7 +606,7 @@ def save_dataset(
     hub_repo_id: str | None = None,
     hub_private: bool = False,
     hub_token: str | None = None,
-):
+) -> str:
     """Save a dataset to disk or HuggingFace Hub.
 
     Args:
@@ -623,7 +679,10 @@ def save_dataset(
     return output_path
 
 
-def build_tokenized_dataset(cfg_like: ELMConfig | Mapping[str, Any], save: bool = True):
+def build_tokenized_dataset(
+    cfg_like: ELMConfig | Mapping[str, Any],
+    save: bool = True,
+) -> Dataset | IterableDataset | tuple[Dataset | IterableDataset, str]:
     """Build, tokenize, and optionally save a dataset from ELM configuration.
 
     This is the main entry point for the tokenization pipeline. It:
@@ -739,7 +798,7 @@ def build_tokenized_dataset(cfg_like: ELMConfig | Mapping[str, Any], save: bool 
     return tokenized
 
 
-def _extract_dataset_name(inform_cfg: dict, fallback_index: int = 0) -> str:
+def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0) -> str:
     """Extract a meaningful dataset name from inform configuration.
 
     Uses the following priority:
@@ -771,6 +830,7 @@ def _extract_dataset_name(inform_cfg: dict, fallback_index: int = 0) -> str:
         return inform_cfg["name"]
 
     data_files = inform_cfg.get("data_files", "")
+    candidate: str | None = None
 
     if not isinstance(data_files, str):
         # Handle list of files - use first file
@@ -807,7 +867,7 @@ def _extract_dataset_name(inform_cfg: dict, fallback_index: int = 0) -> str:
                 candidate = name
 
         # Use the last candidate found
-        if "candidate" in dir() and candidate:
+        if candidate:
             return candidate
 
         # Fallback to last non-empty part
@@ -846,8 +906,8 @@ def _extract_dataset_name(inform_cfg: dict, fallback_index: int = 0) -> str:
 
 
 def _create_source_from_inform(
-    inform_cfg: dict,
-    mixture_cfg: dict,
+    inform_cfg: Mapping[str, Any],
+    mixture_cfg: Mapping[str, Any],
 ) -> "ShardedDataSource":
     """Create a ShardedDataSource from an inform configuration.
 
@@ -875,12 +935,39 @@ def _create_source_from_inform(
     )
 
     data_files = inform_cfg.get("data_files")
-    source_type = inform_cfg.get("type", "").lower()
+    source_type_raw = inform_cfg.get("type") or ""
+
+    if data_files is None:
+        if isinstance(source_type_raw, str):
+            candidate = source_type_raw.strip()
+            known_types = {
+                "json",
+                "jsonl",
+                "parquet",
+                "csv",
+                "arrow",
+                "tsv",
+                "txt",
+                "text",
+                "huggingface",
+                "hf",
+            }
+            if candidate and candidate.lower() not in known_types:
+                # Backward-compatible shorthand: allow HF dataset id in `type` without `data_files`.
+                data_files = candidate
+                source_type_raw = ""
+            else:
+                raise ValueError("mixture.informs[].data_files is required")
+        else:
+            raise ValueError("mixture.informs[].data_files is required")
+    source_type = source_type_raw.lower() if isinstance(source_type_raw, str) else str(source_type_raw).lower()
     split = inform_cfg.get("split", "train")
     dataset_split_name = inform_cfg.get("dataset_split_name")
 
     # Check if it's a HuggingFace dataset
     if source_type in ("huggingface", "hf"):
+        if not isinstance(data_files, str):
+            raise TypeError("mixture.informs[].data_files must be a string for HuggingFace datasets")
         return HuggingFaceShardedSource(
             dataset_name=data_files,
             split=split,
@@ -926,7 +1013,7 @@ def _create_source_from_inform(
         return ArrowShardedSource(files)
     elif source_type in ("csv", "tsv"):
         return CsvShardedSource(files)
-    elif source_type == "txt":
+    elif source_type in ("txt", "text"):
         return TextShardedSource(files)
     else:
         raise ValueError(f"Unsupported dataset type: {source_type}")
@@ -1007,9 +1094,6 @@ def build_sharded_source(cfg_like: ELMConfig | Mapping[str, Any]) -> "ShardedDat
     # Mix if multiple sources
     if len(sources) > 1:
         weights = mixture_cfg.get("mixture_weights")
-        # Convert list weights to dict if needed
-        if isinstance(weights, list) and len(weights) == len(sources):
-            weights = {name: w for name, w in zip(sources.keys(), weights, strict=False)}
 
         source = MixedShardedSource(
             sources=sources,

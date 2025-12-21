@@ -79,6 +79,14 @@ def compare_outputs(
     max_hf = hf_arr[max_idx]
     max_ed = ed_arr[max_idx]
 
+    def _preview_last_values(arr: np.ndarray) -> np.ndarray:
+        """Small preview used in the comparison table."""
+        if arr.ndim >= 3:
+            return arr[0, -1, -5:]
+        if arr.ndim == 2:
+            return arr[0, -5:]
+        return arr[-5:]
+
     # Compare losses if provided
     loss_match = True
     if hf_loss is not None and ed_loss is not None:
@@ -87,10 +95,12 @@ def compare_outputs(
         loss_match = bool(jnp.allclose(hf_loss, adjusted_ed_loss, atol=0.125, rtol=0))
 
     # Build detail table (simple format without tabulate)
+    hf_preview = _preview_last_values(hf_arr)
+    ed_preview = _preview_last_values(ed_arr)
     table_lines = [
         "| Metric          | HuggingFace              | EasyDeL                  |",
         "|-----------------|--------------------------|--------------------------|",
-        f"| Last 5 elements | {str(hf_arr[0, -1, -5:])[:24]:24} | {str(ed_arr[0, -1, -5:])[:24]:24} |",
+        f"| Last 5 elements | {str(hf_preview)[:24]:24} | {str(ed_preview)[:24]:24} |",
     ]
     if hf_loss is not None and ed_loss is not None:
         table_lines.append(f"| Loss            | {str(hf_loss)[:24]:24} | {str(ed_loss)[:24]:24} |")

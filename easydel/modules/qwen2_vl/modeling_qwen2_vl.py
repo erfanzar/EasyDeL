@@ -15,7 +15,6 @@ import math
 import typing as tp
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -227,15 +226,15 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     Base class for Qwen2VL causal language model (or autoregressive) outputs.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
-    past_key_values: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    rope_deltas: chex.Array | None = None
+    loss: Array | None = None
+    logits: Array = None
+    past_key_values: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    rope_deltas: Array | None = None
 
 
-def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
     Vectorized implementation that works correctly with JAX tracing.
@@ -314,11 +313,11 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb_vision(
-    q: chex.Array,
-    k: chex.Array,
-    cos: chex.Array,
-    sin: chex.Array,
-) -> tuple[chex.Array, chex.Array]:
+    q: Array,
+    k: Array,
+    cos: Array,
+    sin: Array,
+) -> tuple[Array, Array]:
     """Apply rotary positional embedding to vision features.
 
     Matches HuggingFace's implementation exactly.
@@ -380,7 +379,7 @@ class Qwen2VLPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -442,7 +441,7 @@ class Qwen2VLPatchMerger(nn.Module):
             ),
         ]
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         x = self.ln_q(x).reshape(-1, self.hidden_size)
         for mlp in self.mlp:
             x = mlp(x)
@@ -484,7 +483,7 @@ class Qwen2VLVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return self.fc2(self.act(self.fc1(x)))
 
 
@@ -576,9 +575,9 @@ class Qwen2VLVisionAttention(UnifiedAttention):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        cu_seqlens: chex.Array,
-        position_embeddings: tuple[chex.Array, chex.Array] | None = None,
-    ) -> chex.Array:
+        cu_seqlens: Array,
+        position_embeddings: tuple[Array, Array] | None = None,
+    ) -> Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -663,7 +662,7 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> chex.Array:
+    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> Array:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -914,9 +913,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        assert isinstance(
-            config, Qwen2VLVisionConfig
-        ), "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
+        assert isinstance(config, Qwen2VLVisionConfig), (
+            "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
+        )
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1015,9 +1014,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        grid_thw: chex.Array,
+        grid_thw: Array,
         max_grid_size,
-    ) -> chex.Array:
+    ) -> Array:
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
@@ -1283,7 +1282,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
     def set_embeddings(self, value):
         self.language_model.set_embeddings(value)
 
-    def get_video_features(self, pixel_values_videos: chex.Array, video_grid_thw: chex.Array | None = None):
+    def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None):
         pixel_values_videos = pixel_values_videos.astype(self.visual.dtype)
         max_grid_size = int(video_grid_thw[:, 1:].max()) if video_grid_thw is not None else 1
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw, max_grid_size=max_grid_size)
@@ -1293,7 +1292,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             video_embeds = jnp.split(video_embeds, indices)
         return video_embeds
 
-    def get_image_features(self, pixel_values: chex.Array, image_grid_thw: chex.Array | None = None):
+    def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None):
         pixel_values = pixel_values.astype(self.visual.dtype)
         max_grid_size = int(image_grid_thw[:, 1:].max()) if image_grid_thw is not None else 1
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, max_grid_size=max_grid_size)
@@ -1305,10 +1304,10 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
     def get_rope_index(
         self,
-        input_ids: chex.Array = None,
-        image_grid_thw: chex.Array = None,
-        video_grid_thw: chex.Array = None,
-        attention_mask: chex.Array = None,
+        input_ids: Array = None,
+        image_grid_thw: Array = None,
+        video_grid_thw: Array = None,
+        attention_mask: Array = None,
     ):
         return get_rope_index(
             input_ids=input_ids,
@@ -1321,6 +1320,51 @@ class Qwen2VLModel(EasyDeLBaseModule):
             vision_start_token_id=self.config.vision_start_token_id,
         )
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        image_embeds: Array | None = None,
+        video_embeds: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        inputs_embeds = super().compute_embedding(input_ids)
+
+        if image_embeds is None and pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            if isinstance(image_embeds, (list, tuple)):
+                image_embeds = jnp.concatenate(image_embeds, axis=0)
+
+        if image_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.image_token_id,
+            )
+
+        if video_embeds is None and pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            if isinstance(video_embeds, (list, tuple)):
+                video_embeds = jnp.concatenate(video_embeds, axis=0)
+
+        if video_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.video_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1332,12 +1376,12 @@ class Qwen2VLModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
-        image_grid_thw: chex.Array | None = None,
-        video_grid_thw: chex.Array | None = None,
-        rope_deltas: chex.Array | None = None,
-        cache_position: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        rope_deltas: Array | None = None,
+        cache_position: Array | None = None,
         mask_info: MaskInfo | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -1350,41 +1394,21 @@ class Qwen2VLModel(EasyDeLBaseModule):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.get_embedding()(input_ids)
-
-        if pixel_values is not None:
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            if isinstance(image_embeds, (list, tuple)):  # noqa:UP038
-                image_embeds = jnp.concatenate(image_embeds, axis=0)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_embeds,
-                placeholder_token_id=self.config.image_token_id,
-            )
-
-        if pixel_values_videos is not None:
-            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            if isinstance(video_embeds, (list, tuple)):  # noqa:UP038
-                video_embeds = jnp.concatenate(video_embeds, axis=0)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_embeds,
-                placeholder_token_id=self.config.video_token_id,
-            )
-
-        if rope_deltas is not None:
-            self.rope_deltas = rope_deltas
-
-        if position_ids is None:
-            position_ids, rope_deltas = self.get_rope_index(
-                input_ids=input_ids,
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+            )
+
+        if position_ids is None:
+            position_ids, _rope_deltas = self.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw if pixel_values is not None else None,
+                video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
                 attention_mask=attention_mask,
             )
-            self.rope_deltas = rope_deltas
         elif position_ids.ndim == 2:
             batch_size, seq_length = position_ids.shape
             position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, seq_length))
@@ -1526,6 +1550,9 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """
         return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
@@ -1539,12 +1566,12 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
-        rope_deltas: chex.Array | None = None,
-        cache_position: chex.Array | None = None,
+        rope_deltas: Array | None = None,
+        cache_position: Array | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
         """Forward pass for the Qwen2-VL model.
@@ -1608,9 +1635,6 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
             lm_logits = self.apply_logit_cap(lm_logits)
-
-        if rope_deltas is None:
-            rope_deltas = getattr(self.base_model, "rope_deltas", None)
 
         return VLMCausalLMOutput(
             logits=lm_logits,
@@ -1719,7 +1743,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def _create_required_props_from_kwargs(
         self,
-        model_kwargs: dict[str, chex.Array],
+        model_kwargs: dict[str, Array],
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         basics = {}
         if "image_grid_thw" in model_kwargs.keys():
@@ -1760,8 +1784,8 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def prepare_inputs_for_call(
         self,
-        image_grid_thw: chex.Array | None = None,
-        video_grid_thw: chex.Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
         drop_ids: bool = True,
         **others,
     ):
@@ -1839,7 +1863,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def _create_required_props_from_kwargs(
         self,
-        model_kwargs: dict[str, chex.Array],
+        model_kwargs: dict[str, Array],
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         basics = {}
         if "image_grid_thw" in model_kwargs.keys():

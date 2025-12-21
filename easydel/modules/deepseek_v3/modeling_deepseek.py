@@ -17,7 +17,6 @@ import typing
 from functools import partial
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -285,9 +284,9 @@ class DeepseekV3MLPMoE(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
+        hidden_states: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
     ):
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -364,7 +363,7 @@ class DeepseekV3MoE(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(self, hidden_states: Array):
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -665,31 +664,31 @@ class DeepseekV3DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        frequencies: tuple[chex.Array, chex.Array] | None = None,
+        frequencies: tuple[Array, Array] | None = None,
     ) -> DecoderLayerOutput:
         """
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            frequencies (tp.Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            frequencies (tp.Tuple[Array, Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -819,11 +818,11 @@ class DeepseekV3Model(EasyDeLBaseModule):
         Forward pass through the Deepseekv3 module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1001,10 +1000,10 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Forward pass of the causal language model.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
+            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
             output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
             output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
             output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.

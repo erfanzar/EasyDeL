@@ -5,4 +5,5 @@ easydel.workers package
    :maxdepth: 2
 
    esurge/index
+   response_store/index
    loggers

@@ -74,178 +74,58 @@ eopod run python -m wandb login YOUR_WANDB_TOKEN
 
 ## Fine-Tuning Methods
 
-EasyDeL provides several state-of-the-art fine-tuning techniques. Below you'll find examples for each method with explanations of their use cases.
+EasyDeL uses a single YAML-driven entrypoint for training and evaluation: `easydel.scripts.elarge`.
 
-> **Tip**: To explore all available parameters for any script, use the `--help` flag:
+> **Tip**: The unified runner has a small CLI and reads the full configuration from YAML:
 > ```shell
-> eopod run python -m easydel.scripts.finetune.dpo --help
+> eopod run python -m easydel.scripts.elarge --help
 > ```
 
-### Direct Preference Optimization (DPO)
+### Configure via YAML
 
-**Use Case**: Fine-tune a model from human preference data to align with human preferences without needing a separate reward model.
+Create a YAML file (e.g. `run.yaml`) with an `eLargeModel` config plus `actions`:
 
-```shell
-eopod run python -m easydel.scripts.finetune.dpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train[:90%]" \
-  --refrence_model_repo_id meta-llama/Llama-3.3-70B-Instruct \
-  --attn_mechanism vanilla \
-  --beta 0.08 \
-  --loss_type sigmoid \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --ref_model_sync_steps 128 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type tqdm \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+```yaml
+config:
+  model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  mixture:
+    informs:
+      - type: hf
+        data_files: trl-lib/ultrafeedback_binarized
+        split: "train[:90%]"
+  trainer:
+    trainer_type: dpo
+    beta: 0.08
+actions:
+  - train
 ```
 
-### Odds Ratio Policy Optimization (ORPO)
-
-**Use Case**: An enhanced version of DPO that uses odds ratios to stabilize training and often results in better preference alignment.
+Run it:
 
 ```shell
-eopod run python -m easydel.scripts.finetune.orpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --beta 0.12 \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+eopod run python -m easydel.scripts.elarge --config run.yaml
 ```
 
-### Supervised Fine-Tuning (SFT)
+### Method Notes
 
-**Use Case**: The most basic fine-tuning approach for adapting a model to a specific task or dataset, including multimodal models.
-
-```shell
-eopod run python -m easydel.scripts.finetune.sft \
-  --repo_id Qwen/Qwen2.5-VL-72B-Instruct \
-  --dataset_name trl-lib/Capybara \
-  --dataset_split "train" \
-  --dataset_text_field messages \
-  --sharding_axis 1,-1,1,1 \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
-```
-
-### Group Relative Policy Optimization for GSM8K (GRPO)
-
-**Use Case**: Specifically designed for enhancing mathematical reasoning capabilities by using group-based preference comparisons on the GSM8K dataset.
-
-```shell
-eopod run python -m easydel.scripts.finetune.gsm8k_grpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
-  --sharding_axis 1,1,1,-1 \
-  --max_prompt_length 2048 \
-  --max_completion_length 1024 \
-  --beta 0.04 \
-  --top_p 0.95 \
-  --top_k 50 \
-  --num_return_sequences 4 \
-  --xml_reward 0.125 \
-  --xml_full_match_reward 0.5 \
-  --xml_full_match_reject 0.0 \
-  --correctness_reward 2.0 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type tqdm \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb \
-  --kv-cache-quantization int8
-```
-
-### Reward Model Training
-
-**Use Case**: Train a reward model that can later be used for RLHF (Reinforcement Learning from Human Feedback) pipelines.
-
-```shell
-eopod run python -m easydel.scripts.finetune.reward \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
-```
+- **DPO**: set `trainer.trainer_type: dpo` and `reference_model.name_or_path`.
+- **ORPO**: set `trainer.trainer_type: orpo`.
+- **SFT**: set `trainer.trainer_type: sft` and configure `mixture.informs` to point at your text dataset.
+- **GRPO**: requires Python reward functions; use the programmatic API (GRPOTrainer) or a custom wrapper that calls `eLargeModel.train(reward_funcs=...)`.
+- **Reward model**: set `trainer.trainer_type: reward`.
 
 ## Common Parameters Explained
 
-The fine-tuning scripts share many parameters:
+Most knobs map 1:1 to `eLargeModel` configuration keys:
 
-- `--repo_id`: The Hugging Face model repository to fine-tune
-- `--dataset_name`: Dataset from Hugging Face Hub for training
-- `--attn_mechanism`: Attention computation method (vanilla, flash, etc.)
-- `--total_batch_size`: Total batch size across all TPU devices
-- `--learning_rate` & `--learning_rate_end`: Initial and final learning rates for scheduling
-- `--auto_shard_states`: Automatically shard model parameters across TPU devices
-- `--save_steps`: Number of steps between model checkpoints
-- `--kv-cache-quantization`: Enable KV cache quantization (e.g., int8) to reduce memory usage
+- `config.model.name_or_path`: Hugging Face model repo (or local path)
+- `config.mixture.informs`: Dataset sources (HF datasets via `type: hf` + `data_files: <dataset_name>`)
+- `config.base_config.values.attn_mechanism`: Attention mechanism selection
+- `config.sharding.axis_dims`: Device mesh sharding dims
+- `config.trainer.total_batch_size`: Global batch size
+- `config.trainer.learning_rate`: Optimizer LR
+- `config.quantization.kv_cache`: KV cache quantization config (when supported)
 
 ## Advanced Usage
 

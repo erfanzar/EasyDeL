@@ -17,10 +17,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-import chex
 import jax
 from eformer.ops.quantization import QuantizationConfig, QuantizationType, quantize
 from flax import nnx as nn
+from jaxtyping import Array
 from tqdm.autonotebook import tqdm
 
 from .linear_8bit import Linear8bit
@@ -99,7 +99,7 @@ class EasyQuantizer:
         self,
         array: jax.Array,
         path: str | tuple[str] | None = None,
-    ) -> chex.Array:
+    ) -> Array:
         """Quantize an array using the configured quantization method.
 
         Args:

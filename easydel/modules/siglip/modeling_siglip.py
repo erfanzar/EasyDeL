@@ -14,7 +14,6 @@
 import typing as tp
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -38,6 +37,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseImageClassificationModule
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
@@ -47,31 +47,31 @@ from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionCo
 class SiglipVisionModelOutput(ModelOutput):
     """Outputs from the SigLIP vision tower including pooled embeddings."""
 
-    image_embeds: chex.Array | None = None
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    image_embeds: Array | None = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
 @auto_pytree
 class SiglipTextModelOutput(ModelOutput):
     """Outputs from the SigLIP text encoder with optional attentions."""
 
-    text_embeds: chex.Array | None = None
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    text_embeds: Array | None = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
 @auto_pytree
 class SiglipOutput(ModelOutput):
     """Contrastive SigLIP output bundling text/vision logits and embeddings."""
 
-    loss: chex.Array | None = None
-    logits_per_image: chex.Array = None
-    logits_per_text: chex.Array = None
-    text_embeds: chex.Array = None
-    image_embeds: chex.Array = None
+    loss: Array | None = None
+    logits_per_image: Array = None
+    logits_per_text: Array = None
+    text_embeds: Array = None
+    image_embeds: Array = None
     text_model_output: BaseModelOutputWithPooling = None
     vision_model_output: BaseModelOutputWithPooling = None
 
@@ -119,7 +119,7 @@ class SiglipVisionEmbeddings(nn.Module):
             precision=precision,
         )
 
-    def interpolate(self, embeddings: chex.Array, height: int, width: int):
+    def interpolate(self, embeddings: Array, height: int, width: int):
         num_patches = embeddings.shape[1]
         num_positions = self.position_embedding.weight.shape[0]
         if num_patches == num_positions and height == width:
@@ -148,7 +148,7 @@ class SiglipVisionEmbeddings(nn.Module):
 
         return jnp.reshape(jnp.transpose(patch_pos_embed, (0, 2, 3, 1)), (1, -1, dim))
 
-    def __call__(self, pixel_values: chex.Array, interpolate_pos_encoding=False):
+    def __call__(self, pixel_values: Array, interpolate_pos_encoding=False):
         _, _, height, width = pixel_values.shape
         target_dtype = self.patch_embedding.kernel.dtype
 
@@ -200,7 +200,7 @@ class SiglipTextEmbeddings(nn.Module):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-    ) -> chex.Array:
+    ) -> Array:
         seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
         max_position_embedding = self.position_embedding.embedding.shape[0]
 
@@ -639,11 +639,23 @@ class SiglipTextModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | BaseModelOutputWithPooling:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided.")
+
+        mask_info = MaskInfo.dynamic_init(
+            mask_info=mask_info,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        if position_ids is None:
+            position_ids = mask_info.q_position_ids
+
         return self.text_model(
             input_ids=input_ids,
             mask_info=mask_info,
@@ -841,9 +853,9 @@ class MultiheadAttention(nn.Module):
 
     def __call__(
         self,
-        query: chex.Array,
-        key: chex.Array,
-        value: chex.Array,
+        query: Array,
+        key: Array,
+        value: Array,
     ):
         qbs, qss, qds = query.shape
         b, s, _d = value.shape
@@ -1065,7 +1077,7 @@ class SiglipModel(EasyDeLBaseModule):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> chex.Array:
+    ) -> Array:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1088,11 +1100,11 @@ class SiglipModel(EasyDeLBaseModule):
 
     def get_image_features(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
-    ) -> chex.Array:
+    ) -> Array:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1112,7 +1124,7 @@ class SiglipModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1214,7 +1226,7 @@ class SiglipModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_CLASSIFICATION, config=SiglipConfig, model_type="siglip")
-class SiglipForImageClassification(EasyDeLBaseModule):
+class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionModel, SiglipConfig]):
     """Image-classification head on top of the SigLIP vision encoder."""
 
     def __init__(
@@ -1226,14 +1238,6 @@ class SiglipForImageClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.num_labels = config.num_labels
         vision_model = SiglipVisionModel(
             config.vision_config,
             dtype=dtype,
@@ -1241,23 +1245,24 @@ class SiglipForImageClassification(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.vision_model = vision_model.vision_model
-        self.use_classif = config.num_labels > 0
-        # Classifier head
-        if self.use_classif:
-            self.classifier = ColumnParallelLinear(
-                config.vision_config.hidden_size,
-                config.num_labels,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
+        super().__init__(
+            config=config,
+            base_model=vision_model,
+            base_model_name="vision_model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            pooling_strategy="mean",
+            classifier_bias=True,
+        )
+        self.num_labels = config.num_labels
+        self.use_classif = self.classifier is not None
 
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
-        labels: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        labels: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
@@ -1277,7 +1282,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
         sequence_output = outputs[0]
 
         logits = jnp.mean(sequence_output, axis=1)
-        if self.use_classif:
+        if self.classifier is not None:
             logits = self.classifier(logits)
 
         return ImageClassifierOutput(
@@ -1310,7 +1315,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
         """
         Returns the embedding layer of the module.
         """
-        return self.vision_model.embeddings
+        return self.base_model.get_embedding()
 
     def get_task_head(self):
         """Returns the image classification head."""

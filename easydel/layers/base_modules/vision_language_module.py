@@ -119,22 +119,19 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
-        # VLM-specific configuration
         vision_feature_layer: int | list[int] = -1,
         vision_feature_select_strategy: str = "default",
         image_token_index: int | None = None,
         video_token_index: int | None = None,
-        # Video processing config (optional)
         temporal_patch_size: int = 2,
         tokens_per_second: float = 1.0,
-        # mRoPE config (optional)
         spatial_merge_size: int = 2,
         mrope_section: tuple[int, int, int] = (24, 20, 20),
-        # Inherited feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         router_aux_loss_coef: float | None = None,
-        # LM head configuration
+        lm_head_name: str = "lm_head",
+        create_lm_head: bool = True,
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
     ):
@@ -160,6 +157,8 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             tie_word_embeddings: Whether to tie embeddings with LM head
             logit_cap: Maximum absolute value for logits
             router_aux_loss_coef: Coefficient for MoE router auxiliary loss
+            lm_head_name: Attribute name for the LM head
+            create_lm_head: Whether to create a new LM head on this wrapper
             lm_head_bias: Whether to use bias in LM head
             lm_head_kernel_init: Custom kernel initializer for LM head
         """
@@ -174,8 +173,10 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             rngs=rngs,
             tie_word_embeddings=tie_word_embeddings,
             logit_cap=logit_cap,
+            lm_head_name=lm_head_name,
             lm_head_bias=lm_head_bias,
             lm_head_kernel_init=lm_head_kernel_init,
+            create_lm_head=create_lm_head,
         )
 
         # Get token IDs from config if not provided
@@ -237,6 +238,29 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement get_image_features()")
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute input embeddings for vision-language models.
+
+        Delegates to the underlying VLM base model's `compute_embedding` when
+        available, so task wrappers expose the same embedding behavior.
+        """
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
+    def compute_embedding_with_info(self, input_ids, *args, **kwargs):
+        """Compute embeddings and auxiliary info for vision-language models.
+
+        Delegates to the underlying VLM base model's `compute_embedding_with_info`
+        so task wrappers can surface any extra multimodal tensors needed when
+        passing `inputs_embeds` directly.
+        """
+        # If a concrete VLM wrapper overrides `compute_embedding`, we want the
+        # wrapper's multimodal embedding logic (e.g. pixel_values merging) to be
+        # used here as well. Otherwise, delegate to the underlying base model.
+        if self.__class__.compute_embedding is not BaseVisionLanguageModule.compute_embedding:
+            return self.compute_embedding(input_ids, *args, **kwargs), None
+
+        return self.base_model.compute_embedding_with_info(input_ids, *args, **kwargs)
+
     def get_video_features(
         self,
         pixel_values_videos: Float[Array, "batch temporal channels height width"],
@@ -280,24 +304,23 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         Returns:
             Merged embeddings with vision features at placeholder positions
         """
-        # Create mask for multimodal positions
+        batch_size, seq_len, hidden = inputs_embeds.shape
         if isinstance(placeholder_token_id, list):
             placeholder_token_id = jnp.array(placeholder_token_id)
             is_multimodal = jnp.isin(input_ids, placeholder_token_id)
         else:
             is_multimodal = input_ids == placeholder_token_id
 
-        # Create dummy row for padding (index 0 maps to dummy)
+        flat_mask = is_multimodal.reshape(-1)
+        flat_embeds = inputs_embeds.reshape(-1, hidden)
+
         dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
         flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-
-        # Use cumsum to create gather indices
-        gather_indices = jnp.cumsum(is_multimodal)
+        gather_indices = jnp.cumsum(flat_mask)
         update_values = flattened_padded[gather_indices]
 
-        # Conditionally replace embeddings
-        condition = jnp.expand_dims(is_multimodal, axis=-1)
-        return jnp.where(condition, update_values, inputs_embeds)
+        merged = jnp.where(flat_mask[:, None], update_values, flat_embeds)
+        return merged.reshape(batch_size, seq_len, hidden)
 
     def _select_vision_features(
         self,

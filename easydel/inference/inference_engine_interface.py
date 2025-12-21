@@ -29,9 +29,12 @@ Classes:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import typing as tp
+import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -40,7 +43,7 @@ from http import HTTPStatus
 
 import uvicorn
 from eformer.loggings import get_logger
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -51,6 +54,7 @@ from .openai_api_modules import (
     CompletionRequest,
     CompletionResponse,
     FunctionCallFormat,
+    ResponsesRequest,
 )
 from .sampling_params import SamplingParams
 
@@ -180,6 +184,13 @@ class BaseInferenceApiServer(ABC):
         server_description: str = "High-performance inference server with OpenAI API compatibility",
         server_version: str = "2.0.0",
         enable_auth_ui: bool = True,
+        max_concurrent_generations: int | None = None,
+        overload_message: str = "Server is busy, please try again later",
+        enable_response_store: bool = True,
+        default_store_responses: bool = True,
+        max_stored_responses: int = 10_000,
+        max_stored_conversations: int = 1_000,
+        response_store_client: tp.Any | None = None,
     ) -> None:
         """
         Initialize the base inference API server.
@@ -196,6 +207,13 @@ class BaseInferenceApiServer(ABC):
             server_description: Description of the server
             server_version: Version of the server
             enable_auth_ui: Enable "Authorize" button in /docs for API key input
+            max_concurrent_generations: Maximum concurrent inference jobs allowed. ``None`` disables the limiter.
+            overload_message: Custom error message returned when all generation slots are busy.
+            enable_response_store: Enable in-memory storage for /v1/responses conversation state.
+            default_store_responses: Default value for the Responses API ``store`` flag when omitted.
+            max_stored_responses: Maximum stored response objects (LRU evicted).
+            max_stored_conversations: Maximum stored conversation histories (LRU evicted).
+            response_store_client: Optional external store client (for example a ZMQ worker client).
         """
         self.thread_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="inference-worker")
         self.max_request_size = max_request_size
@@ -206,8 +224,30 @@ class BaseInferenceApiServer(ABC):
         self._request_lock = asyncio.Lock()
         self.enable_function_calling = enable_function_calling
         self.default_function_format = default_function_format
+        self._overload_message = overload_message
 
-        # Configure OpenAPI security scheme for API key authentication
+        max_slots = 0
+        if max_concurrent_generations is not None:
+            try:
+                max_slots = int(max_concurrent_generations)
+            except (TypeError, ValueError):
+                max_slots = 0
+        self._max_generation_slots = max(0, max_slots)
+        self._generation_slots: asyncio.Queue[int] | None = None
+        if self._max_generation_slots > 0:
+            self._generation_slots = asyncio.Queue(self._max_generation_slots)
+            for slot in range(self._max_generation_slots):
+                self._generation_slots.put_nowait(slot)
+
+        self._enable_response_store = bool(enable_response_store)
+        self._default_store_responses = bool(default_store_responses)
+        self._max_stored_responses = max(0, int(max_stored_responses))
+        self._max_stored_conversations = max(0, int(max_stored_conversations))
+        self._stored_responses: OrderedDict[str, dict[str, tp.Any]] = OrderedDict()
+        self._stored_conversations: OrderedDict[str, list[dict[str, tp.Any]]] = OrderedDict()
+        self._response_store_lock = asyncio.Lock()
+        self._response_store_client = response_store_client
+
         swagger_ui_init_oauth = None
         if enable_auth_ui:
             swagger_ui_init_oauth = {
@@ -403,6 +443,19 @@ class BaseInferenceApiServer(ABC):
         """
         return [
             EndpointConfig(
+                path="/v1/responses",
+                handler=self.responses,
+                methods=["POST"],
+                tags=["Responses"],
+                summary=(
+                    "Unified OpenAI Responses API endpoint. This is the modern surface that "
+                    "replaces legacy completions for most clients and can represent text, "
+                    "tool calls, and multimodal inputs in a single schema.\n\n"
+                    "Servers may choose to implement this directly, or translate it to "
+                    "`/v1/chat/completions` internally."
+                ),
+            ),
+            EndpointConfig(
                 path="/v1/chat/completions",
                 handler=self.chat_completions,
                 methods=["POST"],
@@ -556,7 +609,387 @@ class BaseInferenceApiServer(ABC):
             return None
         return resolved_tools
 
-    # Abstract methods that must be implemented by subclasses
+    def _mark_stream_failure(self) -> None:
+        """Adjust metrics when a streaming response fails after headers are sent."""
+
+        if self.metrics.successful_requests > 0:
+            self.metrics.successful_requests -= 1
+        self.metrics.failed_requests += 1
+
+    @staticmethod
+    def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
+        """Compute delta text by comparing accumulated text.
+
+        Prevents token loss under concurrent streaming by computing delta from
+        full accumulated text rather than relying on potentially incomplete
+        ``delta_text`` values supplied by an inference engine.
+        """
+
+        current_text = current_text or ""
+
+        if current_text.startswith(previous_text):
+            delta_text = current_text[len(previous_text) :]
+            if not delta_text:
+                delta_text = fallback_delta or ""
+        else:
+            if previous_text:
+                logger.warning(
+                    "Accumulated text doesn't start with previous text. "
+                    "prev_len=%s, curr_len=%s. This may indicate state corruption or generation reset.",
+                    len(previous_text),
+                    len(current_text),
+                )
+            delta_text = fallback_delta or current_text
+
+        if not delta_text and not previous_text:
+            delta_text = current_text
+
+        return delta_text
+
+    @asynccontextmanager
+    async def _acquire_generation_slot(self) -> tp.AsyncIterator[None]:
+        """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
+
+        queue = self._generation_slots
+        if queue is None:
+            yield
+            return
+
+        try:
+            token = queue.get_nowait()
+        except asyncio.QueueEmpty as e:
+            raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message) from e
+
+        try:
+            yield
+        finally:
+            try:
+                queue.put_nowait(token)
+            except asyncio.QueueFull:
+                logger.warning("Generation slot queue overfilled while releasing token")
+
+    def _start_stream_task(
+        self,
+        stream_fn: tp.Callable[[], tp.Iterator[tp.Any]],
+    ) -> asyncio.Queue[tuple[str, tp.Any]]:
+        """Run blocking ``stream_fn`` in a worker thread and push results to an asyncio queue."""
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, tp.Any]] = asyncio.Queue()
+
+        def _producer() -> None:
+            try:
+                for output in stream_fn():
+                    asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result()
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
+
+        self.thread_pool.submit(_producer)
+        return queue
+
+    @staticmethod
+    def _normalize_conversation_id(value: tp.Any) -> str | None:
+        """Extract a conversation ID from request payload."""
+
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, dict):
+            conv_id = value.get("id") or value.get("conversation_id") or value.get("conversation")
+            if isinstance(conv_id, str):
+                return conv_id.strip() or None
+        return None
+
+    @staticmethod
+    def _lru_set(store: OrderedDict[str, tp.Any], key: str, value: tp.Any, max_size: int) -> None:
+        store[key] = value
+        store.move_to_end(key)
+        if max_size <= 0:
+            store.clear()
+            return
+        while len(store) > max_size:
+            store.popitem(last=False)
+
+    @staticmethod
+    def _conversation_from_messages(messages: list[dict[str, tp.Any]], assistant_text: str) -> list[dict[str, tp.Any]]:
+        """Create conversation items (excluding ``instructions``) for storage."""
+
+        history = list(messages)
+        history.append({"role": "assistant", "content": assistant_text})
+        return history
+
+    @staticmethod
+    def _responses_payload_to_messages(
+        payload: dict[str, tp.Any],
+        *,
+        include_instructions: bool = False,
+    ) -> list[dict[str, tp.Any]]:
+        """Convert OpenAI Responses API payload into OpenAI-style chat messages.
+
+        Notes:
+            - ``instructions`` is treated as an ephemeral system message. By default we do
+              not include it in the returned message list so it won't be persisted when
+              implementing multi-turn state via ``previous_response_id``.
+        """
+
+        messages: list[dict[str, tp.Any]] = []
+
+        if include_instructions:
+            instructions = payload.get("instructions")
+            if isinstance(instructions, str) and instructions.strip():
+                messages.append({"role": "system", "content": instructions})
+
+        if isinstance(payload.get("messages"), list):
+            messages.extend(tp.cast(list[dict[str, tp.Any]], payload["messages"]))
+        else:
+            input_value = payload.get("input")
+            if isinstance(input_value, str):
+                messages.append({"role": "user", "content": input_value})
+            elif isinstance(input_value, list):
+                if all(isinstance(item, dict) and "role" in item for item in input_value):
+                    messages.extend(tp.cast(list[dict[str, tp.Any]], input_value))
+                else:
+                    messages.append({"role": "user", "content": input_value})
+            elif input_value is not None:
+                messages.append({"role": "user", "content": str(input_value)})
+
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            normalized_parts: list[dict[str, tp.Any]] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "input_text":
+                    normalized_parts.append({"type": "text", "text": part.get("text", "")})
+                elif part_type == "input_image":
+                    image_url = part.get("image_url") or part.get("image") or part.get("url")
+                    if image_url is not None:
+                        normalized_parts.append({"type": "image_url", "image_url": image_url})
+                elif part_type == "input_video":
+                    video = part.get("video")
+                    if video is not None:
+                        normalized_parts.append({"type": "video", "video": video})
+                else:
+                    normalized_parts.append(part)
+            msg["content"] = normalized_parts
+
+        return messages
+
+    @staticmethod
+    def _flatten_messages_to_text(messages: list[dict[str, tp.Any]]) -> list[dict[str, tp.Any]]:
+        """Collapse content arrays into plain text for tool parsing and templating."""
+
+        flattened: list[dict[str, tp.Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = part.get("type")
+                        if part_type in ("text", "input_text"):
+                            text_parts.append(str(part.get("text", "")))
+                flattened.append({**msg, "content": " ".join(part_text for part_text in text_parts if part_text)})
+            else:
+                flattened.append(msg)
+        return flattened
+
+    @staticmethod
+    def _extract_responses_tools(payload: dict[str, tp.Any]) -> tuple[list[dict[str, tp.Any]] | None, list[dict] | None]:
+        """Return (raw_tools, tools_for_chat_template) from a Responses payload."""
+
+        raw_tools = payload.get("tools") or payload.get("functions")
+        if not isinstance(raw_tools, list) or not raw_tools:
+            return None, None
+
+        tools_for_template: list[dict] = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if isinstance(fn, dict):
+                tools_for_template.append(fn)
+            elif isinstance(tool, dict):
+                tools_for_template.append(tool)
+
+        return tp.cast(list[dict[str, tp.Any]], raw_tools), tools_for_template or None
+
+    def _infer_sequence_length_from_engine(self, engine: tp.Any | None = None) -> int:
+        """Infer maximum sequence length from the engine or fall back to 128 tokens."""
+
+        if engine is not None and getattr(engine, "max_model_len", None):
+            try:
+                return int(engine.max_model_len)
+            except (TypeError, ValueError):
+                pass
+        return 128
+
+    def _parse_responses_max_tokens(self, payload: dict[str, tp.Any], engine: tp.Any | None) -> tuple[int, int | None]:
+        """Return (requested_tokens_for_auth, max_tokens_for_sampling)."""
+
+        raw_value = payload.get("max_output_tokens")
+        if raw_value is None:
+            raw_value = payload.get("max_tokens")
+        if raw_value is None:
+            raw_value = payload.get("max_completion_tokens")
+
+        if raw_value is None:
+            return self._infer_sequence_length_from_engine(engine), None
+
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            return self._infer_sequence_length_from_engine(engine), None
+
+        if parsed < 0:
+            return self._infer_sequence_length_from_engine(engine), None
+
+        return parsed, parsed or None
+
+    @staticmethod
+    def _create_sampling_params_from_responses(payload: dict[str, tp.Any], max_tokens: int | None) -> SamplingParams:
+        """Translate a Responses API payload into SamplingParams."""
+
+        temperature = payload.get("temperature", 1.0)
+        top_p = payload.get("top_p", 1.0)
+
+        try:
+            temperature_f = float(temperature)
+        except (TypeError, ValueError):
+            temperature_f = 1.0
+        temperature_f = max(0.0, min(temperature_f, 2.0))
+
+        try:
+            top_p_f = float(top_p)
+        except (TypeError, ValueError):
+            top_p_f = 1.0
+
+        stop = payload.get("stop")
+        n = payload.get("n", 1)
+
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature_f,
+            top_p=top_p_f,
+            presence_penalty=float(payload.get("presence_penalty", 0.0) or 0.0),
+            frequency_penalty=float(payload.get("frequency_penalty", 0.0) or 0.0),
+            repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
+            top_k=int(payload.get("top_k", 50) or 50),
+            min_p=float(payload.get("min_p", 0.0) or 0.0),
+            n=int(n or 1),
+            stop=stop,
+        )
+
+    @staticmethod
+    def _build_responses_object(
+        *,
+        response_id: str,
+        model: str,
+        output_text: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        tool_calls: list[tp.Any] | None = None,
+    ) -> dict[str, tp.Any]:
+        created_at = int(time.time())
+        message: dict[str, tp.Any] = {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": output_text}],
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        return {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model,
+            "status": "completed",
+            "output": [message],
+            "usage": {
+                "input_tokens": int(prompt_tokens),
+                "output_tokens": int(completion_tokens),
+                "total_tokens": int(prompt_tokens) + int(completion_tokens),
+            },
+        }
+
+    @staticmethod
+    def _jsonify_tool_calls(tool_calls: tp.Any) -> list[tp.Any] | None:
+        if not tool_calls:
+            return None
+        if not isinstance(tool_calls, list):
+            return None
+        serialized: list[tp.Any] = []
+        for call in tool_calls:
+            if hasattr(call, "model_dump"):
+                serialized.append(call.model_dump(exclude_unset=True, exclude_none=True))
+            elif isinstance(call, dict):
+                serialized.append(call)
+            else:
+                serialized.append(call)
+        return serialized
+
+    @staticmethod
+    def _sse_event(event: str, payload: dict[str, tp.Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+    async def _response_store_get_response(self, response_id: str) -> dict[str, tp.Any] | None:
+        if not self._enable_response_store:
+            return None
+
+        if self._response_store_client is not None:
+            return await asyncio.to_thread(self._response_store_client.get_response, response_id)
+
+        async with self._response_store_lock:
+            return self._stored_responses.get(response_id)
+
+    async def _response_store_put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
+        if not self._enable_response_store:
+            return
+
+        if self._response_store_client is not None:
+            await asyncio.to_thread(self._response_store_client.put_response, response_id, record)
+            return
+
+        async with self._response_store_lock:
+            self._lru_set(self._stored_responses, response_id, record, self._max_stored_responses)
+
+    async def _response_store_get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
+        if not self._enable_response_store:
+            return None
+
+        if self._response_store_client is not None:
+            return await asyncio.to_thread(self._response_store_client.get_conversation, conversation_id)
+
+        async with self._response_store_lock:
+            return self._stored_conversations.get(conversation_id)
+
+    async def _response_store_put_conversation(
+        self,
+        conversation_id: str,
+        history: list[dict[str, tp.Any]],
+    ) -> None:
+        if not self._enable_response_store:
+            return
+
+        if self._response_store_client is not None:
+            await asyncio.to_thread(self._response_store_client.put_conversation, conversation_id, history)
+            return
+
+        async with self._response_store_lock:
+            self._lru_set(self._stored_conversations, conversation_id, history, self._max_stored_conversations)
+
+    async def responses(self, request: ResponsesRequest, raw_request: Request) -> JSONResponse:
+        """Handle OpenAI Responses API requests (default: not implemented)."""
+        return create_error_response(
+            HTTPStatus.NOT_IMPLEMENTED,
+            "This server does not implement the OpenAI Responses API (/v1/responses).",
+        )
 
     @abstractmethod
     async def chat_completions(

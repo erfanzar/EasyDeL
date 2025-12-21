@@ -87,6 +87,13 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         """
         assert hasattr(config, "num_labels"), "config must have num_labels attribute"
 
+        vision_config = getattr(config, "vision_config", config)
+        hidden_size = getattr(vision_config, "hidden_size", None) or getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            raise AttributeError(
+                "Unable to infer vision hidden size from config (expected `hidden_size` or `vision_config.hidden_size`)."
+            )
+        num_labels = config.num_labels
         super().__init__(
             config=config,
             base_model=base_model,
@@ -109,20 +116,22 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        self.classifier = classifier_block(
-            config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=self._head_bias,
-            kernel_init=self._head_kernel_init,
-            precision=precision,
-            rngs=rngs,
-            **get_dot_general_by_bits(
-                getattr(config, "bits", None),
-                getattr(config, "easy_method", ""),
-            ),
-        )
+        self.classifier = None
+        if num_labels > 0:
+            self.classifier = classifier_block(
+                hidden_size,
+                num_labels,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                use_bias=self._head_bias,
+                kernel_init=self._head_kernel_init,
+                precision=precision,
+                rngs=rngs,
+                **get_dot_general_by_bits(
+                    getattr(config, "bits", None),
+                    getattr(config, "easy_method", ""),
+                ),
+            )
 
     def __call__(
         self,
@@ -151,8 +160,8 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         hidden_states = outputs.last_hidden_state
         pooled_output = self.pool_sequence(hidden_states, input_ids=None)
 
-        # Apply classifier
-        logits = self.classifier(pooled_output)
+        # Apply classifier (or return pooled features if no classifier head)
+        logits = pooled_output if self.classifier is None else self.classifier(pooled_output)
 
         return ImageClassifierOutput(
             logits=logits,

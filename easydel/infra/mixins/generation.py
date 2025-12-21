@@ -53,7 +53,6 @@ import typing as tp
 import warnings
 from functools import cached_property, partial
 
-import chex
 import jax
 import numpy as np
 from eformer.escale import PartitionAxis
@@ -62,6 +61,7 @@ from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
 from jax import lax
 from jax import numpy as jnp
+from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
@@ -106,11 +106,11 @@ class GreedyState:
         model_kwargs: Additional model-specific arguments.
     """
 
-    cur_len: chex.Array
-    sequences: chex.Array
-    running_token: chex.Array
-    is_sent_finished: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    sequences: Array
+    running_token: Array
+    is_sent_finished: Array
+    model_kwargs: dict[str, Array]
 
 
 @auto_pytree
@@ -129,12 +129,12 @@ class SampleState:
         model_kwargs: Additional model-specific arguments.
     """
 
-    cur_len: chex.Array
-    sequences: chex.Array
-    running_token: chex.Array
-    is_sent_finished: chex.Array
-    prng_key: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    sequences: Array
+    running_token: Array
+    is_sent_finished: Array
+    prng_key: Array
+    model_kwargs: dict[str, Array]
 
 
 @auto_pytree
@@ -143,22 +143,22 @@ class BeamSearchState:
     State for beam search generation.
 
     Attributes:
-        cur_len (chex.Array): Current length of the generated sequence.
-        running_sequences (chex.Array): Generated sequences being tracked in the beam.
-        running_scores (chex.Array): Scores of the sequences being tracked in the beam.
-        sequences (chex.Array): Best generated sequences.
-        scores (chex.Array): Scores of the best generated sequences.
-        is_sent_finished (chex.Array): Boolean array indicating if a sequence is finished.
-        model_kwargs (tp.Dict[str, chex.Array]): Model specific keyword arguments.
+        cur_len (Array): Current length of the generated sequence.
+        running_sequences (Array): Generated sequences being tracked in the beam.
+        running_scores (Array): Scores of the sequences being tracked in the beam.
+        sequences (Array): Best generated sequences.
+        scores (Array): Scores of the best generated sequences.
+        is_sent_finished (Array): Boolean array indicating if a sequence is finished.
+        model_kwargs (tp.Dict[str, Array]): Model specific keyword arguments.
     """
 
-    cur_len: chex.Array
-    running_sequences: chex.Array
-    running_scores: chex.Array
-    sequences: chex.Array
-    scores: chex.Array
-    is_sent_finished: chex.Array
-    model_kwargs: dict[str, chex.Array]
+    cur_len: Array
+    running_sequences: Array
+    running_scores: Array
+    sequences: Array
+    scores: Array
+    is_sent_finished: Array
+    model_kwargs: dict[str, Array]
 
 
 def _safepick(config, pickname):
@@ -967,7 +967,7 @@ class EasyGenerationMixin:
         return EasyQuantizer
 
     @staticmethod
-    def compute_prefill_length(array, padding_id) -> chex.Array:
+    def compute_prefill_length(array, padding_id) -> Array:
         """
         Calculates the number of padding tokens at the beginning of each sequence.
 
@@ -975,18 +975,18 @@ class EasyGenerationMixin:
         dealing with left-padded inputs.
 
         Args:
-            array (chex.Array): The input token ID array, typically shape (batch_size, sequence_length).
+            array (Array): The input token ID array, typically shape (batch_size, sequence_length).
             padding_id (int): The token ID used for padding.
 
         Returns:
-            chex.Array: An array of shape (batch_size,) containing the number of leading
+            Array: An array of shape (batch_size,) containing the number of leading
                 padding tokens for each sequence in the batch.
         """
         valid = array != padding_id
         return jnp.sum(jnp.cumsum(valid, axis=-1) == 0, axis=-1)
 
     @staticmethod
-    def compute_prefill_length_from_mask(mask) -> chex.Array:
+    def compute_prefill_length_from_mask(mask) -> Array:
         """
         Calculates the number of padding tokens at the beginning of each sequence
         from a 0/1 or boolean mask.
@@ -1038,15 +1038,15 @@ class EasyGenerationMixin:
         suitable for caching. It ensures inputs are placed on the correct devices/shards.
 
         Args:
-            input_ids (chex.Array): The initial sequence of token IDs. Shape (batch_size, seq_length).
+            input_ids (Array): The initial sequence of token IDs. Shape (batch_size, seq_length).
             max_length (int): The maximum sequence length that the KV cache should support.
             pad_token_id (int): The ID used for padding tokens. Used to calculate `starts` if not provided.
             starts (int | None): Optional pre-calculated starting positions (number of leading pads).
                 If None, calculated using `compute_prefill_length`.
             shardings (dict | None): Optional sharding configuration passed to `init_cache`.
-            attention_mask (tp.Optional[chex.Array]): An optional mask indicating which tokens
+            attention_mask (tp.Optional[Array]): An optional mask indicating which tokens
                 should be attended to. Shape (batch_size, seq_length).
-            token_type_ids (tp.Optional[chex.Array]): Optional segment IDs for models that use them.
+            token_type_ids (tp.Optional[Array]): Optional segment IDs for models that use them.
 
         Returns:
             dict: A dictionary containing the prepared inputs, typically including:
@@ -1153,7 +1153,7 @@ class EasyGenerationMixin:
         return model_kwargs
 
     def _create_required_props_from_kwargs(
-        self, model_kwargs: dict[str, chex.Array]
+        self, model_kwargs: dict[str, Array]
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         """
         Placeholder method to extract or create properties required for specific model types
@@ -1267,7 +1267,7 @@ class EasyGenerationMixin:
         This pre-computes the encoder representation needed by the decoder during generation.
 
         Args:
-            input_ids (chex.Array): The input token IDs for the encoder.
+            input_ids (Array): The input token IDs for the encoder.
             model_kwargs (dict): The dictionary of keyword arguments. Encoder-specific
                 arguments will be used, and `encoder_outputs` will be added.
 
@@ -1287,8 +1287,8 @@ class EasyGenerationMixin:
         batch_size: int,
         decoder_start_token_id: int | None = None,
         bos_token_id: int | None = None,
-        model_kwargs: dict[str, chex.Array] | None = None,
-    ) -> chex.Array:
+        model_kwargs: dict[str, Array] | None = None,
+    ) -> Array:
         """
         Creates the initial `decoder_input_ids` tensor for encoder-decoder generation.
 
@@ -1305,7 +1305,7 @@ class EasyGenerationMixin:
                 "decoder_input_ids", those are returned directly and removed from the dict.
 
         Returns:
-            chex.Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
+            Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
         """
         if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
             decoder_input_ids = model_kwargs.pop("decoder_input_ids")
@@ -1372,11 +1372,11 @@ class EasyGenerationMixin:
         (batch_size, seq_len, ...) becomes (batch_size, num_beams, seq_len, ...).
 
         Args:
-            tensor (chex.Array): The tensor to expand. Assumed to have batch size as the first dimension.
+            tensor (Array): The tensor to expand. Assumed to have batch size as the first dimension.
             num_beams (int): The number of beams to expand to.
 
         Returns:
-            chex.Array: The tensor expanded for beam search.
+            Array: The tensor expanded for beam search.
         """
         return jnp.broadcast_to(tensor[:, None], (tensor.shape[0], num_beams, *tensor.shape[1:]))
 
@@ -1458,9 +1458,9 @@ class EasyGenerationMixin:
 
     def generate(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         generation_config: GenerationConfig | None = None,
-        prng_key: chex.Array | None = None,
+        prng_key: Array | None = None,
         trace: bool = True,
         logits_processor: LogitsProcessorList | None = None,
         **kwargs,
@@ -1469,7 +1469,7 @@ class EasyGenerationMixin:
         Generates sequences of token ids for models with a language modeling head.
 
         Parameters:
-            input_ids (`chex.Array` of shape `(batch_size, sequence_length)`):
+            input_ids (`Array` of shape `(batch_size, sequence_length)`):
                 The sequence used as a prompt for the generation.
             generation_config (`~generation.GenerationConfig`, *optional*):
                 The generation configuration to be used as base parametrization for the generation call. `**kwargs`
@@ -1779,7 +1779,7 @@ class EasyGenerationMixin:
         eos_token_id: int | None = None,
         logits_processor: LogitsProcessorList | None = None,
         trace: bool = True,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
@@ -1876,11 +1876,11 @@ class EasyGenerationMixin:
         max_length: int | None = None,
         pad_token_id: int | None = None,
         eos_token_id: int | None = None,
-        prng_key: chex.Array | None = None,
+        prng_key: Array | None = None,
         logits_processor: LogitsProcessorList | None = None,
         logits_warper: LogitsProcessorList | None = None,
         trace: bool = True,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
         # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
@@ -1992,7 +1992,7 @@ class EasyGenerationMixin:
         logits_processor: LogitsProcessorList | None = None,
         trace: bool = True,
         num_return_sequences: int | None = None,
-        model_kwargs: dict[str, chex.Array] | None = None,
+        model_kwargs: dict[str, Array] | None = None,
     ):
         """
         This beam search function is heavily inspired by Flax's official example:

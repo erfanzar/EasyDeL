@@ -51,7 +51,6 @@ import typing as tp
 import warnings
 from typing import Any, NotRequired
 
-import chex
 import jax
 import jax.extend
 import jax.tree_util
@@ -65,6 +64,7 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
+from jaxtyping import Array
 
 # .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
 from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
@@ -532,7 +532,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.fsdp_is_ep_bound = getattr(self, "fsdp_is_ep_bound", fsdp_is_ep_bound)
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
         self.operation_configs = getattr(self, "operation_configs", operation_configs)
-
         self.pretraining_tp = 1  # it's for pytorch models.
         if self.kv_cache_quantization_config is not None and self.use_sharded_kv_caching:
             use_sharded_kv_caching = self.use_sharded_kv_caching
@@ -541,6 +540,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 " can't be used together at the moment.",
                 stacklevel=1,
             )
+
+        self._external_rope_config_kwargs = getattr(self, "_external_rope_config_kwargs", {})
         super().__init__(**kwargs)
 
     @staticmethod
@@ -1627,14 +1628,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
         else:
             config = RopeConfig.from_dict(self.rope_scaling)
 
-            if config.original_max_position_embeddings is None:
-                config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+        if config.original_max_position_embeddings is None:
+            config.original_max_position_embeddings = getattr(self, "original_max_position_embeddings", None)
+
+        if self._external_rope_config_kwargs is not None and len(self._external_rope_config_kwargs.keys()) > 0:
+            config.update(**self._external_rope_config_kwargs)
 
         return config
 
     def get_basic_rope(
         self,
-        dtype: chex.Array,
+        dtype: Array,
         head_size: int,
         rotary_dim: int | None = None,
         is_neox_style: bool = True,

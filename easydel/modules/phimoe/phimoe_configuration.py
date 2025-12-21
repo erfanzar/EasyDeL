@@ -198,8 +198,10 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         self.router_jitter_noise = router_jitter_noise
         self.input_jitter_noise = input_jitter_noise
         self.embd_pdrop = embd_pdrop
-        self.rope_scaling = rope_scaling or {}
+        self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+        if self.rope_scaling is not None and "original_max_position_embeddings" in self.rope_scaling:
+            self.original_max_position_embeddings = self.rope_scaling["original_max_position_embeddings"]
         self.bits = bits
         self.gradient_checkpointing = gradient_checkpointing
         self.layer_types = layer_types
@@ -229,22 +231,13 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"block_sparse_moe/gate/kernel",
-                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
-            ),
+            (r"block_sparse_moe/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
             (r"block_sparse_moe/experts/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
             (r"block_sparse_moe/experts/w2/kernel", pmag.resolve(RowWise)),
             (r"block_sparse_moe/experts/.*bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/bias",
-                pmag.resolve(Replicated),
-            ),
+            (r".*/(input_layernorm|post_attention_layernorm|norm)/scale", pmag.resolve(Replicated)),
+            (r".*/(input_layernorm|post_attention_layernorm|norm)/bias", pmag.resolve(Replicated)),
             (r"lm_head/kernel", pmag.resolve(ColumnWise)),
             (r"lm_head/bias", pmag.resolve(Replicated)),
             (r".*bias", pmag.resolve(Replicated)),

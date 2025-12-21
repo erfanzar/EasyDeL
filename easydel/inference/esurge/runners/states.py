@@ -48,6 +48,12 @@ class CachedRequestState:
     # List of MultiModalFeature objects (using Any to avoid circular import issues with auto_pytree)
     mm_features: list[Any] = field(pytree_node=False, default_factory=list)
     _vision_processed: bool = field(pytree_node=False, default=False)
+    # Precomputed VLM helpers (stored on host to avoid JIT-incompatible codepaths)
+    prefill_inputs_embeds: np.ndarray | None = field(pytree_node=False, default=None)
+    prefill_position_ids: np.ndarray | None = field(pytree_node=False, default=None)
+    prefill_rope_deltas: np.ndarray | None = field(pytree_node=False, default=None)
+    prefill_visual_pos_masks: np.ndarray | None = field(pytree_node=False, default=None)
+    prefill_deepstack_visual_embeds: list[np.ndarray] | None = field(pytree_node=False, default=None)
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)

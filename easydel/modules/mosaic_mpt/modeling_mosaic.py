@@ -463,7 +463,7 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
         alibi_bias_max (int, optional): The maximum bias value allowed by ALiBi. Defaults to 8.
 
     Returns:
-        chex.Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
+        Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
     """
     alibi = jnp.arange(
         1 - sequence_length,
@@ -515,7 +515,7 @@ class MptModel(EasyDeLBaseModule):
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
         norm_f (nn.LayerNorm): Final layer normalization.
-        alibi (chex.Array, optional): Precomputed ALiBi tensor if using ALiBi.
+        alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
     """
 
     def __init__(

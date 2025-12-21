@@ -756,7 +756,7 @@ def auto_remat(
         ... )
         >>> model = auto_remat(model, policy=policy)
     """
-    if policy == EasyDeLGradientCheckPointers.NONE or policy == "":
+    if policy == EasyDeLGradientCheckPointers.NONE or policy in ["", "none"]:
         if len(modules) == 1:
             return modules[0]
         return modules

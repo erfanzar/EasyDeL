@@ -17,7 +17,6 @@ from __future__ import annotations
 import functools
 import typing as tp
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -71,7 +70,7 @@ def compute_mup_vector(config: FalconH1Config) -> jnp.ndarray:
     return mup_vector
 
 
-def apply_mask_to_padding_states(hidden_states: chex.Array, attention_mask: chex.Array | None) -> chex.Array:
+def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
     if (
         attention_mask is not None
         and attention_mask.shape[0] == hidden_states.shape[0]
@@ -173,7 +172,7 @@ class Conv1D(nn.Module):
                 key=rngs.params(),
             )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
         y = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
@@ -214,7 +213,7 @@ class FalconH1RMSNormGated(nn.Module):
             key=rngs.params(),
         )
 
-    def __call__(self, hidden_states: chex.Array, gate: chex.Array | None = None) -> chex.Array:
+    def __call__(self, hidden_states: Array, gate: Array | None = None) -> Array:
         input_dtype = hidden_states.dtype
         hs = hidden_states.astype(jnp.float32)
 
@@ -364,10 +363,10 @@ class FalconH1Mixer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
         cache_view: HybridCacheView | None = None,
-    ) -> tuple[chex.Array, HybridCacheView | None]:
+    ) -> tuple[Array, HybridCacheView | None]:
         """Forward pass with optional cache support for autoregressive generation.
 
         Args:
@@ -529,7 +528,7 @@ class FalconH1MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         y = self.up_proj(x) * self.act_fn(self.gate_proj(x) * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
         return y
@@ -603,14 +602,14 @@ class FalconH1DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo | None,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: HybridCacheView | None = None,
         cache_metadata: OperationsMetadata | None = None,
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
         """Forward pass for FalconH1 decoder layer.
 
@@ -685,7 +684,13 @@ class FalconH1Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
 
         self.embed_tokens = nn.Embed(
             num_embeddings=config.vocab_size,
@@ -722,11 +727,11 @@ class FalconH1Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Array | None = None,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
         past_key_values: HybridCache | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Array | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -869,11 +874,11 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Array | None = None,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
         past_key_values: HybridCache | None = None,
-        inputs_embeds: chex.Array | None = None,
+        inputs_embeds: Array | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -932,11 +937,11 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         max_length: int,
         pad_token_id: int,
-        starts: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        starts: Array | None = None,
+        attention_mask: Array | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
         """Prepare inputs for autoregressive generation.

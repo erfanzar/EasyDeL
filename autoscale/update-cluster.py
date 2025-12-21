@@ -572,7 +572,10 @@ def main():
     unclassified_quota_rows = []
     try:
         metrics = collect_tpu_quota_metrics(
-            session, project_number, try_all_services=args.try_all_services, verbose=args.verbose
+            session,
+            project_number,
+            try_all_services=args.try_all_services,
+            verbose=args.verbose,
         )
         buckets = normalize_quota_buckets(metrics)
 

@@ -216,23 +216,18 @@ class VisionLlamaConfig(LlamaConfig):
         """
         pmag = self.partition_manager
         return (
-            # Column-wise Sharding (split output dimensions)
             (r".*attn/.*(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            # QKV Projections
             (r".*mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            # MLP Up-Projections
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
-            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
-            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
-            # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/kernel", pmag.resolve(RowWise)),  # Attention Output
-            (r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
-            (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
-            # Replicated Parameters
-            (r".*bias", pmag.resolve(Replicated)),  # All biases
-            (r".*layernorm/scale", pmag.resolve(Replicated)),  # LayerNorm scales
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),  # RMSNorm scales
-            (r".*norm/scale", pmag.resolve(Replicated)),  # Final LayerNorm scale
+            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),
+            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),
+            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
+            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),
+            (r".*attn/o_proj/kernel", pmag.resolve(RowWise)),
+            (r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),
+            (r".*score/kernel", pmag.resolve(RowWise)),
+            (r".*bias", pmag.resolve(Replicated)),
+            (r".*layernorm/scale", pmag.resolve(Replicated)),
+            (r".*rms_norm/scale", pmag.resolve(Replicated)),
+            (r".*norm/scale", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )

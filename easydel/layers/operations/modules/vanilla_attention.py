@@ -194,6 +194,14 @@ class VanillaAttn(OperationImpl):
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE
             causal_computed: bool = causal if not is_decode_mode else False
+            if mask_info is not None:
+                attention_mask = mask_info.attention_mask
+                if attention_mask is not None and attention_mask.ndim == 4:
+                    q_len = query.shape[1]
+                    kv_len = key.shape[1]
+                    if attention_mask.shape[-2] != q_len or attention_mask.shape[-1] != kv_len:
+                        attention_mask = attention_mask[..., :q_len, :kv_len]
+                        mask_info = MaskInfo(_attention_mask=attention_mask)
             outputs, weights = attention(
                 query,
                 key,

@@ -27,7 +27,6 @@ HuggingFace reference:
 
 import functools
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
@@ -35,11 +34,13 @@ from einops import repeat
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as FalconMambaRMSNorm
@@ -49,7 +50,7 @@ from easydel.layers.operations.modules import SSM1Op
 from .falcon_mamba_configuration import FalconMambaConfig
 
 
-def rms_forward(hidden_states: chex.Array, *, variance_epsilon: float = 1e-6) -> chex.Array:
+def rms_forward(hidden_states: Array, *, variance_epsilon: float = 1e-6) -> Array:
     """RMS normalize without learnable weights (HF parity helper)."""
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.astype(jnp.float32)
@@ -62,18 +63,18 @@ def rms_forward(hidden_states: chex.Array, *, variance_epsilon: float = 1e-6) ->
 class FalconMambaOutput(BaseModelOutput):
     """Output type for `FalconMambaModel`."""
 
-    last_hidden_state: chex.Array = None
+    last_hidden_state: Array = None
     cache_params: RecurrentCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 @auto_pytree
 class FalconMambaCausalLMOutput(BaseModelOutput):
     """Output type for `FalconMambaForCausalLM`."""
 
-    logits: chex.Array = None
+    logits: Array = None
     cache_params: RecurrentCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 class Conv1D(nn.Module):
@@ -303,10 +304,10 @@ class FalconMambaMixer(nn.Module):
 
     def __call__(
         self,
-        input_states: chex.Array,
+        input_states: Array,
         cache_params: RecurrentCacheView | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -436,11 +437,11 @@ class FalconMambaBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         cache_params: RecurrentCacheView | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
+    ) -> Array:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -502,12 +503,12 @@ class FalconMambaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
         cache_params: RecurrentCache | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | FalconMambaOutput:
         output_hidden_states = (
@@ -527,7 +528,7 @@ class FalconMambaModel(EasyDeLBaseModule):
                 pad_id = getattr(self.config, "pad_token_id", None)
                 if pad_id is None:
                     eos_id = getattr(self.config, "eos_token_id", None)
-                    if isinstance(eos_id, (list, tuple)) and eos_id:  # noqa:UP038
+                    if isinstance(eos_id, (list, tuple)) and eos_id:
                         eos_id = eos_id[0]
                     pad_id = eos_id
 
@@ -578,8 +579,12 @@ class FalconMambaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=FalconMambaConfig, model_type="falcon_mamba")
-class FalconMambaForCausalLM(EasyDeLBaseModule):
+class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaConfig]):
     """FalconMamba causal language model (backbone + LM head)."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "falcon_mamba"
+    _config_class = FalconMambaConfig
 
     def __init__(
         self,
@@ -592,43 +597,24 @@ class FalconMambaForCausalLM(EasyDeLBaseModule):
     ) -> None:
         super().__init__(
             config=config,
+            base_model_class=FalconMambaModel,
+            base_model_name="backbone",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.backbone = FalconMambaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = auto_remat(
-            ColumnParallelLinear,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
         cache_params: RecurrentCache | None = None,
         output_hidden_states: bool | None = None,
         apply_lm_head: bool = True,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | FalconMambaCausalLMOutput:
         outputs = self.backbone(

@@ -15,7 +15,6 @@
 
 import functools
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -32,6 +31,7 @@ from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, Deco
 from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
     HybridCache,
     RaggedPagesCache,
@@ -268,7 +268,7 @@ class XerxesSparseMoeBlock(nn.Module):
             for _ in range(self.config.num_local_experts)
         ]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -374,17 +374,17 @@ class XerxesDecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
 
         attn_outputs = self.self_attn(
@@ -417,6 +417,10 @@ class XerxesDecoderLayer(nn.Module):
         else:
             feed_forward_hidden_states = self.mlp(feed_forward_input)
 
+        router_logits = None
+        if isinstance(feed_forward_hidden_states, tuple):
+            feed_forward_hidden_states, router_logits = feed_forward_hidden_states
+
         hidden_states = self.post_feedforward_layernorm(feed_forward_hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = apply_logical_sharding(
@@ -427,6 +431,7 @@ class XerxesDecoderLayer(nn.Module):
         return DecoderLayerOutput(
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
+            router_logits=router_logits,
             cache_view=attn_outputs.cache_view,
         )
 
@@ -518,11 +523,11 @@ class XerxesModel(EasyDeLBaseModule):
         Forward pass through the Xerxes module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -640,8 +645,12 @@ class XerxesModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=XerxesConfig, model_type="xerxes")
-class XerxesForCausalLM(EasyDeLBaseModule):
+class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):
     """Xerxes language model with LM head for causal generation."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "xerxes"
+    _config_class = XerxesConfig
 
     def __init__(
         self,
@@ -654,35 +663,13 @@ class XerxesForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=XerxesModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = XerxesModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            self.config.hidden_size,
-            self.config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-            rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_bias=False,
         )
         identity = config.xe_kvnorm and not config.xe_moe
         self.post_pross = Identity() if identity else PostCross()
@@ -705,11 +692,11 @@ class XerxesForCausalLM(EasyDeLBaseModule):
         Forward pass through the Xerxes module.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
-            attention_mask (tp.Optional[chex.Array]): Mask for attention.
-            position_ids (tp.Optional[chex.Array]): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (tp.Optional[Array]): Input tensor containing token IDs.
+            attention_mask (tp.Optional[Array]): Mask for attention.
+            position_ids (tp.Optional[Array]): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
