@@ -32,7 +32,6 @@ class TestQwen3OmniMoe:
             num_experts_per_tok=small_model_config.get("num_experts_per_tok", 2),
         )
 
-    @pytest.mark.skip(reason="Qwen3OmniMoe is a complex multimodal model requiring special test setup")
     def test_causal_lm(self, qwen3_omni_moe_thinker_config, small_model_config):
         """Test Qwen3OmniMoeThinker with BASE_MODULE task."""
         tester = EasyDeLOnlyTester()
