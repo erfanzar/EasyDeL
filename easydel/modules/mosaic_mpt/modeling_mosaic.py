@@ -244,7 +244,11 @@ class MptAttention(UnifiedAttention):
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
-        """Override ALiBi forward with MPT's custom bias computation and masking."""
+        """Override ALiBi forward with fused QKV projection.
+
+        Important: ALiBi does not enforce causality by itself, so we must still
+        apply causal masking (and padding masking) via `mask_info` / `causal`.
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
 
         # 1. Project Q/K/V from fused projection (computed ONCE)
@@ -258,6 +262,10 @@ class MptAttention(UnifiedAttention):
 
         # 3. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
 
         # 4. KV cache concatenation
         (
@@ -276,46 +284,59 @@ class MptAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        # 5. Use external ALiBi bias if provided, otherwise compute it
-
-        if alibi is not None:
-            alibi_bias = alibi
+        # 5. Use external ALiBi bias if provided, otherwise compute it.
+        # HF MPT uses a 3D bias of shape (heads, 1, max_seq_len) and slices
+        # it to the current key length; we accept either 3D or 4D here.
+        if alibi is None:
+            alibi_bias = self._compute_alibi_bias(self.config.max_seq_len)
         else:
-            alibi_bias = self._compute_alibi_bias(key_states.shape[1])
+            alibi_bias = alibi
 
-        position_bias_query_index = max(0, alibi_bias.shape[2] - query_states.shape[1])
-        position_bias_key_index = max(0, alibi_bias.shape[3] - key_states.shape[1])
-        alibi_bias = alibi_bias[:, :, position_bias_query_index:, position_bias_key_index:]
+        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
+        if alibi_bias.ndim == 3:
+            # (H, 1, K)
+            alibi_bias = alibi_bias[None, ...]
+        elif alibi_bias.ndim == 2:
+            # (H, K)
+            alibi_bias = alibi_bias[None, :, None, :]
 
-        mask_ = mask_info.get_or_compute_attention_mask().repeat(alibi_bias.shape[1], 1)
+        q_len = query_states.shape[1]
+        kv_len = key_states.shape[1]
 
-        attention_bias = lax.select(
-            mask_,
-            jnp.full(mask_.shape, 0.0).astype(self.dtype) + alibi_bias.astype(self.dtype),
-            jnp.full(mask_.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        if alibi_bias.shape[-1] != kv_len:
+            start_k = max(0, alibi_bias.shape[-1] - kv_len)
+            alibi_bias = alibi_bias[..., start_k:]
 
-        # 8. Compute attention
+        if alibi_bias.shape[0] == 1 and batch_size != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (batch_size, *alibi_bias.shape[1:]))
+
+        if alibi_bias.shape[-2] == 1 and q_len != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (*alibi_bias.shape[:-2], q_len, kv_len))
+        elif alibi_bias.shape[-2] != q_len:
+            start_q = max(0, alibi_bias.shape[-2] - q_len)
+            alibi_bias = alibi_bias[..., start_q:, :]
+
+        # 6. Compute attention (mask + causal handled by kernel)
         attention = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             mode=mode,
-            bias=attention_bias,
+            bias=alibi_bias,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
-            init_bias=lambda: attention_bias,
-            mask_info=None,  # Mask already applied to bias
-            causal=False,  # ALiBi handles causality through bias
+            init_bias=None,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
         )
 
-        # 9. Merge heads and output projection
+        # 7. Merge heads and output projection
         attn_output = self.shard_attention_prod(
             attention.attention_outputs.reshape(batch_size, sequence_length, self.config.hidden_size)
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 
-        # 10. Apply residual dropout
+        # 8. Apply residual dropout
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(

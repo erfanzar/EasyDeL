@@ -341,7 +341,14 @@ class EasyGenerationMixin:
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
 
-        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        # Some configs (e.g. OpenELM) store per-layer KV head counts in `num_kv_heads`.
+        # Generation cache configs currently expect a single KV head count, so we
+        # use the first layer's value when a list/tuple is provided.
+        num_kv_heads = getattr(text_config, "num_kv_heads", None)
+        if isinstance(num_kv_heads, (list, tuple)):
+            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
         if num_kv_heads is None:
             num_kv_heads = getattr(text_config, "num_attention_heads", None)
 

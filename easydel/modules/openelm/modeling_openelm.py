@@ -27,7 +27,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -176,6 +176,86 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             head_size=config.head_dim,
             rotary_dim=config.head_dim,
             base=config.rope_freq_constant,
+        )
+
+    def forward(
+        self,
+        hidden_states: Float[Array, "batch seq_len hidden_dim"],
+        mask_info: MaskInfo | None,
+        position_ids: Int[Array, "batch seq_len"],
+        mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        frequencies: Float[Array, "seq_len head_dim"] | None = None,
+        alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
+    ) -> AttentionLayerOutput:
+        batch_size, sequence_length = hidden_states.shape[:2]
+
+        qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
+        qkv = qkv.reshape(
+            batch_size,
+            sequence_length,
+            self.num_q_heads + self.num_k_heads + self.num_v_heads,
+            self.head_dim,
+        )
+        query_states = qkv[:, :, : self.num_q_heads, :]
+        key_states = qkv[:, :, self.num_q_heads : self.num_q_heads + self.num_k_heads, :]
+        value_states = qkv[:, :, self.num_q_heads + self.num_k_heads :, :]
+
+        query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
+        query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
+        (
+            key_states,
+            value_states,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        ) = self.concatenate(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            cache_view=cache_view,
+            cache_metadata=cache_metadata,
+            mask_info=mask_info,
+        )
+
+        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
+        attentions: AttentionLayerOutput = self.attention_performer.forward(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            mode=mode,
+            bias=None,
+            cache_metadata=cache_metadata,
+            cache_view=cache_view,
+            init_bias=init_attention_bias,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
+            softmax_aux=softmax_aux,
+        )
+
+        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
+
+        return AttentionLayerOutput(
+            attention_output=attn_output,
+            attention_weight=attentions.attention_weights if output_attentions else None,
+            cache_view=cache_view,
         )
 
 
