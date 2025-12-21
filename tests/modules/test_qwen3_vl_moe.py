@@ -35,7 +35,11 @@ class TestQwen3VLMoE:
         # Avoid TPU pallas grouped_matmul lowering in CI/dev environments.
         org_config.text_config.moe_force_xla_gmm = True
         org_config.moe_force_xla_gmm = True
-        org_config.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [24, 20, 20]}
+        org_config.text_config.rope_scaling = {
+            "rope_type": "default",
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        }
         org_config.vision_config.out_hidden_size = org_config.text_config.hidden_size
         return org_config
 

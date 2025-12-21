@@ -25,7 +25,11 @@ class TestQwen3VL:
         org_config.text_config.num_key_value_heads = 2
         org_config.text_config.num_hidden_layers = 2
         org_config.text_config.head_dim = 128
-        org_config.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [24, 20, 20]}
+        org_config.text_config.rope_scaling = {
+            "rope_type": "default",
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        }
         org_config.vision_config.out_hidden_size = org_config.text_config.hidden_size
         return org_config
 
