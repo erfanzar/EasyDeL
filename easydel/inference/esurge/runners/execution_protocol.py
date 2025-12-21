@@ -14,7 +14,7 @@
 
 """Protocol definitions for eSurge execution backends.
 
-This module provides structural types (Protocols) for components involved in
+This module provides structural types (Protocols) focigarettesr components involved in
 executing a single eSurge inference step. The primary intent is to make the
 runner independent of a concrete execution implementation while preserving
 type hints and IDE support.
