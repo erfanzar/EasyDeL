@@ -1198,34 +1198,32 @@ class EasyDeLOnlyTester:
                 )
 
                 # Run forward pass
-                @ed.ejit(static_argnums=(1,))
-                def jited(ids, gd, gs, go, attention_mask):
-                    model = nn.merge(gd, gs, go)
-                    return model.compute_loss(
-                        input_ids=ids,
-                        attention_mask=attention_mask,
-                    )
-
                 with ed.utils.capture_time() as timer:
-                    ed_output, _metrics = jited(
-                        inputs["jax"]["input_ids"],
+                    @ed.ejit(static_argnums=(0,))
+                    def jited(gd, gs, go, input_ids, attention_mask):
+                        model = nn.merge(gd, gs, go)
+                        return model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                        )
+
+                    ed_output = jited(
                         *ed_model.split_module(),
-                        attention_mask=inputs["jax"]["attention_mask"],
+                        inputs["jax"]["input_ids"],
+                        inputs["jax"]["attention_mask"],
                     )
                 ed_time = timer()
 
             # Verify output
             assert ed_output is not None, f"{module_name} forward pass returned None"
-            assert hasattr(ed_output, "logits"), f"{module_name} output missing logits"
-            assert hasattr(ed_output, "loss"), f"{module_name} output missing loss"
-            assert jnp.isfinite(ed_output.loss), f"{module_name} loss is not finite"
+            assert hasattr(ed_output, "last_hidden_state"), f"{module_name} output missing last_hidden_state"
+            assert bool(jnp.isfinite(ed_output.last_hidden_state).all()), f"{module_name} last_hidden_state not finite"
 
             return TestResult(
                 success=True,
                 ed_time=ed_time,
                 extra_info={
-                    "loss": float(ed_output.loss),
-                    "logits_shape": list(ed_output.logits.shape),
+                    "last_hidden_state_shape": list(ed_output.last_hidden_state.shape),
                 },
             )
 

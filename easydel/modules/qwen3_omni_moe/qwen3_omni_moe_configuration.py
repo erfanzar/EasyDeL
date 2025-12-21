@@ -391,8 +391,13 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         if isinstance(text_config, dict):
             text_config = Qwen3OmniMoeTextConfig(**self._fix_parent_kws(text_config, kwargs))
         elif text_config is None:
-            text_config = Qwen3OmniMoeTextConfig()
+            text_config = Qwen3OmniMoeTextConfig(**kwargs)
         self.text_config = text_config
+
+        if not hasattr(self, "rope_theta"):
+            self.rope_theta = self.text_config.rope_theta
+        if not hasattr(self, "rope_scaling"):
+            self.rope_scaling = getattr(self.text_config, "rope_scaling", None)
 
         self.audio_token_id = audio_token_id
         self.image_token_id = image_token_id
