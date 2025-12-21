@@ -253,13 +253,33 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         so task wrappers can surface any extra multimodal tensors needed when
         passing `inputs_embeds` directly.
         """
-        # If a concrete VLM wrapper overrides `compute_embedding`, we want the
-        # wrapper's multimodal embedding logic (e.g. pixel_values merging) to be
-        # used here as well. Otherwise, delegate to the underlying base model.
-        if self.__class__.compute_embedding is not BaseVisionLanguageModule.compute_embedding:
-            return self.compute_embedding(input_ids, *args, **kwargs), None
+        # When a wrapper overrides `compute_embedding`, we still want to expose
+        # any auxiliary embedding info (e.g. position_ids / rope_deltas /
+        # deepstack tensors) produced by the underlying base model. Some VLMs
+        # require this info when calling the forward with `inputs_embeds`.
+        if self.__class__.compute_embedding is BaseVisionLanguageModule.compute_embedding:
+            return self.base_model.compute_embedding_with_info(input_ids, *args, **kwargs)
 
-        return self.base_model.compute_embedding_with_info(input_ids, *args, **kwargs)
+        inputs_embeds = self.compute_embedding(input_ids, *args, **kwargs)
+        embed_info = None
+
+        base_fn = getattr(self.base_model, "compute_embedding_with_info", None)
+        if callable(base_fn):
+            try:
+                _, embed_info = base_fn(input_ids, *args, **kwargs)
+            except TypeError:
+                # Some base models may not accept wrapper-specific kwargs
+                # (e.g. pixel_values). Fall back to passing only parameters that
+                # exist in the base signature.
+                import inspect
+
+                sig = inspect.signature(base_fn)
+                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    raise
+                filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                _, embed_info = base_fn(input_ids, *args, **filtered_kwargs)
+
+        return inputs_embeds, embed_info
 
     def get_video_features(
         self,

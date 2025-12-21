@@ -805,7 +805,10 @@ class BaseMoeModule(nn.Module, ABC):
         wubps = self.get_moe_spec("column", use_expert_tensor, is_bias=True) if wu_bias is not None else None
         wdbps = self.get_moe_spec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
 
-        gmm_kws = {"preferred_element_type": jnp.bfloat16}
+        preferred_element_type = jnp.bfloat16
+        if jnp.dtype(self.dtype) == jnp.float32:
+            preferred_element_type = jnp.float32
+        gmm_kws = {"preferred_element_type": preferred_element_type}
         if self.config.moe_force_xla_gmm:
             gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
         else:
