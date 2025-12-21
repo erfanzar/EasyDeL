@@ -97,6 +97,18 @@ class BatchMetadata:
     pixel_values_videos: jax.Array | None = None
     video_grid_thw: jax.Array | None = None
 
+    # VLM prefill helpers (kept explicit to avoid JIT-incompatible model codepaths)
+    # - mrope_position_ids: 3D RoPE indices for mRoPE-style models [3, num_tokens]
+    # - prefill_embeds: Optional per-token embedding overrides [num_tokens, hidden]
+    # - prefill_embeds_mask: Mask selecting which rows in `prefill_embeds` to use [num_tokens]
+    mrope_position_ids: jax.Array | None = None
+    prefill_embeds: jax.Array | None = None
+    prefill_embeds_mask: jax.Array | None = None
+
+    # DeepStack-style visual injection (optional, model-specific)
+    visual_pos_masks: jax.Array | None = None
+    deepstack_visual_embeds: tuple[jax.Array, ...] | None = None
+
 
 @auto_pytree(frozen=True)
 class ModelStepOutputs:

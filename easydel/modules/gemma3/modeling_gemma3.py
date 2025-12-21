@@ -15,7 +15,6 @@
 
 from functools import cached_property, partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -40,7 +39,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseVisionLanguageModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -63,22 +62,22 @@ logger = get_logger(__name__)
 @auto_pytree
 class Gemma3ModelOutputWithPast(ModelOutput):
     r"""
-    past_key_values (`tuple(tuple(chex.Array))`):
-        Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+    past_key_values (`tuple(tuple(Array))`):
+        Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
         `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
         `past_key_values` input) to speed up sequential decoding.
-    image_hidden_states (`chex.Array`, *optional*):
-        A `chex.Array` of size `(batch_size, num_images, sequence_length, hidden_size)`.
+    image_hidden_states (`Array`, *optional*):
+        A `Array` of size `(batch_size, num_images, sequence_length, hidden_size)`.
         image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    last_hidden_state: chex.Array | None = None
+    last_hidden_state: Array | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
 
 
 @auto_pytree
@@ -87,40 +86,40 @@ class Gemma3CausalLMOutputWithPast(ModelOutput):
     Base class for Gemma3 causal language model (or autoregressive) outputs.
 
     Args:
-        loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
             Language modeling loss (for next-token prediction).
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.get_text_config().vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.get_text_config().vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(chex.Array))`):
-            Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(tuple(Array))`):
+            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or
             when `config.output_hidden_states=True`):
-            Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed
+        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed
             or when `config.output_attentions=True`):
-            Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        image_hidden_states (`chex.Array`, *optional*):
-            A `chex.Array` of size `(batch_size, sequence_length, hidden_size)`.
+        image_hidden_states (`Array`, *optional*):
+            A `Array` of size `(batch_size, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder after projecting last hidden state.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array | None = None
-    last_hidden_state: chex.Array | None = None
+    loss: Array | None = None
+    logits: Array | None = None
+    last_hidden_state: Array | None = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
@@ -391,16 +390,16 @@ class Gemma3DecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
         frequencies = default_frequencies if self.is_sliding else frequencies
@@ -530,7 +529,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
+        token_type_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -541,10 +540,10 @@ class Gemma3TextModel(EasyDeLBaseModule):
         Forward pass through the Gemma2 module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -569,15 +568,38 @@ class Gemma3TextModel(EasyDeLBaseModule):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
+
+        # HF Gemma3 uses per-layer attention masks:
+        # - full attention: causal
+        # - sliding attention: causal + sliding window
+        # For multimodal (token_type_ids), HF *OR*s a bidirectional image-block mask
+        # with the base mask (so image tokens can see each other even outside the window).
+        #
+        # To match that, we construct two MaskInfo variants and select per layer:
+        #   full:    causal | image_block_mask
+        #   sliding: (causal & window) | image_block_mask
+        mask_info_full = mask_info
+        mask_info_sliding = mask_info
         if token_type_ids is not None:
-            # For VLM with token_type_ids, we need to allow bidirectional attention
-            # for image tokens while maintaining causal for text tokens.
-            # HF uses: (causal_mask) | (image_bidirectional_mask)
-            # To achieve this, we bake causal into the mask first, then OR with
-            # the image bidirectional mask via apply_token_type_ids.
-            mask_info = mask_info.apply_causal()
-            mask_info = mask_info.apply_token_type_ids(token_type_ids)
-            object.__setattr__(mask_info, "_causal_baked", True)
+            token_type_ids = jnp.asarray(token_type_ids, dtype=jnp.int32)
+            is_image = token_type_ids == 1
+            prev_is_image = jnp.pad(is_image, ((0, 0), (1, 0)), constant_values=False)[:, :-1]
+            new_image_start = is_image & (~prev_is_image)
+            image_group_ids = jnp.cumsum(new_image_start.astype(jnp.int32), axis=1) - 1
+            # Use per-image group IDs so equality masking matches HF's "same_image_block" logic.
+            # Text tokens are 0 (disabled by MaskInfo.apply_token_type_ids' default zero_policy="q").
+            grouped_token_types = jnp.where(is_image, image_group_ids + 1, 0).astype(jnp.int32)
+
+            causal_mask_info = mask_info.apply_causal()
+            mask_info_full = causal_mask_info.apply_token_type_ids(grouped_token_types)
+            mask_info_sliding = (
+                causal_mask_info.apply_sliding_window(self.config.sliding_window).apply_token_type_ids(grouped_token_types)
+            )
+
+            # We've baked causal (and for sliding layers, window) into the attention mask, so the
+            # attention kernel shouldn't apply causal/window again.
+            object.__setattr__(mask_info_full, "_causal_baked", True)
+            object.__setattr__(mask_info_sliding, "_causal_baked", True)
         if position_ids is None:
             position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds
@@ -608,9 +630,10 @@ class Gemma3TextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            layer_mask_info = mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
             layer_outputs = block(
                 hidden_states=hidden_states,
-                mask_info=mask_info,
+                mask_info=layer_mask_info,
                 position_ids=position_ids,
                 mode=mode,
                 cache_view=past_key_values.views[idx],
@@ -705,7 +728,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
+        token_type_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
@@ -717,11 +740,11 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         Forward pass through the Gemma3 model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
-            attention_mask (tp.Optional[chex.Array]): Mask for attention.
-            position_ids (tp.Optional[chex.Array]): Positional indices.
-            token_type_ids (tp.Optional[chex.Array]): Token type IDs for handling different types of tokens.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (tp.Optional[Array]): Input tensor containing token IDs.
+            attention_mask (tp.Optional[Array]): Mask for attention.
+            position_ids (tp.Optional[Array]): Positional indices.
+            token_type_ids (tp.Optional[Array]): Token type IDs for handling different types of tokens.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]): Cached key values for
@@ -795,8 +818,12 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma3TextConfig, model_type="gemma3_text")
-class Gemma3ForSequenceClassification(EasyDeLBaseModule):
+class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3TextModel, Gemma3TextConfig]):
     """Text-only Gemma3 backbone with a classification head for sequence tasks."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "gemma3_text"
+    _config_class = Gemma3TextConfig
 
     def __init__(
         self,
@@ -809,31 +836,14 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Gemma3TextModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Gemma3TextModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
@@ -1038,22 +1048,56 @@ class Gemma3Model(EasyDeLBaseModule):
 
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-    def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
+    def get_image_features(self, pixel_values: Array) -> Array:
         vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        image_features: Array | None = None,
+        pixel_values: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        image_token_id = self.config.image_token_id
+        if image_token_id >= self.vocab_size:
+            llm_input_ids = jnp.where(input_ids == image_token_id, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        hidden_size = self.config.get_text_config().hidden_size
+        inputs_embeds = super().compute_embedding(llm_input_ids) * (hidden_size**0.5)
+
+        if image_features is None and pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+
+        if image_features is not None:
+            multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
+            inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                placeholder_token_id=image_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
+        pixel_values: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        token_type_ids: chex.Array | None = None,
+        token_type_ids: Array | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1066,17 +1110,16 @@ class Gemma3Model(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_id >= self.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_id
-            llm_input_ids = input_ids
-            llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
-        else:
-            llm_input_ids = input_ids
-        if inputs_embeds is None:
-            inputs_embeds = self.get_embedding()(llm_input_ids) * (self.config.get_text_config().hidden_size ** 0.5)
+        image_features = None
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
+            )
+        elif image_features is not None:
             if input_ids is None:
                 special_image_mask = inputs_embeds == self.get_embedding()(
                     jnp.array(self.config.image_token_id, dtype="i4")
@@ -1084,8 +1127,12 @@ class Gemma3Model(EasyDeLBaseModule):
             else:
                 special_image_mask = jnp.expand_dims(input_ids == self.config.image_token_id, axis=-1)
                 special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
-            image_features = image_features.astype(inputs_embeds.dtype)
-            inputs_embeds = jnp.place(inputs_embeds, special_image_mask, image_features, inplace=False)
+            inputs_embeds = jnp.place(
+                inputs_embeds,
+                special_image_mask,
+                image_features.astype(inputs_embeds.dtype),
+                inplace=False,
+            )
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -1124,9 +1171,9 @@ class Gemma3Model(EasyDeLBaseModule):
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        token_type_ids: chex.Array | None = None,
+        token_type_ids: Array | None = None,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -1250,10 +1297,13 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         """
         return self.base_model.get_image_features(pixel_values)
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
+        pixel_values: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1261,7 +1311,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
-        token_type_ids: chex.Array | None = None,
+        token_type_ids: Array | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1320,7 +1370,7 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             image_hidden_states=outputs.image_hidden_states if pixel_values is not None else None,
         )
 
-    def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         """Apply the language modeling head with optional logit softcapping.
 
         Gemma3 uses final_logit_softcapping to prevent extreme logit values,

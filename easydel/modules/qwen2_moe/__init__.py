@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_qwen2_moe import Qwen2MoeConfig
 from .modeling_qwen2_moe import Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
+from .qwen2_moe_configuration import Qwen2MoeConfig
 
 __all__ = (
     "Qwen2MoeConfig",

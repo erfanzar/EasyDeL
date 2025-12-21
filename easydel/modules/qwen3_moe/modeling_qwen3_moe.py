@@ -16,7 +16,6 @@
 import typing
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -37,7 +36,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -135,9 +134,9 @@ class Qwen3MoeMLPStack(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
@@ -306,16 +305,16 @@ class Qwen3MoeSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states (Array): Input hidden states (batch_size * sequence_length, hidden_dim).
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tp.Tuple[Array, Array]: A tuple containing:
+                - final_hidden_states (Array): The output hidden states after MoE processing.
+                - router_logits (Array): The logits output by the gating network.
         """
 
         out, router_logits = self.moe_call(
@@ -489,20 +488,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
         """Forward pass of the Qwen3MoeDecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores. Shape:
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores. Shape:
                 (batch_size, 1, query_length, key_length).
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+            tp.Tuple[Array, tp.Optional[Array]]:
                 A tuple containing the output hidden states and optionally the attention weights.
         """
 
@@ -629,14 +628,14 @@ class Qwen3MoeModel(EasyDeLBaseModule):
         """Forward pass of the Qwen3MoeModel.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -834,7 +833,7 @@ class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen3MoeConfig, model_type="qwen3_moe")
-class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
+class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3MoeModel, Qwen3MoeConfig]):
     """Qwen3Moe model with a Sequence Classification head.
 
     This model consists of the base Qwen3Moe transformer (`Qwen3MoeModel`) followed by a
@@ -851,6 +850,10 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
         model (Qwen3MoeModel): The core Qwen3Moe transformer model.
         score (ParallelLinear): The linear layer for classification.
     """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "qwen3_moe"
+    _config_class = Qwen3MoeConfig
 
     def __init__(
         self,
@@ -876,31 +879,14 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
         """
         super().__init__(
             config=config,
+            base_model_class=Qwen3MoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Qwen3MoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
@@ -920,14 +906,14 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
         """Forward pass of the Qwen3MoeForSequenceClassification model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.

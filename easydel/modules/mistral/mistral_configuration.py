@@ -163,11 +163,6 @@ class MistralConfig(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
-        Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-        """
         pmag = self.partition_manager
         return (
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),

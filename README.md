@@ -44,7 +44,7 @@ TPU/GPU clusters.
 - **🔮 Modern Architecture**: Built on Flax NNX (not legacy Linen) for better modularity and performance
 - **50+ Model Architectures**: Broad JAX model collection including LLaMA, Qwen, Mistral, DeepSeek, Gemma, and more
 - **16 Specialized Trainers**: From supervised fine-tuning to RLHF, preference optimization, and knowledge distillation
-- **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, and OpenAI-compatible API
+- **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, OpenAI-compatible API, and multimodal serving (text/image/video)
 - **Full Multimodal Support**: Vision-language models (LLaVA, Qwen2-VL, Llama4-Vision), speech recognition (Whisper), and diffusion models
 - **🚀 TPU & GPU Optimized**: Triton (GPU) and Pallas (TPU) kernel options where available
 - **💜 Hackable Like Transformers, as fast as MaxText**: Easy to understand and modify like HuggingFace Transformers, with optimizations in Pallas/Triton/CUDA.
@@ -122,6 +122,7 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 
 - **Continuous Batching** - Background scheduler for optimal throughput
 - **Paged KV Cache** - Memory-efficient attention with prefix caching
+- **Multimodal (Text/Image/Video)** - Built-in image + video preprocessing and batching for multimodal models
 - **Ragged/Unified Attention** - Variable-length sequence optimization
 - **Async & Speculative** - Async token sampling with placeholder replacement plus Eagle-style speculative decoding support
 - **Streaming** - Delta-text streaming for interactive clients
@@ -183,11 +184,12 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 | Family          | Models                                                                                                                                                                 | Features                              |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
 | **LLaMA**       | Llama, Llama4                                                                                                                                                          | Foundation models, Llama4 with vision |
-| **Qwen**        | Qwen2, Qwen3, Qwen2-MoE, Qwen3-MoE, Qwen2-VL                                                                                                                           | Text, MoE, vision-language            |
+| **Qwen**        | Qwen2, Qwen3, Qwen3-Next, Qwen2-MoE, Qwen3-MoE, Qwen3-Omni, Qwen2-VL                                                                                                   | Text, MoE, vision-language, omni      |
 | **Mistral**     | Mistral, Mistral3, Mixtral                                                                                                                                             | MoE, multimodal (Pixtral)             |
 | **Google**      | Gemma, Gemma2, Gemma3                                                                                                                                                  | Gemma3 with vision support            |
 | **DeepSeek**    | DeepSeekV2, DeepSeekV3                                                                                                                                                 | Multi-head latent attention (MLA)     |
-| **GLM**         | GLM, GLM4, GLM4-MoE                                                                                                                                                    | Bilingual models with MoE             |
+| **Kimi**        | Kimi-Linear                                                                                                                                                            | KDA linear attention                  |
+| **GLM**         | GLM, GLM4, GLM4-MoE, GLM4V, GLM4V-MoE, GLM46V                                                                                                                          | Bilingual, MoE, vision-language       |
 | **Microsoft**   | Phi, Phi3, PhiMoE                                                                                                                                                      | Small language models                 |
 | **Meta**        | OPT, GPT2                                                                                                                                                              | Classic architectures                 |
 | **EleutherAI**  | GPT-NeoX, GPT-J                                                                                                                                                        | Open-source LLMs                      |
@@ -196,12 +198,21 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 
 ### Multimodal Models
 
-| Type                | Models                                                                       | Capabilities                               |
-| ------------------- | ---------------------------------------------------------------------------- | ------------------------------------------ |
-| **Vision-Language** | Llama4-Vision, Qwen2-VL, Gemma3-Vision, Mistral3 (Pixtral), LLaVA, AyaVision | Image understanding + text generation      |
-| **Vision Encoders** | CLIP, SigLIP, Pixtral                                                        | Vision-text alignment                      |
-| **Speech**          | Whisper                                                                      | Transcription, translation, classification |
-| **Diffusion**       | GIDD                                                                         | Diffusion language models                  |
+| Type                | Models                                                                                                             | Capabilities                               |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| **Vision-Language** | Llama4-Vision, Qwen2-VL, Qwen3-Omni, Gemma3-Vision, Mistral3 (Pixtral), GLM4V, GLM4V-MoE, GLM46V, LLaVA, AyaVision | Image understanding + text generation      |
+| **Vision Encoders** | CLIP, SigLIP, Pixtral                                                                                              | Vision-text alignment                      |
+| **Speech**          | Whisper                                                                                                            | Transcription, translation, classification |
+| **Diffusion**       | GIDD                                                                                                               | Diffusion language models                  |
+
+### Recent Additions
+
+- Kimi-Linear (`kimi_linear`)
+- Qwen3-Next (`qwen3_next`)
+- Qwen3-Omni (`qwen3_omni_moe`)
+- GLM4V (`glm4v`)
+- GLM4V-MoE (`glm4v_moe`)
+- GLM46V (`glm46v`)
 
 ### Auto Model Classes
 
@@ -309,8 +320,7 @@ print(f"\n\nTokens/s: {output.tokens_per_second:.2f}")
 - **Evaluation** - Built-in lm-evaluation-harness integration
 - **Serialization** - Save/load configurations as JSON for reproducibility
 
-> [!TIP]
-> `eLargeModel` is designed for common use cases and quick setup - perfect for getting started fast or when you want a simple, unified API. However, it doesn't expose all of EasyDeL's capabilities. For full modularity, fine-grained control, and access to advanced features, work directly with EasyDeL's underlying components (`AutoEasyDeLModelForCausalLM`, `eSurge`, trainers, etc.). The real power of EasyDeL lies in its hackable, composable architecture.
+> [!TIP] > `eLargeModel` is designed for common use cases and quick setup - perfect for getting started fast or when you want a simple, unified API. However, it doesn't expose all of EasyDeL's capabilities. For full modularity, fine-grained control, and access to advanced features, work directly with EasyDeL's underlying components (`AutoEasyDeLModelForCausalLM`, `eSurge`, trainers, etc.). The real power of EasyDeL lies in its hackable, composable architecture.
 
 ### Why eLargeModel?
 
@@ -333,17 +343,17 @@ engine = elm.build_esurge()   # Build what you need
 
 eLargeModel accepts a dictionary with the following sections:
 
-| Section | Purpose | Key Options |
-|---------|---------|-------------|
-| `model` | Model identification | `name_or_path`, `tokenizer`, `task` |
-| `loader` | Loading options | `dtype`, `param_dtype`, `precision`, `verbose` |
-| `sharding` | Distributed setup | `axis_dims`, `axis_names`, `auto_shard_model` |
-| `base_config` | Model configuration | `attn_mechanism`, `gradient_checkpointing`, `moe_method` |
-| `esurge` | Inference engine | `max_model_len`, `max_num_seqs`, `hbm_utilization`, `page_size` |
-| `quantization` | Model quantization | `dtype` (nf4/a8bit), `block_size` |
-| `trainer` | Training settings | `trainer_type`, `learning_rate`, `num_train_epochs` |
-| `mixture` | Dataset configuration | `informs`, `batch_size`, `streaming` |
-| `eval` | Evaluation settings | `max_new_tokens`, `temperature`, `batch_size` |
+| Section        | Purpose               | Key Options                                                     |
+| -------------- | --------------------- | --------------------------------------------------------------- |
+| `model`        | Model identification  | `name_or_path`, `tokenizer`, `task`                             |
+| `loader`       | Loading options       | `dtype`, `param_dtype`, `precision`, `verbose`                  |
+| `sharding`     | Distributed setup     | `axis_dims`, `axis_names`, `auto_shard_model`                   |
+| `base_config`  | Model configuration   | `attn_mechanism`, `gradient_checkpointing`, `moe_method`        |
+| `esurge`       | Inference engine      | `max_model_len`, `max_num_seqs`, `hbm_utilization`, `page_size` |
+| `quantization` | Model quantization    | `dtype` (nf4/a8bit), `block_size`                               |
+| `trainer`      | Training settings     | `trainer_type`, `learning_rate`, `num_train_epochs`             |
+| `mixture`      | Dataset configuration | `informs`, `batch_size`, `streaming`                            |
+| `eval`         | Evaluation settings   | `max_new_tokens`, `temperature`, `batch_size`                   |
 
 ### Creating an eLargeModel
 
@@ -594,34 +604,34 @@ dataset = elm.build_dataset()
 
 ### Available Builder Methods
 
-| Method | Description |
-|--------|-------------|
-| `set_model(path)` | Set model name/path |
-| `set_dtype(dtype)` | Set computation dtype (bf16, fp16, fp32) |
-| `set_sharding(axis_dims, axis_names)` | Configure distributed sharding |
-| `set_quantization(method, block_size)` | Enable quantization (nf4, a8bit) |
-| `set_esurge(...)` | Configure eSurge inference engine |
-| `set_trainer(type, ...)` | Configure training paradigm |
-| `set_mixture(...)` | Configure dataset mixture |
-| `set_eval(...)` | Configure evaluation settings |
-| `set_teacher_model(path)` | Set teacher model for distillation |
-| `set_reference_model(path)` | Set reference model for DPO/ORPO |
-| `add_dataset(...)` | Add dataset to mixture |
-| `update_config(dict)` | Deep merge configuration updates |
+| Method                                 | Description                              |
+| -------------------------------------- | ---------------------------------------- |
+| `set_model(path)`                      | Set model name/path                      |
+| `set_dtype(dtype)`                     | Set computation dtype (bf16, fp16, fp32) |
+| `set_sharding(axis_dims, axis_names)`  | Configure distributed sharding           |
+| `set_quantization(method, block_size)` | Enable quantization (nf4, a8bit)         |
+| `set_esurge(...)`                      | Configure eSurge inference engine        |
+| `set_trainer(type, ...)`               | Configure training paradigm              |
+| `set_mixture(...)`                     | Configure dataset mixture                |
+| `set_eval(...)`                        | Configure evaluation settings            |
+| `set_teacher_model(path)`              | Set teacher model for distillation       |
+| `set_reference_model(path)`            | Set reference model for DPO/ORPO         |
+| `add_dataset(...)`                     | Add dataset to mixture                   |
+| `update_config(dict)`                  | Deep merge configuration updates         |
 
 ### Build Methods
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `build_model()` | `EasyDeLBaseModule` | Build the model |
-| `build_tokenizer()` | `AutoTokenizer` | Build the tokenizer |
-| `build_esurge()` | `eSurge` | Build inference engine |
-| `build_trainer()` | `Trainer` | Build configured trainer |
-| `build_dataset()` | `Dataset` | Build dataset from mixture |
-| `build_teacher_model()` | `EasyDeLBaseModule` | Build teacher model |
-| `build_reference_model()` | `EasyDeLBaseModule` | Build reference model |
-| `train()` | Training results | Run full training pipeline |
-| `eval(tasks)` | Eval results | Run lm-eval benchmarks |
+| Method                    | Returns             | Description                |
+| ------------------------- | ------------------- | -------------------------- |
+| `build_model()`           | `EasyDeLBaseModule` | Build the model            |
+| `build_tokenizer()`       | `AutoTokenizer`     | Build the tokenizer        |
+| `build_esurge()`          | `eSurge`            | Build inference engine     |
+| `build_trainer()`         | `Trainer`           | Build configured trainer   |
+| `build_dataset()`         | `Dataset`           | Build dataset from mixture |
+| `build_teacher_model()`   | `EasyDeLBaseModule` | Build teacher model        |
+| `build_reference_model()` | `EasyDeLBaseModule` | Build reference model      |
+| `train()`                 | Training results    | Run full training pipeline |
+| `eval(tasks)`             | Eval results        | Run lm-eval benchmarks     |
 
 ### Training Example - Supervised Fine-Tuning
 

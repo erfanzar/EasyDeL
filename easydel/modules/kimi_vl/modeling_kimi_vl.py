@@ -28,23 +28,22 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import cached_property
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from flax import nnx as nn
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.base_modules import BaseVisionLanguageModule
 
 from ..deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig
 
 
-def _create_block_diagonal_bias(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+def _create_block_diagonal_bias(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention bias from cumulative sequence lengths.
 
     Returns:
@@ -62,10 +61,10 @@ def _create_block_diagonal_bias(cu_seqlens: chex.Array, seq_length: int, dtype: 
 
 
 def _apply_rope(
-    xq: chex.Array,
-    xk: chex.Array,
-    freqs_cis: chex.Array,
-) -> tuple[chex.Array, chex.Array]:
+    xq: Array,
+    xk: Array,
+    freqs_cis: Array,
+) -> tuple[Array, Array]:
     """Apply complex RoPE to q/k.
 
     Args:
@@ -74,11 +73,11 @@ def _apply_rope(
     """
     freqs_cis = freqs_cis[..., None, :]  # (..., 1, head_dim/2)
 
-    def _to_complex(x: chex.Array) -> chex.Array:
+    def _to_complex(x: Array) -> Array:
         x = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, 2)
         return jax.lax.complex(x[..., 0], x[..., 1])
 
-    def _to_real(x: chex.Array, dtype: jnp.dtype) -> chex.Array:
+    def _to_real(x: Array, dtype: jnp.dtype) -> Array:
         x = jnp.stack([jnp.real(x), jnp.imag(x)], axis=-1)
         return x.reshape(*x.shape[:-2], -1).astype(dtype)
 
@@ -112,7 +111,7 @@ class Learnable2DInterpPosEmb(nn.Module):
         )
         self.dtype = dtype
 
-    def __call__(self, x: chex.Array, grid_hws: chex.Array) -> chex.Array:
+    def __call__(self, x: Array, grid_hws: Array) -> Array:
         pos_embs = []
         kernel = self.kernel.value.astype(jnp.float32).transpose(2, 1, 0)
         for h, w in grid_hws:
@@ -174,7 +173,7 @@ class MoonVisionPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, pixel_values: chex.Array, grid_hws: chex.Array) -> chex.Array:
+    def __call__(self, pixel_values: Array, grid_hws: Array) -> Array:
         if pixel_values.ndim == 4:
             # Convert from NCHW -> NHWC for JAX conv.
             pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
@@ -195,7 +194,7 @@ class Rope2DPosEmb(nn.Module):
         self.theta_base = theta_base
 
     @cached_property
-    def freqs_cis(self) -> chex.Array:
+    def freqs_cis(self) -> Array:
         n = self.max_height * self.max_width
         flat_pos = jnp.arange(n, dtype=jnp.float32)
         x_pos = flat_pos % self.max_width
@@ -209,7 +208,7 @@ class Rope2DPosEmb(nn.Module):
         freqs_cis = jnp.concatenate([x_cis[..., None], y_cis[..., None]], axis=-1)
         return freqs_cis.reshape(self.max_height, self.max_width, -1)
 
-    def get_freqs_cis(self, grid_hws: chex.Array) -> chex.Array:
+    def get_freqs_cis(self, grid_hws: Array) -> Array:
         shapes = [(int(h), int(w)) for h, w in grid_hws]
         if not all(1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes):
             raise ValueError(f"grid_hws out of range: {shapes} vs {(self.max_height, self.max_width)}")
@@ -223,7 +222,7 @@ class MLP2(nn.Module):
     def __init__(
         self,
         dims: tuple[int, int, int],
-        activation: Callable[[chex.Array], chex.Array],
+        activation: Callable[[Array], Array],
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike | None = None,
@@ -251,7 +250,7 @@ class MLP2(nn.Module):
         )
         self.activation = activation
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return self.fc1(self.activation(self.fc0(x)))
 
 
@@ -264,7 +263,7 @@ class MoonVitEncoderLayer(nn.Module):
         num_heads: int,
         hidden_dim: int,
         mlp_dim: int,
-        activation: Callable[[chex.Array], chex.Array],
+        activation: Callable[[Array], Array],
         attn_bias: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
@@ -326,7 +325,7 @@ class MoonVitEncoderLayer(nn.Module):
             requires_cache=False,
         )
 
-    def _attention(self, x: chex.Array, cu_seqlens: chex.Array, rope_freqs_cis: chex.Array) -> chex.Array:
+    def _attention(self, x: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
         seq_length = x.shape[0]
         qkv = self.wqkv(x)
         qkv = qkv.reshape(seq_length, 3, self.num_heads, self.head_dim)
@@ -355,7 +354,7 @@ class MoonVitEncoderLayer(nn.Module):
         attn_out = attn_out.squeeze(0).reshape(seq_length, -1)
         return self.wo(attn_out)
 
-    def __call__(self, hidden_states: chex.Array, cu_seqlens: chex.Array, rope_freqs_cis: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
         hidden_states = residual + self._attention(hidden_states, cu_seqlens, rope_freqs_cis)
@@ -383,8 +382,10 @@ class MoonVitEncoder(nn.Module):
         rngs: nn.Rngs,
     ):
         self.rope_2d = Rope2DPosEmb(hidden_dim // num_heads, 512, 512)
+
         def activation(x):
             return jax.nn.gelu(x, approximate=True)
+
         self.blocks = [
             MoonVitEncoderLayer(
                 base_config=base_config,
@@ -408,7 +409,7 @@ class MoonVitEncoder(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array, grid_hws: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array, grid_hws: Array) -> Array:
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_hws)
 
         grid_lens = (grid_hws[:, 0] * grid_hws[:, 1]).astype(jnp.int32)
@@ -422,10 +423,10 @@ class MoonVitEncoder(nn.Module):
 
 
 def patch_merger(
-    hidden_states: chex.Array,
-    grid_hws: chex.Array,
+    hidden_states: Array,
+    grid_hws: Array,
     merge_kernel_size: tuple[int, int],
-) -> list[chex.Array]:
+) -> list[Array]:
     """Merge patches into spatial groups (matches HF `patch_merger`)."""
     d_model = hidden_states.shape[-1]
     kernel_h, kernel_w = merge_kernel_size
@@ -479,7 +480,7 @@ class MoonVitPretrainedModel(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, pixel_values: chex.Array, grid_hws: chex.Array) -> list[chex.Array]:
+    def __call__(self, pixel_values: Array, grid_hws: Array) -> list[Array]:
         hidden_states = self.patch_embed(pixel_values, grid_hws)
         hidden_states = self.encoder(hidden_states, grid_hws)
         return patch_merger(hidden_states, grid_hws, merge_kernel_size=self.merge_kernel_size)
@@ -527,7 +528,7 @@ class KimiVLMultiModalProjector(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, image_features: list[chex.Array]) -> chex.Array:
+    def __call__(self, image_features: list[Array]) -> Array:
         image_features = jnp.concatenate(image_features, axis=0)
         hidden_states = self.pre_norm(image_features).reshape(-1, self.hidden_size)
         hidden_states = self.linear_1(hidden_states)
@@ -537,7 +538,7 @@ class KimiVLMultiModalProjector(nn.Module):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=KimiVLConfig, model_type="kimi_vl")
-class KimiVLForConditionalGeneration(EasyDeLBaseModule):
+class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausalLM, KimiVLConfig]):
     """Kimi-VL model for image-text to text generation."""
 
     _task_type = TaskType.IMAGE_TEXT_TO_TEXT
@@ -556,7 +557,25 @@ class KimiVLForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config, dtype=dtype, param_dtype=param_dtype, precision=precision, rngs=rngs)
+        language_model = DeepseekV3ForCausalLM(
+            config=config.text_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        super().__init__(
+            config=config,
+            base_model=language_model,
+            base_model_name="language_model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            image_token_index=int(config.media_placeholder_token_id),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            create_lm_head=False,
+        )
         self.vision_tower = MoonVitPretrainedModel(
             config=config.vision_config,
             dtype=dtype,
@@ -571,30 +590,70 @@ class KimiVLForConditionalGeneration(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.language_model = DeepseekV3ForCausalLM(
-            config=config.text_config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
 
     def _merge_with_image_features(
         self,
-        inputs_embeds: chex.Array,
-        input_ids: chex.Array,
-        image_features: chex.Array,
-    ) -> chex.Array:
+        inputs_embeds: Array,
+        input_ids: Array,
+        image_features: Array,
+    ) -> Array:
         placeholder = int(self.config.media_placeholder_token_id)
-        batch_size, seq_len, hidden = inputs_embeds.shape
-        flat_embeds = inputs_embeds.reshape(batch_size * seq_len, hidden)
-        flat_ids = input_ids.reshape(-1)
-        mask = flat_ids == placeholder
-        return flat_embeds.at[mask].set(image_features).reshape(batch_size, seq_len, hidden)
+        multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1])
+        return BaseVisionLanguageModule.merge_multimodal_embeddings(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            placeholder_token_id=placeholder,
+        )
 
-    def _extract_image_features(self, pixel_values: chex.Array, image_grid_hws: chex.Array) -> chex.Array:
+    def _extract_image_features(self, pixel_values: Array, image_grid_hws: Array) -> Array:
         image_features = self.vision_tower(pixel_values, image_grid_hws)
         return self.multi_modal_projector(image_features)
+
+    def get_image_features(
+        self,
+        pixel_values: Float[Array, "num_patches channels patch_h patch_w"],
+        image_grid_hws: Int[Array, "num_images 2"] | None = None,
+        **kwargs,
+    ) -> Float[Array, "num_patches hidden_dim"]:
+        if image_grid_hws is None:
+            raise ValueError("`image_grid_hws` must be provided when `pixel_values` is not None.")
+        return self._extract_image_features(pixel_values.astype(self.dtype), image_grid_hws)
+
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        image_features: Array | None = None,
+        pixel_values: Float[Array, "num_patches channels patch_h patch_w"] | None = None,
+        image_grid_hws: Int[Array, "num_images 2"] | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        placeholder = int(self.config.media_placeholder_token_id)
+        vocab_size = int(getattr(self.config.text_config, "vocab_size", 0) or 0)
+        if vocab_size and placeholder >= vocab_size:
+            llm_input_ids = jnp.where(input_ids == placeholder, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+
+        if image_features is None and pixel_values is not None:
+            if image_grid_hws is None:
+                raise ValueError("`image_grid_hws` must be provided when `pixel_values` is not None.")
+            image_features = self._extract_image_features(pixel_values.astype(self.dtype), image_grid_hws)
+
+        if image_features is not None:
+            inputs_embeds = self._merge_with_image_features(
+                inputs_embeds,
+                input_ids,
+                image_features.astype(inputs_embeds.dtype),
+            )
+
+        return inputs_embeds
 
     def __call__(
         self,
@@ -616,23 +675,24 @@ class KimiVLForConditionalGeneration(EasyDeLBaseModule):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if inputs_embeds is None:
-            llm_input_ids = input_ids
-            placeholder = int(self.config.media_placeholder_token_id)
-            vocab_size = int(getattr(self.config.text_config, "vocab_size", 0) or 0)
-            if vocab_size and placeholder >= vocab_size:
-                llm_input_ids = jnp.where(input_ids == placeholder, 0, input_ids)
-            inputs_embeds = self.language_model.get_embedding()(llm_input_ids.astype("i4"))
-
         image_hidden_states = None
+        image_features = None
         if pixel_values is not None:
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
             if image_grid_hws is None:
                 raise ValueError("`image_grid_hws` must be provided when `pixel_values` is not None.")
 
             image_features = self._extract_image_features(pixel_values.astype(self.dtype), image_grid_hws)
-            image_features = image_features.astype(inputs_embeds.dtype)
-            inputs_embeds = self._merge_with_image_features(inputs_embeds, input_ids, image_features)
-            image_hidden_states = image_features
+
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
+            )
+
+        if image_features is not None:
+            image_hidden_states = image_features.astype(inputs_embeds.dtype)
 
         outputs = self.language_model(
             input_ids=None,
@@ -665,13 +725,13 @@ class KimiVLForConditionalGeneration(EasyDeLBaseModule):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-        image_grid_hws: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        attention_mask: Array | None = None,
+        image_grid_hws: Array | None = None,
     ):
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -701,6 +761,15 @@ class KimiVLForConditionalGeneration(EasyDeLBaseModule):
 
     def get_embedding(self):
         return self.language_model.get_embedding()
+
+    def get_vision_tower(self) -> nn.Module:
+        return self.vision_tower
+
+    def get_projector(self) -> nn.Module:
+        return self.multi_modal_projector
+
+    def get_language_model(self) -> nn.Module:
+        return self.language_model
 
 
 __all__ = [

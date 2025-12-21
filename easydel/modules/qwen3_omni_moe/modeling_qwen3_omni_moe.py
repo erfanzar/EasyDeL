@@ -26,7 +26,6 @@ Components:
 import typing
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -49,6 +48,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseConditionalGenerationModule, BaseVisionLanguageModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -88,15 +88,15 @@ from .qwen3_omni_moe_configuration import (
 class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
     """Output class for Qwen3OmniMoe causal language model."""
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
-    past_key_values: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    rope_deltas: chex.Array | None = None
+    loss: Array | None = None
+    logits: Array = None
+    past_key_values: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    rope_deltas: Array | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
     audio_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
-    router_logits: tuple[chex.Array] | None = None
+    router_logits: tuple[Array] | None = None
 
 
 class Qwen3OmniMoeAudioMLP(nn.Module):
@@ -131,7 +131,7 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         )
         self.act = ACT2FN[config.activation_function]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
@@ -200,9 +200,9 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        attention_mask: Array | None = None,
+    ) -> Array:
         batch_size, seq_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -286,9 +286,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        attention_mask: Array | None = None,
+    ) -> Array:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, attention_mask)
@@ -302,7 +302,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         return hidden_states
 
 
-def create_sinusoidal_positions(length: int, channels: int, max_timescale: int = 10000) -> chex.Array:
+def create_sinusoidal_positions(length: int, channels: int, max_timescale: int = 10000) -> Array:
     """Create sinusoidal position embeddings.
 
     Args:
@@ -497,7 +497,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return self.conv2d1
 
 
-def rotate_half(x: chex.Array) -> chex.Array:
+def rotate_half(x: Array) -> Array:
     """Rotate half the hidden dims for RoPE."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -505,11 +505,11 @@ def rotate_half(x: chex.Array) -> chex.Array:
 
 
 def apply_rotary_pos_emb_vision(
-    q: chex.Array,
-    k: chex.Array,
-    cos: chex.Array,
-    sin: chex.Array,
-) -> tuple[chex.Array, chex.Array]:
+    q: Array,
+    k: Array,
+    cos: Array,
+    sin: Array,
+) -> tuple[Array, Array]:
     """Apply rotary positional embeddings to vision features."""
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
@@ -520,7 +520,7 @@ def apply_rotary_pos_emb_vision(
     return q_embed.astype(orig_q_dtype), k_embed.astype(orig_k_dtype)
 
 
-def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create attention mask from cumulative sequence lengths."""
     attention_mask = jnp.full((1, seq_length, seq_length), jnp.finfo(dtype).min, dtype=dtype)
     mask_updates = jnp.zeros((1, seq_length, seq_length), dtype=dtype)
@@ -565,7 +565,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -630,7 +630,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             ),
         ]
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         x = self.ln_q(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
         x = self.mlp[0](x)
         x = nn.gelu(x, approximate=False)
@@ -670,7 +670,7 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
@@ -718,10 +718,10 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cu_seqlens: chex.Array,
-        rotary_pos_emb: chex.Array,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cu_seqlens: Array,
+        rotary_pos_emb: Array,
+    ) -> Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -779,16 +779,16 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cu_seqlens: chex.Array,
-        rotary_pos_emb: chex.Array,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cu_seqlens: Array,
+        rotary_pos_emb: Array,
+    ) -> Array:
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cu_seqlens, rotary_pos_emb)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
-def create_vision_rotary_embedding(dim: int, theta: float = 10000.0, max_seqlen: int = 8192) -> chex.Array:
+def create_vision_rotary_embedding(dim: int, theta: float = 10000.0, max_seqlen: int = 8192) -> Array:
     """Create vision rotary position embeddings.
 
     Args:
@@ -891,7 +891,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
-    def rot_pos_emb(self, grid_thw: chex.Array, max_grid_size: int) -> chex.Array:
+    def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
         """Compute rotary position embeddings for vision features."""
         pos_ids = []
         for t, h, w in grid_thw:
@@ -928,10 +928,10 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        grid_thw: chex.Array,
+        hidden_states: Array,
+        grid_thw: Array,
         max_grid_size: int,
-    ) -> chex.Array:
+    ) -> Array:
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
@@ -997,7 +997,7 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1078,10 +1078,10 @@ class Qwen3OmniMoeMLPStack(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -1131,7 +1131,7 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -1254,15 +1254,15 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -1331,7 +1331,7 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         )
         self.act_fn = ACT2FN[text_config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
@@ -1376,7 +1376,7 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         self.down_proj = row_linear(imz, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1457,10 +1457,10 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -1538,7 +1538,7 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
             kernel_init=nn.initializers.normal(config.initializer_range),
         )
 
-    def __call__(self, hidden_states: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
         routed_output, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -1663,15 +1663,15 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -1741,7 +1741,7 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1842,14 +1842,14 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -2008,7 +2008,9 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         return self.codec_embedding[0] if self.codec_embedding else None
 
 
-class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(EasyDeLBaseModule):
+class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
+    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerCodePredictorModel, Qwen3OmniMoeTalkerCodePredictorConfig]
+):
     """Talker code predictor with per-group LM heads."""
 
     def __init__(
@@ -2022,18 +2024,14 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(EasyDeLBaseModule)
     ):
         super().__init__(
             config=config,
+            base_model_class=Qwen3OmniMoeTalkerCodePredictorModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-
-        self.model = Qwen3OmniMoeTalkerCodePredictorModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            create_lm_head=False,
+            lm_head_name="lm_head",
         )
 
         self.lm_head = [
@@ -2239,7 +2237,9 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         return self.codec_embedding
 
 
-class Qwen3OmniMoeTalkerForConditionalGeneration(EasyDeLBaseModule):
+class Qwen3OmniMoeTalkerForConditionalGeneration(
+    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerModel, Qwen3OmniMoeTalkerConfig]
+):
     """Full Talker model combining text model and code predictor.
 
     This model takes hidden states from the Thinker and generates
@@ -2255,20 +2255,23 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.model = Qwen3OmniMoeTalkerModel(
+        talker_model = Qwen3OmniMoeTalkerModel(
             config=config.text_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+        )
+        super().__init__(
+            config=config,
+            base_model=talker_model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            create_lm_head=False,
+            lm_head_name="codec_head",
         )
 
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
@@ -2383,7 +2386,7 @@ class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
         )
         self.dtype = dtype
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return x * self.scale.value.astype(self.dtype)
 
 
@@ -2422,7 +2425,7 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         gate = self.act_fn(self.gate_proj(hidden_states))
         up = self.up_proj(hidden_states)
         return self.down_proj(gate * up)
@@ -2496,10 +2499,10 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
+    ) -> Array:
         batch_size, seq_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -2594,10 +2597,10 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
+    ) -> Array:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_output = self.self_attn(hidden_states, attention_mask, position_ids)
@@ -2647,9 +2650,9 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
 
     def __call__(
         self,
-        inputs_embeds: chex.Array,
-        attention_mask: chex.Array | None = None,
-        position_ids: chex.Array | None = None,
+        inputs_embeds: Array,
+        attention_mask: Array | None = None,
+        position_ids: Array | None = None,
     ) -> BaseModelOutput:
         hidden_states = inputs_embeds
 
@@ -2902,6 +2905,9 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def get_embedding(self):
+        return self.embed_tokens
+
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3OmniMoeThinkerConfig, model_type="qwen3_omni_moe")
 class Qwen3OmniMoeModel(EasyDeLBaseModule):
@@ -2982,6 +2988,86 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        input_features: Float[Array, "batch mel_bins time"] | None = None,
+        audio_embeds: Array | None = None,
+        pixel_values: Float[Array, "num_patches channels h w"] | None = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        image_max_grid_size: int | None = None,
+        image_embeds: Array | None = None,
+        pixel_values_videos: Float[Array, "num_patches channels h w"] | None = None,
+        video_grid_thw: Int[Array, "num_videos 3"] | None = None,
+        video_max_grid_size: int | None = None,
+        video_embeds: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(super().compute_embedding(input_ids), "embeddings")
+
+        if input_ids is None and (
+            input_features is not None
+            or audio_embeds is not None
+            or pixel_values is not None
+            or image_embeds is not None
+            or pixel_values_videos is not None
+            or video_embeds is not None
+        ):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+
+        if audio_embeds is None and input_features is not None:
+            audio_outputs = self.audio(input_features)
+            audio_embeds = audio_outputs.last_hidden_state
+
+        if audio_embeds is not None:
+            if audio_embeds.ndim == 3:
+                audio_embeds = audio_embeds.reshape(-1, self.config.text_config.hidden_size)
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                audio_embeds.astype(inputs_embeds.dtype),
+                self.config.audio_token_id,
+            )
+
+        if image_embeds is None and pixel_values is not None:
+            if image_grid_thw is None:
+                raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
+            if image_max_grid_size is None:
+                image_max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
+            image_embeds = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
+
+        if image_embeds is not None:
+            if image_embeds.ndim > 2:
+                image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                image_embeds.astype(inputs_embeds.dtype),
+                self.config.image_token_id,
+            )
+
+        if video_embeds is None and pixel_values_videos is not None:
+            if video_grid_thw is None:
+                raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
+            if video_max_grid_size is None:
+                video_max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
+            video_embeds = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
+
+        if video_embeds is not None:
+            if video_embeds.ndim > 2:
+                video_embeds = video_embeds.reshape(-1, video_embeds.shape[-1])
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                video_embeds.astype(inputs_embeds.dtype),
+                self.config.video_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -2992,8 +3078,10 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         input_features: Float[Array, "batch mel_bins time"] | None = None,
         pixel_values: Float[Array, "num_patches channels h w"] | None = None,
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        image_max_grid_size: int | None = None,
         pixel_values_videos: Float[Array, "num_patches channels h w"] | None = None,
         video_grid_thw: Int[Array, "num_videos 3"] | None = None,
+        video_max_grid_size: int | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -3013,37 +3101,27 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        if inputs_embeds is None:
-            inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
 
-        if input_features is not None:
-            audio_outputs = self.audio(input_features)
-            audio_embeds = audio_outputs.last_hidden_state.reshape(-1, text_config.hidden_size)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                audio_embeds,
-                self.config.audio_token_id,
-            )
-
-        if pixel_values is not None:
-            max_grid = int(max(image_grid_thw[:, 1].max(), image_grid_thw[:, 2].max()))
-            vision_embeds = self.visual(pixel_values, image_grid_thw, max_grid)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                vision_embeds,
-                self.config.image_token_id,
-            )
-
-        if pixel_values_videos is not None:
-            max_grid = int(max(video_grid_thw[:, 1].max(), video_grid_thw[:, 2].max()))
-            video_embeds = self.visual(pixel_values_videos, video_grid_thw, max_grid)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                video_embeds,
-                self.config.video_token_id,
+        if (
+            inputs_embeds is None
+            or input_features is not None
+            or pixel_values is not None
+            or pixel_values_videos is not None
+        ):
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided to compute or merge multimodal embeddings.")
+            inputs_embeds = self.compute_embedding(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                input_features=input_features,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                image_max_grid_size=image_max_grid_size,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                video_max_grid_size=video_max_grid_size,
             )
 
         sequence_length = inputs_embeds.shape[1]
@@ -3124,7 +3202,9 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
     config=Qwen3OmniMoeThinkerConfig,
     model_type="qwen3_omni_moe_thinker",
 )
-class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
+class Qwen3OmniMoeThinkerForConditionalGeneration(
+    BaseVisionLanguageModule[Qwen3OmniMoeThinkerTextModel, Qwen3OmniMoeThinkerConfig]
+):
     """Qwen3OmniMoe Thinker for multimodal understanding (text output only).
 
     This is the Thinker component that handles:
@@ -3157,12 +3237,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
+        text_model = Qwen3OmniMoeThinkerTextModel(
+            config=config.text_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+        )
+        super().__init__(
+            config=config,
+            base_model=text_model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            image_token_index=config.image_token_id,
+            video_token_index=config.video_token_id,
+            spatial_merge_size=getattr(config.vision_config, "spatial_merge_size", 2),
+            create_lm_head=False,
         )
 
         self.audio_tower = Qwen3OmniMoeAudioEncoder(
@@ -3175,14 +3268,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
 
         self.visual = Qwen3OmniMoeVisionEncoder(
             config=config.vision_config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.model = Qwen3OmniMoeThinkerTextModel(
-            config=config.text_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -3211,6 +3296,86 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         """Property to access the audio encoder (alias for audio_tower)."""
         return self.audio_tower
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        input_features: Float[Array, "batch mel_bins time"] | None = None,
+        audio_embeds: Array | None = None,
+        pixel_values: Float[Array, "num_patches channels h w"] | None = None,
+        image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        image_max_grid_size: int | None = None,
+        image_embeds: Array | None = None,
+        pixel_values_videos: Float[Array, "num_patches channels h w"] | None = None,
+        video_grid_thw: Int[Array, "num_videos 3"] | None = None,
+        video_max_grid_size: int | None = None,
+        video_embeds: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if inputs_embeds is None:
+            inputs_embeds = checkpoint_name(self.model.compute_embedding(input_ids), "embeddings")
+
+        if input_ids is None and (
+            input_features is not None
+            or audio_embeds is not None
+            or pixel_values is not None
+            or image_embeds is not None
+            or pixel_values_videos is not None
+            or video_embeds is not None
+        ):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+
+        if audio_embeds is None and input_features is not None:
+            audio_outputs = self.audio_tower(input_features)
+            audio_embeds = audio_outputs.last_hidden_state
+
+        if audio_embeds is not None:
+            if audio_embeds.ndim == 3:
+                audio_embeds = audio_embeds.reshape(-1, self.config.text_config.hidden_size)
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                audio_embeds.astype(inputs_embeds.dtype),
+                self.audio_token_id,
+            )
+
+        if image_embeds is None and pixel_values is not None:
+            if image_grid_thw is None:
+                raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
+            if image_max_grid_size is None:
+                image_max_grid_size = int(jnp.max(image_grid_thw[:, 1:]).item())
+            image_embeds = self.visual(pixel_values, image_grid_thw, image_max_grid_size)
+
+        if image_embeds is not None:
+            if image_embeds.ndim > 2:
+                image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                image_embeds.astype(inputs_embeds.dtype),
+                self.image_token_id,
+            )
+
+        if video_embeds is None and pixel_values_videos is not None:
+            if video_grid_thw is None:
+                raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
+            if video_max_grid_size is None:
+                video_max_grid_size = int(jnp.max(video_grid_thw[:, 1:]).item())
+            video_embeds = self.visual(pixel_values_videos, video_grid_thw, video_max_grid_size)
+
+        if video_embeds is not None:
+            if video_embeds.ndim > 2:
+                video_embeds = video_embeds.reshape(-1, video_embeds.shape[-1])
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                video_embeds.astype(inputs_embeds.dtype),
+                self.video_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -3221,8 +3386,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         input_features: Float[Array, "batch mel_bins time"] | None = None,
         pixel_values: Float[Array, "num_patches channels h w"] | None = None,
         image_grid_thw: Int[Array, "num_images 3"] | None = None,
+        image_max_grid_size: int | None = None,
         pixel_values_videos: Float[Array, "num_patches channels h w"] | None = None,
         video_grid_thw: Int[Array, "num_videos 3"] | None = None,
+        video_max_grid_size: int | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -3231,39 +3398,27 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        text_config = self.config.text_config
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
 
-        if inputs_embeds is None:
-            inputs_embeds = checkpoint_name(self.model.embed_tokens(input_ids.astype("i4")), "embeddings")
-
-        if input_features is not None:
-            audio_outputs = self.audio_tower(input_features)
-            audio_embeds = audio_outputs.last_hidden_state.reshape(-1, text_config.hidden_size)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                audio_embeds,
-                self.audio_token_id,
-            )
-
-        if pixel_values is not None:
-            max_grid = int(max(image_grid_thw[:, 1].max(), image_grid_thw[:, 2].max()))
-            vision_embeds = self.visual(pixel_values, image_grid_thw, max_grid)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                vision_embeds,
-                self.image_token_id,
-            )
-
-        if pixel_values_videos is not None:
-            max_grid = int(max(video_grid_thw[:, 1].max(), video_grid_thw[:, 2].max()))
-            video_embeds = self.visual(pixel_values_videos, video_grid_thw, max_grid)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                video_embeds,
-                self.video_token_id,
+        if (
+            inputs_embeds is None
+            or input_features is not None
+            or pixel_values is not None
+            or pixel_values_videos is not None
+        ):
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided to compute or merge multimodal embeddings.")
+            inputs_embeds = self.compute_embedding(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                input_features=input_features,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                image_max_grid_size=image_max_grid_size,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+                video_max_grid_size=video_max_grid_size,
             )
 
         outputs = self.model(
@@ -3294,7 +3449,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        raise NotImplementedError("This is a decoder-only model.")
+        return self.visual
 
     def get_decoder(self):
         return self.model
@@ -3310,6 +3465,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
 
     def get_lm_head(self):
         return self.lm_head
+
+    def get_vision_tower(self) -> nn.Module:
+        return self.visual
+
+    def get_language_model(self) -> nn.Module:
+        return self.model
 
     def get_image_features(
         self,
@@ -3372,7 +3533,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(EasyDeLBaseModule):
 
 
 @register_module(TaskType.ANY_TO_ANY, config=Qwen3OmniMoeConfig, model_type="qwen3_omni_moe")
-class Qwen3OmniMoeForConditionalGeneration(EasyDeLBaseModule):
+class Qwen3OmniMoeForConditionalGeneration(
+    BaseConditionalGenerationModule[Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeConfig]
+):
     """Full Qwen3OmniMoe model with Thinker, Talker, and Code2Wav.
 
     This is the top-level model that combines:
@@ -3402,20 +3565,22 @@ class Qwen3OmniMoeForConditionalGeneration(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-
-        self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
+        thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config=config.thinker_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+        )
+        super().__init__(
+            config=config,
+            base_model=thinker,
+            base_model_name="thinker",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            create_lm_head=False,
         )
 
         self.has_talker = config.enable_audio_output
@@ -3444,6 +3609,9 @@ class Qwen3OmniMoeForConditionalGeneration(EasyDeLBaseModule):
     def audio(self):
         """Property to access the audio encoder."""
         return self.thinker.audio
+
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.thinker.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
         self,

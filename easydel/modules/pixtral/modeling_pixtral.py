@@ -15,7 +15,6 @@
 
 import functools
 
-import chex
 import jax.lax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -40,12 +39,12 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     """Generates position IDs based on a meshgrid for a list of patch embeddings.
 
     Args:
-        patch_embeds_list (list[chex.Array]): A list of patch embeddings, where each element
+        patch_embeds_list (list[Array]): A list of patch embeddings, where each element
             has shape (..., height, width).
         max_width (int): The maximum width across all patches, used for calculating the linear index.
 
     Returns:
-        chex.Array: A 1D array of position IDs corresponding to the flattened patches.
+        Array: A 1D array of position IDs corresponding to the flattened patches.
     """
     positions = []
     for patch in patch_embeds_list:
@@ -66,11 +65,11 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
 
     Args:
         patch_embeds_list (list[int]): A list containing the number of patches for each image.
-        tensor (chex.Array): The input tensor (e.g., hidden states) with shape
+        tensor (Array): The input tensor (e.g., hidden states) with shape
             (batch_size, sequence_length, ...).
 
     Returns:
-        chex.Array: A block-diagonal attention mask of shape
+        Array: A block-diagonal attention mask of shape
             (batch_size, 1, sequence_length, sequence_length).
             The mask contains 0.0 for allowed attention positions and a large negative number
             (minimum float value) for masked positions.
@@ -368,14 +367,14 @@ class PixtralAttention(AttentionModule):
         """Forward pass of the PixtralAttention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
+            tp.Union[tp.Tuple[Array, Array], tp.Tuple[Array]]:
                 A tuple containing the attention output hidden states. If `output_attentions` is True,
                 it also includes the attention weights.
         """
@@ -544,14 +543,14 @@ class PixtralBlock(nn.Module):
         """Forward pass of the PixtralBlock module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+            tp.Tuple[Array, tp.Optional[Array]]:
                 A tuple containing the output hidden states and optionally the attention weights.
         """
         residual = hidden_states
@@ -633,7 +632,7 @@ class PixtralTransformer(nn.Module):
     def __call__(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
-        position_embeddings: chex.Array | None = None,
+        position_embeddings: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -643,11 +642,11 @@ class PixtralTransformer(nn.Module):
         """Forward pass of the PixtralTransformer module.
 
         Args:
-            inputs_embeds (chex.Array): Input patch embeddings.
-            position_embeddings (tp.Optional[chex.Array]): Precomputed position embeddings (unused in standard RoPE).
-            attention_mask (tp.Optional[chex.Array]): Mask to apply on the attention scores.
+            inputs_embeds (Array): Input patch embeddings.
+            position_embeddings (tp.Optional[Array]): Precomputed position embeddings (unused in standard RoPE).
+            attention_mask (tp.Optional[Array]): Mask to apply on the attention scores.
                 Shape: (batch_size, 1, query_length, key_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
@@ -786,7 +785,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: list[chex.Array],
+        pixel_values: list[Array],
         output_hidden_states: bool | None = False,
         output_attentions: bool | None = None,
         *args,
@@ -798,7 +797,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
         Handles multiple images by concatenating their patch embeddings and applying a block-diagonal attention mask.
 
         Args:
-            pixel_values (tp.List[chex.Array]): A list of input images, where each image is a tensor of shape
+            pixel_values (tp.List[Array]): A list of input images, where each image is a tensor of shape
                 (batch_size, num_channels, height, width).
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
                 Defaults to `config.output_hidden_states`.

@@ -18,6 +18,10 @@ SSM1 (Mamba1-style) Selective State Space operation for EasyDeL.
 This module provides the SSM1 operation, implementing the original Mamba
 selective state space model architecture used by Mamba and FalconMamba.
 
+This implementation delegates to ejKernel's optimized state_space_v1 kernel
+for the core SSM computation, providing automatic platform selection and
+optimization.
+
 Key characteristics of SSM1:
 - 2D A matrix: [intermediate_size, ssm_state_size]
 - SSM state shape: [batch, intermediate_size, ssm_state_size]
@@ -42,7 +46,7 @@ References:
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
-from jax import lax
+from ejkernel.modules import state_space_v1
 from jaxtyping import Array, Float
 
 from easydel.layers.caching import RecurrentCacheView
@@ -71,130 +75,6 @@ class SSM1Output(AttentionOutput):
 
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None
     ssm_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None
-
-
-def _ssm1_recurrent_scan(
-    hidden_states: Float[Array, "batch intermediate_size seq_len"],
-    discrete_A: Float[Array, "batch intermediate_size seq_len ssm_state_size"],
-    discrete_B: Float[Array, "batch intermediate_size seq_len ssm_state_size"],
-    C: Float[Array, "batch seq_len ssm_state_size"],
-    D: Float[Array, "intermediate_size"],  # noqa:F821
-    initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
-    dtype: jnp.dtype = jnp.float32,
-) -> tuple[
-    Float[Array, "batch intermediate_size seq_len"],
-    Float[Array, "batch intermediate_size ssm_state_size"],
-]:
-    """Recurrent scan for SSM1.
-
-    Implements the selective state space recurrence:
-        h_t = dA_t * h_{t-1} + dB_t * x_t
-        y_t = h_t @ C_t + D * x_t
-
-    Args:
-        hidden_states: Input after convolution [batch, d, seq_len]
-        discrete_A: Discretized A [batch, d, seq_len, n]
-        discrete_B: Discretized B [batch, d, seq_len, n]
-        C: Output projection [batch, seq_len, n]
-        D: Skip connection [d]
-        initial_state: Initial SSM state
-        dtype: Computation dtype
-
-    Returns:
-        Tuple of (outputs, final_state)
-    """
-    batch_size, intermediate_size, _seq_len = hidden_states.shape
-    ssm_state_size = discrete_B.shape[-1]
-
-    if initial_state is None:
-        initial_state = jnp.zeros(
-            (batch_size, intermediate_size, ssm_state_size),
-            dtype=dtype,
-        )
-
-    # Compute deltaB_u = discrete_B * hidden_states
-    # [batch, d, seq_len, n] * [batch, d, seq_len, 1] -> [batch, d, seq_len, n]
-    deltaB_u = discrete_B * hidden_states[:, :, :, None].astype(jnp.float32)
-
-    def _step(ssm_state, step_inputs):
-        dA_t, dBu_t, C_t = step_inputs
-        # State update: h_t = dA_t * h_{t-1} + dB_t * x_t
-        # Compute in float32 for numerical stability, then cast back to state dtype
-        new_state = (dA_t * ssm_state.astype(jnp.float32) + dBu_t).astype(ssm_state.dtype)
-        # Output: y_t = h_t @ C_t
-        y_t = lax.batch_matmul(
-            new_state.astype(dtype),
-            jnp.expand_dims(C_t.astype(dtype), -1),
-        )[:, :, 0]
-        return new_state, y_t
-
-    # Transpose for scan: [seq_len, batch, d, n]
-    scan_inputs = (
-        jnp.transpose(discrete_A, (2, 0, 1, 3)),
-        jnp.transpose(deltaB_u, (2, 0, 1, 3)),
-        jnp.transpose(C, (1, 0, 2)),
-    )
-
-    final_state, y = lax.scan(_step, initial_state, scan_inputs)
-
-    # Transpose back: [batch, d, seq_len]
-    y = jnp.transpose(y, (1, 2, 0))
-
-    # Add skip connection
-    y = y + hidden_states * D[None, :, None]
-
-    return y, final_state
-
-
-def _ssm1_single_step(
-    hidden_state: Float[Array, "batch intermediate_size"],
-    B: Float[Array, "batch ssm_state_size"],
-    C: Float[Array, "batch ssm_state_size"],
-    discrete_time_step: Float[Array, "batch intermediate_size"],
-    A: Float[Array, "intermediate_size ssm_state_size"],
-    D: Float[Array, "intermediate_size"],  # noqa:F821
-    ssm_state: Float[Array, "batch intermediate_size ssm_state_size"],
-    dtype: jnp.dtype = jnp.float32,
-) -> tuple[
-    Float[Array, "batch intermediate_size"],
-    Float[Array, "batch intermediate_size ssm_state_size"],
-]:
-    """Single step SSM1 update for inference.
-
-    Args:
-        hidden_state: Current input [batch, d]
-        B: B parameter [batch, n]
-        C: C parameter [batch, n]
-        discrete_time_step: dt [batch, d]
-        A: A matrix [d, n]
-        D: Skip connection [d]
-        ssm_state: Previous state [batch, d, n]
-        dtype: Computation dtype
-
-    Returns:
-        Tuple of (output, new_state)
-    """
-    # Discretization
-    # dA = exp(A * dt)
-    discrete_A = jnp.exp(A[None, :, :] * discrete_time_step[:, :, None])  # [batch, d, n]
-
-    # dB = dt * B
-    discrete_B = discrete_time_step[:, :, None] * B[:, None, :].astype(jnp.float32)  # [batch, d, n]
-
-    # State update - compute in float32 for stability, cast back to input dtype
-    deltaB_u = discrete_B * hidden_state[:, :, None].astype(jnp.float32)
-    new_state = (discrete_A * ssm_state.astype(jnp.float32) + deltaB_u).astype(ssm_state.dtype)
-
-    # Output
-    y = lax.batch_matmul(
-        new_state.astype(dtype),
-        jnp.expand_dims(C.astype(dtype), -1),
-    )[:, :, 0]
-
-    # Skip connection
-    y = y + hidden_state * D[None, :]
-
-    return y, new_state
 
 
 @OperationRegistry.register
@@ -259,7 +139,7 @@ class SSM1Op(OperationImpl):
             .build()
         )
 
-    @jax.named_scope("easydel-ssm1-native")
+    @jax.named_scope("easydel-ssm1-ejkernel")
     def forward_native(
         self,
         hidden_states: Float[Array, "batch seq_len intermediate_size"],
@@ -274,7 +154,11 @@ class SSM1Op(OperationImpl):
         activation: str = "silu",
         **kwargs,
     ) -> SSM1Output:
-        """Forward pass for SSM1 operation.
+        """Forward pass for SSM1 operation using ejKernel.
+
+        Delegates to ejkernel.modules.operations.state_space_v1 for the core
+        SSM computation, which provides optimized implementations with automatic
+        platform selection.
 
         Args:
             hidden_states: Input after conv and activation [batch, seq_len, d]
@@ -293,68 +177,33 @@ class SSM1Op(OperationImpl):
         """
         from easydel.infra.utils import ACT2FN
 
-        _batch_size, seq_len, _intermediate_size = hidden_states.shape
-        _ssm_state_size = B.shape[-1]
         dtype = hidden_states.dtype
-        runtime_dtype = self.metadata.runtime_dtype
 
-        # Convert A from log form
+        # Convert A from log form to real form (negative for stability)
         A_real = -jnp.exp(A.astype(jnp.float32))
 
-        # Transpose for [batch, d, seq_len] format
-        hidden_states_t = jnp.transpose(hidden_states, (0, 2, 1))
-        discrete_time_step_t = jnp.transpose(discrete_time_step, (0, 2, 1))
+        # Get activation function
+        act_fn = ACT2FN.get(activation, jax.nn.silu) if gate is not None else None
 
-        is_inference = seq_len == 1 and ssm_state is not None
-
-        if is_inference:
-            # Single step inference
-            y, new_ssm_state = _ssm1_single_step(
-                hidden_state=hidden_states_t[:, :, 0],
-                B=B[:, 0, :],
-                C=C[:, 0, :],
-                discrete_time_step=discrete_time_step_t[:, :, 0],
-                A=A_real,
-                D=D,
-                ssm_state=ssm_state,
-                dtype=runtime_dtype,
-            )
-            y = y[:, :, None]  # [batch, d, 1]
-        else:
-            # Full sequence processing
-            # Discretization
-            # dA = exp(A * dt) where A is [d, n] and dt is [batch, d, seq_len]
-            discrete_A = jnp.exp(
-                A_real[None, :, None, :] * discrete_time_step_t[:, :, :, None]
-            )  # [batch, d, seq_len, n]
-
-            # dB = dt * B
-            discrete_B = discrete_time_step_t[:, :, :, None] * B[:, None, :, :].astype(
-                jnp.float32
-            )  # [batch, d, seq_len, n]
-
-            y, new_ssm_state = _ssm1_recurrent_scan(
-                hidden_states=hidden_states_t.astype(jnp.float32),
-                discrete_A=discrete_A,
-                discrete_B=discrete_B,
-                C=C,
-                D=D,
-                initial_state=ssm_state,
-                dtype=runtime_dtype,
-            )
-
-        # Transpose back to [batch, seq_len, d]
-        y = jnp.transpose(y, (0, 2, 1))
-
-        # Apply gating
-        if gate is not None:
-            act_fn = ACT2FN.get(activation, jax.nn.silu)
-            y = y * act_fn(gate)
+        # Call ejKernel's state_space_v1
+        # It handles both training (full sequence) and inference (single step) modes
+        y, new_ssm_state, new_conv_state = state_space_v1(
+            hidden_states,
+            A_real,
+            B,
+            C,
+            D,
+            discrete_time_step,
+            gate=gate,
+            initial_state=ssm_state,
+            conv_state=conv_state,
+            act_fn=act_fn,
+        )
 
         return SSM1Output(
             attention_outputs=y.astype(dtype),
             attention_weights=None,
-            conv_state=conv_state,
+            conv_state=new_conv_state,
             ssm_state=new_ssm_state.astype(dtype),
         )
 

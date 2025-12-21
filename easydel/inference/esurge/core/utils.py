@@ -311,6 +311,22 @@ def hash_request_tokens(hash_function: Any, page_size: int, request: EngineReque
     token_ids = request.all_token_ids
 
     req_extra_keys = None
+    # Vision-language models: KV prefix caching must include multimodal content.
+    #
+    # For many VLMs the prompt `token_ids` can be identical across different
+    # images/videos (e.g. `<image>` placeholders expand to a fixed count based
+    # on resolution bucket), while the actual KV state depends on the vision
+    # inputs. If we don't include a multimodal key here, prefix caching may
+    # incorrectly reuse a KV prefix computed for a different image, causing the
+    # model to "see" the wrong picture.
+    mm_features = getattr(request, "mm_features", None)
+    if getattr(request, "has_vision", False) and mm_features:
+        try:
+            req_extra_keys = tuple(
+                (str(getattr(feat, "modality", "mm")), str(getattr(feat, "mm_hash", ""))) for feat in mm_features
+            )
+        except Exception:
+            req_extra_keys = ("multimodal",)
 
     ret = []
     parent_page_hash_value = None

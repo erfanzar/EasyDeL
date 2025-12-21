@@ -225,10 +225,7 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
             (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"(input_layernorm|post_attention_layernorm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r"(input_layernorm|post_attention_layernorm)/kernel", pmag.resolve(Replicated)),
             (r"norm/kernel", pmag.resolve(Replicated)),
             (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
             (r"attn/qkv/kernel", pmag.resolve(ColumnWise)),

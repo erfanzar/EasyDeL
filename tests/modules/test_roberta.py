@@ -23,7 +23,9 @@ class TestRoBERTa:
             num_hidden_layers=small_model_config["num_hidden_layers"],
             num_attention_heads=small_model_config["num_attention_heads"],
             intermediate_size=small_model_config["intermediate_size"],
-            max_position_embeddings=small_model_config["max_position_embeddings"],
+            # RoBERTa uses a position embedding offset (padding_idx + 1),
+            # so max_position_embeddings must be >= sequence_length + 2.
+            max_position_embeddings=small_model_config["max_position_embeddings"] + 2,
         )
 
     def test_base_module(self, roberta_config, small_model_config):

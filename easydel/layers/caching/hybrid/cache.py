@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import typing as tp
 
-import chex
 from eformer import escale as es
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
@@ -1120,7 +1119,7 @@ class HybridCache(BaseCache):
         new_views[layer_idx] = view
         return self.replace(views=new_views)
 
-    def get_cache_position(self) -> chex.Array:
+    def get_cache_position(self) -> Array:
         """Get the current cache position (number of tokens cached).
 
         Returns:

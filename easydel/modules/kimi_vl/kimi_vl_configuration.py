@@ -68,26 +68,21 @@ class MoonViTConfig(EasyDeLBaseConfig):
         """
         pmag = self.partition_manager
         return (
-            # Patch embedding
             (r"patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
             (r"patch_embed/proj/bias", pmag.resolve(Replicated)),
             (r"patch_embed/pos_emb/kernel", pmag.resolve(Replicated)),
-            # Encoder attention layers
             (r"blocks/\d+/wqkv/kernel", pmag.resolve(ColumnWise)),
             (r"blocks/\d+/wqkv/bias", pmag.resolve(Replicated)),
             (r"blocks/\d+/wo/kernel", pmag.resolve(RowWise)),
             (r"blocks/\d+/wo/bias", pmag.resolve(Replicated)),
-            # Encoder MLP layers
             (r"blocks/\d+/mlp/fc0/kernel", pmag.resolve(ColumnWise)),
             (r"blocks/\d+/mlp/fc0/bias", pmag.resolve(Replicated)),
             (r"blocks/\d+/mlp/fc1/kernel", pmag.resolve(RowWise)),
             (r"blocks/\d+/mlp/fc1/bias", pmag.resolve(Replicated)),
-            # Layer norms
             (r"blocks/\d+/(norm0|norm1)/scale", pmag.resolve(Replicated)),
             (r"blocks/\d+/(norm0|norm1)/bias", pmag.resolve(Replicated)),
             (r"final_layernorm/scale", pmag.resolve(Replicated)),
             (r"final_layernorm/bias", pmag.resolve(Replicated)),
-            # Catch-all for biases and other params
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )
@@ -148,8 +143,6 @@ class KimiVLConfig(EasyDeLBaseConfig):
             Tuple of partition rules for distributing all model parameters.
         """
         pmag = self.partition_manager
-
-        # Get rules from sub-configs
         tp_rules = (
             self.text_config.get_partition_rules(*args, **kwargs)
             if hasattr(self.text_config, "get_partition_rules")
@@ -160,12 +153,8 @@ class KimiVLConfig(EasyDeLBaseConfig):
             if hasattr(self.vision_config, "get_partition_rules")
             else ()
         )
-
-        # Multi-modal projector rules
         projector_rules = (
-            # Vision tower components
             (r"vision_tower/.*", pmag.resolve(Replicated)),
-            # Multi-modal projector
             (r"multi_modal_projector/pre_norm/scale", pmag.resolve(Replicated)),
             (r"multi_modal_projector/pre_norm/bias", pmag.resolve(Replicated)),
             (r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
@@ -173,7 +162,6 @@ class KimiVLConfig(EasyDeLBaseConfig):
             (r"multi_modal_projector/linear_2/kernel", pmag.resolve(RowWise)),
             (r"multi_modal_projector/linear_2/bias", pmag.resolve(Replicated)),
         )
-
         return projector_rules + tp_rules + vp_rules
 
 

@@ -224,10 +224,37 @@ class ModelStepExecutor:
                             video_grid_thw=metadata.video_grid_thw,
                         )
                     )
+                if metadata.deepstack_visual_embeds is not None:
+                    if metadata.visual_pos_masks is None:
+                        raise ValueError("`visual_pos_masks` must be provided when `deepstack_visual_embeds` is set.")
+                    external_inputs.update(
+                        dict(
+                            visual_pos_masks=jnp.expand_dims(metadata.visual_pos_masks, 0),
+                            deepstack_visual_embeds=list(metadata.deepstack_visual_embeds),
+                        )
+                    )
+
+                use_prefill_embeds = metadata.prefill_embeds is not None and metadata.prefill_embeds_mask is not None
+                use_mrope = metadata.mrope_position_ids is not None
+
+                if use_mrope:
+                    position_ids = jnp.expand_dims(metadata.mrope_position_ids, 1)
+                else:
+                    position_ids = jnp.expand_dims(position_ids_view, 0)
+
+                model_inputs: dict[str, tp.Any]
+                if use_prefill_embeds:
+                    base_embeds = model.compute_embedding(jnp.expand_dims(input_ids_view, 0))
+                    override = jnp.expand_dims(metadata.prefill_embeds, 0).astype(base_embeds.dtype)
+                    mask = jnp.expand_dims(metadata.prefill_embeds_mask, 0)[..., None]
+                    inputs_embeds = jnp.where(mask, override, base_embeds)
+                    model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
+                else:
+                    model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
 
                 output = model(
-                    input_ids=jnp.expand_dims(input_ids_view, 0),
-                    position_ids=jnp.expand_dims(position_ids_view, 0),
+                    **model_inputs,
+                    position_ids=position_ids,
                     past_key_values=kv_pages,
                     cache_metadata=cache_metadata,
                     apply_lm_head=False,

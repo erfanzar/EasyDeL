@@ -14,8 +14,9 @@
 
 
 import math
+import typing as tp
+from functools import partial
 
-import chex
 import jax.lax
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
@@ -27,6 +28,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ArrayParam
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
@@ -38,26 +40,35 @@ from .rwkv_configuration import RwkvConfig as RwkvConfig
 class RwkvOutput(ModelOutput):
     """Output type for RWKV model."""
 
-    last_hidden_state: chex.Array = None
-    state: tuple[chex.Array, ...] | None = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    last_hidden_state: Array = None
+    state: tuple[Array, ...] | None = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
 @auto_pytree
 class RwkvCausalLMOutput(ModelOutput):
     """Output type for RWKV causal language model."""
 
-    logits: chex.Array = None
-    state: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    loss: Array | None = None
+    logits: Array = None
+    state: list[Array] | None = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
-def init_state(hidden_size):
-    """Create zeroed RWKV recurrent state tensors for a given hidden size."""
-    zeros = jnp.zeros(hidden_size)
-    min_values = jnp.full(hidden_size, -jnp.inf)
+def init_state(hidden_size: int, batch_size: int | None = None):
+    """Create zeroed RWKV recurrent state tensors for a given hidden size.
+
+    RWKV is recurrent over the sequence dimension but can be vectorized over the batch
+    dimension. When `batch_size` is provided, the state tensors include the batch axis.
+    """
+    if batch_size is None:
+        zeros = jnp.zeros((hidden_size,))
+        min_values = jnp.full((hidden_size,), -1e38, dtype=jnp.float32)
+    else:
+        zeros = jnp.zeros((batch_size, hidden_size))
+        min_values = jnp.full((batch_size, hidden_size), -1e38, dtype=jnp.float32)
     time_mix_state = (zeros, zeros, zeros, min_values)
     channel_mix_state = zeros
     return time_mix_state, channel_mix_state
@@ -134,10 +145,10 @@ class RwkvSelfAttention(nn.Module):
 
         ratio_0_to_1 = layer_id / (num_hidden_layers - 1)
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
-        zigzag = 0.5 * (jnp.arange(1, hidden_size + 1) % 3 - 1)
-        time_first = jnp.full(hidden_size, math.log(0.3)) + zigzag
-        h = jnp.arange(0, hidden_size)
-        time_decay = -5 + 8 * (h / (hidden_size - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
+        zigzag = 0.5 * (jnp.arange(1, attention_hidden_size + 1) % 3 - 1)
+        time_first = jnp.full((attention_hidden_size,), math.log(0.3), dtype=jnp.float32) + zigzag.astype(jnp.float32)
+        h = jnp.arange(attention_hidden_size, dtype=jnp.float32)
+        time_decay = -5 + 8 * (h / (attention_hidden_size - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
         x = jnp.arange(hidden_size) / hidden_size
 
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
@@ -146,17 +157,17 @@ class RwkvSelfAttention(nn.Module):
 
         self.time_decay = ArrayParam.bound(
             shape=time_decay.shape,
-            dtype=self.param_dtype,
+            dtype=jnp.float32,
             init_method="zeros",
             key=None,
-            value=time_decay.astype(self.param_dtype),
+            value=time_decay.astype(jnp.float32),
         )
         self.time_first = ArrayParam.bound(
             shape=time_first.shape,
-            dtype=self.param_dtype,
+            dtype=jnp.float32,
             init_method="zeros",
             key=None,
-            value=time_first.astype(self.param_dtype),
+            value=time_first.astype(jnp.float32),
         )
         self.time_mix_key = ArrayParam.bound(
             shape=time_mix_key.shape,
@@ -219,16 +230,20 @@ class RwkvSelfAttention(nn.Module):
 
     def __call__(
         self,
-        hidden: chex.Array,
-        state: tuple[chex.Array, chex.Array, chex.Array, chex.Array],
+        hidden: Array,
+        state: tuple[Array, Array, Array, Array],
     ):
         sx, aa, bb, pp = state
+        # `hidden` is (batch, seq, hidden) during training/testing.
         c_x = jnp.concatenate(
-            (jnp.expand_dims(sx, 0), hidden[:-1, :]),
+            (jnp.expand_dims(sx, 1), hidden[:, :-1, :]),
+            axis=1,
         )
-        key_x = hidden * self.time_mix_key.reshape(-1) + c_x * (1 - self.time_mix_key.reshape(-1))
-        value_x = hidden * self.time_mix_value.reshape(-1) + c_x * (1 - self.time_mix_value.reshape(-1))
-        receptance_x = hidden * self.time_mix_receptance.reshape(-1) + c_x * (1 - self.time_mix_receptance.reshape(-1))
+        key_x = hidden * self.time_mix_key.reshape(1, 1, -1) + c_x * (1 - self.time_mix_key.reshape(1, 1, -1))
+        value_x = hidden * self.time_mix_value.reshape(1, 1, -1) + c_x * (1 - self.time_mix_value.reshape(1, 1, -1))
+        receptance_x = hidden * self.time_mix_receptance.reshape(1, 1, -1) + c_x * (
+            1 - self.time_mix_receptance.reshape(1, 1, -1)
+        )
         receptance_state = checkpoint_name(nn.sigmoid(self.receptance(receptance_x)), "attn_receptance")
         key_states = checkpoint_name(self.key(key_x), "attn_key")
         value_states = checkpoint_name(self.value(value_x), "attn_value")
@@ -251,9 +266,13 @@ class RwkvSelfAttention(nn.Module):
             next_inner_state = (inner_aa, inner_bb, inner_p)
             return next_inner_state, next_c_x
 
-        (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), (key_states, value_states))
-        out = checkpoint_name(hidden + self.output(receptance_state * c_x), "attn_output")
-        next_state = (hidden[-1, :], aa, bb, pp)
+        # Scan over the sequence axis (time), keeping batch dimension in the carry.
+        xs = (jnp.swapaxes(key_states, 0, 1), jnp.swapaxes(value_states, 0, 1))
+        (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), xs)
+        c_x = jnp.swapaxes(c_x, 0, 1)
+
+        out = checkpoint_name(self.output(receptance_state * c_x), "attn_output")
+        next_state = (hidden[:, -1, :], aa, bb, pp)
         return out, next_state
 
 
@@ -285,7 +304,8 @@ class RwkvFeedForward(nn.Module):
 
         ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
         time_mix_key = jnp.power(x, ratio_1_to_almost_0)
-        time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
+        # HF reference uses the same exponent for key + receptance in the channel-mix block.
+        time_mix_receptance = jnp.power(x, ratio_1_to_almost_0)
         self.time_mix_key = ArrayParam.bound(
             shape=time_mix_key.shape,
             dtype=self.param_dtype,
@@ -311,7 +331,7 @@ class RwkvFeedForward(nn.Module):
             rngs=rngs,
         )
         self.receptance = RowParallelLinear(
-            intermediate_size,
+            hidden_size,
             hidden_size,
             use_bias=False,
             dtype=dtype,
@@ -330,12 +350,12 @@ class RwkvFeedForward(nn.Module):
         )
 
     def __call__(self, hidden, state):
-        sx = jnp.concatenate((jnp.expand_dims(state, 0), hidden[:-1, :]))
-        xk = hidden * self.time_mix_key.reshape(-1) + sx * (1 - self.time_mix_key.reshape(-1))
-        xr = hidden * self.time_mix_receptance.reshape(-1) + sx * (1 - self.time_mix_receptance.reshape(-1))
+        sx = jnp.concatenate((jnp.expand_dims(state, 1), hidden[:, :-1, :]), axis=1)
+        xk = hidden * self.time_mix_key.reshape(1, 1, -1) + sx * (1 - self.time_mix_key.reshape(1, 1, -1))
+        xr = hidden * self.time_mix_receptance.reshape(1, 1, -1) + sx * (1 - self.time_mix_receptance.reshape(1, 1, -1))
         r = checkpoint_name(nn.sigmoid(self.receptance(xr)), "mlp_gate")
         k = checkpoint_name(jnp.square(nn.relu(self.key(xk))), "mlp_up")
-        return checkpoint_name(r * self.value(k), "mlp_output"), hidden[-1, :]
+        return checkpoint_name(r * self.value(k), "mlp_output"), hidden[:, -1, :]
 
 
 class SingleStandRwkvBlock(nn.Module):
@@ -398,11 +418,21 @@ class SingleStandRwkvBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden, state=None, output_attentions: bool = False):
+    def __call__(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False):
+        uses_global_state = isinstance(state, list)
         if state is None:
-            state = init_state(self.config.hidden_size)
+            state = init_state(self.config.hidden_size, batch_size=hidden.shape[0])
 
-        self_state, ffd_state = state
+        if uses_global_state:
+            ffd_state = state[0][:, :, self.layer_id]
+            self_state = (
+                state[1][:, :, self.layer_id],
+                state[2][:, :, self.layer_id],
+                state[3][:, :, self.layer_id],
+                state[4][:, :, self.layer_id],
+            )
+        else:
+            self_state, ffd_state = state
         if self.layer_id == 0:
             hidden = self.pre_ln(hidden)
 
@@ -415,7 +445,15 @@ class SingleStandRwkvBlock(nn.Module):
         feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
         hidden = checkpoint_name(hidden + feed_forward, "layer_output")
 
-        outputs = (hidden, (self_state, ffd_state))
+        if uses_global_state:
+            state[0] = state[0].at[:, :, self.layer_id].set(ffd_state)
+            state[1] = state[1].at[:, :, self.layer_id].set(self_state[0])
+            state[2] = state[2].at[:, :, self.layer_id].set(self_state[1])
+            state[3] = state[3].at[:, :, self.layer_id].set(self_state[2])
+            state[4] = state[4].at[:, :, self.layer_id].set(self_state[3])
+            outputs = (hidden, state)
+        else:
+            outputs = (hidden, (self_state, ffd_state))
         if output_attentions:
             outputs += (attention,)
         else:
@@ -442,6 +480,8 @@ class RwkvModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        dtype = jnp.float32
+        param_dtype = jnp.float32
         super().__init__(
             config=config,
             dtype=dtype,
@@ -482,7 +522,7 @@ class RwkvModel(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        state: list[chex.Array] | None = None,
+        state: list[Array] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -491,7 +531,7 @@ class RwkvModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.deterministic else False)
+        use_cache = use_cache if use_cache is not None else (self.config.use_cache if self.deterministic else False)
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -508,10 +548,7 @@ class RwkvModel(EasyDeLBaseModule):
                 self.config.num_hidden_layers,
             )
             state = [
-                jnp.zeros(
-                    *shape,
-                    dtype=inputs_embeds.dtype if i <= 1 else jnp.float32,
-                )
+                jnp.zeros(shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32)
                 for i in range(5)
             ]
             state[4] -= 1e30
@@ -522,7 +559,12 @@ class RwkvModel(EasyDeLBaseModule):
         all_self_attentions = ()
 
         for idx, block in enumerate(self.blocks):
-            hidden_states, state, attentions = block(hidden_states, state=state, output_attentions=output_attentions)
+            hidden_states, state, attentions = block(
+                hidden_states,
+                state=state,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
 
             if self.layers_are_rescaled and self.config.rescale_every > 0 and (idx + 1) % self.config.rescale_every == 0:
                 hidden_states = hidden_states / 2
@@ -555,8 +597,12 @@ class RwkvModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
-class RwkvForCausalLM(EasyDeLBaseModule):
+class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
     """RWKV model with language modeling head for causal generation."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "rwkv"
+    _config_class = RwkvConfig
 
     def __init__(
         self,
@@ -567,39 +613,99 @@ class RwkvForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        dtype = jnp.float32
+        param_dtype = jnp.float32
         super().__init__(
             config=config,
+            base_model_class=RwkvModel,
+            base_model_name="rwkv",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+            lm_head_name="head",
+            lm_head_bias=False,
         )
-        self.rwkv = RwkvModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+
+    @property
+    def transform_fn(self):
+        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
+
+        def _keep_fp32(array: Array, key: tuple):
+            if key and key[-1] in {"time_decay", "time_first"}:
+                return array.astype(jnp.float32)
+            return array
+
+        return partial(
+            StateDictConverter.huggingface_to_easydel,
+            embedding_layer_names=embedding_path,
+            layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
+            dtype=self.param_dtype,
+            shard_fns=self._shard_fns,
+            reform_param=self._get_reform_param(),
+            callback=_keep_fp32,
         )
-        self.head = ColumnParallelLinear(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        max_length: int,
+        pad_token_id: int,
+        starts: int | None = None,
+        shardings: int | None = None,
+        attention_mask: Array | None = None,
+        token_type_ids: Array | None = None,
+        mask_info=None,
+        state: list[Array] | None = None,
+        inputs_embeds: Array | None = None,
+        **kwargs,
+    ) -> dict[str, tp.Any]:
+        del max_length, pad_token_id, starts, shardings, token_type_ids, mask_info, kwargs
+        del inputs_embeds
+
+        if state is None:
+            shape = (
+                input_ids.shape[0],
+                self.config.hidden_size,
+                self.config.num_hidden_layers,
+            )
+            state = [jnp.zeros(shape, dtype=jnp.float32) for _ in range(5)]
+            state[4] = state[4] - 1e30
+
+        model_inputs: dict[str, tp.Any] = {"state": state}
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        return model_inputs
+
+    def update_inputs_for_generation(
+        self,
+        model_outputs: RwkvCausalLMOutput,
+        model_kwargs: dict[str, tp.Any],
+    ) -> dict[str, tp.Any]:
+        model_kwargs["state"] = model_outputs.state
+        return model_kwargs
 
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
-        state: list[chex.Array] | None = None,
+        state: list[Array] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
     ) -> tuple | RwkvCausalLMOutput:
         rwkv_outputs = self.rwkv(
             input_ids,
@@ -611,7 +717,7 @@ class RwkvForCausalLM(EasyDeLBaseModule):
         )
         hidden_states = rwkv_outputs[0]
 
-        logits = self.head(hidden_states)
+        logits = self.apply_lm_head(hidden_states)
 
         return RwkvCausalLMOutput(
             logits=logits,

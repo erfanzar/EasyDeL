@@ -86,6 +86,7 @@ from jax import numpy as jnp
 
 from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView
 
+from ..utils import model_uses_mrope
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 from .executors import BatchMetadataPreparer, ModelStepExecutor, SamplerExecutor
 from .sequence_buffer import SequenceBuffer
@@ -415,6 +416,13 @@ class ExecutionManager:
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        # VLM prefill helpers (optional)
+        mrope_position_ids_cpu: numpy.ndarray | None = None,
+        prefill_embeds_cpu: numpy.ndarray | None = None,
+        prefill_embeds_mask_cpu: numpy.ndarray | None = None,
+        # DeepStack-style visual injection (optional)
+        visual_pos_masks_cpu: numpy.ndarray | None = None,
+        deepstack_visual_embeds_cpu: list[numpy.ndarray] | None = None,
         # Vision-language model data (optional)
         pixel_values: numpy.ndarray | None = None,
         image_grid_thw: numpy.ndarray | None = None,
@@ -507,6 +515,11 @@ class ExecutionManager:
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
             padded_num_reqs_in=padded_num_reqs,
+            mrope_position_ids_cpu=mrope_position_ids_cpu,
+            prefill_embeds_cpu=prefill_embeds_cpu,
+            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+            visual_pos_masks_cpu=visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
             # Vision-language model data
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
@@ -790,6 +803,13 @@ class ExecutionManager:
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
+        # VLM prefill helpers (optional)
+        mrope_position_ids_cpu: numpy.ndarray | None = None,
+        prefill_embeds_cpu: numpy.ndarray | None = None,
+        prefill_embeds_mask_cpu: numpy.ndarray | None = None,
+        # DeepStack-style visual injection (optional)
+        visual_pos_masks_cpu: numpy.ndarray | None = None,
+        deepstack_visual_embeds_cpu: list[numpy.ndarray] | None = None,
         # Vision-language model data (optional)
         pixel_values: numpy.ndarray | None = None,
         image_grid_thw: numpy.ndarray | None = None,
@@ -810,6 +830,11 @@ class ExecutionManager:
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
             padded_num_reqs_in=padded_num_reqs_in,
+            mrope_position_ids_cpu=mrope_position_ids_cpu,
+            prefill_embeds_cpu=prefill_embeds_cpu,
+            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+            visual_pos_masks_cpu=visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,
@@ -944,6 +969,37 @@ class ExecutionManager:
         input_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
         position_ids_buf = jax.device_put(jnp.zeros((self.max_num_tokens,), dtype=jnp.int32), self._empty_sharding)
 
+        mrope_position_ids_cpu = None
+        prefill_embeds_cpu = None
+        prefill_embeds_mask_cpu = None
+        visual_pos_masks_cpu = None
+        deepstack_visual_embeds_cpu = None
+
+        cfg = getattr(self.model, "config", None)
+        task_type = getattr(self.model, "_task_type", None)
+        is_vlm_model = task_type == "image-text-to-text" or (
+            cfg is not None
+            and (getattr(cfg, "image_token_id", None) is not None or getattr(cfg, "video_token_id", None) is not None)
+            and callable(getattr(self.model, "get_image_features", None))
+        )
+        uses_mrope_model = model_uses_mrope(self.model)
+
+        if is_vlm_model:
+            hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
+            prefill_embeds_cpu = numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16)
+            prefill_embeds_mask_cpu = numpy.zeros((int(num_tokens),), dtype=bool)
+            if uses_mrope_model:
+                mrope_position_ids_cpu = numpy.zeros((3, int(num_tokens)), dtype=numpy.int32)
+                deepstack_indexes = getattr(
+                    getattr(self.model.config, "vision_config", None), "deepstack_visual_indexes", None
+                )
+                deepstack_layers = len(deepstack_indexes) if deepstack_indexes else 0
+                if deepstack_layers:
+                    visual_pos_masks_cpu = numpy.zeros((int(num_tokens),), dtype=bool)
+                    deepstack_visual_embeds_cpu = [
+                        numpy.zeros((int(num_tokens), hidden_size), dtype=numpy.float16) for _ in range(deepstack_layers)
+                    ]
+
         # Get page table as CPU array
         page_table_cpu_dummy = temp_buffer.page_table[0].page_table_cpu
 
@@ -967,6 +1023,11 @@ class ExecutionManager:
             min_p_cpu=temp_buffer.min_p,
             page_table_cpu=page_table_cpu_dummy,
             padded_num_reqs_in=padded_num_reqs,
+            mrope_position_ids_cpu=mrope_position_ids_cpu,
+            prefill_embeds_cpu=prefill_embeds_cpu,
+            prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
+            visual_pos_masks_cpu=visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
         )
 
         inputs = StepFunctionInputs(

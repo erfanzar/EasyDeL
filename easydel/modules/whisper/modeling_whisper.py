@@ -18,7 +18,6 @@ import random
 import typing as tp
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -46,6 +45,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseConditionalGenerationModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -930,6 +930,17 @@ class WhisperDecoder(EasyDeLBaseModule):
                 `past_key_values` (if `use_cache` is True), `hidden_states` (optional), `attentions` (optional),
                 and `cross_attentions` (optional).
         """
+        if mask_info is None:
+            attention_mask = jnp.ones((input_ids.shape[0], input_ids.shape[1]), dtype=jnp.bool_)
+            mask_info = MaskInfo.from_attention_mask(attention_mask)
+
+        if encoder_hidden_states is not None and encoder_mask_info is None:
+            cross_attention_mask = jnp.ones(
+                (input_ids.shape[0], input_ids.shape[1], encoder_hidden_states.shape[1]),
+                dtype=jnp.bool_,
+            )
+            encoder_mask_info = MaskInfo.from_attention_mask(cross_attention_mask)
+
         inputs_embeds = self.embed_tokens(input_ids)
         if position_ids is None:
             position_ids = (
@@ -1264,10 +1275,14 @@ class WhisperModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
-class WhisperForConditionalGeneration(EasyDeLBaseModule):
+class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperModel, WhisperConfig]):
     """Whisper encoder-decoder with projection head for speech-to-text generation."""
 
     loss_type = "ForCausalLM"
+
+    _task_type = TaskType.SPEECH_SEQUENCE_TO_SEQUENCE
+    _model_type = "whisper"
+    _config_class = WhisperConfig
 
     def __init__(
         self,
@@ -1280,28 +1295,17 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=WhisperModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = WhisperModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.proj_out = RowParallelLinear(
-            config.d_model,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.init_std),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
+            lm_head_name="proj_out",
+            lm_head_class=RowParallelLinear,
+            lm_head_bias=False,
+            lm_head_kernel_init=jax.nn.initializers.normal(config.init_std),
+            create_lm_head=True,
         )
 
     def _get_encoder_module(self):
@@ -1570,7 +1574,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
     def compute_loss(
         self,
         *,
-        labels: chex.Array | None = None,
+        labels: Array | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
         **batch,

@@ -46,6 +46,7 @@ dependencies = [
 	"datasets>=3.6.0",
 	"gcsfs>=2024.2,<2026",
 	"zstandard>=0.23.0",
+	"pyyaml>=6.0",
 	"msgspec~=0.19.0",
 	"partial-json-parser>=0.2.1.1.post6",
 	"google-api-python-client>=2.179.0",
@@ -149,6 +150,15 @@ reportUninitializedInstanceVariable = "none"
 reportIncompatibleVariableOverride = "none"
 reportPrivateImportUsage = "none"
 reportUnusedParameter = "none"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
 
 [tool.uv]
 conflicts = [

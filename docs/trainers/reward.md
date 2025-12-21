@@ -91,23 +91,32 @@ trainer.train()
 
 ## Command Line Training
 
-You can run reward model training directly from the command line:
+The legacy `easydel.scripts.finetune.*` entrypoints have been removed in favor of the unified YAML runner.
 
 ```bash
-python -m easydel.scripts.finetune.reward \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --center_rewards_coefficient 0.1 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --num_train_epochs 3 \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+python -m easydel.scripts.elarge --config reward.yaml
+```
+
+Example `reward.yaml`:
+
+```yaml
+config:
+  model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  mixture:
+    informs:
+      - type: hf
+        data_files: trl-lib/ultrafeedback_binarized
+        split: train
+  trainer:
+    trainer_type: reward
+    max_sequence_length: 2048
+    center_rewards_coefficient: 0.1
+    total_batch_size: 16
+    learning_rate: 1e-6
+    num_train_epochs: 3
+actions:
+  - train
 ```
 
 ## Dataset Format

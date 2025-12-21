@@ -204,7 +204,7 @@ class UtilityOutput(msgspec.Struct, array_like=True, gc=False):
 
 class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True, gc=False):
     engine_index: int = 0
-    outputs: list[EngineCoreOutput] = []
+    outputs: list[EngineCoreOutput] = msgspec.field(default_factory=list)
     timestamp: float = 0.0
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None

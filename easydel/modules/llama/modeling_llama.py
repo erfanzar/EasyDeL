@@ -337,11 +337,11 @@ class LlamaModel(EasyDeLBaseModule):
         """Forward pass through the Llama model.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+            position_ids (Array, optional): Indices of positions of each input sequence token.
+            segment_ids (Array, optional): Segment token indices for segment embeddings.
             past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
                 precomputed key/value states.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.

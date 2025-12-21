@@ -23,6 +23,7 @@ This module defines configuration schemas for:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -89,13 +90,13 @@ class DatasetConfig:
     """
 
     # Source (required)
-    data_files: str | list[str]
+    data_files: str | os.PathLike | list[str | os.PathLike]
 
     # Identity
     name: str | None = None
 
     # Source options
-    type: Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "hf", "txt"] | None = None
+    type: Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "hf", "txt"] | None = None  # noqa: A003
     split: str = "train"
     num_rows: int | None = None
     dataset_split_name: str | None = None
@@ -115,7 +116,7 @@ class DatasetConfig:
     # Content mapping
     content_field: str = "text"
     additional_fields: list[str] | None = None
-    format_callback: Callable[[dict], dict] | None = None
+    format_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     format_fields: dict[str, str] | None = None
 
     # Shard configuration
@@ -311,7 +312,7 @@ class SaveStageConfig:
 
     enabled: bool = False
     output_dir: str = "./output"
-    format: Literal["parquet", "arrow", "jsonl"] = "parquet"
+    format: Literal["parquet", "arrow", "jsonl"] = "parquet"  # noqa: A003
     num_shards: int | None = None
     compression: str | None = None
     max_shard_size: str | int = "500MB"

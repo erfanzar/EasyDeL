@@ -22,7 +22,12 @@ import sys as _sys
 import typing as _tp
 from logging import getLogger as _getlogger
 
-from eformer.loggings import get_logger as _get_logger
+try:
+    from eformer.loggings import get_logger as _get_logger
+except ModuleNotFoundError:  # pragma: no cover
+    def _get_logger(name: str | None = None):
+        return _getlogger(name or __name__)
+
 from packaging.version import Version as _version
 from ray import is_initialized
 
@@ -342,6 +347,29 @@ _import_structure = {
         "Glm4MoeForCausalLM",
         "Glm4MoeForSequenceClassification",
         "Glm4MoeModel",
+    ],
+    "modules.glm4v": [
+        "Glm4vConfig",
+        "Glm4vForConditionalGeneration",
+        "Glm4vModel",
+        "Glm4vTextConfig",
+        "Glm4vTextModel",
+        "Glm4vVisionConfig",
+        "Glm4vVisionModel",
+    ],
+    "modules.glm4v_moe": [
+        "Glm4vMoeConfig",
+        "Glm4vMoeForConditionalGeneration",
+        "Glm4vMoeModel",
+        "Glm4vMoeTextConfig",
+        "Glm4vMoeTextModel",
+        "Glm4vMoeVisionConfig",
+        "Glm4vMoeVisionModel",
+    ],
+    "modules.glm46v": [
+        "Glm46VConfig",
+        "Glm46VForConditionalGeneration",
+        "Glm46VModel",
     ],
     "modules.gpt2": [
         "GPT2Config",
@@ -783,6 +811,25 @@ if _tp.TYPE_CHECKING:
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
     from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeForSequenceClassification, Glm4MoeModel
+    from .modules.glm4v import (
+        Glm4vConfig,
+        Glm4vForConditionalGeneration,
+        Glm4vModel,
+        Glm4vTextConfig,
+        Glm4vTextModel,
+        Glm4vVisionConfig,
+        Glm4vVisionModel,
+    )
+    from .modules.glm4v_moe import (
+        Glm4vMoeConfig,
+        Glm4vMoeForConditionalGeneration,
+        Glm4vMoeModel,
+        Glm4vMoeTextConfig,
+        Glm4vMoeTextModel,
+        Glm4vMoeVisionConfig,
+        Glm4vMoeVisionModel,
+    )
+    from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -957,7 +1004,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.30"]
+    _targeted_ejkernel_versions = ["0.0.31"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

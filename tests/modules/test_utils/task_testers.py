@@ -15,10 +15,12 @@ import easydel as ed
 
 from .comparators import ComparisonResult, compare_hidden_states, compare_logits
 from .input_generators import (
+    make_audio_inputs,
     make_classification_inputs,
     make_qwen_vlm_inputs,
     make_seq2seq_inputs,
     make_text_inputs,
+    make_vision_inputs,
     make_vlm_inputs,
 )
 from .model_factory import (
@@ -58,22 +60,43 @@ class BaseTester:
             Tuple of (output, time_taken)
         """
         with ed.utils.capture_time() as timer:
-            try:
-                output = hf_model(
-                    **inputs,
-                    output_hidden_states=output_hidden_states,
-                    output_router_logits=output_router_logits,
-                    past_key_values=None,
-                    use_cache=False,
+            call_variants: list[dict[str, Any]] = []
+            if output_router_logits:
+                call_variants.append(
+                    {
+                        "output_hidden_states": output_hidden_states,
+                        "output_router_logits": output_router_logits,
+                        "past_key_values": None,
+                        "use_cache": False,
+                    }
                 )
-            except Exception:
-                # Fallback without router logits (handles TypeError, ValueError, etc.)
-                output = hf_model(
-                    **inputs,
-                    output_hidden_states=output_hidden_states,
-                    past_key_values=None,
-                    use_cache=False,
+                call_variants.append(
+                    {
+                        "output_hidden_states": output_hidden_states,
+                        "output_router_logits": output_router_logits,
+                    }
                 )
+
+            call_variants.append(
+                {
+                    "output_hidden_states": output_hidden_states,
+                    "past_key_values": None,
+                    "use_cache": False,
+                }
+            )
+            call_variants.append({"output_hidden_states": output_hidden_states})
+            call_variants.append({})
+
+            last_exc: Exception | None = None
+            output = None
+            for extra_kwargs in call_variants:
+                try:
+                    output = hf_model(**inputs, **extra_kwargs)
+                    break
+                except (TypeError, ValueError) as exc:
+                    last_exc = exc
+            if output is None:
+                raise last_exc or RuntimeError("HuggingFace forward failed with no exception captured.")
         return output, timer()
 
     def _run_ed_forward(
@@ -295,7 +318,10 @@ class CausalLMTester(BaseTester):
         try:
             # Setup config
             config = setup_config(config, small_model_config)
-            config.sharding_axis_dims = (1, 1, -1, 1, 1)
+            # Generation tests should be portable across backends. Some MoE paths
+            # use collectives that are not available on XLA:CPU when sharding on EP,
+            # so prefer placing the extra device on TP.
+            config.sharding_axis_dims = (1, 1, 1, -1, 1)
             # Handle EasyDeL-only models (no HF model needed for generation test)
             if hf_class is None:
                 with config.mesh:
@@ -451,11 +477,20 @@ class BaseModuleTester(BaseTester):
                 )
 
                 # Generate inputs
-                inputs = make_text_inputs(
-                    vocab_size=small_model_config["vocab_size"],
-                    batch_size=small_model_config["batch_size"],
-                    seq_len=small_model_config["sequence_length"],
-                )
+                if task == ed.TaskType.BASE_VISION:
+                    image_size = getattr(config, "image_size", 224)
+                    num_channels = getattr(config, "num_channels", 3)
+                    inputs = make_vision_inputs(
+                        batch_size=small_model_config["batch_size"],
+                        image_size=image_size,
+                        num_channels=num_channels,
+                    )
+                else:
+                    inputs = make_text_inputs(
+                        vocab_size=small_model_config["vocab_size"],
+                        batch_size=small_model_config["batch_size"],
+                        seq_len=small_model_config["sequence_length"],
+                    )
 
                 # Run HF forward with hidden states
                 hf_inputs = inputs["torch"]
@@ -463,7 +498,16 @@ class BaseModuleTester(BaseTester):
 
                 # Run ED forward with hidden states
                 ed_inputs = inputs["jax"]
-                ed_output, ed_time = self._run_ed_forward(ed_model, ed_inputs, output_hidden_states=True)
+
+                @ed.ejit(static_argnums=(0,))
+                def jited(gd, gs, go, **kwargs):
+                    model = nn.merge(gd, gs, go)
+                    return model(**kwargs, output_hidden_states=True)
+
+                _ = jited(*ed_model.split_module(), **ed_inputs)
+                with ed.utils.capture_time() as timer:
+                    ed_output = jited(*ed_model.split_module(), **ed_inputs)
+                ed_time = timer()
 
                 # Compare hidden states
                 hf_hidden = hf_output.last_hidden_state.cpu().detach().numpy()
@@ -579,6 +623,66 @@ class SequenceClassificationTester(BaseTester):
 class VisionLanguageTester(BaseTester):
     """Test IMAGE_TEXT_TO_TEXT (Vision-Language) models."""
 
+    @staticmethod
+    def _build_vlm_jit_inputs(ed_model: Any, ed_inputs: dict, vlm_config: dict) -> tuple[dict, dict]:
+        """Prepare inputs for a jittable VLM forward pass.
+
+        Computes `inputs_embeds` outside of `ejit` (including multimodal merge) and
+        passes only JIT-friendly tensors (e.g. `inputs_embeds`, `position_ids`,
+        `deepstack_visual_embeds`) to the compiled forward.
+        """
+        input_ids = ed_inputs["input_ids"]
+        attention_mask = ed_inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids, dtype=jnp.bool)
+        else:
+            attention_mask = attention_mask.astype(jnp.bool)
+
+        embedding_kwargs = {k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask"]}
+        if vlm_config.get("is_qwen_vl", False):
+            inputs_embeds, embed_info = ed_model.compute_embedding_with_info(
+                input_ids,
+                attention_mask=attention_mask,
+                **embedding_kwargs,
+            )
+        else:
+            inputs_embeds, embed_info = ed_model.compute_embedding_with_info(input_ids, **embedding_kwargs)
+
+        forward_kwargs: dict[str, Any] = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+        }
+        loss_kwargs: dict[str, Any] = {"labels": input_ids}
+
+        token_type_ids = ed_inputs.get("token_type_ids")
+        if token_type_ids is not None:
+            forward_kwargs["token_type_ids"] = token_type_ids
+
+        if embed_info is not None:
+            position_ids = getattr(embed_info, "position_ids", None)
+            if position_ids is not None:
+                forward_kwargs["position_ids"] = jnp.asarray(position_ids, dtype="i4")
+
+            visual_pos_masks = getattr(embed_info, "visual_pos_masks", None)
+            deepstack_visual_embeds = getattr(embed_info, "deepstack_visual_embeds", None)
+            if deepstack_visual_embeds is not None:
+                forward_kwargs["visual_pos_masks"] = visual_pos_masks
+                forward_kwargs["deepstack_visual_embeds"] = deepstack_visual_embeds
+
+        if vlm_config.get("is_qwen_vl", False) and hasattr(ed_model, "base_model"):
+            base_model = ed_model.base_model
+            if hasattr(base_model, "get_rope_index"):
+                if "position_ids" not in forward_kwargs:
+                    position_ids, _rope_deltas = base_model.get_rope_index(
+                        input_ids=input_ids,
+                        image_grid_thw=ed_inputs.get("image_grid_thw"),
+                        video_grid_thw=ed_inputs.get("video_grid_thw"),
+                        attention_mask=attention_mask,
+                    )
+                    forward_kwargs["position_ids"] = jnp.asarray(position_ids, dtype="i4")
+
+        return forward_kwargs, loss_kwargs
+
     def run(
         self,
         module_name: str,
@@ -639,6 +743,8 @@ class VisionLanguageTester(BaseTester):
                     num_images=vlm_config.get("num_images", 1),
                     token_type_ids=vlm_config.get("use_token_type_ids", False),
                     image_grid_hws=vlm_config.get("image_grid_hws"),
+                    image_grid_thw=vlm_config.get("image_grid_thw"),
+                    video_grid_thw=vlm_config.get("video_grid_thw"),
                 )
 
             # Handle EasyDeL-only VLM models (no HF comparison)
@@ -653,11 +759,38 @@ class VisionLanguageTester(BaseTester):
 
                     # Run ED forward only
                     ed_inputs = inputs["jax"]
+                    forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
+
+                    @ed.ejit(static_argnums=(1,))
+                    def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
+                        model = nn.merge(gd, gs, go)
+                        return model.compute_loss(
+                            labels=labels,
+                            inputs_embeds=embeds,
+                            attention_mask=attention_mask,
+                            **kwargs,
+                        )
+
+                    # Warmup
+                    _ = jited(
+                        forward_kwargs["inputs_embeds"],
+                        *ed_model.split_module(),
+                        attention_mask=forward_kwargs["attention_mask"],
+                        labels=loss_kwargs["labels"],
+                        **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
+                    )
+
                     with ed.utils.capture_time() as timer:
-                        ed_output, _metrics = ed_model.compute_loss(
-                            input_ids=ed_inputs["input_ids"],
-                            attention_mask=jnp.ones_like(ed_inputs["input_ids"], dtype=jnp.bool),
-                            **{k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask"]},
+                        ed_output, _metrics = jited(
+                            forward_kwargs["inputs_embeds"],
+                            *ed_model.split_module(),
+                            attention_mask=forward_kwargs["attention_mask"],
+                            labels=loss_kwargs["labels"],
+                            **{
+                                k: v
+                                for k, v in forward_kwargs.items()
+                                if k not in ["inputs_embeds", "attention_mask"]
+                            },
                         )
                     ed_time = timer()
 
@@ -697,11 +830,34 @@ class VisionLanguageTester(BaseTester):
 
                 # Run ED forward
                 ed_inputs = inputs["jax"]
+                forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
+
+                @ed.ejit(static_argnums=(1,))
+                def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
+                    model = nn.merge(gd, gs, go)
+                    return model.compute_loss(
+                        labels=labels,
+                        inputs_embeds=embeds,
+                        attention_mask=attention_mask,
+                        **kwargs,
+                    )
+
+                # Warmup
+                _ = jited(
+                    forward_kwargs["inputs_embeds"],
+                    *ed_model.split_module(),
+                    attention_mask=forward_kwargs["attention_mask"],
+                    labels=loss_kwargs["labels"],
+                    **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
+                )
+
                 with ed.utils.capture_time() as timer:
-                    ed_output, _metrics = ed_model.compute_loss(
-                        input_ids=ed_inputs["input_ids"],
-                        attention_mask=jnp.ones_like(ed_inputs["input_ids"], dtype=jnp.bool),
-                        **{k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask"]},
+                    ed_output, _metrics = jited(
+                        forward_kwargs["inputs_embeds"],
+                        *ed_model.split_module(),
+                        attention_mask=forward_kwargs["attention_mask"],
+                        labels=loss_kwargs["labels"],
+                        **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
                     )
                 ed_time = timer()
 
@@ -767,24 +923,102 @@ class Seq2SeqTester(BaseTester):
                     hf_model=hf_model,
                 )
 
-                # Generate inputs
-                inputs = make_seq2seq_inputs(
-                    vocab_size=small_model_config["vocab_size"],
-                    batch_size=small_model_config["batch_size"],
-                    src_len=small_model_config["sequence_length"],
-                    tgt_len=small_model_config["sequence_length"] // 2,
-                )
+                if task == ed.TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
+                    audio_length = int(getattr(config, "max_source_positions", small_model_config["sequence_length"]))
+                    audio_length *= 2  # Whisper expects 2x downsampling (e.g., 1500 -> 3000 mel frames)
+                    audio_inputs = make_audio_inputs(
+                        batch_size=small_model_config["batch_size"],
+                        audio_length=audio_length,
+                        num_mel_bins=getattr(config, "num_mel_bins", 80),
+                    )
+                    decoder_inputs = make_text_inputs(
+                        vocab_size=small_model_config["vocab_size"],
+                        batch_size=small_model_config["batch_size"],
+                        seq_len=small_model_config["sequence_length"] // 2,
+                    )
 
-                # Run HF forward
-                hf_inputs = {
-                    **inputs["torch"],
-                    "labels": inputs["torch"]["decoder_input_ids"],
-                }
-                hf_output, hf_time = self._run_hf_forward(hf_model, hf_inputs)
+                    hf_inputs = {
+                        **audio_inputs["torch"],
+                        "decoder_input_ids": decoder_inputs["torch"]["input_ids"],
+                        "labels": decoder_inputs["torch"]["input_ids"],
+                    }
+                    hf_output, hf_time = self._run_hf_forward(hf_model, hf_inputs)
 
-                # Run ED forward
-                ed_inputs = inputs["jax"]
-                ed_output, ed_time = self._run_ed_forward(ed_model, ed_inputs)
+                    ed_inputs = {
+                        **audio_inputs["jax"],
+                        "decoder_input_ids": decoder_inputs["jax"]["input_ids"],
+                    }
+
+                    @ed.ejit(static_argnums=(1,))
+                    def jited(input_features, gd, gs, go, decoder_input_ids):
+                        model = nn.merge(gd, gs, go)
+                        return model.compute_loss(
+                            labels=decoder_input_ids,
+                            input_features=input_features,
+                            decoder_input_ids=decoder_input_ids,
+                        )
+
+                    _ = jited(
+                        ed_inputs["input_features"],
+                        *ed_model.split_module(),
+                        decoder_input_ids=ed_inputs["decoder_input_ids"],
+                    )
+
+                    with ed.utils.capture_time() as timer:
+                        ed_output, _metrics = jited(
+                            ed_inputs["input_features"],
+                            *ed_model.split_module(),
+                            decoder_input_ids=ed_inputs["decoder_input_ids"],
+                        )
+                    ed_time = timer()
+                else:
+                    # Generate inputs
+                    inputs = make_seq2seq_inputs(
+                        vocab_size=small_model_config["vocab_size"],
+                        batch_size=small_model_config["batch_size"],
+                        src_len=small_model_config["sequence_length"],
+                        tgt_len=small_model_config["sequence_length"] // 2,
+                    )
+
+                    # Run HF forward
+                    hf_inputs = {
+                        **inputs["torch"],
+                        "labels": inputs["torch"]["decoder_input_ids"],
+                    }
+                    hf_output, hf_time = self._run_hf_forward(hf_model, hf_inputs)
+
+                    # Run ED forward
+                    ed_inputs = {**inputs["jax"], "labels": inputs["jax"]["decoder_input_ids"]}
+
+                    @ed.ejit(static_argnums=(1,))
+                    def jited(input_ids, gd, gs, go, attention_mask, labels, **kwargs):
+                        model = nn.merge(gd, gs, go)
+                        return model.compute_loss(
+                            labels=labels,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            **kwargs,
+                        )
+
+                    extra_kwargs = {
+                        k: v for k, v in ed_inputs.items() if k not in ["input_ids", "attention_mask", "labels"]
+                    }
+                    _ = jited(
+                        ed_inputs["input_ids"],
+                        *ed_model.split_module(),
+                        attention_mask=ed_inputs["attention_mask"],
+                        labels=ed_inputs["labels"],
+                        **extra_kwargs,
+                    )
+                    with ed.utils.capture_time() as timer:
+                        ed_output, _metrics = jited(
+                            ed_inputs["input_ids"],
+                            *ed_model.split_module(),
+                            attention_mask=ed_inputs["attention_mask"],
+                            labels=ed_inputs["labels"],
+                            **extra_kwargs,
+                        )
+                    ed_time = timer()
 
                 # Compare outputs
                 comparison = compare_logits(
@@ -848,22 +1082,54 @@ class Seq2SeqTester(BaseTester):
                     hf_model=hf_model,
                 )
 
-                # Generate inputs (encoder only for generation)
-                inputs = make_text_inputs(
-                    vocab_size=small_model_config["vocab_size"],
-                    batch_size=1,
-                    seq_len=32,
-                )
+                if task == ed.TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
+                    from transformers import GenerationConfig
 
-                # Run generation
-                with ed.utils.capture_time() as timer:
-                    output = ed_model.generate(
-                        input_ids=inputs["jax"]["input_ids"],
-                        attention_mask=inputs["jax"]["attention_mask"],
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
+                    if not hasattr(ed_model, "generation_config") or ed_model.generation_config is None:
+                        ed_model.generation_config = GenerationConfig(
+                            max_length=getattr(config, "max_target_positions", max_new_tokens + 1),
+                            max_new_tokens=max_new_tokens,
+                            pad_token_id=getattr(config, "pad_token_id", 0) or 0,
+                            eos_token_id=getattr(config, "eos_token_id", 2) or 2,
+                            bos_token_id=getattr(config, "bos_token_id", 1) or 1,
+                            decoder_start_token_id=getattr(
+                                config, "decoder_start_token_id", getattr(config, "bos_token_id", 1) or 1
+                            ),
+                        )
+
+                    audio_length = int(getattr(config, "max_source_positions", small_model_config["sequence_length"]))
+                    audio_length *= 2  # Whisper expects 2x downsampling (e.g., 1500 -> 3000 mel frames)
+                    inputs = make_audio_inputs(
+                        batch_size=1,
+                        audio_length=audio_length,
+                        num_mel_bins=getattr(config, "num_mel_bins", 80),
                     )
-                ed_time = timer()
+
+                    # Run generation
+                    with ed.utils.capture_time() as timer:
+                        output = ed_model.generate(
+                            input_features=inputs["jax"]["input_features"],
+                            max_new_tokens=max_new_tokens,
+                            do_sample=False,
+                        )
+                    ed_time = timer()
+                else:
+                    # Generate inputs (encoder only for generation)
+                    inputs = make_text_inputs(
+                        vocab_size=small_model_config["vocab_size"],
+                        batch_size=1,
+                        seq_len=32,
+                    )
+
+                    # Run generation
+                    with ed.utils.capture_time() as timer:
+                        output = ed_model.generate(
+                            input_ids=inputs["jax"]["input_ids"],
+                            attention_mask=inputs["jax"]["attention_mask"],
+                            max_new_tokens=max_new_tokens,
+                            do_sample=False,
+                        )
+                    ed_time = timer()
 
             cleanup_models(hf_model)
 

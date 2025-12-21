@@ -29,7 +29,6 @@ import typing as tp
 import warnings
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -294,14 +293,14 @@ class GiddAttention(AttentionModule):
     def concatenate(
         self,
         *,
-        query: chex.Array,
-        key: chex.Array,
-        value: chex.Array,
+        query: Array,
+        key: Array,
+        value: Array,
         mask_info: MaskInfo,
-        noise_mask: chex.Array,
+        noise_mask: Array,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-    ) -> tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
+    ) -> tuple[Array, Array, Array, tp.Callable[[], Array]]:
         """
         Prepare and concatenate key, value, and attention mask for attention computation.
 
@@ -380,14 +379,14 @@ class GiddAttention(AttentionModule):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
-        noise_mask: chex.Array,
+        noise_mask: Array,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[Array, Array]:
         """
         Forward pass through the attention module.
 
@@ -643,7 +642,7 @@ class GiddLayer(nn.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        noise_mask: chex.Array,
+        noise_mask: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -802,8 +801,8 @@ class GiddModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        log_snr: chex.Array | None = None,
-        noise_mask: chex.Array | None = None,
+        log_snr: Array | None = None,
+        noise_mask: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -1051,8 +1050,8 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        log_snr: chex.Array | None = None,
-        noise_mask: chex.Array | None = None,
+        log_snr: Array | None = None,
+        noise_mask: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,

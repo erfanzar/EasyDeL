@@ -17,7 +17,6 @@ import math
 import typing as tp
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -41,7 +40,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -72,40 +71,40 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
     Base class for Llama4Vision causal language model (or autoregressive) outputs.
 
     Args:
-        loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
             Language modeling loss (for next-token prediction).
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is passed or
+        past_key_values (`tuple(tuple(Array))`, *optional*, returned when `use_cache=True` is passed or
             when `config.use_cache=True`):
-            Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or
             when `config.output_hidden_states=True`):
-            Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed or when
+        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed or when
             `config.output_attentions=True`):
-            Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        image_hidden_states (`chex.Array`, *optional*):
-            A `chex.Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
+        image_hidden_states (`Array`, *optional*):
+            An `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
+    loss: Array | None = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
@@ -226,9 +225,9 @@ class Llama4TextExperts(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE experts."""
         gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
         up = self.up_proj(hidden_states, group_sizes, sorted_experts)
@@ -729,11 +728,11 @@ class Llama4TextModel(EasyDeLBaseModule):
         """Forward pass through the Llama model.
 
         Args:
-          input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-          inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-          attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-          position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-          segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+          input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
+          inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+          attention_mask (Array, optional): Mask to avoid attention on padding tokens.
+          position_ids (Array, optional): Indices of positions of each input sequence token.
+          segment_ids (Array, optional): Segment token indices for segment embeddings.
           past_key_values (TransformerCache | RaggedPagesCache, optional):
             Cache containing precomputed key/value states.
           cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
@@ -943,7 +942,7 @@ class Llama4MultiModalProjector(nn.Module):
             kernel_init=jax.nn.initializers.normal(0.01),
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         return self.linear_1(hidden_states)
 
 
@@ -1008,7 +1007,7 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, encoded_patches: chex.Array) -> chex.Array:
+    def __call__(self, encoded_patches: Array) -> Array:
         encoded_patches = pixel_shuffle(encoded_patches, self.pixel_shuffle_ratio)
         return self.mlp(encoded_patches)
 
@@ -1175,7 +1174,7 @@ class Llama4VisionMLP2(nn.Module):
         self.fc1 = linear_class(self.intermediate_size, config.projector_input_dim)
         self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
         return self.activation_fn(hidden_states)
 
@@ -1216,7 +1215,7 @@ class Llama4VisionMLP(nn.Module):
         self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
         self.activation_fn = ACT2FN["gelu"]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
@@ -1631,7 +1630,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Llama4Config, model_type="llama4")
-class Llama4ForConditionalGeneration(EasyDeLBaseModule):
+class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM, Llama4Config]):
     """Llama4 Vision model for conditional text generation based on image inputs.
 
     Combines a vision tower and a language model with a multi-modal projector.
@@ -1679,12 +1678,28 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         rngs: nn.Rngs,
     ):
         """Initializes the Llama4ForConditionalGeneration model."""
-        super().__init__(
-            config=config,
+        language_model = Llama4ForCausalLM(
+            config=config.get_text_config(),
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+        )
+        super().__init__(
+            config=config,
+            base_model=language_model,
+            base_model_name="language_model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            vision_feature_layer=getattr(config, "vision_feature_layer", -1),
+            vision_feature_select_strategy=getattr(config, "vision_feature_select_strategy", "default"),
+            image_token_index=getattr(config, "image_token_id", None),
+            video_token_index=getattr(config, "video_token_id", None),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            create_lm_head=False,
+            lm_head_bias=False,
         )
         self.vision_model = Llama4VisionModel(
             config=config.vision_config,
@@ -1700,24 +1715,17 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.language_model = Llama4ForCausalLM(
-            config=config.get_text_config(),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
         self.vocab_size = config.get_text_config().vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-    def get_image_features(self, pixel_values: chex.Array, **kwargs) -> chex.Array:
+    def get_image_features(self, pixel_values: Array, **kwargs) -> Array:
         """Extracts and projects image features from the vision tower.
 
         Args:
-            pixel_values (chex.Array): Input pixel values for the images.
+            pixel_values (Array): Input pixel values for the images.
 
         Returns:
-            chex.Array: Processed image features ready for the language model.
+            Array: Processed image features ready for the language model.
         """
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         image_outputs = self.vision_model(
@@ -1728,10 +1736,50 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         hidden_states = image_outputs.last_hidden_state
         return hidden_states
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        image_features: Array | None = None,
+        pixel_values: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        image_token_id = self.config.image_token_id
+        if image_token_id >= self.vocab_size:
+            llm_input_ids = jnp.where(input_ids == image_token_id, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+
+        if image_features is None and pixel_values is not None:
+            image_features = self.get_image_features(pixel_values, **kwargs)
+
+        if image_features is not None:
+            orgshape = inputs_embeds.shape
+            vision_flat = image_features.reshape(-1, image_features.shape[-1])
+            projected_vision_flat = self.multi_modal_projector(vision_flat).astype(inputs_embeds.dtype)
+
+            image_token_mask_1d = (input_ids == image_token_id).reshape(-1)
+            inputs_embeds_flat = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+
+            num_projected_tokens = projected_vision_flat.shape[0]
+            image_token_indices = jnp.where(
+                image_token_mask_1d,
+                size=num_projected_tokens,
+                fill_value=-1,
+            )[0]
+            inputs_embeds = inputs_embeds_flat.at[image_token_indices].set(projected_vision_flat).reshape(orgshape)
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
+        pixel_values: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1750,33 +1798,18 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_id >= self.vocab_size:
-            special_image_mask = input_ids == self.config.image_token_id
-            llm_input_ids = input_ids
-            llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
-        else:
-            llm_input_ids = input_ids
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
+
+        image_features = None
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
 
         if inputs_embeds is None:
-            inputs_embeds = self.language_model.model.embed_tokens(llm_input_ids)
-
-        if pixel_values is not None:
-            orgshape = inputs_embeds.shape
-
-            image_features = self.get_image_features(pixel_values)
-            vision_flat = image_features.reshape(-1, image_features.shape[-1])
-            projected_vision_flat = self.multi_modal_projector(vision_flat)
-            final_mask = jnp.expand_dims(input_ids == self.config.image_token_id, axis=-1)
-            inputs_embeds_flat = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
-            final_mask_1d = final_mask[..., 0].reshape(-1)
-            num_projected_tokens = projected_vision_flat.shape[0]
-            image_token_indices = jnp.where(
-                final_mask_1d,
-                size=num_projected_tokens,
-                fill_value=-1,
-            )[0]
-            inputs_embeds_updated_flat = inputs_embeds_flat.at[image_token_indices].set(projected_vision_flat)
-            inputs_embeds = inputs_embeds_updated_flat.reshape(orgshape)
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
+            )
         outputs = self.language_model(
             attention_mask=attention_mask,
             mask_info=mask_info,
@@ -1814,16 +1847,16 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         """Prepares inputs for text generation, including pixel values if provided.
 
         Args:
-            input_ids (chex.Array): Initial input token IDs.
+            input_ids (Array): Initial input token IDs.
             max_length (int): Maximum generation length.
-            pixel_values (Optional[chex.Array]): Pixel values for image input.
-            attention_mask (Optional[chex.Array]): Attention mask.
+            pixel_values (Optional[Array]): Pixel values for image input.
+            attention_mask (Optional[Array]): Attention mask.
 
         Returns:
             dict: Model inputs ready for generation.

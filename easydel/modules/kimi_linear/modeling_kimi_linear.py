@@ -31,7 +31,6 @@ import typing
 from functools import partial
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -79,7 +78,7 @@ from easydel.layers.operations.modules import KDAOutput, KernelDeltaAttnOp, fuse
 from .kimi_linear_configuration import KimiLinearConfig
 
 
-def apply_mask_to_padding_states(hidden_states: chex.Array, attention_mask: chex.Array | None) -> chex.Array:
+def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
     if (
         attention_mask is not None
         and attention_mask.shape[0] == hidden_states.shape[0]
@@ -404,9 +403,9 @@ class KimiMLPMoE(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -475,7 +474,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,

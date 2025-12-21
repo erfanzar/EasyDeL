@@ -54,9 +54,9 @@ from __future__ import annotations
 import typing as tp
 from dataclasses import fields, is_dataclass
 
-import chex
 from eformer.pytree import auto_pytree
 from jax.core import Tracer
+from jaxtyping import Array
 
 if tp.TYPE_CHECKING:
     from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -188,6 +188,23 @@ class ModelOutput(tp.OrderedDict):
 
 
 @auto_pytree
+class EmbeddingInfo:
+    """Optional auxiliary outputs produced while computing input embeddings.
+
+    This is primarily used by multimodal models to return extra tensors (e.g.
+    DeepStack visual features, mRoPE indices) alongside `inputs_embeds` without
+    forcing callers to recompute them.
+    """
+
+    position_ids: Array | None = None
+    rope_deltas: Array | None = None
+    visual_pos_masks: Array | None = None
+    deepstack_visual_embeds: list[Array] | None = None
+    deepstack_image_embeds: list[Array] | None = None
+    deepstack_video_embeds: list[Array] | None = None
+
+
+@auto_pytree
 class AttentionLayerOutput(ModelOutput):
     """Output from a single attention layer.
 
@@ -204,8 +221,8 @@ class AttentionLayerOutput(ModelOutput):
             Contains cached key-value pairs from previous steps.
     """
 
-    attention_output: chex.Array
-    attention_weight: chex.Array | None = None
+    attention_output: Array
+    attention_weight: Array | None = None
     cache_view: TransformerCacheView | None = None
 
 
@@ -226,9 +243,9 @@ class EncoderLayerOutput(ModelOutput):
             Only returned when output_attentions=True.
     """
 
-    hidden_states: chex.Array
-    residual_states: chex.Array | None = None
-    attention_weight: chex.Array | None = None
+    hidden_states: Array
+    residual_states: Array | None = None
+    attention_weight: Array | None = None
 
 
 @auto_pytree
@@ -253,12 +270,12 @@ class DecoderLayerOutput(ModelOutput):
         cache_view: Optional cache view for efficient autoregressive generation.
     """
 
-    hidden_states: chex.Array
-    residual_states: chex.Array | None = None
-    cross_attention: chex.Array | None = None
-    attention_weight: chex.Array | None = None
-    router_logits: chex.Array | None = None
-    gate_loss: chex.Array | None = None
+    hidden_states: Array
+    residual_states: Array | None = None
+    cross_attention: Array | None = None
+    attention_weight: Array | None = None
+    router_logits: Array | None = None
+    gate_loss: Array | None = None
     cache_view: TransformerCacheView | None = None
 
 
@@ -268,26 +285,26 @@ class BaseModelOutput(ModelOutput):
     Base class for model's outputs, with potential hidden states and attentions.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    past_key_values: dict[str, chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    past_key_values: dict[str, Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -296,17 +313,17 @@ class BaseModelOutputWithNoAttention(ModelOutput):
     Base class for model's outputs, with potential hidden states.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, num_channels, height, width)`):
+        last_hidden_state (`Array` of shape `(batch_size, num_channels, height, width)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, + one
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, + one
             for the output of each layer) of shape `(batch_size, num_channels, height, width)`. Hidden-states of the
             model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -315,20 +332,20 @@ class BaseModelOutputWithPoolingAndNoAttention(ModelOutput):
     Base class for model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, num_channels, height, width)`):
+        last_hidden_state (`Array` of shape `(batch_size, num_channels, height, width)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        pooler_output (`chex.Array` of shape `(batch_size, hidden_size)`):
+        pooler_output (`Array` of shape `(batch_size, hidden_size)`):
             Last layer hidden-state after a pooling operation on the spatial dimensions.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, + one
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, + one
             for the output of each layer) of shape `(batch_size, num_channels, height, width)`. Hidden-states of the
             model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    last_hidden_state: chex.Array = None
-    pooler_output: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    pooler_output: Array = None
+    hidden_states: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -337,18 +354,18 @@ class ImageClassifierOutputWithNoAttention(ModelOutput):
     Base class for outputs of image classification models.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, config.num_labels)`):
+        logits (`Array` of shape `(batch_size, config.num_labels)`):
             Classification (or regression if config.num_labels==1) scores (before SoftMax).
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or when
         `config.output_hidden_states=True`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, + one
+            tp.Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, + one
             for the output of each stage) of shape `(batch_size, num_channels, height, width)`. Hidden-states (also
             called feature maps) of the model at the output of each stage.
     """
 
-    logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -357,29 +374,29 @@ class BaseModelOutputWithPast(ModelOutput):
     Base class for model's outputs, with potential hidden states and attentions.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        past_key_values (`tp.Dict[str, chex.Array]`):
+        past_key_values (`tp.Dict[str, Array]`):
             Dictionary of pre-computed hidden-states (key and values in the attention blocks) that can be used for fast
             auto-regressive decoding. Pre-computed key and value hidden-states are of shape *[batch_size, max_length]*.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    last_hidden_state: chex.Array = None
-    past_key_values: dict[str, chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    past_key_values: dict[str, Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -388,30 +405,30 @@ class BaseModelOutputWithPooling(ModelOutput):
     Base class for model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        pooler_output (`chex.Array` of shape `(batch_size, hidden_size)`):
+        pooler_output (`Array` of shape `(batch_size, hidden_size)`):
             Last layer hidden-state of the first token of the sequence (classification token) further processed by a
             Linear layer and a Tanh activation function. The Linear layer weights are trained from the next sentence
             prediction (classification) objective during pretraining.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    last_hidden_state: chex.Array = None
-    pooler_output: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    pooler_output: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -420,32 +437,32 @@ class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
     Base class for model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        pooler_output (`chex.Array` of shape `(batch_size, hidden_size)`):
+        pooler_output (`Array` of shape `(batch_size, hidden_size)`):
             Last layer hidden-state of the first token of the sequence (classification token) after further processing
             through the layers used for the auxiliary pretraining task. E.g. for BERT-family of models, this returns
             the classification token after processing through a linear layer and a tanh activation function. The linear
             layer weights are trained from the next sentence prediction (classification) objective during pretraining.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, + one
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, + one
             for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and optionally if
             `config.is_encoder_decoder=True` 2 additional tensors of shape `(batch_size, num_heads,
             encoder_sequence_length, embed_size_per_head)`.
@@ -455,13 +472,13 @@ class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
             input) to speed up sequential decoding.
     """
 
-    last_hidden_state: chex.Array = None
-    pooler_output: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: Array = None
+    pooler_output: Array = None
+    hidden_states: tuple[Array] | None = None
     past_key_values: TransformerCache | None = None
-    attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -470,13 +487,13 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
     Base class for model's outputs that may also contain a past key/values (to speed up sequential decoding).
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
 
             If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
             hidden_size)` is output.
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and optionally if
             `config.is_encoder_decoder=True` 2 additional tensors of shape `(batch_size, num_heads,
             encoder_sequence_length, embed_size_per_head)`.
@@ -484,31 +501,31 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
             Contains pre-computed hidden-states (key and values in the self-attention blocks and optionally if
             `config.is_encoder_decoder=True` in the cross-attention blocks) that can be used (see `past_key_values`
             input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
     """
 
-    last_hidden_state: chex.Array = None
+    last_hidden_state: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -518,59 +535,59 @@ class Seq2SeqModelOutput(ModelOutput):
     decoding.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the decoder of the model.
 
             If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
             hidden_size)` is output.
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-        decoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        decoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the decoder at the output of each layer plus the initial embedding outputs.
-        decoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        decoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
-        encoder_last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+        encoder_last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder of the model.
-        encoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        encoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the encoder at the output of each layer plus the initial embedding outputs.
-        encoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        encoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the encoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
     """
 
-    last_hidden_state: chex.Array = None
+    last_hidden_state: Array = None
     past_key_values: TransformerCache | None = None
-    decoder_hidden_states: tuple[chex.Array] | None = None
-    decoder_attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    encoder_last_hidden_state: chex.Array | None = None
-    encoder_hidden_states: tuple[chex.Array] | None = None
-    encoder_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    decoder_hidden_states: tuple[Array] | None = None
+    decoder_attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    encoder_last_hidden_state: Array | None = None
+    encoder_hidden_states: tuple[Array] | None = None
+    encoder_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -579,27 +596,27 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
     Base class for causal language model (or autoregressive) outputs.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Cross attentions weights after the attention softmax, used to compute the weighted average in the
             cross-attention heads.
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` tuples of length `config.n_layers`, with each tuple containing the cached key, value
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `Array` tuples of length `config.n_layers`, with each tuple containing the cached key, value
             states of the self-attention and the cross-attention layers if model is used in encoder-decoder setting.
             Only relevant if `config.is_decoder = True`.
 
@@ -607,12 +624,12 @@ class CausalLMOutputWithCrossAttentions(ModelOutput):
             `past_key_values` input) to speed up sequential decoding.
     """
 
-    logits: chex.Array = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -621,27 +638,27 @@ class MaskedLMOutput(ModelOutput):
     Base class for masked language models outputs.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    logits: chex.Array | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
-    attentions: tuple[chex.Array] | None = None
+    logits: Array | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
+    attentions: tuple[Array] | None = None
     past_key_values: TransformerCache | None = None
-    loss: chex.Array | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -654,56 +671,56 @@ class Seq2SeqLMOutput(ModelOutput):
     Base class for sequence-to-sequence language models outputs.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-        decoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        decoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the decoder at the output of each layer plus the initial embedding outputs.
-        decoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        decoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
-        encoder_last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+        encoder_last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder of the model.
-        encoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        encoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the encoder at the output of each layer plus the initial embedding outputs.
-        encoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        encoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the encoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
     """
 
-    logits: chex.Array = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    decoder_hidden_states: tuple[chex.Array] | None = None
-    decoder_attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    encoder_last_hidden_state: chex.Array | None = None
-    encoder_hidden_states: tuple[chex.Array] | None = None
-    encoder_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    decoder_hidden_states: tuple[Array] | None = None
+    decoder_attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    encoder_last_hidden_state: Array | None = None
+    encoder_hidden_states: tuple[Array] | None = None
+    encoder_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -712,26 +729,26 @@ class NextSentencePredictorOutput(ModelOutput):
     Base class for outputs of models predicting if two sentences are consecutive or not.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, 2)`):
+        logits (`Array` of shape `(batch_size, 2)`):
             Prediction scores of the next sequence prediction (classification) head (scores of True/False continuation
             before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -740,27 +757,27 @@ class SequenceClassifierOutput(ModelOutput):
     Base class for outputs of sentence classification models.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, config.num_labels)`):
+        logits (`Array` of shape `(batch_size, config.num_labels)`):
             Classification (or regression if config.num_labels==1) scores (before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
+    logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
     past_key_values: TransformerCache | None = None
-    loss: chex.Array | None = None
-    aux_loss: chex.Array | None = None
+    loss: Array | None = None
+    aux_loss: Array | None = None
 
 
 @auto_pytree
@@ -769,56 +786,56 @@ class Seq2SeqSequenceClassifierOutput(ModelOutput):
     Base class for outputs of sequence-to-sequence sentence classification models.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, config.num_labels)`):
+        logits (`Array` of shape `(batch_size, config.num_labels)`):
             Classification (or regression if config.num_labels==1) scores (before SoftMax).
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-        decoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        decoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the decoder at the output of each layer plus the initial embedding outputs.
-        decoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        decoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
-        encoder_last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+        encoder_last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder of the model.
-        encoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        encoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the encoder at the output of each layer plus the initial embedding outputs.
-        encoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        encoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the encoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
     """
 
-    logits: chex.Array = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    decoder_hidden_states: tuple[chex.Array] | None = None
-    decoder_attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    encoder_last_hidden_state: chex.Array | None = None
-    encoder_hidden_states: tuple[chex.Array] | None = None
-    encoder_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    decoder_hidden_states: tuple[Array] | None = None
+    decoder_attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    encoder_last_hidden_state: Array | None = None
+    encoder_hidden_states: tuple[Array] | None = None
+    encoder_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -827,27 +844,27 @@ class MultipleChoiceModelOutput(ModelOutput):
     Base class for outputs of multiple choice models.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, num_choices)`):
+        logits (`Array` of shape `(batch_size, num_choices)`):
             *num_choices* is the second dimension of the input tensors. (see *input_ids* above).
 
             Classification scores (before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -856,25 +873,25 @@ class TokenClassifierOutput(ModelOutput):
     Base class for outputs of token classification models.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.num_labels)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.num_labels)`):
             Classification scores (before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -883,28 +900,28 @@ class QuestionAnsweringModelOutput(ModelOutput):
     Base class for outputs of question answering models.
 
     Args:
-        start_logits (`chex.Array` of shape `(batch_size, sequence_length)`):
+        start_logits (`Array` of shape `(batch_size, sequence_length)`):
             Span-start scores (before SoftMax).
-        end_logits (`chex.Array` of shape `(batch_size, sequence_length)`):
+        end_logits (`Array` of shape `(batch_size, sequence_length)`):
             Span-end scores (before SoftMax).
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    start_logits: chex.Array = None
-    end_logits: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    start_logits: Array = None
+    end_logits: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -913,59 +930,59 @@ class Seq2SeqQuestionAnsweringModelOutput(ModelOutput):
     Base class for outputs of sequence-to-sequence question answering models.
 
     Args:
-        start_logits (`chex.Array` of shape `(batch_size, sequence_length)`):
+        start_logits (`Array` of shape `(batch_size, sequence_length)`):
             Span-start scores (before SoftMax).
-        end_logits (`chex.Array` of shape `(batch_size, sequence_length)`):
+        end_logits (`Array` of shape `(batch_size, sequence_length)`):
             Span-end scores (before SoftMax).
-        past_key_values (`tuple(chex.Array | None)`):
-            tp.Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+        past_key_values (`tuple(Array | None)`):
+            tp.Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-        decoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        decoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the decoder at the output of each layer plus the initial embedding outputs.
-        decoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        decoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
-        cross_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        cross_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the decoder's cross-attention layer, after the attention softmax, used to compute the
             weighted average in the cross-attention heads.
-        encoder_last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+        encoder_last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder of the model.
-        encoder_hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        encoder_hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the encoder at the output of each layer plus the initial embedding outputs.
-        encoder_attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        encoder_attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights of the encoder, after the attention softmax, used to compute the weighted average in the
             self-attention heads.
     """
 
-    start_logits: chex.Array = None
-    end_logits: chex.Array = None
+    start_logits: Array = None
+    end_logits: Array = None
     past_key_values: TransformerCache | None = None
-    decoder_hidden_states: tuple[chex.Array] | None = None
-    decoder_attentions: tuple[chex.Array] | None = None
-    cross_attentions: tuple[chex.Array] | None = None
-    encoder_last_hidden_state: chex.Array | None = None
-    encoder_hidden_states: tuple[chex.Array] | None = None
-    encoder_attentions: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    decoder_hidden_states: tuple[Array] | None = None
+    decoder_attentions: tuple[Array] | None = None
+    cross_attentions: tuple[Array] | None = None
+    encoder_last_hidden_state: Array | None = None
+    encoder_hidden_states: tuple[Array] | None = None
+    encoder_attentions: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -974,33 +991,33 @@ class MoeModelOutput(ModelOutput):
     Base class for MoE model outputs.
 
     Args:
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer)
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer)
             of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        router_logits (`tuple(chex.Array)`, *optional*):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
+        router_logits (`tuple(Array)`, *optional*):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
 
             The logits output of the router network, which are used to compute the mixture of experts.
     """
 
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array] | None = None
     past_key_values: TransformerCache | None = None
-    attentions: tuple[chex.Array] | None = None
-    router_logits: tuple[chex.Array] | None = None
-    all_router_losses: tuple[chex.Array] | None = None
-    logits: chex.Array = None
-    loss: chex.Array | None = None
+    attentions: tuple[Array] | None = None
+    router_logits: tuple[Array] | None = None
+    all_router_losses: tuple[Array] | None = None
+    logits: Array = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -1009,17 +1026,17 @@ class MoeCausalLMOutput(MaskedLMOutput):
     Base class for causal language modeling (CLM) outputs of MoE models.
 
     Args:
-        aux_loss (`chex.Array`, *optional*):
+        aux_loss (`Array`, *optional*):
             Auxiliary loss used for training MoE models.
-        router_logits (`tuple(chex.Array)`, *optional*):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
+        router_logits (`tuple(Array)`, *optional*):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
             The logits output of the router network, which are used to compute the mixture of experts.
     """
 
-    aux_loss: chex.Array | None = None
-    router_logits: tuple[chex.Array] | None = None
-    all_router_losses: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    aux_loss: Array | None = None
+    router_logits: tuple[Array] | None = None
+    all_router_losses: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -1030,49 +1047,49 @@ class VLMCausalLMOutput(ModelOutput):
     LLaVA, Qwen2-VL, Qwen3-VL, Gemma3, AyaVision, Mistral3, and Llama4.
 
     Args:
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (before SoftMax).
         past_key_values (`TransformerCache`, *optional*):
             Pre-computed hidden-states (key and values in attention blocks) for
             efficient autoregressive generation.
-        hidden_states (`tuple(chex.Array)`, *optional*):
+        hidden_states (`tuple(Array)`, *optional*):
             Tuple of hidden-states at output of each layer plus embeddings.
             Shape: `(batch_size, sequence_length, hidden_size)`.
-        last_hidden_state (`chex.Array`, *optional*):
+        last_hidden_state (`Array`, *optional*):
             Hidden-state at output of the last layer.
             Shape: `(batch_size, sequence_length, hidden_size)`.
-        attentions (`tuple(chex.Array)`, *optional*):
+        attentions (`tuple(Array)`, *optional*):
             Attention weights after softmax. Shape: `(batch_size, num_heads,
             sequence_length, sequence_length)`.
-        image_hidden_states (`chex.Array`, *optional*):
+        image_hidden_states (`Array`, *optional*):
             Projected image features from the vision encoder after the multimodal
             projector. Shape varies by model.
-        video_hidden_states (`chex.Array`, *optional*):
+        video_hidden_states (`Array`, *optional*):
             Projected video features for models supporting video input (Qwen2-VL,
             Qwen3-VL, Llama4). Shape varies by model.
-        rope_deltas (`chex.Array`, *optional*):
+        rope_deltas (`Array`, *optional*):
             Position embedding deltas for multi-dimensional RoPE (mRoPE) used in
             Qwen2-VL and Qwen3-VL models.
-        router_logits (`tuple(chex.Array)`, *optional*):
+        router_logits (`tuple(Array)`, *optional*):
             Router logits for MoE VLMs (Qwen3-VL-MoE). Shape:
             `(batch_size, sequence_length, num_experts)`.
-        aux_loss (`chex.Array`, *optional*):
+        aux_loss (`Array`, *optional*):
             Auxiliary loss for MoE load balancing.
-        loss (`chex.Array`, *optional*):
+        loss (`Array`, *optional*):
             Language modeling loss when labels are provided.
     """
 
-    logits: chex.Array = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
-    attentions: tuple[chex.Array] | None = None
-    image_hidden_states: chex.Array | None = None
-    video_hidden_states: chex.Array | None = None
-    rope_deltas: chex.Array | None = None
-    router_logits: tuple[chex.Array] | None = None
-    aux_loss: chex.Array | None = None
-    loss: chex.Array | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
+    attentions: tuple[Array] | None = None
+    image_hidden_states: Array | None = None
+    video_hidden_states: Array | None = None
+    rope_deltas: Array | None = None
+    router_logits: tuple[Array] | None = None
+    aux_loss: Array | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -1093,10 +1110,10 @@ class MambaOutput(BaseModelOutput):
         loss: Optional loss value when labels are provided.
     """
 
-    last_hidden_state: chex.Array = None
-    cache_params: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    last_hidden_state: Array = None
+    cache_params: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -1116,10 +1133,10 @@ class MambaCausalLMOutput(BaseModelOutput):
         loss: Optional language modeling loss when labels are provided.
     """
 
-    logits: chex.Array = None
-    cache_params: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    loss: chex.Array | None = None
+    logits: Array = None
+    cache_params: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    loss: Array | None = None
 
 
 @auto_pytree
@@ -1128,28 +1145,28 @@ class CLIPTextModelOutput(ModelOutput):
     Base class for text model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        text_embeds (`chex.Array` of shape `(batch_size, output_dim`):
+        text_embeds (`Array` of shape `(batch_size, output_dim`):
             The text embeddings obtained by applying the projection layer to the pooled output of
             [`FlaxCLIPTextModel`].
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    text_embeds: chex.Array = None
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    text_embeds: Array = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
 @auto_pytree
@@ -1158,45 +1175,45 @@ class ImageClassifierOutput(ModelOutput):
     Base class for text model's outputs that also contains a pooling of the last hidden states.
 
     Args:
-        text_embeds (`chex.Array` of shape `(batch_size, output_dim`):
+        text_embeds (`Array` of shape `(batch_size, output_dim`):
             The text embeddings obtained by applying the projection layer to the pooled output of
             [`FlaxCLIPTextModel`].
-        last_hidden_state (`chex.Array` of shape `(batch_size, sequence_length, hidden_size)`):
+        last_hidden_state (`Array` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for the output of the embeddings + one for the output of each layer) of shape
+        hidden_states (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for the output of the embeddings + one for the output of each layer) of shape
             `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(chex.Array | None)`):
-            tp.Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+        attentions (`tuple(Array | None)`):
+            tp.Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
 
-    text_embeds: chex.Array = None
-    last_hidden_state: chex.Array = None
-    hidden_states: tuple[chex.Array, ...] | None = None
-    attentions: tuple[chex.Array, ...] | None = None
+    text_embeds: Array = None
+    last_hidden_state: Array = None
+    hidden_states: tuple[Array, ...] | None = None
+    attentions: tuple[Array, ...] | None = None
 
 
 @auto_pytree
 class CLIPOutput(ModelOutput):
     """
     Args:
-        loss:(`chex.Array`) training loss
-        logits_per_image:(`chex.Array` of shape `(image_batch_size, text_batch_size)`):
+        loss:(`Array`) training loss
+        logits_per_image:(`Array` of shape `(image_batch_size, text_batch_size)`):
             The scaled dot product scores between `image_embeds` and `text_embeds`. This represents the image-text
             similarity scores.
-        logits_per_text:(`chex.Array` of shape `(text_batch_size, image_batch_size)`):
+        logits_per_text:(`Array` of shape `(text_batch_size, image_batch_size)`):
             The scaled dot product scores between `text_embeds` and `image_embeds`. This represents the text-image
             similarity scores.
-        text_embeds(`chex.Array` of shape `(batch_size, output_dim`):
+        text_embeds(`Array` of shape `(batch_size, output_dim`):
             The text embeddings obtained by applying the projection layer to the pooled output of
             [`FlaxCLIPTextModel`].
-        image_embeds(`chex.Array` of shape `(batch_size, output_dim`):
+        image_embeds(`Array` of shape `(batch_size, output_dim`):
             The image embeddings obtained by applying the projection layer to the pooled output of
             [`FlaxCLIPVisionModel`].
         text_model_output(`BaseModelOutputWithPooling`):
@@ -1205,11 +1222,11 @@ class CLIPOutput(ModelOutput):
             The output of the [`FlaxCLIPVisionModel`].
     """
 
-    loss: chex.Array = None
-    logits_per_image: chex.Array = None
-    logits_per_text: chex.Array = None
-    text_embeds: chex.Array = None
-    image_embeds: chex.Array = None
+    loss: Array = None
+    logits_per_image: Array = None
+    logits_per_text: Array = None
+    text_embeds: Array = None
+    image_embeds: Array = None
     text_model_output: BaseModelOutputWithPooling = None
     vision_model_output: BaseModelOutputWithPooling = None
 
@@ -1227,11 +1244,11 @@ class GreedySearchOutput(ModelOutput):
 
 
     Args:
-        sequences (`chex.Array` of shape `(batch_size, max_length)`):
+        sequences (`Array` of shape `(batch_size, max_length)`):
             The generated sequences.
     """
 
-    sequences: chex.Array = None
+    sequences: Array = None
 
 
 @auto_pytree
@@ -1241,11 +1258,11 @@ class SampleOutput(ModelOutput):
 
 
     Args:
-        sequences (`chex.Array` of shape `(batch_size, max_length)`):
+        sequences (`Array` of shape `(batch_size, max_length)`):
             The generated sequences.
     """
 
-    sequences: chex.Array = None
+    sequences: Array = None
 
 
 @auto_pytree
@@ -1255,11 +1272,11 @@ class BeamSearchOutput(ModelOutput):
 
 
     Args:
-        sequences (`chex.Array` of shape `(batch_size, max_length)`):
+        sequences (`Array` of shape `(batch_size, max_length)`):
             The generated sequences.
-        scores (`chex.Array` of shape `(batch_size,)`):
+        scores (`Array` of shape `(batch_size,)`):
             The scores (log probabilities) of the generated sequences.
     """
 
-    sequences: chex.Array = None
-    scores: chex.Array = None
+    sequences: Array = None
+    scores: Array = None

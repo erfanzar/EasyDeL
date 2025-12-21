@@ -32,8 +32,8 @@ Example:
     >>> const_list.append(4)  # Raises Exception
 """
 
-from collections.abc import Sequence
-from typing import Generic, Literal, TypeVar, overload
+from collections.abc import Mapping, Sequence
+from typing import Any, Generic, Literal, TypeVar, overload
 
 from jax import numpy as jnp
 from typing_extensions import TypeIs
@@ -189,3 +189,68 @@ def truncate_tokens(tokens, target_len: int, mode: str = "left"):
         return tokens[:keep_left] + tokens[n - keep_right :], drop
     else:
         raise ValueError(f"Unknown truncate_mode: {mode}")
+
+
+def _get_text_config(config: Any) -> Any:
+    """Best-effort resolver for text configs on composite models."""
+    if config is None:
+        return None
+
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            return get_text_config()
+        except TypeError:
+            # Some configs accept `decoder=` or other optional kwargs.
+            try:
+                return get_text_config(decoder=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    return getattr(config, "text_config", config)
+
+
+def _rope_scaling_uses_mrope(rope_scaling: Any) -> bool:
+    if rope_scaling is None:
+        return False
+
+    to_dict = getattr(rope_scaling, "to_dict", None)
+    if callable(to_dict):
+        try:
+            rope_scaling = to_dict()
+        except Exception:
+            pass
+
+    if not isinstance(rope_scaling, Mapping):
+        return False
+
+    # HuggingFace Qwen2/3-VL often uses rope_type='default' with mrope_section present.
+    if rope_scaling.get("mrope_section") is not None:
+        return True
+
+    rope_type = rope_scaling.get("rope_type")
+    if rope_type is None:
+        rope_type = rope_scaling.get("type")
+    if isinstance(rope_type, str) and rope_type.lower() == "mrope":
+        return True
+
+    # Some configs may omit mrope_section but still flag mRoPE behavior.
+    if rope_scaling.get("mrope_interleaved") is not None:
+        return True
+
+    return False
+
+
+def model_uses_mrope(model: Any) -> bool:
+    """Infer whether a model uses multi-dimensional RoPE (mRoPE).
+
+    Prefers config-based detection (text_config.rope_scaling) and falls back to
+    the legacy `_uses_mrope` attribute when unavailable.
+    """
+    cfg = getattr(model, "config", None)
+    text_cfg = _get_text_config(cfg)
+    if text_cfg is not None and _rope_scaling_uses_mrope(getattr(text_cfg, "rope_scaling", None)):
+        return True
+    return bool(getattr(model, "_uses_mrope", False))

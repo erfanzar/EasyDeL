@@ -17,7 +17,6 @@ import functools
 import math
 import typing
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -81,9 +80,9 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
 
 def dropout_add(
     nn_drop: nn.Dropout,
-    x: chex.Array,
-    residual: chex.Array,
-) -> chex.Array:
+    x: Array,
+    residual: Array,
+) -> Array:
     """The dropout_add function is a helper function that adds the residual to the output of
     the dropout layer. This is necessary because we want to use deterministic=True when
     we are evaluating our model, but we still need to add in the residual. The reason for this
@@ -92,8 +91,8 @@ def dropout_add(
 
     Args:
         nn_drop: nn.Dropout: Specify the dropout layer
-        x: chex.Array: Pass in the input to the dropout layer
-        residual: chex.Array: Add the residual to the output of
+        x: Array: Pass in the input to the dropout layer
+        residual: Array: Add the residual to the output of
             dropout_add
         deterministic: bool: Determine whether the dropout layer is
             active or not
@@ -222,7 +221,7 @@ class FalconMlp(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array, deterministic: bool = True):
+    def __call__(self, x: Array, deterministic: bool = True):
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -341,23 +340,23 @@ class FalconBlock(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-        alibi: chex.Array | None = None,
+        alibi: Array | None = None,
     ) -> DecoderLayerOutput:
         """
         Forward pass of the FalconBlock module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-            alibi (tp.Optional[chex.Array], optional): Alibi tensor for adding positional bias.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
+            alibi (tp.Optional[Array], optional): Alibi tensor for adding positional bias.
             init_cache (bool, optional): If True, initializes cache for caching keys and values.
             output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
             deterministic (bool, optional): If True, disables dropout for deterministic behavior.
 
         Returns:
-            tp.Union[chex.Array, tp.Tuple[chex.Array, chex.Array]]: The output tensor and optionally
+            tp.Union[Array, tp.Tuple[Array, Array]]: The output tensor and optionally
                 the attention weights.
         """
         residual = hidden_states
@@ -479,10 +478,10 @@ class FalconModel(EasyDeLBaseModule):
         Forward pass through the Falcon module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.

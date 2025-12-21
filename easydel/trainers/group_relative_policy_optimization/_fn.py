@@ -63,7 +63,7 @@ def get_per_token_logps(model, input_ids, attention_mask, prompt_length):
             are only computed for tokens after this position.
 
     Returns:
-        chex.Array: Per-token log probabilities for the completion portion.
+        Array: Per-token log probabilities for the completion portion.
             Shape: [batch_size, seq_len - prompt_length]
 
     Note:

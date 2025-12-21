@@ -77,11 +77,11 @@ import typing as tp
 from abc import ABCMeta, abstractmethod
 from mimetypes import common_types
 
-import chex
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh
+from jaxtyping import Array
 
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.quantization import EasyDeLQuantizationConfig
@@ -282,12 +282,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -318,12 +318,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
@@ -347,12 +347,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -385,12 +385,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -423,7 +423,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> ImageClassifierOutput:
@@ -443,9 +443,9 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
+        input_ids: Array,
+        attention_mask: Array,
+        position_ids: Array,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> CLIPTextModelOutput:
@@ -469,11 +469,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        pixel_values: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        pixel_values: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ) -> CLIPOutput:
@@ -504,13 +504,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def compute_loss(
         self,
-        input_ids: chex.Array | None = None,
-        labels: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        labels: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
@@ -541,13 +541,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def compute_loss(
         self,
-        input_ids: chex.Array | None = None,
-        labels: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        labels: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         loss_config: LossConfig | None = None,
@@ -575,13 +575,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def compute_loss(
         self,
-        input_ids: chex.Array | None = None,
-        labels: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        labels: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -614,13 +614,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def compute_loss(
         self,
-        input_ids: chex.Array | None = None,
-        labels: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        labels: Array | None = None,
+        inputs_embeds: Array | None = None,
+        attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: chex.Array | None = None,
-        segment_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
+        segment_ids: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -654,7 +654,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     def compute_loss(
         self,
         *,
-        labels: chex.Array | None = None,
+        labels: Array | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
         **batch,
@@ -964,9 +964,9 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def generate(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         generation_config: tp.Any | None = None,
-        prng_key: chex.Array | None = None,
+        prng_key: Array | None = None,
         trace: bool = True,
         logits_processor: tp.Any | None = None,
         **kwargs,
@@ -1042,13 +1042,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def prepare_inputs_for_generation(
         self,
-        input_ids: chex.Array,
+        input_ids: Array,
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         shardings: int | None = None,
-        attention_mask: chex.Array | None = None,
-        token_type_ids: chex.Array | None = None,
+        attention_mask: Array | None = None,
+        token_type_ids: Array | None = None,
         mask_info: tp.Any | None = None,
     ) -> dict[str, tp.Any]:
         """Sets up the initial inputs required for starting autoregressive generation.

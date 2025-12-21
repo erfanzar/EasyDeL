@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -140,10 +140,10 @@ class Gemma2Attention(UnifiedAttention):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
@@ -302,17 +302,17 @@ class Gemma2DecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -424,11 +424,11 @@ class Gemma2Model(EasyDeLBaseModule):
         Forward pass through the Gemma2 module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -580,11 +580,11 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         """Forward pass of the causal language model.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Input token IDs. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs for positional embeddings. Defaults to None.
-            segment_ids (Optional[chex.Array], optional): Segment IDs for segment embeddings. Defaults to None.
+            input_ids (Optional[Array], optional): Input token IDs. Defaults to None.
+            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[Array], optional): Position IDs for positional embeddings. Defaults to None.
+            segment_ids (Optional[Array], optional): Segment IDs for segment embeddings. Defaults to None.
             output_attentions (Optional[bool], optional): Whether to return attention weights. Defaults to None.
             output_hidden_states (Optional[bool], optional): Whether to return hidden states. Defaults to None.
             past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key values for faster
@@ -660,8 +660,12 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma2Config, model_type="gemma2")
-class Gemma2ForSequenceClassification(EasyDeLBaseModule):
+class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Model, Gemma2Config]):
     """Gemma2 text encoder with a classification head for sequence-level tasks."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "gemma2"
+    _config_class = Gemma2Config
 
     def __init__(
         self,
@@ -674,31 +678,14 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Gemma2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Gemma2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(

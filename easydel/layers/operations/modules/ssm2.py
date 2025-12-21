@@ -18,6 +18,10 @@ SSM2 (Mamba2-style) Selective State Space operation for EasyDeL.
 This module provides the SSM2 operation, implementing the Mamba2
 selective state space model architecture used by Mamba2 and FalconH1.
 
+This implementation delegates to ejKernel's optimized state_space_v2 kernel
+for the core SSM computation, providing automatic platform selection and
+optimization.
+
 Key characteristics of SSM2:
 - 1D A matrix: [num_heads] (per-head scalar)
 - SSM state shape: [batch, num_heads, head_dim, ssm_state_size]
@@ -42,6 +46,7 @@ References:
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
+from ejkernel.modules import state_space_v2
 from jax import lax
 from jaxtyping import Array, Float
 
@@ -71,149 +76,6 @@ class SSM2Output(AttentionOutput):
 
     conv_state: Float[Array, "batch conv_dim d_conv"] | None = None
     ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None
-
-
-def _ssm2_recurrent_scan(
-    x: Float[Array, "batch num_heads seq_len head_dim"],
-    B: Float[Array, "batch num_heads seq_len ssm_state_size"],
-    C: Float[Array, "batch num_heads seq_len ssm_state_size"],
-    dt: Float[Array, "batch seq_len num_heads"],
-    A: Float[Array, "num_heads"],
-    D: Float[Array, "num_heads"],
-    initial_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
-    precision: lax.Precision | None = None,
-) -> tuple[
-    Float[Array, "batch num_heads seq_len head_dim"],
-    Float[Array, "batch num_heads head_dim ssm_state_size"],
-]:
-    """Recurrent scan for SSM2.
-
-    Implements the Mamba2-style selective state space recurrence:
-        dA = exp(dt * A)
-        dBx = dt * B * x
-        h_t = dA * h_{t-1} + dBx
-        y_t = einsum(h_t, C_t) + x_t * D
-
-    Args:
-        x: Input [batch, num_heads, seq_len, head_dim]
-        B: B parameter [batch, num_heads, seq_len, ssm_state_size]
-        C: C parameter [batch, num_heads, seq_len, ssm_state_size]
-        dt: Time step [batch, seq_len, num_heads]
-        A: A vector (negative, per-head) [num_heads]
-        D: Skip connection [num_heads]
-        initial_state: Initial SSM state
-        precision: JAX precision for einsum
-
-    Returns:
-        Tuple of (outputs, final_state)
-    """
-    batch_size, num_heads, _seq_len, head_dim = x.shape
-    ssm_state_size = B.shape[-1]
-
-    if initial_state is None:
-        initial_state = jnp.zeros(
-            (batch_size, num_heads, head_dim, ssm_state_size),
-            dtype=jnp.float32,
-        )
-    else:
-        initial_state = initial_state.astype(jnp.float32)
-
-    x = x.astype(jnp.float32)
-    B = B.astype(jnp.float32)
-    C = C.astype(jnp.float32)
-    dt = dt.astype(jnp.float32)
-
-    def _step(ssm_state, step_inputs):
-        x_t, B_t, C_t, dt_t = step_inputs
-        # x_t: [batch, num_heads, head_dim]
-        # B_t: [batch, num_heads, ssm_state_size]
-        # C_t: [batch, num_heads, ssm_state_size]
-        # dt_t: [batch, num_heads]
-
-        # dA = exp(dt * A) where A is [num_heads]
-        dt_b = dt_t[:, :, None, None]  # [batch, num_heads, 1, 1]
-        dA = jnp.exp(dt_b * A[None, :, None, None])
-
-        # dBx = dt * B * x (outer product form)
-        # [batch, num_heads, head_dim, ssm_state_size]
-        dBx = (dt_t[:, :, None, None] * B_t[:, :, None, :]) * x_t[:, :, :, None]
-
-        # State update
-        new_state = ssm_state * dA + dBx
-
-        # Output: einsum("bhdn,bhn->bhd", new_state, C_t)
-        y_t = jnp.einsum("bhdn,bhn->bhd", new_state, C_t, precision=precision)
-
-        # Skip connection
-        y_t = y_t + x_t * D[None, :, None]
-
-        return new_state, y_t
-
-    # Transpose for scan: [seq_len, batch, ...]
-    scan_inputs = (
-        jnp.swapaxes(x, 1, 2).swapaxes(0, 1),  # [seq_len, batch, num_heads, head_dim]
-        jnp.swapaxes(B, 1, 2).swapaxes(0, 1),  # [seq_len, batch, num_heads, ssm_state_size]
-        jnp.swapaxes(C, 1, 2).swapaxes(0, 1),  # [seq_len, batch, num_heads, ssm_state_size]
-        jnp.swapaxes(dt, 0, 1),  # [seq_len, batch, num_heads]
-    )
-
-    final_state, y = lax.scan(_step, initial_state, scan_inputs)
-
-    # Transpose back: [batch, num_heads, seq_len, head_dim]
-    y = jnp.swapaxes(jnp.swapaxes(y, 0, 1), 1, 2)
-
-    return y, final_state
-
-
-def _ssm2_single_step(
-    x: Float[Array, "batch num_heads head_dim"],
-    B: Float[Array, "batch num_heads ssm_state_size"],
-    C: Float[Array, "batch num_heads ssm_state_size"],
-    dt: Float[Array, "batch num_heads"],
-    A: Float[Array, "num_heads"],
-    D: Float[Array, "num_heads"],
-    ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"],
-    precision: lax.Precision | None = None,
-) -> tuple[
-    Float[Array, "batch num_heads head_dim"],
-    Float[Array, "batch num_heads head_dim ssm_state_size"],
-]:
-    """Single step SSM2 update for inference.
-
-    Args:
-        x: Input [batch, num_heads, head_dim]
-        B: B parameter [batch, num_heads, ssm_state_size]
-        C: C parameter [batch, num_heads, ssm_state_size]
-        dt: Time step [batch, num_heads]
-        A: A vector [num_heads]
-        D: Skip connection [num_heads]
-        ssm_state: Previous state [batch, num_heads, head_dim, ssm_state_size]
-        precision: JAX precision
-
-    Returns:
-        Tuple of (output, new_state)
-    """
-    x = x.astype(jnp.float32)
-    B = B.astype(jnp.float32)
-    C = C.astype(jnp.float32)
-    dt = dt.astype(jnp.float32)
-    ssm_state = ssm_state.astype(jnp.float32)
-
-    # dA = exp(dt * A)
-    dt_b = dt[:, :, None, None]  # [batch, num_heads, 1, 1]
-    dA = jnp.exp(dt_b * A[None, :, None, None])
-
-    # dBx = dt * B * x
-    dBx = (dt[:, :, None, None] * B[:, :, None, :]) * x[:, :, :, None]
-
-    # State update
-    new_state = ssm_state * dA + dBx
-
-    # Output
-    y = jnp.einsum("bhdn,bhn->bhd", new_state, C, precision=precision)
-    y = y + x * D[None, :, None]
-
-    return y, new_state
 
 
 @OperationRegistry.register
@@ -278,7 +140,7 @@ class SSM2Op(OperationImpl):
             .build()
         )
 
-    @jax.named_scope("easydel-ssm2-native")
+    @jax.named_scope("easydel-ssm2-ejkernel")
     def forward_native(
         self,
         x: Float[Array, "batch seq_len num_heads head_dim"],
@@ -296,7 +158,11 @@ class SSM2Op(OperationImpl):
         precision: lax.Precision | None = None,
         **kwargs,
     ) -> SSM2Output:
-        """Forward pass for SSM2 operation.
+        """Forward pass for SSM2 operation using ejKernel.
+
+        Delegates to ejkernel.modules.operations.state_space_v2 for the core
+        SSM computation, which provides optimized implementations with automatic
+        platform selection.
 
         Args:
             x: Input tensor [batch, seq_len, num_heads, head_dim]
@@ -316,74 +182,34 @@ class SSM2Op(OperationImpl):
         Returns:
             SSM2Output with outputs and updated states
         """
-        batch_size, seq_len, num_heads, head_dim = x.shape
-        _ssm_state_size = B.shape[-1]
         dtype = x.dtype
 
-        # Convert A from log form
+        # Convert A from log form to real form (negative for stability)
         A_real = -jnp.exp(A.astype(jnp.float32))
 
-        # Expand B, C from n_groups to num_heads
-        group_rep = num_heads // n_groups
-        B = jnp.repeat(B, repeats=group_rep, axis=2)  # [batch, seq_len, num_heads, n]
-        C = jnp.repeat(C, repeats=group_rep, axis=2)  # [batch, seq_len, num_heads, n]
-
-        # Transpose x to [batch, num_heads, seq_len, head_dim]
-        x_t = jnp.transpose(x, (0, 2, 1, 3))
-        B_t = jnp.transpose(B, (0, 2, 1, 3))  # [batch, num_heads, seq_len, n]
-        C_t = jnp.transpose(C, (0, 2, 1, 3))  # [batch, num_heads, seq_len, n]
-
-        is_inference = seq_len == 1 and ssm_state is not None
-
-        if is_inference:
-            # Single step inference
-            y, new_ssm_state = _ssm2_single_step(
-                x=x_t[:, :, 0, :],  # [batch, num_heads, head_dim]
-                B=B_t[:, :, 0, :],  # [batch, num_heads, n]
-                C=C_t[:, :, 0, :],  # [batch, num_heads, n]
-                dt=dt[:, 0, :],  # [batch, num_heads]
-                A=A_real,
-                D=D,
-                ssm_state=ssm_state,
-                precision=precision,
-            )
-            y = y[:, :, None, :]  # [batch, num_heads, 1, head_dim]
-        else:
-            # Full sequence processing
-            y, new_ssm_state = _ssm2_recurrent_scan(
-                x=x_t,
-                B=B_t,
-                C=C_t,
-                dt=dt,
-                A=A_real,
-                D=D,
-                initial_state=ssm_state,
-                precision=precision,
-            )
-
-        # Transpose back to [batch, seq_len, num_heads, head_dim]
-        y = jnp.transpose(y, (0, 2, 1, 3))
-
-        # Reshape to [batch, seq_len, intermediate_size]
-        intermediate_size = num_heads * head_dim
-        y = y.reshape(batch_size, seq_len, intermediate_size)
-
-        # Apply gating
-        if gate is not None:
-            if use_gated_rmsnorm:
-                # Gated RMSNorm
-                y_f32 = y.astype(jnp.float32)
-                variance = jnp.mean(jnp.square(y_f32), axis=-1, keepdims=True)
-                y_norm = y_f32 * lax.rsqrt(variance + rmsnorm_eps)
-                y = (y_norm * jax.nn.silu(gate.astype(jnp.float32))).astype(dtype)
-            else:
-                # Simple gating
-                y = y * jax.nn.silu(gate.astype(jnp.float32))
+        # Call ejKernel's state_space_v2
+        # It handles both training (full sequence) and inference (single step) modes
+        y, new_ssm_state, new_conv_state = state_space_v2(
+            x,
+            A_real,
+            B,
+            C,
+            D,
+            dt,
+            gate=gate,
+            initial_state=ssm_state,
+            conv_state=conv_state,
+            n_groups=n_groups,
+            act_fn=jax.nn.silu if gate is not None else None,
+            use_gated_rmsnorm=use_gated_rmsnorm,
+            rmsnorm_eps=rmsnorm_eps,
+            precision=precision,
+        )
 
         return SSM2Output(
             attention_outputs=y.astype(dtype),
             attention_weights=None,
-            conv_state=conv_state,
+            conv_state=new_conv_state,
             ssm_state=new_ssm_state.astype(dtype),
         )
 

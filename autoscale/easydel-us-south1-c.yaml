@@ -6,7 +6,7 @@ provider:
   type: gcp
   region: us-south1
   availability_zone: us-south1-c
-  project_id: easydel-project
+  project_id: caltech-408917
 
 docker:
   image: "ghcr.io/erfanzar/easydel:latest-tpu"
@@ -26,7 +26,7 @@ docker:
     - -e RAY_TPU_MAX_CONCURRENT_ACTIVE_CONNECTIONS=64
 
 initialization_commands:
-  - gcloud config set project easydel-project
+  - gcloud config set project caltech-408917
   - gcloud config set compute/region us-south1
   - gcloud config set compute/zone us-south1-c
   - yes | gcloud auth configure-docker us-south1-docker.pkg.dev

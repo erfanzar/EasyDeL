@@ -47,7 +47,19 @@ class SimpleDecoder:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def decode(self, tokens, previous_text, buffered_tokens):
+    def _decode_tokens(self, tokens, *, skip_special_tokens: bool) -> str:
+        try:
+            return self.tokenizer.decode(
+                tokens,
+                skip_special_tokens=skip_special_tokens,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+        except Exception:
+            return ""
+
+    def decode(self, tokens, previous_text, buffered_tokens, *, skip_special_tokens: bool):
         """Decode tokens incrementally, handling UTF-8 boundary issues.
 
         Args:
@@ -62,10 +74,7 @@ class SimpleDecoder:
         if not merged:
             return "", [], False
 
-        try:
-            decoded = self.tokenizer.decode(merged, skip_special_tokens=False)
-        except Exception:
-            decoded = ""
+        decoded = self._decode_tokens(merged, skip_special_tokens=skip_special_tokens)
 
         if "�" not in decoded:
             delta = decoded[len(previous_text) :] if previous_text and decoded.startswith(previous_text) else decoded
@@ -78,9 +87,8 @@ class SimpleDecoder:
 
         while remaining:
             new_buffer.insert(0, remaining.pop())
-            try:
-                candidate = self.tokenizer.decode(remaining, skip_special_tokens=True)
-            except Exception:
+            candidate = self._decode_tokens(remaining, skip_special_tokens=skip_special_tokens)
+            if not candidate:
                 continue
             if "�" not in candidate:
                 decoded_text = candidate
@@ -189,14 +197,26 @@ def _detokenizer_worker(
                 new_tokens = generated_tokens[last_idx:]
 
                 if new_tokens or finished:
-                    delta, new_buffered, _ = decoder.decode(new_tokens, state["previous_text"], state["buffered"])
+                    delta, new_buffered, _ = decoder.decode(
+                        new_tokens,
+                        state["previous_text"],
+                        state["buffered"],
+                        skip_special_tokens=skip_special,
+                    )
                     state["buffered"] = new_buffered
                     accumulated = state["previous_text"] + delta
                     state["previous_text"] = accumulated
                     state["last_index"] = len(generated_tokens)
 
                     if finished:
-                        full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
+                        try:
+                            full_decoded = tokenizer.decode(
+                                generated_tokens,
+                                skip_special_tokens=skip_special,
+                                clean_up_tokenization_spaces=False,
+                            )
+                        except TypeError:
+                            full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
                         if full_decoded.startswith(accumulated):
                             delta = full_decoded[len(accumulated) :]
                             accumulated = full_decoded

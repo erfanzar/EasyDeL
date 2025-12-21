@@ -16,7 +16,6 @@
 import functools
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -381,9 +380,9 @@ class Xerxes2MoeMLPStack(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
         return checkpoint_name(
             self.down_proj(
@@ -463,16 +462,16 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states (Array): Input hidden states (batch_size * sequence_length, hidden_dim).
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tp.Tuple[Array, Array]: A tuple containing:
+                - final_hidden_states (Array): The output hidden states after MoE processing.
+                - router_logits (Array): The logits output by the gating network.
         """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -557,7 +556,7 @@ class Xerxes2DecoderLayer(nn.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        frequencies: tuple[chex.Array, chex.Array],
+        frequencies: tuple[Array, Array],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -568,10 +567,10 @@ class Xerxes2DecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -860,10 +859,10 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         Forward pass of the causal language model.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
+            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
             mode (Optional[common_types.RUNTIME_MODE_TYPES], optional): Runtime mode. Defaults to None.
             past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
                 Defaults to None.

@@ -62,11 +62,13 @@ from .types import ELMConfig
 from .utils import load_elm_config, save_elm_config
 
 if typing.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset, IterableDataset
 
     from easydel.data.core.protocols import ShardedDataSource
     from easydel.inference import eSurge
     from easydel.trainers import Trainer
+
+    from .types import TextDatasetInformCfg, VisualDatasetInformCfg
 logger = get_logger("eLargeModel")
 
 
@@ -169,6 +171,43 @@ class eLargeModel:
             eLargeModel instance
         """
         return cls(load_elm_config(json_path))
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str | os.PathLike | ePathLike) -> eLargeModel:
+        """Create eLargeModel from a YAML configuration file.
+
+        The YAML file may either contain the ELM config directly, or wrap it under
+        a `config`/`elarge_model`/`elm` key. If the YAML file also contains a
+        top-level `actions` key (e.g. used by `easydel.scripts.elarge`), that key
+        is ignored when loading the ELM configuration.
+        """
+        try:
+            import yaml  # type: ignore
+        except ImportError as e:
+            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
+
+        yaml_path = ePath(yaml_path)
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+
+        raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise TypeError(f"YAML root must be a mapping/dict, got {type(raw).__name__}.")
+
+        config = None
+        for key in ("config", "elarge_model", "elm"):
+            if key in raw:
+                config = raw[key]
+                break
+        if config is None:
+            config = {k: v for k, v in raw.items() if k != "actions"}
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise TypeError(f"Config must be a mapping/dict, got {type(config).__name__}.")
+        return cls(config)
 
     @classmethod
     def from_pretrained(
@@ -547,7 +586,7 @@ class eLargeModel:
 
     def set_mixture(
         self,
-        informs: list[dict] | None = None,
+        informs: list[TextDatasetInformCfg | VisualDatasetInformCfg] | None = None,
         batch_size: int = 32,
         streaming: bool = True,
         use_fast_loader: bool = True,
@@ -754,6 +793,37 @@ class eLargeModel:
         """
         save_elm_config(self._config, json_path)
 
+    def to_yaml(self, yaml_path: str | os.PathLike | ePathLike) -> None:
+        """Save configuration to a YAML file."""
+        try:
+            import yaml  # type: ignore
+        except ImportError as e:
+            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
+
+        def to_yamlable(obj: Any) -> Any:
+            if obj is None or isinstance(obj, str | int | float | bool):
+                return obj
+            if isinstance(obj, dict):
+                return {str(k): to_yamlable(v) for k, v in obj.items()}
+            if isinstance(obj, list | tuple | set):
+                return [to_yamlable(v) for v in obj]
+            if hasattr(obj, "to_dict") and callable(obj.to_dict):
+                return to_yamlable(obj.to_dict())
+            if hasattr(obj, "value") and not isinstance(obj, type):  # enums
+                return to_yamlable(getattr(obj, "value"))
+            if isinstance(obj, os.PathLike) or hasattr(obj, "__fspath__"):
+                return os.fspath(obj)
+            raise TypeError(f"Object of type {type(obj).__name__} is not YAML serializable")
+
+        data = to_yamlable(self._config)
+
+        yaml_path = ePath(yaml_path)
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        yaml_path.write_text(
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Get configuration as dictionary.
 
@@ -884,7 +954,8 @@ class eLargeModel:
             tok_path = self._config["model"].get("tokenizer", self.model_name)
             if not tok_path:
                 raise ValueError("Tokenizer path must be set")
-            self._tokenizer = AutoTokenizer.from_pretrained(tok_path)
+            trust_remote_code = bool(self._config.get("loader", {}).get("trust_remote_code", False))
+            self._tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=trust_remote_code)
         return self._tokenizer
 
     def build_esurge(self) -> "eSurge":
@@ -950,7 +1021,7 @@ class eLargeModel:
         reference_config["model"] = self._config["reference_model"]
         return build_model(reference_config)
 
-    def build_dataset(self):
+    def build_dataset(self) -> "Dataset | IterableDataset | None":
         """Build dataset from mixture configuration.
 
         Creates a dataset from the configured mixture of data sources.
@@ -991,7 +1062,7 @@ class eLargeModel:
         """
         return build_sharded_source(self._config)
 
-    def get_train_source(self) -> "ShardedDataSource | Dataset | None":
+    def get_train_source(self) -> "ShardedDataSource | Dataset | IterableDataset | None":
         """Get training data as ShardedDataSource or Dataset.
 
         Automatically selects the appropriate data format based on the
@@ -1104,8 +1175,8 @@ class eLargeModel:
 
     def train(
         self,
-        train_dataset: Dataset | ShardedDataSource | None = None,
-        eval_dataset: Dataset | ShardedDataSource | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         base_state_class: type[EasyDeLState] | None = None,
         args_class: type[TrainingArguments] | None = None,
         trainer_class: type[Trainer] | None = None,
@@ -1219,8 +1290,8 @@ class eLargeModel:
 
     def build_trainer(
         self,
-        train_dataset: Dataset | ShardedDataSource | None = None,
-        eval_dataset: Dataset | ShardedDataSource | None = None,
+        train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
+        eval_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         reference_model: EasyDeLBaseModule | None = None,
         reward_model: EasyDeLBaseModule | None = None,
         teacher_model: EasyDeLBaseModule | None = None,

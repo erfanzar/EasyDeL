@@ -16,7 +16,6 @@
 from functools import cached_property
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -349,15 +348,15 @@ class DbrxNormAttentionNorm(nn.Module):
         Forward pass of the attentionNrom module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
             DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
         """
@@ -423,7 +422,7 @@ class DbrxExpertGLU(nn.Module):
         self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
-    def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:
+    def __call__(self, x: Array, expert_idx: int) -> Array:
         expert_shape = (
             self.config.ffn_config.moe_num_experts,
             self.config.ffn_config.ffn_hidden_size,
@@ -485,10 +484,10 @@ class DbrxExperts(nn.Module):
 
     def __call__(
         self,
-        x: chex.Array,
-        weights: chex.Array,
-        top_weights: chex.Array,
-        top_experts: chex.Array,
+        x: Array,
+        weights: Array,
+        top_weights: Array,
+        top_experts: Array,
     ):
         final_hidden_state = jnp.zeros_like(x)
         for index in range(self.config.ffn_config.moe_num_experts):
@@ -538,7 +537,7 @@ class DbrxRouter(nn.Module):
             rngs=rngs,
         )
 
-    def jitter(self, x: chex.Array) -> chex.Array:
+    def jitter(self, x: Array) -> Array:
         if self.moe_jitter_eps is None:
             raise RuntimeError("The router does not have moe_jitter_eps set.")
         low = 1.0 - self.moe_jitter_eps
@@ -546,7 +545,7 @@ class DbrxRouter(nn.Module):
         noise = jax.random.normal(self.make_rng("params"), x.shape, dtype=x.dtype)
         return low + noise * (high - low)
 
-    def __call__(self, x: chex.Array, deterministic: bool = True) -> tuple[chex.Array, chex.Array, chex.Array]:
+    def __call__(self, x: Array, deterministic: bool = True) -> tuple[Array, Array, Array]:
         if not deterministic and self.moe_jitter_eps is not None:
             x = x * self.jitter(x)
 
@@ -620,7 +619,7 @@ class DbrxFFN(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, x: Array) -> tuple[Array, Array]:
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -703,16 +702,16 @@ class DbrxBlock(nn.Module):
         Forward pass of the attentionNrom module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights.
             output_router_logits (bool): If True, outputs router logits.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
             DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
         """
@@ -830,12 +829,12 @@ class DbrxModel(EasyDeLBaseModule):
         Forward pass of the model.
 
         Args:
-                input_ids (chex.Array): Token IDs to process.
-                attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens.
+                input_ids (Array): Token IDs to process.
+                attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens.
                     Defaults to None.
-                position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
-                segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
-                inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
+                position_ids (Optional[Array], optional): Position IDs. Defaults to None.
+                segment_ids (Optional[Array], optional): Segment IDs for segment-based attention. Defaults to None.
+                inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
                 output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
                 output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
                 output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.

@@ -658,16 +658,25 @@ class TransformerCacheView(BaseCacheView):
             sliding_window=sliding_window,
         )
 
-        value_cache_updated = _kv_struct_shard(value_cache_updated).astype(runtime_dtype)
-        key_cache_updated = _kv_struct_shard(key_cache_updated).astype(runtime_dtype)
+        # Keep the cache storage dtype stable (matches the cache allocation dtype) while
+        # returning KV in runtime dtype for the attention computation.
+        value_cache_storage = _kv_struct_shard(value_cache_updated)
+        key_cache_storage = _kv_struct_shard(key_cache_updated)
         batch_axes = getattr(self, "batch_sharding_axes", (BATCH,))
         indexs_updated = apply_logical_sharding(indexs, axes=batch_axes, **sharding_statics)
 
+        value_cache_out = value_cache_storage.astype(runtime_dtype)
+        key_cache_out = key_cache_storage.astype(runtime_dtype)
+
         return (
-            key_cache_updated,
-            value_cache_updated,
+            key_cache_out,
+            value_cache_out,
             mask_info,
-            self.replace(key=quantizer(key_cache_updated), value=quantizer(value_cache_updated), indexs=indexs_updated),
+            self.replace(
+                key=quantizer(key_cache_storage),
+                value=quantizer(value_cache_storage),
+                indexs=indexs_updated,
+            ),
             masking_details,
         )
 

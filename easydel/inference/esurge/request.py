@@ -129,6 +129,8 @@ class EngineRequest:
         self.stop_reason: int | str | None = None
 
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.structured_output_request = getattr(sampling_params, "guided_decoding", None) if sampling_params else None
+        self.use_structured_output = self.structured_output_request is not None
 
         if sampling_params is not None:
             assert sampling_params.max_tokens is not None

@@ -95,24 +95,31 @@ trainer.train()
 
 ## Command Line Training
 
-You can run SFT training directly from the command line:
+The legacy `easydel.scripts.finetune.*` entrypoints have been removed in favor of the unified YAML runner.
 
 ```bash
-python -m easydel.scripts.finetune.sft \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/Capybara \
-  --dataset_split "train" \
-  --dataset_text_field messages \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --packing True \
-  --total_batch_size 16 \
-  --learning_rate 2e-5 \
-  --learning_rate_end 5e-6 \
-  --num_train_epochs 3 \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+python -m easydel.scripts.elarge --config sft.yaml
+```
+
+Example `sft.yaml`:
+
+```yaml
+config:
+  model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  mixture:
+    informs:
+      - type: jsonl
+        data_files: train.jsonl
+        content_field: text
+  trainer:
+    trainer_type: sft
+    max_sequence_length: 2048
+    total_batch_size: 16
+    learning_rate: 2e-5
+    num_train_epochs: 3
+actions:
+  - train
 ```
 
 ## Dataset Formats

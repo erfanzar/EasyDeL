@@ -129,25 +129,15 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         """
         pmag = self.partition_manager
         return (
-            # Patch embedding convolution
             ("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
             (r"ln_pre/kernel", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/attention/(q_proj|k_proj|v_proj)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
+            (r"transformer/layers/\d+/attention/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"transformer/layers/\d+/attention/o_proj/kernel", pmag.resolve(RowWise)),
             (r"transformer/layers/\d+/attention/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/feed_forward/(gate_proj|up_proj)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
+            (r"transformer/layers/\d+/feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"transformer/layers/\d+/feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
             (r"transformer/layers/\d+/feed_forward/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"transformer/layers/\d+/(attention_norm|ffn_norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
+            (r"transformer/layers/\d+/(attention_norm|ffn_norm)/kernel", pmag.resolve(Replicated)),
             (r".*bias", pmag.resolve(Replicated)),
             (r".*", pmag.resolve(Replicated)),
         )

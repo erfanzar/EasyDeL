@@ -17,7 +17,6 @@ import functools
 import itertools
 import typing as tp
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
@@ -26,11 +25,13 @@ from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
@@ -49,19 +50,19 @@ def init_to_value(x, dtype):
 class MambaOutput(BaseModelOutput):
     """Output container for the base Mamba model with cached state."""
 
-    last_hidden_state: chex.Array = None
+    last_hidden_state: Array = None
     cache: RecurrentCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 @auto_pytree
 class MambaCausalLMOutput(BaseModelOutput):
     """Causal LM output including logits and cache for Mamba decoding."""
 
-    logits: chex.Array = None
+    logits: Array = None
     cache: RecurrentCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
 
 
 _T = tp.TypeVar("_T")
@@ -294,10 +295,10 @@ class MambaMixer(nn.Module):
 
     def __call__(
         self,
-        input_states: chex.Array,
+        input_states: Array,
         cache: RecurrentCacheView | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -436,11 +437,11 @@ class MambaBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         cache: RecurrentCacheView | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
+    ) -> Array:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -502,11 +503,11 @@ class MambaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
         cache: RecurrentCache | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaOutput:
@@ -593,8 +594,12 @@ class MambaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
-class MambaForCausalLM(EasyDeLBaseModule):
+class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):
     """Causal language model head on top of the Mamba backbone."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mamba"
+    _config_class = MambaConfig
 
     def __init__(
         self,
@@ -607,43 +612,23 @@ class MambaForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=MambaModel,
+            base_model_name="backbone",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.backbone = MambaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
         cache: RecurrentCache | None = None,
-        position_ids: chex.Array | None = None,
+        position_ids: Array | None = None,
         apply_lm_head: bool = True,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Array | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaCausalLMOutput:

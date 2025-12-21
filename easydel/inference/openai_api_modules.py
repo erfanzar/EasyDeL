@@ -89,7 +89,7 @@ class ChatMessage(OpenAIBaseModel):
     """
 
     role: str
-    content: str | list[tp.Mapping[str, str]]
+    content: str | list[tp.Mapping[str, tp.Any]]
     name: str | None = None
     function_call: dict[str, tp.Any] | None = None
 
@@ -106,7 +106,7 @@ class DeltaMessage(OpenAIBaseModel):
     """
 
     role: str | None = None
-    content: str | list[tp.Mapping[str, str]] | None = None
+    content: str | list[tp.Mapping[str, tp.Any]] | None = None
     function_call: dict[str, tp.Any] | None = None
 
 
@@ -276,6 +276,46 @@ class CompletionRequest(OpenAIBaseModel):
     stop: str | list[str] | None = None
     logit_bias: dict[str, float] | None = None
     user: str | None = None
+
+
+class ResponsesRequest(OpenAIBaseModel):
+    """Represents a request to the OpenAI Responses API (POST /v1/responses)."""
+
+    model: str
+    input: str | list[tp.Any] | None = None
+    messages: list[tp.Mapping[str, tp.Any]] | None = None
+    instructions: str | None = None
+
+    # Conversation state / storage
+    store: bool | None = None
+    previous_response_id: str | None = None
+    conversation: str | dict[str, tp.Any] | None = None
+
+    # Generation settings
+    max_output_tokens: int | None = None
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
+    stop: str | list[str] | None = None
+    n: int | None = None
+
+    # Tools
+    tools: list[tp.Mapping[str, tp.Any]] | None = None
+    functions: list[tp.Mapping[str, tp.Any]] | None = None
+    tool_choice: str | dict[str, tp.Any] | None = None
+    parallel_tool_calls: bool | None = None
+
+    # Streaming / misc
+    stream: bool | None = False
+    truncation: str | None = None
+    include: list[str] | None = None
+    metadata: dict[str, tp.Any] | None = None
 
 
 class CompletionLogprobs(OpenAIBaseModel):

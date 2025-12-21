@@ -40,21 +40,17 @@ args = TrainingArguments(
     model_name="MyFineTunedModel",
     num_train_epochs=3,
     learning_rate=2e-5,
-    total_batch_size=32, # Effective batch size (per_device_train_batch_size * num_devices)
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
+    total_batch_size=32,  # Total batch size across all devices
+    eval_batch_size=32,   # Batch size for evaluation
     gradient_accumulation_steps=1,
     weight_decay=0.01,
-    max_steps=-1, # If > 0, overrides num_train_epochs
-    gradient_checkpointing="nothing_saveable", # Or "everything_saveable"
-    sharding_array=(1, -1, 1, 1, 1), # Device mesh shape for model sharding
-    use_fast_kernels=True,
-    logging_steps=10,
-    save_steps=100, # Save checkpoint every 100 steps
-    save_total_limit=2, # Keep only the latest 2 checkpoints
-    evaluation_strategy="steps", # Or "epoch"
-    eval_steps=100, # Evaluate every 100 steps
-    output_dir="runs/my_model_run"
+    max_training_steps=None,  # If set, overrides num_train_epochs
+    log_steps=10,
+    save_steps=100,  # Save checkpoint every 100 steps
+    save_total_limit=2,  # Keep only the latest 2 checkpoints
+    do_eval=True,  # Enable evaluation
+    evaluation_steps=100,  # Evaluate every 100 steps
+    save_directory="runs/my_model_run",
     # Add other relevant TrainingArguments as needed
 )
 

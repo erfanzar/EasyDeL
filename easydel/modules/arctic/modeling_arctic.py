@@ -16,7 +16,6 @@
 import typing
 from functools import partial
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -261,8 +260,8 @@ class ArcticMLPMoE(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
     ):
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -429,10 +428,10 @@ class ArcticMoeBlock(BaseMoeModule):
         Otherwise, it passes the input through the standard MLP.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
 
         Returns:
-                tp.Tuple[chex.Array, chex.Array]: Tuple containing the output
+                tp.Tuple[Array, Array]: Tuple containing the output
                     hidden state and router_logits (or None if not MoE).
         """
         if self.is_moe_layer:
@@ -688,11 +687,11 @@ class ArcticModel(EasyDeLBaseModule):
         """Forward pass through the ArcticModel.
 
         Args:
-                input_ids (Optional[chex.Array]): Input token IDs.
-                inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-                attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
-                position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
-                segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+                input_ids (Optional[Array]): Input token IDs.
+                inputs_embeds (Optional[Array]): Input embeddings (alternative to input_ids).
+                attention_mask (Optional[Array]): Mask to avoid attending to padding tokens.
+                position_ids (Optional[Array]): Position IDs for positional embeddings.
+                segment_ids (Optional[Array]): Segment IDs (if applicable).
                 output_attentions (Optional[bool]): Whether to return attention weights.
                 output_hidden_states (Optional[bool]): Whether to return all hidden states.
                 output_router_logits (Optional[bool]): Whether to return router logits.
