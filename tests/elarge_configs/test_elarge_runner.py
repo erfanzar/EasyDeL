@@ -89,6 +89,16 @@ class TestElargeDryRun:
             "dpo.yaml",
             "orpo.yaml",
             "distillation.yaml",
+            "reward.yaml",
+            "bco.yaml",
+            "cpo.yaml",
+            "kto.yaml",
+            "gkd.yaml",
+            "grpo.yaml",
+            "gfpo.yaml",
+            "gspo.yaml",
+            "xpo.yaml",
+            "nash_md.yaml",
         ],
     )
     def test_dry_run(self, config_name: str):
@@ -148,6 +158,16 @@ if __name__ == "__main__":
         "dpo": "dpo.yaml",
         "orpo": "orpo.yaml",
         "distillation": "distillation.yaml",
+        "reward": "reward.yaml",
+        "bco": "bco.yaml",
+        "cpo": "cpo.yaml",
+        "kto": "kto.yaml",
+        "gkd": "gkd.yaml",
+        "grpo": "grpo.yaml",
+        "gfpo": "gfpo.yaml",
+        "gspo": "gspo.yaml",
+        "xpo": "xpo.yaml",
+        "nash_md": "nash_md.yaml",
     }
 
     if args.config == "all":

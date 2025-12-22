@@ -1,5 +1,7 @@
-# DPO (Direct Preference Optimization) test config
-# Mirrors tests/trainers/direct_preference_optimization_trainer.py
+# KTO (Kahneman-Tversky Optimization) test config
+# Mirrors tests/trainers/kto_trainer.py
+# Note: Uses legacy HF Dataset pipeline (mixture.use_sharded_source: false) because KTOTrainer
+# performs eager HF `.map(...)` preprocessing.
 
 model:
   name_or_path: Qwen/Qwen2.5-0.5B-Instruct
@@ -25,28 +27,33 @@ base_config:
     gradient_checkpointing: ""
 
 mixture:
+  use_sharded_source: false
   informs:
     - type: trl-lib/ultrafeedback_binarized
       split: "train"
   batch_size: 4
+  streaming: false
 
 trainer:
-  trainer_type: dpo
+  trainer_type: kto
   beta: 0.1
+  loss_type: kto
   learning_rate: 8.0e-6
   num_train_epochs: 1
   total_batch_size: 4
   gradient_accumulation_steps: 2
   max_training_steps: 1024
-  max_sequence_length: 512
+  max_length: 512
   max_prompt_length: 256
   max_completion_length: 256
+  max_sequence_length: 512
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
   shuffle_train_dataset: false
-  save_directory: ./tmp-files/elarge-tests/dpo
+  save_directory: ./tmp-files/elarge-tests/kto
 
 actions:
   - validate
   - train
+

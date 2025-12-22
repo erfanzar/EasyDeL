@@ -228,19 +228,40 @@ class GRPOTrainer(Trainer):
         ):
             if value is not None and key not in self.arguments.generation_extra_kwargs:
                 self.arguments.generation_extra_kwargs[key] = value
+
+        def _peek_first_example(dataset):
+            if dataset is None:
+                return None
+            if isinstance(dataset, dict):
+                for item in dataset.values():
+                    return _peek_first_example(item)
+                return None
+            try:
+                return dataset[0]
+            except Exception:
+                pass
+            try:
+                return next(iter(dataset))
+            except Exception:
+                pass
+            try:
+                shard_names = getattr(dataset, "shard_names", None)
+                open_shard = getattr(dataset, "open_shard", None)
+                if shard_names and open_shard:
+                    return next(iter(open_shard(shard_names[0])))
+            except Exception:
+                pass
+            return None
+
         # Check if datasets are conversational before passing to BaseTrainer
         self.train_is_conversational = False
         self.eval_is_conversational = False
-        if train_dataset is not None:
-            try:
-                self.train_is_conversational = is_conversational(train_dataset[0])
-            except (IndexError, KeyError):
-                pass
-        if eval_dataset is not None:
-            try:
-                self.eval_is_conversational = is_conversational(eval_dataset[0])
-            except (IndexError, KeyError):
-                pass
+        train_sample = _peek_first_example(train_dataset)
+        if train_sample is not None:
+            self.train_is_conversational = is_conversational(train_sample)
+        eval_sample = _peek_first_example(eval_dataset)
+        if eval_sample is not None:
+            self.eval_is_conversational = is_conversational(eval_sample)
 
         self.data_tokenize_fn = data_tokenize_fn
         log_table = None

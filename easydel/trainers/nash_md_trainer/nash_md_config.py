@@ -23,7 +23,7 @@ from easydel.utils.compiling_utils import hash_fn
 from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 
 
-@Registry.register("trainer-arguments", "nash-md")
+@Registry.register("trainer-arguments", ["nash-md", "nash_md"])
 @dataclass
 class NashMDConfig(GRPOConfig):
     """Configuration for the :class:`~easydel.trainers.NashMDTrainer`.

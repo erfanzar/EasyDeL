@@ -17,7 +17,6 @@ import functools
 from typing import ClassVar
 
 import jax.lax
-from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo

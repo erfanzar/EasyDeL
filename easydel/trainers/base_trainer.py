@@ -67,6 +67,7 @@ from .trainer_protocol import (
     TrainerOutput,
 )
 from .training_configurations import MetricsType, TrainingArguments
+from .training_utils import resolve_total_steps
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
 try:
@@ -2094,27 +2095,33 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         def calculate_steps(dataset, is_train: bool) -> int:
-            try:
-                total_data_len = len(dataset)
-            except TypeError as e:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    ) from e
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
 
@@ -2273,27 +2280,33 @@ class BaseTrainer(BaseTrainerProtocol):
             Raises:
               ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
             """
-            try:
-                total_data_len = len(dataset)
-            except TypeError as e:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    ) from e
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
         def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
             """

@@ -24,7 +24,7 @@ base_config:
 mixture:
   informs:
     - type: trl-lib/ultrafeedback_binarized
-      split: "train[:50%]"
+      split: "train"
   batch_size: 4
 
 trainer:
@@ -34,7 +34,7 @@ trainer:
   num_train_epochs: 1
   total_batch_size: 4
   gradient_accumulation_steps: 2
-  max_training_steps: 10
+  max_training_steps: 1024
   max_sequence_length: 512
   max_prompt_length: 256
   max_completion_length: 256

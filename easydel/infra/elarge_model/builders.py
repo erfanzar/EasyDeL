@@ -43,6 +43,7 @@ from easydel.modules.auto import (
     AutoEasyDeLModelForDiffusionLM,
     AutoEasyDeLModelForImageTextToText,
     AutoEasyDeLModelForSeq2SeqLM,
+    AutoEasyDeLModelForSequenceClassification,
     AutoEasyDeLModelForSpeechSeq2Seq,
     AutoEasyDeLModelForZeroShotImageClassification,
 )
@@ -147,6 +148,8 @@ def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
         return AutoEasyDeLModelForZeroShotImageClassification.from_pretrained(**kw)
     if task == TaskType.DIFFUSION_LM:
         return AutoEasyDeLModelForDiffusionLM.from_pretrained(**kw)
+    if task == TaskType.SEQUENCE_CLASSIFICATION:
+        return AutoEasyDeLModelForSequenceClassification.from_pretrained(**kw)
     if task == TaskType.ANY_TO_ANY:
         return AutoEasyDeLAnyToAnyModel.from_pretrained(**kw)
     return AutoEasyDeLModel.from_pretrained(**kw)
@@ -968,10 +971,15 @@ def _create_source_from_inform(
     if source_type in ("huggingface", "hf"):
         if not isinstance(data_files, str):
             raise TypeError("mixture.informs[].data_files must be a string for HuggingFace datasets")
+        streaming = inform_cfg.get("streaming")
+        if streaming is None:
+            streaming = mixture_cfg.get("streaming", True)
         return HuggingFaceShardedSource(
             dataset_name=data_files,
             split=split,
             subset=dataset_split_name,
+            streaming=streaming,
+            cache_dir=mixture_cfg.get("cache_dir"),
         )
 
     # Expand files
@@ -980,10 +988,15 @@ def _create_source_from_inform(
     except FileNotFoundError:
         # Might be a HuggingFace dataset if type wasn't specified
         if isinstance(data_files, str) and not source_type:
+            streaming = inform_cfg.get("streaming")
+            if streaming is None:
+                streaming = mixture_cfg.get("streaming", True)
             return HuggingFaceShardedSource(
                 dataset_name=data_files,
                 split=split,
                 subset=dataset_split_name,
+                streaming=streaming,
+                cache_dir=mixture_cfg.get("cache_dir"),
             )
         raise
 

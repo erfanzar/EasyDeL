@@ -23,6 +23,15 @@ from __future__ import annotations
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+_TRAINER_TYPE_ALIASES: dict[str, str] = {
+    "nash_md": "nash-md",
+}
+
+
+def _normalize_trainer_type(trainer_type: str) -> str:
+    normalized = trainer_type.lower()
+    return _TRAINER_TYPE_ALIASES.get(normalized, normalized)
+
 
 class LossConfig(TypedDict, total=False):
     ignore_index: NotRequired[int]
@@ -62,7 +71,22 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     trainer_type: NotRequired[
         Literal[
-            "sft", "base", "dpo", "grpo", "orpo", "reward", "distillation", "bco", "cpo", "gkd", "kto", "nash_md", "xpo"
+            "sft",
+            "base",
+            "dpo",
+            "grpo",
+            "gfpo",
+            "gspo",
+            "orpo",
+            "reward",
+            "distillation",
+            "bco",
+            "cpo",
+            "gkd",
+            "kto",
+            "nash_md",
+            "nash-md",
+            "xpo",
         ]
     ]
     learning_rate: NotRequired[float]
@@ -590,6 +614,23 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "top_k": 50,
         "temperature": 0.7,
     },
+    "nash-md": {
+        "trainer_prefix": "nashmdtrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.1,
+        "mixture_coef": 0.5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
     "xpo": {
         "trainer_prefix": "xpotrainer",
         "learning_rate": 1e-6,
@@ -631,7 +672,7 @@ def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> Non
         ...     "custom_param": 42,
         ... })
     """
-    TRAINER_SPECIFIC_DEFAULTS[trainer_type.lower()] = defaults
+    TRAINER_SPECIFIC_DEFAULTS[_normalize_trainer_type(trainer_type)] = defaults
 
 
 def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
@@ -645,6 +686,7 @@ def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
     Returns:
         Complete defaults dictionary for the trainer
     """
+    trainer_type = _normalize_trainer_type(trainer_type)
     defaults = dict(BASE_TRAINER_DEFAULTS)
     if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
         defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
@@ -675,7 +717,7 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
     from copy import deepcopy
 
     config = deepcopy(config)
-    trainer_type = config.get("trainer_type", "sft").lower()
+    trainer_type = _normalize_trainer_type(config.get("trainer_type", "sft"))
 
     # Get merged defaults from registry
     defaults = get_trainer_defaults(trainer_type)
@@ -722,7 +764,7 @@ def get_trainer_class(trainer_type: str):
     """
     from easydel.utils import Registry
 
-    return Registry.get_or_raise("trainer", trainer_type.lower())
+    return Registry.get_or_raise("trainer", _normalize_trainer_type(trainer_type))
 
 
 def get_training_arguments_class(trainer_type: str):
@@ -744,4 +786,4 @@ def get_training_arguments_class(trainer_type: str):
 
     from easydel.utils import Registry
 
-    return Registry.get_or_raise("trainer-arguments", trainer_type.lower())
+    return Registry.get_or_raise("trainer-arguments", _normalize_trainer_type(trainer_type))
