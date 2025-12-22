@@ -635,14 +635,6 @@ class Llama4TextDecoderLayer(nn.Module):
         hidden_states = hidden_states + attn_outputs.attention_output
 
         feed_forward_input = self.post_attention_layernorm(hidden_states)
-        # TODO: Support Chunked MLP for LLaMA4
-        # if self.config.use_scan_mlp:
-        # 	feed_forward_hidden_states = block_wise_ffn(
-        # 		self.feed_forward,
-        # 		feed_forward_input,
-        # 		self.config.scan_mlp_chunk_size,
-        # 	)
-        # else:
         feed_forward_hidden_states = self.feed_forward(feed_forward_input)
         if self.is_moe_layer:
             feed_forward_hidden_states, router_logits = feed_forward_hidden_states
@@ -781,14 +773,6 @@ class Llama4TextModel(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
         mask_info = mask_info.apply_chunked(self.config.attention_chunk_size)
-        # causal_mask = jnp.expand_dims(
-        #     _create_chunked_attention_mask(
-        #         self.config.attention_chunk_size,
-        #         0,
-        #         sequence_length,
-        #     ),
-        #     (0, 1),
-        # )
         frequencies = self.compute_complex_rotary(position_ids)
 
         for idx, block in enumerate(self.layers):

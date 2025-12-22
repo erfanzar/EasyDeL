@@ -294,7 +294,6 @@ class FalconMambaMixer(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.time_step_rank = time_step_rank
 
-        # Initialize SSM1 operation
         metadata = OperationMetadata(
             runtime_dtype=dtype,
             runtime_softmax_dtype=jnp.float32,
@@ -313,7 +312,7 @@ class FalconMambaMixer(nn.Module):
         dtype = input_states.dtype
 
         projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
-        projected_states = jnp.swapaxes(projected_states, 2, 1)  # [batch, 2*intermediate, seq_len]
+        projected_states = jnp.swapaxes(projected_states, 2, 1)
         hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
         if attention_mask is not None:
@@ -328,17 +327,16 @@ class FalconMambaMixer(nn.Module):
         is_inference = seq_len == 1 and cache_params is not None
 
         if is_inference and cache_params is not None and cache_params.conv_state is not None:
-            new_hidden = hidden_states[:, :, 0]  # [batch, intermediate]
+            new_hidden = hidden_states[:, :, 0]
             conv_state, _, cache_view = cache_params.concatenate_to_cache(conv_state=new_hidden)
 
-            # Compute conv output for the current token using the same Conv1D path as prefill.
-            conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]  # [batch, d, k]
+            conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]
             conv_out = conv_out_full[:, :, self.conv_kernel_size - 1]
-            hidden_states = jnp.expand_dims(self.act(conv_out).astype(dtype), -1)  # [batch, d, 1]
+            hidden_states = jnp.expand_dims(self.act(conv_out).astype(dtype), -1)
         else:
             conv_input = hidden_states
             conv_out = self.conv1d(conv_input)[..., :seq_len]
-            hidden_states = self.act(conv_out).astype(dtype)  # [batch, d, seq_len]
+            hidden_states = self.act(conv_out).astype(dtype)
 
             if cache_params is not None:
                 if seq_len >= self.conv_kernel_size:
@@ -351,43 +349,35 @@ class FalconMambaMixer(nn.Module):
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # 3. State Space Model sequence transformation
-        # 3.a. Selection - project hidden_states to get time_step, B, C
         ssm_parameters = checkpoint_name(self.x_proj(jnp.swapaxes(hidden_states, 2, 1)), name="ssm_x_proj")
         time_step, B, C = jnp.split(
             ssm_parameters,
             [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
             axis=-1,
         )
-        # B, C: [batch, seq_len, ssm_state_size]
 
-        # FalconMamba-specific: RMS normalization on B, C, time_step
         B = rms_forward(B, variance_epsilon=self.rms_eps)
         C = rms_forward(C, variance_epsilon=self.rms_eps)
         time_step = rms_forward(time_step, variance_epsilon=self.rms_eps)
 
         discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
         discrete_time_step = jax.nn.softplus(discrete_time_step)
-        # discrete_time_step: [batch, seq_len, intermediate_size]
 
-        # 3.b. SSM operation via SSM1Op
-        # Transpose hidden_states and gate from [batch, d, seq_len] to [batch, seq_len, d]
-        hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)  # [batch, seq_len, d]
-        gate_t = jnp.swapaxes(gate, 1, 2)  # [batch, seq_len, d]
+        hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)
+        gate_t = jnp.swapaxes(gate, 1, 2)
 
         ssm_output = self.ssm_op(
             hidden_states=hidden_states_t,
-            A=self.A_log.value,  # [d, n] in log form, SSM1Op applies -exp() internally
-            B=B,  # [batch, seq_len, n]
-            C=C,  # [batch, seq_len, n]
-            D=self.D.value,  # [d]
-            discrete_time_step=discrete_time_step,  # [batch, seq_len, d]
-            gate=gate_t,  # [batch, seq_len, d]
-            ssm_state=ssm_state0,  # [batch, d, n]
+            A=self.A_log.value,
+            B=B,
+            C=C,
+            D=self.D.value,
+            discrete_time_step=discrete_time_step,
+            gate=gate_t,
+            ssm_state=ssm_state0,
             activation=self.activation,
         )
 
-        # Output is [batch, seq_len, d], transpose back to [batch, d, seq_len]
         y = jnp.swapaxes(ssm_output.attention_outputs, 1, 2)
 
         if cache_view is not None:

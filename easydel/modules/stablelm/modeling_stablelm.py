@@ -198,7 +198,6 @@ class StableLmLayerNormPerHead(nn.Module):
             Array: Hidden states after applying LayerNorm per head, same shape as input.
         """
         # hidden_states: [batch, seq_len, num_heads * head_dim]
-        # Reshape to [batch, seq_len, num_heads, head_dim]
         states_per_heads = jnp.split(hidden_states, 1, axis=1)
         # Normalize and merge the heads back together
         return jnp.concatenate(
@@ -306,7 +305,6 @@ class StableLmAttention(UnifiedAttention):
             checkpoint_name(self.value_projection(hidden_states), "attn_value"),
         )
 
-        # Reshape to multi-head format
         query_states = query_states.reshape(
             batch_size,
             sequence_length,

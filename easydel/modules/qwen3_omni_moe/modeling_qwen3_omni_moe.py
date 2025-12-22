@@ -2723,7 +2723,6 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         Returns:
             BaseModelOutput with audio features (not full waveform - upsampling done externally).
         """
-        # Apply offset and get embeddings, then mean across quantizers
         # codes shape: [batch, num_quantizers, seq_len]
         codes_with_offset = codec_tokens + self.code_offset
         hidden_states = self.code_embedding(codes_with_offset.astype("i4")).mean(axis=1)

@@ -1553,7 +1553,6 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         else:
             position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
 
-        # Create MaskInfo from attention mask
         decoder_mask_info = MaskInfo.from_attention_mask(extended_attention_mask)
 
         return self.prepare_inputs_for_call(

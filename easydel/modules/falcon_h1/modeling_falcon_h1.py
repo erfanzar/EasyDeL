@@ -353,7 +353,6 @@ class FalconH1Mixer(nn.Module):
             **dot_cfg,
         )
 
-        # Initialize SSM2 operation
         metadata = OperationMetadata(
             runtime_dtype=dtype,
             runtime_softmax_dtype=jnp.float32,
@@ -411,11 +410,9 @@ class FalconH1Mixer(nn.Module):
 
         # Convolution with cache support for decode mode
         if seq_len == 1 and cache_view is not None and cache_view.conv_state is not None:
-            # Decode mode: use cached conv_state
             new_token = hidden_states_B_C[:, 0, :]  # [batch, conv_dim]
             conv_state, _, updated_cache_view = cache_view.concatenate_to_cache(conv_state=new_token)
 
-            # Compute conv output for the current token using the same Conv1D path as prefill.
             # This keeps decode numerically consistent with the full convolution + slice.
             conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]  # [batch, conv_dim, k]
             conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
@@ -440,7 +437,6 @@ class FalconH1Mixer(nn.Module):
         groups_time_state_size = self.n_groups * self.ssm_state_size
         x, B, C = jnp.split(conv_out, [self.intermediate_size, self.intermediate_size + groups_time_state_size], axis=-1)
 
-        # Reshape for SSM2Op
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
@@ -452,7 +448,6 @@ class FalconH1Mixer(nn.Module):
             # For padding tokens, force dt=0 so the SSM state remains unchanged.
             dt = dt * q_mask[:, :, None].astype(dt.dtype)
 
-        # Get initial SSM state from cache
         if cache_view is not None and cache_view.recurrent_state is not None:
             ssm_state0 = cache_view.recurrent_state.astype(jnp.float32)
         else:
@@ -473,7 +468,6 @@ class FalconH1Mixer(nn.Module):
             precision=self.precision,
         )
 
-        # Output is [batch, seq_len, num_heads * head_dim]
         y = ssm_output.attention_outputs
 
         # Update cache with final SSM state
@@ -638,7 +632,6 @@ class FalconH1DecoderLayer(nn.Module):
         )
         mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
-        # Apply attention with muP scaling
         # Pass updated_cache_view so attention can update key/value while preserving mamba's state
         attn_output = self.self_attn(
             hidden_states * self.attention_in_multiplier,
@@ -796,12 +789,10 @@ class FalconH1Model(EasyDeLBaseModule):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        # Process through decoder layers
         for layer_idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # Get cache view for this layer
             cache_view = None
             if past_key_values is not None:
                 cache_view = past_key_values.get_view(layer_idx)

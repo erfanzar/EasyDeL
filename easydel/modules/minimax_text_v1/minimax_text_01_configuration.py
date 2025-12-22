@@ -175,7 +175,6 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         """
         pmag = self.partition_manager
         return (
-            # 1. Embeddings
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
             (r"self_attn/(q_proj|k_proj|v_proj|qkv_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/(o_proj|out_proj)/kernel", pmag.resolve(RowWise)),

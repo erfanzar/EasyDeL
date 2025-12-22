@@ -351,7 +351,6 @@ class Mamba2Mixer(nn.Module):
             rngs=rngs,
         )
 
-        # Initialize SSM2 operation
         metadata = OperationMetadata(
             runtime_dtype=dtype,
             runtime_softmax_dtype=jnp.float32,
@@ -415,7 +414,6 @@ class Mamba2Mixer(nn.Module):
             new_token = conv_in[:, 0, :]  # [batch, conv_dim]
             conv_state, _, cache_view = cache_params.concatenate_to_cache(conv_state=new_token)
 
-            # Compute conv output for the current token using the same Conv1D path as prefill.
             conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]  # [batch, conv_dim, k]
             conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
         else:
@@ -440,7 +438,6 @@ class Mamba2Mixer(nn.Module):
             axis=-1,
         )
 
-        # Reshape for SSM2Op
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
@@ -451,7 +448,6 @@ class Mamba2Mixer(nn.Module):
         dt = jax.nn.softplus(dt + self.dt_bias.value.astype(jnp.float32))
         dt = jnp.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
-        # Get initial SSM state
         if cache_params is not None and cache_params.recurrent_state is not None:
             ssm_state0 = cache_params.recurrent_state.astype(jnp.float32)
         else:
@@ -472,7 +468,6 @@ class Mamba2Mixer(nn.Module):
             precision=self.precision,
         )
 
-        # Output is [batch, seq_len, num_heads * head_dim]
         y = ssm_output.attention_outputs
 
         if cache_view is not None:

@@ -739,7 +739,6 @@ class Qwen3NextLinearAttention(nn.Module):
 
         self.dt_bias = nn.Param(jnp.ones((self.num_v_heads,), dtype=param_dtype))
 
-        # Initialize GatedDeltaRule operation eagerly for discovery
         metadata = OperationMetadata(
             runtime_dtype=self.dtype,
             runtime_softmax_dtype=jnp.float32,

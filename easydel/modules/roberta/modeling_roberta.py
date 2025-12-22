@@ -934,7 +934,6 @@ class RobertaModel(EasyDeLBaseModule):
                 # No padding - all ones
                 cross_attn_mask = jnp.ones((batch_size, decoder_seq_len, encoder_seq_len), dtype=jnp.bool_)
 
-            # Create MaskInfo from cross-attention mask [batch, 1, decoder_seq, encoder_seq]
             encoder_mask_info = MaskInfo.from_attention_mask(
                 attention_mask=cross_attn_mask[:, None, :, :],
             )

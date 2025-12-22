@@ -752,7 +752,6 @@ class GPT2Model(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        # Get input embeddings
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
 

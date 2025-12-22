@@ -55,7 +55,6 @@ from easydel.layers.norms import RMSNorm
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
-# TODO: Convert this to a jitable jax fn and use that inside model instead of precall
 def get_rope_index(
     input_ids: np.ndarray,
     image_grid_thw: np.ndarray | None = None,

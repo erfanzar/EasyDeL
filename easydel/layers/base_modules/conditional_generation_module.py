@@ -212,14 +212,12 @@ class BaseConditionalGenerationModule(BaseTaskModule[ModelT, ConfigT]):
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply logical sharding
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # Apply LM head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
