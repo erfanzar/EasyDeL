@@ -95,13 +95,13 @@ actions:
 
 ### Available Actions
 
-| Action | Description |
-|--|-|
-| `validate` | Validate configuration before execution |
-| `train` | Run training with configured trainer |
-| `eval` | Evaluate with lm-evaluation-harness |
-| `serve` | Start OpenAI-compatible API server |
-| `to_yaml` / `to_json` | Save normalized config |
+| Action                | Description                             |
+| --------------------- | --------------------------------------- |
+| `validate`            | Validate configuration before execution |
+| `train`               | Run training with configured trainer    |
+| `eval`                | Evaluate with lm-evaluation-harness     |
+| `serve`               | Start OpenAI-compatible API server      |
+| `to_yaml` / `to_json` | Save normalized config                  |
 
 ## Training Examples
 
