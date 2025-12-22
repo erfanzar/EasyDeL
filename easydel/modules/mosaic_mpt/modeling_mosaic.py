@@ -22,7 +22,6 @@ from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
-from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int

@@ -27,6 +27,43 @@ SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
 
+def resolve_total_steps(
+    *,
+    forced_steps: int | None,
+    total_data_len: int | None,
+    batch_size: int,
+    num_epochs: int,
+    gradient_accumulation_steps: int,
+    is_train: bool,
+) -> int:
+    """Resolve total train/eval steps from config and dataset length.
+
+    Notes:
+        - `forced_steps` is interpreted as *optimizer update* steps for training (i.e., after gradient accumulation).
+        - When `forced_steps` is not provided, training steps are derived from dataset length and then divided by
+          `gradient_accumulation_steps` to convert micro-batches into optimizer updates.
+    """
+    if forced_steps is not None:
+        return int(forced_steps)
+
+    if total_data_len is None:
+        raise ValueError("`total_data_len` must be provided when `forced_steps` is None.")
+    if batch_size <= 0:
+        raise ValueError("`batch_size` must be > 0.")
+    if num_epochs <= 0:
+        return 0
+
+    steps_per_epoch = (total_data_len + batch_size - 1) // batch_size
+    steps = steps_per_epoch * num_epochs
+
+    if is_train:
+        if gradient_accumulation_steps <= 0:
+            raise ValueError("`gradient_accumulation_steps` must be > 0.")
+        steps //= gradient_accumulation_steps
+
+    return int(steps)
+
+
 def make_assertions_and_get_sizes(
     batch: dict,
     gradient_accumulation_steps: int,

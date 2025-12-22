@@ -25,8 +25,10 @@ from logging import getLogger as _getlogger
 try:
     from eformer.loggings import get_logger as _get_logger
 except ModuleNotFoundError:  # pragma: no cover
+
     def _get_logger(name: str | None = None):
         return _getlogger(name or __name__)
+
 
 from packaging.version import Version as _version
 from ray import is_initialized

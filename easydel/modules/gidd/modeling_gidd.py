@@ -743,7 +743,6 @@ class GiddModel(EasyDeLBaseModule):
         # Calculate residual scale factor
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
-
         embed_block = auto_remat(
             nn.Embed,
             policy=config.gradient_checkpointing,

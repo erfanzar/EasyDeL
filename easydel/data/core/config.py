@@ -96,7 +96,7 @@ class DatasetConfig:
     name: str | None = None
 
     # Source options
-    type: Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "hf", "txt"] | None = None  # noqa: A003
+    type: Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "hf", "txt"] | None = None
     split: str = "train"
     num_rows: int | None = None
     dataset_split_name: str | None = None
@@ -312,7 +312,7 @@ class SaveStageConfig:
 
     enabled: bool = False
     output_dir: str = "./output"
-    format: Literal["parquet", "arrow", "jsonl"] = "parquet"  # noqa: A003
+    format: Literal["parquet", "arrow", "jsonl"] = "parquet"
     num_shards: int | None = None
     compression: str | None = None
     max_shard_size: str | int = "500MB"

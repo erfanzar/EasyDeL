@@ -810,7 +810,7 @@ class eLargeModel:
             if hasattr(obj, "to_dict") and callable(obj.to_dict):
                 return to_yamlable(obj.to_dict())
             if hasattr(obj, "value") and not isinstance(obj, type):  # enums
-                return to_yamlable(getattr(obj, "value"))
+                return to_yamlable(obj.value)
             if isinstance(obj, os.PathLike) or hasattr(obj, "__fspath__"):
                 return os.fspath(obj)
             raise TypeError(f"Object of type {type(obj).__name__} is not YAML serializable")
@@ -819,10 +819,7 @@ class eLargeModel:
 
         yaml_path = ePath(yaml_path)
         yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        yaml_path.write_text(
-            yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
+        yaml_path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     def to_dict(self) -> dict[str, Any]:
         """Get configuration as dictionary.
@@ -1020,6 +1017,32 @@ class eLargeModel:
         reference_config = dict(self._config)
         reference_config["model"] = self._config["reference_model"]
         return build_model(reference_config)
+
+    def build_reward_model(self) -> EasyDeLBaseModule | None:
+        """Build the reward model for RLHF trainers (GRPO/GFPO/GSPO/XPO/Nash-MD).
+
+        Loads the reward model using the same loader configuration as the
+        primary model, but with the `reward_model` configuration block.
+
+        Returns:
+            EasyDeLBaseModule instance for the reward model, or None if no
+            reward model is configured.
+
+        Notes:
+            Reward models are typically sequence-classification heads with `num_labels=1`.
+            In YAML, set for example:
+                reward_model:
+                  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+                  task: sequence-classification
+                  extra_kwargs:
+                    num_labels: 1
+        """
+        if "reward_model" not in self._config:
+            return None
+
+        reward_config = dict(self._config)
+        reward_config["model"] = self._config["reward_model"]
+        return build_model(reward_config)
 
     def build_dataset(self) -> "Dataset | IterableDataset | None":
         """Build dataset from mixture configuration.
@@ -1392,6 +1415,21 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type in {"bco", "kto"}:
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
         elif trainer_type == "orpo":
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
@@ -1400,15 +1438,49 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
-        elif trainer_type == "grpo":
+        elif trainer_type in {"grpo", "gfpo", "gspo"}:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
-            trainer_kwargs["reward_funcs"] = reward_funcs if reward_funcs is not None else reward_model
+            trainer_kwargs["reward_funcs"] = resolved_reward
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["processing_class"] = self._tokenizer
-            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", self._tokenizer)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type in {"xpo", "nash-md", "nash_md"}:
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    f"{trainer_type} training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", self._tokenizer)
 
         elif trainer_type == "sft":
             trainer_kwargs["arguments"] = training_args
@@ -1425,6 +1497,22 @@ class eLargeModel:
             trainer_kwargs["processing_class"] = self._tokenizer
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
+        elif trainer_type == "gkd":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["formatting_func"] = kwargs.get("formatting_func", None)
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
         elif trainer_type == "distillation":

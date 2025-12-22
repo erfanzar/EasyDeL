@@ -103,7 +103,7 @@ class BaseDatasetInform:
         format_fields: Optional mapping for renaming fields.
     """
 
-    type: DatasetType | str | None = None  # noqa: A003
+    type: DatasetType | str | None = None
     data_files: os.PathLike | str | list[os.PathLike | str] | None = None
     num_rows: int | None = None
     dataset_split_name: str | None = None

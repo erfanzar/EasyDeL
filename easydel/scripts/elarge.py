@@ -1,3 +1,17 @@
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unified eLargeModel runner driven by YAML.
 
 This module provides a single entrypoint to run common workflows (train/eval/etc.)
@@ -41,7 +55,11 @@ import json
 import pprint
 from typing import Any
 
+from eformer.loggings import get_logger
+
 from easydel.infra import eLargeModel
+
+logger = get_logger("eLargeScript")
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
@@ -121,11 +139,11 @@ def _run_action(elm: eLargeModel, name: str, value: Any | None) -> None:
         return
 
     if action in {"print", "show"}:
-        print(elm)
+        logger.info(elm)
         return
 
     if action in {"dump_config", "print_config", "config"}:
-        pprint.pprint(elm.to_dict())
+        logger.info(pprint.pformat(elm.to_dict()))
         return
 
     if action in {"to_json", "save_json", "write_json"}:
@@ -179,7 +197,7 @@ def _run_action(elm: eLargeModel, name: str, value: Any | None) -> None:
             output_path=output_path,
         )
         if params.get("print_results", False):
-            print(json.dumps(results, indent=2))
+            logger.info(json.dumps(results, indent=2))
         return
 
     if action in {"serve", "server"}:
@@ -224,9 +242,7 @@ def _run_action(elm: eLargeModel, name: str, value: Any | None) -> None:
         try:
             from easydel.inference import eSurgeApiServer
         except ImportError as e:
-            raise SystemExit(
-                "Serving requires `fastapi` and `uvicorn` to be installed in your environment."
-            ) from e
+            raise SystemExit("Serving requires `fastapi` and `uvicorn` to be installed in your environment.") from e
 
         tool_parser_name = params.get("tool_parser_name", "hermes")
         if not isinstance(tool_parser_name, str) or not tool_parser_name.strip():
@@ -289,10 +305,10 @@ def main(argv: list[str] | None = None) -> None:
     elm = eLargeModel.from_yaml(config_path)
 
     if args.dry_run:
-        print("actions:")
-        pprint.pprint(actions)
-        print("\nnormalized_config:")
-        pprint.pprint(elm.to_dict())
+        logger.info("actions:")
+        logger.info(pprint.pformat(actions))
+        logger.info("\nnormalized_config:")
+        logger.info(pprint.pformat(elm.to_dict()))
         return
 
     for item in actions:

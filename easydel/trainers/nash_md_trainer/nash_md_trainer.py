@@ -62,7 +62,7 @@ def _ensure_state(model: EasyDeLBaseModule | EasyDeLState | None) -> EasyDeLStat
     return model.to_state()
 
 
-@Registry.register("trainer", "nash-md")
+@Registry.register("trainer", ["nash-md", "nash_md"])
 class NashMDTrainer(GRPOTrainer):
     """Nash Mirror Descent trainer for preference optimization.
 

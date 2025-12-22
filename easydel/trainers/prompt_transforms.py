@@ -1069,6 +1069,11 @@ class SFTPreprocessTransform(Transform):
             if messages:
                 return self._tokenize_conversational(result, messages)
 
+        text_value = result.get(self._text_field)
+        if isinstance(text_value, list) and text_value and all(isinstance(item, dict) for item in text_value):
+            messages = self._normalize_message_list(text_value)
+            return self._tokenize_conversational(result, messages)
+
         # Step 3: Handle prompt/completion format
         if "prompt" in result and "completion" in result:
             return self._tokenize_prompt_completion(result)
@@ -1079,6 +1084,30 @@ class SFTPreprocessTransform(Transform):
 
         # No recognized format, return as-is
         return result
+
+    @staticmethod
+    def _normalize_message_list(messages: list[dict]) -> list[dict]:
+        if not messages:
+            return messages
+        first = messages[0]
+        if "role" in first and "content" in first:
+            return messages
+        if "from" in first and "value" in first:
+            role_mapping = {
+                "human": "user",
+                "gpt": "assistant",
+                "system": "system",
+                "user": "user",
+                "assistant": "assistant",
+            }
+            normalized: list[dict] = []
+            for turn in messages:
+                if not isinstance(turn, dict):
+                    continue
+                role = role_mapping.get(turn.get("from", "user"), turn.get("from", "user"))
+                normalized.append({"role": role, "content": turn.get("value", "")})
+            return normalized
+        return messages
 
     def _tokenize_conversational(self, example: dict, messages: list) -> dict:
         """Tokenize conversational data using chat template."""

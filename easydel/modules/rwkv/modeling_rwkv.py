@@ -547,10 +547,7 @@ class RwkvModel(EasyDeLBaseModule):
                 self.config.hidden_size,
                 self.config.num_hidden_layers,
             )
-            state = [
-                jnp.zeros(shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32)
-                for i in range(5)
-            ]
+            state = [jnp.zeros(shape, dtype=inputs_embeds.dtype if i <= 1 else jnp.float32) for i in range(5)]
             state[4] -= 1e30
 
         hidden_states = inputs_embeds

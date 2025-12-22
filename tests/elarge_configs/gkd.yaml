@@ -1,10 +1,11 @@
-# DPO (Direct Preference Optimization) test config
-# Mirrors tests/trainers/direct_preference_optimization_trainer.py
+# GKD (Generalized Knowledge Distillation) test config
+# Mirrors tests/trainers/generalized_knowledge_distillation_trainer.py
+# Note: Uses same model for student and teacher for testing
 
 model:
   name_or_path: Qwen/Qwen2.5-0.5B-Instruct
 
-reference_model:
+teacher_model:
   name_or_path: Qwen/Qwen2.5-0.5B-Instruct
 
 loader:
@@ -28,25 +29,28 @@ mixture:
   informs:
     - type: trl-lib/ultrafeedback_binarized
       split: "train"
+      content_field: chosen
   batch_size: 4
+  streaming: false
 
 trainer:
-  trainer_type: dpo
-  beta: 0.1
+  trainer_type: gkd
+  dataset_text_field: text
+  lmbda: 0.0
+  max_new_tokens: 16
   learning_rate: 8.0e-6
   num_train_epochs: 1
   total_batch_size: 4
   gradient_accumulation_steps: 2
   max_training_steps: 1024
   max_sequence_length: 512
-  max_prompt_length: 256
-  max_completion_length: 256
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
   shuffle_train_dataset: false
-  save_directory: ./tmp-files/elarge-tests/dpo
+  save_directory: ./tmp-files/elarge-tests/gkd
 
 actions:
   - validate
   - train
+

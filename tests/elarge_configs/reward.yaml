@@ -1,11 +1,11 @@
-# DPO (Direct Preference Optimization) test config
-# Mirrors tests/trainers/direct_preference_optimization_trainer.py
+# Reward Model training test config
+# Mirrors tests/trainers/reward_trainer.py
 
 model:
   name_or_path: Qwen/Qwen2.5-0.5B-Instruct
-
-reference_model:
-  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  task: sequence-classification
+  extra_kwargs:
+    num_labels: 1
 
 loader:
   dtype: bf16
@@ -28,25 +28,24 @@ mixture:
   informs:
     - type: trl-lib/ultrafeedback_binarized
       split: "train"
-  batch_size: 4
+  batch_size: 1
+  streaming: false
 
 trainer:
-  trainer_type: dpo
-  beta: 0.1
+  trainer_type: reward
   learning_rate: 8.0e-6
   num_train_epochs: 1
-  total_batch_size: 4
-  gradient_accumulation_steps: 2
+  total_batch_size: 1
+  gradient_accumulation_steps: 1
   max_training_steps: 1024
   max_sequence_length: 512
-  max_prompt_length: 256
-  max_completion_length: 256
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
   shuffle_train_dataset: false
-  save_directory: ./tmp-files/elarge-tests/dpo
+  save_directory: ./tmp-files/elarge-tests/reward
 
 actions:
   - validate
   - train
+

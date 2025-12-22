@@ -592,8 +592,8 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
             causal_mask_info = mask_info.apply_causal()
             mask_info_full = causal_mask_info.apply_token_type_ids(grouped_token_types)
-            mask_info_sliding = (
-                causal_mask_info.apply_sliding_window(self.config.sliding_window).apply_token_type_ids(grouped_token_types)
+            mask_info_sliding = causal_mask_info.apply_sliding_window(self.config.sliding_window).apply_token_type_ids(
+                grouped_token_types
             )
 
             # We've baked causal (and for sliding layers, window) into the attention mask, so the
@@ -630,7 +630,9 @@ class Gemma3TextModel(EasyDeLBaseModule):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_mask_info = mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
+            layer_mask_info = (
+                mask_info_sliding if self.config.layer_types[idx] == "sliding_attention" else mask_info_full
+            )
             layer_outputs = block(
                 hidden_states=hidden_states,
                 mask_info=layer_mask_info,

@@ -207,6 +207,7 @@ TASK_ALIASES: dict[str, TaskType] = {
     "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
     "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
     "diffusion_lm": TaskType.DIFFUSION_LM,
+    "sequence_classification": TaskType.SEQUENCE_CLASSIFICATION,
     "base": TaskType.BASE_MODULE,
 }
 
