@@ -178,7 +178,6 @@ class MptAttention(UnifiedAttention):
         rngs: nn.Rngs,
     ):
         """Define MPT-specific network with fused QKV projection."""
-        # Fused QKV projection
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             config.hidden_size * 3,
@@ -191,7 +190,6 @@ class MptAttention(UnifiedAttention):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        # Output projection
         self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
@@ -204,16 +202,12 @@ class MptAttention(UnifiedAttention):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        # Residual dropout (MPT-specific)
         self.resid_dropout = nn.Dropout(
             config.attn_config.attn_pdrop,
             rngs=rngs,
         )
 
-        # Create attention performer
         self.attention_performer = self._create_attention_performer(config, rngs)
-
-        # Create ALiBi slopes
         self._create_alibi_slopes(config)
 
     def _create_attention_performer(self, config: MptConfig, rngs: nn.Rngs):
@@ -251,23 +245,19 @@ class MptAttention(UnifiedAttention):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # 1. Project Q/K/V from fused projection (computed ONCE)
         mixed_qkv = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
         query_states, key_states, value_states = jnp.split(mixed_qkv, 3, -1)
 
-        # 2. Reshape to multi-head format
         query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.config.n_heads)
         key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.config.n_heads)
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.config.n_heads)
 
-        # 3. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
-        # 4. KV cache concatenation
         (
             key_states,
             value_states,
@@ -284,9 +274,6 @@ class MptAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        # 5. Use external ALiBi bias if provided, otherwise compute it.
-        # HF MPT uses a 3D bias of shape (heads, 1, max_seq_len) and slices
-        # it to the current key length; we accept either 3D or 4D here.
         if alibi is None:
             alibi_bias = self._compute_alibi_bias(self.config.max_seq_len)
         else:
@@ -294,10 +281,8 @@ class MptAttention(UnifiedAttention):
 
         alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
         if alibi_bias.ndim == 3:
-            # (H, 1, K)
             alibi_bias = alibi_bias[None, ...]
         elif alibi_bias.ndim == 2:
-            # (H, K)
             alibi_bias = alibi_bias[None, :, None, :]
 
         q_len = query_states.shape[1]
@@ -316,7 +301,6 @@ class MptAttention(UnifiedAttention):
             start_q = max(0, alibi_bias.shape[-2] - q_len)
             alibi_bias = alibi_bias[..., start_q:, :]
 
-        # 6. Compute attention (mask + causal handled by kernel)
         attention = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -330,13 +314,10 @@ class MptAttention(UnifiedAttention):
             causal=causal_for_kernel,
         )
 
-        # 7. Merge heads and output projection
         attn_output = self.shard_attention_prod(
             attention.attention_outputs.reshape(batch_size, sequence_length, self.config.hidden_size)
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
-
-        # 8. Apply residual dropout
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(

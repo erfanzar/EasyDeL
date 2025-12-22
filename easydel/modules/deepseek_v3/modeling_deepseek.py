@@ -542,7 +542,6 @@ class DeepseekV3Attention(UnifiedAttention):
             ),
         )
 
-        # Output projection
         setattr(
             self,
             self.projection_mapping["output_projection"],

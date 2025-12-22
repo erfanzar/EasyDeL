@@ -189,7 +189,6 @@ class VanillaAttn(OperationImpl):
             else:
                 bias = None
 
-            # Compute attention
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE

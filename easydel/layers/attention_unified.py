@@ -788,7 +788,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         batch_size: int = hidden_states.shape[0]
         sequence_length: int = hidden_states.shape[1]
 
-        # 1. Project Q/K/V
         if self.use_fused_qkv:
             qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
             if self.use_gqa:
@@ -828,7 +827,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             self.num_key_value_heads,
             self.head_dim,
         )
-        # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
@@ -861,7 +859,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
-        # 7. Compute attention
         attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -880,12 +877,10 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if attentions.cache_view is not None:
             cache_view = attentions.cache_view
 
-        # 8. Merge heads and output projection
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
-        # 9. Optional residual dropout
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
 
@@ -1053,20 +1048,16 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # 1. Project Q/K/V (no RoPE)
         query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
         key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
         value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
 
-        # 2. Reshape to multi-head format
         query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
         value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
 
-        # 3. Post-processing (Q/K norm if configured)
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
 
-        # 4. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         causal_for_kernel = self.causal
@@ -1076,7 +1067,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         sliding_window_for_kernel = self.sliding_window
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
-        # 6. KV cache concatenation
         (
             key_states,
             value_states,
@@ -1093,7 +1083,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mask_info=mask_info,
         )
 
-        # 7. Use external ALiBi bias if provided, otherwise compute it
         if alibi is not None:
             alibi_bias = alibi
         else:
@@ -1102,7 +1091,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
-        # 8. Compute attention with ALiBi bias
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -1118,11 +1106,9 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             softmax_aux=softmax_aux,
         )
 
-        # 9. Merge heads and output projection
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
-        # 10. Optional residual dropout
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
 

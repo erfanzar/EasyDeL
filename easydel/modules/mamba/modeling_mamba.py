@@ -285,7 +285,6 @@ class MambaMixer(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.time_step_rank = time_step_rank
 
-        # Initialize SSM1 operation
         metadata = OperationMetadata(
             runtime_dtype=dtype,
             runtime_softmax_dtype=jnp.float32,
@@ -303,16 +302,13 @@ class MambaMixer(nn.Module):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
 
-        # 1. Gated MLP's linear projection
         projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         projected_states = jnp.swapaxes(projected_states, 2, 1)
-        # [batch, 2 * intermediate_size, seq_len]
         hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # 2. Convolution sequence transformation
         cache_view = cache
         if cache is not None and cache.recurrent_state is not None:
             ssm_state = cache.recurrent_state
@@ -322,21 +318,19 @@ class MambaMixer(nn.Module):
         is_inference = seq_len == 1 and cache is not None
 
         if is_inference and cache is not None and cache.conv_state is not None:
-            # Decode mode: update conv_state rolling buffer with the new token
-            new_hidden = hidden_states[:, :, 0]  # [batch, intermediate_size]
+            new_hidden = hidden_states[:, :, 0]
             conv_state, _, cache_view = cache.concatenate_to_cache(conv_state=new_hidden)
 
-            kernel = jnp.asarray(jnp.swapaxes(self.conv1d.kernel.value, 0, 2), dtype=dtype)  # [features, 1, k]
-            kernel = kernel[:, 0, :]  # [features, k]
-            hidden_states = jnp.sum(conv_state * kernel[None, :, :], axis=-1)  # [batch, intermediate_size]
+            kernel = jnp.asarray(jnp.swapaxes(self.conv1d.kernel.value, 0, 2), dtype=dtype)
+            kernel = kernel[:, 0, :]
+            hidden_states = jnp.sum(conv_state * kernel[None, :, :], axis=-1)
             if self.conv1d.use_bias:
                 hidden_states = hidden_states + jnp.asarray(self.conv1d.bias.value, dtype=dtype)[None, :]
-            hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)  # [batch, intermediate_size, 1]
+            hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)
         else:
-            # Prefill/training: full causal convolution
             conv_input = hidden_states
             conv_out = self.conv1d(conv_input)[..., :seq_len]
-            hidden_states = self.act(conv_out).astype(dtype)  # [batch, intermediate_size, seq_len]
+            hidden_states = self.act(conv_out).astype(dtype)
 
             if cache is not None:
                 if seq_len >= self.conv_kernel_size:
@@ -350,8 +344,6 @@ class MambaMixer(nn.Module):
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # 3. State Space Model sequence transformation
-        # 3.a. Selection - project hidden_states to get time_step, B, C
         ssm_parameters = checkpoint_name(self.x_proj(jnp.swapaxes(hidden_states, 2, 1)), name="ssm_x_proj")
         time_step, B, C = jnp.split(
             ssm_parameters,
@@ -361,36 +353,30 @@ class MambaMixer(nn.Module):
             ],
             axis=-1,
         )
-        # B, C: [batch, seq_len, ssm_state_size]
 
         discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
         discrete_time_step = jax.nn.softplus(discrete_time_step)
-        # discrete_time_step: [batch, seq_len, intermediate_size]
 
-        # 3.b. SSM operation via SSM1Op
-        # Transpose hidden_states and gate from [batch, d, seq_len] to [batch, seq_len, d]
-        hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)  # [batch, seq_len, d]
-        gate_t = jnp.swapaxes(gate, 1, 2)  # [batch, seq_len, d]
+        hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)
+        gate_t = jnp.swapaxes(gate, 1, 2)
 
         ssm_output = self.ssm_op(
             hidden_states=hidden_states_t,
-            A=self.A_log.value,  # [d, n] in log form, SSM1Op applies -exp() internally
-            B=B,  # [batch, seq_len, n]
-            C=C,  # [batch, seq_len, n]
-            D=self.D.value,  # [d]
-            discrete_time_step=discrete_time_step,  # [batch, seq_len, d]
-            gate=gate_t,  # [batch, seq_len, d]
-            ssm_state=ssm_state,  # [batch, d, n]
+            A=self.A_log.value,
+            B=B,
+            C=C,
+            D=self.D.value,
+            discrete_time_step=discrete_time_step,
+            gate=gate_t,
+            ssm_state=ssm_state,
             activation=self.activation,
         )
 
-        # Output is [batch, seq_len, d], transpose back to [batch, d, seq_len]
         scan_output = jnp.swapaxes(ssm_output.attention_outputs, 1, 2)
 
         if cache_view is not None:
             cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state)
 
-        # 4. Final linear projection
         contextualized_states = checkpoint_name(self.out_proj(jnp.swapaxes(scan_output, 2, 1)), name="ssm_output_proj")
         return contextualized_states, cache_view
 

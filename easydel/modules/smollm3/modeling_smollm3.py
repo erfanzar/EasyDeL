@@ -267,7 +267,6 @@ class SmolLM3DecoderLayer(nn.Module):
 
         hidden_states = residual + mlp_output
 
-        # Apply sharding and checkpointing
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -460,13 +459,11 @@ class SmolLM3Model(EasyDeLBaseModule):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
         sequence_length = inputs_embeds.shape[1]
 
-        # Create MaskInfo dynamically if not provided
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -474,11 +471,9 @@ class SmolLM3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
 
-        # Compute position_ids from mask_info if not provided
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        # Set mode
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -493,7 +488,6 @@ class SmolLM3Model(EasyDeLBaseModule):
             else:
                 past_key_values = TransformerCache.init_empty(self.config)
 
-        # Initialize outputs
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 

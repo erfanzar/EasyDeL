@@ -244,7 +244,6 @@ class MiniMaxText01LightningAttention(nn.Module):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         slope_rate: Array | None = None,
     ):
-        # TODO: fix these static issues here
         batch_size, sequence_length, _ = hidden_states.shape
         query_states, key_states, value_states = jnp.split(
             self.act(checkpoint_name(self.qkv_proj(hidden_states), name="attn_qkv")), 3, -1
@@ -772,15 +771,6 @@ class MiniMaxText01DecoderLayer(nn.Module):
         slope_rate: float | None = None,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        # if self.config.use_scan_mlp:
-        # 	feed_forward_hidden_states = block_wise_ffn(
-        # 		self.mlp,
-        # 		feed_forward_input,
-        # 		self.config.scan_mlp_chunk_size,
-        # 	)
-        # else:
-        # 	feed_forward_hidden_states = self.mlp(feed_forward_input)
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -870,7 +860,6 @@ class MiniMaxText01Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Build attention type list from layer_types config
         # 0 = full_attention, 1 = sliding_attention (or other)
         self.attn_type_list = [0 if lt == "full_attention" else 1 for lt in (config.layer_types or [])]
         if not self.attn_type_list:

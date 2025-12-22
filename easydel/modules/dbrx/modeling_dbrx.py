@@ -158,13 +158,8 @@ class DbrxAttention(UnifiedAttention):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        # Create attention performer
         self.attention_performer = self._create_attention_performer(config, rngs)
-
-        # Create rotary embeddings
         self.rotary = self._create_rotary(config, dtype)
-
-        # Create residual dropout
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def _create_rotary(self, config: DbrxConfig, dtype: jnp.dtype):
@@ -246,7 +241,6 @@ class DbrxAttention(UnifiedAttention):
             sliding_window=getattr(self, "sliding_window", None),
         )
 
-        # 7. Compute attention
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -261,7 +255,6 @@ class DbrxAttention(UnifiedAttention):
             sliding_window=getattr(self, "sliding_window", None),
         )
 
-        # 8. Merge heads and output projection
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
 

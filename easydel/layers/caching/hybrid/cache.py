@@ -1394,7 +1394,6 @@ if __name__ == "__main__":
 
     print(f"Created metadata with {metadata.num_hidden_layers} layers")
 
-    # Initialize cache
     cache = HybridCache.init_cache(metadata, dtype=jnp.float32)
     print(f"Initialized cache with {len(cache)} views")
 

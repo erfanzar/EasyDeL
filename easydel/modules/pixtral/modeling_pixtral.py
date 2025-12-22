@@ -56,7 +56,6 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     return jnp.concatenate(positions)
 
 
-# TODO:Make this jitable
 def generate_block_attention_mask(patch_embeds_list, tensor):
     """Generates a block-diagonal attention mask for multi-image processing.
 
