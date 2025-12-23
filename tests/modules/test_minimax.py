@@ -4,7 +4,7 @@ import pytest
 import transformers
 
 import easydel as ed
-from easydel.modules.minimax_text_v1 import MiniMaxText01Config
+from easydel.modules.minimax import MiniMaxConfig
 
 try:
     from .test_utils import CausalLMTester
@@ -18,7 +18,7 @@ class TestMiniMaxTextV1:
     @pytest.fixture
     def minimax_text_v1_config(self, small_model_config):
         """Create MiniMax Text V1-specific config."""
-        return MiniMaxText01Config(
+        return MiniMaxConfig(
             vocab_size=small_model_config["vocab_size"],
             hidden_size=small_model_config["hidden_size"],
             num_hidden_layers=small_model_config["num_hidden_layers"],
@@ -28,11 +28,11 @@ class TestMiniMaxTextV1:
             max_position_embeddings=small_model_config["max_position_embeddings"],
         )
 
-    def test_causal_lm(self, minimax_text_v1_config, small_model_config, hf_minimax_class):
-        """Test MiniMaxText01ForCausalLM."""
+    def test_causal_lm(self, minimax_text_v1_config, small_model_config):
+        """Test MiniMaxForCausalLM."""
         tester = CausalLMTester()
         result = tester.run(
-            module_name="minimax_text_01",
+            module_name="minimax",
             hf_class=transformers.MiniMaxForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=minimax_text_v1_config,
@@ -40,11 +40,11 @@ class TestMiniMaxTextV1:
         )
         assert result.success, f"MiniMax Text V1 CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
-    def test_generation(self, minimax_text_v1_config, small_model_config, hf_minimax_class):
+    def test_generation(self, minimax_text_v1_config, small_model_config):
         """Test MiniMax Text V1 text generation."""
         tester = CausalLMTester()
         result = tester.test_generation(
-            module_name="minimax_text_01",
+            module_name="minimax",
             hf_class=transformers.MiniMaxForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=minimax_text_v1_config,

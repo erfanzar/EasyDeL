@@ -148,6 +148,22 @@ class Conv1D(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Conv1D layer.
+
+        Args:
+            features (int): Number of output features/channels.
+            kernel_size (int, optional): Size of the convolving kernel. Defaults to 1.
+            stride (int, optional): Stride of the convolution. Defaults to 1.
+            padding (int, optional): Padding added to both sides of the input. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            groups (int, optional): Number of blocked connections from input to output. Defaults to 1.
+            use_bias (bool, optional): Whether to add a learnable bias. Defaults to True.
+            num_spatial_dims (int, optional): Number of spatial dimensions. Defaults to 1.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision for computations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.kernel = ArrayParam.bound(
             shape=(kernel_size, 1, features),
             dtype=param_dtype,
@@ -176,6 +192,17 @@ class Conv1D(nn.Module):
         self.precision = precision
 
     def __call__(self, x):
+        """Apply 1D convolution.
+
+        Args:
+            x (Array): Input tensor of shape [batch, features, length] for 1D convolution.
+
+        Returns:
+            Array: Convolved output with same shape as input (after considering stride/padding).
+
+        Raises:
+            ValueError: If input rank doesn't match expected rank (num_spatial_dims + 2).
+        """
         unbatched_rank = self.num_spatial_dims + 2
         if x.ndim != unbatched_rank:
             raise ValueError(
@@ -207,6 +234,13 @@ class MambaRMSNormGated(nn.Module):
         eps: float = 1e-6,
         dtype: jnp.dtype = jnp.float32,
     ):
+        """Initialize gated RMSNorm layer.
+
+        Args:
+            hidden_size (int): Dimensionality of the hidden states.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -218,6 +252,16 @@ class MambaRMSNormGated(nn.Module):
         )
 
     def __call__(self, hidden_states, gate=None):
+        """Apply gated RMS normalization.
+
+        Args:
+            hidden_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            gate (Array | None, optional): Gate tensor of same shape as hidden_states.
+                If provided, applies SiLU gating before normalization. Defaults to None.
+
+        Returns:
+            Array: Normalized (and optionally gated) output with same shape as input.
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
 
@@ -244,6 +288,16 @@ class Mamba2Mixer(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Mixer.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -365,6 +419,23 @@ class Mamba2Mixer(nn.Module):
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
     ):
+        """Apply selective state space transformation.
+
+        Args:
+            input_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            cache_params (RecurrentCacheView | None, optional): Cache for efficient generation.
+                Contains conv_state [batch, conv_dim, conv_kernel] and recurrent_state
+                [batch, num_heads, head_dim, state_size]. Defaults to None.
+            cache_position (Array | None, optional): Position indices for cache updates.
+                Not used in current implementation. Defaults to None.
+            attention_mask (Array | None, optional): Mask tensor of shape [batch, seq_len]
+                where 1 indicates valid tokens and 0 indicates padding. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - contextualized_states (Array): Output tensor of shape [batch, seq_len, hidden_size].
+                - cache_view (RecurrentCacheView | None): Updated cache state for next iteration.
+        """
         dtype = input_states.dtype
 
         mask = None
@@ -491,6 +562,16 @@ class Mamba2Block(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Block.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -527,6 +608,19 @@ class Mamba2Block(nn.Module):
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
     ) -> Array:
+        """Apply Mamba2 block with pre-normalization and residual connection.
+
+        Args:
+            hidden_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            cache_params (RecurrentCacheView | None, optional): Cache for generation. Defaults to None.
+            cache_position (Array | None, optional): Position indices for cache. Defaults to None.
+            attention_mask (Array | None, optional): Attention mask of shape [batch, seq_len]. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - hidden_states (Array): Output tensor of shape [batch, seq_len, hidden_size].
+                - cache_params (RecurrentCacheView | None): Updated cache state.
+        """
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -554,6 +648,15 @@ class Mamba2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Model.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -598,6 +701,31 @@ class Mamba2Model(EasyDeLBaseModule):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | Mamba2Output:
+        """Forward pass through Mamba2 model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape [batch, seq_len].
+                Mutually exclusive with inputs_embeds. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                [batch, seq_len, hidden_size]. Mutually exclusive with input_ids. Defaults to None.
+            cache_params (RecurrentCache | None, optional): Cache containing states for all layers.
+                Used for efficient autoregressive generation. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config value).
+            cache_position (Array | None, optional): Position indices for cache updates. Defaults to None.
+            attention_mask (Array | None, optional): Mask of shape [batch, seq_len] where 1 indicates
+                valid tokens and 0 indicates padding. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Mamba2Output: Object containing:
+                - last_hidden_state (Array): Final hidden states of shape [batch, seq_len, hidden_size].
+                - cache_params (RecurrentCache | None): Updated cache for next iteration.
+                - hidden_states (tuple[Array] | None): Hidden states from all layers if output_hidden_states=True.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are specified or both are None.
+        """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -681,6 +809,15 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2ForCausalLM.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Mamba2Model,
@@ -703,6 +840,31 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | Mamba2CausalLMOutput:
+        """Forward pass for causal language modeling.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape [batch, seq_len].
+                Mutually exclusive with inputs_embeds. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                [batch, seq_len, hidden_size]. Mutually exclusive with input_ids. Defaults to None.
+            cache_params (RecurrentCache | None, optional): Cache containing states for all layers.
+                Used for efficient autoregressive generation. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config value).
+            apply_lm_head (bool, optional): Whether to apply language modeling head to produce logits.
+                Set to False to get only hidden states. Defaults to True.
+            cache_position (Array | None, optional): Position indices for cache updates. Defaults to None.
+            attention_mask (Array | None, optional): Mask of shape [batch, seq_len] where 1 indicates
+                valid tokens and 0 indicates padding. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Mamba2CausalLMOutput: Object containing:
+                - logits (Array | None): Next-token prediction logits of shape [batch, seq_len, vocab_size]
+                  if apply_lm_head=True, otherwise None.
+                - cache_params (RecurrentCache | None): Updated cache for next iteration.
+                - hidden_states (tuple[Array] | None): Hidden states from all layers if output_hidden_states=True.
+        """
         mamba_outputs = self.backbone(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,

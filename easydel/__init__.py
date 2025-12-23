@@ -446,6 +446,11 @@ _import_structure = {
         "Mamba2ForCausalLM",
         "Mamba2Model",
     ],
+    "modules.minimax": [
+        "MiniMaxConfig",
+        "MiniMaxForCausalLM",
+        "MiniMaxModel",
+    ],
     "modules.mistral": [
         "MistralConfig",
         "MistralForCausalLM",
@@ -859,6 +864,7 @@ if _tp.TYPE_CHECKING:
     from .modules.llava import LlavaConfig, LlavaForConditionalGeneration, LlavaModel
     from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
     from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+    from .modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
     from .modules.mistral import MistralConfig, MistralForCausalLM, MistralForSequenceClassification, MistralModel
     from .modules.mistral3 import Mistral3Config, Mistral3ForConditionalGeneration, Mistral3Model, Mistral3Tokenizer
     from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel

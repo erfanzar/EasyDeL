@@ -41,7 +41,7 @@ easydel.modules package
    llava/index
    mamba/index
    mamba2/index
-   minimax_text_v1/index
+   minimax/index
    mistral/index
    mistral3/index
    mixtral/index

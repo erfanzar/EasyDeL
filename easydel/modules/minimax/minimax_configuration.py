@@ -21,18 +21,20 @@ from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
+@register_config("minimax")
+@register_config("minimax_text_01")
 @register_config("MiniMaxText01")
-class MiniMaxText01Config(EasyDeLBaseConfig):
+class MiniMaxConfig(EasyDeLBaseConfig):
     r"""
-    This is the configuration class to store the configuration of a [`MiniMaxText01Model`]. It is used to instantiate an
-    MiniMaxText01 model according to the specified arguments, defining the model architecture. Instantiating
-    a configuration with the defaults will yield a similar configuration to that of the MiniMaxText01.
+    This is the configuration class to store the configuration of a [`MiniMaxModel`]. It is used to instantiate an
+    MiniMax model according to the specified arguments, defining the model architecture. Instantiating
+    a configuration with the defaults will yield a similar configuration to that of the MiniMax.
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
         vocab_size (`int`, *optional*, defaults to 32000):
-            Vocabulary size of the MiniMaxText01 model. Defines the number of different tokens that can
-            be represented by the `inputs_ids` passed when calling [`MiniMaxText01Model`]
+            Vocabulary size of the MiniMax model. Defines the number of different tokens that can
+            be represented by the `inputs_ids` passed when calling [`MiniMaxModel`]
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 14336):
@@ -51,7 +53,7 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to `4096*32`):
-            The maximum sequence length that this model might ever be used with. MiniMaxText01's sliding window attention
+            The maximum sequence length that this model might ever be used with. MiniMax's sliding window attention
             allows sequence of up to 4096*32 tokens.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
@@ -87,16 +89,16 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         router_jitter_noise (`float`, *optional*, defaults to 0.0):
             Amount of noise to add to the router.
     ```python
-    >>> from transformers import MiniMaxText01Model, MiniMaxText01Config
-    >>> # Initializing a MiniMaxText01 style configuration
-    >>> configuration = MiniMaxText01Config()
-    >>> # Initializing a model from the MiniMaxText01 style configuration
-    >>> model = MiniMaxText01Model(configuration)
+    >>> from transformers import MiniMaxModel, MiniMaxConfig
+    >>> # Initializing a MiniMax style configuration
+    >>> configuration = MiniMaxConfig()
+    >>> # Initializing a model from the MiniMax style configuration
+    >>> model = MiniMaxModel(configuration)
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "MiniMaxText01"
+    model_type = "minimax"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
 
     def __init__(
@@ -107,14 +109,15 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=8,
+        head_dim=None,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
         rms_norm_eps=1e-5,
         use_cache=True,
         pad_token_id=None,
-        bos_token_id=None,
-        eos_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
         tie_word_embeddings=False,
         rope_theta=1e6,
         sliding_window=None,
@@ -124,7 +127,14 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
-        layer_types: list[str] | None = None,
+        layer_types=None,
+        block_size=256,
+        full_attn_alpha_factor=1,
+        full_attn_beta_factor=1,
+        linear_attn_alpha_factor=1,
+        linear_attn_beta_factor=1,
+        mlp_alpha_factor=1,
+        mlp_beta_factor=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -146,19 +156,30 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
+        self.head_dim = head_dim
 
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
-
         self.layer_types = layer_types
+        self.block_size = block_size
+        self.full_attn_alpha_factor = full_attn_alpha_factor
+        self.full_attn_beta_factor = full_attn_beta_factor
+        self.linear_attn_alpha_factor = linear_attn_alpha_factor
+        self.linear_attn_beta_factor = linear_attn_beta_factor
+        self.mlp_alpha_factor = mlp_alpha_factor
+        self.mlp_beta_factor = mlp_beta_factor
+
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                "full_attention" if bool((i + 1) % 2) else "linear_attention" for i in range(self.num_hidden_layers)
             ]
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError(
+                f"`layer_types` length ({len(self.layer_types)}) must match `num_hidden_layers` ({self.num_hidden_layers})."
+            )
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -221,10 +242,17 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
             - The attention mask type is set to `AttnMaskType.SLIDING` when a sliding window is defined.
         """
         mapping = {}
-        if self.layer_types is not None:
-            for layer_idx in range(self.num_hidden_layers):
-                mapping[layer_idx] = AttnMaskDetail(
-                    mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
-                    size=self.sliding_window,
-                )
+        if self.layer_types is None:
+            return mapping
+
+        for layer_idx in range(self.num_hidden_layers):
+            layer_type = self.layer_types[layer_idx]
+            if layer_type == "full_attention" and self.sliding_window is not None:
+                mask_type = AttnMaskType.SLIDING
+                size = int(self.sliding_window)
+            else:
+                mask_type = AttnMaskType.FULL
+                size = int(self.max_position_embeddings)
+
+            mapping[layer_idx] = AttnMaskDetail(mask_type=mask_type, size=size)
         return mapping

@@ -35,7 +35,10 @@ class CohereConfig(EasyDeLBaseConfig):
         intermediate_size (`int`, *optional*, defaults to 22528):
             Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
         logit_scale (`float`, *optional*, defaults to 0.0625):
-            A logit scale value used in the attention layer.
+            Scaling factor applied to the final layer's output logits before computing token
+            probabilities. This multiplicative constant (default 1/16) provides finer control over
+            prediction sharpness and probability calibration. Lower values produce smoother
+            distributions; higher values make predictions more peaked.
         num_hidden_layers (`int`, *optional*, defaults to 40):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 64):
@@ -71,7 +74,10 @@ class CohereConfig(EasyDeLBaseConfig):
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         use_qk_norm (`bool`, *optional*, defaults to `False`):
-            Whether to use query and key normalization.
+            Whether to apply RMSNorm to query and key projections before attention computation.
+            When enabled, normalizes Q and K tensors independently using RMS normalization,
+            improving training stability and model quality especially at larger scales. Applied
+            per-head with shape (head_dim, num_heads).
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
         bits (`int`, *optional*):
@@ -107,33 +113,6 @@ class CohereConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initializes the CohereConfig instance.
-
-        Args:
-            vocab_size (int): Vocabulary size.
-            hidden_size (int): Dimensionality of the hidden layers.
-            intermediate_size (int): Dimensionality of the intermediate feed-forward layer.
-            logit_scale (float): Logit scale for attention.
-            num_hidden_layers (int): Number of hidden layers.
-            num_attention_heads (int): Number of attention heads.
-            num_key_value_heads (Optional[int]): Number of key/value heads.
-            hidden_act (str): Activation function.
-            max_position_embeddings (int): Maximum sequence length.
-            initializer_range (float): Initializer range for weights.
-            layer_norm_eps (float): Epsilon for layer normalization.
-            use_cache (bool): Whether to use caching.
-            pad_token_id (int): Padding token ID.
-            bos_token_id (int): Beginning of sequence token ID.
-            eos_token_id (int): End of sequence token ID.
-            tie_word_embeddings (bool): Whether to tie word embeddings.
-            rope_theta (float): RoPE theta value.
-            attention_bias (bool): Whether to use attention bias.
-            attention_dropout (float): Dropout rate for attention.
-            use_qk_norm (bool): Whether to use QK normalization.
-            gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing strategy.
-            bits (Optional[int]): Number of bits for quantization.
-            **kwargs: Additional keyword arguments.
-        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

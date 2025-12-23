@@ -711,6 +711,7 @@ class TrainingArguments:
 
         This ensures the configuration is ready for use by the trainer.
         """
+
         def _coerce_float(value: tp.Any) -> tp.Any:
             if value is None:
                 return None
@@ -773,14 +774,12 @@ class TrainingArguments:
 
         if self.clip_grad is not None and not isinstance(self.clip_grad, (float, int, np.floating, np.integer)):
             raise TypeError(
-                "`clip_grad` must be a number when provided, got "
-                f"{type(self.clip_grad).__name__}: {self.clip_grad!r}"
+                f"`clip_grad` must be a number when provided, got {type(self.clip_grad).__name__}: {self.clip_grad!r}"
             )
 
         if not isinstance(self.warmup_steps, (int, np.integer)):
             raise TypeError(
-                "`warmup_steps` must be an int, got "
-                f"{type(self.warmup_steps).__name__}: {self.warmup_steps!r}"
+                f"`warmup_steps` must be an int, got {type(self.warmup_steps).__name__}: {self.warmup_steps!r}"
             )
 
         if not isinstance(self.gradient_accumulation_steps, (int, np.integer)):

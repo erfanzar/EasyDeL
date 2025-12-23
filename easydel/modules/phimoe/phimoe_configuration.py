@@ -134,42 +134,6 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ) -> None:
-        """Initializes a PhiMoeConfig object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 32064.
-            hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 4096.
-            intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 6400.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 8.
-            hidden_act (str, optional): Activation function name. Defaults to "silu".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096 * 32.
-            initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
-            rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            pad_token_id (int, optional): Padding token ID. Defaults to None.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 1e6.
-            rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-            sliding_window (int, optional): Sliding window size for attention. Defaults to None.
-            attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
-            num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 2.
-            num_local_experts (int, optional): Total number of local experts. Defaults to 16.
-            output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
-            router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
-            router_jitter_noise (float, optional): Jitter noise for router gates. Defaults to 0.01.
-            input_jitter_noise (float, optional): Jitter noise for input tokens (not typically used). Defaults to 0.0.
-            attention_bias (bool, optional): Whether to use bias in attention projections. Defaults to False.
-            embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
-            lm_head_bias (bool, optional): Whether to use bias in the LM head. Defaults to False.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

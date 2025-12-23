@@ -89,23 +89,6 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         initializer_range: int = 0.02,
         **kwargs,
     ):
-        """Initializes a PixtralVisionConfig object.
-
-        Args:
-            hidden_size (int, optional): Dimension of the hidden representations. Defaults to 1024.
-            intermediate_size (int, optional): Dimension of the MLP representations. Defaults to 4096.
-            num_hidden_layers (int, optional): Number of hidden layers in the Transformer encoder. Defaults to 24.
-            num_attention_heads (int, optional): Number of attention heads in the Transformer encoder. Defaults to 16.
-            num_channels (int, optional): Number of input channels in the input images. Defaults to 3.
-            image_size (int, optional): Max dimension of the input images. Defaults to 1024.
-            patch_size (int, optional): Size of the image patches. Defaults to 16.
-            hidden_act (str, optional): Activation function used in the hidden layers. Defaults to "gelu".
-            attention_dropout (float, optional): Dropout probability for the attention layers. Defaults to 0.0.
-            rope_theta (float, optional): The base period of the RoPE embeddings. Defaults to 10000.0.
-            initializer_range (float, optional): The standard deviation for initializing weight matrices.
-                Defaults to 0.02.
-            **kwargs: Additional keyword arguments passed to the parent class.
-        """
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
@@ -122,10 +105,28 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         self.initializer_range = initializer_range
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+        """Get the partition rules for distributed training of the Pixtral vision model.
+
+        This method defines how model parameters should be partitioned across devices
+        for tensor parallelism. It specifies which dimensions of each parameter should
+        be sharded and which should be replicated.
+
+        Args:
+            *args: Additional positional arguments (unused).
+            **kwargs: Additional keyword arguments (unused).
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            tuple: A tuple of tuples, where each inner tuple contains:
+                - str: Regular expression pattern matching parameter names
+                - PartitionSpec: Specification for how to partition the parameter
+
+        Note:
+            The partition rules follow these patterns:
+            - Query/Key/Value projections: Column-wise partitioning for parallelism
+            - Output projections: Row-wise partitioning to match column-wise inputs
+            - Feed-forward layers: Column-wise for gate/up, row-wise for down
+            - Normalization and biases: Replicated across all devices
+            - Patch convolution kernel: Partitioned on the output feature dimension
         """
         pmag = self.partition_manager
         return (

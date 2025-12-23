@@ -706,28 +706,42 @@ class GPT2Model(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """Forward pass through the GPT2Model.
+        """Performs forward pass through the GPT-2 transformer model.
+
+        Processes input tokens through learned token and position embeddings, multiple
+        transformer blocks with pre-norm architecture and absolute positional encoding,
+        and final layer normalization. Supports optional cross-attention for encoder-decoder tasks.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                Only one of input_ids or inputs_embeds should be provided.
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Array, optional): Indices of positions of each input sequence token. Defaults to None.
-            encoder_hidden_states (Array, optional): Hidden states from an encoder model for cross-attention.
-                Defaults to None.
-            encoder_attention_mask (Array, optional): Mask for the encoder hidden states. Defaults to None.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                precomputed key/value states. Defaults to None.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-                Defaults to None.
-            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Must be within [0, max_position_embeddings). Auto-generated if not provided.
+            encoder_hidden_states: Hidden states from encoder of shape (batch_size, encoder_length,
+                hidden_size) for cross-attention in encoder-decoder configurations.
+            encoder_attention_mask: Boolean mask for encoder hidden states.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return self-attention and cross-attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            Union[BaseModelOutputWithPastAndCrossAttentions, Tuple]: Model outputs
-                (last hidden state, optional past KVs, optional hidden states, optional attentions,
-                    optional cross-attentions).
+            BaseModelOutputWithPastAndCrossAttentions containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of self-attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention weights if cross-attention enabled
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
         """
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")

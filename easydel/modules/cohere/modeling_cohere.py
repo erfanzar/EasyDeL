@@ -438,22 +438,38 @@ class CohereModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the core Cohere model.
+        """Performs forward pass through the Cohere transformer model.
+
+        Processes input tokens through embeddings, stacked Cohere decoder blocks with RMSNorm,
+        optional Q/K normalization, SwiGLU gated FFNs, and RoPE position encoding.
 
         Args:
-            input_ids (Optional[Array]): Input token IDs.
-            inputs_embeds (Optional[Array]): Input embeddings (alternative to input_ids).
-            attention_mask (Optional[Array]): Attention mask.
-            position_ids (Optional[Array]): Position IDs.
-            segment_ids (Optional[Array]): Segment IDs.
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Cache metadata.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated from mask_info if not provided.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            Union[BaseModelOutput, Tuple]: Model output.
+            BaseModelOutput containing:
+                - last_hidden_state: Final RMSNorm output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+
+        Raises:
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
+            AssertionError: If sequence length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
