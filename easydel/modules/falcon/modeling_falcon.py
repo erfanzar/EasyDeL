@@ -474,21 +474,38 @@ class FalconModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Falcon module.
+        """Performs forward pass through the Falcon transformer model.
+
+        Processes input tokens through embeddings, stacked Falcon decoder blocks with optional
+        ALiBi positional biases or RoPE, and final layer normalization. Supports both parallel
+        and sequential attention/MLP computation modes.
 
         Args:
-            input_ids (Array): Input tensor containing token IDs.
-            attention_mask (Array): Mask for attention.
-            position_ids (Array): Positional indices.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Required when using RoPE (alibi=False), auto-generated if not provided.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+
+        Raises:
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
         """
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None

@@ -1338,6 +1338,37 @@ class CLIPModel(EasyDeLBaseModule):
         output_attentions=None,
         output_hidden_states=None,
     ) -> CLIPOutput:
+        """Performs forward pass through CLIP's dual-encoder architecture.
+
+        Processes images through the vision transformer and text through the text transformer,
+        projects both to a shared embedding space, and computes contrastive similarity logits
+        between all image-text pairs in the batch.
+
+        Args:
+            input_ids: Text token IDs of shape (batch_size, sequence_length). Tokenized text
+                inputs for the text encoder.
+            pixel_values: Image pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels) depending on data format. Preprocessed
+                images for the vision encoder.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) for text,
+                indicating which tokens to attend to. Auto-generated as all-ones if not provided.
+            mask_info: Pre-computed mask information for text. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length)
+                for text. Auto-generated from attention_mask if not provided.
+            output_attentions: Whether to return attention weights from vision and text encoders.
+            output_hidden_states: Whether to return hidden states from all layers of both encoders.
+
+        Returns:
+            CLIPOutput containing:
+                - logits_per_image: Similarity scores of shape (batch, batch) where entry [i,j]
+                    is the scaled cosine similarity between image i and text j
+                - logits_per_text: Transposed similarity scores of shape (batch, batch)
+                - text_embeds: L2-normalized text embeddings of shape (batch, projection_dim)
+                - image_embeds: L2-normalized image embeddings of shape (batch, projection_dim)
+                - text_model_output: Full output from text encoder including hidden states
+                - vision_model_output: Full output from vision encoder including hidden states
+        """
         if attention_mask is None and input_ids is not None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None and attention_mask is not None:

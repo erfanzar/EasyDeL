@@ -1573,30 +1573,62 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         cache_position: Array | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
-        """Forward pass for the Qwen2-VL model.
+        """Forward pass for Qwen2-VL conditional generation model.
+
+        This method processes multimodal inputs (text, images, and/or videos) and generates
+        language model outputs. Vision inputs are encoded via the vision encoder and fused
+        with text embeddings using placeholder tokens.
 
         Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            mask_info: Mask information
-            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
-            mode: Runtime mode
-            past_key_values: Cached keys/values
-            cache_metadata: Metadata for paged attention
-            apply_lm_head: Whether to apply the LM head
-            inputs_embeds: Input embeddings
-            output_attentions: Whether to output attentions
-            output_hidden_states: Whether to output hidden states
-            pixel_values: Image pixel values
-            pixel_values_videos: Video pixel values
-            image_grid_thw: Image grid shape for mRoPE
-            video_grid_thw: Video grid shape for mRoPE
-            rope_deltas: Position deltas for mRoPE
-            cache_position: Cache position for generation
-            **kwargs: Additional arguments
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs of shape (batch_size, sequence_length).
+                Should contain special vision tokens (image_token_id, video_token_id) at positions where
+                visual content should be inserted. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask of shape (batch_size, sequence_length).
+                Defaults to None.
+            mask_info (MaskInfo | None): Precomputed mask information. Overrides attention_mask if provided.
+                Defaults to None.
+            position_ids (Int[Array, "3 batch seq_len"] | None): 3D position IDs for multi-dimensional RoPE
+                of shape (3, batch_size, sequence_length) encoding [temporal, height, width] dimensions.
+                Auto-computed from image/video grids if None. Defaults to None.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode controlling attention implementation.
+                Defaults to None (auto-inferred).
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached key-value states
+                from previous forward passes for efficient generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Metadata for
+                paged attention operations. Defaults to None.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits. Defaults to True.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed text embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive with input_ids. Defaults to None.
+            output_attentions (bool | None): Whether to return attention weights from all layers. Defaults to None.
+            output_hidden_states (bool | None): Whether to return hidden states from all layers. Defaults to None.
+            pixel_values (Array | None): Image pixel values of shape (num_images, channels, height, width) where
+                channels=3 (RGB). Images are patchified and encoded by the vision encoder. Defaults to None.
+            pixel_values_videos (Array | None): Video pixel values of shape
+                (num_videos, channels, num_frames, height, width). Defaults to None.
+            image_grid_thw (tuple | None): Image grid dimensions as array of shape (num_images, 3) where each row
+                contains [temporal, height_patches, width_patches]. Used for computing M-RoPE positions. Defaults to None.
+            video_grid_thw (tuple | None): Video grid dimensions as array of shape (num_videos, 3) where each row
+                contains [temporal_frames, height_patches, width_patches]. Defaults to None.
+            rope_deltas (Array | None): Position deltas for M-RoPE of shape (batch_size, 1). Represents offset
+                added to position indices due to variable-length vision sequences. Defaults to None.
+            cache_position (Array | None): Explicit cache position indices for generation. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
 
         Returns:
-            VLMCausalLMOutput: Model outputs including logits and optional states
+            VLMCausalLMOutput: Named tuple containing:
+                - logits (Array | None): Language modeling logits of shape (batch_size, sequence_length, vocab_size)
+                  if apply_lm_head=True, otherwise None.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
+                - hidden_states (tuple[Array, ...] | None): Hidden states from all layers if output_hidden_states=True.
+                - last_hidden_state (Array): Final hidden state of shape (batch_size, sequence_length, hidden_size).
+                - attentions (tuple[Array, ...] | None): Attention weights from all layers if output_attentions=True.
+                - rope_deltas (Array | None): Position deltas used for M-RoPE.
+
+        Note:
+            The model uses special token IDs to determine where to insert vision embeddings:
+            - vision_start_token_id: Marks the beginning of a vision sequence
+            - image_token_id or video_token_id: Indicates the type of vision content
+            - vision_end_token_id: Marks the end of a vision sequence
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

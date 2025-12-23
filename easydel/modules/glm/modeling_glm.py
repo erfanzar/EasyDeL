@@ -86,6 +86,14 @@ class GlmMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Forward pass through the GLM MLP.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Output tensor of shape (batch, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -195,6 +203,21 @@ class GlmDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the GLM decoder layer.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info: Mask information for attention computation.
+            position_ids: Position indices of shape (batch, seq_len).
+            mode: Runtime mode (train, decode, etc.).
+            cache_view: Optional cache view for key-value caching.
+            cache_metadata: Optional metadata for cache operations.
+            output_attentions: Whether to return attention weights.
+            frequencies: Optional rotary embedding frequencies.
+
+        Returns:
+            DecoderLayerOutput containing hidden states and optional attention weights.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -307,6 +330,26 @@ class GlmModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the GLM model.
+
+        Args:
+            input_ids: Input token IDs of shape (batch, seq_len).
+            inputs_embeds: Pre-computed input embeddings. Mutually exclusive with input_ids.
+            attention_mask: Optional boolean mask of shape (batch, seq_len).
+            mask_info: Optional pre-computed mask information.
+            position_ids: Optional position indices of shape (batch, seq_len).
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Optional cache for incremental decoding.
+            cache_metadata: Optional metadata for cache operations.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput containing last hidden state and optional intermediate outputs.
+
+        Raises:
+            ValueError: If neither or both of input_ids and inputs_embeds are provided.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

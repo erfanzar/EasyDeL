@@ -420,22 +420,58 @@ class Gemma2Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Gemma2 module.
+        """Forward pass through the Gemma2 base model.
+
+        Processes input tokens through token embedding, applies scaling, and passes them through
+        the decoder layers with alternating sliding window and full attention patterns.
 
         Args:
-            input_ids (Array): Input tensor containing token IDs.
-            attention_mask (Array): Mask for attention.
-            position_ids (Array): Positional indices.
-            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Must be provided if inputs_embeds is None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+                Must be provided if input_ids is None.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Attention mask indicating
+                which tokens should be attended to (True) and which should be ignored (False).
+                Shape: (batch_size, sequence_length). Default: None (all tokens attended).
+            mask_info (MaskInfo, optional): Pre-computed mask information encoding attention
+                patterns and positions. If None, computed from attention_mask or input_ids.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for each token.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode controlling attention computation.
+                Options: MODE_TRAIN (full attention), MODE_DECODE (single-token), MODE_PREFILL.
+                Auto-detected if None based on sequence length and cache presence.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states from previous forward passes for efficient autoregressive
+                generation. Hybrid cache recommended for Gemma2's mixed attention pattern.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for managing paged attention caches in serving scenarios.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Default: None (uses config value).
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Default: None (uses config value).
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput: Model outputs containing:
+                - last_hidden_state (jnp.ndarray): Final layer hidden states after RMSNorm.
+                  Shape: (batch_size, sequence_length, hidden_size).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each layer
+                  if output_hidden_states=True. Each tensor has shape
+                  (batch_size, sequence_length, hidden_size).
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each layer
+                  if output_attentions=True. Each tensor has shape
+                  (batch_size, num_heads, sequence_length, key_value_length).
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated
+                  cache with new key-value states for all layers.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are None or both are provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+
+        Note:
+            Gemma2 applies sqrt(hidden_size) scaling to input embeddings before processing.
+            The model alternates between sliding window attention (4096 tokens) on odd layers
+            and full attention on even layers for efficiency.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -577,23 +613,54 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass of the causal language model.
+        """Forward pass of the Gemma2 causal language model.
+
+        Processes input tokens through the base Gemma2 model and applies the language modeling
+        head to produce next-token prediction logits with optional soft-capping.
 
         Args:
-            input_ids (Optional[Array], optional): Input token IDs. Defaults to None.
-            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[Array], optional): Position IDs for positional embeddings. Defaults to None.
-            segment_ids (Optional[Array], optional): Segment IDs for segment embeddings. Defaults to None.
-            output_attentions (Optional[bool], optional): Whether to return attention weights. Defaults to None.
-            output_hidden_states (Optional[bool], optional): Whether to return hidden states. Defaults to None.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key values for faster
-                inference. Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for cache
-                handling. Defaults to None.
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Must be provided if inputs_embeds is None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+                Must be provided if input_ids is None.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Attention mask indicating
+                which tokens should be attended to. Shape: (batch_size, sequence_length).
+                Default: None (all tokens attended).
+            mask_info (MaskInfo, optional): Pre-computed mask information. If None, computed
+                from attention_mask or input_ids.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for each token.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode (MODE_TRAIN, MODE_DECODE, MODE_PREFILL).
+                Auto-detected if None based on sequence length and cache.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states for efficient autoregressive generation. HybridCache
+                is recommended for Gemma2's mixed attention patterns.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention cache management.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits.
+                Set to False to only get hidden states. Default: True.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Default: None (uses config value).
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Default: None (uses config value).
 
         Returns:
-                Union[CausalLMOutput, Tuple]: Model outputs containing logits and optional hidden states and attentions.
+            CausalLMOutput: Model outputs containing:
+                - logits (jnp.ndarray, optional): Next-token prediction logits if apply_lm_head=True.
+                  Shape: (batch_size, sequence_length, vocab_size). Soft-capping is applied if
+                  final_logit_softcapping is configured (logits = tanh(logits / cap) * cap).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each layer
+                  if output_hidden_states=True.
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each layer
+                  if output_attentions=True.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated
+                  cache with new key-value states.
+
+        Note:
+            Gemma2 applies final_logit_softcapping (default: 30.0) via tanh to prevent extreme
+            logit values and improve training stability. The formula is:
+            logits = tanh(logits / final_logit_softcapping) * final_logit_softcapping
         """
 
         outputs = self.model(

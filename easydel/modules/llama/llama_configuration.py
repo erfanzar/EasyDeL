@@ -203,6 +203,17 @@ class VisionLlamaConfig(LlamaConfig):
         sample_mode="all",
         **kwargs,
     ):
+        """Initialize VisionLlamaConfig for vision-augmented Llama models.
+
+        Args:
+            vision_vocab_size (int, optional): Size of the vision token vocabulary for image encoding.
+                Defaults to 8448.
+            tie_vision_embeddings (bool, optional): Whether to tie vision input and output embeddings.
+                Defaults to False.
+            sample_mode (str, optional): Sampling mode for vision tokens ("all", "random", etc.).
+                Defaults to "all".
+            **kwargs: Additional arguments passed to LlamaConfig parent class.
+        """
         super().__init__(**kwargs)
         self.vision_vocab_size = vision_vocab_size
         self.tie_vision_embeddings = tie_vision_embeddings

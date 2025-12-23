@@ -1276,7 +1276,22 @@ class WhisperModel(EasyDeLBaseModule):
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
 class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperModel, WhisperConfig]):
-    """Whisper encoder-decoder with projection head for speech-to-text generation."""
+    """Whisper encoder-decoder with projection head for speech-to-text generation.
+
+    This model extends the base Whisper architecture with a language modeling head for
+    generating text transcriptions and translations from audio. It supports multilingual
+    speech recognition, translation to English, and timestamp prediction.
+
+    The model consists of:
+        - WhisperModel: The base encoder-decoder transformer
+        - proj_out: Linear projection layer mapping decoder hidden states to vocabulary logits
+
+    Attributes:
+        model (WhisperModel): The base encoder-decoder model.
+        proj_out (RowParallelLinear): Output projection to vocabulary space.
+        config (WhisperConfig): Model configuration.
+        loss_type (str): Loss type identifier for training ("ForCausalLM").
+    """
 
     loss_type = "ForCausalLM"
 
@@ -1293,6 +1308,22 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         *,
         rngs: nn.Rngs,
     ):
+        """Initializes WhisperForConditionalGeneration.
+
+        Args:
+            config (WhisperConfig): Model configuration object specifying architecture
+                parameters such as vocab_size, num_mel_bins, layer counts, hidden dimensions,
+                and attention head counts.
+            dtype (jnp.dtype): Data type for activations and computations during forward pass.
+                Default: jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for model parameters (weights and biases).
+                Default: jnp.bfloat16.
+            precision (str | lax.Precision, optional): JAX precision setting for matrix
+                multiplications. Options include 'default', 'high', 'highest', or None.
+                Default: None.
+            rngs (nn.Rngs): Random number generator state for dropout and parameter
+                initialization.
+        """
         super().__init__(
             config=config,
             base_model_class=WhisperModel,
@@ -1327,6 +1358,58 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass of WhisperForConditionalGeneration.
+
+        Processes audio features through the encoder and generates text through the decoder
+        with an optional language modeling head for next-token prediction.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            decoder_input_ids (jnp.ndarray): Input token IDs for the decoder.
+                Shape: (batch_size, target_sequence_length). For training, these are typically
+                the shifted target sequences. For generation, starts with decoder_start_token_id.
+            decoder_mask_info (MaskInfo, optional): Mask information for decoder self-attention,
+                encoding causal attention patterns and padding. If None, creates default causal mask.
+            decoder_position_ids (Int[Array, "batch seq_len"], optional): Position indices for
+                decoder inputs. Shape: (batch_size, target_sequence_length). If None, uses
+                sequential positions [0, 1, 2, ...].
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode controlling attention computation.
+                Options: MODE_TRAIN (full attention), MODE_DECODE (single-token generation),
+                MODE_PREFILL (initial KV cache population). Auto-detected if None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states from previous decoder layers for fast autoregressive
+                generation. Contains cached states for all decoder layers.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for managing paged attention caches, including sequence lengths and
+                valid token positions.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits.
+                Set to False if you only need hidden states. Default: True.
+            output_attentions (bool): Whether to return attention weights from all layers.
+                Default: False.
+            output_hidden_states (bool): Whether to return hidden states from all layers
+                (encoder and decoder). Default: False.
+
+        Returns:
+            Seq2SeqLMOutput: Model output containing:
+                - logits (jnp.ndarray, optional): Next-token prediction logits if apply_lm_head=True.
+                  Shape: (batch_size, target_sequence_length, vocab_size).
+                - decoder_hidden_states (tuple[jnp.ndarray], optional): Hidden states from each
+                  decoder layer if output_hidden_states=True.
+                - decoder_attentions (tuple[jnp.ndarray], optional): Self-attention weights from
+                  each decoder layer if output_attentions=True.
+                - cross_attentions (tuple[jnp.ndarray], optional): Cross-attention weights from
+                  each decoder layer if output_attentions=True.
+                - encoder_last_hidden_state (jnp.ndarray): Final encoder hidden states.
+                  Shape: (batch_size, encoder_sequence_length, d_model).
+                - encoder_hidden_states (tuple[jnp.ndarray], optional): Hidden states from each
+                  encoder layer if output_hidden_states=True.
+                - encoder_attentions (tuple[jnp.ndarray], optional): Attention weights from each
+                  encoder layer if output_attentions=True.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                  Updated cache with new key/value states.
+        """
         outputs = self.model(
             input_features=input_features,
             decoder_input_ids=decoder_input_ids,
@@ -1623,7 +1706,27 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
 
 @register_module(TaskType.AUDIO_CLASSIFICATION, config=WhisperConfig, model_type="whisper")
 class WhisperForAudioClassification(EasyDeLBaseModule):
-    """Encoder-only Whisper variant with pooling and classifier for audio tagging."""
+    """Encoder-only Whisper variant with pooling and classifier for audio tagging.
+
+    This model uses the Whisper encoder for audio feature extraction, followed by
+    mean-pooling and a classification head for tasks like audio event detection,
+    music genre classification, or acoustic scene classification.
+
+    Architecture:
+        - WhisperEncoder: Processes log-Mel spectrograms into contextualized representations
+        - Optional weighted layer sum: Combines encoder layer outputs with learned weights
+        - Projector: Linear layer reducing d_model to classifier_proj_size
+        - Mean pooling: Aggregates temporal representations
+        - Classifier: Linear layer mapping to num_labels classes
+
+    Attributes:
+        encoder (WhisperEncoder): The Whisper encoder stack.
+        layer_weights (jnp.ndarray, optional): Learned weights for combining encoder layers
+            when use_weighted_layer_sum=True.
+        projector (ColumnParallelLinear): Dimension reduction layer before classification.
+        classifier (ColumnParallelLinear): Final classification layer.
+        config (WhisperConfig): Model configuration.
+    """
 
     def __init__(
         self,
@@ -1634,6 +1737,22 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initializes WhisperForAudioClassification.
+
+        Args:
+            config (WhisperConfig): Model configuration object. Must include num_labels
+                for the classification task and optionally use_weighted_layer_sum and
+                classifier_proj_size.
+            dtype (jnp.dtype): Data type for activations and computations during forward pass.
+                Default: jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for model parameters (weights and biases).
+                Default: jnp.bfloat16.
+            precision (str | lax.Precision, optional): JAX precision setting for matrix
+                multiplications. Options include 'default', 'high', 'highest', or None.
+                Default: None.
+            rngs (nn.Rngs): Random number generator state for dropout and parameter
+                initialization.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1678,6 +1797,41 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
         output_attentions=None,
         output_hidden_states: bool = True,
     ):
+        """Forward pass of WhisperForAudioClassification.
+
+        Processes audio features through the Whisper encoder, applies optional weighted layer
+        summation, pools the representations, and produces classification logits.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            encoder_outputs (BaseModelOutput, optional): Pre-computed encoder outputs to reuse.
+                If provided, skips encoder computation. Must include hidden_states if
+                use_weighted_layer_sum=True. Default: None (compute encoder outputs).
+            output_attentions (bool, optional): Whether to return attention weights from all
+                encoder layers. If None, uses config.output_attentions. Default: None.
+            output_hidden_states (bool): Whether to return hidden states from all encoder layers.
+                Required when use_weighted_layer_sum=True to compute weighted average across
+                layers. Default: True.
+
+        Returns:
+            SequenceClassifierOutput: Classification output containing:
+                - logits (jnp.ndarray): Classification logits over all label classes.
+                  Shape: (batch_size, num_labels).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each encoder
+                  layer if output_hidden_states=True. Each tensor has shape
+                  (batch_size, sequence_length, d_model).
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each encoder
+                  layer if output_attentions=True. Each tensor has shape
+                  (batch_size, num_heads, sequence_length, sequence_length).
+
+        Note:
+            This model uses mean pooling over the temporal dimension to aggregate encoder
+            outputs into a fixed-size representation before classification. If
+            use_weighted_layer_sum=True in the config, it computes a learned weighted
+            average across all encoder layer outputs instead of using only the final layer.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

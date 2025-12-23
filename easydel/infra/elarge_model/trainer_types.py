@@ -729,7 +729,11 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
             stacklevel=2,
         )
         config["max_length"] = config.pop("max_sequence_length")
-    elif "max_sequence_length" in config and "max_length" in config and config["max_sequence_length"] != config["max_length"]:
+    elif (
+        "max_sequence_length" in config
+        and "max_length" in config
+        and config["max_sequence_length"] != config["max_length"]
+    ):
         warnings.warn(
             "Both `max_length` and `max_sequence_length` are set; ignoring `max_sequence_length`.",
             FutureWarning,

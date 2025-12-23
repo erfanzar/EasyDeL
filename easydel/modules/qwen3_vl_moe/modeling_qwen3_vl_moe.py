@@ -1363,6 +1363,46 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
         deepstack_visual_embeds: list[Array] | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through text decoder with MoE and optional deepstack visual integration.
+
+        Processes input embeddings through transformer layers with mixture-of-experts feedforward
+        networks. Supports deepstack visual feature injection at specified layer positions.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Mutually exclusive
+                with inputs_embeds. Converted to embeddings via self.embed_tokens.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                Mutually exclusive with input_ids. Use when embeddings are already prepared.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True indicates
+                valid tokens, False indicates padding.
+            mask_info: Pre-computed mask information for efficient attention operations. Auto-computed
+                if None using MaskInfo.dynamic_init.
+            position_ids: Position IDs of shape (3, batch_size, sequence_length) for 3D mRoPE.
+                Dimensions: [temporal, height, width]. Defaults to standard 1D positions if None.
+            mode: Runtime mode (MODE_TRAIN/DECODE/EVAL). Auto-detected: MODE_DECODE if seq_len=1
+                and cache exists, else MODE_TRAIN.
+            past_key_values: Cached key-value states from previous steps. Initialized as empty
+                TransformerCache if None.
+            cache_metadata: Metadata for paged attention (sequence lengths, block tables, etc.).
+            output_attentions: Whether to return attention weights from all layers. Defaults to
+                config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers. Defaults to
+                config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits for auxiliary loss. Defaults
+                to config.output_router_logits.
+            visual_pos_masks: Boolean mask of shape (batch_size, sequence_length) indicating positions
+                where deepstack visual embeddings should be injected. Required if deepstack_visual_embeds provided.
+            deepstack_visual_embeds: List of visual embedding arrays (one per layer) for deepstack injection.
+                Each array shape: (num_visual_tokens, hidden_size). Injected additively at visual_pos_masks positions.
+
+        Returns:
+            MoeCausalLMOutput containing:
+                - last_hidden_state: Final layer hidden states of shape (batch_size, sequence_length, hidden_size).
+                - hidden_states: Tuple of all layer hidden states if output_hidden_states=True, else None.
+                - attentions: Tuple of attention weights from all layers if output_attentions=True, else None.
+                - past_key_values: Updated cache for next generation step.
+                - router_logits: Tuple of router logits from MoE layers if output_router_logits=True, else None.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify either input_ids or inputs_embeds, but not both.")
 
@@ -1904,6 +1944,51 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         video_max_grid_size: int | None = None,
         cache_position: Array | None = None,
     ) -> BaseModelOutput:
+        """Forward pass for multimodal base model without LM head.
+
+        Orchestrates vision-language fusion by:
+        1. Processing images/videos through vision encoder
+        2. Merging visual embeddings into text token sequence
+        3. Computing 3D mRoPE position IDs
+        4. Running fused embeddings through text decoder with MoE
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Must contain
+                special tokens (image_token_id, video_token_id) at positions where visual
+                features should be inserted.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                If provided, input_ids must still be provided for multimodal merging.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True=valid, False=padding.
+            mask_info: Pre-computed mask information for attention. Auto-computed if None.
+            position_ids: 3D position IDs of shape (3, batch_size, sequence_length) for mRoPE.
+                Dimensions: [temporal, height, width]. Auto-computed from grid_thw if None.
+            mode: Runtime mode (MODE_TRAIN/DECODE/EVAL). Auto-detected from context if None.
+            past_key_values: Cached key-value states for autoregressive generation.
+            cache_metadata: Metadata for paged attention (sequence lengths, block tables).
+            output_attentions: Whether to return attention weights. Defaults to config.output_attentions.
+            output_hidden_states: Whether to return all layer hidden states. Defaults to config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits. Defaults to config.output_router_logits.
+            visual_pos_masks: Boolean mask of shape (batch_size, sequence_length) indicating visual token
+                positions. Auto-computed from pixel_values if not provided.
+            deepstack_visual_embeds: List of visual embeddings for injection at each decoder layer.
+                Auto-computed from pixel_values if not provided.
+            pixel_values: Image pixel values of shape (num_images, channels, height, width).
+            pixel_values_videos: Video pixel values of shape (num_videos, channels, frames, height, width).
+            image_grid_thw: List of (temporal, height, width) tuples for each image grid.
+            video_grid_thw: List of (temporal, height, width) tuples for each video grid.
+            image_max_grid_size: Maximum grid size for adaptive image resolution.
+            video_max_grid_size: Maximum grid size for adaptive video resolution.
+            cache_position: Cache position indices for generation (internal use).
+
+        Returns:
+            Qwen3VLMoeModelOutputWithPast containing:
+                - last_hidden_state: Final hidden states of shape (batch_size, sequence_length, hidden_size).
+                - past_key_values: Updated cache for next generation step.
+                - hidden_states: Tuple of all layer hidden states if output_hidden_states=True.
+                - attentions: Tuple of attention weights if output_attentions=True.
+                - rope_deltas: mRoPE position deltas of shape (batch_size, 1).
+                - router_logits: Tuple of MoE router logits if output_router_logits=True.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -2161,32 +2246,66 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         video_max_grid_size: int | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
-        """Forward pass for the Qwen3-VL-MoE model.
+        """Forward pass for vision-language generation with MoE.
+
+        Processes multimodal inputs (text, images, videos) through the full model pipeline
+        to generate next-token predictions. Handles vision encoding, multimodal fusion,
+        3D RoPE positioning, MoE routing, and language modeling.
 
         Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            mask_info: Mask information
-            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
-            mode: Runtime mode
-            past_key_values: Cached keys/values
-            cache_metadata: Metadata for paged attention
-            apply_lm_head: Whether to apply the LM head
-            inputs_embeds: Input embeddings
-            output_attentions: Whether to output attentions
-            output_hidden_states: Whether to output hidden states
-            output_router_logits: Whether to output router logits
-            pixel_values: Image pixel values
-            pixel_values_videos: Video pixel values
-            image_grid_thw: Image grid shape for mRoPE
-            video_grid_thw: Video grid shape for mRoPE
-            cache_position: Cache position for incremental decoding
-            image_max_grid_size: Maximum grid size for images
-            video_max_grid_size: Maximum grid size for videos
-            **kwargs: Additional arguments
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Special tokens: config.image_token_id for images, config.video_token_id for videos.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True indicates
+                valid tokens and False indicates padding. Defaults to all-ones if not provided.
+            mask_info: Pre-computed mask information for attention operations. If None, computed
+                automatically from input_ids and attention_mask.
+            position_ids: 3D position IDs for mRoPE of shape (3, batch_size, sequence_length).
+                Dimensions are [temporal, height, width]. Auto-computed from grid_thw if None.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_EVAL). Auto-detected if None based on
+                sequence_length and past_key_values presence.
+            past_key_values: Cached key-value states from previous forward passes for autoregressive
+                generation. Can be TransformerCache, RaggedPagesCache, or HybridCache.
+            cache_metadata: Metadata for paged attention operations (sequence lengths, block tables).
+            apply_lm_head: Whether to apply the language modeling head to get logits. Set to False
+                if you only need hidden states. Defaults to True.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                If provided, input_ids is ignored. Useful for custom embedding manipulation.
+            output_attentions: Whether to return attention weights from all layers. Defaults to
+                config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers. Defaults to
+                config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits for auxiliary loss computation.
+                Defaults to config.text_config.output_router_logits.
+            visual_pos_masks: Pre-computed boolean mask of shape (batch_size, sequence_length) indicating
+                positions where visual tokens appear. Auto-computed if pixel_values provided.
+            deepstack_visual_embeds: Pre-computed list of visual embeddings for deepstack injection at
+                each decoder layer. Auto-computed if pixel_values provided.
+            pixel_values: Image pixel values of shape (num_images, channels, height, width).
+                Images are processed through vision encoder and merged at image_token_id positions.
+            pixel_values_videos: Video pixel values of shape (num_videos, channels, frames, height, width).
+                Videos are processed similarly to images but with temporal modeling.
+            image_grid_thw: List of (temporal, height, width) tuples for each image specifying the
+                grid structure after patch embedding. Required if pixel_values provided.
+            video_grid_thw: List of (temporal, height, width) tuples for each video. Required if
+                pixel_values_videos provided.
+            cache_position: Position indices for cached states during generation. Used internally.
+            image_max_grid_size: Maximum grid size for adaptive image resolution. If None, uses
+                original resolution.
+            video_max_grid_size: Maximum grid size for adaptive video resolution. If None, uses
+                original resolution.
+            **kwargs: Additional arguments (unused, for API compatibility).
 
         Returns:
-            VLMCausalLMOutput: Model outputs including logits, router_logits, and optional states
+            VLMCausalLMOutput containing:
+                - logits: Language modeling logits of shape (batch_size, sequence_length, vocab_size)
+                    if apply_lm_head=True, else None.
+                - past_key_values: Updated cache for next generation step.
+                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True.
+                - last_hidden_state: Final hidden state of shape (batch_size, sequence_length, hidden_size).
+                - attentions: Tuple of attention weights if output_attentions=True.
+                - rope_deltas: mRoPE position deltas of shape (batch_size, 1) for tracking position offsets.
+                - router_logits: Tuple of router logits from MoE layers if output_router_logits=True.
+                - image_hidden_states: None (reserved for future use).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (

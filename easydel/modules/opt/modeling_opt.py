@@ -273,6 +273,15 @@ class OPTDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize OPT decoder layer.
+
+        Args:
+            config: OPTConfig containing model hyperparameters.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         super().__init__()
 
         self.config = config
@@ -339,18 +348,23 @@ class OPTDecoderLayer(nn.Module):
     ) -> DecoderLayerOutput:
         """Forward pass of the OPTDecoderLayer.
 
+        Applies pre-norm or post-norm architecture based on config.do_layer_norm_before:
+        - Pre-norm (default): LayerNorm -> Attention -> Residual, LayerNorm -> FFN -> Residual
+        - Post-norm: Attention -> Residual -> LayerNorm, FFN -> Residual -> LayerNorm
+
         Args:
-            hidden_states (Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
-            causal_mask (tp.Optional[Array]): Causal mask for self-attention.
-                Shape: (1, 1, query_len, key_len) or inferred.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            hidden_states: Input hidden states with shape (batch_size, sequence_length, hidden_size).
+            mask_info: Masking information containing attention masks and positions.
+            mode: Runtime mode (train/decode/prefill) for cache handling.
+            cache_view: Optional cache view for key/value states in decoder inference.
+            cache_metadata: Optional metadata for cache handling.
+            output_attentions: Whether to return attention weights (default: False).
 
         Returns:
-            tp.Tuple[Array]: A tuple containing the output hidden states
-                (shape: batch_size, sequence_length, embed_dim)
-                and the attention weights (shape: batch_size, num_heads, sequence_length, key_sequence_length).
-                Attention weights are returned only if `output_attentions` is True in the base attention module.
+            DecoderLayerOutput containing:
+                - hidden_states: Output hidden states with shape (batch_size, sequence_length, hidden_size).
+                - attention_weight: Optional attention weights if output_attentions=True.
+                - cache_view: Updated cache view if cache is used.
         """
         residual = hidden_states
 

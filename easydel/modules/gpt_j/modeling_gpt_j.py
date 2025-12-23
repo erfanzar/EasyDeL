@@ -82,7 +82,16 @@ class GPTJAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize GPT-J attention."""
+        """Initialize GPT-J attention module.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+            layer_idx: Index of this layer in the model (0-indexed).
+        """
         super().__init__(
             config,
             dtype,
@@ -234,6 +243,16 @@ class GPTJMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GPT-J MLP module.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            intermediate_size: Dimensionality of the intermediate feed-forward layer.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         self.config: GPTJConfig = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -272,10 +291,11 @@ class GPTJMLP(nn.Module):
         """Forward pass of the GPTJMLP module.
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states: Input hidden states with shape (batch_size, sequence_length, hidden_size).
 
         Returns:
-            Array: Output hidden states after processing through the MLP.
+            Output hidden states with shape (batch_size, sequence_length, hidden_size) after
+            processing through fc_in -> activation -> fc_out -> dropout.
         """
         gate = checkpoint_name(self.act(self.fc_in(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.dropout(self.fc_out(gate)), "mlp_output")
@@ -307,6 +327,16 @@ class GPTJBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GPT-J transformer block.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            layer_idx: Index of this layer in the model (0-indexed).
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         self.config: GPTJConfig = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -361,24 +391,27 @@ class GPTJBlock(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the GPTJBlock module.
+        """Forward pass of the GPTJBlock module with parallel attention and FFN.
+
+        Note: GPT-J uses a unique architecture where attention and FFN are computed in parallel
+        on the same normalized input, then summed together before adding to the residual.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional): Cache view for
-                key_states/value_states states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for
-                cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
+            hidden_states: Input hidden states with shape (batch_size, sequence_length, hidden_size).
+            mask_info: Masking information containing attention masks and positions.
+            position_ids: Position indices for tokens with shape (batch_size, sequence_length).
+            mode: Runtime mode (train/decode/prefill) for cache handling.
+            cache_view: Optional cache view for key/value states in decoder inference.
+            cache_metadata: Optional metadata for cache handling.
+            output_attentions: Whether to return attention weights (default: False).
+            frequencies: Optional precomputed rotary embedding frequencies with shape
+                (sequence_length, head_dim).
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the output hidden states and
-                optionally the attention weights.
+            DecoderLayerOutput containing:
+                - hidden_states: Output hidden states with shape (batch_size, sequence_length, hidden_size).
+                - attention_weight: Optional attention weights if output_attentions=True.
+                - cache_view: Updated cache view if cache is used.
         """
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -439,6 +472,15 @@ class GPTJModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GPT-J base model.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -508,21 +550,30 @@ class GPTJModel(EasyDeLBaseModule):
         """Forward pass through the GPTJModel.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing precomputed
-                key_states/value_states states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            segment_ids (Array, optional): Segment token indices for segment embeddings.
-            extra_embedding (Array, optional): Additional embedding to add to input embeddings.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids: Input token IDs with shape (batch_size, sequence_length). Mutually exclusive
+                with inputs_embeds.
+            attention_mask: Boolean mask with shape (batch_size, sequence_length) to avoid attention
+                on padding tokens. Values are True for tokens to attend to, False for padding.
+            mask_info: Pre-computed masking information. If None, computed from attention_mask.
+            position_ids: Position indices with shape (batch_size, sequence_length). If None,
+                automatically generated as sequential positions.
+            mode: Runtime mode for cache handling. One of MODE_TRAIN, MODE_DECODE, or MODE_PREFILL.
+                Auto-detected if None.
+            past_key_values: Cache containing precomputed key/value states from previous decode steps.
+            cache_metadata: Metadata for cache operations (positions, sequence lengths, etc.).
+            inputs_embeds: Pre-computed input embeddings with shape (batch_size, sequence_length, hidden_size).
+                Mutually exclusive with input_ids.
+            extra_embedding: Additional embeddings to add to inputs_embeds, with shape
+                (batch_size, sequence_length, hidden_size).
+            output_attentions: Whether to return attention weights from all layers (default: False).
+            output_hidden_states: Whether to return hidden states from all layers (default: False).
 
         Returns:
-            Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
+            BaseModelOutput containing:
+                - last_hidden_state: Final hidden states with shape (batch_size, sequence_length, hidden_size).
+                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True.
+                - attentions: Tuple of attention weights from all layers if output_attentions=True.
+                - past_key_values: Updated cache for next decode step.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -618,7 +669,11 @@ class GPTJModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=GPTJConfig, model_type="gptj")
 class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):
-    """GPT-J model with a language modeling head."""
+    """GPT-J model with a language modeling head for autoregressive text generation.
+
+    This model extends GPTJModel with a linear language modeling head that projects
+    hidden states to vocabulary logits for next-token prediction.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gptj"
@@ -633,6 +688,15 @@ class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GPT-J for causal language modeling.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         super().__init__(
             config=config,
             base_model_class=GPTJModel,
