@@ -497,7 +497,7 @@ elm = (
         num_train_epochs=3,
         total_batch_size=32,
         gradient_accumulation_steps=4,
-        max_sequence_length=2048,
+        max_length=2048,
     )
     .add_dataset("train.json", dataset_type="json", content_field="text")
 )
@@ -662,7 +662,7 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 trainer = ed.SFTTrainer(
     model=model,
     arguments=ed.SFTConfig(
-        max_sequence_length=2048,
+        max_length=2048,
         dataset_text_field="text",
         add_special_tokens=False,
         packing=False,

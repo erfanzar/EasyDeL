@@ -19,7 +19,7 @@ reward_config = RewardConfig(
     learning_rate=1e-6,             # Learning rate for optimization
 
     # Sequence parameters
-    max_sequence_length=1024,       # Maximum sequence length
+    max_length=1024,               # Maximum sequence length
 
     # Reward model parameters
     disable_dropout=True,           # Disable dropout during training
@@ -68,7 +68,7 @@ model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
 config = ed.RewardConfig(
     model_name="reward_model_example",
     save_directory="reward_checkpoints",
-    max_sequence_length=2048,
+    max_length=2048,
     center_rewards_coefficient=0.1,
     total_batch_size=16,
     learning_rate=1e-6,
@@ -110,7 +110,7 @@ config:
         split: train
   trainer:
     trainer_type: reward
-    max_sequence_length: 2048
+    max_length: 2048
     center_rewards_coefficient: 0.1
     total_batch_size: 16
     learning_rate: 1e-6

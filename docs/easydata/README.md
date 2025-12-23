@@ -5,6 +5,7 @@ EasyData is EasyDeL's comprehensive data management module, providing flexible a
 ## Why EasyData?
 
 Training modern LLMs requires handling datasets that are:
+
 - **Too large to fit in memory** - EasyData provides streaming from local files, GCS, S3, and HuggingFace Hub
 - **From multiple sources** - Mix datasets with static or dynamic weights
 - **In various formats** - Parquet, JSON, Arrow, CSV, or HuggingFace datasets
@@ -81,20 +82,21 @@ trainer = ed.DPOTrainer(
 
 ## Supported Data Formats
 
-| Format | Source Class | Cloud Support |
-|--------|-------------|---------------|
-| Parquet | `ParquetShardedSource` | GCS, S3, HTTP |
-| JSON/JSONL | `JsonShardedSource` | GCS, S3, HTTP |
-| Arrow IPC | `ArrowShardedSource` | GCS, S3, HTTP |
-| CSV | `CsvShardedSource` | GCS, S3, HTTP |
-| Plain Text | `TextShardedSource` | GCS, S3, HTTP |
-| HuggingFace Hub | `HuggingFaceShardedSource` | Native |
+| Format          | Source Class               | Cloud Support |
+| --------------- | -------------------------- | ------------- |
+| Parquet         | `ParquetShardedSource`     | GCS, S3, HTTP |
+| JSON/JSONL      | `JsonShardedSource`        | GCS, S3, HTTP |
+| Arrow IPC       | `ArrowShardedSource`       | GCS, S3, HTTP |
+| CSV             | `CsvShardedSource`         | GCS, S3, HTTP |
+| Plain Text      | `TextShardedSource`        | GCS, S3, HTTP |
+| HuggingFace Hub | `HuggingFaceShardedSource` | Native        |
 
 ## Key Concepts
 
 ### ShardedDataSource
 
 The core abstraction enabling:
+
 - **Resumable iteration** - Checkpoint at shard + row level
 - **Distributed training** - Assign shards to workers
 - **Efficient cloud streaming** - Parallel shard access
@@ -102,6 +104,7 @@ The core abstraction enabling:
 ### Transforms
 
 Composable preprocessing:
+
 - `ChatTemplateTransform` - Convert messages to formatted text
 - `TokenizedShardedSource` - On-the-fly tokenization
 - Field operations - Select, rename, filter, combine
@@ -109,6 +112,7 @@ Composable preprocessing:
 ### Token Packing
 
 Pack sequences efficiently for training:
+
 - **Greedy** - Simple concatenation
 - **Pool** - Multiple packers for better fit
 - **First-fit** - Bin-packing algorithm
@@ -116,6 +120,7 @@ Pack sequences efficiently for training:
 ### Multi-Layer Caching
 
 TreeCache-style caching with:
+
 - Memory (LRU) + Disk layers
 - Compression (gzip, lz4, zstd)
 - Automatic expiry
@@ -189,7 +194,7 @@ trainer = ed.SFTTrainer(
     model=model,
     train_dataset=mixed,
     processing_class=tokenizer,
-    arguments=ed.SFTConfig(max_sequence_length=2048),
+    arguments=ed.SFTConfig(max_length=2048),
 )
 trainer.train()
 ```

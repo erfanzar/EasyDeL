@@ -1,27 +1,19 @@
 """Tests for MiniMax Text V1 model."""
 
 import pytest
+import transformers
 
 import easydel as ed
 from easydel.modules.minimax_text_v1 import MiniMaxText01Config
 
 try:
-    from .test_utils import CausalLMTester, get_hf_model_from_hub
+    from .test_utils import CausalLMTester
 except ImportError:
-    from test_utils import CausalLMTester, get_hf_model_from_hub
+    from test_utils import CausalLMTester
 
 
 class TestMiniMaxTextV1:
     """Test suite for MiniMax Text V1 model."""
-
-    @pytest.fixture
-    def hf_minimax_class(self, small_model_config):
-        """Load MiniMax Text V1 HF class from hub."""
-        hf_class, _ = get_hf_model_from_hub(
-            "MiniMaxAI/MiniMax-Text-01",
-            small_model_config,
-        )
-        return hf_class
 
     @pytest.fixture
     def minimax_text_v1_config(self, small_model_config):
@@ -41,7 +33,7 @@ class TestMiniMaxTextV1:
         tester = CausalLMTester()
         result = tester.run(
             module_name="minimax_text_01",
-            hf_class=hf_minimax_class,
+            hf_class=transformers.MiniMaxForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=minimax_text_v1_config,
             small_model_config=small_model_config,
@@ -53,7 +45,7 @@ class TestMiniMaxTextV1:
         tester = CausalLMTester()
         result = tester.test_generation(
             module_name="minimax_text_01",
-            hf_class=hf_minimax_class,
+            hf_class=transformers.MiniMaxForCausalLM,
             task=ed.TaskType.CAUSAL_LM,
             config=minimax_text_v1_config,
             small_model_config=small_model_config,

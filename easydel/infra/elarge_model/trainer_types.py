@@ -21,6 +21,7 @@ available in EasyDeL, including DPO, ORPO, GRPO, SFT, Reward, and Distillation t
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Literal, NotRequired, TypedDict
 
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
@@ -132,6 +133,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     step_start_point: NotRequired[int | None]
     resume_if_possible: NotRequired[bool]
     truncation_mode: NotRequired[Literal["keep_end", "keep_start"]]
+    max_length: NotRequired[int | None]
+    # Deprecated alias (kept for backward compatibility).
     max_sequence_length: NotRequired[int | None]
     save_interval_minutes: NotRequired[float | None]
     save_steps: NotRequired[int | None]
@@ -297,7 +300,7 @@ class SFTTrainerCfg(BaseTrainerCfg):
 class RewardTrainerCfg(BaseTrainerCfg):
     """Configuration for Reward Model trainer (RewardConfig)."""
 
-    max_sequence_length: NotRequired[int | None]
+    max_length: NotRequired[int | None]
     disable_dropout: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
     center_rewards_coefficient: NotRequired[float | None]
@@ -441,7 +444,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "aux_loss_enabled": False,
     "resume_if_possible": True,
     "truncation_mode": "keep_end",
-    "max_sequence_length": 4096,
+    "max_length": 4096,
     "save_directory": "EasyDeL-Checkpoints",
     "save_optimizer_state": True,
     "remove_ckpt_after_load": False,
@@ -532,7 +535,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
     },
     "reward": {
         "trainer_prefix": "rewardtrainer",
-        "max_sequence_length": 1024,
+        "max_length": 1024,
         "disable_dropout": True,
         "center_rewards_coefficient": 0.1,
         "remove_unused_columns": False,
@@ -718,6 +721,21 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
 
     config = deepcopy(config)
     trainer_type = _normalize_trainer_type(config.get("trainer_type", "sft"))
+
+    if "max_sequence_length" in config and "max_length" not in config:
+        warnings.warn(
+            "`max_sequence_length` is deprecated; use `max_length` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config["max_length"] = config.pop("max_sequence_length")
+    elif "max_sequence_length" in config and "max_length" in config and config["max_sequence_length"] != config["max_length"]:
+        warnings.warn(
+            "Both `max_length` and `max_sequence_length` are set; ignoring `max_sequence_length`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config.pop("max_sequence_length", None)
 
     # Get merged defaults from registry
     defaults = get_trainer_defaults(trainer_type)

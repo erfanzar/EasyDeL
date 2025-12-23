@@ -79,7 +79,7 @@ trainer = ed.SFTTrainer(
     train_dataset=dataset,
     processing_class=tokenizer,
     arguments=ed.SFTConfig(
-        max_sequence_length=2048,
+        max_length=2048,
         # Chat template applied automatically
     ),
 )

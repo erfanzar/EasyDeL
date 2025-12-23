@@ -274,7 +274,7 @@ class NashMDTrainer(GRPOTrainer):
                     add_special_tokens=False,
                     truncation=True,
                     return_attention_mask=True,
-                    max_length=self.arguments.max_sequence_length,
+                    max_length=self.arguments.max_length,
                 )
                 logits = reward_func.apply_fn(
                     reward_func.graphdef,
@@ -287,7 +287,7 @@ class NashMDTrainer(GRPOTrainer):
                 outputs = reward_func(
                     prompts=prompts,
                     completions=completions,
-                    max_length=self.arguments.max_sequence_length,
+                    max_length=self.arguments.max_length,
                 )
                 values = jnp.asarray(np.asarray(outputs, dtype=np.float32))
             rewards.append(values)

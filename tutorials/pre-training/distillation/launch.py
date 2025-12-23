@@ -185,7 +185,7 @@ def main():
         use_wandb=True,
         wandb_entity=WANDB_ENTITY,
         do_last_save=True,
-        max_sequence_length=max_length,
+        max_length=max_length,
         # This is MANDATORY for streaming datasets. It tells the trainer how many
         # steps constitute one "epoch". Should be ~ (total_dataset_size // total_batch_size).
         per_epoch_training_steps=98_000_000,

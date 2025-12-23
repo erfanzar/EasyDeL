@@ -128,7 +128,7 @@ model = ed.{{ auto_class }}.from_pretrained(
 
 - **Number of Training Epochs**: `{{ arguments.num_train_epochs }}`
 - **Total Batch Size (per step)**: `{{ arguments.total_batch_size }}`
-- **Maximum Sequence Length**: `{{ arguments.max_sequence_length }}`
+- **Maximum Sequence Length**: `{{ arguments.max_length }}`
 - **Gradient Accumulation Steps**: `{{ arguments.gradient_accumulation_steps }}`
 
 ### Datatypes & Precision
