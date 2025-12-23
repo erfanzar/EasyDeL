@@ -76,25 +76,17 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
     dtype = tensor.dtype
     seq_len = tensor.shape[1]
     d_min = jnp.finfo(dtype).min
-    causal_mask = jnp.full((seq_len, seq_len), fill_value=d_min, dtype=dtype)
+    patch_lengths = jnp.asarray(patch_embeds_list, dtype=jnp.int32)
+    block_end_idx = jnp.cumsum(patch_lengths)
 
-    block_end_idx = jnp.cumsum(jnp.array(patch_embeds_list))
-    block_start_idx = jnp.cumsum(jnp.array([0, *patch_embeds_list[:-1]]))
+    positions = jnp.arange(seq_len, dtype=jnp.int32)
+    block_ids = jnp.sum(positions[:, None] >= block_end_idx[None, :], axis=-1)
+    same_block = block_ids[:, None] == block_ids[None, :]
 
-    def update_mask(mask, start_end):
-        start, end = start_end
-        return mask.at[start:end, start:end].set(0)
-
-    causal_mask = jax.lax.fori_loop(
-        0,
-        len(block_start_idx),
-        lambda i, mask: update_mask(mask, (block_start_idx[i], block_end_idx[i])),
-        causal_mask,
-    )
-
-    causal_mask = jnp.expand_dims(causal_mask, axis=(0, 1))
-    causal_mask = jnp.broadcast_to(causal_mask, (tensor.shape[0], 1, seq_len, seq_len))
-    return causal_mask
+    block_mask = jnp.where(same_block, jnp.array(0, dtype=dtype), d_min)
+    block_mask = jnp.expand_dims(block_mask, axis=(0, 1))
+    block_mask = jnp.broadcast_to(block_mask, (tensor.shape[0], 1, seq_len, seq_len))
+    return block_mask
 
 
 def compute_frequencies(dim: int, max_patches_per_side: int, theta: float = 10000.0):
@@ -159,8 +151,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
     Returns:
         `tuple(jnp.ndarray)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
-    sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
+    # Pixtral uses `[batch, seq_len, heads, head_dim]` layout for Q/K. Accept RoPE
+    # inputs as either `[seq_len, head_dim]` or `[batch, seq_len, head_dim]` and
+    # reshape to broadcast across `heads`.
+    if cos.ndim == 2:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    elif cos.ndim == 3:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+    else:
+        cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
+        sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -455,11 +457,10 @@ class PixtralAttention(AttentionModule):
         ) = self.concatenate(
             query=query_states,
             key=key_states,
-            cache_view=None,
             value=value_states,
             mask_info=mask_info,
-            causal_mask=None,
-            fcm_mask=None,
+            cache_view=None,
+            cache_metadata=None,
         )
 
         attentions = self.attention_performer.forward(
@@ -470,7 +471,7 @@ class PixtralAttention(AttentionModule):
             bias=None,
             cache_metadata=None,
             init_bias=init_attention_bias,
-            attention_mask=mask_info,
+            mask_info=mask_info,
             causal=True,
         )
 
@@ -734,12 +735,6 @@ class PixtralTransformer(nn.Module):
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        sequence_length = inputs_embeds.shape[1]
-
-        assert sequence_length <= self.config.max_position_embeddings, (
-            f"Maximum Position Embedding Reached ! "
-            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-        )
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -761,7 +756,7 @@ class PixtralTransformer(nn.Module):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
+                frequencies=position_embeddings,
             )
             hidden_states = layer_outputs.hidden_states
 
