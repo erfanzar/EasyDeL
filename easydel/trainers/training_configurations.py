@@ -22,7 +22,7 @@ import traceback
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields
 
 import jax
 import jax.experimental
@@ -230,10 +230,11 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Maximum number of evaluation steps."},
     )
-    max_sequence_length: int | None = field(
-        default=4096,
+    max_length: int | None = field(
+        default=None,
         metadata={"help": "The maximum sequence length."},
     )
+    max_sequence_length: InitVar[int | None] = None
     max_training_steps: int | None = field(
         default=None,
         metadata={"help": "The maximum number of training steps."},
@@ -561,7 +562,39 @@ class TrainingArguments:
     def is_process_zero(self):
         return jax.process_index() == 0
 
-    def __post_init__(self):
+    def _handle_deprecated_max_sequence_length(self, max_sequence_length: int | None) -> None:
+        if max_sequence_length is None:
+            return
+        warnings.warn(
+            "`max_sequence_length` is deprecated; use `max_length` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if self.max_length is None:
+            self.max_length = max_sequence_length
+            return
+        if self.max_length == max_sequence_length:
+            return
+
+        # If `max_length` is still at the class default, treat the deprecated alias as the user's intent.
+        max_length_default = None
+        for field_obj in fields(self):
+            if field_obj.name == "max_length":
+                max_length_default = field_obj.default
+                break
+
+        if self.max_length == max_length_default:
+            self.max_length = max_sequence_length
+            return
+
+        warnings.warn(
+            f"Both `max_length` ({self.max_length}) and `max_sequence_length` ({max_sequence_length}) are set; "
+            "ignoring `max_sequence_length`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+
+    def __post_init__(self, max_sequence_length: int | None):
         """
         Post-initialization setup and validation.
 
@@ -577,11 +610,14 @@ class TrainingArguments:
             ValueError: If configuration validation fails
             AssertionError: If required conditions are not met
         """
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
+        if self.max_length is None:
+            self.max_length = 4096
+        self._ensure_variables()
         self._validate_config()
         self._setup_distributed()
         self._setup_optimizer()
         self._setup_logging()
-        self._ensure_variables()
 
     def _validate_config(self):
         """
@@ -675,6 +711,84 @@ class TrainingArguments:
 
         This ensures the configuration is ready for use by the trainer.
         """
+        def _coerce_float(value: tp.Any) -> tp.Any:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (float, int, np.floating, np.integer)):
+                return float(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return value
+                try:
+                    return float(stripped)
+                except ValueError:
+                    return value
+            return value
+
+        def _coerce_int(value: tp.Any) -> tp.Any:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, np.integer)):
+                return int(value)
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return value
+                try:
+                    return int(stripped)
+                except ValueError:
+                    try:
+                        casted = float(stripped)
+                    except ValueError:
+                        return value
+                    return int(casted) if casted.is_integer() else value
+            return value
+
+        self.learning_rate = _coerce_float(self.learning_rate)
+        self.learning_rate_end = _coerce_float(self.learning_rate_end)
+        self.weight_decay = _coerce_float(self.weight_decay)
+        self.clip_grad = _coerce_float(self.clip_grad)
+        self.warmup_steps = _coerce_int(self.warmup_steps)
+        self.gradient_accumulation_steps = _coerce_int(self.gradient_accumulation_steps)
+
+        for name in ("learning_rate", "weight_decay"):
+            value = getattr(self, name, None)
+            if not isinstance(value, (float, int, np.floating, np.integer)):
+                raise TypeError(f"`{name}` must be a number, got {type(value).__name__}: {value!r}")
+
+        if self.learning_rate_end is not None and not isinstance(
+            self.learning_rate_end, (float, int, np.floating, np.integer)
+        ):
+            raise TypeError(
+                "`learning_rate_end` must be a number when provided, got "
+                f"{type(self.learning_rate_end).__name__}: {self.learning_rate_end!r}"
+            )
+
+        if self.clip_grad is not None and not isinstance(self.clip_grad, (float, int, np.floating, np.integer)):
+            raise TypeError(
+                "`clip_grad` must be a number when provided, got "
+                f"{type(self.clip_grad).__name__}: {self.clip_grad!r}"
+            )
+
+        if not isinstance(self.warmup_steps, (int, np.integer)):
+            raise TypeError(
+                "`warmup_steps` must be an int, got "
+                f"{type(self.warmup_steps).__name__}: {self.warmup_steps!r}"
+            )
+
+        if not isinstance(self.gradient_accumulation_steps, (int, np.integer)):
+            raise TypeError(
+                "`gradient_accumulation_steps` must be an int, got "
+                f"{type(self.gradient_accumulation_steps).__name__}: {self.gradient_accumulation_steps!r}"
+            )
+
         if isinstance(self.step_partition_spec, str):
             self.step_partition_spec = eval(self.step_partition_spec)
         elif not isinstance(self.step_partition_spec, PartitionSpec):
@@ -1354,3 +1468,23 @@ class TrainingArguments:
         return save_directory
 
     __hash__ = hash_fn
+
+
+def _get_max_sequence_length(self: TrainingArguments) -> int | None:
+    return self.max_length
+
+
+def _set_max_sequence_length(self: TrainingArguments, value: int | None) -> None:
+    warnings.warn(
+        "`max_sequence_length` is deprecated; use `max_length` instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    self.max_length = value
+
+
+TrainingArguments.max_sequence_length = property(  # type: ignore[attr-defined]
+    _get_max_sequence_length,
+    _set_max_sequence_length,
+    doc="Deprecated alias for `max_length`.",
+)

@@ -349,7 +349,7 @@ class GKDTrainer(SFTTrainer):
         """
         seq_np = np.asarray(sequences)
         seq_len = seq_np.shape[1]
-        max_len = self.arguments.max_sequence_length
+        max_len = self.arguments.max_length
         if max_len is not None and seq_len > max_len:
             start = seq_len - max_len
             seq_np = seq_np[:, start:]

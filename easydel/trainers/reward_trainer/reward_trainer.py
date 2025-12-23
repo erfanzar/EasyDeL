@@ -59,7 +59,7 @@ class RewardTrainer(Trainer):
         >>> config = RewardConfig(
         ...     per_device_train_batch_size=8,
         ...     learning_rate=2e-5,
-        ...     max_sequence_length=512
+        ...     max_length=512
         ... )
         >>> trainer = RewardTrainer(
         ...     arguments=config,
@@ -97,12 +97,12 @@ class RewardTrainer(Trainer):
         if data_collator is None:
             self.input_data_collator_tfds = RewardDataCollatorWithPaddingTFDS(
                 processing_class,
-                max_length=arguments.max_sequence_length,
+                max_length=arguments.max_length,
                 truncation_mode=arguments.truncation_mode,
             )
             self.input_data_collator_grain = RewardDataCollatorWithPaddingGrain(
                 processing_class,
-                max_length=arguments.max_sequence_length,
+                max_length=arguments.max_length,
                 truncation_mode=arguments.truncation_mode,
             )
         else:
@@ -129,7 +129,7 @@ class RewardTrainer(Trainer):
 
         return RewardPreprocessTransform(
             tokenizer=self.processing_class,
-            max_length=self.arguments.max_sequence_length,
+            max_length=self.arguments.max_length,
         )
 
     def _is_pretokenized(self) -> bool:

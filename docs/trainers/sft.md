@@ -114,7 +114,7 @@ config:
         content_field: text
   trainer:
     trainer_type: sft
-    max_sequence_length: 2048
+    max_length: 2048
     total_batch_size: 16
     learning_rate: 2e-5
     num_train_epochs: 3

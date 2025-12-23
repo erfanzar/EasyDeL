@@ -15,8 +15,8 @@ sharding:
 
 base_config:
   values:
-    freq_max_position_embeddings: 512
-    mask_max_position_embeddings: 512
+    freq_max_position_embeddings: 2048
+    mask_max_position_embeddings: 2048
     attn_mechanism: auto
     attn_dtype: bf16
     gradient_checkpointing: ""
@@ -30,16 +30,15 @@ mixture:
 
 trainer:
   trainer_type: bco
-  beta: 0.1
-  learning_rate: 8.0e-6
+  beta: 0.2
+  learning_rate: 1e-5
   num_train_epochs: 1
   total_batch_size: 4
   gradient_accumulation_steps: 64
-  max_training_steps: 1024
+  max_training_steps: 8
   max_length: 2048
   max_prompt_length: 1024
-  max_completion_length: 1024
-  max_sequence_length: 2048
+  max_completion_length: 1024 
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
@@ -49,4 +48,3 @@ trainer:
 actions:
   - validate
   - train
-

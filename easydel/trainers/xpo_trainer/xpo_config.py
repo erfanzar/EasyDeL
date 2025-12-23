@@ -76,13 +76,13 @@ class XPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self):
-        self.max_sequence_length = self.max_prompt_length + self.max_completion_length
+    def __post_init__(self, max_sequence_length: int | None):
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         if isinstance(self.alpha, tp.Sequence) and len(self.alpha) == 1:
             self.alpha = self.alpha[0]
         if isinstance(self.beta, tp.Sequence) and len(self.beta) == 1:
             self.beta = self.beta[0]
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

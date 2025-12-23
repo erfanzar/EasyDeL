@@ -110,12 +110,28 @@ def _parse_action(item: Any) -> tuple[str, Any | None]:
     if isinstance(item, str):
         return item, None
     if isinstance(item, dict):
-        if len(item) != 1:
-            raise SystemExit("Action mappings must have exactly one key (e.g. `{eval: {...}}`).")
-        name, value = next(iter(item.items()))
-        if not isinstance(name, str):
-            raise SystemExit("Action name must be a string.")
-        return name, value
+        if len(item) == 1:
+            name, value = next(iter(item.items()))
+            if not isinstance(name, str):
+                raise SystemExit("Action name must be a string.")
+            return name, value
+
+        # Recover from a common YAML indentation mistake:
+        #   - serve:
+        #     host: ...
+        #     port: ...
+        # which parses as {"serve": None, "host": "...", "port": ...}.
+        none_keys = [key for key, value in item.items() if value is None]
+        if len(none_keys) == 1 and isinstance(none_keys[0], str):
+            name = none_keys[0]
+            params = {key: value for key, value in item.items() if key != name}
+            return name, params or None
+
+        raise SystemExit(
+            "Action mappings must have exactly one key (e.g. `{eval: {...}}`). "
+            "If you meant to pass parameters, indent them under the action key (e.g. `- serve: {host: ..., port: ...}` "
+            "or `- serve:\\n    host: ...`)."
+        )
     raise SystemExit(f"Invalid action item type: {type(item).__name__}.")
 
 

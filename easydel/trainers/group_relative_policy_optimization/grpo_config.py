@@ -173,9 +173,18 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "Keep only the top quantile of tokens by entropy in the loss (1.0 disables filtering)."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
         """Post initialization to set dependent parameters."""
-        self.max_sequence_length = self.max_prompt_length + self.max_completion_length
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
+
+        if self.max_length is not None:
+            if self.max_length < self.max_prompt_length:
+                raise ValueError(
+                    f"`max_length` ({self.max_length}) must be >= `max_prompt_length` ({self.max_prompt_length})."
+                )
+            self.max_completion_length = self.max_length - self.max_prompt_length
+
+        self.max_length = self.max_prompt_length + self.max_completion_length
 
         if self.num_generations is None:
             self.num_generations = self.num_return_sequences
@@ -191,6 +200,6 @@ class GRPOConfig(TrainingArguments):
             self.scale_rewards = "none"
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

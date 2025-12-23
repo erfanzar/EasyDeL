@@ -144,7 +144,7 @@ def main():
         do_last_save=True,  # Save the final model checkpoint after training.
         max_training_steps=None,  # Maximum number of training steps (None means train until epochs are done).
         max_evaluation_steps=None,  # Maximum number of evaluation steps (None means evaluate full test set).
-        max_sequence_length=max_length,  # max_length
+        max_length=max_length,  # Maximum sequence length
         loss_config=ed.LossConfig(z_loss=0.0),  # Z-loss regularization term in SFT loss (0.0 means off).
         track_memory=False,  # Set to True to enable memory tracking (can add minor overhead).
         save_steps=1_000,  # Save a model checkpoint every 1000 training steps.

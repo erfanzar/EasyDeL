@@ -518,7 +518,7 @@ class GRPOTrainer(Trainer):
                                     add_special_tokens=False,
                                     truncation=True,
                                     return_attention_mask=True,
-                                    max_length=self.arguments.max_sequence_length,
+                                    max_length=self.arguments.max_length,
                                 )
                             ),
                         ).logits[:, 0]
@@ -527,7 +527,7 @@ class GRPOTrainer(Trainer):
                         output_reward_func = reward_func(
                             prompts=in_prompts,
                             completions=completions,
-                            max_length=self.arguments.max_sequence_length,
+                            max_length=self.arguments.max_length,
                             batch=batch,
                         )
                         rew = jnp.array(
