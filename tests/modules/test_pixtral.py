@@ -32,7 +32,7 @@ class TestPixtral:
         result = tester.run(
             module_name="pixtral",
             hf_class=transformers.PixtralVisionModel,
-            task=ed.TaskType.BASE_MODULE,
+            task=ed.TaskType.BASE_VISION,
             config=pixtral_config,
             small_model_config=small_model_config,
         )
