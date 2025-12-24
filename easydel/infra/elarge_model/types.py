@@ -265,7 +265,12 @@ class eSurgeCfg(TypedDict, total=False):
     Attributes:
         max_model_len: Maximum sequence length for the model.
         min_input_pad: Minimum padding for input sequences (default: 16).
+        min_token_pad: Optional minimum token bucket size for compilation. When set
+            below `min_input_pad`, decode steps can use smaller token buckets (e.g.
+            `tok=1/b1`), at the cost of more compilation variants.
         max_num_seqs: Maximum number of concurrent sequences (default: 256).
+        max_num_seq_buckets: Optional explicit request-capacity buckets used for
+            compilation (e.g., [8, 16, 32]).
         max_num_batched_tokens: Optional cap on total tokens per batch.
         hbm_utilization: HBM memory utilization ratio (default: 0.85).
         page_size: Page size for paged attention (default: 128).
@@ -297,7 +302,9 @@ class eSurgeCfg(TypedDict, total=False):
 
     max_model_len: NotRequired[int]
     min_input_pad: NotRequired[int]
+    min_token_pad: NotRequired[int | None]
     max_num_seqs: NotRequired[int]
+    max_num_seq_buckets: NotRequired[tp.Sequence[int] | None]
     max_num_batched_tokens: NotRequired[int | None]
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]

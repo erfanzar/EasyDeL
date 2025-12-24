@@ -179,6 +179,7 @@ class eSurgeRunner:
         page_size: int = 128,
         max_model_len: int = 2**13,
         min_input_pad: int = 256,
+        min_token_pad: int | None = None,
         max_num_seqs: int = 16,
         max_num_seq_buckets: list[int] | None = None,
         use_aot_forward: bool = True,
@@ -203,8 +204,10 @@ class eSurgeRunner:
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
 
+        min_token_pad_i = self.min_input_pad if min_token_pad is None else int(min_token_pad)
+        min_token_pad_i = min(min_token_pad_i, int(self.max_model_len))
         self.num_tokens_paddings = self._get_token_paddings(
-            min_token_size=self.min_input_pad,
+            min_token_size=min_token_pad_i,
             max_token_size=self.max_model_len,
             padding_gap=0,
         )
@@ -1089,15 +1092,16 @@ class eSurgeRunner:
                 scheduled_full_cpu.fill(0)
                 scheduled_full_cpu[: len(scheduled_list)] = scheduled_list
 
+                # Packed view of the per-request target lengths for the current window.
+                # Avoid per-step dict lookups; SequenceBuffer keeps this aligned with its ordering.
                 req_num_tokens_np = self._req_num_tokens_cpu
                 req_num_tokens_np.fill(0)
+                req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[start_index:end_index]
+
                 active_mask_full_cpu = self._active_mask_full_cpu
                 active_mask_full_cpu.fill(False)
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
-                        rs = self.requests.get(rid)
-                        if rs:
-                            req_num_tokens_np[i] = rs.num_tokens
                         active_mask_full_cpu[i] = True
 
                 self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
