@@ -21,6 +21,7 @@ consolidated payload to device via `jax.device_put`.
 
 from __future__ import annotations
 
+import time
 import typing as tp
 
 import jax
@@ -74,6 +75,10 @@ class BatchMetadataPreparer:
         self._seq_lens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._logits_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
+        self._packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
+        self._packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._arange_cpu = np.arange(self.max_num_tokens, dtype=np.int32)
         self._pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
@@ -92,6 +97,10 @@ class BatchMetadataPreparer:
         self._async_seq_lens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_logits_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._async_packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
+        self._async_packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
+        self._async_packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._async_pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
             PAGE_TABLE_PADDING_VAL,
@@ -133,6 +142,25 @@ class BatchMetadataPreparer:
         # Double buffering: store pending async device transfer
         self._pending_transfer: tuple | None = None
         self._pending_transfer_metadata: dict | None = None
+
+        # Last-prep timing breakdown (seconds).
+        self.last_prep_stats: dict[str, float] = {}
+
+        # Cache device-side zero buffers for optional VLM inputs. This lets us keep
+        # the input PyTree stable (non-None fields) without paying host→device cost
+        # on steps where those buffers are effectively unused (e.g., all-false masks).
+        self._zero_dev_cache: dict[tuple[str, tuple[int, ...], str], jax.Array] = {}
+
+    def _get_zero_dev(self, *, namespace: str, shape: tuple[int, ...], dtype: np.dtype) -> jax.Array:
+        key = (str(namespace), tuple(int(x) for x in shape), str(np.dtype(dtype)))
+        cached = self._zero_dev_cache.get(key)
+        if cached is None:
+            cached = jax.device_put(np.zeros(shape, dtype=dtype), self._empty_sharding)
+            self._zero_dev_cache[key] = cached
+        return cached
+
+    def _get_zero_dev_like(self, *, namespace: str, arr: np.ndarray) -> jax.Array:
+        return self._get_zero_dev(namespace=namespace, shape=tuple(arr.shape), dtype=arr.dtype)
 
     @property
     def uses_slot_mapping(self) -> bool:
@@ -270,6 +298,10 @@ class BatchMetadataPreparer:
             seq_lens = self._async_seq_lens_cpu
             logits_indices = self._async_logits_indices_cpu
             pages_tables = self._async_pages_tables_cpu
+            packed_qsl_seqlens = self._async_packed_qsl_seqlens_cpu
+            packed_i32_padded = self._async_packed_i32_padded_cpu
+            packed_f32_padded = self._async_packed_f32_padded_cpu
+            packed_misc_i32 = self._async_packed_misc_i32_cpu
             request_distribution = self._async_request_distribution_cpu
             num_kv_update_cpu = self._async_num_kv_update_cpu
             slot_mapping_buf = self._async_slot_mapping_cpu
@@ -281,6 +313,10 @@ class BatchMetadataPreparer:
             seq_lens = self._seq_lens_cpu
             logits_indices = self._logits_indices_cpu
             pages_tables = self._pages_tables_cpu
+            packed_qsl_seqlens = self._packed_qsl_seqlens_cpu
+            packed_i32_padded = self._packed_i32_padded_cpu
+            packed_f32_padded = self._packed_f32_padded_cpu
+            packed_misc_i32 = self._packed_misc_i32_cpu
             request_distribution = self._request_distribution_placeholder
             num_kv_update_cpu = self._num_kv_update_placeholder
             slot_mapping_buf = self._slot_mapping_cpu
@@ -373,26 +409,52 @@ class BatchMetadataPreparer:
             self._async_slot_mapping_placeholder if use_async_buffers else self._slot_mapping_placeholder
         )
 
-        host_payload = (
-            input_ids,
-            positions,
-            qsl,
-            seq_lens,
-            logits_indices[:padded_num_reqs],
-            pages_tables,
-            scheduled[:padded_num_reqs],
-            temperature_cpu[:padded_num_reqs],
-            top_p_cpu[:padded_num_reqs],
-            top_k_cpu[:padded_num_reqs],
-            min_p_cpu[:padded_num_reqs],
-            np.int32(num_requests),
-            np.int32(padded_num_reqs),
-            request_distribution,
-            slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
-            num_kv_update_cpu,
-            scheduled_full_cpu,
-            active_mask_full_cpu,
-        )
+        # Pack small vectors/scalars into dense buffers to reduce PyTree leaf count.
+        packed_qsl_seqlens[0] = qsl
+        packed_qsl_seqlens[1].fill(0)
+        packed_qsl_seqlens[1, :-1] = seq_lens
+
+        packed_i32_padded[:, :padded_num_reqs].fill(0)
+        packed_i32_padded[0, :padded_num_reqs] = scheduled[:padded_num_reqs]
+        packed_i32_padded[1, :padded_num_reqs] = logits_indices[:padded_num_reqs]
+        packed_i32_padded[2, :padded_num_reqs] = top_k_cpu[:padded_num_reqs]
+
+        packed_f32_padded[:, :padded_num_reqs].fill(0)
+        packed_f32_padded[0, :padded_num_reqs] = temperature_cpu[:padded_num_reqs]
+        packed_f32_padded[1, :padded_num_reqs] = top_p_cpu[:padded_num_reqs]
+        packed_f32_padded[2, :padded_num_reqs] = min_p_cpu[:padded_num_reqs]
+
+        packed_misc_i32.fill(0)
+        packed_misc_i32[0] = np.int32(num_requests)
+        packed_misc_i32[1] = np.int32(padded_num_reqs)
+        packed_misc_i32[2:5] = request_distribution
+
+        if self._use_slot_mapping:
+            host_payload = (
+                input_ids,
+                positions,
+                packed_qsl_seqlens,
+                pages_tables,
+                packed_i32_padded[:, :padded_num_reqs],
+                packed_f32_padded[:, :padded_num_reqs],
+                packed_misc_i32,
+                slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
+                num_kv_update_cpu,
+                scheduled_full_cpu,
+                active_mask_full_cpu,
+            )
+        else:
+            host_payload = (
+                input_ids,
+                positions,
+                packed_qsl_seqlens,
+                pages_tables,
+                packed_i32_padded[:, :padded_num_reqs],
+                packed_f32_padded[:, :padded_num_reqs],
+                packed_misc_i32,
+                scheduled_full_cpu,
+                active_mask_full_cpu,
+            )
 
         return host_payload, padded_num_reqs
 
@@ -426,6 +488,7 @@ class BatchMetadataPreparer:
         video_grid_thw: np.ndarray | None = None,
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Precompute batch metadata using CPU-first approach."""
+        host_build_start = time.time()
         host_payload, _padded_num_reqs = self._build_host_payload(
             num_tokens_static=int(num_tokens_static),
             scheduled_full_cpu=scheduled_full_cpu,
@@ -440,46 +503,80 @@ class BatchMetadataPreparer:
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
         )
+        host_build_took = time.time() - host_build_start
 
-        (
-            input_ids_buf,
-            position_ids_buf,
-            qsl,
-            seq_lens,
-            logits_indices,
-            pt,
-            scheduled_dev,
-            temperature_dev,
-            top_p_dev,
-            top_k_dev,
-            min_p_dev,
-            num_requests_dev,
-            padded_num_reqs_dev,
-            req_dist_dev,
-            slot_mapping_dev,
-            num_kv_update_dev,
-            scheduled_full_dev,
-            active_mask_full_dev,
-        ) = jax.device_put(host_payload, self._empty_sharding)
+        device_put_start = time.time()
+
+        slot_mapping_dev = None
+        num_kv_update_dev = None
+        if self._use_slot_mapping:
+            (
+                input_ids_buf,
+                position_ids_buf,
+                packed_qsl_seqlens_dev,
+                pages_tables_dev,
+                packed_i32_padded_dev,
+                packed_f32_padded_dev,
+                packed_misc_i32_dev,
+                slot_mapping_dev,
+                num_kv_update_dev,
+                scheduled_full_dev,
+                active_mask_full_dev,
+            ) = jax.device_put(host_payload, self._empty_sharding)
+        else:
+            (
+                input_ids_buf,
+                position_ids_buf,
+                packed_qsl_seqlens_dev,
+                pages_tables_dev,
+                packed_i32_padded_dev,
+                packed_f32_padded_dev,
+                packed_misc_i32_dev,
+                scheduled_full_dev,
+                active_mask_full_dev,
+            ) = jax.device_put(host_payload, self._empty_sharding)
+        device_put_took = time.time() - device_put_start
 
         mrope_position_ids_dev = None
         prefill_embeds_dev = None
         prefill_embeds_mask_dev = None
+        extra_put_start = time.time()
         if mrope_position_ids_cpu is not None:
             mrope_position_ids_dev = jax.device_put(mrope_position_ids_cpu, self._empty_sharding)
+
+        # Prefill embedding overrides are rare outside of multimodal prompt regions.
+        # Keep device buffers stable, but only transfer when the mask selects any rows.
         if prefill_embeds_cpu is not None:
-            prefill_embeds_dev = jax.device_put(prefill_embeds_cpu, self._empty_sharding)
-        if prefill_embeds_mask_cpu is not None:
-            prefill_embeds_mask_dev = jax.device_put(prefill_embeds_mask_cpu, self._empty_sharding)
+            prefill_embeds_dev = self._get_zero_dev_like(namespace="prefill_embeds", arr=prefill_embeds_cpu)
+            if prefill_embeds_mask_cpu is not None:
+                prefill_embeds_mask_dev = self._get_zero_dev_like(
+                    namespace="prefill_embeds_mask", arr=prefill_embeds_mask_cpu
+                )
+                if bool(prefill_embeds_mask_cpu.any()):
+                    prefill_embeds_dev = jax.device_put(prefill_embeds_cpu, self._empty_sharding)
+                    prefill_embeds_mask_dev = jax.device_put(prefill_embeds_mask_cpu, self._empty_sharding)
+            else:
+                prefill_embeds_mask_dev = self._get_zero_dev(
+                    namespace="prefill_embeds_mask",
+                    shape=(prefill_embeds_cpu.shape[0],),
+                    dtype=np.bool_,
+                )
 
         visual_pos_masks_dev = None
         deepstack_visual_embeds_dev = None
         if visual_pos_masks_cpu is not None:
-            visual_pos_masks_dev = jax.device_put(visual_pos_masks_cpu, self._empty_sharding)
+            visual_pos_masks_dev = self._get_zero_dev_like(namespace="visual_pos_masks", arr=visual_pos_masks_cpu)
+            if bool(visual_pos_masks_cpu.any()):
+                visual_pos_masks_dev = jax.device_put(visual_pos_masks_cpu, self._empty_sharding)
         if deepstack_visual_embeds_cpu is not None:
             deepstack_visual_embeds_dev = tuple(
-                jax.device_put(arr, self._empty_sharding) for arr in deepstack_visual_embeds_cpu
+                self._get_zero_dev_like(namespace=f"deepstack_visual_embeds:{idx}", arr=arr)
+                for idx, arr in enumerate(deepstack_visual_embeds_cpu)
             )
+            if visual_pos_masks_cpu is not None and bool(visual_pos_masks_cpu.any()):
+                deepstack_visual_embeds_dev = tuple(
+                    jax.device_put(arr, self._empty_sharding) for arr in deepstack_visual_embeds_cpu
+                )
 
         pixel_values_dev = None
         image_grid_thw_dev = None
@@ -493,23 +590,24 @@ class BatchMetadataPreparer:
             pixel_values_videos_dev = jax.device_put(pixel_values_videos, self._empty_sharding)
         if video_grid_thw is not None:
             video_grid_thw_dev = jax.device_put(video_grid_thw, self._empty_sharding)
+        extra_put_took = time.time() - extra_put_start
+
+        # Expose a timing breakdown to the execution manager (for perf logs).
+        # Keep in seconds to match other internal metrics.
+        self.last_prep_stats = {
+            "prep_host_time": float(host_build_took),
+            "prep_put_time": float(device_put_took),
+            "prep_extra_put_time": float(extra_put_took),
+        }
 
         metadata = BatchMetadata(
-            scheduled=scheduled_dev,
-            query_start_loc=qsl,
-            seq_lens=seq_lens,
-            pages_tables=pt,
-            padded_num_reqs=padded_num_reqs_dev,
-            logits_indices=logits_indices,
+            packed_qsl_seqlens=packed_qsl_seqlens_dev,
+            packed_i32_padded=packed_i32_padded_dev,
+            packed_f32_padded=packed_f32_padded_dev,
+            packed_misc_i32=packed_misc_i32_dev,
+            pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
-            num_requests=num_requests_dev,
-            temperature=temperature_dev,
-            top_p=top_p_dev,
-            top_k=top_k_dev,
-            min_p=min_p_dev,
-            positions=position_ids_buf,
-            request_distribution=req_dist_dev,
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
             pixel_values=pixel_values_dev,
@@ -562,6 +660,7 @@ class BatchMetadataPreparer:
         np.copyto(self._async_min_p_cpu, min_p_cpu)
         np.copyto(self._async_page_table_cpu, page_table_cpu)
 
+        host_build_start = time.time()
         host_payload, padded_num_reqs = self._build_host_payload(
             num_tokens_static=int(num_tokens_static),
             scheduled_full_cpu=self._async_scheduled_full_cpu,
@@ -577,9 +676,17 @@ class BatchMetadataPreparer:
             copy_slot_mapping=False,
             use_async_buffers=True,
         )
+        host_build_took = time.time() - host_build_start
 
+        device_put_start = time.time()
         self._pending_transfer = jax.device_put(host_payload, self._empty_sharding)
-        self._pending_transfer_metadata = {"num_tokens_static": num_tokens_static, "padded_num_reqs": padded_num_reqs}
+        device_put_took = time.time() - device_put_start
+        self._pending_transfer_metadata = {
+            "num_tokens_static": num_tokens_static,
+            "padded_num_reqs": padded_num_reqs,
+            "host_build_time": float(host_build_took),
+            "device_put_time": float(device_put_took),
+        }
 
     def get_async_prep_result(
         self,
@@ -595,49 +702,67 @@ class BatchMetadataPreparer:
         if self._pending_transfer is None:
             return None
 
-        (
-            input_ids_buf,
-            position_ids_buf,
-            qsl,
-            seq_lens,
-            logits_indices,
-            pt,
-            scheduled_dev,
-            temperature_dev,
-            top_p_dev,
-            top_k_dev,
-            min_p_dev,
-            num_requests_dev,
-            padded_num_reqs_dev,
-            req_dist_dev,
-            slot_mapping_dev,
-            num_kv_update_dev,
-            scheduled_full_dev,
-            active_mask_full_dev,
-        ) = self._pending_transfer
+        device_put_took = 0.0
+        host_build_took = 0.0
+        transfer_meta = tp.cast(dict, self._pending_transfer_metadata or {})
+        try:
+            device_put_took = float(transfer_meta.get("device_put_time", 0.0))
+        except Exception:
+            device_put_took = 0.0
+        try:
+            host_build_took = float(transfer_meta.get("host_build_time", 0.0))
+        except Exception:
+            host_build_took = 0.0
+
+        slot_mapping_dev = None
+        num_kv_update_dev = None
+        if self._use_slot_mapping:
+            (
+                input_ids_buf,
+                position_ids_buf,
+                packed_qsl_seqlens_dev,
+                pages_tables_dev,
+                packed_i32_padded_dev,
+                packed_f32_padded_dev,
+                packed_misc_i32_dev,
+                slot_mapping_dev,
+                num_kv_update_dev,
+                scheduled_full_dev,
+                active_mask_full_dev,
+            ) = self._pending_transfer
+        else:
+            (
+                input_ids_buf,
+                position_ids_buf,
+                packed_qsl_seqlens_dev,
+                pages_tables_dev,
+                packed_i32_padded_dev,
+                packed_f32_padded_dev,
+                packed_misc_i32_dev,
+                scheduled_full_dev,
+                active_mask_full_dev,
+            ) = self._pending_transfer
+
+        # For async prep, host build happened in `start_async_prep`.
+        self.last_prep_stats = {
+            "prep_host_time": float(host_build_took),
+            "prep_put_time": float(device_put_took),
+            "prep_extra_put_time": 0.0,
+        }
 
         metadata = BatchMetadata(
-            scheduled=scheduled_dev,
-            query_start_loc=qsl,
-            seq_lens=seq_lens,
-            pages_tables=pt,
-            padded_num_reqs=padded_num_reqs_dev,
-            logits_indices=logits_indices,
+            packed_qsl_seqlens=packed_qsl_seqlens_dev,
+            packed_i32_padded=packed_i32_padded_dev,
+            packed_f32_padded=packed_f32_padded_dev,
+            packed_misc_i32=packed_misc_i32_dev,
+            pages_tables=pages_tables_dev,
             input_ids_buf=input_ids_buf,
             position_ids_buf=position_ids_buf,
-            num_requests=num_requests_dev,
-            temperature=temperature_dev,
-            top_p=top_p_dev,
-            top_k=top_k_dev,
-            min_p=min_p_dev,
-            positions=position_ids_buf,
-            request_distribution=req_dist_dev,
             slot_mapping=slot_mapping_dev if self._use_slot_mapping else None,
             num_kv_update_slices=num_kv_update_dev if self._use_slot_mapping else None,
         )
 
         self._pending_transfer = None
-        transfer_meta = tp.cast(dict, self._pending_transfer_metadata or {})
         self._pending_transfer_metadata = None
 
         return (

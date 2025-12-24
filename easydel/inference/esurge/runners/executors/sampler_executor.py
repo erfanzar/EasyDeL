@@ -134,13 +134,16 @@ class SamplerExecutor:
             batch_size = logits.shape[0]
             i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
+            active_mask = (i_reqs < metadata.num_requests) & active_mask_full[:batch_size]
+
             temp = metadata.temperature.reshape(-1, 1).astype(logits.dtype)
+            temp = jnp.where(active_mask[:, None], temp, jnp.ones_like(temp))
             topp = metadata.top_p.astype(logits.dtype)
             topk = metadata.top_k.astype(jnp.int32)
             minp = metadata.min_p.astype(logits.dtype)
 
-            is_all_greedy = jnp.all(temp <= 0.0)
-            need_min_p_sampling = jnp.any(minp > 0.0)
+            is_all_greedy = jnp.all(jnp.where(active_mask[:, None], temp <= 0.0, True))
+            need_min_p_sampling = jnp.any((minp > 0.0) & active_mask)
 
             sampling_metadata = SamplingMetadata(
                 temperatures=temp,
@@ -154,7 +157,7 @@ class SamplerExecutor:
                 linear_penalty=None,
             )
 
-            sampled_flat = sample_tokens_fn(logits, sampling_metadata, metadata.positions, rng_key)
+            sampled_flat = sample_tokens_fn(logits, sampling_metadata, rng_key)
             total_tokens = metadata.query_start_loc[-1]
             rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 

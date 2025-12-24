@@ -99,7 +99,12 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     logits = lax.cond(need_top_p, apply_topp, lambda legi: legi, logits)
 
     # Temperature scaling (apply before min-p to match sglang-jax behavior)
-    logits = logits / sampling_metadata.temperatures
+    need_temp = jnp.any(sampling_metadata.temperatures != 1.0)
+
+    def apply_temp(legi):
+        return legi / sampling_metadata.temperatures
+
+    logits = lax.cond(need_temp, apply_temp, lambda legi: legi, logits)
 
     # Min-p filtering (applied after temperature scaling)
     logits = lax.cond(
@@ -123,7 +128,6 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
 def sample_tokens(
     logits: jax.Array,
     sampling_metadata: SamplingMetadata,
-    positions: jax.Array,
     rng: jax.Array,
 ) -> jax.Array:
     """Sample next tokens from logits with advanced filtering.
@@ -142,7 +146,6 @@ def sample_tokens(
             - is_all_greedy: Whether to use greedy sampling
             - do_penalties: Whether to apply penalties
             - linear_penalty: Optional penalty matrix
-        positions: Current token positions [batch] (unused, for API compatibility).
         rng: JAX random key for stochastic sampling.
 
     Returns:
@@ -160,7 +163,7 @@ def sample_tokens(
         ...     do_penalties=False,
         ...     linear_penalty=None,
         ... )
-        >>> tokens = sample_tokens(logits, metadata, None, rng_key)
+        >>> tokens = sample_tokens(logits, metadata, rng_key)
         >>> tokens.shape
         (4,)
     """

@@ -643,7 +643,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             else:
                 if max_tokens < 0:
                     max_tokens = None
-        temperature = max(0.0, min(float(request.temperature or 1.0), 2.0))
+        raw_temperature = request.temperature
+        if raw_temperature is None:
+            temperature_f = 1.0
+        else:
+            temperature_f = float(raw_temperature)
+        temperature = max(0.0, min(temperature_f, 2.0))
+
+        raw_top_k = getattr(request, "top_k", None)
+        if raw_top_k is None:
+            top_k = 0
+        else:
+            top_k = int(raw_top_k)
+        if top_k < 0:
+            top_k = 0
 
         return SamplingParams(
             max_tokens=max_tokens,
@@ -651,7 +664,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             presence_penalty=float(request.presence_penalty or 0.0),
             frequency_penalty=float(request.frequency_penalty or 0.0),
             repetition_penalty=float(getattr(request, "repetition_penalty", 1.0)),
-            top_k=int(getattr(request, "top_k", 50)),
+            top_k=top_k,
             top_p=float(request.top_p or 1.0),
             min_p=float(getattr(request, "min_p", 0.0)),
             n=int(request.n or 1),

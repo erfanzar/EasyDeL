@@ -105,7 +105,9 @@ DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
 DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
 DEFAULT_DECODE_INTERVAL_TOKENS = 4  # Decode every N tokens
 DEFAULT_DECODE_INTERVAL_SECS = 0.02  # Or decode every N seconds (20ms)
-MAX_CONSECUTIVE_SCHEDULER_ERRORS = 10  # Stop scheduler after this many consecutive errors
+# Default to fail-fast (1) so benchmark runs don't spin for hours on fatal errors.
+# Set `EASURGE_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
+MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "1"))
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 
@@ -545,6 +547,8 @@ class eSurge:
         # Scheduler thread
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_running = False
+        self._scheduler_exception: BaseException | None = None
+        self._scheduler_exception_tb: str | None = None
 
         self.initiate()
 
@@ -582,6 +586,28 @@ class eSurge:
 
         self._sampling_params_callback = callback
 
+    def _abort_scheduler_due_to_error(self, exc: BaseException) -> None:
+        # Record the failure so waiting callers can raise immediately.
+        self._scheduler_exception = exc
+        self._scheduler_exception_tb = traceback.format_exc()
+
+        # Stop the scheduler and wake up any waiters (generate/stream/chat).
+        self._scheduler_running = False
+        self._output_event.set()
+        with self._request_lock:
+            events = list(self._request_events.values())
+        for ev in events:
+            ev.set()
+
+    def _raise_if_scheduler_failed(self) -> None:
+        exc = self._scheduler_exception
+        if exc is None:
+            return
+        tb = self._scheduler_exception_tb
+        if tb:
+            raise RuntimeError(f"eSurge scheduler crashed: {exc}\n{tb}") from exc
+        raise RuntimeError(f"eSurge scheduler crashed: {exc}") from exc
+
     def initiate(self) -> None:
         """Start the background scheduler thread.
 
@@ -603,6 +629,10 @@ class eSurge:
             if self.runner.executor_manager.kv_pages is None:
                 self.runner.initialize_kv_cache()
                 self._kv_cache_valid = True
+
+            # Clear any previous crash state before starting a fresh scheduler thread.
+            self._scheduler_exception = None
+            self._scheduler_exception_tb = None
 
             def _scheduler_loop():
                 self._info("Starting background scheduler loop")
@@ -639,7 +669,7 @@ class eSurge:
                                     f"Scheduler loop encountered {consecutive_errors} consecutive errors. "
                                     "Stopping scheduler to prevent resource exhaustion."
                                 )
-                                self._scheduler_running = False
+                                self._abort_scheduler_due_to_error(e)
                                 break
                             time.sleep(0.01)
                     self._info("Background scheduler loop stopped")
@@ -676,7 +706,7 @@ class eSurge:
                                 f"Scheduler loop encountered {consecutive_errors} consecutive errors. "
                                 "Stopping scheduler to prevent resource exhaustion."
                             )
-                            self._scheduler_running = False
+                            self._abort_scheduler_due_to_error(e)
                             break
                         time.sleep(0.01)
 
@@ -1046,11 +1076,13 @@ class eSurge:
         completed = set()
 
         if not self._scheduler_running:
+            self._raise_if_scheduler_failed()
             raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
         while len(completed) < len(prompts):
             self._output_event.wait(timeout=0.1)
             self._output_event.clear()
+            self._raise_if_scheduler_failed()
             with self._output_lock:
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
@@ -1142,6 +1174,7 @@ class eSurge:
         self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
         if not self._scheduler_running:
+            self._raise_if_scheduler_failed()
             raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
         with self._request_lock:
@@ -1155,6 +1188,7 @@ class eSurge:
             while True:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
+                self._raise_if_scheduler_failed()
 
                 snapshot = None
                 with self._output_lock:
@@ -1404,6 +1438,7 @@ class eSurge:
         )
 
         if not self._scheduler_running:
+            self._raise_if_scheduler_failed()
             raise RuntimeError("Background scheduler is not running. Call initiate() first.")
 
         if stream:
@@ -1424,6 +1459,7 @@ class eSurge:
             while True:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
+                self._raise_if_scheduler_failed()
 
                 snapshot = None
                 with self._output_lock:
@@ -1490,6 +1526,7 @@ class eSurge:
         while True:
             req_event.wait(timeout=1.0)
             req_event.clear()
+            self._raise_if_scheduler_failed()
             with self._output_lock:
                 output = self._request_outputs.get(request_id)
                 if output is not None and output.finished:
