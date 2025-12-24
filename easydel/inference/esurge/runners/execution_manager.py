@@ -547,7 +547,6 @@ class ExecutionManager:
 
         start_exec = time.time()
         model_outputs = self.execute_model(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs, inputs=inputs)
-        exec_took = time.time() - start_exec
 
         sampler_inputs = (
             batch_metadata,
@@ -562,8 +561,10 @@ class ExecutionManager:
             sampler_hash_baseline = self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"]
             _tree_hash_diff(sampler_hash_baseline, sampler_hash)
 
-        start_sample = time.time()
-        self.rng_key, out_tokens_full, valid_mask_full = self.sample_tokens(
+        # Enqueue sampling immediately (it will run after the forward pass),
+        # then synchronize on logits to measure forward time without an extra
+        # host-side dispatch gap between the two computations.
+        sampler_out = self.sample_tokens(
             num_tokens=num_tokens,
             padded_num_reqs=padded_num_reqs,
             batch_metadata=batch_metadata,
@@ -572,6 +573,13 @@ class ExecutionManager:
             logits=model_outputs.logits,
             rng_key=self.rng_key,
         )
+        jax.block_until_ready(model_outputs.logits)
+        exec_took = time.time() - start_exec
+
+        start_sample = time.time()
+        rng_key_out, out_tokens_full, valid_mask_full = sampler_out
+        jax.block_until_ready(out_tokens_full)
+        self.rng_key = rng_key_out
         sample_took = time.time() - start_sample
         execute_total_took = time.time() - start_prep
         execute_overhead_took = execute_total_took - (prep_took + exec_took + sample_took)
@@ -613,9 +621,9 @@ class ExecutionManager:
         """Run the compiled model forward step and update `self.kv_pages`."""
 
         model_fn = self._model_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
-        outputs = jax.block_until_ready(
-            model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
-        )
+        # Do not block here: allow the caller to pipeline dependent work
+        # (e.g. enqueue sampling) before synchronizing.
+        outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
 
@@ -633,8 +641,9 @@ class ExecutionManager:
         """Run the compiled sampler step (no KV-cache mutation)."""
 
         sampler_fn = self._sampler_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
-        out = sampler_fn(batch_metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
-        return jax.block_until_ready(out)
+        # Keep this non-blocking so the caller can overlap host work while the
+        # device enqueues sampling behind the forward pass.
+        return sampler_fn(batch_metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
 
     def compile(
         self,

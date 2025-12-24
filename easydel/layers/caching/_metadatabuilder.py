@@ -729,11 +729,14 @@ class AttentionMetadataBuilder:
         min_input_pad_i = max(int(min_input_pad), 1)
 
         nr_safe = max(int(num_requests), 1)
-        requested_bucket = nr_safe if padded_num_reqs_in is None else max(int(padded_num_reqs_in), nr_safe)
+        if padded_num_reqs_in is not None:
+            # When the caller provides an explicit bucket (e.g. precompiled buckets),
+            # honor it directly (as long as it can fit the active requests).
+            return min(max(int(padded_num_reqs_in), nr_safe), max_num_reqs_i)
 
         next_pow2 = 1 << (nr_safe - 1).bit_length()
         fallback_bucket = min_input_pad_i if nr_safe <= min_input_pad_i else next_pow2
-        return min(max(requested_bucket, fallback_bucket), max_num_reqs_i)
+        return min(fallback_bucket, max_num_reqs_i)
 
     @classmethod
     def compute_paged_attention_batch_fields_cpu(

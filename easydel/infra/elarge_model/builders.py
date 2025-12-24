@@ -186,7 +186,9 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         or 8192
     )
     min_input_pad_val = es.get("min_input_pad")
+    min_token_pad_val = es.get("min_token_pad")
     max_num_seqs_val = es.get("max_num_seqs")
+    max_num_seq_buckets_val = es.get("max_num_seq_buckets")
     page_size_val = es.get("page_size")
     hbm_utilization_val = es.get("hbm_utilization")
     use_aot_forward_val = es.get("use_aot_forward")
@@ -225,10 +227,16 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
     truncate_mode = es.get("truncate_mode", "left")
 
+    max_num_seq_buckets = None
+    if max_num_seq_buckets_val is not None:
+        max_num_seq_buckets = [int(v) for v in max_num_seq_buckets_val]
+
     return dict(
         max_model_len=int(max_model_len),
         min_input_pad=int(min_input_pad_val) if min_input_pad_val is not None else 16,
+        min_token_pad=int(min_token_pad_val) if min_token_pad_val is not None else None,
         max_num_seqs=int(max_num_seqs_val) if max_num_seqs_val is not None else 256,
+        max_num_seq_buckets=max_num_seq_buckets,
         max_num_batched_tokens=max_num_batched_tokens,
         hbm_utilization=float(hbm_utilization_val) if hbm_utilization_val is not None else 0.85,
         page_size=int(page_size_val) if page_size_val is not None else 128,

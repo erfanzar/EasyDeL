@@ -256,7 +256,9 @@ class eSurge:
         dtype: jnp.dtype = jnp.bfloat16,
         max_model_len: int = 8192,
         min_input_pad: int = 16,
+        min_token_pad: int | None = None,
         max_num_seqs: int = 256,
+        max_num_seq_buckets: list[int] | None = None,
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
@@ -298,7 +300,14 @@ class eSurge:
             dtype: JAX dtype for model computations (default: bfloat16).
             max_model_len: Maximum sequence length the model can handle.
             min_input_pad: Minimum padding for input sequences.
+            min_token_pad: Optional minimum token bucket size for compilation. When
+                smaller than `min_input_pad`, this allows decode steps like `tok=1/b1`
+                instead of `tok=1/b16`, at the cost of more compilation variants.
             max_num_seqs: Maximum number of concurrent sequences.
+            max_num_seq_buckets: Optional explicit request-capacity buckets used for
+                compilation (e.g., [1, 2, 4, 8, 16, 32]). When provided, the runner
+                compiles these bucket sizes and selects the smallest that can fit
+                the current active batch.
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
             page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
@@ -501,6 +510,8 @@ class eSurge:
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            min_token_pad=min_token_pad,
             use_aot_forward=use_aot_forward,
             verbose=runner_verbose,
             enable_overlap_execution=overlap_execution,
@@ -676,14 +687,44 @@ class eSurge:
                     return
 
                 pending_future: tuple[Any, SchedulerOutput] | None = None
+                prefetched_schedule: SchedulerOutput | None = None
+
+                def _can_prefetch_next(current: SchedulerOutput) -> bool:
+                    # Only prefetch when the current batch is guaranteed not to
+                    # generate new output tokens. That keeps scheduler state
+                    # deterministic (no token-dependent stop conditions) while
+                    # overlapping schedule work with device execution.
+                    try:
+                        for rid in current.num_scheduled_tokens:
+                            req = self.scheduler.requests.get(rid)
+                            if req is None:
+                                continue
+                            if req.num_computed_tokens >= req.num_tokens:
+                                return False
+                    except Exception:
+                        return False
+                    return True
+
                 while self._scheduler_running:
                     try:
                         if pending_future is not None:
-                            self._drain_runner_future(*pending_future)
+                            future, prev_sched_out = pending_future
+
+                            # Opportunistically prefetch the next schedule while the
+                            # current batch is still running on device (prefill-only).
+                            if prefetched_schedule is None and _can_prefetch_next(prev_sched_out):
+                                with self._scheduler_lock:
+                                    prefetched_schedule = self.scheduler.schedule()
+
+                            self._drain_runner_future(future, prev_sched_out)
                             pending_future = None
 
-                        with self._scheduler_lock:
-                            scheduler_output = self.scheduler.schedule()
+                        if prefetched_schedule is not None:
+                            scheduler_output = prefetched_schedule
+                            prefetched_schedule = None
+                        else:
+                            with self._scheduler_lock:
+                                scheduler_output = self.scheduler.schedule()
                         future = self.runner.execute_model_async(scheduler_output)
                         pending_future = (future, scheduler_output)
                         # Reset error counter on success
