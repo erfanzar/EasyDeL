@@ -72,6 +72,7 @@ Example:
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 import typing
 from functools import partial
@@ -97,6 +98,10 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurge-ExecutionManager")
+
+# Syncing inputs after host->device metadata transfer makes `prep_time` more accurate,
+# but it adds a device round-trip that hurts throughput. Keep it opt-in.
+SYNC_INPUTS_FOR_TIMING = bool(int(os.environ.get("EASURGE_SYNC_INPUTS_FOR_TIMING", "0")))
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:
@@ -435,9 +440,6 @@ class ExecutionManager:
         jax.Array,
         jax.Array,
         jax.Array,
-        jax.Array,
-        jax.Array,
-        jax.Array,
         dict[str, float | int],
     ]:
         """Execute a single fused inference step.
@@ -462,16 +464,14 @@ class ExecutionManager:
                 be a power of 2 (or min_input_pad) matching a compiled variant.
 
         Returns:
-            Tuple of 10 elements:
+            Tuple of 7 elements:
                 - out_tokens_full: Generated tokens [max_num_reqs], -1 for invalid.
                 - valid_mask_full: Boolean mask for valid generations [max_num_reqs].
                 - input_ids_buf: Updated input buffer (may contain new tokens).
                 - position_ids_buf: Updated position buffer.
-                - query_start_loc_buf: Query start locations [max_num_reqs+1].
-                - seq_lens_buf: Sequence lengths [max_num_reqs].
-                - pages_tables_buf: Page tables [num_reqs, max_pages].
                 - hidden_states: Last layer hidden states [num_tokens, hidden_dim].
                 - logits: Output logits [padded_num_reqs, vocab_size].
+                - metrics: Execution timing + bucket info.
 
         Raises:
             KeyError: If no compiled function exists for (num_tokens, padded_num_reqs).
@@ -535,8 +535,9 @@ class ExecutionManager:
             rng_key=self.rng_key,
             batch_metadata=batch_metadata,
         )
-        # Only sync for timing when verbose mode is on (saves ~0.2-0.5ms in production)
-        if self._verbose:
+        # Syncing inputs here improves `prep_time` accuracy but adds a device
+        # round-trip; keep it behind an explicit env flag.
+        if self._verbose and SYNC_INPUTS_FOR_TIMING:
             inputs = jax.block_until_ready(inputs)
         prep_took = time.time() - start_prep
         if DEBUG_MODE:
@@ -572,17 +573,24 @@ class ExecutionManager:
             rng_key=self.rng_key,
         )
         sample_took = time.time() - start_sample
+        execute_total_took = time.time() - start_prep
+        execute_overhead_took = execute_total_took - (prep_took + exec_took + sample_took)
+        execute_overhead_took = max(0.0, float(execute_overhead_took))
         buckets_processed = batch_metadata.input_ids_buf.shape[-1]
         metrics = {
             "exec_time": exec_took,
             "sample_time": sample_took,
             "prep_time": prep_took,
+            "execute_overhead_time": execute_overhead_took,
             "buckets_processed": buckets_processed,
+            "token_bucket": int(num_tokens),
+            "padded_num_reqs": int(padded_num_reqs),
         }
+        try:
+            metrics.update(getattr(self._batch_preparer, "last_prep_stats", {}) or {})
+        except Exception:
+            pass
 
-        query_start_loc_buf = batch_metadata.query_start_loc
-        seq_lens_buf = batch_metadata.seq_lens
-        pages_tables_buf = batch_metadata.pages_tables
         hidden_states = model_outputs.hidden_states
         logits = model_outputs.logits
 
@@ -591,9 +599,6 @@ class ExecutionManager:
             valid_mask_full,
             input_ids_buf,
             position_ids_buf,
-            query_start_loc_buf,
-            seq_lens_buf,
-            pages_tables_buf,
             hidden_states,
             logits,
             metrics,
@@ -608,7 +613,9 @@ class ExecutionManager:
         """Run the compiled model forward step and update `self.kv_pages`."""
 
         model_fn = self._model_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
-        outputs = jax.block_until_ready(model_fn(self.graphstate, self.graphother, inputs))
+        outputs = jax.block_until_ready(
+            model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+        )
         self.kv_pages = outputs.kv_pages
         return outputs
 

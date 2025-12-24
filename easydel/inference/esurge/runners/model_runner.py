@@ -71,7 +71,6 @@ from jax import numpy as jnp
 
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
-from ..page_table import PAGE_TABLE_PADDING_VAL
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
 from .async_types import AsyncPreResults
@@ -227,6 +226,11 @@ class eSurgeRunner:
         self.enable_overlap_execution = enable_overlap_execution
         self.enable_sampler_metrics = enable_sampler_metrics
 
+        # Perf logging state (kept lightweight; no allocations in the hot path).
+        self._perf_iteration = 0
+        self._perf_tps_ema: float | None = None
+        self._perf_alpha = 0.2
+
         # Async scheduling state
         self._pre_async_results: AsyncPreResults | None = None
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
@@ -340,19 +344,86 @@ class eSurgeRunner:
 
         self.input_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
         self.position_ids_buf = jnp.zeros((self.max_num_tokens,), dtype=jnp.int32, device=self._empty_sharding)
-        self.query_start_loc_buf = jnp.zeros((self.max_num_reqs + 1,), dtype=jnp.int32, device=self._empty_sharding)
-        self.seq_lens_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
-
-        self.pages_tables_buf = jnp.full(
-            (self.num_reqs_max_model_len, self.max_pages_per_req),
-            fill_value=PAGE_TABLE_PADDING_VAL,
-            dtype=jnp.int32,
-            device=self._empty_sharding,
-        )
         self.num_tokens_paddings_arr = jnp.array(self.num_tokens_paddings, dtype=jnp.int32, device=self._empty_sharding)
         self.scheduled_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
         self.req_num_tokens_full_buf = jnp.zeros((self.max_num_reqs,), dtype=jnp.int32, device=self._empty_sharding)
         self.active_mask_full_buf = jnp.zeros((self.max_num_reqs,), dtype=bool, device=self._empty_sharding)
+
+        # Host-side scratch buffers (avoid per-step NumPy allocations in hot path).
+        self._scheduled_full_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._active_mask_full_cpu = np.zeros((self.max_num_reqs,), dtype=bool)
+        self._req_num_tokens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+
+        # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
+        # large allocations while keeping the step-function input pytree stable).
+        self._vlm_cpu_buffers: dict[
+            int,
+            tuple[
+                np.ndarray,  # prefill_embeds_cpu
+                np.ndarray,  # prefill_embeds_mask_cpu
+                np.ndarray | None,  # mrope_position_ids_cpu
+                np.ndarray | None,  # visual_pos_masks_cpu
+                list[np.ndarray] | None,  # deepstack_visual_embeds_cpu
+            ],
+        ] = {}
+
+    def _get_vlm_cpu_buffers(
+        self,
+        *,
+        num_tokens_static: int,
+        uses_mrope_model: bool,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
+        num_tokens_static = int(num_tokens_static)
+        cached = self._vlm_cpu_buffers.get(num_tokens_static)
+        if cached is None:
+            hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
+
+            prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=np.float16)
+            prefill_embeds_mask_cpu = np.zeros((num_tokens_static,), dtype=bool)
+
+            mrope_position_ids_cpu = None
+            visual_pos_masks_cpu = None
+            deepstack_visual_embeds_cpu = None
+            if uses_mrope_model:
+                mrope_position_ids_cpu = np.zeros((3, num_tokens_static), dtype=np.int32)
+                deepstack_indexes = getattr(
+                    getattr(self.model.config, "vision_config", None),
+                    "deepstack_visual_indexes",
+                    None,
+                )
+                deepstack_layers = len(deepstack_indexes) if deepstack_indexes else 0
+                if deepstack_layers:
+                    visual_pos_masks_cpu = np.zeros((num_tokens_static,), dtype=bool)
+                    deepstack_visual_embeds_cpu = [
+                        np.zeros((num_tokens_static, hidden_size), dtype=np.float16) for _ in range(deepstack_layers)
+                    ]
+
+            cached = (
+                prefill_embeds_cpu,
+                prefill_embeds_mask_cpu,
+                mrope_position_ids_cpu,
+                visual_pos_masks_cpu,
+                deepstack_visual_embeds_cpu,
+            )
+            self._vlm_cpu_buffers[num_tokens_static] = cached
+
+        (
+            prefill_embeds_cpu,
+            prefill_embeds_mask_cpu,
+            mrope_position_ids_cpu,
+            visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu,
+        ) = cached
+
+        # Clear masks/position ids each step; large embed buffers are overwritten only
+        # for the masked regions, and ignored otherwise.
+        prefill_embeds_mask_cpu.fill(False)
+        if mrope_position_ids_cpu is not None:
+            mrope_position_ids_cpu.fill(0)
+        if visual_pos_masks_cpu is not None:
+            visual_pos_masks_cpu.fill(False)
+
+        return cached
 
     def _precompile_jitted_helpers(
         self,
@@ -680,6 +751,7 @@ class eSurgeRunner:
         upd_req_indices: list[int] = []
         upd_num_computed_vals: list[int] = []
         batched_page_rows: list[tuple[int, tuple[list[int], ...]]] = []
+        page_table_dirty = False
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests.get(req_id)
@@ -704,7 +776,15 @@ class eSurgeRunner:
 
             upd_req_indices.append(req_index)
             upd_num_computed_vals.append(int(nct))
-            batched_page_rows.append((req_index, new_page_ids))
+            if resumed_from_preemption:
+                # Resumed requests may provide a full replacement page table.
+                self.sequence_buffer.page_table.add_row(new_page_ids, req_index)
+                page_table_dirty = True
+            else:
+                # Running requests report only incremental page allocations.
+                if any(len(ids) for ids in new_page_ids):
+                    batched_page_rows.append((req_index, new_page_ids))
+                    page_table_dirty = True
 
         if upd_req_indices:
             # num_computed_tokens is now a NumPy array, use standard indexing
@@ -718,6 +798,7 @@ class eSurgeRunner:
             indices = [ix for ix, _ in batched_page_rows]
             pages_per_req = [ids for _, ids in batched_page_rows]
             self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
+        if page_table_dirty:
             self.sequence_buffer.page_table.commit(self.sequence_buffer.num_reqs)
 
         # 6) Add new / reinserted requests
@@ -918,9 +999,11 @@ class eSurgeRunner:
         updating_states_time = time.time() - updating_states_start
 
         # Apply previous async results if available
+        prev_async_start = time.time()
         if self._pre_async_results is not None:
             self._modify_prev_results()
             self._pre_async_results = None  # Clear after applying
+        prev_async_time = time.time() - prev_async_start
 
         # Align ordering with TPU runner: decode requests first.
         if self.sequence_buffer.num_reqs > 1:
@@ -947,6 +1030,20 @@ class eSurgeRunner:
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
 
+        # Window-level perf aggregation (a single scheduler step can span multiple windows).
+        num_windows = 0
+        total_exec_time = 0.0
+        total_sample_time = 0.0
+        total_prep_time = 0.0
+        total_prep_host_time = 0.0
+        total_prep_put_time = 0.0
+        total_prep_extra_put_time = 0.0
+        total_execute_overhead_time = 0.0
+        total_runner_host_time = 0.0
+        total_d2h_time = 0.0
+        token_buckets_used: set[int] = set()
+        req_buckets_used: set[int] = set()
+
         cfg = getattr(self.model, "config", None)
         task_type = getattr(self.model, "_task_type", None)
         is_vlm_model = task_type == "image-text-to-text" or (
@@ -957,6 +1054,7 @@ class eSurgeRunner:
         uses_mrope_model = model_uses_mrope(self.model)
 
         while start_index < self.sequence_buffer.num_reqs:
+            host_start = time.time()
             num_reqs_total = self.sequence_buffer.num_reqs
             scheduled_list: list[int] = []
             req_ids_window = []
@@ -987,11 +1085,14 @@ class eSurgeRunner:
 
             if num_reqs > 0:
                 # Keep scheduled and active_mask as CPU arrays
-                scheduled_full_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
+                scheduled_full_cpu = self._scheduled_full_cpu
+                scheduled_full_cpu.fill(0)
                 scheduled_full_cpu[: len(scheduled_list)] = scheduled_list
 
-                req_num_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-                active_mask_full_cpu = np.zeros(self.max_num_reqs, dtype=bool)
+                req_num_tokens_np = self._req_num_tokens_cpu
+                req_num_tokens_np.fill(0)
+                active_mask_full_cpu = self._active_mask_full_cpu
+                active_mask_full_cpu.fill(False)
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         rs = self.requests.get(rid)
@@ -999,10 +1100,7 @@ class eSurgeRunner:
                             req_num_tokens_np[i] = rs.num_tokens
                         active_mask_full_cpu[i] = True
 
-                self.req_num_tokens_full_buf = jax.device_put(
-                    jnp.asarray(req_num_tokens_np, dtype=jnp.int32),
-                    self._empty_sharding,
-                )
+                self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
             mrope_position_ids_cpu = None
             prefill_embeds_cpu = None
@@ -1020,24 +1118,17 @@ class eSurgeRunner:
                     if req_state.has_vision and not req_state.vision_processed:
                         self._precompute_vlm_prefill(req_state)
 
-                hidden_size = int(getattr(self.model.config.get_text_config(), "hidden_size", 0) or 1)
-                prefill_embeds_cpu = np.zeros((num_tokens_static, hidden_size), dtype=np.float16)
-                prefill_embeds_mask_cpu = np.zeros((num_tokens_static,), dtype=bool)
-
+                (
+                    prefill_embeds_cpu,
+                    prefill_embeds_mask_cpu,
+                    mrope_position_ids_cpu,
+                    visual_pos_masks_cpu,
+                    deepstack_visual_embeds_cpu,
+                ) = self._get_vlm_cpu_buffers(
+                    num_tokens_static=num_tokens_static,
+                    uses_mrope_model=uses_mrope_model,
+                )
                 if uses_mrope_model:
-                    mrope_position_ids_cpu = np.zeros((3, num_tokens_static), dtype=np.int32)
-
-                    deepstack_indexes = getattr(
-                        getattr(self.model.config, "vision_config", None),
-                        "deepstack_visual_indexes",
-                        None,
-                    )
-                    deepstack_layers = len(deepstack_indexes) if deepstack_indexes else 0
-                    if deepstack_layers:
-                        visual_pos_masks_cpu = np.zeros((num_tokens_static,), dtype=bool)
-                        deepstack_visual_embeds_cpu = [
-                            np.zeros((num_tokens_static, hidden_size), dtype=np.float16) for _ in range(deepstack_layers)
-                        ]
                     visual_off = 0
 
                 off = 0
@@ -1084,7 +1175,9 @@ class eSurgeRunner:
 
                     # Embedding overrides: use precomputed prompt embeddings when available.
                     if (
-                        req_state is not None
+                        prefill_embeds_cpu is not None
+                        and prefill_embeds_mask_cpu is not None
+                        and req_state is not None
                         and req_state.prefill_inputs_embeds is not None
                         and start_tok < req_state.num_prompt_tokens
                     ):
@@ -1121,18 +1214,16 @@ class eSurgeRunner:
 
             # Get page table as CPU array (already on CPU, no transfer needed)
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
+            total_runner_host_time += time.time() - host_start
             step_start = time.time()
             (
                 out_tokens_win,
                 valid_mask_win,
                 self.input_ids_buf,
                 self.position_ids_buf,
-                self.query_start_loc_buf,
-                self.seq_lens_buf,
-                self.pages_tables_buf,
                 _hidden_states,
                 _logits,
-                metrics,
+                window_metrics,
             ) = self.executor_manager.execute(
                 num_tokens=num_tokens_static,
                 scheduled_full_cpu=scheduled_full_cpu,
@@ -1157,11 +1248,22 @@ class eSurgeRunner:
 
             # account for device time (blocking already happened inside execute())
             total_step_time += time.time() - step_start
+            num_windows += 1
+            total_exec_time += float(window_metrics.get("exec_time", 0.0))
+            total_sample_time += float(window_metrics.get("sample_time", 0.0))
+            total_prep_time += float(window_metrics.get("prep_time", 0.0))
+            total_prep_host_time += float(window_metrics.get("prep_host_time", 0.0))
+            total_prep_put_time += float(window_metrics.get("prep_put_time", 0.0))
+            total_prep_extra_put_time += float(window_metrics.get("prep_extra_put_time", 0.0))
+            total_execute_overhead_time += float(window_metrics.get("execute_overhead_time", 0.0))
+            token_buckets_used.add(int(window_metrics.get("token_bucket", num_tokens_static)))
+            req_buckets_used.add(int(window_metrics.get("padded_num_reqs", padded_num_reqs)))
 
-            # host copies once
+            d2h_start = time.time()
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
             logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
+            total_d2h_time += time.time() - d2h_start
 
             # Track for async scheduling
             request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
@@ -1211,6 +1313,7 @@ class eSurgeRunner:
 
             start_index = end_index
 
+        metrics_start = time.time()
         metrics_collector = get_metrics_collector()
         if metrics_collector:
             metrics_collector.record_runner_metrics(
@@ -1218,22 +1321,69 @@ class eSurgeRunner:
                 batch_size=len(req_ids_all),
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
             )
+        metrics_time = time.time() - metrics_start
 
         total_time = time.time() - execution_start_time
-        exec_took = metrics["exec_time"]
-        sample_took = metrics["sample_time"]
-        prep_took = metrics["prep_time"]
-        buckets_processed = metrics["buckets_processed"]
+        self._perf_iteration += 1
 
-        self.log_it(
-            f"[execute] "
-            f"step={total_step_time:.3f}s "
-            f"fwd={exec_took:.3f}s "
-            f"sample={sample_took:.3f}s "
-            f"prep={prep_took:.3f}s "
-            f"p-bs={buckets_processed}s "
-            f"update={updating_states_time:.3f}s "
-            f"total={total_time:.3f}s"
+        total_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        wall_tps = total_tokens / total_time if total_time > 0 else 0.0
+        if self._perf_tps_ema is None:
+            self._perf_tps_ema = wall_tps
+        else:
+            self._perf_tps_ema = self._perf_alpha * wall_tps + (1.0 - self._perf_alpha) * self._perf_tps_ema
+
+        def _fmt_bucket(values: set[int]) -> str:
+            if not values:
+                return "?"
+            if len(values) == 1:
+                return str(next(iter(values)))
+            vals = sorted(values)
+            return f"{vals[0]}-{vals[-1]}"
+
+        num_new = len(scheduler_output.scheduled_new_reqs)
+        num_cached = scheduler_output.scheduled_cached_reqs.num_reqs
+        num_finished = len(scheduler_output.finished_req_ids)
+
+        step_gap_time = total_step_time - (total_prep_time + total_exec_time + total_sample_time)
+        step_gap_time = max(0.0, step_gap_time)
+
+        misc_time = total_time - (
+            updating_states_time
+            + prev_async_time
+            + total_runner_host_time
+            + total_d2h_time
+            + total_post_proc_time
+            + total_prep_time
+            + total_exec_time
+            + total_sample_time
+            + total_execute_overhead_time
+            + step_gap_time
+            + metrics_time
+        )
+        misc_time = max(0.0, misc_time)
+
+        prep_detail = ""
+        if (total_prep_host_time + total_prep_put_time + total_prep_extra_put_time) > 0:
+            prep_detail = (
+                f"(host={total_prep_host_time * 1e3:.2f}ms put={total_prep_put_time * 1e3:.2f}ms "
+                f"extra={total_prep_extra_put_time * 1e3:.2f}ms) "
+            )
+
+        logger.info(
+            f"[perf] it={self._perf_iteration:06d} "
+            f"win={num_windows} "
+            f"reqs={len(req_ids_all)}(new={num_new},cached={num_cached},fin={num_finished},pad={_fmt_bucket(req_buckets_used)}) "
+            f"tok={total_tokens}/b{_fmt_bucket(token_buckets_used)} "
+            f"tps={wall_tps:,.0f} ema={self._perf_tps_ema:,.0f} "
+            f"runner={total_runner_host_time * 1e3:.2f}ms d2h={total_d2h_time * 1e3:.2f}ms "
+            f"prep={total_prep_time * 1e3:.2f}ms {prep_detail}"
+            f"fwd={total_exec_time * 1e3:.2f}ms samp={total_sample_time * 1e3:.2f}ms "
+            f"ovh={total_execute_overhead_time * 1e3:.2f}ms metrics={metrics_time * 1e3:.2f}ms "
+            f"async={prev_async_time * 1e3:.2f}ms "
+            f"step={total_step_time * 1e3:.2f}ms gap={step_gap_time * 1e3:.2f}ms "
+            f"sync={updating_states_time * 1e3:.2f}ms post={total_post_proc_time * 1e3:.2f}ms misc={misc_time * 1e3:.2f}ms "
+            f"total={total_time * 1e3:.2f}ms"
         )
 
         # Handle async scheduling return

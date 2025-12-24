@@ -121,14 +121,16 @@ class ModelStepExecutor:
             return None
 
         if self.use_aot_forward:
-            compiled = self._model_step_fn.lower(*(graphdef, graphstate, graphother, inputs)).compile()
+            compiled = self._model_step_fn.lower(
+                *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+            ).compile()
             self._cache_put(key, compiled)
             return None
 
-        def wrapped(graphstate_, graphother_, inputs_):
-            return self._model_step_fn(self.graphdef, graphstate_, graphother_, inputs_)
+        def wrapped(graphstate_, graphother_, kv_pages_, metadata_):
+            return self._model_step_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
-        out = wrapped(graphstate, graphother, inputs)
+        out = wrapped(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
         self._cache_put(key, wrapped)
         return out
 
@@ -143,21 +145,13 @@ class ModelStepExecutor:
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
 
         metadata_sharding = BatchMetadata(
-            scheduled=self._empty_sharding,
-            query_start_loc=self._empty_sharding,
-            seq_lens=self._empty_sharding,
+            packed_qsl_seqlens=self._empty_sharding,
+            packed_i32_padded=self._empty_sharding,
+            packed_f32_padded=self._empty_sharding,
+            packed_misc_i32=self._empty_sharding,
             pages_tables=self._empty_sharding,
-            padded_num_reqs=self._empty_sharding,
-            request_distribution=self._empty_sharding,
-            logits_indices=self._empty_sharding,
             input_ids_buf=self._empty_sharding,
             position_ids_buf=self._empty_sharding,
-            num_requests=self._empty_sharding,
-            temperature=self._empty_sharding,
-            top_p=self._empty_sharding,
-            top_k=self._empty_sharding,
-            min_p=self._empty_sharding,
-            positions=self._empty_sharding,
             slot_mapping=self._empty_sharding if self._use_slot_mapping else None,
             num_kv_update_slices=self._empty_sharding if self._use_slot_mapping else None,
             pixel_values=None,
@@ -166,14 +160,7 @@ class ModelStepExecutor:
             video_grid_thw=None,
         )
 
-        inputs_shardings = StepFunctionInputs(
-            kv_pages=es.extract_shardings(kv_pages_template, self.mesh),
-            scheduled_full=self._empty_sharding,
-            req_num_tokens_full=self._empty_sharding,
-            active_mask_full=self._empty_sharding,
-            rng_key=self._empty_sharding,
-            batch_metadata=metadata_sharding,
-        )
+        kv_pages_sharding = es.extract_shardings(kv_pages_template, self.mesh)
 
         outputs_shardings = ModelStepOutputs(
             kv_pages=es.extract_shardings(kv_pages_template, self.mesh),
@@ -183,19 +170,19 @@ class ModelStepExecutor:
 
         @ejit(
             static_argnums=(0,),
-            donate_argnames=["inputs"],
+            donate_argnames=["kv_pages"],
             in_shardings=(
                 es.extract_shardings(graphstate_template, self.mesh),
                 es.extract_shardings(graphother_template, self.mesh),
-                inputs_shardings,
+                kv_pages_sharding,
+                metadata_sharding,
             ),
             out_shardings=outputs_shardings,
         )
         @self._maybe_implicit
-        def _model_step(graphdef, graphstate, graphother, inputs: StepFunctionInputs) -> ModelStepOutputs:
-            metadata = inputs.batch_metadata
-            kv_pages = inputs.kv_pages
-
+        def _model_step(
+            graphdef, graphstate, graphother, kv_pages: RaggedPagesCache, metadata: BatchMetadata
+        ) -> ModelStepOutputs:
             with self.model.mesh:
                 model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
                 input_ids_view = metadata.input_ids_buf

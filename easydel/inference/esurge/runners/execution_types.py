@@ -61,6 +61,13 @@ class BatchMetadata:
     - v2: Uses slot_mapping and num_kv_update_slices for KV cache updates
     - v3: Uses request_distribution for optimized ragged attention
 
+    Performance note:
+        This structure is part of the step-function input PyTree. To keep host→device
+        transfer overhead low, several small vectors/scalars are packed into a few
+        dense arrays (rather than many independent leaves). Public attributes like
+        `scheduled`, `seq_lens`, etc. are exposed as properties backed by those
+        packed arrays.
+
     Vision-language model support:
     - pixel_values: Image pixel values for VLMs [batch, seq, channels]
     - image_grid_thw: Grid shape (T, H, W) for each image
@@ -68,21 +75,21 @@ class BatchMetadata:
     - video_grid_thw: Grid shape (T, H, W) for each video
     """
 
-    scheduled: jax.Array
-    query_start_loc: jax.Array
-    seq_lens: jax.Array
+    # Packed int32: [2, max_num_reqs+1] => (query_start_loc, seq_lens_padded)
+    packed_qsl_seqlens: jax.Array
+
+    # Packed per-request parameters (padded to batch bucket):
+    # - int32: [3, padded_num_reqs] => (scheduled, logits_indices, top_k)
+    # - float32: [3, padded_num_reqs] => (temperature, top_p, min_p)
+    packed_i32_padded: jax.Array
+    packed_f32_padded: jax.Array
+
+    # Packed int32: [5] => (num_requests, padded_num_reqs, request_distribution[0:3])
+    packed_misc_i32: jax.Array
+
     pages_tables: jax.Array
-    padded_num_reqs: jax.Array
-    request_distribution: jax.Array
-    logits_indices: jax.Array
     input_ids_buf: jax.Array
     position_ids_buf: jax.Array
-    num_requests: jax.Array
-    temperature: jax.Array
-    top_p: jax.Array
-    top_k: jax.Array
-    min_p: jax.Array
-    positions: jax.Array
 
     # Total number of tokens in the batch (used by hybrid mode)
     num_tokens: jax.Array | None = None
@@ -108,6 +115,51 @@ class BatchMetadata:
     # DeepStack-style visual injection (optional, model-specific)
     visual_pos_masks: jax.Array | None = None
     deepstack_visual_embeds: tuple[jax.Array, ...] | None = None
+
+    @property
+    def query_start_loc(self) -> jax.Array:
+        return self.packed_qsl_seqlens[0]
+
+    @property
+    def seq_lens(self) -> jax.Array:
+        # Packed row is padded to `max_num_reqs+1` to share a single buffer with query_start_loc.
+        return self.packed_qsl_seqlens[1, :-1]
+
+    @property
+    def scheduled(self) -> jax.Array:
+        return self.packed_i32_padded[0]
+
+    @property
+    def logits_indices(self) -> jax.Array:
+        return self.packed_i32_padded[1]
+
+    @property
+    def top_k(self) -> jax.Array:
+        return self.packed_i32_padded[2]
+
+    @property
+    def temperature(self) -> jax.Array:
+        return self.packed_f32_padded[0]
+
+    @property
+    def top_p(self) -> jax.Array:
+        return self.packed_f32_padded[1]
+
+    @property
+    def min_p(self) -> jax.Array:
+        return self.packed_f32_padded[2]
+
+    @property
+    def num_requests(self) -> jax.Array:
+        return self.packed_misc_i32[0]
+
+    @property
+    def padded_num_reqs(self) -> jax.Array:
+        return self.packed_misc_i32[1]
+
+    @property
+    def request_distribution(self) -> jax.Array:
+        return self.packed_misc_i32[2:5]
 
 
 @auto_pytree(frozen=True)
@@ -194,7 +246,6 @@ class StepFunctionInputs:
         lines.append(f"  top_p:                {self.batch_metadata.top_p.shape}")
         lines.append(f"  top_k:                {self.batch_metadata.top_k.shape}")
         lines.append(f"  min_p:                {self.batch_metadata.min_p.shape}")
-        lines.append(f"  positions:            {self.batch_metadata.positions.shape}")
         if self.batch_metadata.slot_mapping is not None:
             lines.append(f"  slot_mapping:         {self.batch_metadata.slot_mapping.shape}")
         if self.batch_metadata.num_kv_update_slices is not None:

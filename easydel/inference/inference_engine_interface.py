@@ -871,6 +871,14 @@ class BaseInferenceApiServer(ABC):
         stop = payload.get("stop")
         n = payload.get("n", 1)
 
+        raw_top_k = payload.get("top_k")
+        try:
+            top_k = int(raw_top_k) if raw_top_k is not None else 0
+        except (TypeError, ValueError):
+            top_k = 0
+        if top_k < 0:
+            top_k = 0
+
         return SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature_f,
@@ -878,7 +886,7 @@ class BaseInferenceApiServer(ABC):
             presence_penalty=float(payload.get("presence_penalty", 0.0) or 0.0),
             frequency_penalty=float(payload.get("frequency_penalty", 0.0) or 0.0),
             repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
-            top_k=int(payload.get("top_k", 50) or 50),
+            top_k=top_k,
             min_p=float(payload.get("min_p", 0.0) or 0.0),
             n=int(n or 1),
             stop=stop,

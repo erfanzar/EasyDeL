@@ -77,6 +77,7 @@ class PageTable:
         max_num_reqs: int,
         max_num_pages_per_req: int,
         max_num_batched_tokens: int,
+        sharding: jax.sharding.Sharding | None = None,
     ):
         """Initialize a PageTable with specified capacity.
 
@@ -84,6 +85,7 @@ class PageTable:
             max_num_reqs: Maximum number of concurrent requests.
             max_num_pages_per_req: Maximum pages per request.
             max_num_batched_tokens: Maximum tokens in a batch.
+            sharding: Optional sharding to use for the device page table.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_pages_per_req = max_num_pages_per_req
@@ -92,6 +94,7 @@ class PageTable:
         self.page_table = jnp.zeros(
             (max_num_reqs, max_num_pages_per_req),
             dtype=jnp.int32,
+            device=sharding,
         )
         self.page_table_cpu = np.zeros(
             (max_num_reqs, max_num_pages_per_req),
@@ -251,6 +254,7 @@ class MultiGroupPageTable:
         max_model_len: int,
         max_num_batched_tokens: int,
         page_sizes: list[int],
+        sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         """Initialize a MultiGroupPageTable with page tables for each group.
 
@@ -259,12 +263,14 @@ class MultiGroupPageTable:
             max_model_len: Maximum model sequence length.
             max_num_batched_tokens: Maximum batch token count.
             page_sizes: List of page sizes, one per KV-cache group.
+            sharding: Optional sharding to use for the device page tables.
         """
         self.page_tables = [
             PageTable(
                 max_num_reqs,
                 cdiv(max_model_len, page_size),
                 max_num_batched_tokens,
+                sharding=sharding,
             )
             for page_size in page_sizes
         ]
