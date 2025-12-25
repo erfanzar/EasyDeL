@@ -118,6 +118,13 @@ class BatchMetadataPreparer:
         self._async_min_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
         self._async_page_table_cpu = np.zeros((self.max_num_reqs, self._max_pages_per_req), dtype=np.int32)
 
+        # Device cache for `pages_tables`. This table is derived from the CPU page
+        # table and is only required to change when pages are allocated/replaced
+        # or request rows are moved/swapped/condensed.
+        self._cached_pages_tables_dev: jax.Array | None = None
+        self._cached_page_table_version: int | None = None
+        self._cached_rows_to_copy: int | None = None
+
         if self._use_slot_mapping and metadata is not None:
             self._slices_per_page = metadata.num_slices_per_kv_cache_update_page
             self._max_padded_slices = int(metadata.get_padded_num_slices(self.max_num_tokens, self.max_num_reqs))
@@ -273,10 +280,11 @@ class BatchMetadataPreparer:
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
+        page_table_version: int | None,
         padded_num_reqs_in: int,
         copy_slot_mapping: bool,
         use_async_buffers: bool = False,
-    ) -> tuple[tuple, int]:
+    ) -> tuple[tuple, int, int, int]:
         """Build host payload using preallocated CPU buffers (hot path)."""
 
         max_num_reqs = int(self.max_num_reqs)
@@ -374,10 +382,20 @@ class BatchMetadataPreparer:
             logits_indices[:num_requests] = qsl[1 : num_requests + 1] - 1
 
         # pages_tables: copy active rows, pad inactive.
-        pages_tables.fill(int(PAGE_TABLE_PADDING_VAL))
         rows_to_copy = min(num_requests, int(self._num_reqs_max_model_len), int(page_table_cpu.shape[0]))
-        if rows_to_copy > 0:
-            pages_tables[:rows_to_copy, :] = page_table_cpu[:rows_to_copy, : pages_tables.shape[1]]
+        reuse_pages_tables = (
+            page_table_version is not None
+            and self._cached_pages_tables_dev is not None
+            and self._cached_page_table_version == int(page_table_version)
+            and self._cached_rows_to_copy == int(rows_to_copy)
+        )
+        if reuse_pages_tables:
+            pages_tables_payload = self._cached_pages_tables_dev
+        else:
+            pages_tables.fill(int(PAGE_TABLE_PADDING_VAL))
+            if rows_to_copy > 0:
+                pages_tables[:rows_to_copy, :] = page_table_cpu[:rows_to_copy, : pages_tables.shape[1]]
+            pages_tables_payload = pages_tables
 
         # request_distribution (v3) / slot_mapping (v2)
         request_distribution.fill(0)
@@ -434,7 +452,7 @@ class BatchMetadataPreparer:
                 input_ids,
                 positions,
                 packed_qsl_seqlens,
-                pages_tables,
+                pages_tables_payload,
                 packed_i32_padded[:, :padded_num_reqs],
                 packed_f32_padded[:, :padded_num_reqs],
                 packed_misc_i32,
@@ -448,7 +466,7 @@ class BatchMetadataPreparer:
                 input_ids,
                 positions,
                 packed_qsl_seqlens,
-                pages_tables,
+                pages_tables_payload,
                 packed_i32_padded[:, :padded_num_reqs],
                 packed_f32_padded[:, :padded_num_reqs],
                 packed_misc_i32,
@@ -456,7 +474,7 @@ class BatchMetadataPreparer:
                 active_mask_full_cpu,
             )
 
-        return host_payload, padded_num_reqs
+        return host_payload, padded_num_reqs, num_requests, rows_to_copy
 
     def prepare_batch_metadata(
         self,
@@ -474,6 +492,7 @@ class BatchMetadataPreparer:
         min_p_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        page_table_version: int | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: np.ndarray | None = None,
         prefill_embeds_cpu: np.ndarray | None = None,
@@ -489,7 +508,7 @@ class BatchMetadataPreparer:
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
         """Precompute batch metadata using CPU-first approach."""
         host_build_start = time.time()
-        host_payload, _padded_num_reqs = self._build_host_payload(
+        host_payload, _padded_num_reqs, _num_requests, rows_to_copy = self._build_host_payload(
             num_tokens_static=int(num_tokens_static),
             scheduled_full_cpu=scheduled_full_cpu,
             active_mask_full_cpu=active_mask_full_cpu,
@@ -500,6 +519,7 @@ class BatchMetadataPreparer:
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
         )
@@ -536,6 +556,12 @@ class BatchMetadataPreparer:
                 active_mask_full_dev,
             ) = jax.device_put(host_payload, self._empty_sharding)
         device_put_took = time.time() - device_put_start
+
+        # Cache device `pages_tables` when the caller provides a version counter.
+        if page_table_version is not None:
+            self._cached_pages_tables_dev = pages_tables_dev
+            self._cached_page_table_version = int(page_table_version)
+            self._cached_rows_to_copy = int(rows_to_copy)
 
         mrope_position_ids_dev = None
         prefill_embeds_dev = None
@@ -645,6 +671,7 @@ class BatchMetadataPreparer:
         min_p_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        page_table_version: int | None = None,
     ) -> None:
         """Start async device transfer for the next batch (double buffering)."""
         if self._pending_transfer is not None:
@@ -661,7 +688,7 @@ class BatchMetadataPreparer:
         np.copyto(self._async_page_table_cpu, page_table_cpu)
 
         host_build_start = time.time()
-        host_payload, padded_num_reqs = self._build_host_payload(
+        host_payload, padded_num_reqs, _num_requests, rows_to_copy = self._build_host_payload(
             num_tokens_static=int(num_tokens_static),
             scheduled_full_cpu=self._async_scheduled_full_cpu,
             active_mask_full_cpu=self._async_active_mask_full_cpu,
@@ -672,6 +699,7 @@ class BatchMetadataPreparer:
             top_k_cpu=self._async_top_k_cpu,
             min_p_cpu=self._async_min_p_cpu,
             page_table_cpu=self._async_page_table_cpu,
+            page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
             copy_slot_mapping=False,
             use_async_buffers=True,
@@ -684,6 +712,8 @@ class BatchMetadataPreparer:
         self._pending_transfer_metadata = {
             "num_tokens_static": num_tokens_static,
             "padded_num_reqs": padded_num_reqs,
+            "page_table_version": page_table_version,
+            "rows_to_copy": rows_to_copy,
             "host_build_time": float(host_build_took),
             "device_put_time": float(device_put_took),
         }
@@ -742,6 +772,17 @@ class BatchMetadataPreparer:
                 scheduled_full_dev,
                 active_mask_full_dev,
             ) = self._pending_transfer
+
+        # Update `pages_tables` cache when async prep is used.
+        pt_ver = transfer_meta.get("page_table_version")
+        rows_to_copy = transfer_meta.get("rows_to_copy")
+        if pt_ver is not None and rows_to_copy is not None:
+            try:
+                self._cached_pages_tables_dev = pages_tables_dev
+                self._cached_page_table_version = int(pt_ver)
+                self._cached_rows_to_copy = int(rows_to_copy)
+            except Exception:
+                pass
 
         # For async prep, host build happened in `start_async_prep`.
         self.last_prep_stats = {

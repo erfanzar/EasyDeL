@@ -91,6 +91,7 @@ class ExecutionManagerProtocol(Protocol):
         min_p_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
+        page_table_version: int | None = None,
         *,
         mrope_position_ids_cpu: np.ndarray | None = None,
         prefill_embeds_cpu: np.ndarray | None = None,

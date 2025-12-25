@@ -421,6 +421,7 @@ class ExecutionManager:
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
+        page_table_version: int | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: numpy.ndarray | None = None,
         prefill_embeds_cpu: numpy.ndarray | None = None,
@@ -514,6 +515,7 @@ class ExecutionManager:
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
@@ -819,6 +821,7 @@ class ExecutionManager:
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
+        page_table_version: int | None = None,
         # VLM prefill helpers (optional)
         mrope_position_ids_cpu: numpy.ndarray | None = None,
         prefill_embeds_cpu: numpy.ndarray | None = None,
@@ -845,6 +848,7 @@ class ExecutionManager:
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
             mrope_position_ids_cpu=mrope_position_ids_cpu,
             prefill_embeds_cpu=prefill_embeds_cpu,
@@ -872,6 +876,7 @@ class ExecutionManager:
         min_p_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         padded_num_reqs_in: int,
+        page_table_version: int | None = None,
     ) -> None:
         self._batch_preparer.start_async_prep(
             num_tokens_static=num_tokens_static,
@@ -886,6 +891,7 @@ class ExecutionManager:
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
             page_table_cpu=page_table_cpu,
+            page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
         )
 
