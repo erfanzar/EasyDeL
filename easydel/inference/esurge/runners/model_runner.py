@@ -754,7 +754,6 @@ class eSurgeRunner:
         upd_req_indices: list[int] = []
         upd_num_computed_vals: list[int] = []
         batched_page_rows: list[tuple[int, tuple[list[int], ...]]] = []
-        page_table_dirty = False
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests.get(req_id)
@@ -782,27 +781,21 @@ class eSurgeRunner:
             if resumed_from_preemption:
                 # Resumed requests may provide a full replacement page table.
                 self.sequence_buffer.page_table.add_row(new_page_ids, req_index)
-                page_table_dirty = True
             else:
                 # Running requests report only incremental page allocations.
                 if any(len(ids) for ids in new_page_ids):
                     batched_page_rows.append((req_index, new_page_ids))
-                    page_table_dirty = True
 
         if upd_req_indices:
             # num_computed_tokens is now a NumPy array, use standard indexing
             idx_arr = np.array(upd_req_indices, dtype=np.int32)
             val_arr = np.array(upd_num_computed_vals, dtype=np.int32)
-            new_num_computed = self.sequence_buffer.num_computed_tokens.copy()
-            new_num_computed[idx_arr] = val_arr
-            self.sequence_buffer.num_computed_tokens = new_num_computed
+            self.sequence_buffer.num_computed_tokens[idx_arr] = val_arr
 
         if batched_page_rows:
             indices = [ix for ix, _ in batched_page_rows]
             pages_per_req = [ids for _, ids in batched_page_rows]
             self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
-        if page_table_dirty:
-            self.sequence_buffer.page_table.commit(self.sequence_buffer.num_reqs)
 
         # 6) Add new / reinserted requests
         # Sort in reverse order and pop() to get highest indices first (avoid reusing index 0/1)
@@ -1218,6 +1211,7 @@ class eSurgeRunner:
 
             # Get page table as CPU array (already on CPU, no transfer needed)
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
+            page_table_version = getattr(self.sequence_buffer.page_table[0], "cpu_version", None)
             total_runner_host_time += time.time() - host_start
             step_start = time.time()
             (
@@ -1243,6 +1237,7 @@ class eSurgeRunner:
                 top_k_cpu=self.sequence_buffer.top_k,
                 min_p_cpu=self.sequence_buffer.min_p,
                 page_table_cpu=page_table_cpu,
+                page_table_version=page_table_version,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,

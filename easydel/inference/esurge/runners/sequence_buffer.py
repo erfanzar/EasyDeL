@@ -450,7 +450,6 @@ class SequenceBuffer:
 
         # Page table - mutate in-place
         self.page_table.add_row(request.page_ids, req_index)
-        self.page_table.commit(self.num_reqs)
 
         # Sampling params
         sampling_params = request.sampling_params
@@ -574,7 +573,6 @@ class SequenceBuffer:
 
         # Page table - mutate in-place
         self.page_table.swap_row(i1, i2)
-        self.page_table.commit(self.num_reqs)
 
         self._update_request_distribution()
 
@@ -654,7 +652,6 @@ class SequenceBuffer:
 
         # Page table - mutate in-place
         self.page_table.move_row(from_idx, to_idx)
-        self.page_table.commit(self.num_reqs)
 
         # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
