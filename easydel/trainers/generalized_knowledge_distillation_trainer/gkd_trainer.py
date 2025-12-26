@@ -276,6 +276,7 @@ class GKDTrainer(SFTTrainer):
                 self._warned_missing_prompt = True
             return None, {}
         prompt_ids, prompt_mask, prompt_lengths = prompts
+        prompt_seq_len = int(prompt_ids.shape[1])
 
         try:
             sequences, _, _ = jax.block_until_ready(
@@ -285,7 +286,7 @@ class GKDTrainer(SFTTrainer):
             logger.warning("Failed to generate %s continuations: %s", source, exc)
             return None, {}
 
-        new_batch = self._build_batch_from_sequences(batch, sequences, prompt_lengths)
+        new_batch = self._build_batch_from_sequences(batch, sequences, prompt_seq_len=prompt_seq_len)
         attention_mask = np.asarray(new_batch["attention_mask"])
         completion_lengths = attention_mask.sum(axis=-1) - np.clip(prompt_lengths, 0, attention_mask.shape[1])
         info = {
@@ -305,44 +306,62 @@ class GKDTrainer(SFTTrainer):
         """
         if "prompt_input_ids" in batch and "prompt_attention_mask" in batch:
             prompt_ids = jnp.asarray(batch["prompt_input_ids"])
-            prompt_mask = jnp.asarray(batch["prompt_attention_mask"])
+            prompt_mask = jnp.asarray(batch["prompt_attention_mask"]).astype(jnp.int32)
             prompt_lengths = np.asarray(np.sum(np.asarray(prompt_mask), axis=-1), dtype=np.int32)
             return prompt_ids, prompt_mask, prompt_lengths
 
         input_ids = np.asarray(batch["input_ids"])
-        attention_mask = np.asarray(batch.get("attention_mask"))  # noqa
-        batch_size, seq_len = input_ids.shape
-        completion_mask = batch.get("completion_mask")
-        if completion_mask is not None:
-            prompt_lengths = seq_len - np.asarray(completion_mask).sum(axis=-1)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is None:
+            attention_mask_np = (input_ids != self.pad_token_id).astype(np.int32)
         else:
-            labels = batch.get("labels")
-            if labels is None:
-                return None
-            prompt_lengths = (np.asarray(labels) == -100).sum(axis=-1)
-        prompt_lengths = np.clip(prompt_lengths.astype(np.int32), 0, seq_len)
-        max_prompt = int(max(int(prompt_lengths.max()) if prompt_lengths.size else 0, 1))
-        prompt_ids = np.full((batch_size, max_prompt), self.pad_token_id, dtype=input_ids.dtype)
-        prompt_mask = np.zeros((batch_size, max_prompt), dtype=np.int32)
+            attention_mask_np = np.asarray(attention_mask)
+        valid_tokens = attention_mask_np.astype(bool)
+
+        completion_mask = batch.get("completion_mask")
+        labels = batch.get("labels")
+        if completion_mask is not None:
+            completion_mask_np = np.asarray(completion_mask)
+            prompt_token_mask = valid_tokens & (~completion_mask_np.astype(bool))
+        elif labels is not None:
+            labels_np = np.asarray(labels)
+            prompt_token_mask = valid_tokens & (labels_np == -100)
+        else:
+            return None
+
+        prompt_lengths = np.asarray(prompt_token_mask.sum(axis=-1), dtype=np.int32)
+        max_prompt = int(prompt_lengths.max()) if prompt_lengths.size else 0
+        if max_prompt <= 0:
+            return None
+
+        batch_size = input_ids.shape[0]
+        prompt_ids_np = np.full((batch_size, max_prompt), self.pad_token_id, dtype=input_ids.dtype)
+        prompt_mask_np = np.zeros((batch_size, max_prompt), dtype=np.int32)
         for idx, length in enumerate(prompt_lengths.tolist()):
             if length <= 0:
                 continue
-            prompt_ids[idx, :length] = input_ids[idx, :length]
-            prompt_mask[idx, :length] = 1
-        return jnp.asarray(prompt_ids), jnp.asarray(prompt_mask), prompt_lengths
+            tokens = input_ids[idx][prompt_token_mask[idx]]
+            if tokens.size == 0:
+                continue
+            length = int(min(tokens.size, max_prompt))
+            prompt_ids_np[idx, -length:] = tokens[-length:]
+            prompt_mask_np[idx, -length:] = 1
+
+        return jnp.asarray(prompt_ids_np), jnp.asarray(prompt_mask_np), prompt_lengths
 
     def _build_batch_from_sequences(
         self,
         original_batch: dict[str, jax.Array],
         sequences: jax.Array,
-        prompt_lengths: np.ndarray,
+        *,
+        prompt_seq_len: int,
     ) -> dict[str, jax.Array]:
         """Construct training batch from generated sequences.
 
         Args:
             original_batch: Original input batch.
             sequences: Generated token sequences.
-            prompt_lengths: Length of prompt for each sequence.
+            prompt_seq_len: Prompt token array length used during generation (includes padding).
 
         Returns:
             New batch with generated completions and appropriate masks/labels.
@@ -350,23 +369,24 @@ class GKDTrainer(SFTTrainer):
         seq_np = np.asarray(sequences)
         seq_len = seq_np.shape[1]
         max_len = self.arguments.max_length
+        prompt_cutoff = int(max(prompt_seq_len, 0))
         if max_len is not None and seq_len > max_len:
             start = seq_len - max_len
             seq_np = seq_np[:, start:]
-            prompt_lengths = np.clip(prompt_lengths - start, 0, max_len)
+            prompt_cutoff = max(prompt_cutoff - start, 0)
             seq_len = max_len
 
         attention_mask = (seq_np != self.pad_token_id).astype(np.int32)
         completion_mask = np.zeros_like(attention_mask)
-        for idx, length in enumerate(prompt_lengths.tolist()):
-            completion_mask[idx, int(length) :] = 1
+        if prompt_cutoff < seq_len:
+            completion_mask[:, prompt_cutoff:] = 1
         completion_mask *= attention_mask
 
         labels_dtype = np.asarray(original_batch.get("labels", seq_np)).dtype
         labels = seq_np.astype(labels_dtype, copy=True)
         labels[attention_mask == 0] = -100
-        for idx, length in enumerate(prompt_lengths.tolist()):
-            labels[idx, : int(length)] = -100
+        if prompt_cutoff > 0:
+            labels[:, :prompt_cutoff] = -100
 
         new_batch = dict(original_batch)
         new_batch["input_ids"] = jnp.asarray(seq_np.astype(np.asarray(original_batch["input_ids"]).dtype, copy=False))
