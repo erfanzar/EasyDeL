@@ -622,7 +622,7 @@ dependencies = [
     { name = "datasets" },
     { name = "eformer" },
     { name = "einops" },
-    { name = "ejkernel" },
+    { name = "ejkernel", extra = ["triton"] },
     { name = "fastapi" },
     { name = "flax" },
     { name = "gcsfs" },
@@ -646,6 +646,7 @@ dependencies = [
 
 [package.optional-dependencies]
 gpu = [
+    { name = "ejkernel", extra = ["gpu"], marker = "extra == 'extra-7-easydel-gpu'" },
     { name = "jax", extra = ["cuda12"], marker = "extra == 'extra-7-easydel-gpu'" },
     { name = "tensorboard" },
 ]
@@ -667,6 +668,7 @@ torch = [
     { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
 ]
 tpu = [
+    { name = "ejkernel", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
     { name = "jax", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
     { name = "tensorboard" },
 ]
@@ -677,7 +679,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.85" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.31" },
+    { name = "ejkernel", extras = ["gpu"], marker = "extra == 'gpu'", specifier = "==0.0.40" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.40" },
+    { name = "ejkernel", extras = ["triton"], specifier = "==0.0.40" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -754,7 +758,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.31"
+version = "0.0.40"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -764,11 +768,22 @@ dependencies = [
     { name = "jaxlib" },
     { name = "jaxtyping" },
     { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/00/6e/141a8ad5b8a0d84ad21ae990b7a37a1998bbecd6fd400328151dcd50c65c/ejkernel-0.0.40.tar.gz", hash = "sha256:773d8fee6ada08510d30e7383cf17db36bc4e91a91dbf6ea4c314548c270171c", size = 481536, upload-time = "2025-12-26T15:58:16.671Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/eb/f894a4f5778d64b003069d96ef057a5ee710655dc5cca7af25cab129607e/ejkernel-0.0.40-py3-none-any.whl", hash = "sha256:5148adc8c52a5184675924478dbcdff81fe1d2580c8bf97d999831197026a816", size = 718767, upload-time = "2025-12-26T15:58:14.505Z" },
+]
+
+[package.optional-dependencies]
+gpu = [
+    { name = "jax", extra = ["cuda12"], marker = "extra == 'extra-7-easydel-gpu'" },
     { name = "triton" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/31/5f/2ea443a9ca24a7f041ec905edbb4099587e5bc6d9973adb77bcb02901a05/ejkernel-0.0.31.tar.gz", hash = "sha256:c8dd3fda7574f2f296a3c66b6c38a90e2aae9fb929cd7be35f99172941cb17d1", size = 471441, upload-time = "2025-12-21T18:57:58.893Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/dc/f6/94b0dbf2ba721e9963c00eed36d22a1a3e386284dfb65eee3238e4d7583a/ejkernel-0.0.31-py3-none-any.whl", hash = "sha256:b62ea953af66335a0667d074a939b441da2f105a70889bc1a4872427dce824ae", size = 707378, upload-time = "2025-12-21T18:58:00.836Z" },
+tpu = [
+    { name = "jax", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-gpu' and extra == 'extra-7-easydel-tpu')" },
+]
+triton = [
+    { name = "triton" },
 ]
 
 [[package]]

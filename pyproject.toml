@@ -33,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.8.0",
 	"ray[default]==2.51.0",
 	"eformer==0.0.85",
-	"ejkernel==0.0.31",
+	"ejkernel[triton]==0.0.40",
 	"einops~=0.8.0",
 	"transformers~=4.57.3",
 	"flax==0.11.2",
@@ -61,7 +61,6 @@ dependencies = [
 "Documentation" = "https://easydel.readthedocs.io/en/latest/"
 
 
-
 [tool.uv.build-backend]
 module-name = "easydel"
 module-root = "."
@@ -77,8 +76,13 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]>=0.8.0", "torch==2.8.0", "tensorboard>=2.19.0"]
-tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0"]
+gpu = [
+	"jax[cuda12]>=0.8.0",
+	"torch==2.8.0",
+	"tensorboard>=2.19.0",
+	"ejkernel[gpu]==0.0.40",
+]
+tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.40"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
 profile = [
@@ -98,17 +102,20 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
 ignore = [
-    "F722",  # Forward annotations needed for jaxtyping
-    "B008",  # Do not perform function calls in argument defaults
-    "UP015", # Unnecessary open mode
-    "A005",  # Module-level shadowing
-    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
-    "E501",  # Line too long (handled by formatter)
+	"F722",  # Forward annotations needed for jaxtyping
+	"B008",  # Do not perform function calls in argument defaults
+	"UP015", # Unnecessary open mode
+	"A005",  # Module-level shadowing
+	"UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",  # Line too long (handled by formatter)
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
-"**/modeling_*.py" = ["UP037", "F821"]  # Allow quoted type annotations and forward refs in model files
+"**/modeling_*.py" = [
+	"UP037",
+	"F821",
+] # Allow quoted type annotations and forward refs in model files
 
 [tool.mypy]
 python_version = "3.11"
@@ -152,13 +159,9 @@ reportPrivateImportUsage = "none"
 reportUnusedParameter = "none"
 
 [tool.pytest.ini_options]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 testpaths = ["tests"]
-filterwarnings = [
-    "ignore::DeprecationWarning",
-]
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.uv]
 conflicts = [
