@@ -54,12 +54,15 @@ Example:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
+import tempfile
 import typing as tp
 import warnings
 from copy import deepcopy
+from dataclasses import dataclass
 
 import huggingface_hub
 import huggingface_hub.errors
@@ -114,6 +117,65 @@ CANDIDATE_FILENAMES = [
     FLAX_WEIGHTS_NAME,
     TENSORSTORE_INDEX_NAME,
 ]
+
+
+@dataclass
+class TorchLoadOptions:
+    """Options for torch_load_mode in _from_torch_pretrained."""
+
+    mode: str
+    streaming_cache: str
+    streaming_tmp_dir: str | None
+    hub_kwargs: dict[str, tp.Any]
+
+
+@dataclass
+class StreamingCheckpointInfo:
+    """Metadata for streaming PyTorch checkpoint conversion."""
+
+    ckpt_weight_format: tp.Literal["safetensors", "bin"]
+    ckpt_key_to_filename: dict[str, str]
+    ckpt_filename_to_path: dict[str, str]
+    ed_config: tp.Any
+    generation_config: tp.Any
+    pretrained_model_name_or_path: str
+    resolve_shard: tp.Callable[[str, str | None], str]
+
+
+def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
+    """Parse torch_load_mode related kwargs and return a TorchLoadOptions struct."""
+    torch_load_mode = str(kwargs.pop("torch_load_mode", "full")).lower()
+    if torch_load_mode not in {"full", "streaming"}:
+        warnings.warn(
+            f"Unknown torch_load_mode={torch_load_mode!r}; falling back to 'streaming'. Expected: 'full'|'streaming'.",
+            stacklevel=2,
+        )
+        torch_load_mode = "streaming"
+
+    torch_streaming_cache = str(kwargs.pop("torch_streaming_cache", "hf_cache")).lower()
+    torch_streaming_tmp_dir = kwargs.pop("torch_streaming_tmp_dir", None)
+    if torch_load_mode == "streaming" and torch_streaming_cache not in {"hf_cache", "temp"}:
+        warnings.warn(
+            f"Unknown torch_streaming_cache={torch_streaming_cache!r}; falling back to 'hf_cache'. "
+            "Expected: 'hf_cache'|'temp'.",
+            stacklevel=2,
+        )
+        torch_streaming_cache = "hf_cache"
+
+    hub_kwargs = {
+        k: kwargs[k] for k in ("cache_dir", "revision", "token", "local_files_only", "force_download") if k in kwargs
+    }
+    if "subfolder" in kwargs:
+        hub_kwargs["subfolder"] = kwargs["subfolder"]
+    if "proxies" in kwargs:
+        hub_kwargs["proxies"] = kwargs["proxies"]
+
+    return TorchLoadOptions(
+        mode=torch_load_mode,
+        streaming_cache=torch_streaming_cache,
+        streaming_tmp_dir=torch_streaming_tmp_dir,
+        hub_kwargs=hub_kwargs,
+    )
 
 
 class EasyBridgeMixin(PushToHubMixin):
@@ -836,29 +898,46 @@ class EasyBridgeMixin(PushToHubMixin):
                 "in order to load model from torch you should install torch first run `pip install torch`"
             ) from er
 
-        logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
+        load_options = _parse_torch_load_options(kwargs)
         trust_remote_code = kwargs.get("trust_remote_code", False)
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
-        model_type: str = config.model_type
+
+        logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
+        hf_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **load_options.hub_kwargs,
+        )
+        model_type: str = hf_config.model_type
         config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
-        logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
-        if "torch_dtype" not in kwargs.keys():
-            kwargs["torch_dtype"] = torch.float16
-        torch_dtype = kwargs.pop("torch_dtype")
-        hf_model = cls.get_torch_loader().from_pretrained(pretrained_model_name_or_path, dtype=torch_dtype, **kwargs)
-        generation_config = getattr(hf_model, "generation_config", None)
-        config_class = config_class.from_pretrained(pretrained_model_name_or_path)
-        state_dict = hf_model.state_dict()
+        generation_config = None
+        state_dict = None
+        ckpt_info: StreamingCheckpointInfo | None = None
 
-        del hf_model
-        _clear()
+        if load_options.mode == "full":
+            ed_config, generation_config, state_dict = cls._load_full_torch_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                torch_loader=cls.get_torch_loader(),
+                clear_fn=_clear,
+                kwargs=kwargs,
+            )
+        else:
+            ckpt_info = cls._resolve_streaming_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                config_class=config_class,
+                hub_kwargs=load_options.hub_kwargs,
+                kwargs=kwargs,
+            )
+            ed_config = ckpt_info.ed_config
+            generation_config = ckpt_info.generation_config
 
         logger.debug("adding hf_model basic EasyDeL configurations.")
-        if hasattr(config_class, "attach_custom_arguments"):
-            config_class.attach_custom_arguments()
+        if hasattr(ed_config, "attach_custom_arguments"):
+            ed_config.attach_custom_arguments()
         config_kwargs = {} if config_kwargs is None else config_kwargs
-        config_class.add_basic_configurations(
+        ed_config.add_basic_configurations(
             sharding_axis_dims=sharding_axis_dims,
             sharding_dcn_axis_dims=sharding_dcn_axis_dims,
             sharding_axis_names=sharding_axis_names,
@@ -870,7 +949,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         logger.debug("creating easydel model")
         model = module.lazy_init(
-            config=config_class,
+            config=ed_config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
@@ -903,9 +982,9 @@ class EasyBridgeMixin(PushToHubMixin):
                 trust_remote_code=trust_remote_code,
                 model_task=cls._model_task,
             )
+
         logger.debug("converting huggingface-model to easydel-model.")
-        params_pattern_selection = None
-        uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
         quantizer = EasyQuantizer(quantization_config=quantization_config)
         callback = None
@@ -923,18 +1002,35 @@ class EasyBridgeMixin(PushToHubMixin):
                         x = callable_fn(x)
                 return quantizer(x, p)
 
-        params = model.pure_transform_fn(
-            state_dict,
-            config=config,
-            device=device,
-            shard_fns=passed_shard_fns,
-            params_pattern_selection=params_pattern_selection,
-            remove_state_dict=True,
-            uses_tie_word_embedding=uses_tie_word_embedding,
-            callback=callback,
-        )
-        del state_dict
-        _clear()
+        if load_options.mode == "full":
+            params = model.pure_transform_fn(
+                state_dict,
+                config=hf_config,
+                device=device,
+                shard_fns=passed_shard_fns,
+                params_pattern_selection=None,
+                remove_state_dict=True,
+                uses_tie_word_embedding=uses_tie_word_embedding,
+                callback=callback,
+            )
+            del state_dict
+            _clear()
+        else:
+            if ckpt_info is None:
+                raise RuntimeError("torch_load_mode='streaming' was selected but no checkpoint info was resolved.")
+
+            parameters_flat = cls._convert_streaming_checkpoint_to_params(
+                model=model,
+                ckpt_info=ckpt_info,
+                hf_config=hf_config,
+                load_options=load_options,
+                shard_fns=passed_shard_fns,
+                callback=callback,
+                device=device,
+                clear_fn=_clear,
+            )
+            params = unflatten_dict(parameters_flat)
+
         if is_flatten(params):
             logger.info("converted parameters are flatten making them unflatten.")
             params = unflatten_dict(params)
@@ -950,6 +1046,1117 @@ class EasyBridgeMixin(PushToHubMixin):
             )
         logger.debug("returning model.")
         return model
+
+    @classmethod
+    def _resolve_streaming_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        kwargs: dict[str, tp.Any],
+    ) -> StreamingCheckpointInfo:
+        """Resolve checkpoint files for streaming mode, returning checkpoint info with resolve_shard callable."""
+        from transformers import GenerationConfig
+
+        logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
+
+        ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
+        ckpt_key_to_filename: dict[str, str] = {}
+        ckpt_filename_to_path: dict[str, str] = {}
+
+        revision = kwargs.get("revision", None)
+        token = kwargs.get("token", None)
+        local_files_only = bool(kwargs.get("local_files_only", False))
+        force_download = bool(kwargs.get("force_download", False))
+        proxies = kwargs.get("proxies", None)
+        subfolder = str(kwargs.get("subfolder", "") or "")
+        cache_dir = kwargs.get("cache_dir", None)
+
+        def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
+            if not subfolder:
+                return filename, ""
+            normalized = subfolder.strip("/").replace("\\", "/")
+            if filename.startswith(normalized + "/"):
+                return filename, ""
+            return filename, normalized
+
+        def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
+            return huggingface_hub.hf_hub_download(
+                repo_id=pretrained_model_name_or_path,
+                filename=filename,
+                subfolder=effective_subfolder,
+                revision=revision,
+                cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+
+        def _find_local(filename: str) -> str | None:
+            if not os.path.isdir(pretrained_model_name_or_path):
+                return None
+            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
+            root = pretrained_model_name_or_path
+            if effective_subfolder:
+                root = os.path.join(root, effective_subfolder)
+            candidate = os.path.join(root, filename)
+            return candidate if os.path.isfile(candidate) else None
+
+        def _resolve_shard(fname: str, cache_dir_override: str | None = None) -> str:
+            """Unified shard resolution: local first, then HF download."""
+            local_path = _find_local(fname)
+            if local_path is not None:
+                return local_path
+            return _hf_download(fname, cache_dir_override=cache_dir_override)
+
+        def _load_index(path: str) -> dict[str, tp.Any]:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        resolved_index_file: str | None = None
+        resolved_single_file: str | None = None
+
+        if os.path.isdir(pretrained_model_name_or_path):
+            resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
+            if resolved_index_file is not None:
+                ckpt_weight_format = "safetensors"
+            else:
+                resolved_index_file = _find_local(WEIGHTS_INDEX_NAME)
+                if resolved_index_file is not None:
+                    ckpt_weight_format = "bin"
+
+            if resolved_index_file is None:
+                resolved_single_file = _find_local(SAFE_WEIGHTS_NAME)
+                if resolved_single_file is not None:
+                    ckpt_weight_format = "safetensors"
+                else:
+                    resolved_single_file = _find_local(WEIGHTS_NAME)
+                    if resolved_single_file is not None:
+                        ckpt_weight_format = "bin"
+        else:
+            try:
+                resolved_index_file = _hf_download(SAFE_WEIGHTS_INDEX_NAME)
+                ckpt_weight_format = "safetensors"
+            except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _hf_download(WEIGHTS_INDEX_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _hf_download(SAFE_WEIGHTS_NAME)
+                    ckpt_weight_format = "safetensors"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_single_file = None
+
+            if resolved_single_file is None:
+                try:
+                    resolved_single_file = _hf_download(WEIGHTS_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, huggingface_hub.errors.EntryNotFoundError):
+                    resolved_single_file = None
+
+        if ckpt_weight_format is None or (resolved_index_file is None and resolved_single_file is None):
+            raise FileNotFoundError(
+                "Couldn't locate a PyTorch checkpoint to convert. Expected one of: "
+                f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, {WEIGHTS_INDEX_NAME}, {WEIGHTS_NAME}"
+            )
+
+        if resolved_index_file is not None:
+            index_data = _load_index(resolved_index_file)
+            weight_map = index_data.get("weight_map") or {}
+            if not weight_map:
+                raise ValueError(f"Invalid shard index file (missing weight_map): {resolved_index_file}")
+            ckpt_key_to_filename = dict(weight_map)
+            for fname in sorted(set(weight_map.values())):
+                if os.path.isdir(pretrained_model_name_or_path):
+                    resolved = _find_local(fname)
+                    if resolved is None:
+                        raise FileNotFoundError(f"Missing shard file {fname!r} under {pretrained_model_name_or_path!r}")
+                    ckpt_filename_to_path[fname] = resolved
+        else:
+            assert resolved_single_file is not None
+            if ckpt_weight_format == "safetensors":
+                ckpt_filename_to_path[SAFE_WEIGHTS_NAME] = resolved_single_file
+            else:
+                ckpt_filename_to_path[WEIGHTS_NAME] = resolved_single_file
+
+        ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+        try:
+            generation_config = GenerationConfig.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+        except Exception:
+            generation_config = None
+
+        return StreamingCheckpointInfo(
+            ckpt_weight_format=ckpt_weight_format,
+            ckpt_key_to_filename=ckpt_key_to_filename,
+            ckpt_filename_to_path=ckpt_filename_to_path,
+            ed_config=ed_config,
+            generation_config=generation_config,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            resolve_shard=_resolve_shard,
+        )
+
+    @classmethod
+    def _convert_streaming_checkpoint_to_params(
+        cls,
+        model,
+        ckpt_info: StreamingCheckpointInfo,
+        hf_config: tp.Any,
+        load_options: TorchLoadOptions,
+        shard_fns: dict[tuple, tp.Callable] | None,
+        callback: tp.Callable | None,
+        device: tp.Any | None,
+        clear_fn: tp.Callable[[], None],
+    ) -> dict[tuple, tp.Any]:
+        """Convert streaming PyTorch checkpoint to flattened JAX params dict.
+
+        This function handles the streaming conversion of PyTorch checkpoints to JAX format,
+        including MoE expert grouping and multi-file handling.
+
+        Args:
+            ckpt_info: StreamingCheckpointInfo with checkpoint paths and resolve_shard callable.
+            hf_config: The HuggingFace config for the model.
+            load_options: TorchLoadOptions with streaming cache settings.
+            shard_fns: Optional sharding functions to apply to tensors.
+            callback: Optional callback for post-processing tensors.
+            device: Optional JAX device for placement.
+            clear_fn: Function to call for memory cleanup.
+
+        Returns:
+            Flattened dict of (tuple_key -> jax_array) ready for unflattening.
+        """
+        import torch
+        from safetensors.torch import safe_open
+
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        ckpt_weight_format = ckpt_info.ckpt_weight_format
+        ckpt_key_to_filename = ckpt_info.ckpt_key_to_filename
+        ckpt_filename_to_path = ckpt_info.ckpt_filename_to_path
+        pretrained_model_name_or_path = ckpt_info.pretrained_model_name_or_path
+        resolve_shard = ckpt_info.resolve_shard
+        torch_streaming_cache = load_options.streaming_cache
+        torch_streaming_tmp_dir = load_options.streaming_tmp_dir
+
+        transformer = model.pure_transform_fn
+        embedding_layer_names = transformer.keywords.get("embedding_layer_names")
+        layernorm_names = transformer.keywords.get("layernorm_names")
+        moe_block_names = transformer.keywords.get("moe_block_names")
+        moe_names = transformer.keywords.get("moe_names")
+        moe_block_path = transformer.keywords.get("moe_block_path")
+        moe_path = transformer.keywords.get("moe_path")
+        reform_param = transformer.keywords.get("reform_param")
+
+        moe_names_set = set(moe_names or [])
+        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{excepted_expert_name}."
+
+        consolidated_moe_keys: set[str] = set()
+        moe_groups: dict[str, dict[int, str]] = {}
+        moe_expert_keys: set[str] = set()
+
+        def _register_moe_key(k: str):
+            if not (moe_block_path and moe_names_set and moe_path):
+                return
+            if expert_prefix not in k:
+                return
+            for block_path in moe_block_path:
+                block_expert_prefix = block_path + expert_prefix
+                if not k.startswith(block_expert_prefix):
+                    continue
+                remainder = k[len(block_expert_prefix) :]
+                dot_idx = remainder.find(".")
+                if dot_idx <= 0:
+                    continue
+                expert_part = remainder[:dot_idx]
+                if not expert_part.isdigit():
+                    continue
+                expert_idx = int(expert_part)
+                moe_name_part = remainder[dot_idx + 1 :]
+                moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
+                if moe_name not in moe_names_set:
+                    continue
+                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                moe_groups.setdefault(target_path, {})[expert_idx] = k
+                moe_expert_keys.add(k)
+                return
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            if ckpt_weight_format == "safetensors":
+                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        ckpt_key_to_filename[k] = filename
+                        _register_moe_key(k)
+            else:
+                shard = None
+                try:
+                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(resolved_path, map_location="cpu")
+                for k in shard.keys():
+                    ckpt_key_to_filename[k] = filename
+                    _register_moe_key(k)
+                del shard
+                clear_fn()
+        else:
+            for k in ckpt_key_to_filename:
+                _register_moe_key(k)
+
+        for target_path in moe_groups:
+            consolidated_moe_keys.add(f"{target_path}.weight")
+
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
+        converter_config = {
+            "embedding_layer_names": set(embedding_layer_names or []),
+            "layernorm_names": set(layernorm_names or []),
+            "moe_block_names": set(moe_block_names or []),
+            "moe_names": set(moe_names or []),
+            "lm_head_name": None,
+            "uses_tie_word_embedding": uses_tie_word_embedding,
+            "dtype": model.param_dtype,
+            "consolidated_moe_keys": consolidated_moe_keys,
+            "reform_param": reform_param,
+        }
+
+        parameters_flat: dict[tuple, tp.Any] = {}
+
+        def _maybe_shard_and_callback(key_tuple, arr):
+            if shard_fns and key_tuple in shard_fns:
+                arr = shard_fns[key_tuple](arr)
+            if callback is not None:
+                arr = callback(arr, key_tuple)
+            return arr
+
+        def _process_tensor(key: str, tensor):
+            results = StateDictConverter.process_tensor(key, tensor, converter_config)
+            if results is None:
+                return
+            for key_tuple, jax_array in results:
+                parameters_flat[key_tuple] = _maybe_shard_and_callback(key_tuple, jax_array)
+
+        @contextlib.contextmanager
+        def _with_resolved_shard(fname: str):
+            if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
+                yield ckpt_filename_to_path[fname]
+                return
+
+            if os.path.isdir(pretrained_model_name_or_path):
+                resolved = resolve_shard(fname, None)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_cache == "hf_cache":
+                resolved = resolve_shard(fname, None)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_tmp_dir is not None:
+                if os.path.isfile(torch_streaming_tmp_dir):
+                    raise NotADirectoryError(f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}")
+                os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                yield resolve_shard(fname, tmpdir)
+
+        def _run_streaming_conversion():
+            file_to_non_moe_keys: dict[str, list[str]] = {}
+            for key, fname in ckpt_key_to_filename.items():
+                if key in moe_expert_keys:
+                    continue
+                file_to_non_moe_keys.setdefault(fname, []).append(key)
+
+            file_to_moe_groups: dict[str, list[tuple[str, dict[int, str]]]] = {}
+            multi_file_moe_groups: dict[str, dict[int, str]] = {}
+            for target_path, expert_key_by_idx in moe_groups.items():
+                files = {ckpt_key_to_filename[k] for k in expert_key_by_idx.values() if k in ckpt_key_to_filename}
+                if len(files) == 1:
+                    fname = next(iter(files))
+                    file_to_moe_groups.setdefault(fname, []).append((target_path, expert_key_by_idx))
+                else:
+                    multi_file_moe_groups[target_path] = expert_key_by_idx
+
+            all_files = sorted(set(ckpt_key_to_filename.values()) | set(ckpt_filename_to_path.keys()))
+
+            for fname in all_files:
+                non_moe_keys = file_to_non_moe_keys.get(fname, [])
+                moe_groups_for_file = file_to_moe_groups.get(fname, [])
+                if not non_moe_keys and not moe_groups_for_file:
+                    continue
+
+                with _with_resolved_shard(fname) as resolved_path:
+                    if ckpt_weight_format == "safetensors":
+                        with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                            for k in sorted(non_moe_keys):
+                                _process_tensor(k, f.get_tensor(k))
+
+                            for target_path, expert_key_by_idx in moe_groups_for_file:
+                                expert_indices = sorted(expert_key_by_idx.keys())
+                                if not expert_indices:
+                                    continue
+                                stacked_key = f"{target_path}.weight"
+                                first_key = expert_key_by_idx[expert_indices[0]]
+                                first_tensor = f.get_tensor(first_key)
+                                stacked_shape = (len(expert_indices), *first_tensor.shape)
+                                stacked_tensor = torch.empty(
+                                    stacked_shape,
+                                    dtype=first_tensor.dtype,
+                                    device=first_tensor.device,
+                                )
+                                for pos, expert_idx in enumerate(expert_indices):
+                                    stacked_tensor[pos] = f.get_tensor(expert_key_by_idx[expert_idx])
+                                _process_tensor(stacked_key, stacked_tensor)
+                                del stacked_tensor
+                                clear_fn()
+                    else:
+                        shard = None
+                        try:
+                            shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                        except TypeError:
+                            shard = torch.load(resolved_path, map_location="cpu")
+
+                        for k in sorted(non_moe_keys):
+                            _process_tensor(k, shard[k])
+
+                        for target_path, expert_key_by_idx in moe_groups_for_file:
+                            expert_indices = sorted(expert_key_by_idx.keys())
+                            if not expert_indices:
+                                continue
+                            stacked_key = f"{target_path}.weight"
+                            first_key = expert_key_by_idx[expert_indices[0]]
+                            first_tensor = shard[first_key]
+                            stacked_shape = (len(expert_indices), *first_tensor.shape)
+                            stacked_tensor = torch.empty(
+                                stacked_shape,
+                                dtype=first_tensor.dtype,
+                                device=first_tensor.device,
+                            )
+                            for pos, expert_idx in enumerate(expert_indices):
+                                stacked_tensor[pos] = shard[expert_key_by_idx[expert_idx]]
+                            _process_tensor(stacked_key, stacked_tensor)
+                            del stacked_tensor
+                            clear_fn()
+
+                        del shard
+                        clear_fn()
+
+            if multi_file_moe_groups:
+                if torch_streaming_cache == "temp":
+                    raise RuntimeError(
+                        "Encountered MoE expert groups spanning multiple shard files while "
+                        "torch_streaming_cache='temp'. Use torch_streaming_cache='hf_cache' "
+                        "(and a local cache_dir) to avoid re-downloading shards."
+                    )
+
+                for target_path, expert_key_by_idx in sorted(multi_file_moe_groups.items()):
+                    expert_indices = sorted(expert_key_by_idx.keys())
+                    if not expert_indices:
+                        continue
+
+                    stacked_key = f"{target_path}.weight"
+                    first_key = expert_key_by_idx[expert_indices[0]]
+                    first_fname = ckpt_key_to_filename[first_key]
+                    with _with_resolved_shard(first_fname) as first_path:
+                        if ckpt_weight_format == "safetensors":
+                            with safe_open(first_path, framework="pt", device="cpu") as f:
+                                first_tensor = f.get_tensor(first_key)
+                        else:
+                            shard = None
+                            try:
+                                shard = torch.load(first_path, map_location="cpu", weights_only=True)
+                            except TypeError:
+                                shard = torch.load(first_path, map_location="cpu")
+                            first_tensor = shard[first_key]
+                            del shard
+                            clear_fn()
+
+                    stacked_shape = (len(expert_indices), *first_tensor.shape)
+                    stacked_tensor = torch.empty(
+                        stacked_shape,
+                        dtype=first_tensor.dtype,
+                        device=first_tensor.device,
+                    )
+
+                    pos_by_expert = {expert_idx: pos for pos, expert_idx in enumerate(expert_indices)}
+                    per_file: dict[str, list[tuple[int, str]]] = {}
+                    for expert_idx, key in expert_key_by_idx.items():
+                        fname = ckpt_key_to_filename[key]
+                        per_file.setdefault(fname, []).append((pos_by_expert[expert_idx], key))
+
+                    for fname, items in per_file.items():
+                        with _with_resolved_shard(fname) as resolved_path:
+                            if ckpt_weight_format == "safetensors":
+                                with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                                    for pos, key in items:
+                                        stacked_tensor[pos] = f.get_tensor(key)
+                            else:
+                                shard = None
+                                try:
+                                    shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                                except TypeError:
+                                    shard = torch.load(resolved_path, map_location="cpu")
+                                for pos, key in items:
+                                    stacked_tensor[pos] = shard[key]
+                                del shard
+                                clear_fn()
+
+                    _process_tensor(stacked_key, stacked_tensor)
+                    del stacked_tensor
+                    clear_fn()
+
+        if device is not None:
+            with jax.default_device(device):
+                _run_streaming_conversion()
+        else:
+            _run_streaming_conversion()
+
+        return parameters_flat
+
+    @classmethod
+    def _load_full_torch_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str,
+        config_class: type,
+        hub_kwargs: dict[str, tp.Any],
+        torch_loader: tp.Any,
+        clear_fn: tp.Callable[[], None],
+        kwargs: dict[str, tp.Any],
+    ) -> tuple[tp.Any, tp.Any, dict[str, tp.Any]]:
+        """Load full PyTorch checkpoint into memory (for torch_load_mode='full').
+
+        Returns:
+            Tuple of (ed_config, generation_config, state_dict)
+        """
+        import torch
+
+        logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
+        if "torch_dtype" not in kwargs:
+            kwargs["torch_dtype"] = torch.float16
+        torch_dtype = kwargs.pop("torch_dtype")
+        hf_model = torch_loader.from_pretrained(
+            pretrained_model_name_or_path,
+            dtype=torch_dtype,
+            **kwargs,
+        )
+        generation_config = getattr(hf_model, "generation_config", None)
+        ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+        state_dict = hf_model.state_dict()
+
+        del hf_model
+        clear_fn()
+        return ed_config, generation_config, state_dict
+
+    @classmethod
+    def huggingface_to_easydel_sequential(
+        cls,
+        pretrained_model_name_or_path: str,
+        save_directory: str | os.PathLike,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.Precision | None = None,
+        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
+        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: PartitionAxis | None = None,
+        backend: EasyDeLBackends | None = None,
+        platform: EasyDeLPlatforms | None = None,
+        config_kwargs: EasyDeLBaseConfigDict | None = None,
+        partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
+        trust_remote_code: bool = False,
+        torch_streaming_cache: str = "temp",
+        torch_streaming_tmp_dir: str | None = None,
+        tensorstore_chunk_bytes: int = 2_147_483_648,
+        verbose: bool = True,
+        **kwargs,
+    ) -> str:
+        """
+        Convert a HuggingFace PyTorch checkpoint to an EasyDeL checkpoint sequentially.
+
+        This avoids materializing the full `state_dict`/params tree in memory by:
+        - downloading one shard at a time (optionally to a temp dir),
+        - converting each tensor to the EasyDeL naming/layout,
+        - writing each tensor immediately into a TensorStore (zarr) checkpoint.
+
+        MoE expert weights are written slice-by-slice to avoid allocating stacked expert tensors.
+        """
+        from datetime import datetime
+
+        import tensorstore as ts
+        from eformer.escale import match_partition_rules
+        from huggingface_hub.errors import EntryNotFoundError
+        from jax.experimental.array_serialization import serialization as jax_ser
+        from jax.experimental.array_serialization import tensorstore_impl as ts_impl
+        from transformers import AutoConfig, GenerationConfig
+
+        from easydel.modules.auto.auto_configuration import get_modules_by_type
+        from easydel.utils.parameters_transformation import StateDictConverter, TensorConverter
+
+        if jax.process_count() > 1 and jax.process_index() != 0:
+            logger.info("Skipping sequential conversion on non-zero process index.")
+            return str(save_directory)
+
+        torch_streaming_cache = str(torch_streaming_cache).lower().strip()
+        if torch_streaming_cache not in {"hf_cache", "temp"}:
+            warnings.warn(
+                f"Unknown torch_streaming_cache={torch_streaming_cache!r}; falling back to 'temp'. "
+                "Expected: 'hf_cache'|'temp'.",
+                stacklevel=1,
+            )
+            torch_streaming_cache = "temp"
+
+        cpu_device = None
+        try:
+            cpu_device = jax.devices("cpu")[0]
+        except Exception:
+            cpu_device = None
+        import contextlib
+
+        convert_ctx = jax.default_device(cpu_device) if cpu_device is not None else contextlib.nullcontext()
+
+        save_root = ePath(save_directory)
+        save_root.mkdir(parents=True, exist_ok=True)
+
+        hub_kwargs = {
+            k: kwargs[k] for k in ("cache_dir", "revision", "token", "local_files_only", "force_download") if k in kwargs
+        }
+        if "subfolder" in kwargs:
+            hub_kwargs["subfolder"] = kwargs["subfolder"]
+        if "proxies" in kwargs:
+            hub_kwargs["proxies"] = kwargs["proxies"]
+
+        hf_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
+        model_type: str = hf_config.model_type
+        ed_config_cls, module = get_modules_by_type(model_type, task_type=cls._model_task)
+
+        generation_config = None
+        try:
+            generation_config = GenerationConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                trust_remote_code=trust_remote_code,
+                **hub_kwargs,
+            )
+        except Exception:
+            generation_config = None
+
+        ed_config: EasyDeLBaseConfig = ed_config_cls.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
+        if hasattr(ed_config, "attach_custom_arguments"):
+            ed_config.attach_custom_arguments()
+        config_kwargs = {} if config_kwargs is None else config_kwargs
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+        add_config_overrides: dict[str, tp.Any] = {}
+        if isinstance(getattr(ed_config, "gradient_checkpointing", None), bool):
+            from easydel.infra.etils import EasyDeLGradientCheckPointers
+
+            add_config_overrides["gradient_checkpointing"] = (
+                EasyDeLGradientCheckPointers.CHECKPOINT_DOTS
+                if bool(ed_config.gradient_checkpointing)
+                else EasyDeLGradientCheckPointers.NONE
+            )
+        ed_config.add_basic_configurations(
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+            partition_axis=partition_axis,
+            backend=backend,
+            platform=platform,
+            **add_config_overrides,
+            **config_kwargs,
+        )
+
+        model = module.lazy_init(
+            config=ed_config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=nn.Rngs(0),
+        )
+
+        required_params = set(flatten_dict(model.graphtree_params_shape))
+        if partition_rules is None:
+            try:
+                partition_rules = ed_config.get_partition_rules(True)
+            except Exception:
+                partition_rules = None
+        spec_map: dict[tuple, PartitionSpec] = {}
+        if partition_rules is not None:
+            try:
+                specs_tree = match_partition_rules(partition_rules, model.graphtree_params_shape)
+                spec_map = flatten_dict(specs_tree)
+            except Exception:
+                spec_map = {}
+
+        transformer = model.pure_transform_fn
+        embedding_layer_names = transformer.keywords.get("embedding_layer_names")
+        layernorm_names = transformer.keywords.get("layernorm_names")
+        moe_block_names = transformer.keywords.get("moe_block_names")
+        moe_names = transformer.keywords.get("moe_names")
+        moe_block_path = transformer.keywords.get("moe_block_path")
+        moe_path = transformer.keywords.get("moe_path")
+        reform_param = transformer.keywords.get("reform_param")
+
+        uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
+
+        moe_names_set = set(moe_names or [])
+        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{excepted_expert_name}."
+
+        consolidated_moe_keys: set[str] = set()
+        moe_groups: dict[str, dict[int, str]] = {}
+        expert_key_to_group: dict[str, tuple[str, int]] = {}
+
+        def _register_moe_key(k: str):
+            if not (moe_block_path and moe_names_set and moe_path):
+                return
+            if expert_prefix not in k:
+                return
+            for block_path in moe_block_path:
+                block_expert_prefix = block_path + expert_prefix
+                if not k.startswith(block_expert_prefix):
+                    continue
+                remainder = k[len(block_expert_prefix) :]
+                dot_idx = remainder.find(".")
+                if dot_idx <= 0:
+                    continue
+                expert_part = remainder[:dot_idx]
+                if not expert_part.isdigit():
+                    continue
+                expert_idx = int(expert_part)
+                moe_name_part = remainder[dot_idx + 1 :]
+                moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
+                if moe_name not in moe_names_set:
+                    continue
+                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                moe_groups.setdefault(target_path, {})[expert_idx] = k
+                expert_key_to_group[k] = (target_path, expert_idx)
+                return
+
+        ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
+        ckpt_key_to_filename: dict[str, str] = {}
+
+        revision = kwargs.get("revision", None)
+        token = kwargs.get("token", None)
+        local_files_only = bool(kwargs.get("local_files_only", False))
+        force_download = bool(kwargs.get("force_download", False))
+        proxies = kwargs.get("proxies", None)
+        subfolder = str(kwargs.get("subfolder", "") or "")
+        cache_dir = kwargs.get("cache_dir", None)
+
+        def _strip_or_keep_subfolder(filename: str) -> tuple[str, str]:
+            if not subfolder:
+                return filename, ""
+            normalized = subfolder.strip("/").replace("\\", "/")
+            if filename.startswith(normalized + "/"):
+                return filename, ""
+            return filename, normalized
+
+        def _hf_download(filename: str, *, cache_dir_override: str | None = None) -> str:
+            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
+            return huggingface_hub.hf_hub_download(
+                repo_id=pretrained_model_name_or_path,
+                filename=filename,
+                subfolder=effective_subfolder,
+                revision=revision,
+                cache_dir=cache_dir_override if cache_dir_override is not None else cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                token=token,
+                local_files_only=local_files_only,
+            )
+
+        def _find_local(filename: str) -> str | None:
+            if not os.path.isdir(pretrained_model_name_or_path):
+                return None
+            filename, effective_subfolder = _strip_or_keep_subfolder(filename)
+            root = pretrained_model_name_or_path
+            if effective_subfolder:
+                root = os.path.join(root, effective_subfolder)
+            candidate = os.path.join(root, filename)
+            return candidate if os.path.isfile(candidate) else None
+
+        def _load_index(path: str) -> dict[str, tp.Any]:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        resolved_index_file: str | None = None
+        resolved_single_file: str | None = None
+
+        if os.path.isdir(pretrained_model_name_or_path):
+            resolved_index_file = _find_local(SAFE_WEIGHTS_INDEX_NAME)
+            if resolved_index_file is not None:
+                ckpt_weight_format = "safetensors"
+            else:
+                resolved_index_file = _find_local(WEIGHTS_INDEX_NAME)
+                if resolved_index_file is not None:
+                    ckpt_weight_format = "bin"
+
+            if resolved_index_file is None:
+                resolved_single_file = _find_local(SAFE_WEIGHTS_NAME)
+                if resolved_single_file is not None:
+                    ckpt_weight_format = "safetensors"
+                else:
+                    resolved_single_file = _find_local(WEIGHTS_NAME)
+                    if resolved_single_file is not None:
+                        ckpt_weight_format = "bin"
+        else:
+            try:
+                resolved_index_file = _hf_download(SAFE_WEIGHTS_INDEX_NAME)
+                ckpt_weight_format = "safetensors"
+            except (FileNotFoundError, EntryNotFoundError):
+                resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_index_file = _hf_download(WEIGHTS_INDEX_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_index_file = None
+
+            if resolved_index_file is None:
+                try:
+                    resolved_single_file = _hf_download(SAFE_WEIGHTS_NAME)
+                    ckpt_weight_format = "safetensors"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_single_file = None
+
+            if resolved_single_file is None:
+                try:
+                    resolved_single_file = _hf_download(WEIGHTS_NAME)
+                    ckpt_weight_format = "bin"
+                except (FileNotFoundError, EntryNotFoundError):
+                    resolved_single_file = None
+
+        if ckpt_weight_format is None or (resolved_index_file is None and resolved_single_file is None):
+            raise FileNotFoundError(
+                "Couldn't locate a PyTorch checkpoint to convert. Expected one of: "
+                f"{SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, {WEIGHTS_INDEX_NAME}, {WEIGHTS_NAME}"
+            )
+
+        ckpt_filename_to_path: dict[str, str] = {}
+        if resolved_index_file is not None:
+            index_data = _load_index(resolved_index_file)
+            weight_map = index_data.get("weight_map") or {}
+            if not weight_map:
+                raise ValueError(f"Invalid shard index file (missing weight_map): {resolved_index_file}")
+            ckpt_key_to_filename = dict(weight_map)
+            for k in ckpt_key_to_filename:
+                _register_moe_key(k)
+            for target_path in moe_groups:
+                consolidated_moe_keys.add(f"{target_path}.weight")
+        else:
+            assert resolved_single_file is not None
+            filename = SAFE_WEIGHTS_NAME if ckpt_weight_format == "safetensors" else WEIGHTS_NAME
+            ckpt_filename_to_path[filename] = resolved_single_file
+
+        converter_config = {
+            "embedding_layer_names": set(embedding_layer_names or []),
+            "layernorm_names": set(layernorm_names or []),
+            "moe_block_names": set(moe_block_names or []),
+            "moe_names": set(moe_names or []),
+            "lm_head_name": None,
+            "uses_tie_word_embedding": uses_tie_word_embedding,
+            "dtype": model.param_dtype,
+            "consolidated_moe_keys": consolidated_moe_keys,
+            "reform_param": reform_param,
+        }
+
+        def _chunk_shape_for(
+            key_tuple: tuple, global_shape: tuple[int, ...], dtype_: jnp.dtype, *, moe: bool
+        ) -> list[int]:
+            spec = spec_map.get(key_tuple)
+            local_shape = global_shape
+            if spec is not None:
+                try:
+                    sharding = jax.sharding.NamedSharding(ed_config.mesh, spec)
+                    local_shape = tuple(int(x) for x in sharding.shard_shape(global_shape))
+                except Exception:
+                    local_shape = global_shape
+            chunk = ts_impl._compute_chunk_shape(
+                tuple(int(max(1, d)) for d in local_shape), dtype_, tensorstore_chunk_bytes
+            )
+            if moe and chunk:
+                chunk = [1, *list(chunk[1:])]
+            return [int(max(1, d)) for d in chunk]
+
+        def _tensorstore_path_for_params(key_tuple: tuple) -> tuple[str, str]:
+            rel = os.path.join("model", "params", *[str(p) for p in key_tuple])
+            abs_path = os.path.join(str(save_root), rel)
+            return abs_path, rel
+
+        array_index: list[dict[str, tp.Any]] = []
+
+        def _write_tensor(key_tuple: tuple, value) -> None:
+            if key_tuple not in required_params:
+                return
+            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+            spec = jax_ser.get_tensorstore_spec(abs_path)
+            chunks = _chunk_shape_for(key_tuple, tuple(int(i) for i in value.shape), value.dtype, moe=False)
+            spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
+                tuple(int(i) for i in value.shape),
+                value.dtype,
+                tuple(chunks),
+                driver="zarr",
+            )
+            spec["dtype"] = jnp.dtype(value.dtype).name
+            t = ts.open(ts.Spec(spec), create=True, open=True).result()
+            t.write(value).result()
+            array_index.append(
+                {
+                    "path": rel_path,
+                    "shape": [int(i) for i in value.shape],
+                    "dtype": str(value.dtype),
+                }
+            )
+
+        def _write_checkpoint_index() -> None:
+            index_path = save_root / TENSORSTORE_INDEX_NAME
+            index_data = {
+                "format": "tensorstore",
+                "version": "easydel",
+                "prefixes": {"model": array_index},
+            }
+            index_path.write_text(json.dumps(index_data, indent=2))
+            meta_path = save_root / "checkpoint_metadata.json"
+            meta_path.write_text(
+                json.dumps(
+                    {"timestamp": datetime.now().isoformat(), "custom_metadata": {"step": 0}},
+                    indent=2,
+                )
+            )
+
+        def _save_configs() -> None:
+            config_to_save = deepcopy(ed_config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [module.__name__]
+            config_to_save.save_pretrained(str(save_root))
+            if generation_config is not None:
+                generation_config.save_pretrained(str(save_root))
+
+        _save_configs()
+
+        import tempfile
+
+        @contextlib.contextmanager
+        def _with_resolved_shard(fname: str):
+            if fname in ckpt_filename_to_path and os.path.isfile(ckpt_filename_to_path[fname]):
+                yield ckpt_filename_to_path[fname]
+                return
+
+            if os.path.isdir(pretrained_model_name_or_path):
+                resolved = _find_local(fname)
+                if resolved is None:
+                    raise FileNotFoundError(f"Missing shard file {fname!r} under {pretrained_model_name_or_path!r}")
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_cache == "hf_cache":
+                resolved = _hf_download(fname)
+                ckpt_filename_to_path[fname] = resolved
+                yield resolved
+                return
+
+            if torch_streaming_tmp_dir is not None:
+                if os.path.isfile(torch_streaming_tmp_dir):
+                    raise NotADirectoryError(f"torch_streaming_tmp_dir points to a file: {torch_streaming_tmp_dir!r}")
+                os.makedirs(torch_streaming_tmp_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=torch_streaming_tmp_dir) as tmpdir:
+                yield _hf_download(fname, cache_dir_override=tmpdir)
+
+        def _iter_keys_single_file(filename: str, path: str):
+            import torch
+            from safetensors.torch import safe_open  # type:ignore
+
+            if ckpt_weight_format == "safetensors":
+                with safe_open(path, framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        yield k
+            else:
+                shard = None
+                try:
+                    shard = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    shard = torch.load(path, map_location="cpu")
+                for k in shard.keys():
+                    yield k
+                del shard
+
+        if not ckpt_key_to_filename:
+            filename = next(iter(ckpt_filename_to_path.keys()))
+            resolved_path = ckpt_filename_to_path[filename]
+            for k in _iter_keys_single_file(filename, resolved_path):
+                ckpt_key_to_filename[k] = filename
+                _register_moe_key(k)
+            for target_path in moe_groups:
+                consolidated_moe_keys.add(f"{target_path}.weight")
+            converter_config["consolidated_moe_keys"] = consolidated_moe_keys
+
+        file_to_keys: dict[str, list[str]] = {}
+        for k, fname in ckpt_key_to_filename.items():
+            file_to_keys.setdefault(fname, []).append(k)
+
+        moe_expected: dict[str, int] = {tp: len(expert_key_by_idx) for tp, expert_key_by_idx in moe_groups.items()}
+        moe_remaining: dict[str, int] = dict(moe_expected)
+        moe_handles: dict[str, dict[str, tp.Any]] = {}
+
+        def _ensure_moe_group_ready(target_path: str, *, sample_expert_tensor) -> dict[str, tp.Any] | None:
+            if target_path in moe_handles:
+                return moe_handles[target_path]
+
+            stacked_key = f"{target_path}.weight"
+            out_key = stacked_key[:-7] + ".kernel" if stacked_key.endswith(".weight") else stacked_key + ".kernel"
+            key_tuple = tuple(int(n) if n.isdigit() else n for n in out_key.split("."))
+            if key_tuple not in required_params:
+                return None
+
+            abs_path, rel_path = _tensorstore_path_for_params(key_tuple)
+
+            out_features, in_features = tuple(int(i) for i in sample_expert_tensor.shape)
+            num_experts = int(moe_expected[target_path])
+            global_shape = (num_experts, in_features, out_features)
+            chunks = _chunk_shape_for(key_tuple, global_shape, model.param_dtype, moe=True)
+
+            ts_spec = jax_ser.get_tensorstore_spec(abs_path)
+            ts_spec["metadata"] = ts_impl._get_tensorstore_metadata_cached(
+                global_shape,
+                model.param_dtype,
+                tuple(chunks),
+                driver="zarr",
+            )
+            ts_spec["dtype"] = jnp.dtype(model.param_dtype).name
+            ts_arr = ts.open(ts.Spec(ts_spec), create=True, open=True).result()
+
+            handle = {
+                "key_tuple": key_tuple,
+                "abs_path": abs_path,
+                "rel_path": rel_path,
+                "num_experts": num_experts,
+                "in_features": in_features,
+                "out_features": out_features,
+                "pos_by_expert": {ei: pos for pos, ei in enumerate(sorted(moe_groups[target_path].keys()))},
+                "ts": ts_arr,
+            }
+            moe_handles[target_path] = handle
+            array_index.append(
+                {
+                    "path": rel_path,
+                    "shape": [num_experts, in_features, out_features],
+                    "dtype": str(jnp.dtype(model.param_dtype)),
+                }
+            )
+            return handle
+
+        def _finalize_moe_group(target_path: str) -> None:
+            if target_path in moe_handles:
+                moe_handles.pop(target_path, None)
+
+        def _process_and_write(key: str, tensor) -> None:
+            with convert_ctx:
+                results = StateDictConverter.process_tensor(key, tensor, converter_config)
+            if results is None:
+                return
+            for key_tuple, jax_array in results:
+                _write_tensor(key_tuple, jax_array)
+
+        import torch
+        from safetensors.torch import safe_open  # type:ignore
+
+        if verbose:
+            logger.info(f"Sequential conversion started: {pretrained_model_name_or_path} -> {save_root}")
+
+        for fname in sorted(file_to_keys.keys()):
+            keys = sorted(file_to_keys[fname])
+            if not keys:
+                continue
+
+            if verbose:
+                logger.info(f"Converting shard: {fname} ({len(keys)} tensors)")
+
+            with _with_resolved_shard(fname) as resolved_path:
+                if ckpt_weight_format == "safetensors":
+                    with safe_open(resolved_path, framework="pt", device="cpu") as f:
+                        for k in keys:
+                            if k in expert_key_to_group:
+                                target_path, expert_idx = expert_key_to_group[k]
+                                expert_tensor = f.get_tensor(k)
+                                handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
+                                if handle is not None:
+                                    pos = handle["pos_by_expert"][expert_idx]
+                                    with convert_ctx:
+                                        expert_slice = TensorConverter.convert_pytorch_to_jnp(
+                                            expert_tensor.permute(1, 0),
+                                            model.param_dtype,
+                                        )
+                                    handle["ts"][pos].write(expert_slice).result()
+                                moe_remaining[target_path] -= 1
+                                if moe_remaining[target_path] <= 0:
+                                    _finalize_moe_group(target_path)
+                                del expert_tensor
+                                continue
+
+                            _process_and_write(k, f.get_tensor(k))
+                else:
+                    shard = None
+                    try:
+                        shard = torch.load(resolved_path, map_location="cpu", weights_only=True)
+                    except TypeError:
+                        shard = torch.load(resolved_path, map_location="cpu")
+
+                    for k in keys:
+                        if k in expert_key_to_group:
+                            target_path, expert_idx = expert_key_to_group[k]
+                            expert_tensor = shard[k]
+                            handle = _ensure_moe_group_ready(target_path, sample_expert_tensor=expert_tensor)
+                            if handle is not None:
+                                pos = handle["pos_by_expert"][expert_idx]
+                                with convert_ctx:
+                                    expert_slice = TensorConverter.convert_pytorch_to_jnp(
+                                        expert_tensor.permute(1, 0),
+                                        model.param_dtype,
+                                    )
+                                handle["ts"][pos].write(expert_slice).result()
+                            moe_remaining[target_path] -= 1
+                            if moe_remaining[target_path] <= 0:
+                                _finalize_moe_group(target_path)
+                            del expert_tensor
+                            continue
+                        _process_and_write(k, shard[k])
+                    del shard
+
+            gc.collect()
+
+        incomplete = {k: v for k, v in moe_remaining.items() if v > 0}
+        if incomplete:
+            raise RuntimeError(
+                "Some MoE expert groups were incomplete after processing all shards: "
+                + ", ".join([f"{k} missing={v}" for k, v in sorted(incomplete.items())][:10])
+            )
+
+        _write_checkpoint_index()
+        if verbose:
+            logger.info(f"Sequential conversion finished. Wrote {len(array_index)} tensors to {save_root}")
+
+        return str(save_root)
 
     @classmethod
     def get_torch_loader(cls):
