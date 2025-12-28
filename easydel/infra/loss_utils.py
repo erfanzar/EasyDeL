@@ -392,6 +392,25 @@ def sparse_cross_entropy_chunked_vocab(
     chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute sparse cross-entropy loss with vocabulary chunking for memory efficiency.
+
+    This function chunks along the vocabulary dimension to reduce memory usage
+    when computing cross-entropy for large vocabularies.
+
+    Args:
+        logits: Model logits with shape [..., V] where V is vocabulary size.
+        targets: Target token indices with shape [...].
+        weights: Optional per-token weights with shape [...].
+        ignore_index: Index to ignore in loss computation (default: -100).
+        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
+        z_loss: Coefficient for z-loss regularization (default: 0.0).
+        reduction: Reduction type, "mean" or "sum" (default: "mean").
+        chunk_size: Vocabulary chunk size for memory efficiency (default: 8192).
+        compute_dtype: Dtype for computation (default: jnp.float32).
+
+    Returns:
+        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+    """
     logits = logits.astype(compute_dtype)
     valid = targets != ignore_index
     safe_targets = jnp.where(valid, targets, 0)
@@ -434,6 +453,25 @@ def sparse_cross_entropy_chunked_tokens(
     token_chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute sparse cross-entropy loss with token sequence chunking for memory efficiency.
+
+    This function chunks along the token/batch dimension to reduce memory usage
+    when computing cross-entropy for long sequences or large batches.
+
+    Args:
+        logits: Model logits with shape [B, T, V] or [N, V].
+        targets: Target token indices with shape [B, T] or [N].
+        weights: Optional per-token weights with shape matching targets.
+        ignore_index: Index to ignore in loss computation (default: -100).
+        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
+        z_loss: Coefficient for z-loss regularization (default: 0.0).
+        reduction: Reduction type, "mean" or "sum" (default: "sum").
+        token_chunk_size: Token sequence chunk size for memory efficiency (default: 8192).
+        compute_dtype: Dtype for computation (default: jnp.float32).
+
+    Returns:
+        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+    """
     logits = logits.astype(compute_dtype)
     V = logits.shape[-1]
     logits2d = logits.reshape(-1, V)

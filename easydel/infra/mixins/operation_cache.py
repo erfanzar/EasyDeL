@@ -209,10 +209,13 @@ class OperationCacheMixin:
         """Get requirements for an operation by name from the registry.
 
         Args:
-            name: Operation name to look up.
+            name (str | None): Operation name to look up. If None, returns None immediately.
+            mode (ExecutionMode): The execution mode to get requirements for. Can be
+                PREFILL, DECODE, or MIXED. Defaults to ExecutionMode.MIXED.
 
         Returns:
-            OperationRequirements if found, None otherwise.
+            OperationRequirements | None: Requirements for the operation if found in
+                the registry, None otherwise.
         """
         if name is None:
             return None
