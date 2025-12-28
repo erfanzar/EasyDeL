@@ -331,13 +331,12 @@ def main() -> None:
         if args.repo_id:
             from huggingface_hub import HfApi
 
-            api = HfApi()
+            api = HfApi(token=args.token)
             api.create_repo(repo_id=args.repo_id, repo_type="model", exist_ok=True, token=args.token)
             api.upload_large_folder(
                 folder_path=str(out_dir),
                 repo_id=args.repo_id,
                 repo_type="model",
-                token=args.token,
                 commit_message="Add EasyDeL checkpoint",
             )
     else:
