@@ -252,11 +252,11 @@ tags:
 
 <p align="center">
   <a href="https://github.com/erfanzar/EasyDeL">
-    <img src="https://img.shields.io/badge?label=EasyDeL&message=v{{ easydel_version }}&color=blue&style={{ shields_style }}" alt="EasyDeL Version" />
+    <img src="https://img.shields.io/static/v1?label=EasyDeL&message=v{{ easydel_version }}&color=blue&style={{ shields_style }}" alt="EasyDeL Version" />
   </a>
-  <img src="https://img.shields.io/badge?label=Arch&message={{ model.architecture | urlencode }}&color=0A66C2&style={{ shields_style }}" alt="Model Architecture" />
-  <img src="https://img.shields.io/badge?label=Task&message={{ model.model_task_str | urlencode }}&color=green&style={{ shields_style }}" alt="Task" />
-  <img src="https://img.shields.io/badge?label=Attention&message={{ model.attn_mechanism_str | urlencode }}&color=8A2BE2&style={{ shields_style }}" alt="Attention Mechanism" />
+  <img src="https://img.shields.io/static/v1?label=Arch&message={{ model.architecture | urlencode }}&color=0A66C2&style={{ shields_style }}" alt="Model Architecture" />
+  <img src="https://img.shields.io/static/v1?label=Task&message={{ model.model_task_str | urlencode }}&color=green&style={{ shields_style }}" alt="Task" />
+  <img src="https://img.shields.io/static/v1?label=Attention&message={{ model.attn_mechanism_str | urlencode }}&color=8A2BE2&style={{ shields_style }}" alt="Attention Mechanism" />
 </p>
 
 ## Run Summary
@@ -394,44 +394,15 @@ tags:
 ---
 
 <p align="center">
-  <a href="https://github.com/erfanzar/EasyDeL">
-    <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80" alt="EasyDeL" />
-  </a>
+  <img alt="easydel" src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png">
 </p>
 
 <h1 align="center">{{ model.name }}</h1>
 
-<p align="center">
+<div align="center">
   {{ model.description if model.description else "A model compatible with the EasyDeL JAX stack." }}
-</p>
+</div>
 
-<p align="center">
-  {% if model.repo_is_local %}
-  <img src="https://img.shields.io/badge?label=Checkpoint&message={{ model.repo_badge_message | urlencode }}&color=FFD21E&style={{ shields_style }}" alt="Checkpoint" />
-  {% else %}
-  <a href="https://huggingface.co/{{ model.repo_id }}">
-    <img src="https://img.shields.io/badge?label=HF&message={{ model.repo_id | urlencode }}&color=FFD21E&style={{ shields_style }}" alt="HuggingFace Repo" />
-  </a>
-  {% endif %}
-  <a href="https://github.com/erfanzar/EasyDeL">
-    <img src="https://img.shields.io/badge?label=EasyDeL&message=v{{ model.version | urlencode }}&color=0B5FFF&style={{ shields_style }}" alt="EasyDeL Version" />
-  </a>
-  <img src="https://img.shields.io/badge?label=Model&message={{ model_type | urlencode }}&color=0A66C2&style={{ shields_style }}" alt="Model Type" />
-  <img src="https://img.shields.io/badge?label=Task&message={{ task | urlencode }}&color=2EAD4D&style={{ shields_style }}" alt="Task" />
-  <img src="https://img.shields.io/badge?label=Attention&message={{ model.attn_mechanism | urlencode }}&color=8A2BE2&style={{ shields_style }}" alt="Attention Mechanism" />
-</p>
-
----
-
-## At a Glance
-
-| Field | Value |
-| --- | --- |
-| {% if model.repo_is_local %}Checkpoint path{% else %}Repo ID{% endif %} | `{{ model.repo_id }}` |
-| Model type | `{{ model_type }}` |
-| Task | `{{ task }}` |
-| Attention | `{{ model.attn_mechanism }}` (`AttentionMechanisms.{{ attn_enum }}`) |
-| EasyDeL | `{{ model.version }}` |
 
 ## Overview
 
@@ -449,14 +420,20 @@ dtype = jnp.bfloat16  # try jnp.float16 on many GPUs
 
 model = ed.{{ auto_class }}.from_pretrained(
     repo_id,
-    config_kwargs=ed.EasyDeLBaseConfigDict(
-        attn_dtype=dtype,
-        attn_mechanism=ed.AttentionMechanisms.{{ attn_enum }},
-    ),
     dtype=dtype,
     param_dtype=dtype,
     precision=lax.Precision("fastest"),
+    sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp"),
+    sharding_axis_dims=(1, -1, 1, 1, 1),
+    config_kwargs=ed.EasyDeLBaseConfigDict(
+        attn_dtype=dtype,
+        attn_mechanism=ed.AttentionMechanisms.{{ attn_enum }},
+        fsdp_is_ep_bound=True,
+        sp_is_ep_bound=True,
+        moe_method=ed.MoEMethods.FUSED_MOE,
+    ),
     auto_shard_model=True,
+    partition_axis=ed.PartitionAxis(),
 )
 ```
 
