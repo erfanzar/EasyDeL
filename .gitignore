@@ -14,6 +14,7 @@ env.py
 exp.py
 vxp.py
 nohup.out
+generated-readmes
 sharding_test.py
 cluster.yaml
 exprimental.py
