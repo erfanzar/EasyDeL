@@ -135,7 +135,18 @@ if DEFAULT_HARDWARE_ABSTRACTION:
 
 
 def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
-    """Derive flattened mesh shape and axis names for expert-parallel layouts."""
+    """Derive flattened mesh shape and axis names for expert-parallel layouts.
+
+    Args:
+        mesh: JAX device mesh to extract dimensions from.
+        pm: PartitionManager instance for axis name resolution.
+        fsdp_is_ep_bound: Whether to fold FSDP axis into expert-parallel axis.
+        sp_is_ep_bound: Whether to fold sequence-parallel axis into expert-parallel axis.
+
+    Returns:
+        Tuple of ((dp_size, ep_size, tp_size), (dp_name, ep_name, tp_name)) containing
+        the flattened mesh dimensions and corresponding axis names.
+    """
     # Resolve Names
     dpname, fsdpname, epname, tpname, spname = (
         _resolve_eformer_axis(DP, pm),
@@ -1857,6 +1868,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _fix_parent_kws(kw1, kw2):
+        """Merge two keyword argument dictionaries, with kw1 taking precedence.
+
+        Args:
+            kw1: Primary dictionary (takes precedence).
+            kw2: Secondary dictionary (provides defaults for missing keys).
+
+        Returns:
+            Merged dictionary with all keys from both inputs, kw1 values preferred.
+        """
         result = copy.deepcopy(kw1)
         tkey = result.keys()
         for k, v in kw2.items():

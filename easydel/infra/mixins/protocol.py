@@ -295,24 +295,27 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """
-        Forward pass for Causal Language Models (e.g., GPT).
+        """Forward pass for Causal Language Models (e.g., GPT, Llama).
 
         Args:
-            input_ids: Optional array of token IDs.
-            inputs_embeds: Optional array of input embeddings. Use this if you've pre-computed embeddings
-                           and want to bypass the embedding layer.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs (used in models like BERT).
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-                             Useful for faster inference.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            inputs_embeds (Array | None): Optional array of input embeddings. Use this if you've
+                pre-computed embeddings and want to bypass the embedding layer.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+                Preferred over attention_mask for document-level boundaries.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None for auto).
+            past_key_values (Cache | None): Optional cache containing key and value tensors
+                from previous model passes. Useful for faster inference.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
 
         Returns:
-            A CausalLMOutput. See return type for more details.
+            CausalLMOutput: Model output containing logits and optionally hidden states/attentions.
         """
 
     @tp.overload
@@ -327,21 +330,20 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
-        """
-        Forward pass for Sequence Classification Models (e.g., BERT for sentiment analysis).
+        """Forward pass for Sequence Classification Models (e.g., BERT for sentiment).
 
         Args:
-            input_ids: Optional array of token IDs.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
 
         Returns:
-           A SequenceClassifierOutput. See return type for more details.
+            SequenceClassifierOutput: Model output containing logits for classification.
         """
 
     @tp.overload
@@ -361,25 +363,26 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeModelOutput:
-        """
-        Forward pass for Mixture-of-Experts (MoE) Models.
+        """Forward pass for Mixture-of-Experts (MoE) Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-            output_router_logits: Optional flag to return the router logits,
-                 which are used to determine which experts to use for each token.
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            output_router_logits (bool | None): Optional flag to return router logits
+                that determine expert selection.
+            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None).
+            past_key_values (Cache | None): Optional cache from previous model passes.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
 
         Returns:
-            A MoeModelOutput. See return type for more details.
+            MoeModelOutput: Model output with logits, router logits, and optional states.
         """
 
     @tp.overload
@@ -399,25 +402,26 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """
-        Forward pass for Mixture-of-Experts (MoE) Causal Language Models.
+        """Forward pass for Mixture-of-Experts (MoE) Causal Language Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-            output_router_logits: Optional flag to return the router logits,
-                 which are used to determine which experts to use for each token.
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            output_router_logits (bool | None): Optional flag to return router logits
+                that determine expert selection.
+            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None).
+            past_key_values (Cache | None): Optional cache from previous model passes.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
 
         Returns:
-           A MoeCausalLMOutput. See return type for more details.
+            MoeCausalLMOutput: Model output with logits, router logits, and optional states.
         """
 
     @tp.overload
@@ -518,24 +522,25 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[CausalLMOutput, LossMetrics]:
-        """
-        Computes the loss for Causal Language Models.
+        """Computes the loss for Causal Language Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            labels: Optional array of target token IDs.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            labels (Array | None): Optional array of target token IDs for computing loss.
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            past_key_values (Cache | None): Optional cache from previous model passes.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            loss_config (LossConfig | None): Optional configuration for loss computation.
+            loss_kwargs (dict | None): Optional additional keyword arguments for loss computation.
 
         Returns:
-            A CausalLMOutput and a tuple containing model outputs including the loss.
-            See return type for more details.
+            tuple[CausalLMOutput, LossMetrics]: Model output and loss metrics.
         """
 
     @tp.overload
@@ -553,23 +558,23 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[SequenceClassifierOutput, LossMetrics]:
-        """
-        Computes the loss for Sequence Classification Models.
+        """Computes the loss for Sequence Classification Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            labels: Optional array of target classification labels.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            labels (Array | None): Optional array of target classification labels.
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            loss_config (LossConfig | None): Optional configuration for loss computation.
+            loss_kwargs (dict | None): Optional additional keyword arguments for loss computation.
 
         Returns:
-            A SequenceClassifierOutput and a tuple containing model outputs including the loss.
-            See return type for more details.
+            tuple[SequenceClassifierOutput, LossMetrics]: Model output and loss metrics.
         """
 
     @tp.overload
@@ -590,25 +595,26 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeModelOutput, LossMetrics]:
-        """
-        Computes the loss for Mixture-of-Experts (MoE) Models.
+        """Computes the loss for Mixture-of-Experts (MoE) Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            labels: Optional array of target token IDs or labels for the specific task.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-            output_router_logits: Optional flag to return the router logits.
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            labels (Array | None): Optional array of target token IDs for computing loss.
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            output_router_logits (bool | None): Optional flag to return router logits.
+            past_key_values (Cache | None): Optional cache from previous model passes.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            loss_config (LossConfig | None): Optional configuration for loss computation.
+            loss_kwargs (dict | None): Optional additional keyword arguments for loss.
 
         Returns:
-            A MoeModelOutput and a tuple containing model outputs including the loss.
-            See return type for more details.
+            tuple[MoeModelOutput, LossMetrics]: Model output and loss metrics.
         """
 
     @tp.overload
@@ -629,25 +635,26 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
     ) -> tuple[MoeCausalLMOutput, LossMetrics]:
-        """
-        Computes the loss for Mixture-of-Experts (MoE) Causal Language Models.
+        """Computes the loss for Mixture-of-Experts (MoE) Causal Language Models.
 
         Args:
-            input_ids: Optional array of token IDs.
-            labels: Optional array of target token IDs.
-            inputs_embeds: Optional array of input embeddings.
-            attention_mask: Optional array indicating which tokens should be attended to.
-            position_ids: Optional array specifying token positions.
-            segment_ids: Optional array indicating segment IDs.
-            output_attentions: Optional flag to return attention weights from each layer.
-            output_hidden_states: Optional flag to return hidden states from each layer.
-            output_router_logits: Optional flag to return the router logits.
-            past_key_values: Optional cache containing key and value tensors from previous model passes.
-
+            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
+            labels (Array | None): Optional array of target token IDs for computing loss.
+            inputs_embeds (Array | None): Optional array of input embeddings.
+            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
+            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
+            position_ids (Array | None): Optional array specifying token positions.
+            segment_ids (Array | None): Optional array indicating segment IDs.
+            output_attentions (bool | None): Optional flag to return attention weights.
+            output_hidden_states (bool | None): Optional flag to return hidden states.
+            output_router_logits (bool | None): Optional flag to return router logits.
+            past_key_values (Cache | None): Optional cache from previous model passes.
+            cache_metadata (Metadata | None): Optional metadata for cache operations.
+            loss_config (LossConfig | None): Optional configuration for loss computation.
+            loss_kwargs (dict | None): Optional additional keyword arguments for loss.
 
         Returns:
-            A MoeCausalLMOutput and a tuple containing model outputs including the loss.
-            See return type for more details.
+            tuple[MoeCausalLMOutput, LossMetrics]: Model output and loss metrics.
         """
 
     @tp.overload
@@ -663,15 +670,42 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def graphdef(self) -> nn.GraphDef: ...
+    def graphdef(self) -> nn.GraphDef:
+        """Returns the static graph definition of the model.
+
+        The graphdef contains the model's structure without any variable data,
+        used for JAX transformations and serialization.
+
+        Returns:
+            nn.GraphDef: The Flax NNX graph definition.
+        """
+        ...
 
     @property
     @abstractmethod
-    def graphstate(self) -> nn.GraphState: ...
+    def graphstate(self) -> nn.GraphState:
+        """Returns the trainable state (parameters) of the model.
+
+        The graphstate contains all trainable parameters like weights and biases
+        that are updated during training.
+
+        Returns:
+            nn.GraphState: The trainable state containing model parameters.
+        """
+        ...
 
     @property
     @abstractmethod
-    def graphother(self) -> nn.GraphState: ...
+    def graphother(self) -> nn.GraphState:
+        """Returns the non-trainable state of the model.
+
+        The graphother contains non-trainable state like batch normalization
+        statistics, RNG keys, and other mutable but non-optimized state.
+
+        Returns:
+            nn.GraphState: The non-trainable state of the model.
+        """
+        ...
 
     @abstractmethod
     def to_dtype(self: Self, dtype) -> Self:

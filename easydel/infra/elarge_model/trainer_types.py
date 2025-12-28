@@ -30,11 +30,48 @@ _TRAINER_TYPE_ALIASES: dict[str, str] = {
 
 
 def _normalize_trainer_type(trainer_type: str) -> str:
+    """Normalize trainer type string to canonical form.
+
+    Handles case normalization and known aliases (e.g., "nash_md" -> "nash-md").
+
+    Args:
+        trainer_type: Trainer type string to normalize.
+
+    Returns:
+        Normalized trainer type string in lowercase with aliases resolved.
+
+    Example:
+        >>> _normalize_trainer_type("DPO")
+        'dpo'
+        >>> _normalize_trainer_type("nash_md")
+        'nash-md'
+    """
     normalized = trainer_type.lower()
     return _TRAINER_TYPE_ALIASES.get(normalized, normalized)
 
 
 class LossConfig(TypedDict, total=False):
+    """Configuration for loss computation in training.
+
+    Attributes:
+        ignore_index: Token index to ignore in loss computation (default: -100 for padding).
+        label_smoothing: Label smoothing factor (0.0 = no smoothing).
+        z_loss: Z-loss regularization coefficient for router auxiliary loss.
+        loss_normalizing_factor: How to normalize loss across tokens/sequences.
+        num_labels: Number of labels for classification tasks.
+        problem_type: Type of classification problem.
+        divide_weight_sum: Whether to divide by sum of weights.
+        shift_tokens: Whether to shift tokens for causal LM loss computation.
+        break_on_nan: Whether to raise an error on NaN loss values.
+        reduction: Loss reduction method ("none", "mean", or "sum").
+        num_classification_labels: Number of classification labels.
+        classification_problem_type: Type of classification problem for sequence classification.
+        chunk_vocab_size: Chunk size for vocabulary-chunked cross entropy.
+        chunk_token_size: Chunk size for token-chunked cross entropy.
+        chunk_block_size: Block size for chunked computations.
+        compute_dtype: Dtype for loss computation ("fp32" or "bf16").
+    """
+
     ignore_index: NotRequired[int]
     label_smoothing: NotRequired[float]
     z_loss: NotRequired[float]

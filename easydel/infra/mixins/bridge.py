@@ -232,9 +232,12 @@ class EasyBridgeMixin(PushToHubMixin):
         """Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
         Args:
-          save_directory (ePath): The directory where the model files will be saved.
-          gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-          float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
+            save_directory (ePathLike): The directory where the model files will be saved.
+            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
+                Defaults to None, which uses the model's default gather functions.
+            float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
+            step (int, optional): The training step number for versioned checkpoints.
+                Defaults to None.
         """
         save_directory.mkdir(parents=True, exist_ok=True)
 
@@ -281,10 +284,16 @@ class EasyBridgeMixin(PushToHubMixin):
         Args:
             save_directory (str or PathLike): The directory where to save the model.
             push_to_hub (bool, optional): If True, pushes the model to the Hugging Face Hub.
-            token (str or bool, optional): The Hugging Face Hub token.
+                Defaults to False.
+            token (str or bool, optional): The Hugging Face Hub token for authentication.
+                Defaults to None.
             gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-            float_dtype (dtype, optional): Data type for saving weights.
-            **kwargs: Additional keyword arguments for Hugging Face Hub.
+                Defaults to None.
+            float_dtype (jnp.dtype, optional): Data type for saving weights. Defaults to None.
+            step (int, optional): The training step number for versioned checkpoints.
+                Defaults to None.
+            **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
+                commit_message).
         """
 
         easy_directory = ePath(save_directory)
@@ -335,7 +344,6 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Args:
             repo_id (str): The repository ID on Hugging Face Hub.
-            params (any): Model parameters.
             use_temp_dir (bool, optional): If True, uses a temporary directory. Defaults to None
             commit_message (str, optional): The commit message for the push.
             private (bool, optional): If True, creates a private repository.
@@ -495,15 +503,20 @@ class EasyBridgeMixin(PushToHubMixin):
         """Loads model weights from a checkpoint file.
 
         Args:
-            resolved_archive_file: The path to the checkpoint file.
-            model: an easydel model.
-            quantization_config: Quantization configuration for loading.
-            quantize_tensors: Whether to quantize tensors during loading.
-            shard_fns: Custom shard functions for loading checkpoint.
-            vebose: Whether to print verbose messages.
+            resolved_archive_file (str | None): The path to the checkpoint file.
+                Can be None if no weights file is provided.
+            model (EasyDeLBaseModule): The EasyDeL model instance to load weights into.
+            param_dtype (jnp.dtype): The data type for model parameters.
+            mesh (jax.sharding.Mesh): The JAX mesh for distributed sharding.
+            shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
+                Defaults to None.
+            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+                for loading. Pass None to disable quantization.
+            quantize_tensors (bool): Whether to quantize tensors during loading.
+            vebose (bool): Whether to print verbose messages during loading.
 
         Returns:
-            an easydel, with loaded parameter.
+            EasyDeLBaseModule: The model with loaded parameters.
         """
         callback = None
         if quantize_tensors and quantization_config is not None:
@@ -610,27 +623,51 @@ class EasyBridgeMixin(PushToHubMixin):
         """Loads an EasyDeL model from a pretrained model or path.
 
         Args:
-            pretrained_model_name_or_path: The name or path of the pretrained model.
-            sharding_axis_dims: The dimensions of sharding axes.
-            sharding_axis_names: The names of sharding axes.
-            partition_axis: The partition axis configuration.
-            dtype: The data type of the model.
-            param_dtype: The data type of the parameters.
-            precision: The computation precision.
-            config_kwargs: Additional configuration parameters.
-            partition_rules: Custom partitioning rules for sharding.
-            backend: The backend to use.
-            platform: The platform to use.
-            shard_fns: Custom shard functions for loading checkpoint.
-            auto_shard_model: Whether to automatically shard the model.
-            verbose: Whether to print verbose messages. Defaults to True.
-            mismatch_allowed: If True, allows mismatch in parameters while loading. Defaults to True.
-            quantization_config: Quantization config for loading. Pass None to disable.
-            quantize_tensors: Whether to quantize tensors during loading.
-            **kwargs: Additional keyword arguments.
+            pretrained_model_name_or_path (str | PathLike | None): The name or path of the
+                pretrained model. Can be a HuggingFace Hub model ID or a local directory path.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN (Data Center
+                Network) sharding axes for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis): The partition axis configuration for model sharding.
+                Defaults to PartitionAxis().
+            dtype (jnp.dtype): The data type for model computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): The computation precision.
+                Defaults to jax.lax.Precision("fastest").
+            config_kwargs (dict[str, Any] | None): Additional configuration parameters to override.
+                Defaults to None.
+            partition_rules (tuple[tuple[str, PartitionSpec]] | None): Custom partitioning rules
+                for sharding. Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to "jax".
+            shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
+                Defaults to None.
+            auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            mismatch_allowed (bool): If True, allows mismatch in parameters while loading.
+                Defaults to True.
+            *model_args: Additional positional arguments passed to the model.
+            config (EasyDeLBaseConfig | str | PathLike | None): Model configuration or path
+                to configuration file. Defaults to None.
+            cache_dir (str | PathLike | None): Directory to cache downloaded models.
+                Defaults to None.
+            force_download (bool): Whether to force re-download of model files. Defaults to False.
+            local_files_only (bool): Whether to only use local files without downloading.
+                Defaults to False.
+            token (str | bool | None): HuggingFace Hub authentication token. Defaults to None.
+            revision (str): The specific model version to use (branch, tag, or commit).
+                Defaults to "main".
+            vebose (bool): Legacy parameter for verbose output. Defaults to True.
+            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+                for loading. Pass None to disable. Defaults to None.
+            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder).
 
         Returns:
-            The loaded EasyDeL model.
+            EasyDeLBaseModule: The loaded EasyDeL model with weights.
         """
 
         from huggingface_hub import HfApi
@@ -880,6 +917,55 @@ class EasyBridgeMixin(PushToHubMixin):
         verbose: bool = True,
         **kwargs,
     ):
+        """Loads an EasyDeL model from a PyTorch pretrained checkpoint.
+
+        This method converts PyTorch model weights to JAX format and creates an EasyDeL model.
+        Supports both full loading (loads entire model into memory) and streaming loading
+        (processes one shard at a time to reduce memory usage).
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path
+                to the PyTorch checkpoint.
+            device (jax.Device | None): The JAX device for tensor placement. Defaults to None.
+            dtype (jax.numpy.dtype): The data type for model computations.
+                Defaults to jax.numpy.float32.
+            param_dtype (jax.numpy.dtype): The data type for model parameters.
+                Defaults to jax.numpy.float32.
+            precision (jax.lax.Precision | None): The computation precision. Defaults to None.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
+                for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis | None): The partition axis configuration.
+                Defaults to None.
+            shard_fns (Mapping[tuple, Callable] | dict | None): Custom shard functions for
+                sharding tensors. Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to None.
+            config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters.
+                Defaults to None.
+            auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
+            partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
+                rules for sharding. Defaults to None.
+            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration.
+                Pass None to disable. Defaults to None.
+            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            **kwargs: Additional keyword arguments including:
+                - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
+                - torch_streaming_cache (str): "hf_cache" or "temp". Defaults to "hf_cache".
+                - torch_streaming_tmp_dir (str): Temporary directory for streaming.
+                - trust_remote_code (bool): Whether to trust remote code. Defaults to False.
+                - cache_dir, revision, token, local_files_only, force_download, subfolder, proxies.
+
+        Returns:
+            EasyDeLBaseModule: The loaded EasyDeL model with converted weights.
+
+        Raises:
+            ModuleNotFoundError: If PyTorch is not installed.
+        """
         from transformers import AutoConfig
 
         from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -1055,7 +1141,29 @@ class EasyBridgeMixin(PushToHubMixin):
         hub_kwargs: dict[str, tp.Any],
         kwargs: dict[str, tp.Any],
     ) -> StreamingCheckpointInfo:
-        """Resolve checkpoint files for streaming mode, returning checkpoint info with resolve_shard callable."""
+        """Resolve checkpoint files for streaming mode, returning checkpoint info.
+
+        This method discovers available checkpoint files (SafeTensors or PyTorch .bin format)
+        and builds the metadata needed for streaming conversion without loading all weights
+        into memory.
+
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path.
+            config_class (type): The EasyDeL config class to use for loading configuration.
+            hub_kwargs (dict[str, Any]): Keyword arguments for HuggingFace Hub operations
+                (cache_dir, revision, token, etc.).
+            kwargs (dict[str, Any]): Additional keyword arguments including revision, token,
+                local_files_only, force_download, proxies, subfolder, and cache_dir.
+
+        Returns:
+            StreamingCheckpointInfo: Metadata containing checkpoint format, key-to-file mappings,
+                resolved file paths, EasyDeL config, generation config, and a resolve_shard
+                callable for on-demand shard downloading.
+
+        Raises:
+            FileNotFoundError: If no valid PyTorch checkpoint files can be found.
+            ValueError: If the shard index file is invalid (missing weight_map).
+        """
         from transformers import GenerationConfig
 
         logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
@@ -1222,16 +1330,21 @@ class EasyBridgeMixin(PushToHubMixin):
         including MoE expert grouping and multi-file handling.
 
         Args:
-            ckpt_info: StreamingCheckpointInfo with checkpoint paths and resolve_shard callable.
-            hf_config: The HuggingFace config for the model.
-            load_options: TorchLoadOptions with streaming cache settings.
-            shard_fns: Optional sharding functions to apply to tensors.
-            callback: Optional callback for post-processing tensors.
-            device: Optional JAX device for placement.
-            clear_fn: Function to call for memory cleanup.
+            model (EasyDeLBaseModule): The EasyDeL model instance used for transformation
+                configuration and parameter shape information.
+            ckpt_info (StreamingCheckpointInfo): Checkpoint metadata with paths and
+                resolve_shard callable.
+            hf_config (Any): The HuggingFace config for the model.
+            load_options (TorchLoadOptions): Options with streaming cache settings.
+            shard_fns (dict[tuple, Callable] | None): Optional sharding functions to apply
+                to tensors.
+            callback (Callable | None): Optional callback for post-processing tensors
+                (e.g., quantization).
+            device (Any | None): Optional JAX device for tensor placement.
+            clear_fn (Callable[[], None]): Function to call for memory cleanup between shards.
 
         Returns:
-            Flattened dict of (tuple_key -> jax_array) ready for unflattening.
+            dict[tuple, Any]: Flattened dict of (tuple_key -> jax_array) ready for unflattening.
         """
         import torch
         from safetensors.torch import safe_open
@@ -1534,8 +1647,20 @@ class EasyBridgeMixin(PushToHubMixin):
     ) -> tuple[tp.Any, tp.Any, dict[str, tp.Any]]:
         """Load full PyTorch checkpoint into memory (for torch_load_mode='full').
 
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path.
+            config_class (type): The EasyDeL config class to use for loading configuration.
+            hub_kwargs (dict[str, Any]): Keyword arguments for HuggingFace Hub operations
+                (cache_dir, revision, token, etc.).
+            torch_loader (Any): The HuggingFace AutoModel class for loading the PyTorch model.
+            clear_fn (Callable[[], None]): Function to call for memory cleanup after loading.
+            kwargs (dict[str, Any]): Additional keyword arguments for model loading
+                (e.g., torch_dtype).
+
         Returns:
-            Tuple of (ed_config, generation_config, state_dict)
+            tuple[Any, Any, dict[str, Any]]: A tuple of (ed_config, generation_config, state_dict)
+                where ed_config is the EasyDeL configuration, generation_config is the
+                generation configuration (if available), and state_dict contains the model weights.
         """
         import torch
 
@@ -1581,8 +1706,7 @@ class EasyBridgeMixin(PushToHubMixin):
         verbose: bool = True,
         **kwargs,
     ) -> str:
-        """
-        Convert a HuggingFace PyTorch checkpoint to an EasyDeL checkpoint sequentially.
+        """Convert a HuggingFace PyTorch checkpoint to an EasyDeL checkpoint sequentially.
 
         This avoids materializing the full `state_dict`/params tree in memory by:
         - downloading one shard at a time (optionally to a temp dir),
@@ -1591,8 +1715,45 @@ class EasyBridgeMixin(PushToHubMixin):
 
         MoE expert weights are written slice-by-slice to avoid allocating stacked expert tensors.
 
-        If `output_repo_id` is provided, it is used in the generated `README.md` so the model card
-        points to the final Hub repo when uploading the converted folder.
+        Args:
+            pretrained_model_name_or_path (str): The HuggingFace Hub model ID or local path
+                to the PyTorch checkpoint.
+            save_directory (str | PathLike): The directory where the converted checkpoint
+                will be saved.
+            output_repo_id (str | None): If provided, it is used in the generated README.md
+                so the model card points to the final Hub repo. Defaults to None.
+            dtype (jnp.dtype): The data type for model computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None): The computation precision. Defaults to None.
+            sharding_axis_dims (Sequence[int]): The dimensions for sharding axes.
+                Defaults to (1, -1, 1, 1, 1).
+            sharding_dcn_axis_dims (Sequence[int] | None): The dimensions for DCN sharding axes
+                for multi-host setups. Defaults to None.
+            sharding_axis_names (Sequence[str]): The names of sharding axes.
+                Defaults to ("dp", "fsdp", "ep", "tp", "sp").
+            partition_axis (PartitionAxis | None): The partition axis configuration.
+                Defaults to None.
+            backend (EasyDeLBackends | None): The backend to use. Defaults to None.
+            platform (EasyDeLPlatforms | None): The platform to use. Defaults to None.
+            config_kwargs (EasyDeLBaseConfigDict | None): Additional configuration parameters
+                to override. Defaults to None.
+            partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
+                rules for sharding. Defaults to None.
+            trust_remote_code (bool): Whether to trust remote code from HuggingFace Hub.
+                Defaults to False.
+            torch_streaming_cache (str): Where to cache downloaded shards. Options are
+                "hf_cache" (uses HuggingFace cache) or "temp" (uses temporary directory).
+                Defaults to "temp".
+            torch_streaming_tmp_dir (str | None): Custom temporary directory for streaming.
+                Only used when torch_streaming_cache="temp". Defaults to None.
+            tensorstore_chunk_bytes (int): The chunk size in bytes for TensorStore arrays.
+                Defaults to 2_147_483_648 (2GB).
+            verbose (bool): Whether to print verbose messages. Defaults to True.
+            **kwargs: Additional keyword arguments (e.g., cache_dir, revision, token,
+                local_files_only, force_download, subfolder, proxies).
+
+        Returns:
+            str: The path to the saved checkpoint directory.
         """
         from datetime import datetime
 
@@ -1902,7 +2063,7 @@ class EasyBridgeMixin(PushToHubMixin):
             return [int(max(1, d)) for d in chunk]
 
         def _tensorstore_path_for_params(key_tuple: tuple) -> tuple[str, str]:
-            rel = os.path.join("model", "params", *[str(p) for p in key_tuple])
+            rel = os.path.join("model", *[str(p) for p in key_tuple])
             abs_path = os.path.join(str(save_root), rel)
             return abs_path, rel
 
@@ -2183,6 +2344,19 @@ class EasyBridgeMixin(PushToHubMixin):
 
     @classmethod
     def get_torch_loader(cls):
+        """Gets the appropriate HuggingFace AutoModel class for loading PyTorch weights.
+
+        This method returns the correct transformers AutoModel class based on the model's
+        task type (e.g., CausalLM, Seq2Seq, AudioClassification). If the class has a
+        custom `hf_torch_auto_loader` attribute set, that will be used instead.
+
+        Returns:
+            type: The HuggingFace AutoModel class appropriate for this model's task type.
+
+        Raises:
+            ValueError: If no matching AutoModel class can be found for the model's task type.
+                In this case, set `hf_torch_auto_loader` on your class manually.
+        """
         from ..factory import TaskType
 
         auto_loader = getattr(cls, "hf_torch_auto_loader", None)

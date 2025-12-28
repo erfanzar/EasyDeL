@@ -405,12 +405,18 @@ class EasyGenerationMixin:
     def create_recurrent_cache_config(self, batch_size: int):
         """Create RecurrentCacheConfig from model configuration.
 
+        This method automatically detects the recurrent architecture type (Qwen3-Next,
+        FalconH1, Mamba2, Mamba) and creates the appropriate cache configuration.
+
         Args:
-            batch_size: Batch size for inference.
-            max_length: Maximum sequence length (unused for recurrent).
+            batch_size (int): Batch size for inference.
 
         Returns:
-            RecurrentCacheConfig configured for the model.
+            RecurrentCacheConfig: Cache configuration appropriate for the model's
+                recurrent layer architecture.
+
+        Raises:
+            ValueError: If intermediate_size cannot be inferred for certain architectures.
         """
         from easydel.layers.caching import RecurrentCacheConfig
 
@@ -586,12 +592,17 @@ class EasyGenerationMixin:
     def create_kda_cache_config(self, batch_size: int):
         """Create KDACacheConfig from model configuration.
 
+        Creates cache configuration for models using Key-Dependent Attention (KDA)
+        mechanisms like certain linear attention variants.
+
         Args:
-            batch_size: Batch size for inference.
-            max_length: Maximum sequence length (unused for KDA).
+            batch_size (int): Batch size for inference.
 
         Returns:
-            KDACacheConfig configured for the model.
+            KDACacheConfig: Cache configuration for KDA-style attention layers.
+
+        Raises:
+            ValueError: If num_heads cannot be inferred from the model configuration.
         """
         from easydel.layers.caching import KDACacheConfig
 
@@ -633,12 +644,13 @@ class EasyGenerationMixin:
     def create_lightning_cache_config(self, batch_size: int):
         """Create LightningCacheConfig from model configuration.
 
+        Creates cache configuration for models using Lightning Attention mechanisms.
+
         Args:
-            batch_size: Batch size for inference.
-            max_length: Maximum sequence length (unused for lightning cache).
+            batch_size (int): Batch size for inference.
 
         Returns:
-            LightningCacheConfig configured for the model.
+            LightningCacheConfig: Cache configuration for Lightning Attention layers.
         """
 
         from easydel.layers.caching import LightningCacheConfig
@@ -686,15 +698,20 @@ class EasyGenerationMixin:
     ):
         """Create RaggedPagesCacheConfig from model configuration.
 
+        Creates cache configuration for Paged Attention (vLLM-style) with ragged
+        page management. The batch size is determined dynamically based on HBM
+        utilization.
+
         Args:
-            batch_size: Batch size for inference.
-            max_length: Maximum sequence length.
-            page_size: Number of tokens per page.
-            hbm_utilization: Target HBM memory utilization fraction.
-            dtype: Data type for cache tensors.
+            max_length (int): Maximum sequence length (max_model_length).
+            page_size (int): Number of tokens per page. Defaults to 128.
+            hbm_utilization (float): Target HBM memory utilization fraction (0.0-1.0).
+                Defaults to 0.9.
+            dtype (jnp.dtype | None): Data type for cache tensors. If None, uses
+                the model's kvdtype. Defaults to None.
 
         Returns:
-            RaggedPagesCacheConfig configured for the model.
+            RaggedPagesCacheConfig: Cache configuration for paged attention.
         """
         from easydel.layers.caching import RaggedPagesCacheConfig
 
@@ -751,16 +768,18 @@ class EasyGenerationMixin:
         - Lightning attention operations -> LightningCacheView
 
         Args:
-            batch_size: Batch size for inference.
-            max_length: Maximum sequence length.
-            page_size: Page size for RaggedPagesCache (default 128).
-            hbm_utilization: HBM utilization for RaggedPagesCache (default 0.9).
-            dtype: Data type for cache tensors. Defaults to model's kvdtype.
-            quantizer: Optional quantizer for KV cache.
-            masking_details: Optional masking details for attention.
+            batch_size (int): Batch size for inference.
+            max_length (int): Maximum sequence length.
+            page_size (int): Page size for RaggedPagesCache. Defaults to 128.
+            hbm_utilization (float): HBM utilization for RaggedPagesCache. Defaults to 0.9.
+            dtype (jnp.dtype | None): Data type for cache tensors. Defaults to model's kvdtype.
+            quantizer: Optional quantizer for KV cache compression.
+            masking_details: Optional masking details for attention operations.
+            starts (jnp.array | None): Optional starting positions for sequences.
+                Used to initialize cache state for pre-filled prompts. Defaults to None.
 
         Returns:
-            HybridCache with per-layer views appropriate for each operation.
+            HybridCache: Cache with per-layer views appropriate for each operation.
 
         Example:
             >>> # Standard usage - automatically creates appropriate views per layer
@@ -1010,6 +1029,30 @@ class EasyGenerationMixin:
         kv_positions: jax.Array | None,
         is_self_attn: bool = True,
     ) -> MaskInfo:
+        """Creates a MaskInfo object from attention masks or segment IDs.
+
+        This method prefers explicit segment IDs over attention masks when both
+        are provided, as segment-based masking is more flexible and supports
+        document-level boundaries.
+
+        Args:
+            attention_mask (jax.Array | None): Optional attention mask of shape
+                (B, L) or (B, 1, Q, K).
+            q_segment_ids (jax.Array | None): Optional query segment IDs for
+                document-aware masking.
+            kv_segment_ids (jax.Array | None): Optional key/value segment IDs.
+                If None and is_self_attn=True, uses q_segment_ids.
+            q_positions (jax.Array | None): Optional query position indices.
+            kv_positions (jax.Array | None): Optional key/value position indices.
+            is_self_attn (bool): Whether this is self-attention (vs cross-attention).
+                Defaults to True.
+
+        Returns:
+            MaskInfo: A MaskInfo object configured for the attention operation.
+
+        Raises:
+            ValueError: If neither segment_ids nor attention_mask is provided.
+        """
         # Prefer explicit segment IDs over masks
         if q_segment_ids is not None:
             return MaskInfo.from_segments(
@@ -1049,16 +1092,21 @@ class EasyGenerationMixin:
             max_length (int): The maximum sequence length that the KV cache should support.
             pad_token_id (int): The ID used for padding tokens. Used to calculate `starts` if not provided.
             starts (int | None): Optional pre-calculated starting positions (number of leading pads).
-                If None, calculated using `compute_prefill_length`.
+                If None, calculated using `compute_prefill_length`. Defaults to None.
             shardings (dict | None): Optional sharding configuration passed to `init_cache`.
-            attention_mask (tp.Optional[Array]): An optional mask indicating which tokens
-                should be attended to. Shape (batch_size, seq_length).
-            token_type_ids (tp.Optional[Array]): Optional segment IDs for models that use them.
+                Defaults to None.
+            attention_mask (Array | None): An optional mask indicating which tokens
+                should be attended to. Shape (batch_size, seq_length). Defaults to None.
+            token_type_ids (Array | None): Optional segment IDs for models that use them.
+                Defaults to None.
+            mask_info (MaskInfo | None): Optional pre-computed MaskInfo object for attention.
+                If provided, used directly instead of computing from attention_mask.
+                Defaults to None.
 
         Returns:
             dict: A dictionary containing the prepared inputs, typically including:
                 - "past_key_values": The initialized KV cache.
-                - "attention_mask": The extended attention mask for generation.
+                - "mask_info": The MaskInfo object for attention masking.
                 - "position_ids": The calculated initial position IDs.
                 - "token_type_ids": (Optional) Prepared token type IDs.
                 This dictionary is then passed through `prepare_inputs_for_call`.
@@ -1438,6 +1486,25 @@ class EasyGenerationMixin:
         input_ids: jnp.ndarray | None = None,
         **model_kwargs,
     ) -> tuple[jnp.ndarray, dict[str, tp.Any]]:
+        """Expands input tensors for generation with multiple return sequences.
+
+        Repeats input_ids and all array-valued model_kwargs along the batch dimension
+        to support generating multiple sequences per input (e.g., for beam search or
+        multiple return sequences).
+
+        Args:
+            expand_size (int): Number of times to repeat each input. Defaults to 1.
+            is_encoder_decoder (bool): Whether the model is encoder-decoder. If True,
+                also expands encoder_outputs. Defaults to False.
+            input_ids (jnp.ndarray | None): Input token IDs to expand. Defaults to None.
+            **model_kwargs: Additional model kwargs. Array values will be repeated.
+
+        Returns:
+            tuple[jnp.ndarray, dict[str, Any]]: Tuple of (expanded_input_ids, expanded_model_kwargs).
+
+        Raises:
+            ValueError: If is_encoder_decoder=True but encoder_outputs is not in model_kwargs.
+        """
         if expand_size == 1:
             return input_ids, model_kwargs
 
