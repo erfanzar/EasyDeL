@@ -337,7 +337,6 @@ def main() -> None:
                 folder_path=str(out_dir),
                 repo_id=args.repo_id,
                 repo_type="model",
-                commit_message="Add EasyDeL checkpoint",
             )
     else:
         model = model_cls.from_pretrained(
