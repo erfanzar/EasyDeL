@@ -42,7 +42,7 @@ TPU/GPU clusters.
 ## Why EasyDeL?
 
 - **🔮 Modern Architecture**: Built on Flax NNX (not legacy Linen) for better modularity and performance
-- **50+ Model Architectures**: Broad JAX model collection including LLaMA, Qwen, Mistral, DeepSeek, Gemma, and more
+- **70+ Model Architectures**: Broad JAX model collection including LLaMA, Qwen, Mistral, DeepSeek, Gemma, and more
 - **16 Specialized Trainers**: From supervised fine-tuning to RLHF, preference optimization, and knowledge distillation
 - **🚀 Production-Ready Inference**: eSurge engine with continuous batching, paged KV cache, OpenAI-compatible API, and multimodal serving (text/image/video)
 - **Full Multimodal Support**: Vision-language models (LLaVA, Qwen2-VL, Llama4-Vision), speech recognition (Whisper), and diffusion models
@@ -179,7 +179,7 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 
 ## Supported Models
 
-### Text Models (50+)
+### Text Models (70+)
 
 | Family          | Models                                                                                                                                                                 | Features                              |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
@@ -1291,7 +1291,7 @@ config = LlamaConfig(
     platform="triton",                   # Kernel backend
     use_scan_mlp=True,                   # Custom optimizations
     rope_theta=10000,                    # Positional encoding
-    # ... and 50+ more options
+    # ... and 70+ more options
 )
 
 model = LlamaForCausalLM(config=config, rngs=rngs)
