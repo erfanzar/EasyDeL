@@ -1562,6 +1562,7 @@ class EasyBridgeMixin(PushToHubMixin):
         pretrained_model_name_or_path: str,
         save_directory: str | os.PathLike,
         *,
+        output_repo_id: str | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
@@ -1589,6 +1590,9 @@ class EasyBridgeMixin(PushToHubMixin):
         - writing each tensor immediately into a TensorStore (zarr) checkpoint.
 
         MoE expert weights are written slice-by-slice to avoid allocating stacked expert tensors.
+
+        If `output_repo_id` is provided, it is used in the generated `README.md` so the model card
+        points to the final Hub repo when uploading the converted folder.
         """
         from datetime import datetime
 
@@ -2153,6 +2157,25 @@ class EasyBridgeMixin(PushToHubMixin):
             )
 
         _write_checkpoint_index()
+        try:
+            attn_mechanism = getattr(ed_config, "attn_mechanism", "auto")
+            if hasattr(attn_mechanism, "value"):
+                attn_mechanism = attn_mechanism.value
+
+            model_display_name = getattr(hf_config, "_name_or_path", None) or pretrained_model_name_or_path
+            readme_repo_id = output_repo_id or str(save_root)
+            model_info = ModelInfo(
+                name=str(model_display_name),
+                type=module.__name__,
+                repo_id=readme_repo_id,
+                description=f"EasyDeL checkpoint converted from {pretrained_model_name_or_path}.",
+                model_type=model_type,
+                model_task=cls._model_task or "CausalLM",
+                attn_mechanism=str(attn_mechanism),
+            )
+            ReadmeGenerator().generate_readme(model_info, output_path=str(save_root / "README.md"))
+        except Exception:
+            logger.exception("Failed to generate README for converted checkpoint at %s", save_root)
         if verbose:
             logger.info(f"Sequential conversion finished. Wrote {len(array_index)} tensors to {save_root}")
 

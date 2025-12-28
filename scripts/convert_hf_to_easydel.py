@@ -317,6 +317,7 @@ def main() -> None:
         Base.huggingface_to_easydel_sequential(
             pretrained_model_name_or_path=args.source,
             save_directory=str(out_dir),
+            output_repo_id=args.repo_id,
             dtype=dtype,
             param_dtype=param_dtype,
             sharding_axis_dims=args.sharding_axis_dims,
@@ -332,7 +333,7 @@ def main() -> None:
 
             api = HfApi()
             api.create_repo(repo_id=args.repo_id, repo_type="model", exist_ok=True, token=args.token)
-            api.upload_folder(
+            api.upload_large_folder(
                 folder_path=str(out_dir),
                 repo_id=args.repo_id,
                 repo_type="model",
