@@ -78,6 +78,12 @@ def main() -> None:
         help="Optional: HF repo id to push to (e.g. username/my-easydel)",
     )
     parser.add_argument(
+        "--push-to-hub",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --repo-id is set, push the converted folder to the HF Hub.",
+    )
+    parser.add_argument(
         "--task",
         default="auto",
         choices=(
@@ -328,16 +334,17 @@ def main() -> None:
             verbose=True,
             **hf_kwargs,
         )
-        if args.repo_id:
+        if args.repo_id and args.push_to_hub:
             from huggingface_hub import HfApi
 
             api = HfApi(token=args.token)
             api.create_repo(repo_id=args.repo_id, repo_type="model", exist_ok=True, token=args.token)
-            api.upload_large_folder(
+            api.upload_folder(
                 folder_path=str(out_dir),
                 repo_id=args.repo_id,
                 repo_type="model",
-            )
+                commit_message="Adding EasyDeL Checkpoints",
+        )
     else:
         model = model_cls.from_pretrained(
             args.source,
@@ -351,7 +358,7 @@ def main() -> None:
             torch_streaming_tmp_dir=args.torch_streaming_tmp_dir,
             **hf_kwargs,
         )
-        if args.repo_id:
+        if args.repo_id and args.push_to_hub:
             model.save_pretrained(
                 str(out_dir),
                 push_to_hub=True,
@@ -362,7 +369,7 @@ def main() -> None:
             model.save_pretrained(str(out_dir))
 
     logger.info(f"Done. Saved to: {out_dir}")
-    if args.repo_id:
+    if args.repo_id and args.push_to_hub:
         logger.info(f"Pushed to: {args.repo_id}")
 
 
