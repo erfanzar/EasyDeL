@@ -155,7 +155,11 @@ class OpenAIToolParser(ToolParser):
             if self.current_tool_id >= 0:
                 cur_arguments = current_tool_call.get("arguments")
                 if cur_arguments:
-                    cur_args_json = cur_arguments if isinstance(cur_arguments, str) else json.dumps(cur_arguments, ensure_ascii=False)
+                    cur_args_json = (
+                        cur_arguments
+                        if isinstance(cur_arguments, str)
+                        else json.dumps(cur_arguments, ensure_ascii=False)
+                    )
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     argument_diff = cur_args_json[sent:]
                     delta = (
@@ -204,10 +208,14 @@ class OpenAIToolParser(ToolParser):
         if cur_arguments is None:
             return None
 
-        cur_args_json = cur_arguments if isinstance(cur_arguments, str) else json.dumps(cur_arguments, ensure_ascii=False)
+        cur_args_json = (
+            cur_arguments if isinstance(cur_arguments, str) else json.dumps(cur_arguments, ensure_ascii=False)
+        )
         sent = len(self.streamed_args_for_tool[self.current_tool_id])
 
-        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments") if self.prev_tool_call_arr else None
+        prev_arguments = (
+            self.prev_tool_call_arr[self.current_tool_id].get("arguments") if self.prev_tool_call_arr else None
+        )
         argument_diff: str | None = None
 
         if is_complete:

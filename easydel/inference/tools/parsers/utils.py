@@ -42,4 +42,3 @@ __all__ = [
     "is_complete_json",
     "partial_json_loads",
 ]
-

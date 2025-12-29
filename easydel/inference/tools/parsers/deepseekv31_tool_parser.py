@@ -87,7 +87,9 @@ class DeepSeekV31ToolParser(ToolParser):
 
             tool_calls: list[ToolCall] = []
             for function_name, function_args in function_call_tuples:
-                tool_calls.append(ToolCall(type="function", function=FunctionCall(name=function_name, arguments=function_args)))
+                tool_calls.append(
+                    ToolCall(type="function", function=FunctionCall(name=function_name, arguments=function_args))
+                )
 
             content = model_output[: model_output.find(self.tool_calls_start_token)]
             return ExtractedToolCallInformation(
@@ -285,4 +287,3 @@ class DeepSeekV31ToolParser(ToolParser):
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
             return None
-
