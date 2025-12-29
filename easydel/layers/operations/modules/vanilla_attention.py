@@ -201,7 +201,7 @@ class VanillaAttn(OperationImpl):
                     if attention_mask.shape[-2] != q_len or attention_mask.shape[-1] != kv_len:
                         attention_mask = attention_mask[..., :q_len, :kv_len]
                         mask_info = MaskInfo(_attention_mask=attention_mask)
-            outputs, weights = attention(
+            attn_result = attention(
                 query,
                 key,
                 value,
@@ -219,6 +219,10 @@ class VanillaAttn(OperationImpl):
                 causal=causal_computed,
                 logits_soft_cap=logits_soft_cap,
             )
+            if isinstance(attn_result, tuple):
+                outputs, weights = attn_result
+            else:
+                outputs, weights = attn_result, None
 
             # Apply output sharding
             outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output)

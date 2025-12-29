@@ -655,6 +655,7 @@ class TransformerCacheView(BaseCacheView):
         mask_info = mask_info.apply_kv_lengths(
             kv_lengths=indexs,
             q_len=num_updated_cache_vectors,
+            end_index=indexs,
             sliding_window=sliding_window,
         )
 
